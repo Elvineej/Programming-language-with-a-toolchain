@@ -1,0 +1,4 @@
+fn main() {
+  x
+}
+//~ ERROR[E0200] unresolved name

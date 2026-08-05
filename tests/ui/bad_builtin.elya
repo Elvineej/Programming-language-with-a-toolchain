@@ -1,0 +1,4 @@
+fn main() {
+  io.nope("x")
+}
+//~ ERROR[E0201] unknown builtin
