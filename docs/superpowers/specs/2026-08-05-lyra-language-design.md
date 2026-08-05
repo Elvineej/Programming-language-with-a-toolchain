@@ -702,6 +702,30 @@ Thin vertical slices; always keep a running language.
 
 **Cost profile of adding linear/affine types later — additive, not invasive.** Two viable paths exist and neither redesigns Algorithm J: **(a)** a *fully additive* usage/multiplicity checker run as a separate pass over the typed **Core IR** (every binder and use site is already explicit and CFG-shaped there), touching the unifier not at all; or **(b)** a *bounded extension* in the Linear-Haskell style — a `Multiplicity` component on the `Fn` arrow that unifies alongside types, structurally the **same kind of extension already validated for effect rows** (new field on `Fn`, new variable kind, generalize/instantiate), not a new algorithm. The v1 inferencer keeps this additive on purpose by preserving two properties (both already true): the arrow type stays extensible (it already carries the effect row), and Core keeps all binders and uses explicit. **The one genuine future cost, recorded so it is not a surprise:** the *interaction rules* between linearity and multi-shot handlers — a linear resource must be forbidden from capture into a continuation that may resume more than once — require dedicated design (studied in the Effekt / Frank / linear-handlers literature). That is design effort on the *rules*, not a change to the core inference algorithm, and doing it after the effect system is concrete is an advantage rather than a liability.
 
+### Future major-version direction — AI / HPC compute (roadmap only; does not alter v1)
+
+**Status:** north-star for a future major version. **This does not change Slices 1–3 or the implementation bound**, and it does not touch the manifesto (§1) or the four axes (§2). The manifesto remains Lyra's single soul — effects-first, purity by default, one radical bet. The features below are a direction the *existing* bet can grow toward, not a second identity competing with the first. **If any item here ever conflicts with the manifesto, the manifesto wins and the conflict is flagged, not silently reconciled.**
+
+Candidate feature set (all deferred): an Intelligent Hardware Scheduler; automatic multithreading; SIMD / auto-vectorization; tensors and GPU/NPU execution; Python interop; an HTTP framework; database drivers; async networking.
+
+**The decisive question — does this fit the effect mechanism, or fight it?** The honest answer is a clean split.
+
+**Fits as a flagship *extension* of effects — the compute surface is handlers over a `Compute` / `Tensor` effect.** Running a kernel on a GPU or NPU is, semantically, an effect: an operation is *performed* (`Tensor.matmul(a, b)`, `Compute.run(kernel)`) and a *handler* decides where and how it executes, then resumes with the result.
+- The **hardware scheduler is a handler** (or a stack of them) for the `Compute` effect: it reads device availability and a cost model, honors `@prefer(GPU)` / `@prefer(NPU)` as hints carried on the operation, chooses a backend, dispatches, and resumes. `@prefer(...)` is handler selection, not a separate subsystem.
+- It **layers on effects already planned**: device dispatch is asynchronous, so `Compute` sits on the `Async` effect; device buffers are linear resources, so it uses the linear/affine discipline deferred above and the one-shot handler default (§8.3) — a multi-shot handler over device memory would double-free a buffer, exactly the §8.6 hazard, so `Compute` handlers are one-shot.
+- To be viable it must be a **coarse-grained, graph-capturing effect**, not an eager per-scalar one: performing a continuation per numeric op would be ruinous. The `Tensor` handler accumulates a compute graph and dispatches it fused (effects-as-staging), rather than suspending on every element. This is a real design commitment, but an *extension* of the mechanism, not a departure from it.
+
+So the scheduler, device placement, `@prefer`, and tensor/kernel operations are a **natural flagship extension of the effects bet** — the same shape as every other Lyra effect, and they *strengthen* the manifesto rather than compete with it.
+
+**Fits as libraries *over* effects (no core changes):** async networking, the HTTP framework, and database drivers are ordinary libraries written against the `Async` / `IO` / capability effects. They *use* the mechanism; they add no new core.
+
+**Genuinely separate subsystems (honest future cost — these are *not* handlers):**
+- **Automatic parallelization** — auto-multithreading and auto-SIMD/vectorization of *ordinary* code. This is implicit whole-program optimization in the middle-end/codegen, not something the user *performs*, so it cannot be a handler; it is a separate compiler subsystem. It does not threaten purity-by-default because it is semantics-preserving (like any optimizer), so it does not compete with the manifesto — but it is a bolt-on, and its cost is counted as one.
+- **GPU/NPU code-generation backends** (SPIR-V / PTX / LLVM-GPU targets) and **device-memory management** — real codegen/runtime subsystems the `Compute` handlers dispatch *into*. The effect gives a clean front-end; the backend is separate engineering.
+- **The Python interop bridge** — an FFI + runtime-embedding subsystem. Individual calls *into* Python could be tracked as a `PyFFI` effect (for capability/auditing), but the interop machinery itself is a subsystem, not a handler.
+
+**Summary:** the compute *interface* (scheduler-as-handler, `@prefer`, tensor ops) is a flagship *extension of the effect model* that reinforces the bet; the compute *implementation* (auto-parallelization, GPU/NPU backends, device memory, Python bridge) is separate subsystem work whose cost is acknowledged honestly here. None of it is in scope before the language self-hosts (Slice 8) and the effect system, `Async`, and linear resources are all real.
+
 ---
 
 ## 14. Risks & Mitigations
