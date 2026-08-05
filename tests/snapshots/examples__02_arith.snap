@@ -1,0 +1,5 @@
+---
+source: tests/examples.rs
+expression: "run_example(\"02_arith.elya\")"
+---
+forty-two
