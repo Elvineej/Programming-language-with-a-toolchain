@@ -1,0 +1,20 @@
+[package]
+name = "lyra"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+
+[lib]
+name = "lyra"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lyra"
+path = "src/main.rs"
+
+[dependencies]
+logos = "0.14"
+ariadne = "0.4"
+
+[dev-dependencies]
+insta = "1"
