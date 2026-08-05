@@ -568,12 +568,12 @@ mod tests {
 
     #[test]
     fn parses_hello_world_module() {
-        let src = "import lyra/io\n\npub fn main() / {IO} {\n  io.println(\"Hello, Lyra!\")\n}\n";
+        let src = "import elya/io\n\npub fn main() / {IO} {\n  io.println(\"Hello, Elya!\")\n}\n";
         let (m, diags) = parse_module(&Session::new(), src);
         assert!(diags.is_empty(), "diags: {diags:?}");
         assert_eq!(
             crate::ast::pretty(&m),
-            r#"(module (fn main () (block (call io.println "Hello, Lyra!"))))"#
+            r#"(module (fn main () (block (call io.println "Hello, Elya!"))))"#
         );
         // `Decl` has a single variant in Slice 1, so this binding is irrefutable.
         let Decl::Fn(f) = &m.decls[0].node;

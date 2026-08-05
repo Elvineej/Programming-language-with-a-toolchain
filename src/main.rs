@@ -6,7 +6,7 @@ fn main() -> ExitCode {
         Some("run") => cmd(&args, true),
         Some("check") => cmd(&args, false),
         _ => {
-            eprintln!("usage: lyra <run|check> <file.lyra>");
+            eprintln!("usage: elya <run|check> <file.elya>");
             ExitCode::from(2)
         }
     }
@@ -25,7 +25,7 @@ fn cmd(args: &[String], run: bool) -> ExitCode {
         }
     };
     if run {
-        match lyra::run_source(path, &text) {
+        match elya::run_source(path, &text) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
@@ -36,7 +36,7 @@ fn cmd(args: &[String], run: bool) -> ExitCode {
             }
         }
     } else {
-        match lyra::check_source(path, &text) {
+        match elya::check_source(path, &text) {
             Ok(()) => {
                 println!("ok");
                 ExitCode::SUCCESS

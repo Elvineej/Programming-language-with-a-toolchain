@@ -1,10 +1,10 @@
-# Lyra Slice 1 — Tree-Walking Interpreter Implementation Plan
+# Elya Slice 1 — Tree-Walking Interpreter Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a running Lyra interpreter that executes a small subset of the language (literals, arithmetic, `let`, `if/else`, function definitions and calls, and `io.println`) end-to-end through lexer → parser → name-check → tree-walking evaluator, with the test and diagnostics infrastructure that later slices build on.
+**Goal:** Build a running Elya interpreter that executes a small subset of the language (literals, arithmetic, `let`, `if/else`, function definitions and calls, and `io.println`) end-to-end through lexer → parser → name-check → tree-walking evaluator, with the test and diagnostics infrastructure that later slices build on.
 
-**Architecture:** One Rust crate `lyra` (library + binary). Each compiler pass is a pure function `fn(&Session, In) -> (Out, Vec<Diagnostic>)` living in its own module; modules are layered (`span/diag → lex → ast → parse → resolve → eval → cli`) and a test enforces the layering so a future workspace split stays mechanical. Slice 1 uses a plain recursive tree-walker (no type checker); the CEK refactor and real types arrive in Slice 2.
+**Architecture:** One Rust crate `elya` (library + binary). Each compiler pass is a pure function `fn(&Session, In) -> (Out, Vec<Diagnostic>)` living in its own module; modules are layered (`span/diag → lex → ast → parse → resolve → eval → cli`) and a test enforces the layering so a future workspace split stays mechanical. Slice 1 uses a plain recursive tree-walker (no type checker); the CEK refactor and real types arrive in Slice 2.
 
 **Tech Stack:** Rust (edition 2021), `logos` (lexer), `ariadne` (diagnostic rendering), `insta` (snapshot tests). Dev tooling: `rustfmt`, `clippy`, a local `scripts/check` script wired to a git pre-push hook.
 
@@ -12,7 +12,7 @@
 
 - **Language/edition:** Rust, `edition = "2021"`. Toolchain channel `stable` pinned via `rust-toolchain.toml`; MSRV floor 1.75.
 - **Dependencies (runtime):** exactly `logos = "0.14"` and `ariadne = "0.4"`. No others in Slice 1. **Dev-dependencies:** `insta = "1"`.
-- **Single crate:** `lyra`, library `src/lib.rs` + binary `src/main.rs`. No workspace yet.
+- **Single crate:** `elya`, library `src/lib.rs` + binary `src/main.rs`. No workspace yet.
 - **Pass signature rule:** every pass is `pub fn name(&Session, In) -> (Out, Vec<Diagnostic>)` (or `-> Vec<Diagnostic>` when it produces no value). No global mutable state, no `thread_local`, no `lazy_static`. Shared state lives in `Session`.
 - **Spans everywhere:** every token and every AST node carries a `Span` from the moment it is created.
 - **Module layer order (pinned):** `span = 0, diag = 0, lex = 1, ast = 1, parse = 2, resolve = 3, types = 4, core = 5, eval = 6, main/cli = 7`. A module may only reference modules at a **strictly lower** layer (equal-layer `span`/`diag` and `lex`/`ast` references are allowed). `tests/arch/layering.rs` enforces this.
@@ -32,7 +32,7 @@
 | `.gitignore`, `.gitattributes` | Ignore `/target`; normalize LF |
 | `scripts/check.sh`, `scripts/check.ps1` | Local CI (fmt + clippy + test) |
 | `src/lib.rs` | `Session`, pipeline wiring (`run_source`, `check_source`), module declarations |
-| `src/main.rs` | CLI: `lyra run <file>` / `lyra check <file>` |
+| `src/main.rs` | CLI: `elya run <file>` / `elya check <file>` |
 | `src/span.rs` | `Span`, `Spanned<T>`, `SourceMap` (offset→line/col) |
 | `src/diag.rs` | `Severity`, `Label`, `Diagnostic`, `render()` |
 | `src/lex.rs` | `TokenKind`, `Token`, `lex()` |
@@ -40,9 +40,9 @@
 | `src/parse.rs` | Recursive-descent + Pratt parser with recovery |
 | `src/resolve.rs` | Name checking, builtin table, `E02xx` diagnostics |
 | `src/eval.rs` | `Value`, `Env`, tree-walker, builtins, depth instrumentation |
-| `examples/*.lyra` | Slice-1-runnable example programs (golden tests) |
-| `tests/examples.rs` | Runs `examples/*.lyra`, snapshots output |
-| `tests/ui.rs` + `tests/ui/*.lyra` | `//~ ERROR[Ennnn]` diagnostic fixtures |
+| `examples/*.elya` | Slice-1-runnable example programs (golden tests) |
+| `tests/examples.rs` | Runs `examples/*.elya`, snapshots output |
+| `tests/ui.rs` + `tests/ui/*.elya` | `//~ ERROR[Ennnn]` diagnostic fixtures |
 | `tests/arch/layering.rs` | Module-layer DAG enforcement |
 | `tests/tce.rs` | Depth-instrumentation "grow" control (bounded assertions land Slice 2) |
 
@@ -56,24 +56,24 @@
 - Create: `scripts/check.sh`, `scripts/check.ps1`
 
 **Interfaces:**
-- Produces: crate `lyra` builds; `lib.rs` declares empty modules `span, diag, lex, ast, parse, resolve, eval`; `pub struct Session` placeholder.
+- Produces: crate `elya` builds; `lib.rs` declares empty modules `span, diag, lex, ast, parse, resolve, eval`; `pub struct Session` placeholder.
 
 - [ ] **Step 1: Create the Cargo manifest**
 
 `Cargo.toml`:
 ```toml
 [package]
-name = "lyra"
+name = "elya"
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.75"
 
 [lib]
-name = "lyra"
+name = "elya"
 path = "src/lib.rs"
 
 [[bin]]
-name = "lyra"
+name = "elya"
 path = "src/main.rs"
 
 [dependencies]
@@ -108,7 +108,7 @@ components = ["rustfmt", "clippy"]
 
 `src/lib.rs`:
 ```rust
-//! The Lyra compiler (Slice 1: tree-walking interpreter).
+//! The Elya compiler (Slice 1: tree-walking interpreter).
 
 pub mod span;
 pub mod diag;
@@ -136,7 +136,7 @@ Create empty module files so the crate compiles: `src/span.rs`, `src/diag.rs`, `
 `src/main.rs`:
 ```rust
 fn main() {
-    eprintln!("lyra: no command yet (scaffold)");
+    eprintln!("elya: no command yet (scaffold)");
     std::process::exit(2);
 }
 ```
@@ -170,7 +170,7 @@ Expected: compiles with no errors.
 
 ```bash
 git add -A
-git commit -m "chore: scaffold lyra crate (lib+bin, deps, check scripts)"
+git commit -m "chore: scaffold elya crate (lib+bin, deps, check scripts)"
 ```
 
 ---
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn location_maps_offset_to_line_and_col() {
-        let sm = SourceMap::new("t.lyra", "ab\ncd\n");
+        let sm = SourceMap::new("t.elya", "ab\ncd\n");
         assert_eq!(sm.location(0), (1, 1)); // 'a'
         assert_eq!(sm.location(1), (1, 2)); // 'b'
         assert_eq!(sm.location(3), (2, 1)); // 'c'
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn render_mentions_code_and_message() {
-        let sm = SourceMap::new("t.lyra", "foo\n");
+        let sm = SourceMap::new("t.elya", "foo\n");
         let d = Diagnostic::error("E0200", "unresolved name `foo`")
             .with_label(Span::new(0, 3), "not found");
         let out = render(&[d], &sm);
@@ -653,7 +653,7 @@ pub fn lex(_session: &Session, text: &str) -> (Vec<Token>, Vec<Diagnostic>) {
             Ok(kind) => tokens.push(Token { kind, span }),
             Err(()) => diags.push(
                 Diagnostic::error("E0001", "unexpected character")
-                    .with_label(span, "not a valid Lyra token"),
+                    .with_label(span, "not a valid Elya token"),
             ),
         }
     }
@@ -1163,12 +1163,12 @@ Add to `src/parse.rs` tests module:
 ```rust
     #[test]
     fn parses_hello_world_module() {
-        let src = "import lyra/io\n\npub fn main() / {IO} {\n  io.println(\"Hello, Lyra!\")\n}\n";
+        let src = "import elya/io\n\npub fn main() / {IO} {\n  io.println(\"Hello, Elya!\")\n}\n";
         let (m, diags) = parse_module(&Session::new(), src);
         assert!(diags.is_empty(), "diags: {diags:?}");
         assert_eq!(
             crate::ast::pretty(&m),
-            r#"(module (fn main () (block (call io.println "Hello, Lyra!"))))"#
+            r#"(module (fn main () (block (call io.println "Hello, Elya!"))))"#
         );
         // effect row parsed but only names retained
         if let Decl::Fn(f) = &m.decls[0].node {
@@ -2019,8 +2019,8 @@ Add to `src/eval.rs` tests:
 
     #[test]
     fn hello_world_prints() {
-        let src = "pub fn main() / {IO} {\n  io.println(\"Hello, Lyra!\")\n}\n";
-        assert_eq!(run(src), "Hello, Lyra!\n");
+        let src = "pub fn main() / {IO} {\n  io.println(\"Hello, Elya!\")\n}\n";
+        assert_eq!(run(src), "Hello, Elya!\n");
     }
 
     #[test]
@@ -2164,7 +2164,7 @@ git commit -m "feat(eval): user functions, calls, io.println builtin, run_module
 
 **Files:**
 - Modify: `src/lib.rs`, `src/main.rs`
-- Create: `examples/01_hello.lyra`, `examples/02_arith.lyra`
+- Create: `examples/01_hello.elya`, `examples/02_arith.elya`
 - Test: inline `#[cfg(test)]` in `src/lib.rs`
 
 **Interfaces:**
@@ -2183,22 +2183,22 @@ mod tests {
     #[test]
     fn run_source_executes_hello_world() {
         let out = run_source(
-            "h.lyra",
-            "pub fn main() / {IO} {\n  io.println(\"Hello, Lyra!\")\n}\n",
+            "h.elya",
+            "pub fn main() / {IO} {\n  io.println(\"Hello, Elya!\")\n}\n",
         )
         .unwrap();
-        assert_eq!(out, "Hello, Lyra!\n");
+        assert_eq!(out, "Hello, Elya!\n");
     }
 
     #[test]
     fn run_source_reports_diagnostics() {
-        let err = run_source("b.lyra", "fn main() { x }\n").unwrap_err();
+        let err = run_source("b.elya", "fn main() { x }\n").unwrap_err();
         assert!(err.contains("E0200"), "err: {err}");
     }
 
     #[test]
     fn check_source_is_ok_for_valid_program() {
-        assert!(check_source("h.lyra", "fn main() { io.println(\"x\") }\n").is_ok());
+        assert!(check_source("h.elya", "fn main() { io.println(\"x\") }\n").is_ok());
     }
 }
 ```
@@ -2261,7 +2261,7 @@ fn main() -> ExitCode {
         Some("run") => cmd(&args, true),
         Some("check") => cmd(&args, false),
         _ => {
-            eprintln!("usage: lyra <run|check> <file.lyra>");
+            eprintln!("usage: elya <run|check> <file.elya>");
             ExitCode::from(2)
         }
     }
@@ -2280,7 +2280,7 @@ fn cmd(args: &[String], run: bool) -> ExitCode {
         }
     };
     if run {
-        match lyra::run_source(path, &text) {
+        match elya::run_source(path, &text) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
@@ -2291,7 +2291,7 @@ fn cmd(args: &[String], run: bool) -> ExitCode {
             }
         }
     } else {
-        match lyra::check_source(path, &text) {
+        match elya::check_source(path, &text) {
             Ok(()) => {
                 println!("ok");
                 ExitCode::SUCCESS
@@ -2305,17 +2305,17 @@ fn cmd(args: &[String], run: bool) -> ExitCode {
 }
 ```
 
-Create `examples/01_hello.lyra`:
-```lyra
-import lyra/io
+Create `examples/01_hello.elya`:
+```elya
+import elya/io
 
 pub fn main() / {IO} {
-  io.println("Hello, Lyra!")
+  io.println("Hello, Elya!")
 }
 ```
 
-Create `examples/02_arith.lyra`:
-```lyra
+Create `examples/02_arith.elya`:
+```elya
 fn double(x) {
   x + x
 }
@@ -2335,16 +2335,16 @@ pub fn main() / {IO} {
 
 Run: `cargo test --lib tests`
 Expected: PASS.
-Run: `cargo run --quiet -- run examples/01_hello.lyra`
-Expected output: `Hello, Lyra!`
-Run: `cargo run --quiet -- run examples/02_arith.lyra`
+Run: `cargo run --quiet -- run examples/01_hello.elya`
+Expected output: `Hello, Elya!`
+Run: `cargo run --quiet -- run examples/02_arith.elya`
 Expected output: `forty-two`
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/lib.rs src/main.rs examples/
-git commit -m "feat: end-to-end pipeline, lyra run/check CLI, example programs"
+git commit -m "feat: end-to-end pipeline, elya run/check CLI, example programs"
 ```
 
 ---
@@ -2355,7 +2355,7 @@ git commit -m "feat: end-to-end pipeline, lyra run/check CLI, example programs"
 - Create: `tests/examples.rs`
 
 **Interfaces:**
-- Consumes: `lyra::run_source` (public).
+- Consumes: `elya::run_source` (public).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2366,17 +2366,17 @@ git commit -m "feat: end-to-end pipeline, lyra run/check CLI, example programs"
 fn run_example(rel: &str) -> String {
     let path = format!("{}/examples/{rel}", env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(&path).expect("read example");
-    lyra::run_source(rel, &text).expect("example should run cleanly")
+    elya::run_source(rel, &text).expect("example should run cleanly")
 }
 
 #[test]
 fn hello() {
-    insta::assert_snapshot!("01_hello", run_example("01_hello.lyra"));
+    insta::assert_snapshot!("01_hello", run_example("01_hello.elya"));
 }
 
 #[test]
 fn arith() {
-    insta::assert_snapshot!("02_arith", run_example("02_arith.lyra"));
+    insta::assert_snapshot!("02_arith", run_example("02_arith.elya"));
 }
 ```
 
@@ -2388,7 +2388,7 @@ Expected: FAIL — snapshots not yet accepted (insta reports pending).
 - [ ] **Step 3: Review and accept snapshots**
 
 Run: `cargo insta review` (or `cargo insta accept` if `cargo-insta` is installed; otherwise set `INSTA_UPDATE=always cargo test --test examples` once and inspect the generated `.snap` files).
-Confirm `01_hello` snapshot content is `Hello, Lyra!\n` and `02_arith` is `forty-two\n`.
+Confirm `01_hello` snapshot content is `Hello, Elya!\n` and `02_arith` is `forty-two\n`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -2407,7 +2407,7 @@ git commit -m "test: golden snapshot tests for example programs"
 ## Task 14: UI diagnostic harness (`//~ ERROR[Ennnn]`)
 
 **Files:**
-- Create: `tests/ui.rs`, `tests/ui/unresolved.lyra`, `tests/ui/bad_builtin.lyra`
+- Create: `tests/ui.rs`, `tests/ui/unresolved.elya`, `tests/ui/bad_builtin.elya`
 
 **Interfaces:**
 - The harness parses `//~ ERROR[Ennnn] <substring>` annotations from a fixture, runs `check_source`, and asserts (a) every expected code appears and (b) no rendered `%r`/`%e`/`%s` gibberish token appears (guards the future effect-diagnostics invariant from spec §9).
@@ -2416,16 +2416,16 @@ git commit -m "test: golden snapshot tests for example programs"
 
 - [ ] **Step 1: Write the fixtures**
 
-`tests/ui/unresolved.lyra`:
-```lyra
+`tests/ui/unresolved.elya`:
+```elya
 fn main() {
   x
 }
 //~ ERROR[E0200] unresolved name
 ```
 
-`tests/ui/bad_builtin.lyra`:
-```lyra
+`tests/ui/bad_builtin.elya`:
+```elya
 fn main() {
   io.nope("x")
 }
@@ -2465,7 +2465,7 @@ fn check_fixture(name: &str) {
     let src = fs::read_to_string(&path).expect("read fixture");
     let expects = parse_expectations(&src);
     assert!(!expects.is_empty(), "fixture has no expectations: {name}");
-    let rendered = lyra::check_source(name, &src)
+    let rendered = elya::check_source(name, &src)
         .expect_err("fixture should produce diagnostics");
     for e in &expects {
         assert!(
@@ -2490,12 +2490,12 @@ fn check_fixture(name: &str) {
 
 #[test]
 fn unresolved() {
-    check_fixture("unresolved.lyra");
+    check_fixture("unresolved.elya");
 }
 
 #[test]
 fn bad_builtin() {
-    check_fixture("bad_builtin.lyra");
+    check_fixture("bad_builtin.elya");
 }
 ```
 
@@ -2650,10 +2650,10 @@ git commit -m "test(arch): enforce module-layer DAG so workspace split stays mec
 //! Slice 2 with the CEK machine; here we prove the measurement grows with
 //! recursion, so the harness is real when the guarantee lands.
 
-use lyra::ast::Module;
-use lyra::parse::parse_module;
-use lyra::eval::run_module;
-use lyra::Session;
+use elya::ast::Module;
+use elya::parse::parse_module;
+use elya::eval::run_module;
+use elya::Session;
 
 fn max_depth_for(src: &str) -> usize {
     let (m, d): (Module, _) = parse_module(&Session::new(), src);
@@ -2730,20 +2730,20 @@ Write-Output "installed pre-push hook -> scripts/check.sh"
 
 `README.md`:
 ```markdown
-# Lyra
+# Elya
 
 An effects-first, statically-typed, natively-compiled language (in progress).
 This repository currently implements **Slice 1**: a tree-walking interpreter for
 a small subset (literals, arithmetic, `let`, `if/else`, functions, `io.println`).
 
-See the design spec: `docs/superpowers/specs/2026-08-05-lyra-language-design.md`.
+See the design spec: `docs/superpowers/specs/2026-08-05-elya-language-design.md`.
 
 ## Build & run
 
 ```sh
 cargo build
-cargo run -- run examples/01_hello.lyra     # prints: Hello, Lyra!
-cargo run -- check examples/02_arith.lyra    # front-end only
+cargo run -- run examples/01_hello.elya     # prints: Hello, Elya!
+cargo run -- check examples/02_arith.elya    # front-end only
 ```
 
 ## Local CI
@@ -2781,7 +2781,7 @@ git commit -m "chore: local CI check script, pre-push hook installer, README"
 - §9 diagnostics discipline + no-`%r/%e/%s` invariant → Task 14.
 - §10.1 minimum crate layout → Task 1; §10.3 pure-pass signatures → all pass tasks; §10.4 lexer/parser/recovery → Tasks 4, 6, 7, 8; §10.5 name resolution → Task 9; §10.7 layering enforcement → Task 15.
 - §11 testing: snapshots → Task 13; UI diagnostics → Task 14; oracle discipline → the tree-walker is the sole evaluator in Slice 1 (oracle cross-check begins Slice 2); layering → Task 15; TCE harness → Task 16; CI → Tasks 1, 17. *(Fuzzing/proptest deferred: not required to make Slice 1 a working deliverable; add in Slice 2 when the surface is larger.)*
-- §12 Slice 1 exit criterion (`lyra run` on examples produces golden output; harnesses green) → Tasks 12–17.
+- §12 Slice 1 exit criterion (`elya run` on examples produces golden output; harnesses green) → Tasks 12–17.
 
 **Gaps intentionally deferred (not Slice 1):** types/inference, CEK machine, ADTs/`case`, generics, traits, effects/handlers, bytecode/native, fuzzing. Each is a named later slice in spec §12–§13.
 

@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn location_maps_offset_to_line_and_col() {
-        let sm = SourceMap::new("t.lyra", "ab\ncd\n");
+        let sm = SourceMap::new("t.elya", "ab\ncd\n");
         assert_eq!(sm.location(0), (1, 1)); // 'a'
         assert_eq!(sm.location(1), (1, 2)); // 'b'
         assert_eq!(sm.location(3), (2, 1)); // 'c'
