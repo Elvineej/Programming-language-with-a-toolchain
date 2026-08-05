@@ -1,0 +1,5 @@
+import lyra/io
+
+pub fn main() / {IO} {
+  io.println("Hello, Lyra!")
+}
