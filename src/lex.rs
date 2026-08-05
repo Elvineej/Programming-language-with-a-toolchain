@@ -173,7 +173,7 @@ pub fn lex(_session: &Session, text: &str) -> (Vec<Token>, Vec<Diagnostic>) {
             Ok(kind) => tokens.push(Token { kind, span }),
             Err(()) => diags.push(
                 Diagnostic::error("E0001", "unexpected character")
-                    .with_label(span, "not a valid Lyra token"),
+                    .with_label(span, "not a valid Elya token"),
             ),
         }
     }

@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn render_mentions_code_and_message() {
-        let sm = SourceMap::new("t.lyra", "foo\n");
+        let sm = SourceMap::new("t.elya", "foo\n");
         let d = Diagnostic::error("E0200", "unresolved name `foo`")
             .with_label(Span::new(0, 3), "not found");
         let out = render(&[d], &sm);

@@ -1,6 +1,6 @@
-# Lyra — Language & Toolchain Design Specification
+# Elya — Language & Toolchain Design Specification
 
-- **Codename:** Lyra
+- **Codename:** Elya
 - **Status:** Design approved (brainstorming complete); ready for implementation planning
 - **Date:** 2026-08-05
 - **Scope of this document:** the full language design (identity, syntax, type system, effect system, semantics) plus the compiler architecture and testing strategy for the **first implementation cycle — Vertical Slices 1–3** (front end + tree-walking/CEK interpreter). The broader roadmap (native codegen, runtime/GC, standard library, toolchain, self-hosting) is recorded here as the north-star arc but each later slice gets its own spec → plan → build cycle.
@@ -9,7 +9,7 @@
 
 ## 0. How to read this document
 
-Lyra is a large, multi-year ambition. To avoid the classic "boil the ocean" failure, this spec **fully specifies the language** but **scopes implementation to Slices 1–3**. Everything downstream is intentionally left as roadmap (§13) so that the first implementation plan is bounded and always keeps a running language.
+Elya is a large, multi-year ambition. To avoid the classic "boil the ocean" failure, this spec **fully specifies the language** but **scopes implementation to Slices 1–3**. Everything downstream is intentionally left as roadmap (§13) so that the first implementation plan is bounded and always keeps a running language.
 
 The single sentence every later ambiguity appeals to is the **manifesto** (§1). When in doubt: prefer purity, prefer inference, prefer expressing a capability as an effect rather than a keyword.
 
@@ -17,9 +17,9 @@ The single sentence every later ambiguity appeals to is the **manifesto** (§1).
 
 ## 1. Manifesto & Identity
 
-> **Lyra is a statically-typed, natively-compiled language where side effects are part of a function's type and are handled by ordinary code.** It has ML's data modeling (algebraic types, exhaustive pattern matching, global inference), Gleam's calm readability, and Rust's ambition for a real toolchain — but its one radical bet is *effects as first-class, inferred, handler-resolved values*. Purity is the default; anything that touches the world announces itself in its type; and `try`/`throw`, `async`/`await`, generators, and dependency injection are not language features but **library handlers** over one uniform mechanism. Lyra refuses ambient authority, refuses exceptions, and refuses to make you write types the compiler can infer.
+> **Elya is a statically-typed, natively-compiled language where side effects are part of a function's type and are handled by ordinary code.** It has ML's data modeling (algebraic types, exhaustive pattern matching, global inference), Gleam's calm readability, and Rust's ambition for a real toolchain — but its one radical bet is *effects as first-class, inferred, handler-resolved values*. Purity is the default; anything that touches the world announces itself in its type; and `try`/`throw`, `async`/`await`, generators, and dependency injection are not language features but **library handlers** over one uniform mechanism. Elya refuses ambient authority, refuses exceptions, and refuses to make you write types the compiler can infer.
 
-**Lyra refuses:**
+**Elya refuses:**
 - **Ambient authority** — a function that performs I/O says so in its type (`/ {IO}`).
 - **Exceptions / stack unwinding** — recoverable errors are `Result(T, E)` values; unrecoverable control flow is an `Exn` *effect*, handled explicitly.
 - **Ambient mutable loops** — no `while`/`for`/`let mut` in the core; iteration is recursion with **guaranteed tail-call elimination**, and mutable state is the `State` effect.
@@ -56,15 +56,15 @@ These are the "on paper" decisions the master roadmap requires before any lexer 
 
 ### 3.2 Canonical snippets
 
-```lyra
-import lyra/io
+```elya
+import elya/io
 
 pub fn main() / {IO} {
-  io.println("Hello, Lyra!")
+  io.println("Hello, Elya!")
 }
 ```
 
-```lyra
+```elya
 pub type Tree(a) {
   Leaf
   Node(left: Tree(a), value: a, right: Tree(a))
@@ -78,7 +78,7 @@ pub fn size(t: Tree(a)) -> Int {
 }
 ```
 
-```lyra
+```elya
 pub trait Show(a) {
   fn show(x: a) -> String
 }
@@ -188,19 +188,19 @@ Lexical notes: `uident` starts uppercase (types, constructors, effects, traits);
 
 ## 5. The Ten Example Programs (syntax spec + first golden tests)
 
-These are simultaneously the syntax specification, the first end-to-end regression tests, and the reality check on the type/effect system. All are in final Lyra syntax.
+These are simultaneously the syntax specification, the first end-to-end regression tests, and the reality check on the type/effect system. All are in final Elya syntax.
 
 **01 — Hello world**
-```lyra
-import lyra/io
+```elya
+import elya/io
 
 pub fn main() / {IO} {
-  io.println("Hello, Lyra!")
+  io.println("Hello, Elya!")
 }
 ```
 
 **02 — Recursion & guaranteed TCE (factorial + tail-recursive fib)**
-```lyra
+```elya
 pub fn factorial(n) {
   case n {
     0 -> 1
@@ -220,7 +220,7 @@ pub fn fib(n) {
 ```
 
 **03 — Record type + functions**
-```lyra
+```elya
 pub type Point { Point(x: Float, y: Float) }
 
 pub fn origin() -> Point { Point(0.0, 0.0) }
@@ -233,7 +233,7 @@ pub fn distance(a: Point, b: Point) -> Float {
 ```
 
 **04 — Enum + exhaustive match**
-```lyra
+```elya
 pub type Shape {
   Circle(radius: Float)
   Rect(width: Float, height: Float)
@@ -248,7 +248,7 @@ pub fn area(s: Shape) -> Float {
 ```
 
 **05 — Generic function + generic data structure**
-```lyra
+```elya
 pub type Stack(a) { Stack(items: List(a)) }
 
 pub fn push(s: Stack(a), x: a) -> Stack(a) {
@@ -264,7 +264,7 @@ pub fn pop(s: Stack(a)) -> Option((a, Stack(a))) {
 ```
 
 **06 — Trait definition + two implementations**
-```lyra
+```elya
 pub trait Show(a) {
   fn show(x: a) -> String
 }
@@ -283,8 +283,8 @@ impl Show(Bool) {
 ```
 
 **07 — Result-based error handling with `?`**
-```lyra
-import lyra/int
+```elya
+import elya/int
 
 pub type ParseError { NotANumber(input: String) }
 
@@ -296,8 +296,8 @@ pub fn add_strings(a: String, b: String) -> Result(Int, ParseError) {
 ```
 
 **08 — Closures / higher-order functions**
-```lyra
-import lyra/list
+```elya
+import elya/list
 
 pub fn sum_of_squares(xs: List(Int)) -> Int {
   xs
@@ -307,12 +307,12 @@ pub fn sum_of_squares(xs: List(Int)) -> Int {
 ```
 
 **09 — A module importing another module**
-```lyra
-// geometry/circle.lyra
+```elya
+// geometry/circle.elya
 pub fn area(r: Float) -> Float { 3.14159 *. r *. r }
 
-// main.lyra
-import lyra/io
+// main.elya
+import elya/io
 import geometry/circle
 
 pub fn main() / {IO} {
@@ -321,12 +321,12 @@ pub fn main() / {IO} {
 ```
 
 **10 — End-to-end word count (stdlib + I/O effect + `?`)**
-```lyra
-import lyra/io
-import lyra/string
-import lyra/list
-import lyra/map
-import lyra/int
+```elya
+import elya/io
+import elya/string
+import elya/list
+import elya/map
+import elya/int
 
 pub fn main() / {IO} -> Result(Unit, io.Error) {
   let text = io.read_file("poem.txt")?
@@ -399,11 +399,11 @@ TCE is a **compiler promise with regression tests**, not an optimization that "u
 
 ---
 
-## 8. The Effect System (Lyra's soul)
+## 8. The Effect System (Elya's soul)
 
 ### 8.1 Declarations, rows, handlers
 
-```lyra
+```elya
 effect Log { fn log(msg: String) -> Unit }
 
 effect State(s) {
@@ -414,7 +414,7 @@ effect State(s) {
 
 A function's type is `(args) / <row> -> ret`. Pure functions have the empty row `<>` and need no annotation. `throw`/`try` is an `Exn` effect whose handler never calls `resume`; `async` is an `Async` effect handled by an event-loop; a generator is a `Yield` effect. **One mechanism, many features.**
 
-```lyra
+```elya
 handle prog() with {
   State.get()  -> resume(0)
   State.put(n) -> resume(Unit)
@@ -444,7 +444,7 @@ The clause runs with `resume` bound to a first-class value `Resume(k_cap, env_at
 **Multi-shot is free because `k_cap` and `env` are persistent immutable data:** invoking `Resume(k_cap)` twice re-enters the *same* captured continuation independently, each producing its own run, because nothing was mutated or popped. One-shot is not a different representation — it is the same `Resume` value called ≤ once (and dropped afterward). No redesign separates them.
 
 **Worked multi-shot example — nondeterminism with state and cleanup across a second resume:**
-```lyra
+```elya
 effect Choice { fn choose(xs: List(a)) -> a }
 
 pub fn all(body) {
@@ -482,7 +482,7 @@ Cleanup timing is a **semantic choice made by frame placement**, not an implemen
 - Cleanup fires **once** iff it lies *below* the handler (`k_rest`).
 
 **Double-free hazard:** a resource acquired **once outside** the handler but released by an `ensure` placed **inside** a `multi` handler runs its release per branch — a double-free:
-```lyra
+```elya
 let conn = db.open()                     // acquired once, outside
 handle
   ensure(fn(){ db.close(conn) }, fn(){   // WRONG: inside the multi handler
@@ -493,7 +493,7 @@ with multi { Choice.choose(xs) -> list.flat_map(xs, resume) ; return(v) -> [v] }
 ```
 
 **Rule:** a resource's release must sit at the same scope *relative to the handler* as its acquisition. Acquired outside ⇒ release outside (wrap the whole `handle`; lands in `k_rest`; fires once). Acquired inside the body ⇒ `ensure` inside (per-branch). Corrected:
-```lyra
+```elya
 let conn = db.open()
 ensure(fn(){ db.close(conn) }, fn(){     // fire-once: wraps the handle, in k_rest
   handle
@@ -518,7 +518,7 @@ Rendering uses `ariadne`/`codespan`-style multi-span output. The governing disci
 ### 9.1 E0420 — unhandled effect
 ```
 error[E0420]: effect `Log` is never handled
-  ┌─ app.lyra:8:3
+  ┌─ app.elya:8:3
 4 │   log("hi " <> name)
   │   ─── `Log` is performed here (inside `greet`)
 8 │   greet("ada")
@@ -531,7 +531,7 @@ error[E0420]: effect `Log` is never handled
 ### 9.2 E0421 — purity violation (closed empty row)
 ```
 error[E0421]: this function must be pure here, but it performs `IO`
-  ┌─ app.lyra:8:28
+  ┌─ app.elya:8:28
 2 │ pub fn shout(s) / {IO} -> String { io.println(s) ... }
   │                   ──── `shout` performs `IO`
 8 │ let loud = list.map(names, shout)
@@ -545,7 +545,7 @@ error[E0421]: this function must be pure here, but it performs `IO`
 **Simple case (declared vs actual):**
 ```
 error[E0423]: effect row mismatch: `sync` performs more than it declares
-  ┌─ app.lyra:6:14
+  ┌─ app.elya:6:14
 5 │ pub fn sync(url) / {Log} -> Unit {
   │                    ───── declared to perform only {Log}
 6 │   let body = fetch(url)
@@ -558,7 +558,7 @@ error[E0423]: effect row mismatch: `sync` performs more than it declares
 **Mid-unification case (shared-label payload conflict, type vars still open).** In a simple-row system two *fully open* rows never fail (they resolve by extension); the tail-variable gibberish in Koka/Links actually comes from **payload-type conflicts on a shared label** or a **closed tail** discovered late. Handled thus:
 ```
 error[E0423]: conflicting uses of effect `State`
-  ┌─ app.lyra:9:6
+  ┌─ app.elya:9:6
 6 │ fn use_int(x) / {State(Int)} ...
   │                  ─────────── requires `State(Int)`
 7 │ fn use_str(x) / {State(String)} ...
@@ -586,13 +586,13 @@ Reported as the offending label + its origin ("effect row would be infinite"), n
 
 ### 10.1 Minimum crate layout (not the maximal one)
 
-**One crate, `lyra` (lib + bin); modules are the pass boundaries.** The pure-function pass discipline (§10.3) is a *signature* rule, not a crate-boundary rule, so it survives collapse into one crate intact. Split into a workspace later only if compile times force it — kept mechanical by the layering test (§10.7, §11.6).
+**One crate, `elya` (lib + bin); modules are the pass boundaries.** The pure-function pass discipline (§10.3) is a *signature* rule, not a crate-boundary rule, so it survives collapse into one crate intact. Split into a workspace later only if compile times force it — kept mechanical by the layering test (§10.7, §11.6).
 
 ```
-lyra/
+elya/
   Cargo.toml                # single crate: lib + bin
   src/
-    main.rs                 # CLI: `lyra run` / `lyra check`
+    main.rs                 # CLI: `elya run` / `elya check`
     lib.rs                  # Session (interners, source map), pipeline wiring
     span.rs   diag.rs       # spans + ariadne diagnostics (foundation)
     lex.rs    ast.rs  parse.rs
@@ -635,7 +635,7 @@ Lower the typed AST to a small typed **Core**: `case` → decision trees; pipeli
 
 ### 10.7 Module-layering enforcement (compiler-internal)
 
-The compiler's own Rust modules are assigned a layer: `span/diag → lex → ast → parse → resolve → types → core → eval → cli`. A test (§11.6) fails CI on any **back-edge** (e.g., `types` referencing `eval`), keeping a future workspace split mechanical. This is distinct from **Lyra program** modules, which **may** be mutually recursive within a package (needed by the cross-module TCE case, §11.4); Lyra **packages** become an enforced DAG when the package-manager slice lands (§13).
+The compiler's own Rust modules are assigned a layer: `span/diag → lex → ast → parse → resolve → types → core → eval → cli`. A test (§11.6) fails CI on any **back-edge** (e.g., `types` referencing `eval`), keeping a future workspace split mechanical. This is distinct from **Elya program** modules, which **may** be mutually recursive within a package (needed by the cross-module TCE case, §11.4); Elya **packages** become an enforced DAG when the package-manager slice lands (§13).
 
 ---
 
@@ -645,7 +645,7 @@ The compiler's own Rust modules are assigned a layer: `span/diag → lex → ast
 Per pass: tokens, pretty-AST, resolved symbols, inferred types + effect rows, Core IR, eval output.
 
 ### 11.2 The ten examples as golden end-to-end tests
-`lyra run examples/NN.lyra` output is snapshotted. They double as the syntax spec.
+`elya run examples/NN.elya` output is snapshotted. They double as the syntax spec.
 
 ### 11.3 Oracle discipline (wired now)
 Eval output is the reference. When the CEK machine lands (Slice 2) it must match the tree-walker on every program (cross-check test). Later VM/native slices must match the CEK machine.
@@ -654,7 +654,7 @@ Eval output is the reference. When the CEK machine lands (Slice 2) it must match
 Each case asserts a **K-depth ceiling** and pairs with a non-tail control asserted to *grow*:
 
 - **Deep self-tail-recursion:** `count_down(10_000_000)` at bounded K-depth.
-- **Mutual recursion across Lyra modules:** `parity/even.is_even` ↔ `parity/odd.is_odd`, `is_even(10_000_000)` bounded — proves tail calls survive symbol/module resolution.
+- **Mutual recursion across Elya modules:** `parity/even.is_even` ↔ `parity/odd.is_odd`, `is_even(10_000_000)` bounded — proves tail calls survive symbol/module resolution.
 - **Tail-through-resume:** a handler whose clause ends in tail `resume`, driving a `State`-threaded countdown 10M steps, bounded.
 - **Tail calls in handlers:** a handler clause body ending in an ordinary tail call is O(1).
 - **Composed case (tight ceiling):** a tail call **into** a handler that **tail-resumes into** a function that **tail-calls back across a module boundary**, 10M steps, asserting `assert_eq!(peak_k_depth, K_MAX)` where `K_MAX` is a single-digit constant pinned at first measurement. A per-iteration off-by-one drives depth toward 10M (fails); a constant off-by-one makes it `K_MAX+1` (fails the equality). This composition is where splice-into-current-slot meets symbol resolution.
@@ -686,7 +686,7 @@ Thin vertical slices; always keep a running language.
 - **Slice 2 — grow the front end + CEK refactor.** Arithmetic, variables, functions, `if`, `case`, real name resolution, first HM type checker. **Refactor the evaluator into the CEK machine.** First TCE assertions come online.
 - **Slice 3 — data, polymorphism, and effects.** Records, enums, pattern matching, generics, traits (dictionary-passing), exhaustiveness. **Algebraic effects & handlers** with row-polymorphic inference, one-shot default + `multi`, `resume`, the §9 effect diagnostics, and the full TCE suite (§11.4) green. All ten examples run.
 
-**Exit criterion for this cycle:** `lyra run examples/*.lyra` produces the golden output for all ten programs; the CEK machine matches the tree-walker oracle; the TCE suite (including the composed tight-ceiling case) is green; the §9 diagnostics have passing UI fixtures; one-shot enforcement negative tests pass; the layering test passes.
+**Exit criterion for this cycle:** `elya run examples/*.elya` produces the golden output for all ten programs; the CEK machine matches the tree-walker oracle; the TCE suite (including the composed tight-ceiling case) is green; the §9 diagnostics have passing UI fixtures; one-shot enforcement negative tests pass; the layering test passes.
 
 ---
 
@@ -694,9 +694,9 @@ Thin vertical slices; always keep a running language.
 
 - **Slice 4 — bytecode VM** (register-based), retarget front end at it; keep CEK as oracle.
 - **Slice 5 — native codegen** via **Cranelift (debug backend)** + **LLVM (release backend)**; mark-sweep → generational **GC**; stack maps/safepoints; FFI (C ABI); `musttail` TCE tests.
-- **Slice 6 — standard library** written in Lyra (dogfooding).
+- **Slice 6 — standard library** written in Elya (dogfooding).
 - **Slice 7 — toolchain:** package manager + build system (enforced **package DAG**), then LSP (salsa-backed incremental front end), formatter, linter, DWARF debug info, test runner, docs generator, REPL, tree-sitter grammar, WASM playground.
-- **Slice 8 — self-hosting:** rewrite the compiler in Lyra; bootstrap to a stage-2 == stage-3 bit-identical fixed point.
+- **Slice 8 — self-hosting:** rewrite the compiler in Elya; bootstrap to a stage-2 == stage-3 bit-identical fixed point.
 
 **Deferred language features (future research branches):** linear/affine types (for static resource safety, §8.6), ownership/borrowing, higher-kinded types, dependent/refinement types, concurrency runtime for the `Async` effect.
 
@@ -704,7 +704,7 @@ Thin vertical slices; always keep a running language.
 
 ### Future major-version direction — AI / HPC compute (roadmap only; does not alter v1)
 
-**Status:** north-star for a future major version. **This does not change Slices 1–3 or the implementation bound**, and it does not touch the manifesto (§1) or the four axes (§2). The manifesto remains Lyra's single soul — effects-first, purity by default, one radical bet. The features below are a direction the *existing* bet can grow toward, not a second identity competing with the first. **If any item here ever conflicts with the manifesto, the manifesto wins and the conflict is flagged, not silently reconciled.**
+**Status:** north-star for a future major version. **This does not change Slices 1–3 or the implementation bound**, and it does not touch the manifesto (§1) or the four axes (§2). The manifesto remains Elya's single soul — effects-first, purity by default, one radical bet. The features below are a direction the *existing* bet can grow toward, not a second identity competing with the first. **If any item here ever conflicts with the manifesto, the manifesto wins and the conflict is flagged, not silently reconciled.**
 
 Candidate feature set (all deferred): an Intelligent Hardware Scheduler; automatic multithreading; SIMD / auto-vectorization; tensors and GPU/NPU execution; Python interop; an HTTP framework; database drivers; async networking.
 
@@ -715,7 +715,7 @@ Candidate feature set (all deferred): an Intelligent Hardware Scheduler; automat
 - It **layers on effects already planned**: device dispatch is asynchronous, so `Compute` sits on the `Async` effect; device buffers are linear resources, so it uses the linear/affine discipline deferred above and the one-shot handler default (§8.3) — a multi-shot handler over device memory would double-free a buffer, exactly the §8.6 hazard, so `Compute` handlers are one-shot.
 - To be viable it must be a **coarse-grained, graph-capturing effect**, not an eager per-scalar one: performing a continuation per numeric op would be ruinous. The `Tensor` handler accumulates a compute graph and dispatches it fused (effects-as-staging), rather than suspending on every element. This is a real design commitment, but an *extension* of the mechanism, not a departure from it.
 
-So the scheduler, device placement, `@prefer`, and tensor/kernel operations are a **natural flagship extension of the effects bet** — the same shape as every other Lyra effect, and they *strengthen* the manifesto rather than compete with it.
+So the scheduler, device placement, `@prefer`, and tensor/kernel operations are a **natural flagship extension of the effects bet** — the same shape as every other Elya effect, and they *strengthen* the manifesto rather than compete with it.
 
 **Fits as libraries *over* effects (no core changes):** async networking, the HTTP framework, and database drivers are ordinary libraries written against the `Async` / `IO` / capability effects. They *use* the mechanism; they add no new core.
 
@@ -756,4 +756,4 @@ So the scheduler, device placement, `@prefer`, and tensor/kernel operations are 
 
 ---
 
-*Codename Lyra. Build thin slices, keep it running, test error messages and TCE as guarantees, and don't start with the borrow checker.*
+*Codename Elya. Build thin slices, keep it running, test error messages and TCE as guarantees, and don't start with the borrow checker.*

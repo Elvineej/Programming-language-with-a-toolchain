@@ -311,8 +311,8 @@ mod tests {
 
     #[test]
     fn hello_world_prints() {
-        let src = "pub fn main() / {IO} {\n  io.println(\"Hello, Lyra!\")\n}\n";
-        assert_eq!(run(src), "Hello, Lyra!\n");
+        let src = "pub fn main() / {IO} {\n  io.println(\"Hello, Elya!\")\n}\n";
+        assert_eq!(run(src), "Hello, Elya!\n");
     }
 
     #[test]

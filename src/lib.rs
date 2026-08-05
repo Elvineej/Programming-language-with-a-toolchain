@@ -1,4 +1,4 @@
-//! The Lyra compiler (Slice 1: tree-walking interpreter).
+//! The Elya compiler (Slice 1: tree-walking interpreter).
 
 pub mod ast;
 pub mod diag;
@@ -63,21 +63,21 @@ mod tests {
     #[test]
     fn run_source_executes_hello_world() {
         let out = run_source(
-            "h.lyra",
-            "pub fn main() / {IO} {\n  io.println(\"Hello, Lyra!\")\n}\n",
+            "h.elya",
+            "pub fn main() / {IO} {\n  io.println(\"Hello, Elya!\")\n}\n",
         )
         .unwrap();
-        assert_eq!(out, "Hello, Lyra!\n");
+        assert_eq!(out, "Hello, Elya!\n");
     }
 
     #[test]
     fn run_source_reports_diagnostics() {
-        let err = run_source("b.lyra", "fn main() { x }\n").unwrap_err();
+        let err = run_source("b.elya", "fn main() { x }\n").unwrap_err();
         assert!(err.contains("E0200"), "err: {err}");
     }
 
     #[test]
     fn check_source_is_ok_for_valid_program() {
-        assert!(check_source("h.lyra", "fn main() { io.println(\"x\") }\n").is_ok());
+        assert!(check_source("h.elya", "fn main() { io.println(\"x\") }\n").is_ok());
     }
 }
