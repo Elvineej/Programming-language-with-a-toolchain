@@ -194,7 +194,10 @@ mod tests {
     #[test]
     fn lexes_keywords_idents_and_ops() {
         use TokenKind::*;
-        assert_eq!(kinds("pub fn main"), vec![KwPub, KwFn, Lower("main".into())]);
+        assert_eq!(
+            kinds("pub fn main"),
+            vec![KwPub, KwFn, Lower("main".into())]
+        );
         assert_eq!(kinds("1 + 2"), vec![Int(1), Plus, Int(2)]);
     }
 

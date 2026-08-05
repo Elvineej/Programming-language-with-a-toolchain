@@ -483,10 +483,7 @@ impl<'a> Parser<'a> {
     fn recover_to_decl(&mut self) {
         // Synchronize: skip tokens until a declaration keyword or EOF.
         while let Some(k) = self.peek() {
-            if matches!(
-                k,
-                TokenKind::KwFn | TokenKind::KwPub | TokenKind::KwImport
-            ) {
+            if matches!(k, TokenKind::KwFn | TokenKind::KwPub | TokenKind::KwImport) {
                 return;
             }
             self.bump();
@@ -522,10 +519,7 @@ fn infix_bp(kind: &TokenKind) -> Option<(u8, u8, BinOp)> {
 }
 
 /// Test/convenience entry: parse a single expression from source text.
-pub fn parse_expr_str(
-    session: &Session,
-    text: &str,
-) -> (Option<Spanned<Expr>>, Vec<Diagnostic>) {
+pub fn parse_expr_str(session: &Session, text: &str) -> (Option<Spanned<Expr>>, Vec<Diagnostic>) {
     let (tokens, mut diags) = lex(session, text);
     let mut p = Parser::new(&tokens);
     let e = p.expr(0);
