@@ -111,7 +111,12 @@ impl Default for Interp {
     }
 }
 
-pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<Value, RuntimeError> {
+pub(crate) fn apply_binop(
+    op: BinOp,
+    l: Value,
+    r: Value,
+    span: Span,
+) -> Result<Value, RuntimeError> {
     use BinOp::*;
     use Value::*;
     match (op, l, r) {
@@ -386,7 +391,15 @@ pub mod cek {
                 Stmt::Let { name, value } => State::Eval(
                     value,
                     env.clone(),
-                    push(Frame::LetCont { name, rest, tail, env }, k),
+                    push(
+                        Frame::LetCont {
+                            name,
+                            rest,
+                            tail,
+                            env,
+                        },
+                        k,
+                    ),
                 ),
                 Stmt::Expr(e) => {
                     State::Eval(e, env.clone(), push(Frame::SeqDrop { rest, tail, env }, k))
@@ -469,9 +482,21 @@ pub mod cek {
             Expr::Binary { op, lhs, rhs } => State::Eval(
                 lhs,
                 env.clone(),
-                push(Frame::BinRight { op: *op, rhs, env, span }, k),
+                push(
+                    Frame::BinRight {
+                        op: *op,
+                        rhs,
+                        env,
+                        span,
+                    },
+                    k,
+                ),
             ),
-            Expr::If { cond, then_block, else_block } => State::Eval(
+            Expr::If {
+                cond,
+                then_block,
+                else_block,
+            } => State::Eval(
                 cond,
                 env.clone(),
                 push(
@@ -553,19 +578,37 @@ pub mod cek {
                 State::Return(apply_binop(op, lval, v, span)?, rest)
             }
             Frame::UnApply { op, span } => State::Return(apply_unop(op, v, span)?, rest),
-            Frame::IfBranch { then_blk, else_blk, env, span } => match v {
+            Frame::IfBranch {
+                then_blk,
+                else_blk,
+                env,
+                span,
+            } => match v {
                 Value::Bool(true) => eval_block_state(then_blk, env, rest),
                 Value::Bool(false) => eval_block_state(else_blk, env, rest),
                 _ => return Err(rt(span, "if condition must be a Bool")),
             },
-            Frame::LetCont { name, rest: stmts, tail, env } => {
+            Frame::LetCont {
+                name,
+                rest: stmts,
+                tail,
+                env,
+            } => {
                 let env2 = env.extend(&[(name.to_string(), v)]);
                 step_block(stmts, tail, env2, rest)
             }
-            Frame::SeqDrop { rest: stmts, tail, env } => step_block(stmts, tail, env, rest),
-            Frame::CallArgs { callee, done, pending, env, span } => {
-                advance_call(interp, fns, v, callee, done, pending, env, span, rest)?
-            }
+            Frame::SeqDrop {
+                rest: stmts,
+                tail,
+                env,
+            } => step_block(stmts, tail, env, rest),
+            Frame::CallArgs {
+                callee,
+                done,
+                pending,
+                env,
+                span,
+            } => advance_call(interp, fns, v, callee, done, pending, env, span, rest)?,
         }))
     }
 
@@ -593,7 +636,16 @@ pub mod cek {
             Some((next, more)) => Ok(State::Eval(
                 next,
                 env.clone(),
-                push(Frame::CallArgs { callee, done, pending: more, env, span }, rest),
+                push(
+                    Frame::CallArgs {
+                        callee,
+                        done,
+                        pending: more,
+                        env,
+                        span,
+                    },
+                    rest,
+                ),
             )),
             // All args evaluated — apply. NO frame is pushed here (the TCE lever).
             None => apply_callee(interp, fns, callee, done, span, rest),

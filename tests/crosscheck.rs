@@ -7,7 +7,10 @@ fn both(src: &str) -> (String, String) {
     let (m, d) = parse_module(&Session::new(), src);
     assert!(d.is_empty(), "parse: {d:?}");
     let cek = elya::eval::run_module(&m).unwrap().output().to_string();
-    let tree = elya::eval::run_module_tree(&m).unwrap().output().to_string();
+    let tree = elya::eval::run_module_tree(&m)
+        .unwrap()
+        .output()
+        .to_string();
     (cek, tree)
 }
 
