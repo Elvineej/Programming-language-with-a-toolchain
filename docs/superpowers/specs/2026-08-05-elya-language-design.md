@@ -726,6 +726,30 @@ So the scheduler, device placement, `@prefer`, and tensor/kernel operations are 
 
 **Summary:** the compute *interface* (scheduler-as-handler, `@prefer`, tensor ops) is a flagship *extension of the effect model* that reinforces the bet; the compute *implementation* (auto-parallelization, GPU/NPU backends, device memory, Python bridge) is separate subsystem work whose cost is acknowledged honestly here. None of it is in scope before the language self-hosts (Slice 8) and the effect system, `Async`, and linear resources are all real.
 
+### Future major-version direction — Direct device integration (IoT / hardware orchestration; roadmap only; does not alter v1)
+
+**Status:** north-star for a future major version, sequenced *after* the AI/HPC compute layer above. **This does not change any current slice or the implementation bound**, and it does not touch the manifesto (§1) or the four axes (§2). **If any item here ever conflicts with the manifesto, the manifesto wins and the conflict is flagged, not silently reconciled** — and one such conflict is called out below rather than absorbed.
+
+Candidate capability set (all deferred): connect to and control external devices — **ESP32, Arduino, Raspberry Pi Pico, USB cameras, microphones, HID, serial, Bluetooth, CAN bus, industrial PLCs** — over **USB / serial / Ethernet / Bluetooth**; **automatic device discovery**; **synchronous device I/O**; **asynchronous device events**; and **multi-device parallel coordination**.
+
+**The decisive question — does this fit the effect mechanism, or fight it? Two explicit points.**
+
+**(1) Strong effect-fit — the whole feature is naturally a `Device` effect interpreted by a runtime, not a bolt-on.** Every part maps onto the mechanism Elya already has:
+- **Opening a device is acquiring a capability** — `Device.open("/dev/ttyUSB0")` performs a capability-granting operation, exactly the "no ambient authority" stance of the manifesto (§1): a program that talks to hardware says so in its type (`/ {Device}`), and the handle it receives *is* the capability.
+- **Device I/O is performing an effect** — reads, writes, and control commands are operations of a `Device` effect (`Device.read`, `Device.write`), tracked in the row and dispatched by a handler.
+- **`when device.event { … }` is a handler over an event effect** — asynchronous device events are an `Event`/`Device` effect whose handler clauses fire per event; this is *exactly* algebraic-effect handling, and it composes with the `Async` effect the roadmap already assumes.
+- **`parallel { … }` is concurrent effect execution** — coordinating several devices at once is running effectful computations concurrently under a scheduling handler, the same shape as the AI/HPC hardware scheduler.
+
+So device placement, discovery, sync/async I/O, and the event surface are a **natural flagship extension of the effects bet** — a `Device` effect (layered on `Async` + capabilities) interpreted by a device runtime, strengthening the manifesto rather than competing with it.
+
+**(2) Honest conflict — the illustrative sketch syntax fights the v1 manifesto and must be re-expressed, not absorbed.** Any informal sketch of this feature that reads like `for d in devices { … }` with mutable assignment such as `temperature = read(sensor)` uses **imperative loops and mutable variables that v1 deliberately cut** (§2/§3.1: no `while`/`for`/`let mut` in the core; iteration is recursion + higher-order functions; mutation is the `State` effect). This is a real conflict, and the manifesto wins: the *capability* is roadmapped, but its **surface syntax must be rewritten in Elya's effects-first idiom** — iteration over discovered devices via `list.for_each` / recursion, immutable bindings, and any mutable device/session state expressed through the `State` effect. The imperative sketch is a mock-up of intent, not a proposal for the surface; the conflict is noted here so it is resolved at design time, not smuggled in.
+
+**Genuinely separate subsystems (honest future cost — beneath the effect surface):**
+- **The driver / protocol matrix** — each device class (ESP32, Arduino, Pico, USB video/audio, HID, serial, Bluetooth, CAN, PLC) is a *separate integration* with its own transport, framing, and protocol. This is large, open-ended engineering the `Device` handlers dispatch *into*; the effect surface is clean, the backend matrix is not, and its cost is counted as a subsystem.
+- **Multi-device parallel coordination** — a device-level cousin of the AI/HPC **hardware scheduler**: discovery, capability negotiation, and concurrent orchestration across heterogeneous devices. Real scheduler/runtime work, **sequenced after the core language and the compute layer**.
+
+**Summary:** the device *interface* (capability-open, `Device` I/O operations, event handlers, `parallel` as concurrent effects) is a flagship *extension of the effect model*; the device *implementation* (the per-class driver/protocol matrix and multi-device coordination runtime) is separate subsystem work whose cost is acknowledged honestly. Its illustrative syntax must be recast into the effects-first, immutable, recursion-based idiom before it enters the surface. None of it precedes self-hosting (Slice 8), a real `Async` effect, and the compute layer.
+
 ---
 
 ## 14. Risks & Mitigations
