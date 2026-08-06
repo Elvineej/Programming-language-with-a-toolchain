@@ -1,0 +1,5 @@
+pub fn main() {
+  let _ = 1 + "a"
+  io.println("x")
+}
+//~ ERROR[E0400] type mismatch
