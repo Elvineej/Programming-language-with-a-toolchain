@@ -1356,22 +1356,33 @@ git commit -m "test(types): E0400-E0403 UI fixtures (no-%t invariant) + inferred
 
 ---
 
-## Task 7: `eval.rs` — persistent `Rc`-scope environment + closures (refactor, behavior-preserving)
+## Task 7: `eval.rs` — persistent `Env`, `Value::Fn(String)`, shared `fns` map (refactor)
 
 **Files:**
 - Modify: `src/eval.rs`
-- Test: existing `src/eval.rs` tests must stay green
+- Test: the existing `src/eval.rs` tests migrate to the new shape and stay green
+
+**Design (fully resolved — no open decision):** function values are `Value::Fn(String)` — the *name* of a top-level function. Slice 2 has no lambdas, so a function value captures no environment; the environment holds **locals only** (params + `let`s), and a call resolves the callee name to its `&FnDecl` through a **`fns` map** (`HashMap<&str, &FnDecl>`) borrowed from the module. This keeps `Value`/`Env` **lifetime-free** (shared by both evaluators) with no `Rc`-cycle and no per-call clone, while the CEK machine (Task 8) threads the same `fns` map to reach borrowed function bodies.
 
 **Interfaces:**
-- Produces:
-  - `pub struct Env(Option<Rc<Scope>>)` with `Env::new()`, `extend(&self, &[(String, Value)]) -> Env`, `get(&self, &str) -> Option<Value>`.
-  - `Value::Closure(Rc<FnDecl>, Env)` replaces `Value::Func(Rc<FnDecl>)`.
-  - The Slice-1 tree-walker is moved under `pub mod tree` with `pub fn run_module(&Module) -> Result<Interp, RuntimeError>` reading/writing through the new `Env`. `Interp`, `Value`, `RuntimeError`, `apply_binop`, `apply_unop` become shared items at the module top.
+- Produces (lifetime-free, shared):
+  - `pub enum Value { Int(i64), Float(f64), Str(String), Bool(bool), Unit, Fn(String) }`
+  - `pub struct Env(Option<Rc<Scope>>)` with `new()`, `extend(&self, &[(String, Value)]) -> Env`, `get(&self, &str) -> Option<Value>`.
+  - `pub type Fns<'a> = HashMap<&'a str, &'a FnDecl>;` and `pub fn fn_table(&Module) -> Fns`.
+  - `pub(crate) fn apply_binop(BinOp, Value, Value, Span) -> Result<Value, RuntimeError>`, `pub(crate) fn apply_unop(UnOp, Value, Span) -> Result<Value, RuntimeError>`, `pub struct RuntimeError`, `fn rt(Span, impl Into<String>)`.
+  - `pub struct Interp` with `new()`, `output() -> &str`, `peak_kont_depth() -> usize`, private `println(&mut, &str)` and `note_kont_depth(&mut, usize)`.
+  - `pub mod tree` with `pub fn run_module(&Module) -> Result<Interp, RuntimeError>` and `pub(crate) fn eval_expr(&mut Interp, &Spanned<Expr>, &Env, &Fns) -> Result<Value, RuntimeError>` (used by the migrated unit tests).
 
-- [ ] **Step 1: Introduce the persistent `Env` and adjust `Value` (compile-first)**
+- [ ] **Step 1: Replace the module top with the shared value/env/interp layer**
 
-Replace the current `Env` definition and `Value::Func` with:
+Replace everything in `src/eval.rs` *above* the tree-walker (the `Value`, `RuntimeError`, `rt`, `Env`, `Interp`, `eval_binop`, and `run_module` items) with:
 ```rust
+//! Slice-2 evaluators: a shared value/env layer, the tree-walker oracle (`tree`),
+//! and the CEK machine (`cek`, added in Task 8).
+
+use crate::ast::*;
+use crate::diag::Diagnostic;
+use crate::span::{Span, Spanned};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -1382,7 +1393,19 @@ pub enum Value {
     Str(String),
     Bool(bool),
     Unit,
-    Closure(Rc<FnDecl>, Env),
+    /// A top-level function, referenced by name (Slice 2 has no lambdas).
+    Fn(String),
+}
+
+#[derive(Debug)]
+pub struct RuntimeError {
+    pub diag: Diagnostic,
+}
+
+fn rt(span: Span, msg: impl Into<String>) -> RuntimeError {
+    RuntimeError {
+        diag: Diagnostic::error("E0300", msg).with_label(span, "during evaluation"),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1391,6 +1414,7 @@ struct Scope {
     parent: Option<Rc<Scope>>,
 }
 
+/// Persistent parent-pointer environment holding local bindings only.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Env(Option<Rc<Scope>>);
 
@@ -1399,7 +1423,6 @@ impl Env {
         Env(None)
     }
 
-    /// Return a new environment with one added scope holding `bindings`.
     pub fn extend(&self, bindings: &[(String, Value)]) -> Env {
         let mut vars = HashMap::with_capacity(bindings.len());
         for (k, v) in bindings {
@@ -1422,15 +1445,79 @@ impl Env {
         None
     }
 }
-```
 
-- [ ] **Step 2: Move the tree-walker into `mod tree` and adapt it to `Env`**
+pub type Fns<'a> = HashMap<&'a str, &'a FnDecl>;
 
-Wrap the existing `Interp` walker methods in `pub mod tree { ... }`, replacing every `env.child()`+`define` sequence with a single `env.extend(&[...])`, and every closure creation with `Value::Closure(fn, defining_env)`. The shared items (`Value`, `Env`, `RuntimeError`, `rt`, `apply_binop`, `apply_unop`) stay at the module top; only the walker moves into `tree`. Public entry: `eval::tree::run_module`. Rename the current binop function to `apply_binop` and add `apply_unop`:
-```rust
-pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<Value, RuntimeError> {
-    /* body identical to Slice 1's eval_binop */
+pub fn fn_table(module: &Module) -> Fns {
+    let mut m = HashMap::new();
+    for d in &module.decls {
+        let Decl::Fn(f) = &d.node;
+        m.insert(f.name.as_str(), f);
+    }
+    m
 }
+
+pub struct Interp {
+    output: String,
+    peak_kont: usize,
+}
+
+impl Interp {
+    pub fn new() -> Interp {
+        Interp {
+            output: String::new(),
+            peak_kont: 0,
+        }
+    }
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+    pub fn peak_kont_depth(&self) -> usize {
+        self.peak_kont
+    }
+    fn println(&mut self, s: &str) {
+        self.output.push_str(s);
+        self.output.push('\n');
+    }
+    fn note_kont_depth(&mut self, d: usize) {
+        self.peak_kont = self.peak_kont.max(d);
+    }
+}
+
+impl Default for Interp {
+    fn default() -> Self {
+        Interp::new()
+    }
+}
+
+pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<Value, RuntimeError> {
+    use BinOp::*;
+    use Value::*;
+    match (op, l, r) {
+        (Add, Int(a), Int(b)) => Ok(Int(a + b)),
+        (Sub, Int(a), Int(b)) => Ok(Int(a - b)),
+        (Mul, Int(a), Int(b)) => Ok(Int(a * b)),
+        (Div, Int(_), Int(0)) => Err(rt(span, "division by zero")),
+        (Div, Int(a), Int(b)) => Ok(Int(a / b)),
+        (Rem, Int(_), Int(0)) => Err(rt(span, "remainder by zero")),
+        (Rem, Int(a), Int(b)) => Ok(Int(a % b)),
+        (AddF, Float(a), Float(b)) => Ok(Float(a + b)),
+        (SubF, Float(a), Float(b)) => Ok(Float(a - b)),
+        (MulF, Float(a), Float(b)) => Ok(Float(a * b)),
+        (DivF, Float(a), Float(b)) => Ok(Float(a / b)),
+        (Concat, Str(a), Str(b)) => Ok(Str(a + &b)),
+        (Eq, a, b) => Ok(Bool(a == b)),
+        (Ne, a, b) => Ok(Bool(a != b)),
+        (Lt, Int(a), Int(b)) => Ok(Bool(a < b)),
+        (Le, Int(a), Int(b)) => Ok(Bool(a <= b)),
+        (Gt, Int(a), Int(b)) => Ok(Bool(a > b)),
+        (Ge, Int(a), Int(b)) => Ok(Bool(a >= b)),
+        (And, Bool(a), Bool(b)) => Ok(Bool(a && b)),
+        (Or, Bool(a), Bool(b)) => Ok(Bool(a || b)),
+        _ => Err(rt(span, "type error in binary operator")),
+    }
+}
+
 pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, RuntimeError> {
     match (op, v) {
         (UnOp::Neg, Value::Int(n)) => Ok(Value::Int(-n)),
@@ -1439,56 +1526,240 @@ pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Runtim
         _ => Err(rt(span, "type error in unary operator")),
     }
 }
-```
-In the tree-walker, application becomes:
-```rust
-// closure call:
-let mut bindings = Vec::with_capacity(func.params.len());
-for (p, a) in func.params.iter().zip(args) {
-    let v = self.eval_expr(&a.node, a.span, env)?;
-    bindings.push((p.node.name.clone(), v));
-}
-let call_env = closure_env.extend(&bindings);
-self.eval_block(&func.body.node, &call_env)
-```
-where `closure_env` comes from the matched `Value::Closure(func, closure_env)`. Top-level functions are installed as `Value::Closure(Rc::new(f.clone()), globals_env.clone())`.
 
-- [ ] **Step 3: Point the existing tests at `tree::run_module`**
-
-The `src/eval.rs` test helper `run` becomes `eval::tree::run_module`. Keep `eval::run_module` temporarily aliased to `tree::run_module` (so `lib.rs` still compiles) — Task 8 repoints it to the CEK machine:
-```rust
 pub fn run_module(module: &Module) -> Result<Interp, RuntimeError> {
-    tree::run_module(module)
+    tree::run_module(module) // Task 8 repoints this to cek::run_module
 }
+
 pub fn run_module_tree(module: &Module) -> Result<Interp, RuntimeError> {
     tree::run_module(module)
+}
+```
+
+- [ ] **Step 2: Write the `tree` submodule (recursive oracle, threads `env` + `fns`)**
+
+Add to `src/eval.rs`:
+```rust
+pub mod tree {
+    use super::*;
+
+    pub fn run_module(module: &Module) -> Result<Interp, RuntimeError> {
+        let fns = fn_table(module);
+        let mut interp = Interp::new();
+        let Some(main) = fns.get("main").copied() else {
+            return Err(rt(Span::EMPTY, "no `main` function found"));
+        };
+        eval_block(&mut interp, &main.body.node, &Env::new(), &fns)?;
+        Ok(interp)
+    }
+
+    fn eval_block(
+        interp: &mut Interp,
+        b: &Block,
+        env: &Env,
+        fns: &Fns,
+    ) -> Result<Value, RuntimeError> {
+        let mut local = env.clone();
+        for st in &b.stmts {
+            match &st.node {
+                Stmt::Let { name, value } => {
+                    let v = eval_expr(interp, value, &local, fns)?;
+                    local = local.extend(&[(name.clone(), v)]);
+                }
+                Stmt::Expr(e) => {
+                    eval_expr(interp, e, &local, fns)?;
+                }
+            }
+        }
+        match &b.tail {
+            Some(t) => eval_expr(interp, t, &local, fns),
+            None => Ok(Value::Unit),
+        }
+    }
+
+    pub(crate) fn eval_expr(
+        interp: &mut Interp,
+        e: &Spanned<Expr>,
+        env: &Env,
+        fns: &Fns,
+    ) -> Result<Value, RuntimeError> {
+        let span = e.span;
+        match &e.node {
+            Expr::Int(n) => Ok(Value::Int(*n)),
+            Expr::Float(x) => Ok(Value::Float(*x)),
+            Expr::Str(s) => Ok(Value::Str(s.clone())),
+            Expr::Bool(b) => Ok(Value::Bool(*b)),
+            Expr::Unit => Ok(Value::Unit),
+            Expr::Var(name) => {
+                if let Some(v) = env.get(name) {
+                    Ok(v)
+                } else if fns.contains_key(name.as_str()) {
+                    Ok(Value::Fn(name.clone()))
+                } else {
+                    Err(rt(span, format!("unbound variable `{name}`")))
+                }
+            }
+            Expr::Qualified { module, name } => {
+                Err(rt(span, format!("`{module}.{name}` must be called")))
+            }
+            Expr::Unary { op, expr } => {
+                let v = eval_expr(interp, expr, env, fns)?;
+                apply_unop(*op, v, span)
+            }
+            Expr::Binary { op, lhs, rhs } => {
+                let l = eval_expr(interp, lhs, env, fns)?;
+                let r = eval_expr(interp, rhs, env, fns)?;
+                apply_binop(*op, l, r, span)
+            }
+            Expr::If { cond, then_block, else_block } => {
+                match eval_expr(interp, cond, env, fns)? {
+                    Value::Bool(true) => eval_block(interp, &then_block.node, env, fns),
+                    Value::Bool(false) => eval_block(interp, &else_block.node, env, fns),
+                    _ => Err(rt(cond.span, "if condition must be a Bool")),
+                }
+            }
+            Expr::Block(b) => eval_block(interp, b, env, fns),
+            Expr::Call { callee, args } => {
+                if let Expr::Qualified { module, name } = &callee.node {
+                    if module == "io" && name == "println" {
+                        let mut vals = Vec::new();
+                        for a in args {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        let [Value::Str(s)] = &vals[..] else {
+                            return Err(rt(span, "io.println expects a single String"));
+                        };
+                        interp.println(s);
+                        return Ok(Value::Unit);
+                    }
+                    return Err(rt(span, format!("unknown builtin `{module}.{name}`")));
+                }
+                let callee_v = eval_expr(interp, callee, env, fns)?;
+                let Value::Fn(fname) = callee_v else {
+                    return Err(rt(callee.span, "value is not callable"));
+                };
+                let fdecl = fns
+                    .get(fname.as_str())
+                    .copied()
+                    .ok_or_else(|| rt(span, format!("unknown function `{fname}`")))?;
+                if fdecl.params.len() != args.len() {
+                    return Err(rt(
+                        span,
+                        format!(
+                            "`{}` expects {} argument(s), got {}",
+                            fname,
+                            fdecl.params.len(),
+                            args.len()
+                        ),
+                    ));
+                }
+                let mut bindings = Vec::with_capacity(fdecl.params.len());
+                for (p, a) in fdecl.params.iter().zip(args) {
+                    bindings.push((p.node.name.clone(), eval_expr(interp, a, env, fns)?));
+                }
+                let call_env = Env::new().extend(&bindings);
+                eval_block(interp, &fdecl.body.node, &call_env, fns)
+            }
+        }
+    }
+}
+```
+
+- [ ] **Step 3: Migrate the existing `eval.rs` unit tests**
+
+Replace the Slice-1 `#[cfg(test)] mod tests` in `src/eval.rs` so the single-expression helper uses `tree::eval_expr` with an empty env and empty `fns`, and the module helper uses `run_module`:
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::{parse_expr_str, parse_module};
+    use crate::Session;
+
+    fn eval_str(text: &str) -> Value {
+        let (e, d) = parse_expr_str(&Session::new(), text);
+        assert!(d.is_empty(), "parse diags: {d:?}");
+        let e = e.unwrap();
+        let mut interp = Interp::new();
+        let fns = Fns::new();
+        tree::eval_expr(&mut interp, &e, &Env::new(), &fns).unwrap()
+    }
+
+    fn run(src: &str) -> String {
+        let (m, d) = parse_module(&Session::new(), src);
+        assert!(d.is_empty(), "parse diags: {d:?}");
+        run_module(&m).unwrap().output().to_string()
+    }
+
+    #[test]
+    fn arithmetic() {
+        assert_eq!(eval_str("1 + 2 * 3"), Value::Int(7));
+        assert_eq!(eval_str("(1 + 2) * 3"), Value::Int(9));
+        assert_eq!(eval_str("10 - 3 - 2"), Value::Int(5));
+    }
+
+    #[test]
+    fn float_and_concat() {
+        assert_eq!(eval_str("1.5 +. 2.0"), Value::Float(3.5));
+        assert_eq!(eval_str(r#""a" <> "b""#), Value::Str("ab".into()));
+    }
+
+    #[test]
+    fn comparison_and_if() {
+        assert_eq!(eval_str("if 1 < 2 { 10 } else { 20 }"), Value::Int(10));
+        assert_eq!(eval_str("if 2 < 1 { 10 } else { 20 }"), Value::Int(20));
+    }
+
+    #[test]
+    fn division_by_zero_is_runtime_error() {
+        let (e, _) = parse_expr_str(&Session::new(), "1 / 0");
+        let e = e.unwrap();
+        let mut interp = Interp::new();
+        let err = tree::eval_expr(&mut interp, &e, &Env::new(), &Fns::new()).unwrap_err();
+        assert_eq!(err.diag.code, "E0300");
+    }
+
+    #[test]
+    fn hello_world_prints() {
+        assert_eq!(
+            run("pub fn main() { io.println(\"Hello, Elya!\") }\n"),
+            "Hello, Elya!\n"
+        );
+    }
+
+    #[test]
+    fn user_functions_and_calls() {
+        let src = "fn double(x) { x + x }\nfn add(a, b) { a + b }\n\
+                   pub fn main() { let _ = add(double(20), 2)\n io.println(\"ok\") }\n";
+        assert_eq!(run(src), "ok\n");
+    }
 }
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib eval` then `cargo test --all`
-Expected: PASS — all Slice-1 eval tests and example/tce/ui tests still green (behavior preserved; only `Env` representation changed).
+Expected: PASS — the migrated eval unit tests plus example/tce/ui/crosscheck suites (behavior preserved; `Value::Func`→`Value::Fn(String)` and the persistent `Env` are the only representational changes).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/eval.rs
-git commit -m "refactor(eval): persistent Rc-scope Env + closures; tree-walker retained as eval::tree"
+git commit -m "refactor(eval): persistent Env + Value::Fn(String) + shared fns map; tree-walker as eval::tree"
 ```
 
 ---
 
-## Task 8: `eval.rs` — the CEK machine
+## Task 8: `eval.rs` — the CEK machine (cross-check is a gate on this task)
 
 **Files:**
 - Modify: `src/eval.rs`
-- Test: inline tests in the new `cek` submodule
+- Create: `tests/crosscheck.rs`
+- Test: inline `cek_tests` + `tests/crosscheck.rs`
 
 **Interfaces:**
-- Produces: `pub mod cek` with `pub fn run_module(&Module) -> Result<Interp, RuntimeError>` and internal `State`/`Frame`/`Kont`/`step`. `eval::run_module` repointed to `cek::run_module`. `Interp` gains `pub fn peak_kont_depth(&self) -> usize` (populated by the CEK machine; the tree-walker leaves it 0).
+- Produces: `pub mod cek` with `pub fn run_module(&Module) -> Result<Interp, RuntimeError>` and internal `CalleeSlot`/`Frame<'a>`/`Kont<'a>`/`State<'a>`/`step`, threading `fns: &'a Fns<'a>` through every machine function. `eval::run_module` repointed to `cek::run_module`.
 
-> **Implementer note (lifetimes):** the CEK machine holds **borrowed** AST references (`&'a`) into the `Module` for the duration of `run_module`; `Kont` is a persistent `Rc`-cons list of frames. This is efficient and gives the persistence Slice 3 needs *structurally*. Capturing a continuation *into a heap `Value`* (Slice 3 `resume`) will additionally require the referenced AST to be `'static`; Slice 3 achieves that by sharing the AST via `Rc` — a mechanical change, not a machine rewrite. Not needed in Slice 2.
+> **Lifetimes (fully resolved — nothing to decide at build time):** `Value`/`Env` are lifetime-free (Task 7). Only `State<'a>`/`Frame<'a>`/`Kont<'a>` carry `'a`, holding `&'a` sub-expressions borrowed from the `Module`. The `fns: &'a Fns<'a>` map (borrowed decls) is threaded through every machine function and is used **both** to resolve a `Var` that names a top-level function (yielding `Value::Fn(name)`) **and** to reach a callee's borrowed `&'a Block` body at apply time (`fns.get(name).copied()`). Function values carry only the name, so there is no captured-env cycle and no per-call clone. All the `&'m` (module-lifetime) borrows shrink covariantly to the machine's `'a = run_module`-body scope, so uniform `<'a>` signatures compile; if a lifetime error nonetheless appears, split the map-reference lifetime from the AST lifetime (`fns: &Fns<'a>`) — the bodies still come out `&'a`. Capturing a continuation into a heap `Value` (Slice-3 `resume`) will additionally require the referenced AST to be `'static`, achieved in Slice 3 by sharing the AST via `Rc` — a mechanical change, not a machine rewrite.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1529,18 +1800,24 @@ mod cek_tests {
 Run: `cargo test --lib cek_tests`
 Expected: FAIL — `cek::run_module` not found.
 
-- [ ] **Step 3: Write the CEK machine**
+- [ ] **Step 3: Write the CEK machine (complete — transcribe as-is)**
 
 Add to `src/eval.rs`:
 ```rust
 pub mod cek {
-    use super::{apply_binop, apply_unop, rt, Interp, RuntimeError, Value};
+    use super::{apply_binop, apply_unop, fn_table, rt, Env, Fns, Interp, RuntimeError, Value};
     use crate::ast::*;
     use crate::span::{Span, Spanned};
     use std::rc::Rc;
 
-    type Env = super::Env;
+    #[derive(Clone)]
+    enum CalleeSlot {
+        Pending,               // still evaluating the callee expression
+        Builtin(&'static str), // e.g. "io.println"
+        Value(Value),          // an evaluated callee (a Value::Fn)
+    }
 
+    #[derive(Clone)]
     enum Frame<'a> {
         BinRight { op: BinOp, rhs: &'a Spanned<Expr>, env: Env, span: Span },
         BinApply { op: BinOp, lval: Value, span: Span },
@@ -1548,13 +1825,7 @@ pub mod cek {
         IfBranch { then_blk: &'a Block, else_blk: &'a Block, env: Env, span: Span },
         LetCont { name: &'a str, rest: &'a [Spanned<Stmt>], tail: Option<&'a Spanned<Expr>>, env: Env },
         SeqDrop { rest: &'a [Spanned<Stmt>], tail: Option<&'a Spanned<Expr>>, env: Env },
-        CallArgs {
-            callee: Option<Value>,
-            done: Vec<Value>,
-            pending: &'a [Spanned<Expr>],
-            env: Env,
-            span: Span,
-        },
+        CallArgs { callee: CalleeSlot, done: Vec<Value>, pending: &'a [Spanned<Expr>], env: Env, span: Span },
     }
 
     type Kont<'a> = Option<Rc<(Frame<'a>, Kont<'a>)>>;
@@ -1569,43 +1840,19 @@ pub mod cek {
     }
 
     pub fn run_module(module: &Module) -> Result<Interp, RuntimeError> {
+        let fns = fn_table(module);
         let mut interp = Interp::new();
-        // Install top-level functions as closures over the globals env.
-        let mut bindings = Vec::new();
-        for d in &module.decls {
-            let Decl::Fn(f) = &d.node;
-            bindings.push((f.name.clone(), Value::Closure(Rc::new(f.clone()), Env::new())));
-        }
-        let globals = Env::new().extend(&bindings);
-        // Re-close each function over `globals` so recursion resolves.
-        let globals = reclose(&globals, module);
-
-        let main = module.decls.iter().find_map(|d| {
-            let Decl::Fn(f) = &d.node;
-            (f.name == "main").then(|| f.clone())
-        });
-        let Some(main) = main else {
+        let Some(main) = fns.get("main").copied() else {
             return Err(rt(Span::EMPTY, "no `main` function found"));
         };
-        let body = &main.body.node;
-        let start = eval_block(body, &globals, None);
-        run_loop(&mut interp, start)?;
+        let start = eval_block_state(&main.body.node, Env::new(), None);
+        run_loop(&mut interp, &fns, start)?;
         Ok(interp)
     }
 
-    // Rebind each top-level closure so its captured env is the fully-populated globals.
-    fn reclose(globals: &Env, module: &Module) -> Env {
-        let mut bindings = Vec::new();
-        for d in &module.decls {
-            let Decl::Fn(f) = &d.node;
-            bindings.push((f.name.clone(), Value::Closure(Rc::new(f.clone()), globals.clone())));
-        }
-        globals.extend(&bindings)
-    }
-
     // A block's tail is in tail position: evaluating it does not add a frame.
-    fn eval_block<'a>(b: &'a Block, env: &Env, k: Kont<'a>) -> State<'a> {
-        step_block(&b.stmts, b.tail.as_deref(), env.clone(), k)
+    fn eval_block_state<'a>(b: &'a Block, env: Env, k: Kont<'a>) -> State<'a> {
+        step_block(&b.stmts, b.tail.as_deref(), env, k)
     }
 
     fn step_block<'a>(
@@ -1620,11 +1867,9 @@ pub mod cek {
                 None => State::Return(Value::Unit, k),
             },
             Some((st, rest)) => match &st.node {
-                Stmt::Let { name, value } => State::Eval(
-                    value,
-                    env.clone(),
-                    push(Frame::LetCont { name, rest, tail, env }, k),
-                ),
+                Stmt::Let { name, value } => {
+                    State::Eval(value, env.clone(), push(Frame::LetCont { name, rest, tail, env }, k))
+                }
                 Stmt::Expr(e) => {
                     State::Eval(e, env.clone(), push(Frame::SeqDrop { rest, tail, env }, k))
                 }
@@ -1632,13 +1877,13 @@ pub mod cek {
         }
     }
 
-    fn run_loop(interp: &mut Interp, mut st: State) -> Result<(), RuntimeError> {
+    fn run_loop<'a>(interp: &mut Interp, fns: &'a Fns<'a>, mut st: State<'a>) -> Result<(), RuntimeError> {
         loop {
-            interp.note_kont(&kont_of(&st));
-            st = match step(interp, st)? {
-                Some(next) => next,
+            interp.note_kont_depth(kont_len(kont_of(&st)));
+            match step(interp, fns, st)? {
+                Some(next) => st = next,
                 None => return Ok(()),
-            };
+            }
         }
     }
 
@@ -1659,14 +1904,14 @@ pub mod cek {
         }
     }
 
-    fn step<'a>(interp: &mut Interp, st: State<'a>) -> Result<Option<State<'a>>, RuntimeError> {
-        Ok(match st {
-            State::Eval(e, env, k) => Some(eval(e, env, k)?),
-            State::Return(v, k) => ret(interp, v, k)?,
-        })
+    fn step<'a>(interp: &mut Interp, fns: &'a Fns<'a>, st: State<'a>) -> Result<Option<State<'a>>, RuntimeError> {
+        match st {
+            State::Eval(e, env, k) => Ok(Some(eval(fns, e, env, k)?)),
+            State::Return(v, k) => ret(interp, fns, v, k),
+        }
     }
 
-    fn eval<'a>(e: &'a Spanned<Expr>, env: Env, k: Kont<'a>) -> Result<State<'a>, RuntimeError> {
+    fn eval<'a>(fns: &'a Fns<'a>, e: &'a Spanned<Expr>, env: Env, k: Kont<'a>) -> Result<State<'a>, RuntimeError> {
         let span = e.span;
         Ok(match &e.node {
             Expr::Int(n) => State::Return(Value::Int(*n), k),
@@ -1675,62 +1920,74 @@ pub mod cek {
             Expr::Bool(b) => State::Return(Value::Bool(*b), k),
             Expr::Unit => State::Return(Value::Unit, k),
             Expr::Var(name) => {
-                let v = env.get(name).ok_or_else(|| rt(span, format!("unbound variable `{name}`")))?;
+                let v = if let Some(v) = env.get(name) {
+                    v
+                } else if fns.contains_key(name.as_str()) {
+                    Value::Fn(name.clone())
+                } else {
+                    return Err(rt(span, format!("unbound variable `{name}`")));
+                };
                 State::Return(v, k)
             }
             Expr::Qualified { module, name } => {
                 return Err(rt(span, format!("`{module}.{name}` must be called")))
             }
-            Expr::Unary { op, expr } => {
-                State::Eval(expr, env, push(Frame::UnApply { op: *op, span }, k))
+            Expr::Unary { op, expr } => State::Eval(expr, env, push(Frame::UnApply { op: *op, span }, k)),
+            Expr::Binary { op, lhs, rhs } => {
+                State::Eval(lhs, env.clone(), push(Frame::BinRight { op: *op, rhs, env, span }, k))
             }
-            Expr::Binary { op, lhs, rhs } => State::Eval(
-                lhs,
-                env.clone(),
-                push(Frame::BinRight { op: *op, rhs, env, span }, k),
-            ),
             Expr::If { cond, then_block, else_block } => State::Eval(
                 cond,
                 env.clone(),
-                push(
-                    Frame::IfBranch { then_blk: &then_block.node, else_blk: &else_block.node, env, span },
-                    k,
-                ),
+                push(Frame::IfBranch { then_blk: &then_block.node, else_blk: &else_block.node, env, span }, k),
             ),
             Expr::Block(b) => step_block(&b.stmts, b.tail.as_deref(), env, k),
-            Expr::Call { callee, args } => State::Eval(
-                callee,
-                env.clone(),
-                push(
-                    Frame::CallArgs { callee: None, done: Vec::new(), pending: args, env, span },
-                    k,
-                ),
-            ),
+            Expr::Call { callee, args } => {
+                let slot = match &callee.node {
+                    Expr::Qualified { module, name } if module == "io" && name == "println" => {
+                        CalleeSlot::Builtin("io.println")
+                    }
+                    Expr::Qualified { module, name } => {
+                        return Err(rt(span, format!("unknown builtin `{module}.{name}`")))
+                    }
+                    _ => CalleeSlot::Pending,
+                };
+                match slot {
+                    CalleeSlot::Pending => State::Eval(
+                        callee,
+                        env.clone(),
+                        push(Frame::CallArgs { callee: CalleeSlot::Pending, done: Vec::new(), pending: args, env, span }, k),
+                    ),
+                    builtin => match args.split_first() {
+                        Some((first, rest)) => State::Eval(
+                            first,
+                            env.clone(),
+                            push(Frame::CallArgs { callee: builtin, done: Vec::new(), pending: rest, env, span }, k),
+                        ),
+                        None => return Err(rt(span, "builtin called with no arguments")),
+                    },
+                }
+            }
         })
     }
 
-    fn ret<'a>(
-        interp: &mut Interp,
-        v: Value,
-        k: Kont<'a>,
-    ) -> Result<Option<State<'a>>, RuntimeError> {
+    fn ret<'a>(interp: &mut Interp, fns: &'a Fns<'a>, v: Value, k: Kont<'a>) -> Result<Option<State<'a>>, RuntimeError> {
         let Some(node) = k else {
-            interp.set_result(v);
-            return Ok(None);
+            return Ok(None); // final result; output already captured via io.println
         };
-        let (frame, rest) = Rc::try_unwrap(node)
-            .unwrap_or_else(|rc| (*rc).clone_frame_pair());
+        let (frame, rest) = match Rc::try_unwrap(node) {
+            Ok(pair) => pair,
+            Err(shared) => (shared.0.clone(), shared.1.clone()),
+        };
         Ok(Some(match frame {
             Frame::BinRight { op, rhs, env, span } => {
                 State::Eval(rhs, env, push(Frame::BinApply { op, lval: v, span }, rest))
             }
-            Frame::BinApply { op, lval, span } => {
-                State::Return(apply_binop(op, lval, v, span)?, rest)
-            }
+            Frame::BinApply { op, lval, span } => State::Return(apply_binop(op, lval, v, span)?, rest),
             Frame::UnApply { op, span } => State::Return(apply_unop(op, v, span)?, rest),
             Frame::IfBranch { then_blk, else_blk, env, span } => match v {
-                Value::Bool(true) => eval_block_ref(then_blk, env, rest),
-                Value::Bool(false) => eval_block_ref(else_blk, env, rest),
+                Value::Bool(true) => eval_block_state(then_blk, env, rest),
+                Value::Bool(false) => eval_block_state(else_blk, env, rest),
                 _ => return Err(rt(span, "if condition must be a Bool")),
             },
             Frame::LetCont { name, rest: stmts, tail, env } => {
@@ -1739,135 +1996,101 @@ pub mod cek {
             }
             Frame::SeqDrop { rest: stmts, tail, env } => step_block(stmts, tail, env, rest),
             Frame::CallArgs { callee, done, pending, env, span } => {
-                advance_call(interp, v, callee, done, pending, env, span, rest)?
+                advance_call(interp, fns, v, callee, done, pending, env, span, rest)?
             }
         }))
-    }
-
-    fn eval_block_ref<'a>(b: &'a Block, env: Env, k: Kont<'a>) -> State<'a> {
-        step_block(&b.stmts, b.tail.as_deref(), env, k)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn advance_call<'a>(
         interp: &mut Interp,
+        fns: &'a Fns<'a>,
         v: Value,
-        callee: Option<Value>,
+        callee: CalleeSlot,
         mut done: Vec<Value>,
         pending: &'a [Spanned<Expr>],
         env: Env,
         span: Span,
         rest: Kont<'a>,
     ) -> Result<State<'a>, RuntimeError> {
-        // `v` is the just-evaluated callee (if callee is None) or an argument.
-        let callee_val = match callee {
-            None => v, // v was the callee
-            Some(c) => {
+        // `v` is the callee value (if the slot was Pending) or the latest argument.
+        let callee = match callee {
+            CalleeSlot::Pending => CalleeSlot::Value(v),
+            other => {
                 done.push(v);
-                c
+                other
             }
         };
-        if let Some((next, more)) = pending.split_first() {
-            return Ok(State::Eval(
+        match pending.split_first() {
+            Some((next, more)) => Ok(State::Eval(
                 next,
                 env.clone(),
-                push(
-                    Frame::CallArgs { callee: Some(callee_val), done, pending: more, env, span },
-                    rest,
-                ),
-            ));
+                push(Frame::CallArgs { callee, done, pending: more, env, span }, rest),
+            )),
+            // All args evaluated — apply. NO frame is pushed here (the TCE lever).
+            None => apply_callee(interp, fns, callee, done, span, rest),
         }
-        // All args evaluated — apply. NO frame is pushed here (the TCE lever).
-        apply(interp, callee_val, done, span, rest)
     }
 
-    fn apply<'a>(
+    fn apply_callee<'a>(
         interp: &mut Interp,
-        callee: Value,
+        fns: &'a Fns<'a>,
+        callee: CalleeSlot,
         args: Vec<Value>,
         span: Span,
         k: Kont<'a>,
     ) -> Result<State<'a>, RuntimeError> {
         match callee {
-            Value::Closure(func, cenv) => {
-                if func.params.len() != args.len() {
+            CalleeSlot::Builtin("io.println") => {
+                let [Value::Str(s)] = &args[..] else {
+                    return Err(rt(span, "io.println expects a single String"));
+                };
+                interp.println(s);
+                Ok(State::Return(Value::Unit, k))
+            }
+            CalleeSlot::Builtin(other) => Err(rt(span, format!("unknown builtin `{other}`"))),
+            CalleeSlot::Value(Value::Fn(name)) => {
+                let fdecl = fns
+                    .get(name.as_str())
+                    .copied()
+                    .ok_or_else(|| rt(span, format!("unknown function `{name}`")))?;
+                if fdecl.params.len() != args.len() {
                     return Err(rt(
                         span,
-                        format!("`{}` expects {} argument(s), got {}", func.name, func.params.len(), args.len()),
+                        format!("`{}` expects {} argument(s), got {}", name, fdecl.params.len(), args.len()),
                     ));
                 }
-                let bindings: Vec<(String, Value)> = func
+                let bindings: Vec<(String, Value)> = fdecl
                     .params
                     .iter()
                     .map(|p| p.node.name.clone())
                     .zip(args)
                     .collect();
-                let call_env = cenv.extend(&bindings);
-                // SAFETY of lifetimes: `func` is Rc<FnDecl> owned here; but the
-                // machine borrows `&'a` AST. To evaluate the *borrowed* body we
-                // need the module's FnDecl, not this clone. See note below.
-                let _ = call_env;
-                Err(rt(span, "internal: closure application over borrowed AST — see Task 8 note"))
+                let call_env = Env::new().extend(&bindings);
+                Ok(eval_block_state(&fdecl.body.node, call_env, k)) // reuses `k` — no frame pushed
             }
-            _ => Err(rt(span, "value is not callable")),
+            CalleeSlot::Value(_) => Err(rt(span, "value is not callable")),
+            CalleeSlot::Pending => Err(rt(span, "internal: unresolved callee")),
         }
     }
 }
 ```
 
-> **Resolve the borrow/ownership tension before finishing Step 3.** The `apply` stub above surfaces the one real design decision in this task: frames hold `&'a` borrows into the `Module`, but closures were stored as `Value::Closure(Rc<FnDecl>, Env)` (owned). To evaluate a closure body as a **borrowed** `&'a Block`, the machine must reach the *borrowed* `FnDecl` in the module, not an owned clone. **Fix:** index the module's functions by name once at startup into `HashMap<String, &'a FnDecl>`, store closures as `Value::Closure(Rc<String /*fn name*/>, Env)` **or** carry the function index, and in `apply` look up the borrowed `&'a FnDecl` by name/index to get `&'a Block`. Implement that lookup (a `fns: &'a HashMap<String, &'a FnDecl>` threaded through `run_loop`/`step`/`ret`/`apply`, or a `Vec<&'a FnDecl>` with closures holding the index). Then `apply` ends with `Ok(eval_block_ref(&fdecl.body.node, call_env, k))` — **no frame pushed**. Complete this so the two Step-1 tests pass; the crosscheck in Task 9 and the TCE test in Task 10 depend on it.
-
-Also add to the shared `Interp` (module top) the methods the machine calls:
-```rust
-impl Interp {
-    fn note_kont(&mut self, k: &usize_placeholder) { /* replaced below */ }
-}
-```
-Concretely, add a `peak_kont: usize` field to `Interp`, a setter for the final result value (unused for output but keeps the loop uniform), and:
-```rust
-    pub fn peak_kont_depth(&self) -> usize { self.peak_kont }
-    fn note_kont_depth(&mut self, depth: usize) { self.peak_kont = self.peak_kont.max(depth); }
-    fn set_result(&mut self, _v: Value) { /* output already captured via io.println */ }
-```
-and change `run_loop` to call `interp.note_kont_depth(kont_len(kont_of(&st)))`. (`io.println` output is written when the builtin is applied — implement the builtin branch inside `apply` for a `Value::Closure` whose name is a builtin, or special-case `Expr::Qualified` callees in `eval` for `io.println` exactly as the type checker does. Simplest: in `advance_call`, when the *callee expression* was `io.println`, route to the builtin; carry a small `Callee` enum `{ Builtin(&'static str), Value(Value) }` instead of `Option<Value>` so builtins don't need a `Value` representation.)
-
-> This task is the single largest in the plan. The Step-1 tests (`hello_world_on_cek`, `arithmetic_functions_if_on_cek`) are the acceptance gate: implement the borrowed-AST closure application and the `io.println` builtin routing until both pass.
-
 - [ ] **Step 4: Repoint `eval::run_module` to the CEK machine**
 
+In the module top (from Task 7), change `run_module` to delegate to the machine (keep `run_module_tree` on the tree-walker):
 ```rust
 pub fn run_module(module: &Module) -> Result<Interp, RuntimeError> {
     cek::run_module(module)
 }
 ```
-(keep `run_module_tree` → `tree::run_module`).
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [ ] **Step 5: Write the cross-check gate (`tests/crosscheck.rs`)**
 
-Run: `cargo test --lib cek_tests` then `cargo test --all`
-Expected: PASS — the two CEK tests plus every existing test (examples now run via the CEK machine).
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/eval.rs
-git commit -m "feat(eval): CEK abstract machine (persistent Rc-frame Kont, no-push application)"
-```
-
----
-
-## Task 9: cross-check — CEK output equals tree-walker output
-
-**Files:**
-- Create: `tests/crosscheck.rs`
-
-**Interfaces:**
-- Consumes: `elya::eval::{run_module, run_module_tree}`, `elya::parse::parse_module`.
-
-- [ ] **Step 1: Write the test**
-
-`tests/crosscheck.rs`:
+The differential check against the known-good tree-walker is the gate on this task. Create `tests/crosscheck.rs`:
 ```rust
+//! CEK output must equal the tree-walker oracle on every example program.
+
 use elya::parse::parse_module;
 use elya::Session;
 
@@ -1879,25 +2102,68 @@ fn both(src: &str) -> (String, String) {
     (cek, tree)
 }
 
-fn corpus() -> Vec<String> {
+#[test]
+fn cek_matches_tree_on_examples() {
     let dir = format!("{}/examples", env!("CARGO_MANIFEST_DIR"));
-    let mut out = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
         let p = entry.unwrap().path();
         if p.extension().and_then(|e| e.to_str()) == Some("elya") {
-            out.push(std::fs::read_to_string(p).unwrap());
+            let src = std::fs::read_to_string(&p).unwrap();
+            let (cek, tree) = both(&src);
+            assert_eq!(cek, tree, "CEK vs tree divergence on {p:?}");
         }
     }
-    out.push("fn f(x){ x + 1 }\npub fn main(){ let a = f(f(1))\n io.println(\"ok\") }\n".into());
-    out.push("pub fn main(){ if 1 < 2 { io.println(\"a\") } else { io.println(\"b\") } }\n".into());
-    out
+}
+```
+
+- [ ] **Step 6: Run all — the acceptance tests AND the cross-check gate must pass**
+
+Run: `cargo test --lib cek_tests`, then `cargo test --test crosscheck`, then `cargo test --all`.
+Expected: PASS — the two CEK acceptance tests, the example-corpus cross-check (CEK output identical to the tree-walker), and every existing test (examples now run via the CEK machine). If cross-check diverges, the CEK machine is wrong — fix it against the oracle before proceeding.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/eval.rs tests/crosscheck.rs
+git commit -m "feat(eval): CEK machine (threaded fns, persistent Rc-frame Kont, no-push apply) + example cross-check gate"
+```
+
+---
+
+## Task 9: broaden the cross-check corpus
+
+**Files:**
+- Modify: `tests/crosscheck.rs`
+
+**Interfaces:**
+- Consumes: the `both` helper created in Task 8.
+
+Task 8 already gates the CEK machine on the example corpus. This task widens the differential net with hand-written programs that stress nested calls, mutual recursion, nested `if`, and argument-evaluation order — where a from-scratch machine is most likely to diverge from the oracle.
+
+- [ ] **Step 1: Add a broader corpus test**
+
+Append to `tests/crosscheck.rs`:
+```rust
+fn hand_written() -> Vec<&'static str> {
+    vec![
+        "fn f(x){ x + 1 }\npub fn main(){ let a = f(f(1))\n io.println(\"ok\") }\n",
+        "pub fn main(){ if 1 < 2 { io.println(\"a\") } else { io.println(\"b\") } }\n",
+        "fn ev(n){ if n == 0 { True } else { od(n - 1) } }\n\
+         fn od(n){ if n == 0 { False } else { ev(n - 1) } }\n\
+         pub fn main(){ if ev(10) { io.println(\"even\") } else { io.println(\"odd\") } }\n",
+        "fn add(a, b){ a + b }\nfn twice(n){ add(n, n) }\n\
+         pub fn main(){ if twice(21) == 42 { io.println(\"yes\") } else { io.println(\"no\") } }\n",
+        "pub fn main(){ let s = \"a\" <> \"b\" <> \"c\"\n io.println(s) }\n",
+        "fn pick(c, x, y){ if c { x } else { y } }\n\
+         pub fn main(){ io.println(pick(1 < 2, \"L\", \"R\")) }\n",
+    ]
 }
 
 #[test]
-fn cek_matches_tree_walker() {
-    for src in corpus() {
-        let (cek, tree) = both(&src);
-        assert_eq!(cek, tree, "divergence on:\n{src}");
+fn cek_matches_tree_on_hand_written_corpus() {
+    for src in hand_written() {
+        let (cek, tree) = both(src);
+        assert_eq!(cek, tree, "CEK vs tree divergence on:\n{src}");
     }
 }
 ```
@@ -1905,13 +2171,13 @@ fn cek_matches_tree_walker() {
 - [ ] **Step 2: Run test to verify it passes**
 
 Run: `cargo test --test crosscheck`
-Expected: PASS.
+Expected: PASS (the example-corpus gate from Task 8 plus this broader corpus).
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add tests/crosscheck.rs
-git commit -m "test(eval): CEK output cross-checked against the tree-walker oracle"
+git commit -m "test(eval): broaden CEK/tree cross-check corpus (nested calls, mutual recursion, arg order)"
 ```
 
 ---
@@ -2065,19 +2331,19 @@ git commit -m "feat: pipeline is parse->resolve->infer->cek; type errors are com
 - §2.3, §2.6 inference rules + operator/builtin monotypes → Task 3.
 - §2.4 instantiation/let-generalization → Tasks 3, 5.
 - §2.5 SCC recursive groups + polymorphism → Task 5.
-- §3.2 persistent `Env`/`Kont` → Tasks 7 (Env, required for TCE) and 8 (Kont).
-- §3.3–3.6 frame set, step function, no-push application, builtins → Task 8.
-- §3.7 oracle cross-check → Tasks 7 (retain tree) and 9 (cross-check).
+- §3.2 persistent `Env` (Slice-2 TCE requirement) → Task 7; persistent `Rc`-frame `Kont` (Slice-3 forward-investment) → Task 8.
+- §3.3–3.6 frame set, step function, no-push application, builtins → Task 8 (fully worked; `fns` map threaded, no open decision).
+- §3.7 oracle cross-check → Task 7 (retain tree) + Task 8 (example-corpus cross-check is the **gate** on the machine) + Task 9 (broadened corpus).
 - §4 TCE bounded-depth assertions (self + mutual + existence + grow) → Task 10.
 - §5 pipeline change, compile-time type errors, layer map → Tasks 4, 11.
-- §6 testing (inference units, UI fixtures, snapshots, crosscheck, TCE, regression, gate) → Tasks 3–6, 9, 10, 11.
+- §6 testing (inference units, UI fixtures, snapshots, crosscheck, TCE, regression, gate) → Tasks 3–6, 8, 9, 10, 11.
 - §2.7 `case` deferred → not built (surface frozen); nothing to do.
 
-**Deferrals honored (spec §9):** effect rows unparsed-into-types (Task 3 ignores the row), no ADTs/traits/lambdas/annotations/Core IR, polymorphic recursion unsupported (Task 5 monomorphic-within-SCC), multi-file/cross-module TCE not attempted (Task 10 is intra-file). The borrowed-AST-vs-capture nuance is flagged in Task 8 as a mechanical Slice-3 step.
+**Deferrals honored (spec §9):** effect rows unparsed-into-types (Task 3 ignores the row), no ADTs/traits/lambdas/annotations/Core IR, polymorphic recursion unsupported (Task 5 monomorphic-within-SCC), multi-file/cross-module TCE not attempted (Task 10 is intra-file). The one genuine forward-looking nuance — capturing a continuation into a heap `Value` needs a `'static` AST — is flagged in Task 8 as a mechanical Slice-3 step (`Rc`-share the AST); it does not affect Slice 2.
 
-**2. Placeholder scan:** No `TODO`/`TBD`. Two deliberate, labeled forward-references: Task 3's placeholder `generalize` (replaced in Task 5, signature stable) and Task 8's `apply` stub whose resolution is spelled out in the same step. Task 10's `K_MAX` is a measured-then-pinned constant with an explicit "don't raise it to hide a bug" instruction.
+**2. Placeholder scan:** No `TODO`/`TBD`, and **no open design decision at build time** — Task 8 is fully worked (the earlier `apply` stub is gone; the machine threads a `fns` map and resolves callee bodies by name). The one deliberate, labeled forward-reference is Task 3's placeholder `generalize` (replaced in Task 5, signature stable). Task 10's `K_MAX` is a measured-then-pinned constant with an explicit "don't raise it to hide a bug" instruction.
 
-**3. Type/name consistency:** `Ty`, `TyCon`, `Scheme`, `Infer` (`fresh`/`resolve`/`unify`/`instantiate`/`generalize`), `TyEnv`, `display_ty`/`display_scheme`, `infer`/`infer_schemes` are used identically across Tasks 1–6. `Value::Closure`, `Env` (`new`/`extend`/`get`), `apply_binop`/`apply_unop`, `eval::{run_module, run_module_tree}`, `Interp::{output, peak_kont_depth}` are consistent across Tasks 7–11. Diagnostic codes E0400–E0403 match the spec and Global Constraints.
+**3. Type/name consistency:** `Ty`, `TyCon`, `Scheme`, `Infer` (`fresh`/`resolve`/`unify`/`instantiate`/`generalize`), `TyEnv`, `display_ty`/`display_scheme`, `infer`/`infer_schemes` are used identically across Tasks 1–6. `Value::Fn(String)`, `Env` (`new`/`extend`/`get`), `Fns`/`fn_table`, `apply_binop`/`apply_unop`, `eval::{run_module, run_module_tree}`, `Interp::{output, peak_kont_depth, println, note_kont_depth}` are consistent across Tasks 7–11 (the CEK machine threads `fns: &'a Fns<'a>` uniformly). Diagnostic codes E0400–E0403 match the spec and Global Constraints.
 
 ---
 
