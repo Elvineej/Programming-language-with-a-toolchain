@@ -43,6 +43,9 @@ pub fn check_source(name: &str, text: &str) -> Result<(), String> {
     let sm = SourceMap::new(name, text);
     let (module, mut diags) = parse::parse_module(&session, text);
     diags.extend(resolve::check(&session, &module));
+    if diags.is_empty() {
+        diags.extend(types::infer(&session, &module));
+    }
     match fail_if_errors(&diags, &sm) {
         Some(rendered) => Err(rendered),
         None => Ok(()),

@@ -415,6 +415,67 @@ fn subst_vars(t: &Ty, m: &HashMap<u32, Ty>) -> Ty {
     }
 }
 
+pub fn infer(session: &Session, module: &Module) -> Vec<Diagnostic> {
+    let (_schemes, diags) = infer_schemes(session, module);
+    diags
+}
+
+/// Type every top-level function. Slice-4 note: this is currently a single
+/// monomorphic group; Task 5 replaces it with SCC-ordered generalization.
+pub fn infer_schemes(
+    _session: &Session,
+    module: &Module,
+) -> (Vec<(String, String)>, Vec<Diagnostic>) {
+    let mut inf = Infer::new();
+    let mut env = TyEnv::new();
+
+    let mut fn_tys: Vec<(String, Vec<Ty>, Ty)> = Vec::new();
+    for d in &module.decls {
+        let Decl::Fn(f) = &d.node;
+        let params: Vec<Ty> = f.params.iter().map(|_| inf.fresh()).collect();
+        let result = inf.fresh();
+        env.insert(
+            &f.name,
+            Scheme {
+                vars: Vec::new(),
+                ty: Ty::Fn(params.clone(), Box::new(result.clone())),
+            },
+        );
+        fn_tys.push((f.name.clone(), params, result));
+    }
+
+    for (d, (_, params, result)) in module.decls.iter().zip(&fn_tys) {
+        let Decl::Fn(f) = &d.node;
+        env.push();
+        for (p, pty) in f.params.iter().zip(params) {
+            env.insert(
+                &p.node.name,
+                Scheme {
+                    vars: Vec::new(),
+                    ty: pty.clone(),
+                },
+            );
+        }
+        let body_ty = inf.infer_block(&f.body.node, &mut env);
+        inf.unify(&body_ty, result, f.body.span);
+        env.pop();
+    }
+
+    let schemes = fn_tys
+        .iter()
+        .map(|(name, params, result)| {
+            let fnty = Ty::Fn(params.clone(), Box::new(result.clone()));
+            let s = Scheme {
+                vars: Vec::new(),
+                ty: inf.resolve(&fnty),
+            };
+            (name.clone(), display_scheme(&inf, &s))
+        })
+        .collect();
+
+    (schemes, inf.diags)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +515,14 @@ mod tests {
         );
         let (_t, n) = infer_expr_str("if 1 { 10 } else { 20 }");
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn module_infer_types_a_function() {
+        let (m, d) = crate::parse::parse_module(&Session::new(), "fn f(x) { x + 1 }\n");
+        assert!(d.is_empty());
+        let diags = infer(&Session::new(), &m);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
