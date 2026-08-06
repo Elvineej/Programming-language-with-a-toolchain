@@ -147,7 +147,9 @@ fn run_it(g) { g() }        // inferred:  fn(fn() / e -> a) / e -> a   — polym
 
 ### 3.6 "No subtyping" preserved
 
-A function that "does less" is handled by **row-variable instantiation**, not sub-effecting: a caller expecting `fn() / {IO} -> a` accepts `run_it` by instantiating `run_it`'s `e := {IO}`. There is no rule "`{}` ≤ `{IO}`". Sub-effecting was rejected (design spec §8.2) precisely because it is subtyping; row polymorphism gives composition without it. Consequence, stated honestly (§11): an **annotated** function must perform *exactly* its declared row — declaring an unused effect is `E0423`, not silently widened.
+A function that "does less" is handled by **row-variable instantiation**, not sub-effecting: a caller expecting `fn() / {IO} -> a` accepts `run_it` by instantiating `run_it`'s `e := {IO}`. There is no rule "`{}` ≤ `{IO}`". Sub-effecting was rejected (design spec §8.2) precisely because it is subtyping; row polymorphism gives composition without it. Consequence, stated honestly (§11): an **annotated** function must perform *exactly* its declared row — declaring an unused effect is `E0423`, not silently widened. In practice this bites mostly on explicit *public* signatures (unannotated functions have their rows inferred).
+
+**`E0423` severity is revisitable (strict-by-default, not welded shut).** The error-vs-warning severity for the declared-more-than-performed case is a deliberate strict default. If real use shows exact-match is too strict, relaxing it to *warn, don't error* is **additive and stays subtyping-free** — tolerating an over-declared annotated row is not sub-effecting (it introduces no `{} ≤ {IO}` rule and no coercion; it merely accepts a row the programmer wrote but did not use). Chosen strict now; revisit on evidence.
 
 ### 3.7 Honest deferrals in the type system
 
@@ -317,7 +319,13 @@ Using a tail-resumptive `State` handler that threads the counter through `resume
 
 - **Row-inference unit tests:** `run_it : fn(fn() / e -> a) / e -> a` (row-poly); `greet : fn(String) / {Log} -> Unit`; effect-row snapshots (`insta`) of inferred schemes including rows.
 - **Effect-error UI fixtures** (`//~ ERROR[E0420|E0421|E0423|E0424|E0425]`): unhandled effect, purity violation, declared-vs-actual mismatch, cyclic row, double-resume — each asserting named labels and **no `%r`/`%row`** token.
-- **Handler semantics golden tests:** exception (`-1`), state loop, multi-shot flip (`"hello/bye"`) — expected outputs (the tree-walker cannot oracle these; §4.6).
+- **Handler-semantics golden corpus — the *only* backstop, so coverage is deliberate, not happy-path.** §4.6 removed the tree-walker oracle for effect programs, which *raises the bar*: golden outputs are the sole safety net, so the corpus is designed to exercise **every distinct handler behavior**, each an output-verified program, not just demos:
+  - **(a) non-resuming / `Exn`-style** — a clause that never calls `resume` (captured continuation dropped);
+  - **(b) one-shot resume** — resume exactly once (the common case);
+  - **(c) multi-shot re-invocation** — `resume` called **more than once**, results combined (over `String`);
+  - **(d) nested handlers** — two handlers in scope; the inner discharges its effect, the outer catches the residual; correct **innermost-matching**;
+  - **(e) tail-resumptive** — `resume` in tail position (the §6 loop).
+  Happy-path examples alone are explicitly insufficient; each row (a)–(e) is a required corpus entry.
 - **Cross-check narrowed** to effect-free programs (`cek == tree`), still green.
 - **TCE-through-effects** regressions (§6): bounded tail-resumptive state loop + tail-in-handler, pinned `K_MAX_EFF`, plus a grow control.
 - **One-shot enforcement negative tests:** static `E0425` fixture + a runtime double-resume test.
@@ -327,14 +335,14 @@ Using a tail-resumptive `State` handler that threads the counter through `resume
 
 ## 9. Build Order (sub-slices — likely a plan per sub-slice)
 
-1. **3a — AST `Rc`-share + effect syntax** (parse `effect`, rows, `handle`/`with`/`multi`, `resume`; resolver). Pure plumbing; existing tests stay green; no semantics yet.
+1. **3a — AST `Box`→`Rc` + effect syntax** (parse `effect`, rows, `handle`/`with`/`multi`, `resume`; resolver). Pure plumbing, **behavior-preserving**. **Explicit gate: the entire existing test suite stays green after 3a — before any effect *semantics* land.** The `Box`→`Rc` change is deref-only downstream; the new syntax is parsed + resolved but not yet type-checked or evaluated. This is the isolated, low-risk change to already-shipped code, landed first behind the full suite.
 2. **3b — effect-row types + inference + discharge** (row union-find, `unify_row`, ambient threading, `E0420`–`E0424`, row-poly `run_it`, snapshots). No machine changes; `check_source` type-checks effects.
 3. **3c — handlers & one-shot `resume` on the CEK machine** (`HandleK`, perform/capture, deep-handler `resume`, exception + state golden tests; one-shot `E0425`).
-4. **3d — multi-shot** (`with multi`, the flip demo; `E0426` cleanup lint).
+4. **3d — multi-shot** (`with multi`; `E0426` cleanup lint). **Gate: a working, output-verified multi-shot program** — `resume` re-invoked and results combined (over `String`), producing the expected output. This is the actual cash-out of the "multi-shot needs no design change" claim from the effect-design review (design spec §8.4) — *demonstrated running*, not merely "the representation supports it."
 5. **3e — TCE through effects** (tail-resume splice rule; §6 bounded assertions; grow control).
 
 ### Exit criterion
-All handler golden tests pass; row-poly inference + `E042x` fixtures green; tail-resumptive state loop bounded at a pinned constant; effect-free cross-check still green; full gate green.
+The §8 handler-semantics golden corpus — non-resuming, one-shot, **multi-shot re-invocation (output-verified)**, nested handlers, tail-resumptive — all pass; row-poly inference + `E042x` fixtures green; tail-resumptive state loop bounded at a pinned constant; effect-free cross-check still green; full gate green and pushed to `origin/main`.
 
 ---
 
