@@ -1,7 +1,8 @@
 //! Hindley–Milner type inference (Algorithm J).
 
+use crate::ast::{BinOp, Block, Expr, Stmt, UnOp};
 use crate::diag::Diagnostic;
-use crate::span::Span;
+use crate::span::{Span, Spanned};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,10 +231,229 @@ fn write_ty(t: &Ty, names: &mut HashMap<u32, String>, out: &mut String) {
     }
 }
 
+#[derive(Default)]
+pub struct TyEnv {
+    scopes: Vec<HashMap<String, Scheme>>,
+}
+
+impl TyEnv {
+    pub fn new() -> TyEnv {
+        TyEnv {
+            scopes: vec![HashMap::new()],
+        }
+    }
+    fn push(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+    fn pop(&mut self) {
+        self.scopes.pop();
+    }
+    pub fn insert(&mut self, name: &str, s: Scheme) {
+        self.scopes.last_mut().unwrap().insert(name.to_string(), s);
+    }
+    pub fn lookup(&self, name: &str) -> Option<&Scheme> {
+        self.scopes.iter().rev().find_map(|s| s.get(name))
+    }
+}
+
+fn binop_type(op: BinOp) -> (Ty, Ty, Ty) {
+    use BinOp::*;
+    match op {
+        Add | Sub | Mul | Div | Rem => (Ty::int(), Ty::int(), Ty::int()),
+        AddF | SubF | MulF | DivF => (Ty::float(), Ty::float(), Ty::float()),
+        Lt | Le | Gt | Ge => (Ty::int(), Ty::int(), Ty::bool()),
+        Concat => (Ty::str(), Ty::str(), Ty::str()),
+        And | Or => (Ty::bool(), Ty::bool(), Ty::bool()),
+        // Eq/Ne handled specially in infer_expr (both operands share a fresh var).
+        Eq | Ne => (Ty::Error, Ty::Error, Ty::bool()),
+    }
+}
+
+impl Infer {
+    pub fn instantiate(&mut self, s: &Scheme) -> Ty {
+        if s.vars.is_empty() {
+            return s.ty.clone();
+        }
+        let mapping: HashMap<u32, Ty> = s.vars.iter().map(|v| (*v, self.fresh())).collect();
+        subst_vars(&s.ty, &mapping)
+    }
+
+    pub fn infer_block(&mut self, b: &Block, env: &mut TyEnv) -> Ty {
+        env.push();
+        for st in &b.stmts {
+            match &st.node {
+                Stmt::Let { name, value } => {
+                    let t = self.infer_expr(value, env);
+                    let scheme = self.generalize(&t, env);
+                    env.insert(name, scheme);
+                }
+                Stmt::Expr(e) => {
+                    self.infer_expr(e, env);
+                }
+            }
+        }
+        let result = match &b.tail {
+            Some(tail) => self.infer_expr(tail, env),
+            None => Ty::unit(),
+        };
+        env.pop();
+        result
+    }
+
+    pub fn infer_expr(&mut self, e: &Spanned<Expr>, env: &mut TyEnv) -> Ty {
+        let span = e.span;
+        match &e.node {
+            Expr::Int(_) => Ty::int(),
+            Expr::Float(_) => Ty::float(),
+            Expr::Str(_) => Ty::str(),
+            Expr::Bool(_) => Ty::bool(),
+            Expr::Unit => Ty::unit(),
+            Expr::Var(name) => match env.lookup(name) {
+                Some(s) => {
+                    let s = s.clone();
+                    self.instantiate(&s)
+                }
+                None => Ty::Error, // unresolved names are E0200 from resolution
+            },
+            Expr::Qualified { .. } => Ty::Error, // typed at the Call site (builtins)
+            Expr::Unary { op, expr } => {
+                let t = self.infer_expr(expr, env);
+                let (operand, result) = match op {
+                    UnOp::Neg => (Ty::int(), Ty::int()),
+                    UnOp::Not => (Ty::bool(), Ty::bool()),
+                };
+                self.unify(&t, &operand, span);
+                result
+            }
+            Expr::Binary { op, lhs, rhs } => {
+                let lt = self.infer_expr(lhs, env);
+                let rt = self.infer_expr(rhs, env);
+                if matches!(op, BinOp::Eq | BinOp::Ne) {
+                    self.unify(&lt, &rt, span);
+                    Ty::bool()
+                } else {
+                    let (l, r, res) = binop_type(*op);
+                    self.unify(&lt, &l, span);
+                    self.unify(&rt, &r, span);
+                    res
+                }
+            }
+            Expr::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let ct = self.infer_expr(cond, env);
+                self.unify_cond(&ct, cond.span);
+                let tt = self.infer_block(&then_block.node, env);
+                let et = self.infer_block(&else_block.node, env);
+                self.unify(&tt, &et, span);
+                tt
+            }
+            Expr::Block(b) => self.infer_block(b, env),
+            Expr::Call { callee, args } => self.infer_call(callee, args, span, env),
+        }
+    }
+
+    fn unify_cond(&mut self, t: &Ty, span: Span) {
+        let r = self.resolve(t);
+        if r != Ty::bool() && r != Ty::Error && !matches!(r, Ty::Var(_)) {
+            self.diags.push(
+                Diagnostic::error("E0403", "condition must be `Bool`")
+                    .with_label(span, format!("this is `{}`", display_ty(self, &r))),
+            );
+        } else {
+            self.unify(t, &Ty::bool(), span);
+        }
+    }
+
+    fn infer_call(
+        &mut self,
+        callee: &Spanned<Expr>,
+        args: &[Spanned<Expr>],
+        span: Span,
+        env: &mut TyEnv,
+    ) -> Ty {
+        if let Expr::Qualified { module, name } = &callee.node {
+            if module == "io" && name == "println" {
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env)).collect();
+                let want = Ty::Fn(vec![Ty::str()], Box::new(Ty::unit()));
+                let got = Ty::Fn(arg_ts, Box::new(Ty::unit()));
+                self.unify(&want, &got, span);
+                return Ty::unit();
+            }
+            return Ty::Error; // unknown builtin is E0201 from resolution
+        }
+        let f = self.infer_expr(callee, env);
+        let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env)).collect();
+        let result = self.fresh();
+        let expected = Ty::Fn(arg_ts, Box::new(result.clone()));
+        self.unify(&f, &expected, span);
+        result
+    }
+
+    /// Placeholder generalization; the real one lands in Task 5.
+    fn generalize(&mut self, t: &Ty, _env: &TyEnv) -> Scheme {
+        Scheme {
+            vars: Vec::new(),
+            ty: self.resolve(t),
+        }
+    }
+}
+
+fn subst_vars(t: &Ty, m: &HashMap<u32, Ty>) -> Ty {
+    match t {
+        Ty::Var(v) => m.get(v).cloned().unwrap_or(Ty::Var(*v)),
+        Ty::Base(c) => Ty::Base(*c),
+        Ty::Fn(ps, r) => Ty::Fn(
+            ps.iter().map(|p| subst_vars(p, m)).collect(),
+            Box::new(subst_vars(r, m)),
+        ),
+        Ty::Tuple(xs) => Ty::Tuple(xs.iter().map(|x| subst_vars(x, m)).collect()),
+        Ty::Error => Ty::Error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::parse_expr_str;
     use crate::span::Span;
+    use crate::Session;
+
+    fn infer_expr_str(src: &str) -> (String, usize) {
+        let (e, d) = parse_expr_str(&Session::new(), src);
+        assert!(d.is_empty(), "parse: {d:?}");
+        let e = e.unwrap();
+        let mut inf = Infer::new();
+        let mut env = TyEnv::new();
+        let t = inf.infer_expr(&e, &mut env);
+        (display_ty(&inf, &t), inf.diags.len())
+    }
+
+    #[test]
+    fn infers_arithmetic_and_comparison() {
+        assert_eq!(infer_expr_str("1 + 2"), ("Int".into(), 0));
+        assert_eq!(infer_expr_str("1.0 +. 2.0"), ("Float".into(), 0));
+        assert_eq!(infer_expr_str("1 < 2"), ("Bool".into(), 0));
+        assert_eq!(infer_expr_str(r#""a" <> "b""#), ("String".into(), 0));
+    }
+
+    #[test]
+    fn mismatch_in_operator_is_e0400() {
+        let (_t, n) = infer_expr_str(r#"1 + "a""#);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn if_branches_must_agree_and_cond_is_bool() {
+        assert_eq!(
+            infer_expr_str("if 1 < 2 { 10 } else { 20 }"),
+            ("Int".into(), 0)
+        );
+        let (_t, n) = infer_expr_str("if 1 { 10 } else { 20 }");
+        assert_eq!(n, 1);
+    }
 
     #[test]
     fn unifies_equal_bases() {
