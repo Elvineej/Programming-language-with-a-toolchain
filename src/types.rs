@@ -1,6 +1,6 @@
 //! Hindley–Milner type inference (Algorithm J).
 
-use crate::ast::{BinOp, Block, Decl, Expr, Module, Stmt, UnOp};
+use crate::ast::{BinOp, Block, Decl, Expr, FnDecl, Module, Stmt, UnOp};
 use crate::diag::Diagnostic;
 use crate::span::{Span, Spanned};
 use crate::Session;
@@ -393,11 +393,52 @@ impl Infer {
         result
     }
 
-    /// Placeholder generalization; the real one lands in Task 5.
-    fn generalize(&mut self, t: &Ty, _env: &TyEnv) -> Scheme {
-        Scheme {
-            vars: Vec::new(),
-            ty: self.resolve(t),
+    /// Generalize `t` under `env`: quantify the vars free in `t` but not in the
+    /// environment. (The level/rank optimization is a valid future speedup;
+    /// this free-vars version produces identical schemes.)
+    fn generalize(&mut self, t: &Ty, env: &TyEnv) -> Scheme {
+        let resolved = self.resolve(t);
+        let mut in_ty = Vec::new();
+        free_vars(self, &resolved, &mut in_ty);
+        let mut in_env = Vec::new();
+        env_free_vars(self, env, &mut in_env);
+        let vars: Vec<u32> = in_ty.into_iter().filter(|v| !in_env.contains(v)).collect();
+        Scheme { ty: resolved, vars }
+    }
+}
+
+fn free_vars(inf: &Infer, t: &Ty, acc: &mut Vec<u32>) {
+    match inf.resolve(t) {
+        Ty::Var(v) => {
+            if !acc.contains(&v) {
+                acc.push(v);
+            }
+        }
+        Ty::Base(_) | Ty::Error => {}
+        Ty::Fn(ps, r) => {
+            for p in &ps {
+                free_vars(inf, p, acc);
+            }
+            free_vars(inf, &r, acc);
+        }
+        Ty::Tuple(xs) => {
+            for x in &xs {
+                free_vars(inf, x, acc);
+            }
+        }
+    }
+}
+
+fn env_free_vars(inf: &Infer, env: &TyEnv, acc: &mut Vec<u32>) {
+    for scope in &env.scopes {
+        for scheme in scope.values() {
+            let mut fv = Vec::new();
+            free_vars(inf, &scheme.ty, &mut fv);
+            for v in fv {
+                if !scheme.vars.contains(&v) && !acc.contains(&v) {
+                    acc.push(v);
+                }
+            }
         }
     }
 }
@@ -420,8 +461,9 @@ pub fn infer(session: &Session, module: &Module) -> Vec<Diagnostic> {
     diags
 }
 
-/// Type every top-level function. Slice-4 note: this is currently a single
-/// monomorphic group; Task 5 replaces it with SCC-ordered generalization.
+/// Type every top-level function, processing mutually-recursive groups (SCCs of
+/// the call graph) in dependency order so each group is generalized before later
+/// groups use it — giving proper let-polymorphism across the top level.
 pub fn infer_schemes(
     _session: &Session,
     module: &Module,
@@ -429,51 +471,213 @@ pub fn infer_schemes(
     let mut inf = Infer::new();
     let mut env = TyEnv::new();
 
-    let mut fn_tys: Vec<(String, Vec<Ty>, Ty)> = Vec::new();
-    for d in &module.decls {
-        let Decl::Fn(f) = &d.node;
-        let params: Vec<Ty> = f.params.iter().map(|_| inf.fresh()).collect();
-        let result = inf.fresh();
-        env.insert(
-            &f.name,
-            Scheme {
-                vars: Vec::new(),
-                ty: Ty::Fn(params.clone(), Box::new(result.clone())),
-            },
-        );
-        fn_tys.push((f.name.clone(), params, result));
-    }
-
-    for (d, (_, params, result)) in module.decls.iter().zip(&fn_tys) {
-        let Decl::Fn(f) = &d.node;
-        env.push();
-        for (p, pty) in f.params.iter().zip(params) {
-            env.insert(
-                &p.node.name,
-                Scheme {
-                    vars: Vec::new(),
-                    ty: pty.clone(),
-                },
-            );
-        }
-        let body_ty = inf.infer_block(&f.body.node, &mut env);
-        inf.unify(&body_ty, result, f.body.span);
-        env.pop();
-    }
-
-    let schemes = fn_tys
+    let fns: Vec<&FnDecl> = module
+        .decls
         .iter()
-        .map(|(name, params, result)| {
-            let fnty = Ty::Fn(params.clone(), Box::new(result.clone()));
-            let s = Scheme {
-                vars: Vec::new(),
-                ty: inf.resolve(&fnty),
-            };
-            (name.clone(), display_scheme(&inf, &s))
+        .map(|d| {
+            let Decl::Fn(f) = &d.node;
+            f
         })
         .collect();
+    let name_idx: HashMap<&str, usize> = fns
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.as_str(), i))
+        .collect();
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); fns.len()];
+    for (i, f) in fns.iter().enumerate() {
+        let mut refs = Vec::new();
+        collect_refs(&f.body.node, &mut refs);
+        for r in refs {
+            if let Some(&j) = name_idx.get(r.as_str()) {
+                if !edges[i].contains(&j) {
+                    edges[i].push(j);
+                }
+            }
+        }
+    }
+    let groups = tarjan_scc(&edges); // callees before callers (reverse topological)
 
-    (schemes, inf.diags)
+    let mut schemes_out: Vec<(String, String)> = Vec::new();
+
+    for group in &groups {
+        // 1. fresh monotype per member, in scope for the whole group.
+        let mut member_ty: HashMap<usize, (Vec<Ty>, Ty)> = HashMap::new();
+        for &i in group {
+            let f = fns[i];
+            let params: Vec<Ty> = f.params.iter().map(|_| inf.fresh()).collect();
+            let result = inf.fresh();
+            env.insert(
+                &f.name,
+                Scheme {
+                    vars: Vec::new(),
+                    ty: Ty::Fn(params.clone(), Box::new(result.clone())),
+                },
+            );
+            member_ty.insert(i, (params, result));
+        }
+        // 2. infer each body under its params (monomorphic within the group).
+        for &i in group {
+            let f = fns[i];
+            let (params, result) = &member_ty[&i];
+            env.push();
+            for (p, pty) in f.params.iter().zip(params) {
+                env.insert(
+                    &p.node.name,
+                    Scheme {
+                        vars: Vec::new(),
+                        ty: pty.clone(),
+                    },
+                );
+            }
+            let body_ty = inf.infer_block(&f.body.node, &mut env);
+            inf.unify(&body_ty, result, f.body.span);
+            env.pop();
+        }
+        // 3. generalize each member and re-insert its polytype for later groups.
+        for &i in group {
+            let f = fns[i];
+            let (params, result) = &member_ty[&i];
+            let fnty = Ty::Fn(params.clone(), Box::new(result.clone()));
+            let scheme = generalize_toplevel(&mut inf, &fnty, &env, group, &fns);
+            env.insert(&f.name, scheme.clone());
+            schemes_out.push((f.name.clone(), display_scheme(&inf, &scheme)));
+        }
+    }
+
+    (schemes_out, inf.diags)
+}
+
+fn collect_refs(b: &Block, acc: &mut Vec<String>) {
+    for st in &b.stmts {
+        match &st.node {
+            Stmt::Let { value, .. } => collect_refs_expr(&value.node, acc),
+            Stmt::Expr(e) => collect_refs_expr(&e.node, acc),
+        }
+    }
+    if let Some(t) = &b.tail {
+        collect_refs_expr(&t.node, acc);
+    }
+}
+
+fn collect_refs_expr(e: &Expr, acc: &mut Vec<String>) {
+    match e {
+        Expr::Var(n) => acc.push(n.clone()),
+        Expr::Call { callee, args } => {
+            collect_refs_expr(&callee.node, acc);
+            for a in args {
+                collect_refs_expr(&a.node, acc);
+            }
+        }
+        Expr::Unary { expr, .. } => collect_refs_expr(&expr.node, acc),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_refs_expr(&lhs.node, acc);
+            collect_refs_expr(&rhs.node, acc);
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            collect_refs_expr(&cond.node, acc);
+            collect_refs(&then_block.node, acc);
+            collect_refs(&else_block.node, acc);
+        }
+        Expr::Block(b) => collect_refs(b, acc),
+        _ => {}
+    }
+}
+
+/// Iterative Tarjan's SCC. Components are emitted callees-before-callers
+/// (reverse topological), which is the order generalization needs.
+fn tarjan_scc(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let n = edges.len();
+    let mut index = vec![usize::MAX; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut counter = 0usize;
+    let mut out: Vec<Vec<usize>> = Vec::new();
+
+    for start in 0..n {
+        if index[start] != usize::MAX {
+            continue;
+        }
+        let mut call: Vec<(usize, usize)> = vec![(start, 0)];
+        while let Some(&(v, mut pi)) = call.last() {
+            if pi == 0 {
+                index[v] = counter;
+                low[v] = counter;
+                counter += 1;
+                stack.push(v);
+                on_stack[v] = true;
+            }
+            let mut recursed = false;
+            while pi < edges[v].len() {
+                let w = edges[v][pi];
+                pi += 1;
+                if index[w] == usize::MAX {
+                    call.last_mut().unwrap().1 = pi;
+                    call.push((w, 0));
+                    recursed = true;
+                    break;
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+            }
+            if recursed {
+                continue;
+            }
+            call.last_mut().unwrap().1 = pi;
+            if low[v] == index[v] {
+                let mut comp = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on_stack[w] = false;
+                    comp.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                out.push(comp);
+            }
+            call.pop();
+            if let Some(&(parent, _)) = call.last() {
+                low[parent] = low[parent].min(low[v]);
+            }
+        }
+    }
+    out
+}
+
+fn generalize_toplevel(
+    inf: &mut Infer,
+    fnty: &Ty,
+    env: &TyEnv,
+    group: &[usize],
+    fns: &[&FnDecl],
+) -> Scheme {
+    let group_names: Vec<&str> = group.iter().map(|&i| fns[i].name.as_str()).collect();
+    let resolved = inf.resolve(fnty);
+    let mut in_ty = Vec::new();
+    free_vars(inf, &resolved, &mut in_ty);
+    let mut in_env = Vec::new();
+    for scope in &env.scopes {
+        for (n, scheme) in scope {
+            if group_names.contains(&n.as_str()) {
+                continue;
+            }
+            let mut fv = Vec::new();
+            free_vars(inf, &scheme.ty, &mut fv);
+            for v in fv {
+                if !scheme.vars.contains(&v) && !in_env.contains(&v) {
+                    in_env.push(v);
+                }
+            }
+        }
+    }
+    let vars: Vec<u32> = in_ty.into_iter().filter(|v| !in_env.contains(v)).collect();
+    Scheme { ty: resolved, vars }
 }
 
 #[cfg(test)]
