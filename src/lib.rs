@@ -7,6 +7,7 @@ pub mod lex;
 pub mod parse;
 pub mod resolve;
 pub mod span;
+pub mod types;
 
 use crate::diag::{render, Diagnostic};
 use crate::span::SourceMap;
