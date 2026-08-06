@@ -100,7 +100,9 @@ impl Interp {
         self.output.push_str(s);
         self.output.push('\n');
     }
-    // `note_kont_depth` (writes `peak_kont`) is added with the CEK machine in Task 8.
+    fn note_kont_depth(&mut self, d: usize) {
+        self.peak_kont = self.peak_kont.max(d);
+    }
 }
 
 impl Default for Interp {
@@ -147,7 +149,7 @@ pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Runtim
 }
 
 pub fn run_module(module: &Module) -> Result<Interp, RuntimeError> {
-    tree::run_module(module) // Task 8 repoints this to cek::run_module
+    cek::run_module(module)
 }
 
 pub fn run_module_tree(module: &Module) -> Result<Interp, RuntimeError> {
@@ -277,6 +279,401 @@ pub mod tree {
                 eval_block(interp, &fdecl.body.node, &call_env, fns)
             }
         }
+    }
+}
+
+pub mod cek {
+    use super::{apply_binop, apply_unop, fn_table, rt, Env, Fns, Interp, RuntimeError, Value};
+    use crate::ast::*;
+    use crate::span::{Span, Spanned};
+    use std::rc::Rc;
+
+    #[derive(Clone)]
+    enum CalleeSlot {
+        Pending,               // still evaluating the callee expression
+        Builtin(&'static str), // e.g. "io.println"
+        Value(Value),          // an evaluated callee (a Value::Fn)
+    }
+
+    #[derive(Clone)]
+    enum Frame<'a> {
+        BinRight {
+            op: BinOp,
+            rhs: &'a Spanned<Expr>,
+            env: Env,
+            span: Span,
+        },
+        BinApply {
+            op: BinOp,
+            lval: Value,
+            span: Span,
+        },
+        UnApply {
+            op: UnOp,
+            span: Span,
+        },
+        IfBranch {
+            then_blk: &'a Block,
+            else_blk: &'a Block,
+            env: Env,
+            span: Span,
+        },
+        LetCont {
+            name: &'a str,
+            rest: &'a [Spanned<Stmt>],
+            tail: Option<&'a Spanned<Expr>>,
+            env: Env,
+        },
+        SeqDrop {
+            rest: &'a [Spanned<Stmt>],
+            tail: Option<&'a Spanned<Expr>>,
+            env: Env,
+        },
+        CallArgs {
+            callee: CalleeSlot,
+            done: Vec<Value>,
+            pending: &'a [Spanned<Expr>],
+            env: Env,
+            span: Span,
+        },
+    }
+
+    struct KontNode<'a> {
+        frame: Frame<'a>,
+        rest: Kont<'a>,
+    }
+    // Alias is non-recursive because the recursion goes through the named
+    // `KontNode` struct (recursive type *aliases* are not allowed).
+    type Kont<'a> = Option<Rc<KontNode<'a>>>;
+
+    fn push<'a>(f: Frame<'a>, k: Kont<'a>) -> Kont<'a> {
+        Some(Rc::new(KontNode { frame: f, rest: k }))
+    }
+
+    enum State<'a> {
+        Eval(&'a Spanned<Expr>, Env, Kont<'a>),
+        Return(Value, Kont<'a>),
+    }
+
+    pub fn run_module(module: &Module) -> Result<Interp, RuntimeError> {
+        let fns = fn_table(module);
+        let mut interp = Interp::new();
+        let Some(main) = fns.get("main").copied() else {
+            return Err(rt(Span::EMPTY, "no `main` function found"));
+        };
+        let start = eval_block_state(&main.body.node, Env::new(), None);
+        run_loop(&mut interp, &fns, start)?;
+        Ok(interp)
+    }
+
+    // A block's tail is in tail position: evaluating it does not add a frame.
+    fn eval_block_state<'a>(b: &'a Block, env: Env, k: Kont<'a>) -> State<'a> {
+        step_block(&b.stmts, b.tail.as_deref(), env, k)
+    }
+
+    fn step_block<'a>(
+        stmts: &'a [Spanned<Stmt>],
+        tail: Option<&'a Spanned<Expr>>,
+        env: Env,
+        k: Kont<'a>,
+    ) -> State<'a> {
+        match stmts.split_first() {
+            None => match tail {
+                Some(t) => State::Eval(t, env, k), // tail position — no frame
+                None => State::Return(Value::Unit, k),
+            },
+            Some((st, rest)) => match &st.node {
+                Stmt::Let { name, value } => State::Eval(
+                    value,
+                    env.clone(),
+                    push(Frame::LetCont { name, rest, tail, env }, k),
+                ),
+                Stmt::Expr(e) => {
+                    State::Eval(e, env.clone(), push(Frame::SeqDrop { rest, tail, env }, k))
+                }
+            },
+        }
+    }
+
+    fn run_loop<'a>(
+        interp: &mut Interp,
+        fns: &'a Fns<'a>,
+        mut st: State<'a>,
+    ) -> Result<(), RuntimeError> {
+        loop {
+            interp.note_kont_depth(kont_len(kont_of(&st)));
+            match step(interp, fns, st)? {
+                Some(next) => st = next,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    fn kont_len(k: &Kont) -> usize {
+        let mut n = 0;
+        let mut cur = k;
+        while let Some(node) = cur {
+            n += 1;
+            cur = &node.rest;
+        }
+        n
+    }
+
+    fn kont_of<'a, 'b>(st: &'b State<'a>) -> &'b Kont<'a> {
+        match st {
+            State::Eval(_, _, k) => k,
+            State::Return(_, k) => k,
+        }
+    }
+
+    fn step<'a>(
+        interp: &mut Interp,
+        fns: &'a Fns<'a>,
+        st: State<'a>,
+    ) -> Result<Option<State<'a>>, RuntimeError> {
+        match st {
+            State::Eval(e, env, k) => Ok(Some(eval(fns, e, env, k)?)),
+            State::Return(v, k) => ret(interp, fns, v, k),
+        }
+    }
+
+    fn eval<'a>(
+        fns: &'a Fns<'a>,
+        e: &'a Spanned<Expr>,
+        env: Env,
+        k: Kont<'a>,
+    ) -> Result<State<'a>, RuntimeError> {
+        let span = e.span;
+        Ok(match &e.node {
+            Expr::Int(n) => State::Return(Value::Int(*n), k),
+            Expr::Float(x) => State::Return(Value::Float(*x), k),
+            Expr::Str(s) => State::Return(Value::Str(s.clone()), k),
+            Expr::Bool(b) => State::Return(Value::Bool(*b), k),
+            Expr::Unit => State::Return(Value::Unit, k),
+            Expr::Var(name) => {
+                let v = if let Some(v) = env.get(name) {
+                    v
+                } else if fns.contains_key(name.as_str()) {
+                    Value::Fn(name.clone())
+                } else {
+                    return Err(rt(span, format!("unbound variable `{name}`")));
+                };
+                State::Return(v, k)
+            }
+            Expr::Qualified { module, name } => {
+                return Err(rt(span, format!("`{module}.{name}` must be called")))
+            }
+            Expr::Unary { op, expr } => {
+                State::Eval(expr, env, push(Frame::UnApply { op: *op, span }, k))
+            }
+            Expr::Binary { op, lhs, rhs } => State::Eval(
+                lhs,
+                env.clone(),
+                push(Frame::BinRight { op: *op, rhs, env, span }, k),
+            ),
+            Expr::If { cond, then_block, else_block } => State::Eval(
+                cond,
+                env.clone(),
+                push(
+                    Frame::IfBranch {
+                        then_blk: &then_block.node,
+                        else_blk: &else_block.node,
+                        env,
+                        span,
+                    },
+                    k,
+                ),
+            ),
+            Expr::Block(b) => step_block(&b.stmts, b.tail.as_deref(), env, k),
+            Expr::Call { callee, args } => {
+                let slot = match &callee.node {
+                    Expr::Qualified { module, name } if module == "io" && name == "println" => {
+                        CalleeSlot::Builtin("io.println")
+                    }
+                    Expr::Qualified { module, name } => {
+                        return Err(rt(span, format!("unknown builtin `{module}.{name}`")))
+                    }
+                    _ => CalleeSlot::Pending,
+                };
+                match slot {
+                    CalleeSlot::Pending => State::Eval(
+                        callee,
+                        env.clone(),
+                        push(
+                            Frame::CallArgs {
+                                callee: CalleeSlot::Pending,
+                                done: Vec::new(),
+                                pending: args,
+                                env,
+                                span,
+                            },
+                            k,
+                        ),
+                    ),
+                    builtin => match args.split_first() {
+                        Some((first, rest)) => State::Eval(
+                            first,
+                            env.clone(),
+                            push(
+                                Frame::CallArgs {
+                                    callee: builtin,
+                                    done: Vec::new(),
+                                    pending: rest,
+                                    env,
+                                    span,
+                                },
+                                k,
+                            ),
+                        ),
+                        None => return Err(rt(span, "builtin called with no arguments")),
+                    },
+                }
+            }
+        })
+    }
+
+    fn ret<'a>(
+        interp: &mut Interp,
+        fns: &'a Fns<'a>,
+        v: Value,
+        k: Kont<'a>,
+    ) -> Result<Option<State<'a>>, RuntimeError> {
+        let Some(node) = k else {
+            return Ok(None); // final result; output already captured via io.println
+        };
+        let (frame, rest) = match Rc::try_unwrap(node) {
+            Ok(node) => (node.frame, node.rest),
+            Err(shared) => (shared.frame.clone(), shared.rest.clone()),
+        };
+        Ok(Some(match frame {
+            Frame::BinRight { op, rhs, env, span } => {
+                State::Eval(rhs, env, push(Frame::BinApply { op, lval: v, span }, rest))
+            }
+            Frame::BinApply { op, lval, span } => {
+                State::Return(apply_binop(op, lval, v, span)?, rest)
+            }
+            Frame::UnApply { op, span } => State::Return(apply_unop(op, v, span)?, rest),
+            Frame::IfBranch { then_blk, else_blk, env, span } => match v {
+                Value::Bool(true) => eval_block_state(then_blk, env, rest),
+                Value::Bool(false) => eval_block_state(else_blk, env, rest),
+                _ => return Err(rt(span, "if condition must be a Bool")),
+            },
+            Frame::LetCont { name, rest: stmts, tail, env } => {
+                let env2 = env.extend(&[(name.to_string(), v)]);
+                step_block(stmts, tail, env2, rest)
+            }
+            Frame::SeqDrop { rest: stmts, tail, env } => step_block(stmts, tail, env, rest),
+            Frame::CallArgs { callee, done, pending, env, span } => {
+                advance_call(interp, fns, v, callee, done, pending, env, span, rest)?
+            }
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn advance_call<'a>(
+        interp: &mut Interp,
+        fns: &'a Fns<'a>,
+        v: Value,
+        callee: CalleeSlot,
+        mut done: Vec<Value>,
+        pending: &'a [Spanned<Expr>],
+        env: Env,
+        span: Span,
+        rest: Kont<'a>,
+    ) -> Result<State<'a>, RuntimeError> {
+        // `v` is the callee value (if the slot was Pending) or the latest argument.
+        let callee = match callee {
+            CalleeSlot::Pending => CalleeSlot::Value(v),
+            other => {
+                done.push(v);
+                other
+            }
+        };
+        match pending.split_first() {
+            Some((next, more)) => Ok(State::Eval(
+                next,
+                env.clone(),
+                push(Frame::CallArgs { callee, done, pending: more, env, span }, rest),
+            )),
+            // All args evaluated — apply. NO frame is pushed here (the TCE lever).
+            None => apply_callee(interp, fns, callee, done, span, rest),
+        }
+    }
+
+    fn apply_callee<'a>(
+        interp: &mut Interp,
+        fns: &'a Fns<'a>,
+        callee: CalleeSlot,
+        args: Vec<Value>,
+        span: Span,
+        k: Kont<'a>,
+    ) -> Result<State<'a>, RuntimeError> {
+        match callee {
+            CalleeSlot::Builtin("io.println") => {
+                let [Value::Str(s)] = &args[..] else {
+                    return Err(rt(span, "io.println expects a single String"));
+                };
+                interp.println(s);
+                Ok(State::Return(Value::Unit, k))
+            }
+            CalleeSlot::Builtin(other) => Err(rt(span, format!("unknown builtin `{other}`"))),
+            CalleeSlot::Value(Value::Fn(name)) => {
+                let fdecl = fns
+                    .get(name.as_str())
+                    .copied()
+                    .ok_or_else(|| rt(span, format!("unknown function `{name}`")))?;
+                if fdecl.params.len() != args.len() {
+                    return Err(rt(
+                        span,
+                        format!(
+                            "`{}` expects {} argument(s), got {}",
+                            name,
+                            fdecl.params.len(),
+                            args.len()
+                        ),
+                    ));
+                }
+                let bindings: Vec<(String, Value)> = fdecl
+                    .params
+                    .iter()
+                    .map(|p| p.node.name.clone())
+                    .zip(args)
+                    .collect();
+                let call_env = Env::new().extend(&bindings);
+                Ok(eval_block_state(&fdecl.body.node, call_env, k)) // reuses `k` — no frame
+            }
+            CalleeSlot::Value(_) => Err(rt(span, "value is not callable")),
+            CalleeSlot::Pending => Err(rt(span, "internal: unresolved callee")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod cek_tests {
+    use super::*;
+    use crate::parse::parse_module;
+    use crate::Session;
+
+    fn run(src: &str) -> String {
+        let (m, d) = parse_module(&Session::new(), src);
+        assert!(d.is_empty(), "parse: {d:?}");
+        cek::run_module(&m).unwrap().output().to_string()
+    }
+
+    #[test]
+    fn hello_world_on_cek() {
+        assert_eq!(
+            run("pub fn main() { io.println(\"Hello, Elya!\") }\n"),
+            "Hello, Elya!\n"
+        );
+    }
+
+    #[test]
+    fn arithmetic_functions_if_on_cek() {
+        let src = "fn double(x) { x + x }\npub fn main() { \
+            let a = double(20)\n let b = a + 2\n \
+            if b == 42 { io.println(\"forty-two\") } else { io.println(\"nope\") } }\n";
+        assert_eq!(run(src), "forty-two\n");
     }
 }
 
