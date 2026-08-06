@@ -2,7 +2,7 @@
 
 - **Codename:** Elya
 - **Slice:** 2 of the Slices 1–3 implementation cycle
-- **Status:** Design draft — awaiting review before an implementation plan is written
+- **Status:** Design **approved** (review incorporated: `case` cut; Env/Kont persistence cost recorded) — ready for an implementation plan
 - **Date:** 2026-08-06
 - **Depends on:** Slice 1 (merged to `main`, commit `1e7947d`) — the working tree-walking interpreter.
 - **Companion documents:** the language design spec (`docs/superpowers/specs/2026-08-05-elya-language-design.md`, "the design spec" below) and the Slice 1 plan (`docs/superpowers/plans/2026-08-05-elya-slice-1-interpreter.md`).
@@ -25,27 +25,15 @@ Section-number references of the form "design spec §X" point at the language de
 2. **The CEK abstract machine**: the recursive tree-walker is refactored into an explicit **Control / Environment / Kontinuation** state machine driven by an iterative step loop. This is the load-bearing refactor the design spec sequences *before* effects (Slice 3) and it is what makes both continuation capture (Slice 3) and TCE (below) possible.
 3. **TCE as a tested correctness guarantee**: Slice 1 shipped only a depth *grow-control*. Slice 2 delivers the real promise — **deep tail recursion runs in bounded continuation depth**, asserted against a pinned constant, with paired non-tail controls that must grow.
 
-### 1.2 Surface additions (deliberately small)
+### 1.2 The surface is frozen to Slice 1's
 
-Slice 2 **deepens the pipeline more than it widens the surface.** The runnable language is Slice 1's (literals; `Int`/`Float` arithmetic with the distinct-operator split; `<>`; comparisons; `let`; `if/else`; top-level functions; calls; `io.println`) **plus one addition**: a **minimal `case`** over *literal, wildcard, and variable-binding* patterns.
+Slice 2 **deepens the pipeline without widening the surface at all.** The runnable language is exactly Slice 1's — literals; `Int`/`Float` arithmetic with the distinct-operator split; `<>`; comparisons; `let`; `if/else`; top-level functions; calls; `io.println` — and Slice 2 adds **no new value-level constructs**. Its one job is to make that surface **typed** and running on the **CEK machine**.
 
-```elya
-fn classify(n) {
-  case n {
-    0 -> "zero"
-    1 -> "one"
-    other -> "many"     // variable pattern binds `other`
-  }
-}
-```
-
-`case` scrutinees may be `Int`, `Bool`, or `String`; patterns are integer/bool/string **literals**, the wildcard `_`, or a lowercase **variable** that binds the scrutinee. **Constructor patterns, tuple/list patterns, and exhaustiveness checking are NOT in Slice 2** — they arrive in Slice 3 with algebraic data types (§9).
-
-> **Scope note (open for your review):** `case` is the one place Slice 2 widens the surface, and the design spec §12 lists it under Slice 2 while listing "pattern matching / enums / exhaustiveness" under Slice 3. Minimal literal-`case` is coherent in Slice 2 and makes inference more interesting (all arms unify), but it is also cleanly deferrable to Slice 3 where it joins full pattern matching. **Recommendation: keep the minimal `case` in Slice 2** (fully specified in §2.7 and §3). If you'd rather Slice 2 be purely "types + CEK + TCE over the exact Slice-1 surface," say so and I'll cut `case` from this spec.
+`case` / pattern matching was considered for Slice 2 and **deliberately cut**: it widens the surface at the worst moment and belongs with algebraic-data-type pattern matching in Slice 3, where any minimal version would have to be revisited anyway (§9).
 
 ### 1.3 What Slice 2 explicitly does NOT do
 
-Algebraic data types, enums, records, constructor pattern matching, exhaustiveness, user-defined generic *types*, traits/type-classes, lambdas / first-class function *expressions*, a surface-level checked type-annotation syntax, a separate Core IR, effect-row typing/enforcement, and handlers/`resume`. Each is placed and justified in §9.
+`case` / pattern matching (all forms), algebraic data types, enums, records, exhaustiveness, user-defined generic *types*, traits/type-classes, lambdas / first-class function *expressions*, a surface-level checked type-annotation syntax, a separate Core IR, effect-row typing/enforcement, and handlers/`resume`. Each is placed and justified in §9.
 
 Polymorphism in Slice 2 is **parametric polymorphism over top-level functions**, produced by HM generalization — e.g. `fn id(x) { x }` infers `∀a. a -> a`. No user syntax is required or accepted for it; this is the substrate on which Slice 3's generic *data types* are later built.
 
@@ -94,7 +82,6 @@ Inference walks the AST in a typing environment `Γ : name → Scheme`, returnin
 | `Block{stmts, tail}` | thread `Γ` through statements (`let` extends it, §2.4); result is the `tail` type, or `Unit` if no tail. |
 | `Call{callee, args}` | infer `callee : F`; infer each `arg : Aᵢ`; make a fresh result var `R`; `unify(F, Fn([A₁..], R))`; result `R`. Arity surfaces as **E0402**. |
 | `Qualified{m, n}` used as a call callee | resolved to a **builtin** type (§2.6); a bare (uncalled) qualified reference is an **E0201**-adjacent error (kept from Slice 1's resolver). |
-| `Case{scrutinee, arms}` | §2.7. |
 
 ### 2.4 Generalization, instantiation, let-polymorphism
 
@@ -129,9 +116,9 @@ Monomorphic, matching the design spec's "distinct numeric operators, no numeric 
 
 `main` is typed `Fn([], Unit)` (its `/ {IO}` annotation is parsed and retained by name, not typed — §9).
 
-### 2.7 Minimal `case` typing
+### 2.7 `case` / pattern matching — deferred
 
-For `case scrut { p1 -> e1; … }`: infer `scrut : S`; for each arm, type the pattern against `S` (a literal pattern unifies `S` with its literal's base type; `_` imposes no constraint; a variable pattern binds the variable to `S` in that arm's environment), infer the arm body, and unify all arm-body types to a single result `R`. Result is `R`. **No exhaustiveness check** (§9); a scrutinee matching no arm is a **runtime** error (E03xx) in the evaluator.
+Not in Slice 2. `case` and all pattern matching are deferred to Slice 3, where they join algebraic data types and exhaustiveness checking (§9). Slice 2 has no pattern syntax to type, and the CEK machine (§3) needs no matching frame.
 
 ### 2.8 Diagnostics and the anti-gibberish discipline
 
@@ -172,7 +159,7 @@ error[E0401]: infinite type
 
 ### 3.1 Why now
 
-The design spec sequences the CEK refactor into Slice 2, *before* effects, for three reasons: (a) making the continuation an explicit, capturable data structure is the prerequisite for Slice-3 handlers and `resume`; (b) an iterative step loop gives TCE and removes host-stack limits; (c) it is the stepping stone to a bytecode VM later. Slice 1's tree-walker is retained as a **test oracle** (§3.8), not deleted.
+The design spec sequences the CEK refactor into Slice 2, *before* effects, for three reasons: (a) making the continuation an explicit, capturable data structure is the prerequisite for Slice-3 handlers and `resume`; (b) an iterative step loop gives TCE and removes host-stack limits; (c) it is the stepping stone to a bytecode VM later. Slice 1's tree-walker is retained as a **test oracle** (§3.7), not deleted.
 
 ### 3.2 State, values, environment, continuation
 
@@ -189,7 +176,11 @@ Kont = persistent, Rc-linked frames:  Kont ::= Nil | Rc<(Frame, Kont)>
 
 Both `Env` and `Kont` are **persistent and immutable** (structural sharing via `Rc`). No new dependency is required — this uses only `std::rc::Rc`.
 
-> **Flag (§9 — designed now for Slice 3):** a plain `Vec` continuation would suffice for a *non-capturing* Slice-2 machine and would also give TCE. We choose the persistent representation now specifically so Slice 3's handlers can **capture and re-enter** a continuation (`resume`, including multi-shot) with no rewrite — exactly the "one-shot and multi-shot share the representation" claim in design spec §8.4. This is deliberate forward-investment, and it is the one place Slice 2's implementation is shaped by a Slice-3 requirement.
+> **Cost of persistence (reviewed and confirmed):** persistence is cheap-or-free for Slice 2, and the two structures differ in *why* they are persistent:
+> - **`Env` persistence is a Slice-2 requirement, not forward-investment.** The TCE guarantee (§4.3) demands that a tail call not grow memory; Slice 1's clone-and-push `Vec<HashMap>` env grows linearly with recursion depth and would *defeat* TCE. A persistent parent-pointer scope (O(1) extend, O(1) share) is the simplest representation that is *also* correct under deep tail recursion. This makes Slice 2 **correct**; it is not extra complexity taken on for Slice 3.
+> - **`Kont` persistence is genuine Slice-3 forward-investment, but negligibly cheap.** A plain `Vec` stack would suffice for the non-capturing Slice-2 machine and would also give TCE. An `Rc`-cons list costs only a handful of `Rc::new`/deref sites over a `Vec`, and it lets the step loop thread `Kont` as an *immutable value* — exactly the shape Slice 3 needs to **capture and re-enter** a continuation (`resume`, including multi-shot; design spec §8.4). Adopting it now avoids a Slice-3 rewrite of the machine's core loop at essentially no Slice-2 cost.
+>
+> Net: neither choice adds meaningful Slice-2 complexity; `Env` persistence is *required* here and `Kont` persistence is a near-free investment. Both are kept.
 
 ### 3.3 Frame set (Slice-2 subset)
 
@@ -202,32 +193,31 @@ Both `Env` and `Kont` are **persistent and immutable** (structural sharing via `
 | `LetCont{name, rest, env}` | binding name, rest-of-block, env | waiting for the `let` value; then bind and continue the block |
 | `SeqDrop{rest, env}` | rest-of-block, env | waiting for a statement-expression value (discarded); then continue |
 | `CallArgs{callee_val, done, pending, env}` | evaluated callee, values so far, args left, env | evaluating arguments left-to-right; when none left, apply |
-| `CaseArms{arms, env}` | remaining arms, env | waiting for the scrutinee; then match |
 
 `CallArgs` is written so that, once the callee and all arguments are values, **application happens without leaving a residual frame** (§3.5).
 
 ### 3.4 The step function
 
-`step(State) -> Step` where `Step ::= Continue(State) | Done(Value) | RuntimeError`. **Eval** transitions decompose an expression, pushing at most one frame and moving to a sub-expression or to `Return`. **Return** transitions consume the top frame. Representative transitions (complete set covers every frame in §3.3):
+`step(State) -> Step` where `Step ::= Continue(State) | Done(Value) | RuntimeError`. **Eval** transitions decompose an expression, pushing at most one frame and moving to a sub-expression or to `Return`. **Return** transitions consume the top frame. Representative transitions (the complete set covers every frame in §3.3):
 
 Eval:
 - `Eval(Lit v, _, k)` → `Return(v, k)`
 - `Eval(Var x, env, k)` → `Return(lookup(env, x), k)`
 - `Eval(Binary{op,l,r}, env, k)` → `Eval(l, env, BinRight{op,r,env} :: k)`
+- `Eval(Unary{op,e}, env, k)` → `Eval(e, env, UnApply{op} :: k)`
 - `Eval(If{c,t,e}, env, k)` → `Eval(c, env, IfBranch{t,e,env} :: k)`
 - `Eval(Block{[], tail}, env, k)` → `Eval(tail, env, k)`  *(empty-stmt block: tail in tail position — no frame added)*
 - `Eval(Block{[Let{x,v}, …rest], tail}, env, k)` → `Eval(v, env, LetCont{x, Block{rest,tail}, env} :: k)`
 - `Eval(Block{[ExprStmt e, …rest], tail}, env, k)` → `Eval(e, env, SeqDrop{Block{rest,tail}, env} :: k)`
 - `Eval(Call{callee,args}, env, k)` → `Eval(callee, env, CallArgs{callee_val: none, done: [], pending: args, env} :: k)`
-- `Eval(Case{scrut,arms}, env, k)` → `Eval(scrut, env, CaseArms{arms, env} :: k)`
 
 Return:
 - `Return(v, BinRight{op,r,env} :: k)` → `Eval(r, env, BinApply{op, v} :: k)`
 - `Return(v, BinApply{op, lval} :: k)` → `Return(apply_binop(op, lval, v)?, k)`
+- `Return(v, UnApply{op} :: k)` → `Return(apply_unop(op, v)?, k)`
 - `Return(Bool b, IfBranch{t,e,env} :: k)` → `Eval(if b {t} else {e}, env, k)`  *(chosen branch inherits `k` — tail position)*
 - `Return(v, LetCont{x, rest, env} :: k)` → `Eval(rest, extend(env, x, v), k)`
 - `Return(_, SeqDrop{rest, env} :: k)` → `Eval(rest, env, k)`
-- `Return(v, CaseArms{arms, env} :: k)` → match `v` against `arms`; `Eval(chosen_body, env', k)` (arm body in tail position) or `RuntimeError` if no arm matches
 - `Return(v, CallArgs{…} :: k)` → advance argument evaluation; when the callee and all args are values, **apply** (§3.5)
 - `Return(v, Nil)` → `Done(v)`
 
@@ -259,7 +249,7 @@ Cross-checking uses **shallow** programs only: the tree-walker recurses on the h
 ### 3.8 Honest deferrals in the machine
 
 - **No Core IR.** The CEK machine steps over the **typed AST directly**. The design spec's Core IR (desugaring, decision-tree compilation of patterns) becomes worthwhile with ADTs and is deferred to Slice 3 (§9).
-- **Persistent kont/env is forward-investment** for Slice-3 capture (§3.2 flag), not used by any Slice-2 feature.
+- **`Kont` persistence is forward-investment** for Slice-3 capture (§3.2), not used by any Slice-2 feature; **`Env` persistence is a Slice-2 correctness requirement** (§4.3), not forward-investment.
 
 ---
 
@@ -270,7 +260,6 @@ Cross-checking uses **shallow** programs only: the tree-walker recurses on the h
 An expression is in **tail position** of a function body when its value is the function's result with no pending work:
 - the `tail` expression of the function body block;
 - both branch blocks of a tail-position `if` (their tails);
-- every arm body of a tail-position `case`;
 - a `let`/expression *statement* is **never** in tail position (there is always a following statement or the block tail).
 
 A **tail call** is a `Call` in tail position.
@@ -344,9 +333,8 @@ Each sub-slice ends green and demoable, mirroring the Slice-1 discipline:
 1. **2a** — `Type`/`Scheme` + union-find unification + occurs-check (unit-tested in isolation).
 2. **2b** — inference walk over expressions with **monomorphic** top-level functions; wire `types::infer` into `check_source`; first E0400/E0403 fixtures.
 3. **2c** — generalization + instantiation + **SCC** grouping → polymorphism (`id`/`const` tests); E0401/E0402 fixtures; the zonk/letter-naming reporter.
-4. **2d** — persistent `Env`; the **CEK machine** for the current constructs; the tree-walker cross-check goes green.
-5. **2e** — **TCE** instrumentation and the §4.4 bounded assertions.
-6. **2f** — **minimal `case`**: parser + AST node, typing (§2.7), CEK `CaseArms` frame, cross-check + fixtures. *(Cut this sub-slice if `case` is deferred per the §1.2 scope note.)*
+4. **2d** — persistent `Env`; the **CEK machine** for all current constructs; the tree-walker cross-check goes green.
+5. **2e** — **TCE** instrumentation and the §4.4 bounded assertions; pipeline switched to `parse → resolve → infer → cek`; all Slice-1 tests green (adjusted); full gate green.
 
 ---
 
@@ -356,7 +344,7 @@ Each sub-slice ends green and demoable, mirroring the Slice-1 discipline:
 - **`Env`/`Kont` growth defeating TCE** → persistent replace-don't-nest `Env` (§4.3) and no-push application (§4.2); the §4.4 bounded assertion is the guard.
 - **CEK ≠ tree-walker divergence** → the cross-check test on every program catches any behavioral drift the moment it appears.
 - **Type-error quality debt** → the zonk-before-print discipline and the no-`%t` UI invariant are specified and tested from sub-slice 2b, not bolted on.
-- **Scope creep** → `case` is minimal and flagged as cuttable; ADTs/traits/lambdas/effects are explicitly out (§9).
+- **Scope creep** → the surface is frozen to Slice 1's; `case`, ADTs, traits, lambdas, and effects are all explicitly out (§9).
 - **SCC/recursion subtlety** → monomorphic-within-SCC is the standard, well-understood treatment; polymorphic recursion is explicitly unsupported and flagged.
 
 ---
@@ -366,13 +354,13 @@ Each sub-slice ends green and demoable, mirroring the Slice-1 discipline:
 | Deferred item | Where it lands | Why it's safe to defer |
 |---|---|---|
 | Effect-row typing & enforcement (`/ {IO}`) | Slice 3 | Slice 2 types values/functions; effect rows are parsed and retained by name. Row-polymorphic inference is Slice 3's headline. |
-| ADTs, enums, records, constructor patterns, exhaustiveness | Slice 3 | `Con` already carries an argument list; the type machinery is ready. Minimal literal-`case` (§2.7) needs none of it. |
+| `case` / pattern matching, ADTs, enums, records, exhaustiveness | Slice 3 | Cut from Slice 2 (surface frozen). `Con` already carries an argument list, so the type machinery is ready when they arrive together in Slice 3. |
 | User generic *types* (`Tree(a)`) / traits | Slice 3 | Parametric polymorphism over functions (via generalization) exists in Slice 2; generic *data* and ad-hoc polymorphism build on it later. |
 | Lambdas / first-class function *expressions* | Slice 3 (or a dedicated sub-slice) | HM polymorphism is already demonstrable via top-level functions; `Closure` values and application are built now, so adding lambda syntax later is additive. |
 | Checked type-annotation syntax + surface `Type` AST | Slice 3 | Annotations are parsed-and-discarded (Slice-1 behavior). They reference ADT type names, which arrive in Slice 3. |
 | Separate Core IR / pattern-match compilation | Slice 3 | The CEK machine runs on the AST directly; Core IR pays off with ADTs. |
 | Polymorphic recursion | Later (needs annotations) | Undecidable without annotations; monomorphic recursion within an SCC is the standard treatment. |
-| Handlers / `resume` / multi-shot | Slice 3 | The persistent `Env`/`Kont` representation is built now precisely so this is additive, not a rewrite (§3.2). |
+| Handlers / `resume` / multi-shot | Slice 3 | The persistent `Kont`/`Env` representation is built now precisely so this is additive, not a rewrite (§3.2). |
 | Multi-file modules; cross-module TCE case | Slice 3 (with the module/package work) | Slice 2 tests self- and mutual-tail-recursion within one file, which exercises the same tail-call mechanism. |
 | Float ordering operators (`<.` etc.), `%`-on-float | Slice 3 | Lexed already; typing them is trivial to add and not needed for Slice-2 goals. |
 
@@ -388,9 +376,8 @@ Each sub-slice ends green and demoable, mirroring the Slice-1 discipline:
 - [ ] Type reporter: zonk + letter-naming; no-`%t` UI invariant tested.
 - [ ] Persistent `Env`; CEK machine for all current constructs; **cross-check `cek == tree` green**.
 - [ ] TCE instrumentation; §4.4 bounded assertions (self + mutual tail recursion) green; grow-control retained.
-- [ ] Minimal `case` (parse + type + CEK + fixtures) — *or* explicitly cut per §1.2.
 - [ ] Pipeline switched to `parse → resolve → infer → cek`; type errors compile-time; all Slice-1 tests green (adjusted); full gate (`scripts/check.sh`) green.
 
 ---
 
-*Slice 2 turns the interpreter typed and the evaluator into a machine — the two changes that make Slice 3's effects possible — while proving tail-call elimination as a measured guarantee rather than a hope. Review gate: this spec is for your approval before any implementation plan is written.*
+*Slice 2 turns the interpreter typed and the evaluator into a machine — the two changes that make Slice 3's effects possible — while proving tail-call elimination as a measured guarantee rather than a hope. The surface stays exactly Slice 1's; `case` and everything else wait for Slice 3.*
