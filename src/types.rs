@@ -1,8 +1,9 @@
 //! Hindley–Milner type inference (Algorithm J).
 
-use crate::ast::{BinOp, Block, Expr, Stmt, UnOp};
+use crate::ast::{BinOp, Block, Decl, Expr, Module, Stmt, UnOp};
 use crate::diag::Diagnostic;
 use crate::span::{Span, Spanned};
+use crate::Session;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
