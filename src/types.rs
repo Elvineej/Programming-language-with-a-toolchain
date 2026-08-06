@@ -782,7 +782,10 @@ mod tests {
         let out = display_ty(&inf, &t);
         assert_eq!(out, "fn(a) -> b");
         assert!(!out.contains('%'), "no internal token: {out}");
-        assert!(!out.contains("t0") && !out.contains("t1"), "no raw var id: {out}");
+        assert!(
+            !out.contains("t0") && !out.contains("t1"),
+            "no raw var id: {out}"
+        );
     }
 
     #[test]
