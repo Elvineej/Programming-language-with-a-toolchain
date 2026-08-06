@@ -28,6 +28,9 @@ pub fn run_source(name: &str, text: &str) -> Result<String, String> {
     let sm = SourceMap::new(name, text);
     let (module, mut diags) = parse::parse_module(&session, text);
     diags.extend(resolve::check(&session, &module));
+    if diags.is_empty() {
+        diags.extend(types::infer(&session, &module));
+    }
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
         return Err(rendered);
     }
@@ -83,5 +86,15 @@ mod tests {
     #[test]
     fn check_source_is_ok_for_valid_program() {
         assert!(check_source("h.elya", "fn main() { io.println(\"x\") }\n").is_ok());
+    }
+
+    #[test]
+    fn run_source_rejects_ill_typed_at_compile_time() {
+        let err = run_source(
+            "t.elya",
+            "pub fn main() { let _ = 1 + \"a\"\n io.println(\"x\") }\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("E0400"), "{err}");
     }
 }
