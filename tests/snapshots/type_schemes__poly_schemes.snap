@@ -1,0 +1,7 @@
+---
+source: tests/type_schemes.rs
+expression: "schemes_text(\"fn id(x) { x }\\nfn first(x, y) { x }\\nfn twice(n) { n + n }\\n\")"
+---
+first : forall a b. fn(a, b) -> a
+id : forall a. fn(a) -> a
+twice : fn(Int) -> Int

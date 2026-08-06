@@ -41,7 +41,7 @@ fn check_fixture(name: &str) {
         );
     }
     // Invariant (spec §9): no raw inference tail-variable tokens leak.
-    for bad in ["%r", "%e", "%s"] {
+    for bad in ["%r", "%e", "%s", "%t", "%v"] {
         assert!(
             !rendered.contains(bad),
             "diagnostic leaked internal token `{bad}`:\n{rendered}"
@@ -57,4 +57,24 @@ fn unresolved() {
 #[test]
 fn bad_builtin() {
     check_fixture("bad_builtin.elya");
+}
+
+#[test]
+fn type_mismatch() {
+    check_fixture("type_mismatch.elya");
+}
+
+#[test]
+fn occurs_check() {
+    check_fixture("occurs_check.elya");
+}
+
+#[test]
+fn bad_arity() {
+    check_fixture("bad_arity.elya");
+}
+
+#[test]
+fn non_bool_cond() {
+    check_fixture("non_bool_cond.elya");
 }

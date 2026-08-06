@@ -1,0 +1,5 @@
+pub fn main() {
+  let _ = if 1 { 2 } else { 3 }
+  io.println("x")
+}
+//~ ERROR[E0403] condition must be

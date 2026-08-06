@@ -1,0 +1,8 @@
+fn add(a, b) {
+  a + b
+}
+pub fn main() {
+  let _ = add(1)
+  io.println("x")
+}
+//~ ERROR[E0402] wrong number of arguments

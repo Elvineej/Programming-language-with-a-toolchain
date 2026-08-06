@@ -1,0 +1,4 @@
+fn f(x) {
+  x(x)
+}
+//~ ERROR[E0401] infinite type
