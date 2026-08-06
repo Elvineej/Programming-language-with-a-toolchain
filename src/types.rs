@@ -2,6 +2,7 @@
 
 use crate::diag::Diagnostic;
 use crate::span::Span;
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TyCon {
@@ -155,46 +156,78 @@ impl Default for Infer {
     }
 }
 
-// Placeholder until Task 2 adds the zonking printer; unify()'s mismatch arm
-// calls display_ty, which is defined in Task 2. For Task 1 we provide a minimal
-// version so the crate compiles and mismatch messages are readable.
+/// Render a type for humans: resolve (zonk) it, then name remaining free
+/// variables `a, b, c, …` per call — never an internal `t<number>` token.
 pub fn display_ty(inf: &Infer, t: &Ty) -> String {
-    fn go(t: &Ty, out: &mut String) {
-        match t {
-            Ty::Var(v) => out.push_str(&format!("t{v}")),
-            Ty::Base(TyCon::Int) => out.push_str("Int"),
-            Ty::Base(TyCon::Float) => out.push_str("Float"),
-            Ty::Base(TyCon::Bool) => out.push_str("Bool"),
-            Ty::Base(TyCon::Str) => out.push_str("String"),
-            Ty::Base(TyCon::Unit) => out.push_str("Unit"),
-            Ty::Fn(ps, r) => {
-                out.push_str("fn(");
-                for (i, p) in ps.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    go(p, out);
-                }
-                out.push_str(") -> ");
-                go(r, out);
-            }
-            Ty::Tuple(xs) => {
-                out.push('(');
-                for (i, x) in xs.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    go(x, out);
-                }
-                out.push(')');
-            }
-            Ty::Error => out.push_str("<error>"),
-        }
-    }
+    let mut names: HashMap<u32, String> = HashMap::new();
     let resolved = inf.resolve(t);
     let mut out = String::new();
-    go(&resolved, &mut out);
+    write_ty(&resolved, &mut names, &mut out);
     out
+}
+
+/// Render a scheme as `forall a b. <ty>` (or just the type when unquantified).
+pub fn display_scheme(inf: &Infer, s: &Scheme) -> String {
+    let mut names: HashMap<u32, String> = HashMap::new();
+    for v in &s.vars {
+        let n = letter(names.len());
+        names.insert(*v, n);
+    }
+    let resolved = inf.resolve(&s.ty);
+    let mut body = String::new();
+    write_ty(&resolved, &mut names, &mut body);
+    if s.vars.is_empty() {
+        body
+    } else {
+        let quant: Vec<String> = s.vars.iter().map(|v| names[v].clone()).collect();
+        format!("forall {}. {}", quant.join(" "), body)
+    }
+}
+
+fn letter(i: usize) -> String {
+    let c = (b'a' + (i % 26) as u8) as char;
+    if i < 26 {
+        c.to_string()
+    } else {
+        format!("{c}{}", i / 26)
+    }
+}
+
+fn write_ty(t: &Ty, names: &mut HashMap<u32, String>, out: &mut String) {
+    match t {
+        Ty::Var(v) => {
+            let next = names.len();
+            let name = names.entry(*v).or_insert_with(|| letter(next)).clone();
+            out.push_str(&name);
+        }
+        Ty::Base(TyCon::Int) => out.push_str("Int"),
+        Ty::Base(TyCon::Float) => out.push_str("Float"),
+        Ty::Base(TyCon::Bool) => out.push_str("Bool"),
+        Ty::Base(TyCon::Str) => out.push_str("String"),
+        Ty::Base(TyCon::Unit) => out.push_str("Unit"),
+        Ty::Fn(ps, r) => {
+            out.push_str("fn(");
+            for (i, p) in ps.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_ty(p, names, out);
+            }
+            out.push_str(") -> ");
+            write_ty(r, names, out);
+        }
+        Ty::Tuple(xs) => {
+            out.push('(');
+            for (i, x) in xs.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_ty(x, names, out);
+            }
+            out.push(')');
+        }
+        Ty::Error => out.push_str("<error>"),
+    }
 }
 
 #[cfg(test)]
@@ -244,5 +277,45 @@ mod tests {
         inf.unify(&a, &b, Span::EMPTY);
         assert_eq!(inf.diags.len(), 1);
         assert_eq!(inf.diags[0].code, "E0402");
+    }
+
+    #[test]
+    fn printer_names_free_vars_with_letters() {
+        let mut inf = Infer::new();
+        let a = inf.fresh();
+        let b = inf.fresh();
+        let t = Ty::Fn(vec![a.clone()], Box::new(b.clone()));
+        let out = display_ty(&inf, &t);
+        assert_eq!(out, "fn(a) -> b");
+        assert!(!out.contains('%'), "no internal token: {out}");
+        assert!(!out.contains("t0") && !out.contains("t1"), "no raw var id: {out}");
+    }
+
+    #[test]
+    fn printer_reuses_same_letter_for_same_var() {
+        let mut inf = Infer::new();
+        let a = inf.fresh();
+        let t = Ty::Fn(vec![a.clone()], Box::new(a.clone()));
+        assert_eq!(display_ty(&inf, &t), "fn(a) -> a");
+    }
+
+    #[test]
+    fn printer_resolves_bound_vars() {
+        let mut inf = Infer::new();
+        let a = inf.fresh();
+        inf.unify(&a, &Ty::int(), Span::EMPTY);
+        assert_eq!(display_ty(&inf, &a), "Int");
+    }
+
+    #[test]
+    fn scheme_prints_quantifiers() {
+        let mut inf = Infer::new();
+        let a = inf.fresh();
+        let Ty::Var(av) = a else { unreachable!() };
+        let s = Scheme {
+            vars: vec![av],
+            ty: Ty::Fn(vec![a.clone()], Box::new(a.clone())),
+        };
+        assert_eq!(display_scheme(&inf, &s), "forall a. fn(a) -> a");
     }
 }
