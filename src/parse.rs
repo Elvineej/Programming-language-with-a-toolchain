@@ -232,9 +232,16 @@ impl<'a> Parser<'a> {
                         self.recover_to_decl();
                     }
                 }
+                Some(TokenKind::KwEffect) => {
+                    if let Some(e) = self.effect_decl() {
+                        decls.push(e);
+                    } else {
+                        self.recover_to_decl();
+                    }
+                }
                 _ => {
                     let span = self.peek_span();
-                    self.error(span, "expected `import`, `fn`, or `pub fn`");
+                    self.error(span, "expected `import`, `fn`, `pub fn`, or `effect`");
                     self.recover_to_decl();
                 }
             }
@@ -243,6 +250,136 @@ impl<'a> Parser<'a> {
             }
         }
         Module { imports, decls }
+    }
+
+    fn effect_decl(&mut self) -> Option<Spanned<Decl>> {
+        let start = self.peek_span();
+        self.bump(); // effect
+        let name = match self.peek()?.clone() {
+            TokenKind::Upper(n) => {
+                self.bump();
+                n
+            }
+            _ => {
+                self.error(self.peek_span(), "expected effect name (uppercase)");
+                return None;
+            }
+        };
+        if !self.eat(&TokenKind::LBrace) {
+            self.error(self.peek_span(), "expected `{`");
+            return None;
+        }
+        let mut ops = Vec::new();
+        while self.peek() == Some(&TokenKind::KwFn) {
+            let op = self.op_sig()?;
+            ops.push(op);
+        }
+        let end = self.peek_span();
+        self.eat(&TokenKind::RBrace);
+        Some(spanned(
+            Decl::Effect(EffectDecl { name, ops }),
+            start.merge(end),
+        ))
+    }
+
+    fn op_sig(&mut self) -> Option<Spanned<OpSig>> {
+        let start = self.peek_span();
+        self.bump(); // fn
+        let name = match self.peek()?.clone() {
+            TokenKind::Lower(n) => {
+                self.bump();
+                n
+            }
+            _ => {
+                self.error(self.peek_span(), "expected operation name");
+                return None;
+            }
+        };
+        if !self.eat(&TokenKind::LParen) {
+            self.error(self.peek_span(), "expected `(`");
+            return None;
+        }
+        let mut params = Vec::new();
+        let mut param_tys = Vec::new();
+        if self.peek() != Some(&TokenKind::RParen) {
+            loop {
+                let pspan = self.peek_span();
+                let pname = match self.peek()?.clone() {
+                    TokenKind::Lower(n) => {
+                        self.bump();
+                        n
+                    }
+                    _ => {
+                        self.error(pspan, "expected parameter name");
+                        return None;
+                    }
+                };
+                if !self.eat(&TokenKind::Colon) {
+                    self.error(self.peek_span(), "operation params need a type");
+                    return None;
+                }
+                let ty = self.type_ann()?;
+                params.push(spanned(Param { name: pname }, pspan));
+                param_tys.push(ty);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        if !self.eat(&TokenKind::RParen) {
+            self.error(self.peek_span(), "expected `)`");
+            return None;
+        }
+        if !self.eat(&TokenKind::Arrow) {
+            self.error(self.peek_span(), "operation needs a return type `-> T`");
+            return None;
+        }
+        let ret = self.type_ann()?;
+        let end = ret.span;
+        Some(spanned(
+            OpSig {
+                name,
+                params,
+                param_tys,
+                ret,
+            },
+            start.merge(end),
+        ))
+    }
+
+    fn type_ann(&mut self) -> Option<Spanned<TypeAnn>> {
+        let span = self.peek_span();
+        let name = match self.peek()?.clone() {
+            TokenKind::Upper(n) => {
+                self.bump();
+                n
+            }
+            TokenKind::Unit => {
+                self.bump();
+                "Unit".to_string()
+            }
+            TokenKind::Lower(n) => {
+                self.bump();
+                n // type variable
+            }
+            _ => {
+                self.error(span, "expected a type");
+                return None;
+            }
+        };
+        let mut args = Vec::new();
+        if self.eat(&TokenKind::LParen) {
+            if self.peek() != Some(&TokenKind::RParen) {
+                loop {
+                    args.push(self.type_ann()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.eat(&TokenKind::RParen);
+        }
+        Some(spanned(TypeAnn { name, args }, span))
     }
 
     fn import(&mut self) -> Option<Spanned<Import>> {
@@ -490,7 +627,10 @@ impl<'a> Parser<'a> {
     fn recover_to_decl(&mut self) {
         // Synchronize: skip tokens until a declaration keyword or EOF.
         while let Some(k) = self.peek() {
-            if matches!(k, TokenKind::KwFn | TokenKind::KwPub | TokenKind::KwImport) {
+            if matches!(
+                k,
+                TokenKind::KwFn | TokenKind::KwPub | TokenKind::KwImport | TokenKind::KwEffect
+            ) {
                 return;
             }
             self.bump();
@@ -592,6 +732,21 @@ mod tests {
             crate::ast::pretty(&m),
             "(module (fn f () (block (let x 1) (if x (block 2) (block 3)))))"
         );
+    }
+
+    #[test]
+    fn parses_effect_declaration() {
+        let src = "effect Log {\n  fn log(msg: String) -> Unit\n}\n";
+        let (m, d) = parse_module(&Session::new(), src);
+        assert!(d.is_empty(), "diags: {d:?}");
+        assert_eq!(crate::ast::pretty(&m), "(module (effect Log (log)))");
+        let Decl::Effect(e) = &m.decls[0].node else {
+            panic!("expected effect")
+        };
+        assert_eq!(e.name, "Log");
+        assert_eq!(e.ops[0].node.name, "log");
+        assert_eq!(e.ops[0].node.param_tys[0].node.name, "String");
+        assert_eq!(e.ops[0].node.ret.node.name, "Unit");
     }
 
     #[test]
