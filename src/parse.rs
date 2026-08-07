@@ -576,8 +576,9 @@ mod tests {
             crate::ast::pretty(&m),
             r#"(module (fn main () (block (call io.println "Hello, Elya!"))))"#
         );
-        // `Decl` has a single variant in Slice 1, so this binding is irrefutable.
-        let Decl::Fn(f) = &m.decls[0].node;
+        let Decl::Fn(f) = &m.decls[0].node else {
+            panic!("expected fn")
+        };
         assert_eq!(f.effect_row, vec!["IO".to_string()]);
         assert!(f.is_pub);
     }
@@ -602,9 +603,9 @@ mod tests {
         let names: Vec<_> = m
             .decls
             .iter()
-            .map(|d| {
-                let Decl::Fn(f) = &d.node;
-                f.name.clone()
+            .filter_map(|d| match &d.node {
+                Decl::Fn(f) => Some(f.name.clone()),
+                Decl::Effect(_) => None,
             })
             .collect();
         assert!(names.contains(&"ok".to_string()), "names: {names:?}");

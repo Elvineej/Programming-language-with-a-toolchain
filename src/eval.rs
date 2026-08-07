@@ -72,8 +72,9 @@ pub type Fns<'a> = HashMap<&'a str, &'a FnDecl>;
 pub fn fn_table<'a>(module: &'a Module) -> Fns<'a> {
     let mut m = HashMap::new();
     for d in &module.decls {
-        let Decl::Fn(f) = &d.node;
-        m.insert(f.name.as_str(), f);
+        if let Decl::Fn(f) = &d.node {
+            m.insert(f.name.as_str(), f);
+        }
     }
     m
 }
@@ -282,6 +283,9 @@ pub mod tree {
                 }
                 let call_env = Env::new().extend(&bindings);
                 eval_block(interp, &fdecl.body.node, &call_env, fns)
+            }
+            Expr::Handle { .. } | Expr::Resume { .. } => {
+                Err(rt(span, "effects are not evaluated yet (Slice 3c)"))
             }
         }
     }
@@ -553,6 +557,9 @@ pub mod cek {
                         None => return Err(rt(span, "builtin called with no arguments")),
                     },
                 }
+            }
+            Expr::Handle { .. } | Expr::Resume { .. } => {
+                return Err(rt(span, "effects are not evaluated yet (Slice 3c)"))
             }
         })
     }

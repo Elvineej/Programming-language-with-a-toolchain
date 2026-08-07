@@ -18,6 +18,7 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
             Decl::Fn(f) => {
                 fn_names.insert(f.name.clone());
             }
+            Decl::Effect(_) => {} // operations registered in Task 5
         }
     }
     let mut cx = Cx {
@@ -33,6 +34,7 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
                 }
                 cx.check_block(&f.body.node, &mut scope);
             }
+            Decl::Effect(_) => {} // effect operation bodies are just signatures
         }
     }
     cx.diags
@@ -106,6 +108,9 @@ impl Cx<'_> {
                 self.check_block(&else_block.node, scope);
             }
             Expr::Block(b) => self.check_block(b, scope),
+            // Provisional (Task 5 adds operation/resume resolution + clause scoping).
+            Expr::Handle { body, .. } => self.check_expr(&body.node, body.span, scope),
+            Expr::Resume { arg } => self.check_expr(&arg.node, arg.span, scope),
         }
     }
 }

@@ -18,6 +18,7 @@ pub struct Import {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Decl {
     Fn(FnDecl),
+    Effect(EffectDecl),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -33,6 +34,52 @@ pub struct FnDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Param {
     pub name: String,
+}
+
+/// A surface type annotation. Slice 3a: base names (`Int`, `String`, `Unit`, …)
+/// with optional args (for future generic types). Retained for effect operation
+/// signatures so Slice 3b's type checker has them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeAnn {
+    pub name: String,
+    pub args: Vec<Spanned<TypeAnn>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpSig {
+    pub name: String,
+    pub params: Vec<Spanned<Param>>,
+    pub param_tys: Vec<Spanned<TypeAnn>>,
+    pub ret: Spanned<TypeAnn>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectDecl {
+    pub name: String,
+    pub ops: Vec<Spanned<OpSig>>,
+}
+
+/// One operation clause in a handler: `Effect.op(params) -> body`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpClause {
+    pub effect: Option<String>,
+    pub op: String,
+    pub params: Vec<Spanned<Param>>,
+    pub body: Rc<Spanned<Expr>>,
+}
+
+/// The optional `return(x) -> body` clause of a handler.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReturnClause {
+    pub binder: String,
+    pub body: Rc<Spanned<Expr>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Handler {
+    pub multi: bool,
+    pub clauses: Vec<Spanned<OpClause>>,
+    pub ret: Option<ReturnClause>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,6 +125,13 @@ pub enum Expr {
         else_block: Rc<Spanned<Block>>,
     },
     Block(Block),
+    Handle {
+        body: Rc<Spanned<Expr>>,
+        handler: Rc<Handler>,
+    },
+    Resume {
+        arg: Rc<Spanned<Expr>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +190,13 @@ fn pretty_decl(d: &Decl, s: &mut String) {
             }
             s.push_str(") ");
             pretty_block(&f.body.node, s);
+            s.push(')');
+        }
+        Decl::Effect(e) => {
+            s.push_str(&format!("(effect {}", e.name));
+            for op in &e.ops {
+                s.push_str(&format!(" ({})", op.node.name));
+            }
             s.push(')');
         }
     }
@@ -205,6 +266,35 @@ fn pretty_expr(e: &Expr, s: &mut String) {
             s.push(')');
         }
         Expr::Block(b) => pretty_block(b, s),
+        Expr::Handle { body, handler } => {
+            s.push_str("(handle ");
+            pretty_expr(&body.node, s);
+            for c in &handler.clauses {
+                let c = &c.node;
+                let eff = c.effect.clone().unwrap_or_default();
+                s.push_str(&format!(" ({}.{} (", eff, c.op));
+                for (i, p) in c.params.iter().enumerate() {
+                    if i > 0 {
+                        s.push(' ');
+                    }
+                    s.push_str(&p.node.name);
+                }
+                s.push_str(") ");
+                pretty_expr(&c.body.node, s);
+                s.push(')');
+            }
+            if let Some(r) = &handler.ret {
+                s.push_str(&format!(" (return {} ", r.binder));
+                pretty_expr(&r.body.node, s);
+                s.push(')');
+            }
+            s.push(')');
+        }
+        Expr::Resume { arg } => {
+            s.push_str("(resume ");
+            pretty_expr(&arg.node, s);
+            s.push(')');
+        }
     }
 }
 
@@ -268,5 +358,65 @@ mod tests {
             }))],
         };
         assert_eq!(pretty(&m), "(module (fn f () (block (+ 1 2))))");
+    }
+
+    #[test]
+    fn pretty_prints_effect_decl_and_handle() {
+        // effect Log { fn log(msg: String) -> Unit }
+        let eff = Decl::Effect(EffectDecl {
+            name: "Log".into(),
+            ops: vec![sp(OpSig {
+                name: "log".into(),
+                params: vec![sp(Param { name: "msg".into() })],
+                param_tys: vec![sp(TypeAnn {
+                    name: "String".into(),
+                    args: vec![],
+                })],
+                ret: sp(TypeAnn {
+                    name: "Unit".into(),
+                    args: vec![],
+                }),
+            })],
+        });
+        // handle x with { Log.log(m) -> resume(m) return(r) -> r }
+        let handler = Handler {
+            multi: false,
+            clauses: vec![sp(OpClause {
+                effect: Some("Log".into()),
+                op: "log".into(),
+                params: vec![sp(Param { name: "m".into() })],
+                body: Rc::new(sp(Expr::Resume {
+                    arg: Rc::new(sp(Expr::Var("m".into()))),
+                })),
+            })],
+            ret: Some(ReturnClause {
+                binder: "r".into(),
+                body: Rc::new(sp(Expr::Var("r".into()))),
+            }),
+        };
+        let handle = Expr::Handle {
+            body: Rc::new(sp(Expr::Var("x".into()))),
+            handler: Rc::new(handler),
+        };
+        let m = Module {
+            imports: vec![],
+            decls: vec![
+                sp(eff),
+                sp(Decl::Fn(FnDecl {
+                    is_pub: false,
+                    name: "f".into(),
+                    params: vec![],
+                    effect_row: vec![],
+                    body: Rc::new(sp(Block {
+                        stmts: vec![].into(),
+                        tail: Some(Rc::new(sp(handle))),
+                    })),
+                })),
+            ],
+        };
+        assert_eq!(
+            pretty(&m),
+            "(module (effect Log (log)) (fn f () (block (handle x (Log.log (m) (resume m)) (return r r)))))"
+        );
     }
 }

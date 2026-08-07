@@ -353,6 +353,13 @@ impl Infer {
             }
             Expr::Block(b) => self.infer_block(b, env),
             Expr::Call { callee, args } => self.infer_call(callee, args, span, env),
+            Expr::Handle { .. } | Expr::Resume { .. } => {
+                self.diags.push(
+                    Diagnostic::error("E0499", "effects are not type-checked yet (Slice 3b)")
+                        .with_label(span, "unsupported here"),
+                );
+                Ty::Error
+            }
         }
     }
 
@@ -474,9 +481,9 @@ pub fn infer_schemes(
     let fns: Vec<&FnDecl> = module
         .decls
         .iter()
-        .map(|d| {
-            let Decl::Fn(f) = &d.node;
-            f
+        .filter_map(|d| match &d.node {
+            Decl::Fn(f) => Some(f),
+            Decl::Effect(_) => None,
         })
         .collect();
     let name_idx: HashMap<&str, usize> = fns
