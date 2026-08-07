@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+# Block commits that aren't rustfmt-clean. Cargo isn't on the default PATH here,
+# so prepend the user cargo bin (see project memory: cargo-on-windows-path).
+export PATH="$HOME/.cargo/bin:$PATH"
+if ! cargo fmt --all -- --check; then
+  echo "pre-commit: rustfmt check failed — run 'cargo fmt --all' and re-stage." >&2
+  exit 1
+fi
