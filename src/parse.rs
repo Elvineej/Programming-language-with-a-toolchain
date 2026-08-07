@@ -119,6 +119,7 @@ impl<'a> Parser<'a> {
         let span = self.peek_span();
         match self.peek()?.clone() {
             TokenKind::KwIf => self.if_expr(),
+            TokenKind::KwHandle => self.handle_expr(),
             TokenKind::LBrace => self.block_expr(),
             TokenKind::Int(n) => {
                 self.bump();
@@ -177,6 +178,21 @@ impl<'a> Parser<'a> {
                     return None;
                 }
                 Some(e)
+            }
+            // `resume` is contextually reserved: `resume(EXPR)` is a dedicated node.
+            TokenKind::Lower(ref n) if n == "resume" => {
+                self.bump(); // resume
+                if !self.eat(&TokenKind::LParen) {
+                    self.error(self.peek_span(), "expected `(` after `resume`");
+                    return None;
+                }
+                let arg = self.expr(0)?;
+                let end = self.peek_span();
+                if !self.eat(&TokenKind::RParen) {
+                    self.error(end, "expected `)`");
+                    return None;
+                }
+                Some(spanned(Expr::Resume { arg: Rc::new(arg) }, span.merge(end)))
             }
             TokenKind::Lower(name) => {
                 self.bump();
@@ -380,6 +396,146 @@ impl<'a> Parser<'a> {
             self.eat(&TokenKind::RParen);
         }
         Some(spanned(TypeAnn { name, args }, span))
+    }
+
+    fn handle_expr(&mut self) -> Option<Spanned<Expr>> {
+        let start = self.peek_span();
+        self.bump(); // handle
+        let body = self.expr(0)?;
+        if !self.eat(&TokenKind::KwWith) {
+            self.error(self.peek_span(), "expected `with`");
+            return None;
+        }
+        let multi = self.eat(&TokenKind::KwMulti);
+        if !self.eat(&TokenKind::LBrace) {
+            self.error(self.peek_span(), "expected `{`");
+            return None;
+        }
+        let mut clauses = Vec::new();
+        let mut ret = None;
+        while self.peek().is_some() && self.peek() != Some(&TokenKind::RBrace) {
+            if self.peek() == Some(&TokenKind::KwReturn) {
+                self.bump(); // return
+                if !self.eat(&TokenKind::LParen) {
+                    self.error(self.peek_span(), "expected `(`");
+                    return None;
+                }
+                let binder = match self.peek()?.clone() {
+                    TokenKind::Lower(n) => {
+                        self.bump();
+                        n
+                    }
+                    _ => {
+                        self.error(self.peek_span(), "expected binder");
+                        return None;
+                    }
+                };
+                if !self.eat(&TokenKind::RParen) {
+                    self.error(self.peek_span(), "expected `)`");
+                    return None;
+                }
+                if !self.eat(&TokenKind::Arrow) {
+                    self.error(self.peek_span(), "expected `->`");
+                    return None;
+                }
+                let body_r = self.expr(0)?;
+                ret = Some(ReturnClause {
+                    binder,
+                    body: Rc::new(body_r),
+                });
+            } else {
+                let c = self.op_clause()?;
+                clauses.push(c);
+            }
+        }
+        let end = self.peek_span();
+        self.eat(&TokenKind::RBrace);
+        Some(spanned(
+            Expr::Handle {
+                body: Rc::new(body),
+                handler: Rc::new(Handler {
+                    multi,
+                    clauses,
+                    ret,
+                }),
+            },
+            start.merge(end),
+        ))
+    }
+
+    fn op_clause(&mut self) -> Option<Spanned<OpClause>> {
+        let start = self.peek_span();
+        // `Effect.op(params)` (Effect optional: `op(params)`)
+        let (effect, op) = match self.peek()?.clone() {
+            TokenKind::Upper(eff) => {
+                self.bump();
+                if !self.eat(&TokenKind::Dot) {
+                    self.error(self.peek_span(), "expected `.` after effect name");
+                    return None;
+                }
+                let op = match self.peek()?.clone() {
+                    TokenKind::Lower(o) => {
+                        self.bump();
+                        o
+                    }
+                    _ => {
+                        self.error(self.peek_span(), "expected operation name");
+                        return None;
+                    }
+                };
+                (Some(eff), op)
+            }
+            TokenKind::Lower(o) => {
+                self.bump();
+                (None, o)
+            }
+            _ => {
+                self.error(self.peek_span(), "expected `Effect.op` clause");
+                return None;
+            }
+        };
+        if !self.eat(&TokenKind::LParen) {
+            self.error(self.peek_span(), "expected `(`");
+            return None;
+        }
+        let mut params = Vec::new();
+        if self.peek() != Some(&TokenKind::RParen) {
+            loop {
+                let pspan = self.peek_span();
+                match self.peek()?.clone() {
+                    TokenKind::Lower(n) => {
+                        self.bump();
+                        params.push(spanned(Param { name: n }, pspan));
+                    }
+                    _ => {
+                        self.error(pspan, "expected parameter name");
+                        return None;
+                    }
+                }
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        if !self.eat(&TokenKind::RParen) {
+            self.error(self.peek_span(), "expected `)`");
+            return None;
+        }
+        if !self.eat(&TokenKind::Arrow) {
+            self.error(self.peek_span(), "expected `->`");
+            return None;
+        }
+        let body = self.expr(0)?;
+        let end = body.span;
+        Some(spanned(
+            OpClause {
+                effect,
+                op,
+                params,
+                body: Rc::new(body),
+            },
+            start.merge(end),
+        ))
     }
 
     fn import(&mut self) -> Option<Spanned<Import>> {
@@ -747,6 +903,32 @@ mod tests {
         assert_eq!(e.ops[0].node.name, "log");
         assert_eq!(e.ops[0].node.param_tys[0].node.name, "String");
         assert_eq!(e.ops[0].node.ret.node.name, "Unit");
+    }
+
+    #[test]
+    fn parses_handle_with_resume_and_return() {
+        let src = "fn f() {\n  handle g() with {\n    Log.log(m) -> resume(m)\n    return(r) -> r\n  }\n}\n";
+        let (m, d) = parse_module(&Session::new(), src);
+        assert!(d.is_empty(), "diags: {d:?}");
+        assert_eq!(
+            crate::ast::pretty(&m),
+            "(module (fn f () (block (handle (call g) (Log.log (m) (resume m)) (return r r)))))"
+        );
+    }
+
+    #[test]
+    fn parses_multi_handler() {
+        let src = "fn f() {\n  handle g() with multi {\n    Flip.flip() -> resume(True)\n  }\n}\n";
+        let (m, d) = parse_module(&Session::new(), src);
+        assert!(d.is_empty(), "diags: {d:?}");
+        let Decl::Fn(f) = &m.decls[0].node else {
+            panic!("expected fn")
+        };
+        let tail = f.body.node.tail.as_ref().unwrap();
+        let Expr::Handle { handler, .. } = &tail.node else {
+            panic!("expected handle")
+        };
+        assert!(handler.multi);
     }
 
     #[test]
