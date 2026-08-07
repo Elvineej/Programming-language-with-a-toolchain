@@ -92,6 +92,8 @@ Known sites to change to `.iter()`: `resolve::check_block`/`check_expr` (stmts, 
 Run: `cargo fmt --all && sh scripts/check.sh` (with `~/.cargo/bin` on PATH).
 Expected: **all existing tests pass** (43 lib + arch + crosscheck + examples + tce + type_schemes + types + ui), fmt clean, clippy `-D warnings` clean. Behavior is unchanged — this is the pre-flagged behavior-preserving change. If anything fails, it is a mechanical miss (a `Box::new` left, or a `&rc_slice` needing `.iter()`); fix it.
 
+**Strict gate (review-confirmed):** existing test *assertions/expectations are never edited to make them pass.* The **only** permitted edit to an existing test is the forced *construction-syntax* fix in `ast::tests::pretty_prints_binary_expr`, which builds nodes directly (`Box::new`→`Rc::new`, `vec![…]` used as `stmts`/`tail`→`Rc::from(...)`/`Rc::new(...)`) — its asserted `pretty(&m)` string stays **byte-identical**. Every other test (all parser-produced-AST tests) passes untouched. If any test's *expected output* would need changing, that is a behavior change and a bug in this task, not an accommodation.
+
 - [ ] **Step 6: Commit + push**
 
 ```bash
@@ -673,6 +675,31 @@ fn full_effect_program_parses_and_resolves_clean() {
                  handle greet(\"ada\") with {\n\
                    Log.log(m) -> { io.println(m) resume(Unit) }\n\
                    return(x) -> x\n\
+                 }\n\
+               }\n";
+    assert!(parse_resolve(src).is_empty(), "resolve diags: {:?}", parse_resolve(src));
+}
+
+#[test]
+fn multi_handler_parses_and_resolves() {
+    // Prove the `with multi` shape at parse+resolve now, so when 3d turns on
+    // multi-shot semantics the only new variable is the machine.
+    let src = "effect Flip { fn flip() -> Bool }\n\
+               fn choose() / {Flip} -> String { if flip() { \"a\" } else { \"b\" } }\n\
+               fn f() { handle choose() with multi { Flip.flip() -> resume(True) return(x) -> x } }\n";
+    assert!(parse_resolve(src).is_empty(), "resolve diags: {:?}", parse_resolve(src));
+}
+
+#[test]
+fn nested_handlers_parse_and_resolve() {
+    // Prove the nested-handler shape at parse+resolve now (innermost-matching is
+    // a 3c semantics concern; the syntax/scoping must already be correct).
+    let src = "effect Log { fn log(m: String) -> Unit }\n\
+               effect Exn { fn fail() -> Unit }\n\
+               fn g() { Unit }\n\
+               fn f() {\n\
+                 handle (handle g() with { Exn.fail() -> Unit }) with {\n\
+                   Log.log(m) -> resume(Unit)\n\
                  }\n\
                }\n";
     assert!(parse_resolve(src).is_empty(), "resolve diags: {:?}", parse_resolve(src));
