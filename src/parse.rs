@@ -608,11 +608,12 @@ impl<'a> Parser<'a> {
             self.error(self.peek_span(), "expected `)`");
             return None;
         }
-        // optional effect row: `/ { Name, Name }`
+        // optional effect row: `/ { Name, Name }`. `None` distinguishes an
+        // absent annotation (infer the row) from an explicit pure `/ {}`.
         let effect_row = if self.eat(&TokenKind::Slash) {
-            self.effect_row()
+            Some(self.effect_row())
         } else {
-            Vec::new()
+            None
         };
         // optional return type: `-> Type`
         if self.eat(&TokenKind::Arrow) {
@@ -632,8 +633,8 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    /// Parse `{ Name, Name }` after `/`, keeping only effect head names.
-    fn effect_row(&mut self) -> Vec<String> {
+    /// Parse `{ Name, Name }` after `/`, keeping effect head names with spans.
+    fn effect_row(&mut self) -> Vec<Spanned<String>> {
         let mut names = Vec::new();
         if !self.eat(&TokenKind::LBrace) {
             self.error(self.peek_span(), "expected `{` for effect row");
@@ -641,6 +642,7 @@ impl<'a> Parser<'a> {
         }
         if self.peek() != Some(&TokenKind::RBrace) {
             loop {
+                let lspan = self.peek_span();
                 match self.peek().cloned() {
                     Some(TokenKind::Upper(n)) => {
                         self.bump();
@@ -648,7 +650,7 @@ impl<'a> Parser<'a> {
                         if self.eat(&TokenKind::LParen) {
                             self.skip_balanced_parens();
                         }
-                        names.push(n);
+                        names.push(spanned(n, lspan));
                     }
                     _ => {
                         self.error(self.peek_span(), "expected effect name");
@@ -875,8 +877,33 @@ mod tests {
         let Decl::Fn(f) = &m.decls[0].node else {
             panic!("expected fn")
         };
-        assert_eq!(f.effect_row, vec!["IO".to_string()]);
+        let labels: Vec<&str> = f
+            .effect_row
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|l| l.node.as_str())
+            .collect();
+        assert_eq!(labels, ["IO"]);
         assert!(f.is_pub);
+    }
+
+    #[test]
+    fn distinguishes_absent_from_explicit_pure_row() {
+        let (m1, _) = parse_module(&Session::new(), "fn f() { 1 }\n");
+        let Decl::Fn(f1) = &m1.decls[0].node else {
+            panic!("expected fn")
+        };
+        assert!(f1.effect_row.is_none(), "unannotated => None");
+        let (m2, _) = parse_module(&Session::new(), "fn f() / {} { 1 }\n");
+        let Decl::Fn(f2) = &m2.decls[0].node else {
+            panic!("expected fn")
+        };
+        assert_eq!(
+            f2.effect_row.as_ref().map(|r| r.len()),
+            Some(0),
+            "explicit pure => Some([])"
+        );
     }
 
     #[test]
