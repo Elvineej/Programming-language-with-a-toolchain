@@ -50,7 +50,7 @@ impl Cx<'_> {
 
     fn check_block(&mut self, b: &Block, scope: &mut Vec<HashSet<String>>) {
         scope.push(HashSet::new());
-        for st in &b.stmts {
+        for st in b.stmts.iter() {
             match &st.node {
                 Stmt::Let { name, value } => {
                     self.check_expr(&value.node, value.span, scope);
@@ -87,7 +87,7 @@ impl Cx<'_> {
             }
             Expr::Call { callee, args } => {
                 self.check_expr(&callee.node, callee.span, scope);
-                for a in args {
+                for a in args.iter() {
                     self.check_expr(&a.node, a.span, scope);
                 }
             }

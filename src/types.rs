@@ -281,7 +281,7 @@ impl Infer {
 
     pub fn infer_block(&mut self, b: &Block, env: &mut TyEnv) -> Ty {
         env.push();
-        for st in &b.stmts {
+        for st in b.stmts.iter() {
             match &st.node {
                 Stmt::Let { name, value } => {
                     let t = self.infer_expr(value, env);
@@ -549,7 +549,7 @@ pub fn infer_schemes(
 }
 
 fn collect_refs(b: &Block, acc: &mut Vec<String>) {
-    for st in &b.stmts {
+    for st in b.stmts.iter() {
         match &st.node {
             Stmt::Let { value, .. } => collect_refs_expr(&value.node, acc),
             Stmt::Expr(e) => collect_refs_expr(&e.node, acc),
@@ -565,7 +565,7 @@ fn collect_refs_expr(e: &Expr, acc: &mut Vec<String>) {
         Expr::Var(n) => acc.push(n.clone()),
         Expr::Call { callee, args } => {
             collect_refs_expr(&callee.node, acc);
-            for a in args {
+            for a in args.iter() {
                 collect_refs_expr(&a.node, acc);
             }
         }

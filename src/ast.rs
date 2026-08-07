@@ -1,6 +1,7 @@
 //! Abstract syntax tree (Slice 1 subset). Every node is `Spanned`.
 
 use crate::span::Spanned;
+use std::rc::Rc;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Module {
@@ -26,7 +27,7 @@ pub struct FnDecl {
     pub params: Vec<Spanned<Param>>,
     /// Slice 1 retains only effect head names; the type checker arrives in Slice 2.
     pub effect_row: Vec<String>,
-    pub body: Spanned<Block>,
+    pub body: Rc<Spanned<Block>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -36,8 +37,8 @@ pub struct Param {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Block {
-    pub stmts: Vec<Spanned<Stmt>>,
-    pub tail: Option<Box<Spanned<Expr>>>,
+    pub stmts: Rc<[Spanned<Stmt>]>,
+    pub tail: Option<Rc<Spanned<Expr>>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -59,22 +60,22 @@ pub enum Expr {
         name: String,
     },
     Call {
-        callee: Box<Spanned<Expr>>,
-        args: Vec<Spanned<Expr>>,
+        callee: Rc<Spanned<Expr>>,
+        args: Rc<[Spanned<Expr>]>,
     },
     Unary {
         op: UnOp,
-        expr: Box<Spanned<Expr>>,
+        expr: Rc<Spanned<Expr>>,
     },
     Binary {
         op: BinOp,
-        lhs: Box<Spanned<Expr>>,
-        rhs: Box<Spanned<Expr>>,
+        lhs: Rc<Spanned<Expr>>,
+        rhs: Rc<Spanned<Expr>>,
     },
     If {
-        cond: Box<Spanned<Expr>>,
-        then_block: Spanned<Block>,
-        else_block: Spanned<Block>,
+        cond: Rc<Spanned<Expr>>,
+        then_block: Rc<Spanned<Block>>,
+        else_block: Rc<Spanned<Block>>,
     },
     Block(Block),
 }
@@ -142,7 +143,7 @@ fn pretty_decl(d: &Decl, s: &mut String) {
 
 fn pretty_block(b: &Block, s: &mut String) {
     s.push_str("(block");
-    for st in &b.stmts {
+    for st in b.stmts.iter() {
         s.push(' ');
         match &st.node {
             Stmt::Let { name, value } => {
@@ -172,7 +173,7 @@ fn pretty_expr(e: &Expr, s: &mut String) {
         Expr::Call { callee, args } => {
             s.push_str("(call ");
             pretty_expr(&callee.node, s);
-            for a in args {
+            for a in args.iter() {
                 s.push(' ');
                 pretty_expr(&a.node, s);
             }
@@ -250,8 +251,8 @@ mod tests {
     fn pretty_prints_binary_expr() {
         let e = Expr::Binary {
             op: BinOp::Add,
-            lhs: Box::new(sp(Expr::Int(1))),
-            rhs: Box::new(sp(Expr::Int(2))),
+            lhs: Rc::new(sp(Expr::Int(1))),
+            rhs: Rc::new(sp(Expr::Int(2))),
         };
         let m = Module {
             imports: vec![],
@@ -260,10 +261,10 @@ mod tests {
                 name: "f".into(),
                 params: vec![],
                 effect_row: vec![],
-                body: sp(Block {
-                    stmts: vec![],
-                    tail: Some(Box::new(sp(e))),
-                }),
+                body: Rc::new(sp(Block {
+                    stmts: vec![].into(),
+                    tail: Some(Rc::new(sp(e))),
+                })),
             }))],
         };
         assert_eq!(pretty(&m), "(module (fn f () (block (+ 1 2))))");

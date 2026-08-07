@@ -5,6 +5,7 @@ use crate::diag::Diagnostic;
 use crate::lex::{lex, Token, TokenKind};
 use crate::span::{spanned, Span, Spanned};
 use crate::Session;
+use std::rc::Rc;
 
 struct Parser<'a> {
     tokens: &'a [Token],
@@ -78,8 +79,8 @@ impl<'a> Parser<'a> {
             lhs = spanned(
                 Expr::Binary {
                     op,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
+                    lhs: Rc::new(lhs),
+                    rhs: Rc::new(rhs),
                 },
                 span,
             );
@@ -107,8 +108,8 @@ impl<'a> Parser<'a> {
         }
         Some(spanned(
             Expr::Call {
-                callee: Box::new(callee),
-                args,
+                callee: Rc::new(callee),
+                args: args.into(),
             },
             start.merge(end),
         ))
@@ -150,7 +151,7 @@ impl<'a> Parser<'a> {
                 Some(spanned(
                     Expr::Unary {
                         op: UnOp::Neg,
-                        expr: Box::new(e),
+                        expr: Rc::new(e),
                     },
                     s,
                 ))
@@ -162,7 +163,7 @@ impl<'a> Parser<'a> {
                 Some(spanned(
                     Expr::Unary {
                         op: UnOp::Not,
-                        expr: Box::new(e),
+                        expr: Rc::new(e),
                     },
                     s,
                 ))
@@ -332,7 +333,7 @@ impl<'a> Parser<'a> {
                 name,
                 params,
                 effect_row,
-                body,
+                body: Rc::new(body),
             }),
             start.merge(end),
         ))
@@ -417,7 +418,7 @@ impl<'a> Parser<'a> {
             } else {
                 let e = self.expr(0)?;
                 if self.peek() == Some(&TokenKind::RBrace) {
-                    tail = Some(Box::new(e));
+                    tail = Some(e);
                 } else {
                     let span = e.span;
                     stmts.push(spanned(Stmt::Expr(e), span));
@@ -426,7 +427,13 @@ impl<'a> Parser<'a> {
         }
         let end = self.peek_span();
         self.eat(&TokenKind::RBrace);
-        Some(spanned(Block { stmts, tail }, start.merge(end)))
+        Some(spanned(
+            Block {
+                stmts: stmts.into(),
+                tail: tail.map(Rc::new),
+            },
+            start.merge(end),
+        ))
     }
 
     fn let_stmt(&mut self) -> Option<Spanned<Stmt>> {
@@ -467,9 +474,9 @@ impl<'a> Parser<'a> {
         let span = start.merge(else_block.span);
         Some(spanned(
             Expr::If {
-                cond: Box::new(cond),
-                then_block,
-                else_block,
+                cond: Rc::new(cond),
+                then_block: Rc::new(then_block),
+                else_block: Rc::new(else_block),
             },
             span,
         ))
