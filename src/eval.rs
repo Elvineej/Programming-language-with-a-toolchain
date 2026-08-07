@@ -304,11 +304,16 @@ pub mod cek {
         Value(Value),          // an evaluated callee (a Value::Fn)
     }
 
+    // Frames own their AST via cheap `Rc` clones (the 3a `Box`->`Rc` groundwork),
+    // so `Frame`/`Kont`/`State` are lifetime-free — a prerequisite for capturing a
+    // continuation into a first-class `Value` (Slice 3c). Sliced positions carry
+    // an `Rc<[_]>` plus a `usize` cursor (no per-step reslice), keeping the per-step
+    // cost O(1) so the pinned TCE depth is unchanged.
     #[derive(Clone)]
-    enum Frame<'a> {
+    enum Frame {
         BinRight {
             op: BinOp,
-            rhs: &'a Spanned<Expr>,
+            rhs: Rc<Spanned<Expr>>,
             env: Env,
             span: Span,
         },
@@ -322,46 +327,49 @@ pub mod cek {
             span: Span,
         },
         IfBranch {
-            then_blk: &'a Block,
-            else_blk: &'a Block,
+            then_blk: Rc<Spanned<Block>>,
+            else_blk: Rc<Spanned<Block>>,
             env: Env,
             span: Span,
         },
         LetCont {
-            name: &'a str,
-            rest: &'a [Spanned<Stmt>],
-            tail: Option<&'a Spanned<Expr>>,
+            name: String,
+            stmts: Rc<[Spanned<Stmt>]>,
+            cursor: usize,
+            tail: Option<Rc<Spanned<Expr>>>,
             env: Env,
         },
         SeqDrop {
-            rest: &'a [Spanned<Stmt>],
-            tail: Option<&'a Spanned<Expr>>,
+            stmts: Rc<[Spanned<Stmt>]>,
+            cursor: usize,
+            tail: Option<Rc<Spanned<Expr>>>,
             env: Env,
         },
         CallArgs {
             callee: CalleeSlot,
             done: Vec<Value>,
-            pending: &'a [Spanned<Expr>],
+            args: Rc<[Spanned<Expr>]>,
+            cursor: usize,
             env: Env,
             span: Span,
         },
     }
 
-    struct KontNode<'a> {
-        frame: Frame<'a>,
-        rest: Kont<'a>,
+    struct KontNode {
+        frame: Frame,
+        rest: Kont,
     }
     // Alias is non-recursive because the recursion goes through the named
     // `KontNode` struct (recursive type *aliases* are not allowed).
-    type Kont<'a> = Option<Rc<KontNode<'a>>>;
+    type Kont = Option<Rc<KontNode>>;
 
-    fn push<'a>(f: Frame<'a>, k: Kont<'a>) -> Kont<'a> {
+    fn push(f: Frame, k: Kont) -> Kont {
         Some(Rc::new(KontNode { frame: f, rest: k }))
     }
 
-    enum State<'a> {
-        Eval(&'a Spanned<Expr>, Env, Kont<'a>),
-        Return(Value, Kont<'a>),
+    enum State {
+        Eval(Rc<Spanned<Expr>>, Env, Kont),
+        Return(Value, Kont),
     }
 
     pub fn run_module(module: &Module) -> Result<Interp, RuntimeError> {
@@ -376,47 +384,55 @@ pub mod cek {
     }
 
     // A block's tail is in tail position: evaluating it does not add a frame.
-    fn eval_block_state<'a>(b: &'a Block, env: Env, k: Kont<'a>) -> State<'a> {
-        step_block(&b.stmts, b.tail.as_deref(), env, k)
+    fn eval_block_state(b: &Block, env: Env, k: Kont) -> State {
+        step_block(b.stmts.clone(), 0, b.tail.clone(), env, k)
     }
 
-    fn step_block<'a>(
-        stmts: &'a [Spanned<Stmt>],
-        tail: Option<&'a Spanned<Expr>>,
+    fn step_block(
+        stmts: Rc<[Spanned<Stmt>]>,
+        cursor: usize,
+        tail: Option<Rc<Spanned<Expr>>>,
         env: Env,
-        k: Kont<'a>,
-    ) -> State<'a> {
-        match stmts.split_first() {
-            None => match tail {
+        k: Kont,
+    ) -> State {
+        if cursor >= stmts.len() {
+            return match tail {
                 Some(t) => State::Eval(t, env, k), // tail position — no frame
                 None => State::Return(Value::Unit, k),
-            },
-            Some((st, rest)) => match &st.node {
-                Stmt::Let { name, value } => State::Eval(
-                    value,
-                    env.clone(),
-                    push(
-                        Frame::LetCont {
-                            name,
-                            rest,
-                            tail,
-                            env,
-                        },
-                        k,
-                    ),
+            };
+        }
+        match &stmts[cursor].node {
+            Stmt::Let { name, value } => State::Eval(
+                Rc::new(value.clone()),
+                env.clone(),
+                push(
+                    Frame::LetCont {
+                        name: name.clone(),
+                        stmts: stmts.clone(),
+                        cursor: cursor + 1,
+                        tail,
+                        env,
+                    },
+                    k,
                 ),
-                Stmt::Expr(e) => {
-                    State::Eval(e, env.clone(), push(Frame::SeqDrop { rest, tail, env }, k))
-                }
-            },
+            ),
+            Stmt::Expr(e) => State::Eval(
+                Rc::new(e.clone()),
+                env.clone(),
+                push(
+                    Frame::SeqDrop {
+                        stmts: stmts.clone(),
+                        cursor: cursor + 1,
+                        tail,
+                        env,
+                    },
+                    k,
+                ),
+            ),
         }
     }
 
-    fn run_loop<'a>(
-        interp: &mut Interp,
-        fns: &'a Fns<'a>,
-        mut st: State<'a>,
-    ) -> Result<(), RuntimeError> {
+    fn run_loop(interp: &mut Interp, fns: &Fns, mut st: State) -> Result<(), RuntimeError> {
         loop {
             interp.note_kont_depth(kont_len(kont_of(&st)));
             match step(interp, fns, st)? {
@@ -436,30 +452,21 @@ pub mod cek {
         n
     }
 
-    fn kont_of<'a, 'b>(st: &'b State<'a>) -> &'b Kont<'a> {
+    fn kont_of(st: &State) -> &Kont {
         match st {
             State::Eval(_, _, k) => k,
             State::Return(_, k) => k,
         }
     }
 
-    fn step<'a>(
-        interp: &mut Interp,
-        fns: &'a Fns<'a>,
-        st: State<'a>,
-    ) -> Result<Option<State<'a>>, RuntimeError> {
+    fn step(interp: &mut Interp, fns: &Fns, st: State) -> Result<Option<State>, RuntimeError> {
         match st {
-            State::Eval(e, env, k) => Ok(Some(eval(fns, e, env, k)?)),
+            State::Eval(e, env, k) => Ok(Some(eval(fns, &e, env, k)?)),
             State::Return(v, k) => ret(interp, fns, v, k),
         }
     }
 
-    fn eval<'a>(
-        fns: &'a Fns<'a>,
-        e: &'a Spanned<Expr>,
-        env: Env,
-        k: Kont<'a>,
-    ) -> Result<State<'a>, RuntimeError> {
+    fn eval(fns: &Fns, e: &Spanned<Expr>, env: Env, k: Kont) -> Result<State, RuntimeError> {
         let span = e.span;
         Ok(match &e.node {
             Expr::Int(n) => State::Return(Value::Int(*n), k),
@@ -481,15 +488,15 @@ pub mod cek {
                 return Err(rt(span, format!("`{module}.{name}` must be called")))
             }
             Expr::Unary { op, expr } => {
-                State::Eval(expr, env, push(Frame::UnApply { op: *op, span }, k))
+                State::Eval(expr.clone(), env, push(Frame::UnApply { op: *op, span }, k))
             }
             Expr::Binary { op, lhs, rhs } => State::Eval(
-                lhs,
+                lhs.clone(),
                 env.clone(),
                 push(
                     Frame::BinRight {
                         op: *op,
-                        rhs,
+                        rhs: rhs.clone(),
                         env,
                         span,
                     },
@@ -501,19 +508,19 @@ pub mod cek {
                 then_block,
                 else_block,
             } => State::Eval(
-                cond,
+                cond.clone(),
                 env.clone(),
                 push(
                     Frame::IfBranch {
-                        then_blk: &then_block.node,
-                        else_blk: &else_block.node,
+                        then_blk: then_block.clone(),
+                        else_blk: else_block.clone(),
                         env,
                         span,
                     },
                     k,
                 ),
             ),
-            Expr::Block(b) => step_block(&b.stmts, b.tail.as_deref(), env, k),
+            Expr::Block(b) => step_block(b.stmts.clone(), 0, b.tail.clone(), env, k),
             Expr::Call { callee, args } => {
                 let slot = match &callee.node {
                     Expr::Qualified { module, name } if module == "io" && name == "println" => {
@@ -526,36 +533,40 @@ pub mod cek {
                 };
                 match slot {
                     CalleeSlot::Pending => State::Eval(
-                        callee,
+                        callee.clone(),
                         env.clone(),
                         push(
                             Frame::CallArgs {
                                 callee: CalleeSlot::Pending,
                                 done: Vec::new(),
-                                pending: args,
+                                args: args.clone(),
+                                cursor: 0,
                                 env,
                                 span,
                             },
                             k,
                         ),
                     ),
-                    builtin => match args.split_first() {
-                        Some((first, rest)) => State::Eval(
-                            first,
+                    builtin => {
+                        if args.is_empty() {
+                            return Err(rt(span, "builtin called with no arguments"));
+                        }
+                        State::Eval(
+                            Rc::new(args[0].clone()),
                             env.clone(),
                             push(
                                 Frame::CallArgs {
                                     callee: builtin,
                                     done: Vec::new(),
-                                    pending: rest,
+                                    args: args.clone(),
+                                    cursor: 1,
                                     env,
                                     span,
                                 },
                                 k,
                             ),
-                        ),
-                        None => return Err(rt(span, "builtin called with no arguments")),
-                    },
+                        )
+                    }
                 }
             }
             Expr::Handle { .. } | Expr::Resume { .. } => {
@@ -564,12 +575,12 @@ pub mod cek {
         })
     }
 
-    fn ret<'a>(
+    fn ret(
         interp: &mut Interp,
-        fns: &'a Fns<'a>,
+        fns: &Fns,
         v: Value,
-        k: Kont<'a>,
-    ) -> Result<Option<State<'a>>, RuntimeError> {
+        k: Kont,
+    ) -> Result<Option<State>, RuntimeError> {
         let Some(node) = k else {
             return Ok(None); // final result; output already captured via io.println
         };
@@ -591,46 +602,50 @@ pub mod cek {
                 env,
                 span,
             } => match v {
-                Value::Bool(true) => eval_block_state(then_blk, env, rest),
-                Value::Bool(false) => eval_block_state(else_blk, env, rest),
+                Value::Bool(true) => eval_block_state(&then_blk.node, env, rest),
+                Value::Bool(false) => eval_block_state(&else_blk.node, env, rest),
                 _ => return Err(rt(span, "if condition must be a Bool")),
             },
             Frame::LetCont {
                 name,
-                rest: stmts,
+                stmts,
+                cursor,
                 tail,
                 env,
             } => {
-                let env2 = env.extend(&[(name.to_string(), v)]);
-                step_block(stmts, tail, env2, rest)
+                let env2 = env.extend(&[(name, v)]);
+                step_block(stmts, cursor, tail, env2, rest)
             }
             Frame::SeqDrop {
-                rest: stmts,
+                stmts,
+                cursor,
                 tail,
                 env,
-            } => step_block(stmts, tail, env, rest),
+            } => step_block(stmts, cursor, tail, env, rest),
             Frame::CallArgs {
                 callee,
                 done,
-                pending,
+                args,
+                cursor,
                 env,
                 span,
-            } => advance_call(interp, fns, v, callee, done, pending, env, span, rest)?,
+            } => advance_call(interp, fns, v, callee, done, args, cursor, env, span, rest)?,
         }))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn advance_call<'a>(
+    fn advance_call(
         interp: &mut Interp,
-        fns: &'a Fns<'a>,
+        fns: &Fns,
         v: Value,
         callee: CalleeSlot,
         mut done: Vec<Value>,
-        pending: &'a [Spanned<Expr>],
+        args: Rc<[Spanned<Expr>]>,
+        cursor: usize,
         env: Env,
         span: Span,
-        rest: Kont<'a>,
-    ) -> Result<State<'a>, RuntimeError> {
+        rest: Kont,
+    ) -> Result<State, RuntimeError> {
         // `v` is the callee value (if the slot was Pending) or the latest argument.
         let callee = match callee {
             CalleeSlot::Pending => CalleeSlot::Value(v),
@@ -639,34 +654,36 @@ pub mod cek {
                 other
             }
         };
-        match pending.split_first() {
-            Some((next, more)) => Ok(State::Eval(
-                next,
+        if cursor < args.len() {
+            Ok(State::Eval(
+                Rc::new(args[cursor].clone()),
                 env.clone(),
                 push(
                     Frame::CallArgs {
                         callee,
                         done,
-                        pending: more,
+                        args: args.clone(),
+                        cursor: cursor + 1,
                         env,
                         span,
                     },
                     rest,
                 ),
-            )),
+            ))
+        } else {
             // All args evaluated — apply. NO frame is pushed here (the TCE lever).
-            None => apply_callee(interp, fns, callee, done, span, rest),
+            apply_callee(interp, fns, callee, done, span, rest)
         }
     }
 
-    fn apply_callee<'a>(
+    fn apply_callee(
         interp: &mut Interp,
-        fns: &'a Fns<'a>,
+        fns: &Fns,
         callee: CalleeSlot,
         args: Vec<Value>,
         span: Span,
-        k: Kont<'a>,
-    ) -> Result<State<'a>, RuntimeError> {
+        k: Kont,
+    ) -> Result<State, RuntimeError> {
         match callee {
             CalleeSlot::Builtin("io.println") => {
                 let [Value::Str(s)] = &args[..] else {
