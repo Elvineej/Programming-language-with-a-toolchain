@@ -35,7 +35,11 @@ fn stages(src: &str) -> Stages {
 /// E0499 (at least one). This is the whole Slice 3a contract in one place.
 fn assert_reaches_e0499_gate(src: &str) {
     let st = stages(src);
-    assert!(st.parse.is_empty(), "unexpected parse diags: {:?}", st.parse);
+    assert!(
+        st.parse.is_empty(),
+        "unexpected parse diags: {:?}",
+        st.parse
+    );
     assert!(
         st.resolve.is_empty(),
         "unexpected resolve diags: {:?}",
