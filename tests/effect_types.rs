@@ -80,3 +80,34 @@ fn effect_propagates_through_a_call() {
     assert!(d.is_empty(), "{d:?}");
     assert_eq!(s["twice"], "fn() / {Log} -> Unit");
 }
+
+#[test]
+fn run_it_instantiates_at_different_effects() {
+    // The same row-polymorphic run_it is applied to a Log-performing function
+    // AND a pure one — parametric row polymorphism, no subtyping (spec §3.6).
+    let src = "effect Log { fn log(msg: String) -> Unit }\n\
+               fn run_it(g) { g() }\n\
+               fn noisy() { log(\"x\") }\n\
+               fn quiet() { 1 }\n\
+               fn use_both() { run_it(noisy) run_it(quiet) }\n";
+    let (s, d) = schemes(src);
+    assert!(d.is_empty(), "{d:?}");
+    // use_both performs {Log} (via run_it(noisy)); run_it(quiet) is pure.
+    assert_eq!(s["use_both"], "fn() / {Log} -> Int");
+}
+
+#[test]
+fn handled_effect_in_main_is_clean() {
+    // Discharge end-to-end: main handles the only user effect, so nothing
+    // escapes — no E0420 (contrast tests/ui/unhandled_effect.elya).
+    let src = "effect Log { fn log(msg: String) -> Unit }\n\
+               fn greet() { log(\"hi\") }\n\
+               pub fn main() {\n\
+                 handle greet() with { Log.log(m) -> resume(Unit) return(r) -> r }\n\
+               }\n";
+    let (_s, d) = schemes(src);
+    assert!(
+        d.is_empty(),
+        "handled effect should type-check clean: {d:?}"
+    );
+}
