@@ -26,8 +26,10 @@ pub struct FnDecl {
     pub is_pub: bool,
     pub name: String,
     pub params: Vec<Spanned<Param>>,
-    /// Slice 1 retains only effect head names; the type checker arrives in Slice 2.
-    pub effect_row: Vec<String>,
+    /// Effect-row annotation: `None` = unannotated (row inferred, Slice 3b),
+    /// `Some(vec![])` = explicit pure `/ {}`, `Some([Log@span, …])` = declared
+    /// exactly those effects. Spans point diagnostics at the declared effect.
+    pub effect_row: Option<Vec<Spanned<String>>>,
     pub body: Rc<Spanned<Block>>,
 }
 
@@ -350,7 +352,7 @@ mod tests {
                 is_pub: false,
                 name: "f".into(),
                 params: vec![],
-                effect_row: vec![],
+                effect_row: None,
                 body: Rc::new(sp(Block {
                     stmts: vec![].into(),
                     tail: Some(Rc::new(sp(e))),
@@ -406,7 +408,7 @@ mod tests {
                     is_pub: false,
                     name: "f".into(),
                     params: vec![],
-                    effect_row: vec![],
+                    effect_row: None,
                     body: Rc::new(sp(Block {
                         stmts: vec![].into(),
                         tail: Some(Rc::new(sp(handle))),
