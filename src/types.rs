@@ -4,7 +4,7 @@ use crate::ast::{BinOp, Block, Decl, Expr, FnDecl, Module, Stmt, UnOp};
 use crate::diag::Diagnostic;
 use crate::span::{Span, Spanned};
 use crate::Session;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TyCon {
@@ -19,10 +19,56 @@ pub enum TyCon {
 pub enum Ty {
     Var(u32),
     Base(TyCon),
-    Fn(Vec<Ty>, Box<Ty>),
+    /// A function type carries its latent effect row between the params and the
+    /// result: `fn(A) / {E} -> B`. A pure function's row is `EffectRow::pure()`.
+    Fn(Vec<Ty>, EffectRow, Box<Ty>),
     Tuple(Vec<Ty>),
     /// Poison value that unifies with anything; suppresses cascade errors.
     Error,
+}
+
+/// Row variables index a second union-find (`row_subst`), distinct from the
+/// type-variable space that indexes `subst`.
+pub type RowVar = u32;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RowTail {
+    /// Exactly the labels present — no more.
+    Closed,
+    /// The labels present *plus* whatever this row variable resolves to.
+    Open(RowVar),
+    /// Poison tail that absorbs any label; suppresses cascade row errors.
+    ErrorRow,
+}
+
+/// An effect row: a set of effect labels (each with the span that introduced
+/// it, for provenance) and a tail. Labels are kept sorted (`BTreeMap`) so the
+/// printed order is stable and each label appears at most once (idempotent).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectRow {
+    pub labels: BTreeMap<String, Span>,
+    pub tail: RowTail,
+}
+
+impl EffectRow {
+    /// The empty, closed row — a pure computation performs nothing.
+    pub fn pure() -> EffectRow {
+        EffectRow {
+            labels: BTreeMap::new(),
+            tail: RowTail::Closed,
+        }
+    }
+    /// An empty row open at `tail` — "these (none yet) plus whatever `tail` is".
+    pub fn open(tail: RowVar) -> EffectRow {
+        EffectRow {
+            labels: BTreeMap::new(),
+            tail: RowTail::Open(tail),
+        }
+    }
+    /// A closed row with exactly `label` (used to force `label ∈ amb`).
+    pub fn is_pure(&self) -> bool {
+        self.labels.is_empty() && self.tail == RowTail::Closed
+    }
 }
 
 impl Ty {
@@ -51,6 +97,7 @@ pub struct Scheme {
 
 pub struct Infer {
     subst: Vec<Option<Ty>>,
+    row_subst: Vec<Option<EffectRow>>,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -58,6 +105,7 @@ impl Infer {
     pub fn new() -> Infer {
         Infer {
             subst: Vec::new(),
+            row_subst: Vec::new(),
             diags: Vec::new(),
         }
     }
@@ -68,6 +116,41 @@ impl Infer {
         Ty::Var(id)
     }
 
+    /// A fresh, unbound row variable.
+    pub fn fresh_row(&mut self) -> RowVar {
+        let id = self.row_subst.len() as u32;
+        self.row_subst.push(None);
+        id
+    }
+
+    /// Deep-zonk a row: follow the tail through `row_subst`, accumulating the
+    /// labels found along the chain (union; earliest provenance span wins). The
+    /// result's tail is the first `Closed`/`ErrorRow`/unbound-`Open` reached.
+    pub fn resolve_row(&self, r: &EffectRow) -> EffectRow {
+        let mut labels = r.labels.clone();
+        let mut tail = r.tail.clone();
+        loop {
+            // Borrow `tail` (don't move it) to find the next link, if any.
+            let next = match &tail {
+                RowTail::Open(v) => match &self.row_subst[*v as usize] {
+                    Some(bound) => {
+                        for (k, sp) in &bound.labels {
+                            labels.entry(k.clone()).or_insert(*sp);
+                        }
+                        Some(bound.tail.clone())
+                    }
+                    None => None, // unbound: this open tail is the residual
+                },
+                RowTail::Closed | RowTail::ErrorRow => None,
+            };
+            match next {
+                Some(t) => tail = t,
+                None => break,
+            }
+        }
+        EffectRow { labels, tail }
+    }
+
     /// Follow bound variables to a representative, recursively (deep).
     pub fn resolve(&self, t: &Ty) -> Ty {
         match t {
@@ -76,8 +159,9 @@ impl Infer {
                 None => Ty::Var(*v),
             },
             Ty::Base(c) => Ty::Base(*c),
-            Ty::Fn(ps, r) => Ty::Fn(
+            Ty::Fn(ps, row, r) => Ty::Fn(
                 ps.iter().map(|p| self.resolve(p)).collect(),
+                self.resolve_row(row),
                 Box::new(self.resolve(r)),
             ),
             Ty::Tuple(xs) => Ty::Tuple(xs.iter().map(|x| self.resolve(x)).collect()),
@@ -86,10 +170,12 @@ impl Infer {
     }
 
     fn occurs(&self, v: u32, t: &Ty) -> bool {
+        // Type occurs-check only concerns the type-variable space; row variables
+        // live in a separate union-find with its own occurs-check (Task 3).
         match self.resolve(t) {
             Ty::Var(u) => u == v,
             Ty::Base(_) | Ty::Error => false,
-            Ty::Fn(ps, r) => ps.iter().any(|p| self.occurs(v, p)) || self.occurs(v, &r),
+            Ty::Fn(ps, _row, r) => ps.iter().any(|p| self.occurs(v, p)) || self.occurs(v, &r),
             Ty::Tuple(xs) => xs.iter().any(|x| self.occurs(v, x)),
         }
     }
@@ -119,7 +205,9 @@ impl Infer {
             (Ty::Var(x), Ty::Var(y)) if x == y => {}
             (Ty::Var(x), t) | (t, Ty::Var(x)) => self.bind(x, &t, span),
             (Ty::Base(x), Ty::Base(y)) if x == y => {}
-            (Ty::Fn(p1, r1), Ty::Fn(p2, r2)) => {
+            // Effect rows are ignored here until Task 4 threads real rows; every
+            // arrow is pure at this stage, so the rows are trivially equal.
+            (Ty::Fn(p1, _row1, r1), Ty::Fn(p2, _row2, r2)) => {
                 if p1.len() != p2.len() {
                     self.diags.push(
                         Diagnostic::error("E0402", "wrong number of arguments").with_label(
@@ -158,10 +246,39 @@ impl Default for Infer {
     }
 }
 
+/// Letter names for free variables during printing. Type variables and row
+/// variables occupy *separate* id-spaces, so they get separate maps — but draw
+/// from a *shared* counter, so every distinct variable (of either kind) gets a
+/// distinct letter in first-seen order (`a`, `b`, `c`, …). Never a `%`/`t<n>`.
+#[derive(Default)]
+struct Names {
+    ty: HashMap<u32, String>,
+    row: HashMap<u32, String>,
+}
+
+impl Names {
+    fn ty_name(&mut self, v: u32) -> String {
+        if let Some(n) = self.ty.get(&v) {
+            return n.clone();
+        }
+        let n = letter(self.ty.len() + self.row.len());
+        self.ty.insert(v, n.clone());
+        n
+    }
+    fn row_name(&mut self, v: u32) -> String {
+        if let Some(n) = self.row.get(&v) {
+            return n.clone();
+        }
+        let n = letter(self.ty.len() + self.row.len());
+        self.row.insert(v, n.clone());
+        n
+    }
+}
+
 /// Render a type for humans: resolve (zonk) it, then name remaining free
 /// variables `a, b, c, …` per call — never an internal `t<number>` token.
 pub fn display_ty(inf: &Infer, t: &Ty) -> String {
-    let mut names: HashMap<u32, String> = HashMap::new();
+    let mut names = Names::default();
     let resolved = inf.resolve(t);
     let mut out = String::new();
     write_ty(&resolved, &mut names, &mut out);
@@ -170,18 +287,16 @@ pub fn display_ty(inf: &Infer, t: &Ty) -> String {
 
 /// Render a scheme as `forall a b. <ty>` (or just the type when unquantified).
 pub fn display_scheme(inf: &Infer, s: &Scheme) -> String {
-    let mut names: HashMap<u32, String> = HashMap::new();
-    for v in &s.vars {
-        let n = letter(names.len());
-        names.insert(*v, n);
-    }
+    let mut names = Names::default();
+    // Seed quantified type variables first so they take the leading letters,
+    // in declaration order.
+    let quant: Vec<String> = s.vars.iter().map(|v| names.ty_name(*v)).collect();
     let resolved = inf.resolve(&s.ty);
     let mut body = String::new();
     write_ty(&resolved, &mut names, &mut body);
-    if s.vars.is_empty() {
+    if quant.is_empty() {
         body
     } else {
-        let quant: Vec<String> = s.vars.iter().map(|v| names[v].clone()).collect();
         format!("forall {}. {}", quant.join(" "), body)
     }
 }
@@ -195,19 +310,17 @@ fn letter(i: usize) -> String {
     }
 }
 
-fn write_ty(t: &Ty, names: &mut HashMap<u32, String>, out: &mut String) {
+fn write_ty(t: &Ty, names: &mut Names, out: &mut String) {
     match t {
         Ty::Var(v) => {
-            let next = names.len();
-            let name = names.entry(*v).or_insert_with(|| letter(next)).clone();
-            out.push_str(&name);
+            out.push_str(&names.ty_name(*v));
         }
         Ty::Base(TyCon::Int) => out.push_str("Int"),
         Ty::Base(TyCon::Float) => out.push_str("Float"),
         Ty::Base(TyCon::Bool) => out.push_str("Bool"),
         Ty::Base(TyCon::Str) => out.push_str("String"),
         Ty::Base(TyCon::Unit) => out.push_str("Unit"),
-        Ty::Fn(ps, r) => {
+        Ty::Fn(ps, row, r) => {
             out.push_str("fn(");
             for (i, p) in ps.iter().enumerate() {
                 if i > 0 {
@@ -215,7 +328,14 @@ fn write_ty(t: &Ty, names: &mut HashMap<u32, String>, out: &mut String) {
                 }
                 write_ty(p, names, out);
             }
-            out.push_str(") -> ");
+            out.push(')');
+            // A pure row is invisible: `fn(A) -> B`. A non-pure row prints as
+            // ` / {E, …}` (with a ` | e` residual tail when polymorphic).
+            if !row.is_pure() {
+                out.push_str(" / ");
+                write_row(row, names, out);
+            }
+            out.push_str(" -> ");
             write_ty(r, names, out);
         }
         Ty::Tuple(xs) => {
@@ -230,6 +350,34 @@ fn write_ty(t: &Ty, names: &mut HashMap<u32, String>, out: &mut String) {
         }
         Ty::Error => out.push_str("<error>"),
     }
+}
+
+/// Render an effect row as `{A, B}` (labels sorted, from the `BTreeMap`), with a
+/// ` | e` residual when the tail is a genuinely-polymorphic row variable. Assumes
+/// the row is already zonked (callers resolve the enclosing type first). Never
+/// emits a raw row-variable token — the effect-diagnostic no-`%r` discipline.
+fn write_row(row: &EffectRow, names: &mut Names, out: &mut String) {
+    out.push('{');
+    for (i, label) in row.labels.keys().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(label);
+    }
+    match &row.tail {
+        RowTail::Open(v) => {
+            let name = names.row_name(*v);
+            if row.labels.is_empty() {
+                out.push_str(&name);
+            } else {
+                out.push_str(" | ");
+                out.push_str(&name);
+            }
+        }
+        RowTail::ErrorRow => out.push_str(" | <error>"),
+        RowTail::Closed => {}
+    }
+    out.push('}');
 }
 
 #[derive(Default)]
@@ -385,8 +533,8 @@ impl Infer {
         if let Expr::Qualified { module, name } = &callee.node {
             if module == "io" && name == "println" {
                 let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env)).collect();
-                let want = Ty::Fn(vec![Ty::str()], Box::new(Ty::unit()));
-                let got = Ty::Fn(arg_ts, Box::new(Ty::unit()));
+                let want = Ty::Fn(vec![Ty::str()], EffectRow::pure(), Box::new(Ty::unit()));
+                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::unit()));
                 self.unify(&want, &got, span);
                 return Ty::unit();
             }
@@ -395,7 +543,7 @@ impl Infer {
         let f = self.infer_expr(callee, env);
         let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env)).collect();
         let result = self.fresh();
-        let expected = Ty::Fn(arg_ts, Box::new(result.clone()));
+        let expected = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(result.clone()));
         self.unify(&f, &expected, span);
         result
     }
@@ -422,7 +570,9 @@ fn free_vars(inf: &Infer, t: &Ty, acc: &mut Vec<u32>) {
             }
         }
         Ty::Base(_) | Ty::Error => {}
-        Ty::Fn(ps, r) => {
+        Ty::Fn(ps, _row, r) => {
+            // Row variables are generalized separately (Task 4); this collects
+            // only free *type* variables.
             for p in &ps {
                 free_vars(inf, p, acc);
             }
@@ -454,8 +604,9 @@ fn subst_vars(t: &Ty, m: &HashMap<u32, Ty>) -> Ty {
     match t {
         Ty::Var(v) => m.get(v).cloned().unwrap_or(Ty::Var(*v)),
         Ty::Base(c) => Ty::Base(*c),
-        Ty::Fn(ps, r) => Ty::Fn(
+        Ty::Fn(ps, row, r) => Ty::Fn(
             ps.iter().map(|p| subst_vars(p, m)).collect(),
+            row.clone(), // row instantiation is Task 4
             Box::new(subst_vars(r, m)),
         ),
         Ty::Tuple(xs) => Ty::Tuple(xs.iter().map(|x| subst_vars(x, m)).collect()),
@@ -518,7 +669,7 @@ pub fn infer_schemes(
                 &f.name,
                 Scheme {
                     vars: Vec::new(),
-                    ty: Ty::Fn(params.clone(), Box::new(result.clone())),
+                    ty: Ty::Fn(params.clone(), EffectRow::pure(), Box::new(result.clone())),
                 },
             );
             member_ty.insert(i, (params, result));
@@ -545,7 +696,7 @@ pub fn infer_schemes(
         for &i in group {
             let f = fns[i];
             let (params, result) = &member_ty[&i];
-            let fnty = Ty::Fn(params.clone(), Box::new(result.clone()));
+            let fnty = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(result.clone()));
             let scheme = generalize_toplevel(&mut inf, &fnty, &env, group, &fns);
             env.insert(&f.name, scheme.clone());
             schemes_out.push((f.name.clone(), display_scheme(&inf, &scheme)));
@@ -764,7 +915,7 @@ mod tests {
     fn occurs_check_is_e0401() {
         let mut inf = Infer::new();
         let v = inf.fresh();
-        let f = Ty::Fn(vec![v.clone()], Box::new(Ty::int()));
+        let f = Ty::Fn(vec![v.clone()], EffectRow::pure(), Box::new(Ty::int()));
         inf.unify(&v, &f, Span::EMPTY);
         assert_eq!(inf.diags.len(), 1);
         assert_eq!(inf.diags[0].code, "E0401");
@@ -773,8 +924,12 @@ mod tests {
     #[test]
     fn function_arity_mismatch_is_e0402() {
         let mut inf = Infer::new();
-        let a = Ty::Fn(vec![Ty::int()], Box::new(Ty::unit()));
-        let b = Ty::Fn(vec![Ty::int(), Ty::int()], Box::new(Ty::unit()));
+        let a = Ty::Fn(vec![Ty::int()], EffectRow::pure(), Box::new(Ty::unit()));
+        let b = Ty::Fn(
+            vec![Ty::int(), Ty::int()],
+            EffectRow::pure(),
+            Box::new(Ty::unit()),
+        );
         inf.unify(&a, &b, Span::EMPTY);
         assert_eq!(inf.diags.len(), 1);
         assert_eq!(inf.diags[0].code, "E0402");
@@ -785,7 +940,7 @@ mod tests {
         let mut inf = Infer::new();
         let a = inf.fresh();
         let b = inf.fresh();
-        let t = Ty::Fn(vec![a.clone()], Box::new(b.clone()));
+        let t = Ty::Fn(vec![a.clone()], EffectRow::pure(), Box::new(b.clone()));
         let out = display_ty(&inf, &t);
         assert_eq!(out, "fn(a) -> b");
         assert!(!out.contains('%'), "no internal token: {out}");
@@ -796,10 +951,34 @@ mod tests {
     }
 
     #[test]
+    fn pure_fn_prints_without_row() {
+        let inf = Infer::new();
+        let t = Ty::Fn(vec![Ty::int()], EffectRow::pure(), Box::new(Ty::unit()));
+        assert_eq!(display_ty(&inf, &t), "fn(Int) -> Unit");
+    }
+
+    #[test]
+    fn nonpure_fn_prints_row_and_open_tail() {
+        let mut inf = Infer::new();
+        let tail = inf.fresh_row();
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("Log".to_string(), Span::EMPTY);
+        let row = EffectRow {
+            labels,
+            tail: RowTail::Open(tail),
+        };
+        let t = Ty::Fn(vec![], row, Box::new(Ty::unit()));
+        // Named label + a polymorphic residual, no `%`/raw-var token.
+        let out = display_ty(&inf, &t);
+        assert_eq!(out, "fn() / {Log | a} -> Unit");
+        assert!(!out.contains('%'), "no internal token: {out}");
+    }
+
+    #[test]
     fn printer_reuses_same_letter_for_same_var() {
         let mut inf = Infer::new();
         let a = inf.fresh();
-        let t = Ty::Fn(vec![a.clone()], Box::new(a.clone()));
+        let t = Ty::Fn(vec![a.clone()], EffectRow::pure(), Box::new(a.clone()));
         assert_eq!(display_ty(&inf, &t), "fn(a) -> a");
     }
 
@@ -818,7 +997,7 @@ mod tests {
         let Ty::Var(av) = a else { unreachable!() };
         let s = Scheme {
             vars: vec![av],
-            ty: Ty::Fn(vec![a.clone()], Box::new(a.clone())),
+            ty: Ty::Fn(vec![a.clone()], EffectRow::pure(), Box::new(a.clone())),
         };
         assert_eq!(display_scheme(&inf, &s), "forall a. fn(a) -> a");
     }
