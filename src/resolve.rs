@@ -13,16 +13,23 @@ pub fn builtins() -> &'static [&'static str] {
 
 pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
     let mut fn_names: HashSet<String> = HashSet::new();
+    let mut op_names: HashSet<String> = HashSet::new();
     for d in &module.decls {
         match &d.node {
             Decl::Fn(f) => {
                 fn_names.insert(f.name.clone());
             }
-            Decl::Effect(_) => {} // operations registered in Task 5
+            Decl::Effect(e) => {
+                for op in &e.ops {
+                    op_names.insert(op.node.name.clone());
+                }
+            }
         }
     }
     let mut cx = Cx {
         fns: &fn_names,
+        ops: &op_names,
+        in_handler: 0,
         diags: Vec::new(),
     };
     for d in &module.decls {
@@ -42,12 +49,18 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
 
 struct Cx<'a> {
     fns: &'a HashSet<String>,
+    ops: &'a HashSet<String>,
+    /// Nesting depth of handler clauses currently being checked. `resume` is
+    /// only legal where this is nonzero (E0210 otherwise).
+    in_handler: usize,
     diags: Vec<Diagnostic>,
 }
 
 impl Cx<'_> {
     fn resolves_var(&self, name: &str, scope: &[HashSet<String>]) -> bool {
-        scope.iter().rev().any(|s| s.contains(name)) || self.fns.contains(name)
+        scope.iter().rev().any(|s| s.contains(name))
+            || self.fns.contains(name)
+            || self.ops.contains(name)
     }
 
     fn check_block(&mut self, b: &Block, scope: &mut Vec<HashSet<String>>) {
@@ -108,9 +121,39 @@ impl Cx<'_> {
                 self.check_block(&else_block.node, scope);
             }
             Expr::Block(b) => self.check_block(b, scope),
-            // Provisional (Task 5 adds operation/resume resolution + clause scoping).
-            Expr::Handle { body, .. } => self.check_expr(&body.node, body.span, scope),
-            Expr::Resume { arg } => self.check_expr(&arg.node, arg.span, scope),
+            Expr::Handle { body, handler } => {
+                // The handled computation is not itself inside a clause, so a
+                // bare `resume` here is still an error (in_handler unchanged).
+                self.check_expr(&body.node, body.span, scope);
+                self.in_handler += 1;
+                for c in &handler.clauses {
+                    let clause = &c.node;
+                    scope.push(HashSet::new());
+                    for p in &clause.params {
+                        scope.last_mut().unwrap().insert(p.node.name.clone());
+                    }
+                    self.check_expr(&clause.body.node, clause.body.span, scope);
+                    scope.pop();
+                }
+                self.in_handler -= 1;
+                if let Some(ret) = &handler.ret {
+                    // The return clause runs after the computation completes;
+                    // `resume` is not in scope there.
+                    scope.push(HashSet::new());
+                    scope.last_mut().unwrap().insert(ret.binder.clone());
+                    self.check_expr(&ret.body.node, ret.body.span, scope);
+                    scope.pop();
+                }
+            }
+            Expr::Resume { arg } => {
+                if self.in_handler == 0 {
+                    self.diags.push(
+                        Diagnostic::error("E0210", "`resume` used outside a handler")
+                            .with_label(span, "`resume` is only valid inside a handler clause"),
+                    );
+                }
+                self.check_expr(&arg.node, arg.span, scope);
+            }
         }
     }
 }
@@ -151,5 +194,28 @@ mod tests {
     fn known_builtin_resolves() {
         let d = diags(r#"fn f() { io.println("x") }"#);
         assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn operation_call_resolves() {
+        let d =
+            diags("effect Log {\n  fn log(msg: String) -> Unit\n}\nfn f() {\n  log(\"hi\")\n}\n");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn resume_inside_handler_resolves() {
+        let src = "effect Log {\n  fn log(msg: String) -> Unit\n}\n\
+                   fn g() { 1 }\n\
+                   fn f() {\n  handle g() with {\n    Log.log(m) -> resume(m)\n    return(r) -> r\n  }\n}\n";
+        let d = diags(src);
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn resume_outside_handler_is_e0210() {
+        let d = diags("fn f() {\n  resume(1)\n}\n");
+        assert_eq!(d.len(), 1, "expected one diag, got: {d:?}");
+        assert_eq!(d[0].code, "E0210");
     }
 }

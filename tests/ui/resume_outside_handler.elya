@@ -1,0 +1,4 @@
+fn main() {
+  resume(1)
+}
+//~ ERROR[E0210] `resume` used outside a handler
