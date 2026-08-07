@@ -503,7 +503,7 @@ ensure(fn(){ db.close(conn) }, fn(){     // fire-once: wraps the handle, in k_re
 })
 ```
 
-**Selection & enforcement (no linear types in v1):** `ensure(cleanup, body)` = per-branch; wrapping the `handle` = fire-once. A **lint (E0426)** flags a resource acquired outside a `with multi` handler and released inside it, catching the double-free class at compile time. The full static guarantee awaits linear/affine types (deferred; §13, §14).
+**Selection & enforcement (no linear types in v1):** `ensure(cleanup, body)` = per-branch; wrapping the `handle` = fire-once. A **lint (E0426)** flags a resource acquired outside a `with multi` handler and released inside it, catching the double-free class at compile time. The full static guarantee awaits linear/affine types (deferred; §13, §15).
 
 ---
 
@@ -752,7 +752,42 @@ So device placement, discovery, sync/async I/O, and the event surface are a **na
 
 ---
 
-## 14. Risks & Mitigations
+## 14. Post-v1 Paradigm Explorations
+
+**Deliberately separate from §13.** §13 lists composable *features* that extend the effect model (compute, devices). This section lists whole-*paradigm* ideas — different ways a language could fundamentally work. They are not features you bolt on; each one either **EXTENDS** Elya (compatible with effects-first, statically-typed, natively-compiled identity — typically as a sub-language, an effect + runtime, or an additional backend) or **REPLACES** it (would change Elya's core identity or contradict a locked decision in §2). The manifesto (§1) stays authoritative; **nothing here is v1 scope**, and none of it is even considered before self-hosting. Where two ideas are mutually exclusive, it is stated.
+
+1. **Intent-Oriented Programming** — *declare the outcome; the compiler picks the algorithm.* **REPLACES.** "The compiler synthesizes the algorithm" is a program-synthesis / constraint-solver research problem, **not a compiler feature**, and it contradicts the model where you write algorithms and the compiler compiles them. A narrow, honest EXTENDS version exists — a typed `solve { … }` constraint sub-language (like the probabilistic one below) that hands specific problems to a solver — but the full "describe intent, get a program" vision replaces Elya's identity.
+
+2. **Living Programs** — *programs that run continuously and hot-evolve their own code/state at runtime.* **REPLACES.** A continuously-mutating, self-modifying runtime replaces the compile-then-run, statically-typed, effects-first evaluation model (§2). It contradicts native AOT compilation and the immutable-by-default core. *Mutually exclusive with* the native-compiled static identity, and with Dataflow-First (below) — they are two different replacement execution models; you cannot adopt both as *the* model.
+
+3. **Dataflow-First** — *computation is a reactive dataflow graph; values propagate.* **REPLACES.** Reactive dataflow **replaces the effects-first CEK evaluation model** (§7/§8) with a different execution semantics. *Mutually exclusive with* the effects-first identity (the two are alternative answers to "how does a program run"), and with Living Programs (two distinct replacement paradigms).
+
+4. **Hardware-Native** — *the language targets/represents hardware directly.* **EXTENDS (as a backend), with a REPLACES reading to reject.** As *additional native codegen backends* (FPGA/GPU/NPU alongside CPU-LLVM), this extends the native-compilation story and overlaps the §13 compute layer — compatible. But the reading where *the language's semantics are spatial hardware/dataflow* collapses into Dataflow-First and **REPLACES** the evaluation model. The two readings are mutually exclusive; Elya keeps the backend-target reading and rejects the spatial-semantics one.
+
+5. **Self-Optimizing** — *a JIT/adaptive runtime that rewrites hot code as it runs.* **REPLACES.** A self-optimizing JIT **contradicts the locked native-LLVM AOT decision** (§2, back-end target). *Mutually exclusive with* the native-compile axis. (Profile-*guided* AOT optimization would EXTEND and is uncontroversial; the *paradigm* here — runtime self-modification for speed — is the JIT identity, which replaces AOT.)
+
+6. **Probability Programming** — *first-class probabilistic modeling and inference.* **EXTENDS.** A typed **sub-language**: `sample`/`observe` are operations of a `Dist` effect, and inference (MCMC, variational) is a *handler* over that effect. This is a textbook effect-fit — probabilistic programming is one of the canonical motivations for algebraic effects — and needs no change to the core.
+
+7. **Time-Travel** — *reversible / record-and-replay execution.* **EXTENDS.** As a **runtime + tooling** capability — time-travel debugging, deterministic replay, reversible stepping — it leverages exactly what Elya already has: immutable values, a persistent environment, and captured continuations. It is a runtime feature, not a semantic change. (The distinct, magical reading — programs that literally read values "from the future" — would break causality/soundness and **REPLACES**; that reading is rejected.)
+
+8. **Distributed by Default** — *location transparency; computations run across machines.* **EXTENDS.** A `Remote`/`Net` effect plus a distributed **runtime**: remote calls are effect operations, placement/partitioning is a scheduling *handler* (a distributed cousin of the §13 hardware scheduler), and it composes with `Async`. Distribution is an effect + runtime layer, not a new core.
+
+9. **Cognitive Memory** — *persistent, associative, "cognitive" memory available to programs.* **EXTENDS.** A `Memory` effect over a persistent/associative store — a **runtime feature**. Memory operations are effects; the store is a runtime service. No change to the language core; it sits alongside `IO`/`State` as another effect.
+
+10. **Universal Compute** — *one program, runnable on any substrate (CPU/GPU/NPU/FPGA/edge/browser).* **EXTENDS.** As *portable codegen to many backends* (including WASM, already a secondary target, and the §13 compute backends) this extends the native-compilation story — compatible. The stronger reading, where *a runtime transparently schedules a program across all substrates and picks placement at run time*, overlaps Self-Optimizing (the runtime-picks part → REPLACES) and Distributed-by-Default (EXTENDS); Elya keeps the portable-backend reading.
+
+**Mutual-exclusivity summary (explicit):**
+- **Dataflow-First** ⟂ the **effects-first CEK identity** (§7/§8) — alternative execution models; only one can be *the* model.
+- **Dataflow-First** ⟂ **Living Programs** — two different replacement execution paradigms.
+- **Self-Optimizing (JIT)** ⟂ **native-LLVM AOT** (§2, locked) — cannot both be the compilation model.
+- **Living Programs** ⟂ the **native-compiled static identity** (§2).
+- **Hardware-Native's** two readings (backend-target *vs.* spatial-semantics) are mutually exclusive; the spatial reading equals Dataflow-First.
+
+**Verdict:** four ideas — **Probability Programming, Time-Travel (as replay/debug), Distributed by Default, Cognitive Memory** — are genuine EXTENDS: each lands as a typed sub-language or an effect + runtime and *reinforces* the effects-first bet. **Hardware-Native** and **Universal Compute** are EXTENDS only in their backend-target reading. The rest — **Intent-Oriented, Living Programs, Dataflow-First, Self-Optimizing** — are REPLACES: they would change Elya's identity or contradict a §2 decision, and are recorded here as roads deliberately *not* taken.
+
+---
+
+## 15. Risks & Mitigations
 
 - **Boiling the ocean** → vertical slices; this cycle is bounded to Slices 1–3.
 - **CEK refactor underestimated** → sequenced deliberately (tree-walker first in Slice 1; CEK in Slice 2 *before* effects in Slice 3); acknowledged as load-bearing.
@@ -765,7 +800,7 @@ So device placement, discovery, sync/async I/O, and the event surface are a **na
 
 ---
 
-## 15. Milestone Checklist (Slices 1–3)
+## 16. Milestone Checklist (Slices 1–3)
 
 - [ ] Spec, EBNF grammar, and 10 example programs (this document).
 - [ ] Four design axes + signature feature decided (this document).
