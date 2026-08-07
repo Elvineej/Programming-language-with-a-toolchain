@@ -936,6 +936,89 @@ impl Infer {
             }
         }
     }
+
+    /// Enforce that an *annotated* function performs exactly its declared row
+    /// (spec §3.6, strict default — no sub-effecting). Declaring pure (`/ {}`)
+    /// but performing an effect is `E0421`; any set difference (in either
+    /// direction) is `E0423`, naming the exact labels it differs by.
+    fn check_exact_row(&mut self, amb: RowVar, declared: &[Spanned<String>]) {
+        let performed = self.resolve_row(&EffectRow::open(amb));
+        if declared.is_empty() {
+            // Declared pure `/ {}`: any performed effect is a purity violation.
+            if !performed.labels.is_empty() {
+                let names: Vec<String> = performed.labels.keys().cloned().collect();
+                let span = performed
+                    .labels
+                    .values()
+                    .next()
+                    .copied()
+                    .unwrap_or(Span::EMPTY);
+                self.diags.push(
+                    Diagnostic::error(
+                        "E0421",
+                        format!(
+                            "this function is declared pure but performs `{}`",
+                            names.join(", ")
+                        ),
+                    )
+                    .with_label(span, "performed here")
+                    .with_help(format!(
+                        "the declared row is {{}} (pure); the body performs {{{}}}",
+                        names.join(", ")
+                    )),
+                );
+            }
+            return;
+        }
+        let declared_names: Vec<&str> = declared.iter().map(|l| l.node.as_str()).collect();
+        // performed \ declared — the body does more than it declares.
+        let extra: Vec<(String, Span)> = performed
+            .labels
+            .iter()
+            .filter(|(k, _)| !declared_names.contains(&k.as_str()))
+            .map(|(k, s)| (k.clone(), *s))
+            .collect();
+        if !extra.is_empty() {
+            let span = extra[0].1;
+            self.emit_row_mismatch(
+                &extra,
+                span,
+                "the body performs an effect the declared row does not",
+            );
+        }
+        // declared \ performed — the body declares more than it does.
+        let unused: Vec<(String, Span)> = declared
+            .iter()
+            .filter(|l| !performed.labels.contains_key(&l.node))
+            .map(|l| (l.node.clone(), l.span))
+            .collect();
+        if !unused.is_empty() {
+            let span = unused[0].1;
+            self.emit_row_mismatch(
+                &unused,
+                span,
+                "the declared row includes an effect the body never performs",
+            );
+        }
+    }
+
+    /// The discharge pass at `main`: `main` may perform only `{IO}` (natively
+    /// discharged by the runtime). Any user effect that survives to `main` is
+    /// unhandled — `E0420`, naming the perform site from provenance.
+    fn check_main_discharge(&mut self, amb: RowVar) {
+        let performed = self.resolve_row(&EffectRow::open(amb));
+        for (label, sp) in &performed.labels {
+            if label != "IO" {
+                self.diags.push(
+                    Diagnostic::error("E0420", format!("effect `{label}` is never handled"))
+                        .with_label(*sp, format!("`{label}` is performed here"))
+                        .with_help(format!(
+                            "`main` may perform only {{IO}}; handle it with `handle … with {{ {label}.op(..) -> … }}`"
+                        )),
+                );
+            }
+        }
+    }
 }
 
 /// Elaborate an operation-signature type annotation into a `Ty`. Slice 3b
@@ -1188,6 +1271,17 @@ pub fn infer_schemes(
         for &i in group {
             let (params, amb_f, _result) = member_ty[&i].clone();
             inf.close_unrelayed_residual(amb_f, &params);
+        }
+        // 2.6. enforce annotated rows (exact match) and main's discharge set.
+        for &i in group {
+            let f = fns[i];
+            let (_params, amb_f, _result) = member_ty[&i].clone();
+            if let Some(declared) = &f.effect_row {
+                inf.check_exact_row(amb_f, declared);
+            }
+            if f.name == "main" {
+                inf.check_main_discharge(amb_f);
+            }
         }
         // 3. generalize each member and re-insert its polytype for later groups.
         for &i in group {

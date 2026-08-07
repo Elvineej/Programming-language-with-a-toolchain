@@ -1,0 +1,11 @@
+effect Log {
+  fn log(msg: String) -> Unit
+}
+effect Net {
+  fn fetch(url: String) -> String
+}
+fn sync(url) / {Log} {
+  log(url)
+  fetch(url)
+}
+//~ ERROR[E0423] differ by exactly

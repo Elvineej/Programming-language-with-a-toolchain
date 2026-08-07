@@ -1,0 +1,10 @@
+effect Log {
+  fn log(msg: String) -> Unit
+}
+fn greet() {
+  log("hi")
+}
+pub fn main() {
+  greet()
+}
+//~ ERROR[E0420] effect `Log` is never handled

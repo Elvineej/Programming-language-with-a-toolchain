@@ -1,0 +1,7 @@
+effect Log {
+  fn log(msg: String) -> Unit
+}
+fn f() / {} {
+  log("x")
+}
+//~ ERROR[E0421] declared pure but performs
