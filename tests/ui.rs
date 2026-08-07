@@ -78,3 +78,8 @@ fn bad_arity() {
 fn non_bool_cond() {
     check_fixture("non_bool_cond.elya");
 }
+
+#[test]
+fn resume_outside_handler() {
+    check_fixture("resume_outside_handler.elya");
+}
