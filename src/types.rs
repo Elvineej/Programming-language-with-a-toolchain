@@ -65,10 +65,24 @@ impl EffectRow {
             tail: RowTail::Open(tail),
         }
     }
-    /// A closed row with exactly `label` (used to force `label ∈ amb`).
+    /// Whether this is the empty, closed (pure) row.
     pub fn is_pure(&self) -> bool {
         self.labels.is_empty() && self.tail == RowTail::Closed
     }
+}
+
+/// The result of a failed row reconciliation. `unify_row` is a diagnostic-free
+/// primitive: it *returns* the labels that could not be absorbed (because the
+/// other side's tail was closed), and the caller — an inference site or the
+/// discharge pass — decides whether that is `E0420`/`E0421`/`E0423` and attaches
+/// provenance. (The row occurs-check `E0424` is the one exception, pushed inside
+/// the primitive, mirroring how the type occurs-check `E0401` is pushed in `bind`.)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RowConflict {
+    /// Labels present in the first row that the second row (closed) cannot absorb.
+    pub only1: Vec<(String, Span)>,
+    /// Labels present in the second row that the first row (closed) cannot absorb.
+    pub only2: Vec<(String, Span)>,
 }
 
 impl Ty {
@@ -237,6 +251,138 @@ impl Infer {
                     .push(Diagnostic::error("E0400", "type mismatch").with_label(span, msg));
             }
         }
+    }
+
+    // ---- Effect-row unification (second union-find) ----
+
+    /// Rewriting unification of two simple effect rows (Rémy / Leijen; Koka).
+    /// Diagnostic-free except the row occurs-check (`E0424`): label-absorption
+    /// failures are *returned* as a `RowConflict` for the caller to classify.
+    pub fn unify_row(
+        &mut self,
+        r1: &EffectRow,
+        r2: &EffectRow,
+        span: Span,
+    ) -> Result<(), RowConflict> {
+        let r1 = self.resolve_row(r1);
+        let r2 = self.resolve_row(r2);
+        // A poison tail on either side absorbs everything — no cascade.
+        if r1.tail == RowTail::ErrorRow || r2.tail == RowTail::ErrorRow {
+            return Ok(());
+        }
+        // Matching labels are compatible (idempotent; monomorphic ops carry no
+        // payloads to reconcile in Slice 3b). Split out each side's extras.
+        let only1: Vec<(String, Span)> = r1
+            .labels
+            .iter()
+            .filter(|(k, _)| !r2.labels.contains_key(*k))
+            .map(|(k, s)| (k.clone(), *s))
+            .collect();
+        let only2: Vec<(String, Span)> = r2
+            .labels
+            .iter()
+            .filter(|(k, _)| !r1.labels.contains_key(*k))
+            .map(|(k, s)| (k.clone(), *s))
+            .collect();
+
+        let mut conflict = RowConflict::default();
+        // r2's tail must absorb only1; r1's tail must absorb only2. Each returns
+        // the residual tail left after rewriting.
+        let t2 = self.absorb(&only1, &r2.tail, span, &mut conflict.only1);
+        let t1 = self.absorb(&only2, &r1.tail, span, &mut conflict.only2);
+        if !conflict.only1.is_empty() || !conflict.only2.is_empty() {
+            return Err(conflict);
+        }
+        // The two residual tails must be equal.
+        self.unify_tails(&t1, &t2, span);
+        Ok(())
+    }
+
+    /// Rewrite `tail` so it contains `extra`, returning the residual tail.
+    /// `Open(v)` grows by binding `v := {extra} | Open(fresh)`; a `Closed` tail
+    /// cannot absorb non-empty `extra`, so those labels go into `bucket`.
+    fn absorb(
+        &mut self,
+        extra: &[(String, Span)],
+        tail: &RowTail,
+        span: Span,
+        bucket: &mut Vec<(String, Span)>,
+    ) -> RowTail {
+        if extra.is_empty() {
+            return tail.clone();
+        }
+        match tail {
+            RowTail::Open(v) => {
+                let fresh = self.fresh_row();
+                let labels: BTreeMap<String, Span> = extra.iter().cloned().collect();
+                self.bind_row(
+                    *v,
+                    &EffectRow {
+                        labels,
+                        tail: RowTail::Open(fresh),
+                    },
+                    span,
+                );
+                RowTail::Open(fresh)
+            }
+            RowTail::Closed => {
+                bucket.extend(extra.iter().cloned());
+                RowTail::Closed
+            }
+            RowTail::ErrorRow => RowTail::ErrorRow,
+        }
+    }
+
+    /// Unify two residual row tails (no labels remain at this point).
+    fn unify_tails(&mut self, t1: &RowTail, t2: &RowTail, span: Span) {
+        match (t1, t2) {
+            (RowTail::ErrorRow, _) | (_, RowTail::ErrorRow) => {}
+            (RowTail::Open(a), RowTail::Open(b)) => {
+                if a != b {
+                    self.bind_row(*a, &EffectRow::open(*b), span);
+                }
+            }
+            (RowTail::Open(a), RowTail::Closed) | (RowTail::Closed, RowTail::Open(a)) => {
+                self.bind_row(*a, &EffectRow::pure(), span);
+            }
+            (RowTail::Closed, RowTail::Closed) => {}
+        }
+    }
+
+    /// Bind row variable `v := r`, with an occurs-check (`E0424`): `v` may not
+    /// appear in `r`'s tail, or the row would contain itself.
+    fn bind_row(&mut self, v: RowVar, r: &EffectRow, span: Span) {
+        let resolved = self.resolve_row(r);
+        if resolved.tail == RowTail::Open(v) {
+            self.diags.push(
+                Diagnostic::error("E0424", "cyclic effect row")
+                    .with_label(span, "an effect row would contain itself"),
+            );
+            self.row_subst[v as usize] = Some(EffectRow {
+                labels: BTreeMap::new(),
+                tail: RowTail::ErrorRow,
+            });
+            return;
+        }
+        self.row_subst[v as usize] = Some(resolved);
+    }
+
+    /// Force `op ∈ amb`: unify the ambient with `{op@span} | Open(fresh)`, which
+    /// rewrites `amb`'s tail to expose `op`. Never fails when `amb` is open.
+    pub fn add_effect(&mut self, amb: RowVar, op: &str, span: Span) -> Result<(), RowConflict> {
+        let fresh = self.fresh_row();
+        let mut labels = BTreeMap::new();
+        labels.insert(op.to_string(), span);
+        let target = EffectRow {
+            labels,
+            tail: RowTail::Open(fresh),
+        };
+        self.unify_row(&EffectRow::open(amb), &target, span)
+    }
+
+    /// Fold every label of `eff` into `amb` (pour a callee's row into ambient).
+    pub fn add_row(&mut self, amb: RowVar, eff: &EffectRow, span: Span) -> Result<(), RowConflict> {
+        self.unify_row(&EffectRow::open(amb), eff, span)
     }
 }
 
@@ -1000,5 +1146,74 @@ mod tests {
             ty: Ty::Fn(vec![a.clone()], EffectRow::pure(), Box::new(a.clone())),
         };
         assert_eq!(display_scheme(&inf, &s), "forall a. fn(a) -> a");
+    }
+
+    // ---- Effect-row unification (Task 3) ----
+
+    fn row(labels: &[&str], tail: RowTail) -> EffectRow {
+        let mut m = std::collections::BTreeMap::new();
+        for l in labels {
+            m.insert((*l).to_string(), Span::EMPTY);
+        }
+        EffectRow { labels: m, tail }
+    }
+
+    #[test]
+    fn add_effect_extends_open_row() {
+        let mut inf = Infer::new();
+        let amb = inf.fresh_row();
+        assert!(inf.add_effect(amb, "Log", Span::EMPTY).is_ok());
+        let r = inf.resolve_row(&EffectRow::open(amb));
+        assert!(r.labels.contains_key("Log"), "amb should now contain Log");
+        assert!(matches!(r.tail, RowTail::Open(_)), "still open/polymorphic");
+        assert!(inf.diags.is_empty());
+    }
+
+    #[test]
+    fn two_open_rows_reconcile_by_mutual_extension() {
+        let mut inf = Infer::new();
+        let a = inf.fresh_row();
+        let b = inf.fresh_row();
+        let r1 = row(&["Log"], RowTail::Open(a));
+        let r2 = row(&["Net"], RowTail::Open(b));
+        assert!(inf.unify_row(&r1, &r2, Span::EMPTY).is_ok());
+        let z1 = inf.resolve_row(&r1);
+        let z2 = inf.resolve_row(&r2);
+        // Both rows now carry both labels — no "neither is a subset" failure.
+        for z in [&z1, &z2] {
+            assert!(z.labels.contains_key("Log") && z.labels.contains_key("Net"));
+        }
+        assert!(inf.diags.is_empty());
+    }
+
+    #[test]
+    fn closed_row_meeting_extra_is_conflict_not_diag() {
+        let mut inf = Infer::new();
+        let r1 = row(&["Log"], RowTail::Closed);
+        let r2 = row(&["Log", "Net"], RowTail::Closed);
+        let err = inf.unify_row(&r1, &r2, Span::EMPTY).unwrap_err();
+        // `Net` is in r2 and cannot be absorbed by the closed r1.
+        let only2: Vec<&str> = err.only2.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(only2, ["Net"]);
+        assert!(err.only1.is_empty());
+        assert!(
+            inf.diags.is_empty(),
+            "unify_row must not push diagnostics for label conflicts"
+        );
+    }
+
+    #[test]
+    fn cyclic_row_is_e0424() {
+        // Directly exercise the occurs-check code path: bind σ := {A} | Open(σ),
+        // a row that would contain itself. (Unconstructible from 3b surface
+        // syntax, so the primitive's unit test is its coverage — plan 5b.)
+        let mut inf = Infer::new();
+        let s = inf.fresh_row();
+        let cyclic = row(&["A"], RowTail::Open(s));
+        inf.bind_row(s, &cyclic, Span::EMPTY);
+        assert_eq!(inf.diags.len(), 1);
+        assert_eq!(inf.diags[0].code, "E0424");
+        // σ is poisoned to ErrorRow so no cascade follows.
+        assert_eq!(inf.resolve_row(&EffectRow::open(s)).tail, RowTail::ErrorRow);
     }
 }
