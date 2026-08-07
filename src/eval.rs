@@ -181,7 +181,7 @@ pub mod tree {
         fns: &Fns,
     ) -> Result<Value, RuntimeError> {
         let mut local = env.clone();
-        for st in &b.stmts {
+        for st in b.stmts.iter() {
             match &st.node {
                 Stmt::Let { name, value } => {
                     let v = eval_expr(interp, value, &local, fns)?;
@@ -246,7 +246,7 @@ pub mod tree {
                 if let Expr::Qualified { module, name } = &callee.node {
                     if module == "io" && name == "println" {
                         let mut vals = Vec::new();
-                        for a in args {
+                        for a in args.iter() {
                             vals.push(eval_expr(interp, a, env, fns)?);
                         }
                         let [Value::Str(s)] = &vals[..] else {
@@ -277,7 +277,7 @@ pub mod tree {
                     ));
                 }
                 let mut bindings = Vec::with_capacity(fdecl.params.len());
-                for (p, a) in fdecl.params.iter().zip(args) {
+                for (p, a) in fdecl.params.iter().zip(args.iter()) {
                     bindings.push((p.node.name.clone(), eval_expr(interp, a, env, fns)?));
                 }
                 let call_env = Env::new().extend(&bindings);
