@@ -1,10 +1,10 @@
-//! Slice 3a integration gate: effect *syntax* is parsed and name-resolved,
-//! but not yet type-checked. A well-formed effect program must parse cleanly,
-//! resolve cleanly, and produce exactly the "effects aren't type-checked yet"
-//! diagnostic (E0499) from the inference stage — nothing else.
+//! Slice 3b: well-formed effect programs parse, resolve, AND type-check cleanly
+//! — effects are now typed with row inference and handler discharge. Evaluation
+//! is still deferred to 3c, so `run_source` reports the "not evaluated yet"
+//! placeholder (asserted below).
 //!
-//! Coverage per the Slice 3 plan: a basic handler, a `with multi` handler, and
-//! a lexically *nested* handler all reach the same E0499 gate.
+//! (In 3a these same shapes stopped at the E0499 "not type-checked yet" gate;
+//! Task 5 removes that placeholder — the feature landing, not an accommodation.)
 
 use elya::{parse::parse_module, resolve, types, Session};
 
@@ -31,9 +31,9 @@ fn stages(src: &str) -> Stages {
     }
 }
 
-/// Assert: parses clean, resolves clean, and the only type diagnostics are
-/// E0499 (at least one). This is the whole Slice 3a contract in one place.
-fn assert_reaches_e0499_gate(src: &str) {
+/// Assert: parses clean, resolves clean, and type-checks clean (no diagnostics
+/// at any stage). Effects are typed and their effect discharged.
+fn assert_type_checks_clean(src: &str) {
     let st = stages(src);
     assert!(
         st.parse.is_empty(),
@@ -45,29 +45,25 @@ fn assert_reaches_e0499_gate(src: &str) {
         "unexpected resolve diags: {:?}",
         st.resolve
     );
-    assert!(
-        !st.types.is_empty() && st.types.iter().all(|c| c == "E0499"),
-        "expected only E0499 from inference, got: {:?}",
-        st.types
-    );
+    assert!(st.types.is_empty(), "unexpected type diags: {:?}", st.types);
 }
 
 #[test]
-fn basic_handler_reaches_e0499() {
+fn basic_handler_type_checks() {
     let src = "effect Log {\n\
                \x20 fn log(msg: String) -> Unit\n\
                }\n\
                fn prog() {\n\
                \x20 handle log(\"hi\") with {\n\
-               \x20   Log.log(m) -> resume(m)\n\
+               \x20   Log.log(m) -> resume(Unit)\n\
                \x20   return(r) -> r\n\
                \x20 }\n\
                }\n";
-    assert_reaches_e0499_gate(src);
+    assert_type_checks_clean(src);
 }
 
 #[test]
-fn multi_handler_reaches_e0499() {
+fn multi_handler_type_checks() {
     let src = "effect Flip {\n\
                \x20 fn flip() -> Bool\n\
                }\n\
@@ -76,24 +72,48 @@ fn multi_handler_reaches_e0499() {
                \x20   Flip.flip() -> resume(True)\n\
                \x20 }\n\
                }\n";
-    assert_reaches_e0499_gate(src);
+    assert_type_checks_clean(src);
 }
 
 #[test]
-fn nested_handler_reaches_e0499() {
-    // A handler lexically nested inside another handler's clause body.
-    let src = "effect Ask {\n\
-               \x20 fn ask() -> Int\n\
+fn nested_handlers_type_check() {
+    // An inner handler discharges Log; the outer discharges Warn. Both effects
+    // are handled, so nothing escapes.
+    let src = "effect Log {\n\
+               \x20 fn log(msg: String) -> Unit\n\
                }\n\
-               effect Log {\n\
-               \x20 fn log(n: Int) -> Unit\n\
+               effect Warn {\n\
+               \x20 fn warn(msg: String) -> Unit\n\
                }\n\
                fn prog() {\n\
-               \x20 handle ask() with {\n\
-               \x20   Ask.ask() -> handle log(1) with {\n\
-               \x20     Log.log(n) -> resume(0)\n\
-               \x20   }\n\
+               \x20 handle (handle log(\"a\") with { Log.log(m) -> resume(Unit) }) with {\n\
+               \x20   Warn.warn(m) -> resume(Unit)\n\
+               \x20   return(x) -> x\n\
                \x20 }\n\
                }\n";
-    assert_reaches_e0499_gate(src);
+    assert_type_checks_clean(src);
+}
+
+#[test]
+fn effects_type_check_but_dont_evaluate_yet() {
+    // The whole point of 3b: effects type-check. Evaluation is 3c, so running
+    // the program still reports the machine's "not evaluated yet" placeholder.
+    let src = "effect Log {\n\
+               \x20 fn log(msg: String) -> Unit\n\
+               }\n\
+               pub fn main() {\n\
+               \x20 handle log(\"hi\") with {\n\
+               \x20   Log.log(m) -> resume(Unit)\n\
+               \x20   return(r) -> r\n\
+               \x20 }\n\
+               }\n";
+    assert!(
+        elya::check_source("t.elya", src).is_ok(),
+        "effect program should type-check in 3b"
+    );
+    let err = elya::run_source("t.elya", src).unwrap_err();
+    assert!(
+        err.contains("not evaluated yet"),
+        "expected the 3c eval placeholder, got: {err}"
+    );
 }

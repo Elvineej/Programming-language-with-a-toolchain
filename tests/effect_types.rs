@@ -48,6 +48,29 @@ fn relay_is_row_polymorphic() {
 }
 
 #[test]
+fn handle_discharges_the_effect() {
+    // A function whose body performs Log but handles it is pure again.
+    let src = "effect Log { fn log(msg: String) -> Unit }\n\
+               fn safe() { handle log(\"x\") with { Log.log(m) -> resume(Unit) return(r) -> r } }\n";
+    let (s, d) = schemes(src);
+    assert!(d.is_empty(), "{d:?}");
+    assert_eq!(s["safe"], "fn() -> Unit");
+}
+
+#[test]
+fn resume_arg_must_match_operation_result_type() {
+    // Flip.flip : () -> Bool, so `resume` takes a Bool; resuming with an Int is
+    // a type error — resume's type is derived from the clause's operation.
+    let src = "effect Flip { fn flip() -> Bool }\n\
+               fn prog() { handle flip() with { Flip.flip() -> resume(1) } }\n";
+    let (_s, d) = schemes(src);
+    assert!(
+        d.iter().any(|c| c == "E0400"),
+        "expected E0400 from resume type mismatch: {d:?}"
+    );
+}
+
+#[test]
 fn effect_propagates_through_a_call() {
     // A function that calls a Log-performing function also performs {Log}.
     let src = "effect Log { fn log(msg: String) -> Unit }\n\

@@ -1,6 +1,6 @@
 //! Hindley–Milner type inference (Algorithm J).
 
-use crate::ast::{BinOp, Block, Decl, Expr, FnDecl, Module, Stmt, TypeAnn, UnOp};
+use crate::ast::{BinOp, Block, Decl, Expr, FnDecl, Handler, Module, Stmt, TypeAnn, UnOp};
 use crate::diag::Diagnostic;
 use crate::span::{Span, Spanned};
 use crate::Session;
@@ -126,6 +126,9 @@ pub struct Infer {
     /// Operation name -> its elaborated signature. Populated from `effect`
     /// declarations before inference; a call to one of these is a *perform*.
     ops: HashMap<String, OpInfo>,
+    /// Stack of `(B, R)` for the handler clause currently being typed: `resume`
+    /// takes the operation's result type `B` and yields the handle's result `R`.
+    resume_stack: Vec<(Ty, Ty)>,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -135,6 +138,7 @@ impl Infer {
             subst: Vec::new(),
             row_subst: Vec::new(),
             ops: HashMap::new(),
+            resume_stack: Vec::new(),
             diags: Vec::new(),
         }
     }
@@ -701,12 +705,20 @@ impl Infer {
             }
             Expr::Block(b) => self.infer_block(b, env, amb),
             Expr::Call { callee, args } => self.infer_call(callee, args, span, env, amb),
-            Expr::Handle { .. } | Expr::Resume { .. } => {
-                self.diags.push(
-                    Diagnostic::error("E0499", "effects are not type-checked yet (Slice 3b)")
-                        .with_label(span, "unsupported here"),
-                );
-                Ty::Error
+            Expr::Handle { body, handler } => self.infer_handle(body, handler, span, env, amb),
+            Expr::Resume { arg } => {
+                let arg_ty = self.infer_expr(arg, env, amb);
+                match self.resume_stack.last().cloned() {
+                    Some((b, r)) => {
+                        // resume : (B) -> R — takes the operation's result, yields
+                        // the handle's result. Its latent effect is the clause's
+                        // ambient, already threaded, so nothing new is added here.
+                        self.unify(&arg_ty, &b, span);
+                        r
+                    }
+                    // resume outside a handler is E0210 at resolve time.
+                    None => Ty::Error,
+                }
             }
         }
     }
@@ -770,6 +782,112 @@ impl Infer {
         let eff = self.resolve_row(&EffectRow::open(call_row));
         let _ = self.add_row(amb, &eff, span);
         result
+    }
+
+    /// Type `handle e with H`: infer `e` under a fresh inner ambient seeded with
+    /// the handled effect `E`; type each clause (binding params + `resume : (B)
+    /// -> R`) and the return clause; then *discharge* `E` so the residual effects
+    /// of `e` pass through into the enclosing ambient (spec §3.4).
+    fn infer_handle(
+        &mut self,
+        body: &Spanned<Expr>,
+        handler: &Handler,
+        span: Span,
+        env: &mut TyEnv,
+        amb: RowVar,
+    ) -> Ty {
+        let effect = self.handler_effect(handler);
+        // `e` may perform E plus a polymorphic remainder.
+        let amb_in = self.fresh_row();
+        if let Some(e) = &effect {
+            let _ = self.add_effect(amb_in, e, span);
+        }
+        let body_ty = self.infer_expr(body, env, amb_in);
+
+        // R — the handle's result type, shared by every clause and `return`.
+        let result = self.fresh();
+        for c in &handler.clauses {
+            let clause = &c.node;
+            let (params, b) = match self.ops.get(&clause.op) {
+                Some(op) => (op.params.clone(), op.ret.clone()),
+                None => (Vec::new(), Ty::Error),
+            };
+            env.push();
+            for (idx, p) in clause.params.iter().enumerate() {
+                let pty = params.get(idx).cloned().unwrap_or_else(|| self.fresh());
+                env.insert(
+                    &p.node.name,
+                    Scheme {
+                        vars: Vec::new(),
+                        row_vars: Vec::new(),
+                        ty: pty,
+                    },
+                );
+            }
+            // The clause body runs at the handler's *outer* ambient; `resume`
+            // there takes B and yields R.
+            self.resume_stack.push((b, result.clone()));
+            let clause_ty = self.infer_expr(&clause.body, env, amb);
+            self.unify(&clause_ty, &result, clause.body.span);
+            self.resume_stack.pop();
+            env.pop();
+        }
+        match &handler.ret {
+            Some(ret) => {
+                env.push();
+                env.insert(
+                    &ret.binder,
+                    Scheme {
+                        vars: Vec::new(),
+                        row_vars: Vec::new(),
+                        ty: body_ty.clone(),
+                    },
+                );
+                let ret_ty = self.infer_expr(&ret.body, env, amb);
+                self.unify(&ret_ty, &result, ret.body.span);
+                env.pop();
+            }
+            // No return clause ⇒ identity: R = type of `e`.
+            None => self.unify(&result, &body_ty, span),
+        }
+
+        // Discharge E: everything `e` performed *except* E flows into the ambient.
+        let mut residual = self.resolve_row(&EffectRow::open(amb_in));
+        if let Some(e) = &effect {
+            residual.labels.remove(e);
+        }
+        let _ = self.add_row(amb, &residual, span);
+        result
+    }
+
+    /// The single effect a handler covers — all clauses must agree. Clauses that
+    /// span more than one effect are `E0423` (a well-formedness condition on the
+    /// handler's typed meaning, so it lives with the type info; plan 5a).
+    fn handler_effect(&mut self, handler: &Handler) -> Option<String> {
+        let mut found: Option<String> = None;
+        for c in &handler.clauses {
+            let clause = &c.node;
+            let eff = clause
+                .effect
+                .clone()
+                .or_else(|| self.ops.get(&clause.op).map(|o| o.effect.clone()));
+            match (&found, eff) {
+                (None, Some(e)) => found = Some(e),
+                (Some(f), Some(e)) if *f != e => {
+                    self.diags.push(
+                        Diagnostic::error("E0423", "a handler must cover a single effect")
+                            .with_label(
+                                c.span,
+                                format!(
+                                "this clause handles `{e}`, but the handler already handles `{f}`"
+                            ),
+                            ),
+                    );
+                }
+                _ => {}
+            }
+        }
+        found
     }
 
     /// Generalize `t` under `env`: quantify the type *and* row variables free in
