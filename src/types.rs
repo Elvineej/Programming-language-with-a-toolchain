@@ -1,6 +1,6 @@
 //! Hindley–Milner type inference (Algorithm J).
 
-use crate::ast::{BinOp, Block, Decl, Expr, FnDecl, Module, Stmt, UnOp};
+use crate::ast::{BinOp, Block, Decl, Expr, FnDecl, Module, Stmt, TypeAnn, UnOp};
 use crate::diag::Diagnostic;
 use crate::span::{Span, Spanned};
 use crate::Session;
@@ -106,12 +106,26 @@ impl Ty {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scheme {
     pub vars: Vec<u32>,
+    /// Quantified effect-row variables (row polymorphism, spec §3.5).
+    pub row_vars: Vec<RowVar>,
     pub ty: Ty,
+}
+
+/// The elaborated signature of an effect operation: which effect it belongs to,
+/// its (monomorphic, base-typed) parameter types, and its result type.
+#[derive(Clone)]
+struct OpInfo {
+    effect: String,
+    params: Vec<Ty>,
+    ret: Ty,
 }
 
 pub struct Infer {
     subst: Vec<Option<Ty>>,
     row_subst: Vec<Option<EffectRow>>,
+    /// Operation name -> its elaborated signature. Populated from `effect`
+    /// declarations before inference; a call to one of these is a *perform*.
+    ops: HashMap<String, OpInfo>,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -120,6 +134,7 @@ impl Infer {
         Infer {
             subst: Vec::new(),
             row_subst: Vec::new(),
+            ops: HashMap::new(),
             diags: Vec::new(),
         }
     }
@@ -219,9 +234,7 @@ impl Infer {
             (Ty::Var(x), Ty::Var(y)) if x == y => {}
             (Ty::Var(x), t) | (t, Ty::Var(x)) => self.bind(x, &t, span),
             (Ty::Base(x), Ty::Base(y)) if x == y => {}
-            // Effect rows are ignored here until Task 4 threads real rows; every
-            // arrow is pure at this stage, so the rows are trivially equal.
-            (Ty::Fn(p1, _row1, r1), Ty::Fn(p2, _row2, r2)) => {
+            (Ty::Fn(p1, row1, r1), Ty::Fn(p2, row2, r2)) => {
                 if p1.len() != p2.len() {
                     self.diags.push(
                         Diagnostic::error("E0402", "wrong number of arguments").with_label(
@@ -234,6 +247,17 @@ impl Infer {
                         self.unify(x, y, span);
                     }
                     self.unify(&r1, &r2, span);
+                    // The two arrows' effect rows must reconcile. A closing
+                    // conflict (both rows closed but differing) is E0423.
+                    if let Err(c) = self.unify_row(&row1, &row2, span) {
+                        let differ: Vec<(String, Span)> =
+                            c.only1.iter().chain(c.only2.iter()).cloned().collect();
+                        self.emit_row_mismatch(
+                            &differ,
+                            span,
+                            "these function values perform different effects",
+                        );
+                    }
                 }
             }
             (Ty::Tuple(x), Ty::Tuple(y)) if x.len() == y.len() => {
@@ -380,9 +404,34 @@ impl Infer {
         self.unify_row(&EffectRow::open(amb), &target, span)
     }
 
-    /// Fold every label of `eff` into `amb` (pour a callee's row into ambient).
+    /// Pour a callee's latent row into the ambient: `amb ⊇ eff`. Adds each of
+    /// `eff`'s labels (keeping `amb` open, so a *closed* callee row never forces
+    /// the ambient closed), and relays a polymorphic tail into the ambient.
     pub fn add_row(&mut self, amb: RowVar, eff: &EffectRow, span: Span) -> Result<(), RowConflict> {
-        self.unify_row(&EffectRow::open(amb), eff, span)
+        let eff = self.resolve_row(eff);
+        for (label, sp) in &eff.labels {
+            self.add_effect(amb, label, *sp)?;
+        }
+        if let RowTail::Open(rho) = eff.tail {
+            // The callee's polymorphic effects flow into the ambient.
+            self.unify_row(&EffectRow::open(amb), &EffectRow::open(rho), span)?;
+        }
+        Ok(())
+    }
+
+    /// Emit `E0423` naming the exact set of labels two rows differ by. Rows are
+    /// rendered as named labels (never a `%r` token) — the effect-diagnostic
+    /// discipline. Shared by the unifier and the exact-match pass (Task 6).
+    fn emit_row_mismatch(&mut self, differ: &[(String, Span)], span: Span, note: &str) {
+        let mut labels: Vec<String> = differ.iter().map(|(k, _)| k.clone()).collect();
+        labels.sort();
+        labels.dedup();
+        let set = format!("{{{}}}", labels.join(", "));
+        self.diags.push(
+            Diagnostic::error("E0423", "effect row mismatch")
+                .with_label(span, note.to_string())
+                .with_help(format!("the rows differ by exactly: {set}")),
+        );
     }
 }
 
@@ -434,9 +483,10 @@ pub fn display_ty(inf: &Infer, t: &Ty) -> String {
 /// Render a scheme as `forall a b. <ty>` (or just the type when unquantified).
 pub fn display_scheme(inf: &Infer, s: &Scheme) -> String {
     let mut names = Names::default();
-    // Seed quantified type variables first so they take the leading letters,
-    // in declaration order.
-    let quant: Vec<String> = s.vars.iter().map(|v| names.ty_name(*v)).collect();
+    // Seed quantified type variables first, then row variables, so each takes a
+    // distinct leading letter in declaration order (`forall a b. …`).
+    let mut quant: Vec<String> = s.vars.iter().map(|v| names.ty_name(*v)).collect();
+    quant.extend(s.row_vars.iter().map(|v| names.row_name(*v)));
     let resolved = inf.resolve(&s.ty);
     let mut body = String::new();
     write_ty(&resolved, &mut names, &mut body);
@@ -566,36 +616,40 @@ fn binop_type(op: BinOp) -> (Ty, Ty, Ty) {
 
 impl Infer {
     pub fn instantiate(&mut self, s: &Scheme) -> Ty {
-        if s.vars.is_empty() {
+        if s.vars.is_empty() && s.row_vars.is_empty() {
             return s.ty.clone();
         }
         let mapping: HashMap<u32, Ty> = s.vars.iter().map(|v| (*v, self.fresh())).collect();
-        subst_vars(&s.ty, &mapping)
+        let row_mapping: HashMap<RowVar, RowVar> =
+            s.row_vars.iter().map(|v| (*v, self.fresh_row())).collect();
+        subst_vars(&s.ty, &mapping, &row_mapping)
     }
 
-    pub fn infer_block(&mut self, b: &Block, env: &mut TyEnv) -> Ty {
+    /// Infer a block, threading the ambient effect row `amb` through every
+    /// sub-expression — sequencing unions effects into the same ambient.
+    pub fn infer_block(&mut self, b: &Block, env: &mut TyEnv, amb: RowVar) -> Ty {
         env.push();
         for st in b.stmts.iter() {
             match &st.node {
                 Stmt::Let { name, value } => {
-                    let t = self.infer_expr(value, env);
+                    let t = self.infer_expr(value, env, amb);
                     let scheme = self.generalize(&t, env);
                     env.insert(name, scheme);
                 }
                 Stmt::Expr(e) => {
-                    self.infer_expr(e, env);
+                    self.infer_expr(e, env, amb);
                 }
             }
         }
         let result = match &b.tail {
-            Some(tail) => self.infer_expr(tail, env),
+            Some(tail) => self.infer_expr(tail, env, amb),
             None => Ty::unit(),
         };
         env.pop();
         result
     }
 
-    pub fn infer_expr(&mut self, e: &Spanned<Expr>, env: &mut TyEnv) -> Ty {
+    pub fn infer_expr(&mut self, e: &Spanned<Expr>, env: &mut TyEnv, amb: RowVar) -> Ty {
         let span = e.span;
         match &e.node {
             Expr::Int(_) => Ty::int(),
@@ -612,7 +666,7 @@ impl Infer {
             },
             Expr::Qualified { .. } => Ty::Error, // typed at the Call site (builtins)
             Expr::Unary { op, expr } => {
-                let t = self.infer_expr(expr, env);
+                let t = self.infer_expr(expr, env, amb);
                 let (operand, result) = match op {
                     UnOp::Neg => (Ty::int(), Ty::int()),
                     UnOp::Not => (Ty::bool(), Ty::bool()),
@@ -621,8 +675,8 @@ impl Infer {
                 result
             }
             Expr::Binary { op, lhs, rhs } => {
-                let lt = self.infer_expr(lhs, env);
-                let rt = self.infer_expr(rhs, env);
+                let lt = self.infer_expr(lhs, env, amb);
+                let rt = self.infer_expr(rhs, env, amb);
                 if matches!(op, BinOp::Eq | BinOp::Ne) {
                     self.unify(&lt, &rt, span);
                     Ty::bool()
@@ -638,15 +692,15 @@ impl Infer {
                 then_block,
                 else_block,
             } => {
-                let ct = self.infer_expr(cond, env);
+                let ct = self.infer_expr(cond, env, amb);
                 self.unify_cond(&ct, cond.span);
-                let tt = self.infer_block(&then_block.node, env);
-                let et = self.infer_block(&else_block.node, env);
+                let tt = self.infer_block(&then_block.node, env, amb);
+                let et = self.infer_block(&else_block.node, env, amb);
                 self.unify(&tt, &et, span);
                 tt
             }
-            Expr::Block(b) => self.infer_block(b, env),
-            Expr::Call { callee, args } => self.infer_call(callee, args, span, env),
+            Expr::Block(b) => self.infer_block(b, env, amb),
+            Expr::Call { callee, args } => self.infer_call(callee, args, span, env, amb),
             Expr::Handle { .. } | Expr::Resume { .. } => {
                 self.diags.push(
                     Diagnostic::error("E0499", "effects are not type-checked yet (Slice 3b)")
@@ -675,28 +729,51 @@ impl Infer {
         args: &[Spanned<Expr>],
         span: Span,
         env: &mut TyEnv,
+        amb: RowVar,
     ) -> Ty {
+        // Builtins.
         if let Expr::Qualified { module, name } = &callee.node {
             if module == "io" && name == "println" {
-                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env)).collect();
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
                 let want = Ty::Fn(vec![Ty::str()], EffectRow::pure(), Box::new(Ty::unit()));
                 let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::unit()));
                 self.unify(&want, &got, span);
+                let _ = self.add_effect(amb, "IO", span); // io.println performs {IO}
                 return Ty::unit();
             }
             return Ty::Error; // unknown builtin is E0201 from resolution
         }
-        let f = self.infer_expr(callee, env);
-        let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env)).collect();
+        // An operation call is a *perform*: it adds its effect to the ambient
+        // and yields the operation's declared result type.
+        if let Expr::Var(name) = &callee.node {
+            if let Some(op) = self.ops.get(name).cloned() {
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+                let want = Ty::Fn(
+                    op.params.clone(),
+                    EffectRow::pure(),
+                    Box::new(op.ret.clone()),
+                );
+                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(op.ret.clone()));
+                self.unify(&want, &got, span);
+                let _ = self.add_effect(amb, &op.effect, span);
+                return op.ret;
+            }
+        }
+        // Ordinary function call: unify the arrow's param/result types, then pour
+        // the callee's latent effect row into the ambient (`amb ⊇ ε_f`).
+        let f = self.infer_expr(callee, env, amb);
+        let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
         let result = self.fresh();
-        let expected = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(result.clone()));
+        let call_row = self.fresh_row();
+        let expected = Ty::Fn(arg_ts, EffectRow::open(call_row), Box::new(result.clone()));
         self.unify(&f, &expected, span);
+        let eff = self.resolve_row(&EffectRow::open(call_row));
+        let _ = self.add_row(amb, &eff, span);
         result
     }
 
-    /// Generalize `t` under `env`: quantify the vars free in `t` but not in the
-    /// environment. (The level/rank optimization is a valid future speedup;
-    /// this free-vars version produces identical schemes.)
+    /// Generalize `t` under `env`: quantify the type *and* row variables free in
+    /// `t` but not in the environment (row polymorphism, spec §3.5).
     fn generalize(&mut self, t: &Ty, env: &TyEnv) -> Scheme {
         let resolved = self.resolve(t);
         let mut in_ty = Vec::new();
@@ -704,7 +781,78 @@ impl Infer {
         let mut in_env = Vec::new();
         env_free_vars(self, env, &mut in_env);
         let vars: Vec<u32> = in_ty.into_iter().filter(|v| !in_env.contains(v)).collect();
-        Scheme { ty: resolved, vars }
+
+        let mut row_in_ty = Vec::new();
+        free_row_vars(self, &resolved, &mut row_in_ty);
+        let mut row_in_env = Vec::new();
+        env_free_row_vars(self, env, &mut row_in_env);
+        let row_vars: Vec<RowVar> = row_in_ty
+            .into_iter()
+            .filter(|v| !row_in_env.contains(v))
+            .collect();
+        Scheme {
+            ty: resolved,
+            vars,
+            row_vars,
+        }
+    }
+
+    /// Close a function's ambient residual tail *unless* that tail is relayed
+    /// through a parameter's effect row. A function that performs a concrete set
+    /// of effects (e.g. `{Log}`) thus gets a closed row; only one that relays a
+    /// higher-order argument's effects stays row-polymorphic (spec §3.5).
+    ///
+    /// Known limitation (flagged): a function that BOTH relays a parameter and
+    /// performs its own concrete effect keeps an open tail and may print a more
+    /// general row than minimal. Not exercised by the 3b corpus (no lambdas;
+    /// row-poly is demonstrated via the pure relay `run_it`).
+    fn close_unrelayed_residual(&mut self, amb: RowVar, params: &[Ty]) {
+        let resolved = self.resolve_row(&EffectRow::open(amb));
+        if let RowTail::Open(rho) = resolved.tail {
+            let mut in_params = Vec::new();
+            for p in params {
+                free_row_vars(self, p, &mut in_params);
+            }
+            if !in_params.contains(&rho) {
+                self.bind_row(rho, &EffectRow::pure(), Span::EMPTY);
+            }
+        }
+    }
+}
+
+/// Elaborate an operation-signature type annotation into a `Ty`. Slice 3b
+/// operations are monomorphic over base types; anything else (a generic type,
+/// a type variable, an unknown name) is `E0404` + `Ty::Error`.
+fn elaborate_ty(inf: &mut Infer, ann: &Spanned<TypeAnn>) -> Ty {
+    let t = &ann.node;
+    if !t.args.is_empty() {
+        inf.diags.push(
+            Diagnostic::error("E0404", "unsupported type in effect operation").with_label(
+                ann.span,
+                "generic effect operations are not supported yet (Slice 3b)",
+            ),
+        );
+        return Ty::Error;
+    }
+    match t.name.as_str() {
+        "Int" => Ty::int(),
+        "Float" => Ty::float(),
+        "Bool" => Ty::bool(),
+        "String" => Ty::str(),
+        "Unit" => Ty::unit(),
+        other => {
+            inf.diags.push(
+                Diagnostic::error(
+                    "E0404",
+                    format!("unknown type `{other}` in effect operation"),
+                )
+                .with_label(
+                    ann.span,
+                    "effect operations use base types: Int, Float, Bool, String, Unit",
+                ),
+            );
+            Ty::Error
+        }
     }
 }
 
@@ -746,16 +894,63 @@ fn env_free_vars(inf: &Infer, env: &TyEnv, acc: &mut Vec<u32>) {
     }
 }
 
-fn subst_vars(t: &Ty, m: &HashMap<u32, Ty>) -> Ty {
+/// Collect the free effect-row variables of a type (the open tails of its
+/// arrows). The type is resolved first, so tails are their residual variables.
+fn free_row_vars(inf: &Infer, t: &Ty, acc: &mut Vec<RowVar>) {
+    match inf.resolve(t) {
+        Ty::Fn(ps, row, r) => {
+            for p in &ps {
+                free_row_vars(inf, p, acc);
+            }
+            if let RowTail::Open(v) = row.tail {
+                if !acc.contains(&v) {
+                    acc.push(v);
+                }
+            }
+            free_row_vars(inf, &r, acc);
+        }
+        Ty::Tuple(xs) => {
+            for x in &xs {
+                free_row_vars(inf, x, acc);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn env_free_row_vars(inf: &Infer, env: &TyEnv, acc: &mut Vec<RowVar>) {
+    for scope in &env.scopes {
+        for scheme in scope.values() {
+            let mut fv = Vec::new();
+            free_row_vars(inf, &scheme.ty, &mut fv);
+            for v in fv {
+                if !scheme.row_vars.contains(&v) && !acc.contains(&v) {
+                    acc.push(v);
+                }
+            }
+        }
+    }
+}
+
+fn subst_vars(t: &Ty, m: &HashMap<u32, Ty>, rm: &HashMap<RowVar, RowVar>) -> Ty {
     match t {
         Ty::Var(v) => m.get(v).cloned().unwrap_or(Ty::Var(*v)),
         Ty::Base(c) => Ty::Base(*c),
-        Ty::Fn(ps, row, r) => Ty::Fn(
-            ps.iter().map(|p| subst_vars(p, m)).collect(),
-            row.clone(), // row instantiation is Task 4
-            Box::new(subst_vars(r, m)),
-        ),
-        Ty::Tuple(xs) => Ty::Tuple(xs.iter().map(|x| subst_vars(x, m)).collect()),
+        Ty::Fn(ps, row, r) => {
+            let tail = match &row.tail {
+                RowTail::Open(v) => RowTail::Open(*rm.get(v).unwrap_or(v)),
+                other => other.clone(),
+            };
+            Ty::Fn(
+                ps.iter().map(|p| subst_vars(p, m, rm)).collect(),
+                EffectRow {
+                    labels: row.labels.clone(),
+                    tail,
+                },
+                Box::new(subst_vars(r, m, rm)),
+            )
+        }
+        Ty::Tuple(xs) => Ty::Tuple(xs.iter().map(|x| subst_vars(x, m, rm)).collect()),
         Ty::Error => Ty::Error,
     }
 }
@@ -774,6 +969,30 @@ pub fn infer_schemes(
 ) -> (Vec<(String, String)>, Vec<Diagnostic>) {
     let mut inf = Infer::new();
     let mut env = TyEnv::new();
+
+    // Elaborate effect declarations into the operation-signature table, so a
+    // call to an operation is recognised as a perform during inference.
+    for d in &module.decls {
+        if let Decl::Effect(e) = &d.node {
+            for op in &e.ops {
+                let sig = &op.node;
+                let params: Vec<Ty> = sig
+                    .param_tys
+                    .iter()
+                    .map(|t| elaborate_ty(&mut inf, t))
+                    .collect();
+                let ret = elaborate_ty(&mut inf, &sig.ret);
+                inf.ops.insert(
+                    sig.name.clone(),
+                    OpInfo {
+                        effect: e.name.clone(),
+                        params,
+                        ret,
+                    },
+                );
+            }
+        }
+    }
 
     let fns: Vec<&FnDecl> = module
         .decls
@@ -805,44 +1024,58 @@ pub fn infer_schemes(
     let mut schemes_out: Vec<(String, String)> = Vec::new();
 
     for group in &groups {
-        // 1. fresh monotype per member, in scope for the whole group.
-        let mut member_ty: HashMap<usize, (Vec<Ty>, Ty)> = HashMap::new();
+        // 1. fresh monotype per member (with a fresh open ambient row), in scope
+        //    for the whole group.
+        let mut member_ty: HashMap<usize, (Vec<Ty>, RowVar, Ty)> = HashMap::new();
         for &i in group {
             let f = fns[i];
             let params: Vec<Ty> = f.params.iter().map(|_| inf.fresh()).collect();
+            let amb_f = inf.fresh_row();
             let result = inf.fresh();
             env.insert(
                 &f.name,
                 Scheme {
                     vars: Vec::new(),
-                    ty: Ty::Fn(params.clone(), EffectRow::pure(), Box::new(result.clone())),
+                    row_vars: Vec::new(),
+                    ty: Ty::Fn(
+                        params.clone(),
+                        EffectRow::open(amb_f),
+                        Box::new(result.clone()),
+                    ),
                 },
             );
-            member_ty.insert(i, (params, result));
+            member_ty.insert(i, (params, amb_f, result));
         }
-        // 2. infer each body under its params (monomorphic within the group).
+        // 2. infer each body under its params + ambient (monomorphic in-group).
         for &i in group {
             let f = fns[i];
-            let (params, result) = &member_ty[&i];
+            let (params, amb_f, result) = member_ty[&i].clone();
             env.push();
-            for (p, pty) in f.params.iter().zip(params) {
+            for (p, pty) in f.params.iter().zip(&params) {
                 env.insert(
                     &p.node.name,
                     Scheme {
                         vars: Vec::new(),
+                        row_vars: Vec::new(),
                         ty: pty.clone(),
                     },
                 );
             }
-            let body_ty = inf.infer_block(&f.body.node, &mut env);
-            inf.unify(&body_ty, result, f.body.span);
+            let body_ty = inf.infer_block(&f.body.node, &mut env, amb_f);
+            inf.unify(&body_ty, &result, f.body.span);
             env.pop();
+        }
+        // 2.5. close each member's residual ambient (once all in-group effects
+        //      are accumulated), unless it is relayed through a parameter.
+        for &i in group {
+            let (params, amb_f, _result) = member_ty[&i].clone();
+            inf.close_unrelayed_residual(amb_f, &params);
         }
         // 3. generalize each member and re-insert its polytype for later groups.
         for &i in group {
             let f = fns[i];
-            let (params, result) = &member_ty[&i];
-            let fnty = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(result.clone()));
+            let (params, amb_f, result) = member_ty[&i].clone();
+            let fnty = Ty::Fn(params, EffectRow::open(amb_f), Box::new(result));
             let scheme = generalize_toplevel(&mut inf, &fnty, &env, group, &fns);
             env.insert(&f.name, scheme.clone());
             schemes_out.push((f.name.clone(), display_scheme(&inf, &scheme)));
@@ -965,7 +1198,10 @@ fn generalize_toplevel(
     let resolved = inf.resolve(fnty);
     let mut in_ty = Vec::new();
     free_vars(inf, &resolved, &mut in_ty);
+    let mut row_in_ty = Vec::new();
+    free_row_vars(inf, &resolved, &mut row_in_ty);
     let mut in_env = Vec::new();
+    let mut row_in_env = Vec::new();
     for scope in &env.scopes {
         for (n, scheme) in scope {
             if group_names.contains(&n.as_str()) {
@@ -978,10 +1214,25 @@ fn generalize_toplevel(
                     in_env.push(v);
                 }
             }
+            let mut rfv = Vec::new();
+            free_row_vars(inf, &scheme.ty, &mut rfv);
+            for v in rfv {
+                if !scheme.row_vars.contains(&v) && !row_in_env.contains(&v) {
+                    row_in_env.push(v);
+                }
+            }
         }
     }
     let vars: Vec<u32> = in_ty.into_iter().filter(|v| !in_env.contains(v)).collect();
-    Scheme { ty: resolved, vars }
+    let row_vars: Vec<RowVar> = row_in_ty
+        .into_iter()
+        .filter(|v| !row_in_env.contains(v))
+        .collect();
+    Scheme {
+        ty: resolved,
+        vars,
+        row_vars,
+    }
 }
 
 #[cfg(test)]
@@ -997,7 +1248,8 @@ mod tests {
         let e = e.unwrap();
         let mut inf = Infer::new();
         let mut env = TyEnv::new();
-        let t = inf.infer_expr(&e, &mut env);
+        let amb = inf.fresh_row();
+        let t = inf.infer_expr(&e, &mut env, amb);
         (display_ty(&inf, &t), inf.diags.len())
     }
 
@@ -1143,6 +1395,7 @@ mod tests {
         let Ty::Var(av) = a else { unreachable!() };
         let s = Scheme {
             vars: vec![av],
+            row_vars: vec![],
             ty: Ty::Fn(vec![a.clone()], EffectRow::pure(), Box::new(a.clone())),
         };
         assert_eq!(display_scheme(&inf, &s), "forall a. fn(a) -> a");
@@ -1200,6 +1453,14 @@ mod tests {
             inf.diags.is_empty(),
             "unify_row must not push diagnostics for label conflicts"
         );
+    }
+
+    #[test]
+    fn unknown_op_type_is_e0404() {
+        let (m, _) =
+            crate::parse::parse_module(&Session::new(), "effect E { fn op(x: Foo) -> Unit }\n");
+        let (_s, d) = infer_schemes(&Session::new(), &m);
+        assert!(d.iter().any(|x| x.code == "E0404"), "expected E0404: {d:?}");
     }
 
     #[test]
