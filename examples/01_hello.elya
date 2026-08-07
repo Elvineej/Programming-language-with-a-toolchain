@@ -1,5 +1,0 @@
-import elya/io
-
-pub fn main() / {IO} {
-  io.println("Hello, Elya!")
-}

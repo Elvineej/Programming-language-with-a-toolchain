@@ -40,8 +40,9 @@ fn check_fixture(name: &str) {
             e.substring
         );
     }
-    // Invariant (spec §9): no raw inference tail-variable tokens leak.
-    for bad in ["%r", "%e", "%s", "%t", "%v"] {
+    // Invariant (spec §9): no raw inference tail-variable tokens leak (types or
+    // effect rows).
+    for bad in ["%r", "%e", "%s", "%t", "%v", "%row"] {
         assert!(
             !rendered.contains(bad),
             "diagnostic leaked internal token `{bad}`:\n{rendered}"
@@ -82,4 +83,19 @@ fn non_bool_cond() {
 #[test]
 fn resume_outside_handler() {
     check_fixture("resume_outside_handler.elya");
+}
+
+#[test]
+fn unhandled_effect() {
+    check_fixture("unhandled_effect.elya");
+}
+
+#[test]
+fn impure_pure_fn() {
+    check_fixture("impure_pure_fn.elya");
+}
+
+#[test]
+fn row_mismatch() {
+    check_fixture("row_mismatch.elya");
 }
