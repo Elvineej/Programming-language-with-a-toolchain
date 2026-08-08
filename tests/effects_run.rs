@@ -1,10 +1,20 @@
 //! Slice 3c: output-verified execution of effect programs on the CEK machine.
 //!
 //! The tree-walker recurses on the host stack and CANNOT capture continuations,
-//! so it is NOT an oracle for effect programs (spec §4.6). This corpus is the
-//! sole safety net for effect-program correctness, so it is built per handler
-//! *behavior* — one clause per distinct semantics — and every case asserts a
-//! concrete expected output, not mere absence of a crash.
+//! so it is NOT an oracle for effect programs (spec §4.6). The Slice-2 `cek ==
+//! tree` cross-check therefore stays effect-*free* (retained, unchanged, still
+//! green), and THIS corpus is the sole safety net for effect-program
+//! correctness — so it is built per handler *behavior*, and every case asserts a
+//! concrete expected output, not mere absence of a crash:
+//!
+//!   (a) non-resuming / Exn-style   -> `non_resuming_clause_is_exception_like`
+//!   (b) one-shot resume            -> `one_shot_resume_passes_a_value_back`
+//!   (d) nested / innermost-match   -> `nested_handlers_match_innermost`
+//!   (e) tail-resumptive            -> `tail_resumptive_loop_runs`
+//!   plus: handle-over-pure-body, and the one-shot E0425 negative test.
+//!
+//! (c) multi-shot re-invocation is deliberately NOT covered here — it lands in
+//! Slice 3d (output-verified). Its absence is intentional, not an oversight.
 
 use elya::{run_source, Session};
 
