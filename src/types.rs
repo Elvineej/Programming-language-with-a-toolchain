@@ -137,6 +137,9 @@ pub struct Infer {
     /// Stack of `(B, R)` for the handler clause currently being typed: `resume`
     /// takes the operation's result type `B` and yields the handle's result `R`.
     resume_stack: Vec<(Ty, Ty)>,
+    /// Constructor name -> arity. An n-ary constructor used unapplied or
+    /// partially applied is `E0433` (unapplied constructors need 4b's closures).
+    ctor_arity: HashMap<String, usize>,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -147,6 +150,7 @@ impl Infer {
             row_subst: Vec::new(),
             ops: HashMap::new(),
             resume_stack: Vec::new(),
+            ctor_arity: HashMap::new(),
             diags: Vec::new(),
         }
     }
@@ -658,6 +662,18 @@ impl Infer {
         subst_vars(&s.ty, &mapping, &row_mapping)
     }
 
+    /// `E0433`: an n-ary constructor used unapplied or partially applied.
+    fn emit_unapplied_ctor(&mut self, name: &str, arity: usize, span: Span) {
+        let plural = if arity == 1 { "" } else { "s" };
+        self.diags.push(
+            Diagnostic::error("E0433", format!("constructor `{name}` needs {arity} argument{plural}"))
+                .with_label(span, "unapplied or partially-applied constructor")
+                .with_help(
+                    "unapplied constructors become first-class function values in Slice 4b; apply it here, e.g. `Some(x)`",
+                ),
+        );
+    }
+
     /// Infer a block, threading the ambient effect row `amb` through every
     /// sub-expression — sequencing unions effects into the same ambient.
     pub fn infer_block(&mut self, b: &Block, env: &mut TyEnv, amb: RowVar) -> Ty {
@@ -690,13 +706,22 @@ impl Infer {
             Expr::Str(_) => Ty::str(),
             Expr::Bool(_) => Ty::bool(),
             Expr::Unit => Ty::unit(),
-            Expr::Var(name) => match env.lookup(name) {
-                Some(s) => {
-                    let s = s.clone();
-                    self.instantiate(&s)
+            Expr::Var(name) => {
+                if let Some(&arity) = self.ctor_arity.get(name) {
+                    if arity > 0 {
+                        // A bare n-ary constructor: E0433 (needs 4b closures).
+                        self.emit_unapplied_ctor(name, arity, span);
+                        return Ty::Error;
+                    }
                 }
-                None => Ty::Error, // unresolved names are E0200 from resolution
-            },
+                match env.lookup(name) {
+                    Some(s) => {
+                        let s = s.clone();
+                        self.instantiate(&s)
+                    }
+                    None => Ty::Error, // unresolved names are E0200 from resolution
+                }
+            }
             Expr::Qualified { .. } => Ty::Error, // typed at the Call site (builtins)
             Expr::Unary { op, expr } => {
                 let t = self.infer_expr(expr, env, amb);
@@ -849,6 +874,27 @@ impl Infer {
                 return Ty::unit();
             }
             return Ty::Error; // unknown builtin is E0201 from resolution
+        }
+        // A constructor application: `Cons(h, t)`. Must be saturated (E0433).
+        if let Expr::Var(name) = &callee.node {
+            if let Some(&arity) = self.ctor_arity.get(name) {
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+                if args.len() != arity {
+                    self.emit_unapplied_ctor(name, arity, span);
+                    return Ty::Error;
+                }
+                let Some(scheme) = env.lookup(name).cloned() else {
+                    return Ty::Error;
+                };
+                let (params, result) = match self.instantiate(&scheme) {
+                    Ty::Fn(ps, _r, r) => (ps, *r),
+                    other => (Vec::new(), other),
+                };
+                for (at, pt) in arg_ts.iter().zip(&params) {
+                    self.unify(at, pt, span);
+                }
+                return result;
+            }
         }
         // An operation call is a *perform*: it adds its effect to the ambient
         // and yields the operation's declared result type.
@@ -1387,6 +1433,7 @@ pub fn infer_schemes(
             let result = Ty::Con(t.name.clone(), param_vars.clone());
             for v in &t.variants {
                 let vd = &v.node;
+                inf.ctor_arity.insert(vd.name.clone(), vd.fields.len());
                 let mut field_tys = Vec::new();
                 for f in &vd.fields {
                     field_tys.push(elaborate_adt_ty(&mut inf, f, &param_env, &known_types));

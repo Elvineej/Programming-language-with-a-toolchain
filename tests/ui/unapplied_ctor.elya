@@ -1,0 +1,9 @@
+type Option(a) {
+  None,
+  Some(a)
+}
+fn f() {
+  let g = Some
+  g
+}
+//~ ERROR[E0433] needs 1 argument

@@ -99,3 +99,8 @@ fn impure_pure_fn() {
 fn row_mismatch() {
     check_fixture("row_mismatch.elya");
 }
+
+#[test]
+fn unapplied_ctor() {
+    check_fixture("unapplied_ctor.elya");
+}
