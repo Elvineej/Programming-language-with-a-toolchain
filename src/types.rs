@@ -726,6 +726,8 @@ impl Infer {
                     None => Ty::Error,
                 }
             }
+            // Provisional (Task 2 types match: scrutinee/pattern/arm bodies).
+            Expr::Match { .. } => Ty::Error,
         }
     }
 
@@ -1235,6 +1237,7 @@ pub fn infer_schemes(
         .filter_map(|d| match &d.node {
             Decl::Fn(f) => Some(f),
             Decl::Effect(_) => None,
+            Decl::Type(_) => None,
         })
         .collect();
     let name_idx: HashMap<&str, usize> = fns

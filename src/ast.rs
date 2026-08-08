@@ -19,6 +19,22 @@ pub struct Import {
 pub enum Decl {
     Fn(FnDecl),
     Effect(EffectDecl),
+    Type(TypeDecl),
+}
+
+/// A parametric algebraic data type: `type List(a) { Nil, Cons(a, List(a)) }`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeDecl {
+    pub name: String,
+    pub params: Vec<String>,
+    pub variants: Vec<Spanned<VariantDecl>>,
+}
+
+/// One value constructor of an ADT, with positional, typed payload fields.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VariantDecl {
+    pub name: String,
+    pub fields: Vec<Spanned<TypeAnn>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -96,6 +112,25 @@ pub enum Stmt {
     Expr(Spanned<Expr>),
 }
 
+/// A `match` pattern. Slice 4a: constructor, variable, and wildcard (literal
+/// patterns arrive in a later increment). Nested arbitrarily via `Ctor.args`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Pattern {
+    Wild,
+    Var(String),
+    Ctor {
+        name: String,
+        args: Vec<Spanned<Pattern>>,
+    },
+}
+
+/// One arm of a `match`: `pat -> body`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MatchArm {
+    pub pat: Spanned<Pattern>,
+    pub body: Rc<Spanned<Expr>>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Int(i64),
@@ -133,6 +168,10 @@ pub enum Expr {
     },
     Resume {
         arg: Rc<Spanned<Expr>>,
+    },
+    Match {
+        scrutinee: Rc<Spanned<Expr>>,
+        arms: Rc<[Spanned<MatchArm>]>,
     },
 }
 
@@ -200,6 +239,52 @@ fn pretty_decl(d: &Decl, s: &mut String) {
                 s.push_str(&format!(" ({})", op.node.name));
             }
             s.push(')');
+        }
+        Decl::Type(t) => {
+            s.push_str(&format!("(type {}", t.name));
+            for v in &t.variants {
+                s.push_str(&format!(" ({}", v.node.name));
+                for f in &v.node.fields {
+                    s.push(' ');
+                    pretty_type_ann(&f.node, s);
+                }
+                s.push(')');
+            }
+            s.push(')');
+        }
+    }
+}
+
+fn pretty_type_ann(t: &TypeAnn, s: &mut String) {
+    if t.args.is_empty() {
+        s.push_str(&t.name);
+    } else {
+        s.push('(');
+        s.push_str(&t.name);
+        for a in &t.args {
+            s.push(' ');
+            pretty_type_ann(&a.node, s);
+        }
+        s.push(')');
+    }
+}
+
+fn pretty_pattern(p: &Pattern, s: &mut String) {
+    match p {
+        Pattern::Wild => s.push('_'),
+        Pattern::Var(x) => s.push_str(x),
+        Pattern::Ctor { name, args } => {
+            s.push_str(name);
+            if !args.is_empty() {
+                s.push_str(" (");
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        s.push(' ');
+                    }
+                    pretty_pattern(&a.node, s);
+                }
+                s.push(')');
+            }
         }
     }
 }
@@ -297,6 +382,18 @@ fn pretty_expr(e: &Expr, s: &mut String) {
             pretty_expr(&arg.node, s);
             s.push(')');
         }
+        Expr::Match { scrutinee, arms } => {
+            s.push_str("(match ");
+            pretty_expr(&scrutinee.node, s);
+            for arm in arms.iter() {
+                s.push_str(" (");
+                pretty_pattern(&arm.node.pat.node, s);
+                s.push(' ');
+                pretty_expr(&arm.node.body.node, s);
+                s.push(')');
+            }
+            s.push(')');
+        }
     }
 }
 
@@ -337,6 +434,69 @@ mod tests {
 
     fn sp<T>(node: T) -> Spanned<T> {
         spanned(node, Span::EMPTY)
+    }
+
+    #[test]
+    fn pretty_prints_type_decl_and_match() {
+        // type Opt(a) { None, Some(a) }
+        let ty = Decl::Type(TypeDecl {
+            name: "Opt".into(),
+            params: vec!["a".into()],
+            variants: vec![
+                sp(VariantDecl {
+                    name: "None".into(),
+                    fields: vec![],
+                }),
+                sp(VariantDecl {
+                    name: "Some".into(),
+                    fields: vec![sp(TypeAnn {
+                        name: "a".into(),
+                        args: vec![],
+                    })],
+                }),
+            ],
+        });
+        // fn f(o) { match o { None -> 0  Some(x) -> x } }
+        let m = Expr::Match {
+            scrutinee: Rc::new(sp(Expr::Var("o".into()))),
+            arms: vec![
+                sp(MatchArm {
+                    pat: sp(Pattern::Ctor {
+                        name: "None".into(),
+                        args: vec![],
+                    }),
+                    body: Rc::new(sp(Expr::Int(0))),
+                }),
+                sp(MatchArm {
+                    pat: sp(Pattern::Ctor {
+                        name: "Some".into(),
+                        args: vec![sp(Pattern::Var("x".into()))],
+                    }),
+                    body: Rc::new(sp(Expr::Var("x".into()))),
+                }),
+            ]
+            .into(),
+        };
+        let module = Module {
+            imports: vec![],
+            decls: vec![
+                sp(ty),
+                sp(Decl::Fn(FnDecl {
+                    is_pub: false,
+                    name: "f".into(),
+                    params: vec![sp(Param { name: "o".into() })],
+                    effect_row: None,
+                    body: Rc::new(sp(Block {
+                        stmts: vec![].into(),
+                        tail: Some(Rc::new(sp(m))),
+                    })),
+                })),
+            ],
+        };
+        assert_eq!(
+            pretty(&module),
+            "(module (type Opt (None) (Some a)) (fn f (o) (block (match o (None 0) (Some (x) x)))))"
+        );
     }
 
     #[test]

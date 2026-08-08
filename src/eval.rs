@@ -307,6 +307,7 @@ pub mod tree {
             Expr::Handle { .. } | Expr::Resume { .. } => {
                 Err(rt(span, "effects are not evaluated yet (Slice 3c)"))
             }
+            Expr::Match { .. } => Err(rt(span, "match is not evaluated yet (Slice 4a Task 2)")),
         }
     }
 }
@@ -683,6 +684,9 @@ pub mod cek {
                     env,
                     push(Frame::ResumeApply { resume, span }, k),
                 )
+            }
+            Expr::Match { .. } => {
+                return Err(rt(span, "match is not evaluated yet (Slice 4a Task 2)"))
             }
         })
     }
