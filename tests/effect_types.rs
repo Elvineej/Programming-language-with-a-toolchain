@@ -2,7 +2,9 @@
 //! printed form of ambient-row inference — concrete-effect functions get a
 //! closed row, a pure relay is row-polymorphic, pure functions show no row.
 
-use elya::{parse::parse_module, types::infer_schemes, Session};
+use elya::diag::{render, Diagnostic, Severity};
+use elya::span::SourceMap;
+use elya::{check_source, parse::parse_module, run_source, types, types::infer_schemes, Session};
 use std::collections::HashMap;
 
 fn schemes(src: &str) -> (HashMap<String, String>, Vec<String>) {
@@ -109,5 +111,90 @@ fn handled_effect_in_main_is_clean() {
     assert!(
         d.is_empty(),
         "handled effect should type-check clean: {d:?}"
+    );
+}
+
+// ---- Slice 3d: E0426 cleanup lint + non-fatal warning semantics ----
+
+/// The full diagnostics from inference (not just codes) — for severity/wording.
+fn infer_diags(src: &str) -> Vec<Diagnostic> {
+    let (m, pd) = parse_module(&Session::new(), src);
+    assert!(pd.is_empty(), "parse diags: {pd:?}");
+    types::infer(&Session::new(), &m)
+}
+
+// A `with multi` handler whose body performs {IO} (io.println after the flip).
+const MULTI_OVER_IO: &str = "effect Flip { fn flip() -> Bool }\n\
+    fn noisy() { let x = flip()  let _ = io.println(\"tick\")  x }\n\
+    pub fn main() {\n\
+      let _ = handle noisy() with multi { Flip.flip() -> resume(True) }\n\
+      io.println(\"done\")\n\
+    }\n";
+
+#[test]
+fn multi_over_io_warns_e0426() {
+    let diags = infer_diags(MULTI_OVER_IO);
+    let w = diags
+        .iter()
+        .find(|d| d.code == "E0426")
+        .expect("expected E0426");
+    assert_eq!(w.severity, Severity::Warning, "E0426 must be a warning");
+    let sm = SourceMap::new("t.elya", MULTI_OVER_IO);
+    let rendered = render(&diags, &sm);
+    assert!(rendered.contains("E0426"), "{rendered}");
+    assert!(
+        rendered.contains("IO"),
+        "should name the effect: {rendered}"
+    );
+    for bad in ["%r", "%e", "%row"] {
+        assert!(!rendered.contains(bad), "leaked token {bad}: {rendered}");
+    }
+}
+
+#[test]
+fn multi_over_io_still_compiles_and_runs() {
+    // E0426 is a lint: the program type-checks and runs (warning is non-fatal).
+    assert!(
+        check_source("t.elya", MULTI_OVER_IO).is_ok(),
+        "warning must not fail check_source"
+    );
+    assert_eq!(
+        run_source("t.elya", MULTI_OVER_IO).expect("should run"),
+        "tick\ndone\n"
+    );
+}
+
+#[test]
+fn severity_partition_is_locked() {
+    // Lock the Error/Warning partition against regression: a warning-only program
+    // succeeds; an error program still fails.
+    assert!(
+        check_source("t.elya", MULTI_OVER_IO).is_ok(),
+        "warning => success"
+    );
+    let err_src = "pub fn main() { let _ = 1 + \"a\"\n io.println(\"x\") }\n";
+    assert!(check_source("e.elya", err_src).is_err(), "error => failure");
+}
+
+#[test]
+fn one_shot_over_io_does_not_warn() {
+    let src = "effect Flip { fn flip() -> Bool }\n\
+        fn noisy() { let x = flip()  let _ = io.println(\"tick\")  x }\n\
+        fn prog() { handle noisy() with { Flip.flip() -> resume(True) } }\n";
+    assert!(
+        !infer_diags(src).iter().any(|d| d.code == "E0426"),
+        "one-shot handler must not warn E0426"
+    );
+}
+
+#[test]
+fn multi_pure_body_does_not_warn() {
+    // choose() performs {Flip} but no observable IO — no duplication, no E0426.
+    let src = "effect Flip { fn flip() -> Bool }\n\
+        fn choose() { if flip() { \"a\" } else { \"b\" } }\n\
+        fn prog() { handle choose() with multi { Flip.flip() -> resume(True) <> resume(False) } }\n";
+    assert!(
+        !infer_diags(src).iter().any(|d| d.code == "E0426"),
+        "no IO in body => no E0426"
     );
 }
