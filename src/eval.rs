@@ -353,6 +353,12 @@ pub mod cek {
             env: Env,
             span: Span,
         },
+        // Installed by `handle`; catches the body's normal return (the return
+        // clause) and, in Task 3, is the boundary an operation searches for.
+        HandleK {
+            handler: Rc<Handler>,
+            env: Env,
+        },
     }
 
     struct KontNode {
@@ -569,8 +575,20 @@ pub mod cek {
                     }
                 }
             }
-            Expr::Handle { .. } | Expr::Resume { .. } => {
-                return Err(rt(span, "effects are not evaluated yet (Slice 3c)"))
+            // Install the handler and evaluate the body under it.
+            Expr::Handle { body, handler } => State::Eval(
+                body.clone(),
+                env.clone(),
+                push(
+                    Frame::HandleK {
+                        handler: handler.clone(),
+                        env,
+                    },
+                    k,
+                ),
+            ),
+            Expr::Resume { .. } => {
+                return Err(rt(span, "resume is not evaluated yet (Slice 3c Task 3)"))
             }
         })
     }
@@ -630,6 +648,15 @@ pub mod cek {
                 env,
                 span,
             } => advance_call(interp, fns, v, callee, done, args, cursor, env, span, rest)?,
+            // The body returned normally (no outstanding operation): run the
+            // return clause (or identity), discharging the handler.
+            Frame::HandleK { handler, env } => match &handler.ret {
+                Some(ret_clause) => {
+                    let env2 = env.extend(&[(ret_clause.binder.clone(), v)]);
+                    State::Eval(ret_clause.body.clone(), env2, rest)
+                }
+                None => State::Return(v, rest),
+            },
         }))
     }
 

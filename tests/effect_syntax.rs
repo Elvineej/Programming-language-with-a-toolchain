@@ -93,27 +93,7 @@ fn nested_handlers_type_check() {
                }\n";
     assert_type_checks_clean(src);
 }
-
-#[test]
-fn effects_type_check_but_dont_evaluate_yet() {
-    // The whole point of 3b: effects type-check. Evaluation is 3c, so running
-    // the program still reports the machine's "not evaluated yet" placeholder.
-    let src = "effect Log {\n\
-               \x20 fn log(msg: String) -> Unit\n\
-               }\n\
-               pub fn main() {\n\
-               \x20 handle log(\"hi\") with {\n\
-               \x20   Log.log(m) -> resume(Unit)\n\
-               \x20   return(r) -> r\n\
-               \x20 }\n\
-               }\n";
-    assert!(
-        elya::check_source("t.elya", src).is_ok(),
-        "effect program should type-check in 3b"
-    );
-    let err = elya::run_source("t.elya", src).unwrap_err();
-    assert!(
-        err.contains("not evaluated yet"),
-        "expected the 3c eval placeholder, got: {err}"
-    );
-}
+// (The 3b test `effects_type_check_but_dont_evaluate_yet` was removed in 3c:
+//  effects now evaluate on the CEK machine, so its "not evaluated yet" premise
+//  is obsolete. Execution is verified by the output-checked golden corpus in
+//  tests/effects_run.rs — the deliberate replacement for the missing oracle.)
