@@ -757,9 +757,11 @@ pub mod cek {
         }))
     }
 
-    /// Re-enter a captured continuation with value `u`. One-shot: a second
-    /// resumption of the same continuation is `E0425` (3d relaxes for `multi`).
-    /// Rebuilds `Kont' = k_cap ++ [HandleK] ++ k_now`, deepest-first.
+    /// Re-enter a captured continuation with value `u`. A one-shot handler
+    /// enforces a single use (`E0425` on a second `resume`); a `with multi`
+    /// handler permits re-entry — each resumption is an independent run of the
+    /// *same immutable* captured frames. Rebuilds `Kont' = k_cap ++ [HandleK] ++
+    /// k_now`, deepest-first.
     fn resume_apply(
         resume: Value,
         u: Value,
@@ -769,15 +771,23 @@ pub mod cek {
         let Value::Resume(rd) = resume else {
             return Err(rt(span, "internal: `resume` target is not a continuation"));
         };
-        if rd.consumed.get() {
-            return Err(RuntimeError {
-                diag: Diagnostic::error("E0425", "continuation resumed more than once").with_label(
-                    span,
-                    "this handler is one-shot — use `with multi` for multi-shot",
-                ),
-            });
+        // One-shot enforcement — skipped for `with multi`. This is the ONLY
+        // difference between one-shot and multi-shot: the re-push below is
+        // identical, because `rd.captured` is an immutable owned snapshot and
+        // each `f.clone()` builds a fresh, independent `Kont` (persistent frames,
+        // copy-on-write `Env`) — so re-entering it more than once is sound.
+        if !rd.handler.multi {
+            if rd.consumed.get() {
+                return Err(RuntimeError {
+                    diag: Diagnostic::error("E0425", "continuation resumed more than once")
+                        .with_label(
+                            span,
+                            "this handler is one-shot — use `with multi` for multi-shot",
+                        ),
+                });
+            }
+            rd.consumed.set(true);
         }
-        rd.consumed.set(true);
         let mut k = k_now;
         k = push(
             Frame::HandleK {

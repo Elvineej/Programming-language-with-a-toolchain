@@ -124,6 +124,44 @@ fn resuming_twice_in_a_one_shot_handler_is_e0425() {
 }
 
 #[test]
+fn multi_shot_collects_both_branches() {
+    // (c) multi-shot re-invocation: the `with multi` clause resumes TWICE — once
+    // per branch — and combines the results over String. The same immutable
+    // captured continuation (the `if flip()` frame) is re-entered independently,
+    // taking a different branch each time. This is the cash-out of the
+    // "multi-shot at no design change" claim (spec §4.5).
+    let src = "effect Flip {\n\
+               \x20 fn flip() -> Bool\n\
+               }\n\
+               fn choose() { if flip() { \"hello\" } else { \"bye\" } }\n\
+               pub fn main() {\n\
+               \x20 io.println(handle choose() with multi {\n\
+               \x20   Flip.flip() -> resume(True) <> \"/\" <> resume(False)\n\
+               \x20   return(x) -> x\n\
+               \x20 })\n\
+               }\n";
+    assert_eq!(run(src), "hello/bye\n");
+}
+
+#[test]
+fn multi_shot_three_way_collect() {
+    // A second multi-shot shape so (c) isn't a single data point: three resumes
+    // combined left to right.
+    let src = "effect Pick {\n\
+               \x20 fn pick() -> Int\n\
+               }\n\
+               fn label(n) { if n == 1 { \"a\" } else { if n == 2 { \"b\" } else { \"c\" } } }\n\
+               fn choose() { label(pick()) }\n\
+               pub fn main() {\n\
+               \x20 io.println(handle choose() with multi {\n\
+               \x20   Pick.pick() -> resume(1) <> \"|\" <> resume(2) <> \"|\" <> resume(3)\n\
+               \x20   return(x) -> x\n\
+               \x20 })\n\
+               }\n";
+    assert_eq!(run(src), "a|b|c\n");
+}
+
+#[test]
 fn handle_over_pure_body_applies_return_clause() {
     // The body performs no operation; the handler discharges and the return
     // clause transforms the body's value (here, identity).
