@@ -19,6 +19,7 @@
 - **Ordering discipline:** `cargo fmt --all` first, then `sh scripts/check.sh`, commit **only** on gate exit 0. The `scripts/githooks/pre-commit` fmt guard is installed. PATH prepends `~/.cargo/bin` (project memory). Push to `origin/main` after each commit.
 - **Scratch/debug work runs in the session scratchpad, never under repo `examples/`** (project memory: a stray `rm` there has twice deleted tracked fixtures). For a debug render, add a throwaway `#[test] -- --nocapture`, not `cargo run --example`.
 - **Preservation gate (every task):** the entire existing suite stays green — Slice-3 effect goldens, `tce.rs` (`K_MAX = 3`) + effect-TCE (`K_MAX_EFF = 4`), E042x fixtures, cross-check.
+- **ADT differential oracle — a hard gate from Task 2 onward:** every effect-free ADT golden runs on **both** the CEK machine and the tree-walker via `run_both` (below) and asserts identical output. The tree-walker is a real oracle again for effect-free ADT code (no continuation capture needed), and `cek == tree` is the strongest net for catching an evaluator divergence — so it is a **per-golden hard assertion locked in at Task 2 and held green through Tasks 3–6**, not a property confirmed only at the end.
 
 ---
 
@@ -109,23 +110,36 @@ fn parses_match() {
 // type Ctors<'a> = HashMap<&'a str, usize>;  // constructor name -> arity, threaded like fn_table
 ```
 
-- [ ] **Step 1: Write the failing end-to-end test** (`tests/adt.rs`):
+- [ ] **Step 1: Write the failing end-to-end test + the differential `run_both` helper** (`tests/adt.rs`). `run_both` is the standard runner for *every* ADT golden in Tasks 2/3/5 — it type-checks, runs on **both** evaluators, and asserts `cek == tree` (the hard gate from Global Constraints):
 ```rust
-use elya::{run_source, check_source};
+use elya::{check_source, eval, parse::parse_module, Session};
+
+/// Type-check, then run on BOTH the CEK machine and the tree-walker; assert the
+/// two agree (the effect-free ADT differential oracle) and return the output.
+fn run_both(src: &str) -> String {
+    assert!(check_source("t.elya", src).is_ok(), "{:?}", check_source("t.elya", src));
+    let (m, d) = parse_module(&Session::new(), src);
+    assert!(d.is_empty(), "parse: {d:?}");
+    let cek = eval::run_module(&m).unwrap().output().to_string();
+    let tree = eval::run_module_tree(&m).unwrap().output().to_string();
+    assert_eq!(cek, tree, "cek != tree divergence:\ncek={cek:?}\ntree={tree:?}");
+    cek
+}
+
 #[test]
 fn nullary_adt_runs_end_to_end() {
     let src = "type Bool2 { T, F }\n\
                fn to_int(b) { match b { T -> 1  F -> 0 } }\n\
                pub fn main() { let _ = to_int(T)  io.println(\"ok\") }\n";
-    assert!(check_source("t.elya", src).is_ok(), "{:?}", check_source("t.elya", src));
-    assert_eq!(run_source("t.elya", src).unwrap(), "ok\n");
+    assert_eq!(run_both(src), "ok\n"); // asserts cek == tree by construction
 }
 ```
+(`eval::run_module` = CEK, `eval::run_module_tree` = tree-walker — both already `pub`.)
 - [ ] **Step 2: Run to verify it fails** — currently `Decl::Type`/`Expr::Match` hit the Task-1 placeholder.
 - [ ] **Step 3: Resolver.** In `resolve::check`: gather **type + constructor names** from `Decl::Type` (constructor `name`s into a `ctors: HashSet<String>`; type names into `types: HashSet<String>`). `resolves_var` treats a constructor name as resolved. `check_expr` `Expr::Match { scrutinee, arms }`: check the scrutinee, then per arm push a scope, **bind the pattern's variables** (walk the pattern collecting `Var` names; a `Ctor` pattern's `name` must be a known constructor else `E0432`), check the body, pop. Add `fn pattern_binders(&self, pat, scope, out)` that also validates constructor names. `Decl::Type` bodies need no resolution (signatures only).
 - [ ] **Step 4: Types.** Add `Ty::Con(String, Vec<Ty>)`; fan it out mechanically (mirror `Ty::Tuple`) through `resolve`, `occurs`, `unify` (arm: `(Con(n1,a1),Con(n2,a2)) if n1==n2 && a1.len()==a2.len() => unify args pairwise; else E0400`), `free_vars`, `free_row_vars`, `subst_vars`, `write_ty` (display `Bool2`, or `List(Int)` later). In `infer_schemes`, **before typing bodies**, build constructor `Scheme`s from `Decl::Type` and `env.insert` them (two-pass; nullary here: `T`/`F` → `Scheme{ty: Con("Bool2", [])}`). Add `check_pattern(&mut self, pat, expected, bindings)` handling `Wild`/`Var`/`Ctor` (nullary: instantiate the ctor scheme → result `R`, unify `R ~ expected`, no sub-patterns). Add the `Expr::Match` arm: infer scrutinee `S`, fresh `R`, per arm `check_pattern(pat, S)` → bind in a pushed scope → infer body → unify with `R`; thread the ambient `amb`.
 - [ ] **Step 5: Eval.** Add `Value::Ctor(String, Vec<Value>)` (+ its `PartialEq` arm — `Ctor(n1,a1)==Ctor(n2,a2)` iff name+args equal). Build a `Ctors` arity table (`name -> arity`) in `run_module`, thread like `fns`/`ops` (tree + cek). Nullary construction: `Var(name)` where `name ∈ ctors` (arity 0) → `Value::Ctor(name, [])`. `Expr::Match`: **tree** — eval scrutinee, `match_pattern` each arm in order, eval the first match's body with bindings; **cek** — eval scrutinee under `Frame::MatchK { arms: Rc<[…]>, env }`, on return `match_pattern` and eval the winning body **in the match's continuation slot** (reuse `rest` — tail position). `fn match_pattern(v: &Value, p: &Pattern) -> Option<Vec<(String, Value)>>` (Wild/Var/Ctor). A fall-through (no arm matches) is a defensive `E0300` (Task 6 makes it statically unreachable).
-- [ ] **Step 6: Run the end-to-end test + fmt + gate** — the Bool2 program type-checks and runs on both evaluators. Add a cross-check assertion (`tests/adt.rs` also runs it via the tree-walker and asserts equal output), or rely on `tests/crosscheck.rs` picking it up once ADT programs are added there in Task 7.
+- [ ] **Step 6: Run the end-to-end test + fmt + gate** — the Bool2 program type-checks and runs, and `run_both` asserts **`cek == tree`** (the differential oracle is now live for ADTs). This `run_both` assertion is the hard cross-check gate from here on; every ADT golden in Tasks 3/5 uses it.
 - [ ] **Step 7: Commit + push** (`feat: nullary ADTs run end-to-end (Ty::Con, Value::Ctor, match on tree+cek)`).
 
 ---
@@ -157,8 +171,7 @@ fn list_length_and_option() {
                  let n = length(xs)\n\
                  io.println(unwrap_or(Some(\"hi\"), \"default\"))\n\
                }\n";
-    assert!(check_source("t.elya", src).is_ok());
-    assert_eq!(run_source("t.elya", src).unwrap(), "hi\n");
+    assert_eq!(run_both(src), "hi\n"); // run_both asserts cek == tree
 }
 ```
 (Also assert `length` infers `forall a. fn(List(a)) -> Int` via `infer_schemes` if convenient.)
@@ -182,6 +195,8 @@ Fixture `tests/ui/unapplied_ctor.elya` (`fn f() { Some }` or `map(Some, xs)`-sha
 **Files:** Create `tests/tce_match.rs`. (Conditional: `src/eval.rs`, only if measurement shows growth.)
 
 The `MatchK` frame is transient (pushed to evaluate the scrutinee, popped before the body, which runs in the match's continuation slot), so a tail-position `match` should already be bounded. **Measure-first, same discipline as `tce_effects.rs`.**
+
+> **Ordering constraint (fold-in):** both fixtures' matches must be **exhaustive** — `match xs { Nil -> …  Cons(h, t) -> … }` covers `List` fully — so that when **Task 6** turns on `E0430` they don't start failing non-exhaustiveness. Written clean now (full coverage), verified when Task 6 lands. Any `match` in a TCE/other fixture is either total or has a `_` catch-all.
 
 - [ ] **Step 1: Write the bounded + grow tests** (`tests/tce_match.rs`):
 ```rust
@@ -233,8 +248,9 @@ fn literal_patterns_run() {
     let src = "fn classify(n) { match n { 0 -> \"zero\"  _ -> \"other\" } }\n\
                fn name(b) { match b { True -> \"t\"  False -> \"f\" } }\n\
                pub fn main() { io.println(classify(0))\n io.println(name(False)) }\n";
-    assert!(check_source("t.elya", src).is_ok());
-    assert_eq!(run_source("t.elya", src).unwrap(), "zero\nf\n");
+    // Exhaustive (the `_` and True/False cover their scrutinees), so this stays
+    // green when Task 6 turns on E0430. run_both asserts cek == tree.
+    assert_eq!(run_both(src), "zero\nf\n");
 }
 ```
 - [ ] **Step 2: Run to verify it fails** — literal patterns not parsed.
@@ -281,7 +297,7 @@ pub fn check(module: &Module, types: &TypeInfo) -> Vec<Diagnostic>;   // E0430 (
 **Files:** Modify `src/main.rs`. Test: `tests/adt.rs` (integration), confirm nets.
 
 - [ ] **Step 1: Surface warnings in the CLI.** In `src/main.rs`, on a **successful** compile (no errors), render any `Severity::Warning` diagnostics to **stderr** (they no longer flow through `check_source`'s `Err` since 3d). This discharges the effects-spec §11 "warning CLI surfacing" obligation — now meaningful with `E0426`/`E0431`. (If `main.rs` currently drops the warning list, thread it out of the pipeline; keep it minimal.)
-- [ ] **Step 2: Extend the cross-check corpus to ADTs.** In `tests/crosscheck.rs` (or its hand-written corpus), add an **effect-free ADT program** (e.g. `List` sum) asserting `cek == tree` — the net that *extends* to ADTs (spec §3.4).
+- [ ] **Step 2: Confirm + broaden the ADT differential oracle.** `cek == tree` is already a per-golden hard gate (via `run_both`, live since Task 2). Additionally register one effect-free ADT program (e.g. `List` sum) in `tests/crosscheck.rs`'s hand-written corpus so the standing cross-check suite also exercises ADTs (spec §3.4) — belt-and-suspenders on the strongest evaluator-divergence net.
 - [ ] **Step 3: The Slice-4a exit gate.** `cargo fmt --all && sh scripts/check.sh` fully green:
   - ADT goldens (List/Option/Tree) type-check, run, **cross-check `cek == tree`**;
   - exhaustiveness accepts finite (`Bool` T/F) and rejects infinite-without-catch-all (`Int`), with **nested witnesses**; useless arms warn;
