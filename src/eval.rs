@@ -18,6 +18,8 @@ pub enum Value {
     Fn(String),
     /// A first-class captured continuation (Slice 3c). `resume(v)` re-enters it.
     Resume(Rc<cek::ResumeData>),
+    /// A constructed ADT value (Slice 4a): `Cons(1, Nil)` = `Ctor("Cons", [1, Nil])`.
+    Ctor(String, Vec<Value>),
 }
 
 // Hand-written so `Value::Resume` compares `false` (continuations are not
@@ -33,8 +35,37 @@ impl PartialEq for Value {
             (Bool(a), Bool(b)) => a == b,
             (Unit, Unit) => true,
             (Fn(a), Fn(b)) => a == b,
+            (Ctor(n1, a1), Ctor(n2, a2)) => n1 == n2 && a1 == a2,
             _ => false,
         }
+    }
+}
+
+/// Whether `name` denotes a data constructor. Constructors are `Upper`-cased
+/// (the lexer guarantees it) and the resolver has already validated existence,
+/// so the evaluators recognise a constructor by its leading capital — no table
+/// to thread.
+pub(crate) fn is_ctor_name(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
+/// Try to match `value` against `pattern`, returning the variable bindings on
+/// success. Recursive: a constructor pattern matches a same-named `Ctor` value
+/// and its sub-patterns against the fields.
+pub(crate) fn match_pattern(value: &Value, pat: &Pattern) -> Option<Vec<(String, Value)>> {
+    match pat {
+        Pattern::Wild => Some(Vec::new()),
+        Pattern::Var(x) => Some(vec![(x.clone(), value.clone())]),
+        Pattern::Ctor { name, args } => match value {
+            Value::Ctor(vname, vargs) if vname == name && vargs.len() == args.len() => {
+                let mut binds = Vec::new();
+                for (v, p) in vargs.iter().zip(args.iter()) {
+                    binds.extend(match_pattern(v, &p.node)?);
+                }
+                Some(binds)
+            }
+            _ => None,
+        },
     }
 }
 
@@ -235,6 +266,8 @@ pub mod tree {
             Expr::Var(name) => {
                 if let Some(v) = env.get(name) {
                     Ok(v)
+                } else if is_ctor_name(name) {
+                    Ok(Value::Ctor(name.clone(), Vec::new())) // nullary constructor
                 } else if fns.contains_key(name.as_str()) {
                     Ok(Value::Fn(name.clone()))
                 } else {
@@ -278,6 +311,16 @@ pub mod tree {
                     }
                     return Err(rt(span, format!("unknown builtin `{module}.{name}`")));
                 }
+                // Constructor application: `Cons(1, Nil)` builds a `Ctor` value.
+                if let Expr::Var(name) = &callee.node {
+                    if is_ctor_name(name) {
+                        let mut vals = Vec::with_capacity(args.len());
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        return Ok(Value::Ctor(name.clone(), vals));
+                    }
+                }
                 let callee_v = eval_expr(interp, callee, env, fns)?;
                 let Value::Fn(fname) = callee_v else {
                     return Err(rt(callee.span, "value is not callable"));
@@ -307,13 +350,25 @@ pub mod tree {
             Expr::Handle { .. } | Expr::Resume { .. } => {
                 Err(rt(span, "effects are not evaluated yet (Slice 3c)"))
             }
-            Expr::Match { .. } => Err(rt(span, "match is not evaluated yet (Slice 4a Task 2)")),
+            Expr::Match { scrutinee, arms } => {
+                let v = eval_expr(interp, scrutinee, env, fns)?;
+                for arm in arms.iter() {
+                    if let Some(binds) = match_pattern(&v, &arm.node.pat.node) {
+                        let arm_env = env.extend(&binds);
+                        return eval_expr(interp, &arm.node.body, &arm_env, fns);
+                    }
+                }
+                Err(rt(span, "no match arm matched (non-exhaustive)"))
+            }
         }
     }
 }
 
 pub mod cek {
-    use super::{apply_binop, apply_unop, fn_table, rt, Env, Fns, Interp, RuntimeError, Value};
+    use super::{
+        apply_binop, apply_unop, fn_table, is_ctor_name, match_pattern, rt, Env, Fns, Interp,
+        RuntimeError, Value,
+    };
     use crate::ast::*;
     use crate::diag::Diagnostic;
     use crate::span::{Span, Spanned};
@@ -354,6 +409,7 @@ pub mod cek {
         Builtin(&'static str),                    // e.g. "io.println"
         Value(Value),                             // an evaluated callee (a Value::Fn)
         Operation { effect: String, op: String }, // a perform of an effect op
+        Ctor { name: String },                    // a data-constructor application
     }
 
     // Frames own their AST via cheap `Rc` clones (the 3a `Box`->`Rc` groundwork),
@@ -414,6 +470,12 @@ pub mod cek {
         // Evaluating a `resume(arg)`; on return, re-enters the continuation.
         ResumeApply {
             resume: Value,
+            span: Span,
+        },
+        // Evaluating a `match` scrutinee; on return, dispatch to an arm.
+        MatchK {
+            arms: Rc<[Spanned<MatchArm>]>,
+            env: Env,
             span: Span,
         },
     }
@@ -557,6 +619,8 @@ pub mod cek {
             Expr::Var(name) => {
                 let v = if let Some(v) = env.get(name) {
                     v
+                } else if is_ctor_name(name) {
+                    Value::Ctor(name.clone(), Vec::new()) // nullary constructor
                 } else if fns.contains_key(name.as_str()) {
                     Value::Fn(name.clone())
                 } else {
@@ -609,7 +673,10 @@ pub mod cek {
                     Expr::Qualified { module, name } => {
                         return Err(rt(span, format!("unknown builtin `{module}.{name}`")))
                     }
-                    // A call to an operation name is a perform.
+                    // A call to a constructor builds a value; to an operation, performs.
+                    Expr::Var(name) if is_ctor_name(name) => {
+                        CalleeSlot::Ctor { name: name.clone() }
+                    }
                     Expr::Var(name) => match ops.get(name.as_str()) {
                         Some(effect) => CalleeSlot::Operation {
                             effect: effect.clone(),
@@ -685,9 +752,19 @@ pub mod cek {
                     push(Frame::ResumeApply { resume, span }, k),
                 )
             }
-            Expr::Match { .. } => {
-                return Err(rt(span, "match is not evaluated yet (Slice 4a Task 2)"))
-            }
+            // Evaluate the scrutinee, then dispatch to a matching arm.
+            Expr::Match { scrutinee, arms } => State::Eval(
+                scrutinee.clone(),
+                env.clone(),
+                push(
+                    Frame::MatchK {
+                        arms: arms.clone(),
+                        env,
+                        span,
+                    },
+                    k,
+                ),
+            ),
         })
     }
 
@@ -758,6 +835,21 @@ pub mod cek {
             // `resume(v)` re-enters the captured continuation: deep-handler
             // semantics re-install the handler beneath the captured frames.
             Frame::ResumeApply { resume, span } => resume_apply(resume, v, span, rest)?,
+            // The scrutinee returned `v`: dispatch to the first matching arm and
+            // evaluate its body in the match's continuation slot (tail position).
+            Frame::MatchK { arms, env, span } => {
+                let mut chosen = None;
+                for arm in arms.iter() {
+                    if let Some(binds) = match_pattern(&v, &arm.node.pat.node) {
+                        chosen = Some((arm.node.body.clone(), env.extend(&binds)));
+                        break;
+                    }
+                }
+                match chosen {
+                    Some((body, arm_env)) => State::Eval(body, arm_env, rest),
+                    None => return Err(rt(span, "no match arm matched (non-exhaustive)")),
+                }
+            }
         }))
     }
 
@@ -974,6 +1066,7 @@ pub mod cek {
                 Ok(eval_block_state(&fdecl.body.node, call_env, k)) // reuses `k` — no frame
             }
             CalleeSlot::Operation { effect, op } => perform(effect, op, args, span, k),
+            CalleeSlot::Ctor { name } => Ok(State::Return(Value::Ctor(name, args), k)),
             CalleeSlot::Value(_) => Err(rt(span, "value is not callable")),
             CalleeSlot::Pending => Err(rt(span, "internal: unresolved callee")),
         }

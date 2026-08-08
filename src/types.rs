@@ -1,6 +1,6 @@
 //! Hindley–Milner type inference (Algorithm J).
 
-use crate::ast::{BinOp, Block, Decl, Expr, FnDecl, Handler, Module, Stmt, TypeAnn, UnOp};
+use crate::ast::{BinOp, Block, Decl, Expr, FnDecl, Handler, Module, Pattern, Stmt, TypeAnn, UnOp};
 use crate::diag::Diagnostic;
 use crate::span::{Span, Spanned};
 use crate::Session;
@@ -23,6 +23,8 @@ pub enum Ty {
     /// result: `fn(A) / {E} -> B`. A pure function's row is `EffectRow::pure()`.
     Fn(Vec<Ty>, EffectRow, Box<Ty>),
     Tuple(Vec<Ty>),
+    /// An applied, nominal type constructor: `List(Int)` = `Con("List",[Int])`.
+    Con(String, Vec<Ty>),
     /// Poison value that unifies with anything; suppresses cascade errors.
     Error,
 }
@@ -204,6 +206,7 @@ impl Infer {
                 Box::new(self.resolve(r)),
             ),
             Ty::Tuple(xs) => Ty::Tuple(xs.iter().map(|x| self.resolve(x)).collect()),
+            Ty::Con(n, args) => Ty::Con(n.clone(), args.iter().map(|a| self.resolve(a)).collect()),
             Ty::Error => Ty::Error,
         }
     }
@@ -216,6 +219,7 @@ impl Infer {
             Ty::Base(_) | Ty::Error => false,
             Ty::Fn(ps, _row, r) => ps.iter().any(|p| self.occurs(v, p)) || self.occurs(v, &r),
             Ty::Tuple(xs) => xs.iter().any(|x| self.occurs(v, x)),
+            Ty::Con(_, args) => args.iter().any(|a| self.occurs(v, a)),
         }
     }
 
@@ -272,6 +276,12 @@ impl Infer {
             }
             (Ty::Tuple(x), Ty::Tuple(y)) if x.len() == y.len() => {
                 for (p, q) in x.iter().zip(&y) {
+                    self.unify(p, q, span);
+                }
+            }
+            // Nominal: same constructor name + arity, then unify args pairwise.
+            (Ty::Con(n1, a1), Ty::Con(n2, a2)) if n1 == n2 && a1.len() == a2.len() => {
+                for (p, q) in a1.iter().zip(&a2) {
                     self.unify(p, q, span);
                 }
             }
@@ -554,6 +564,19 @@ fn write_ty(t: &Ty, names: &mut Names, out: &mut String) {
             }
             out.push(')');
         }
+        Ty::Con(n, args) => {
+            out.push_str(n);
+            if !args.is_empty() {
+                out.push('(');
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    write_ty(a, names, out);
+                }
+                out.push(')');
+            }
+        }
         Ty::Error => out.push_str("<error>"),
     }
 }
@@ -726,8 +749,72 @@ impl Infer {
                     None => Ty::Error,
                 }
             }
-            // Provisional (Task 2 types match: scrutinee/pattern/arm bodies).
-            Expr::Match { .. } => Ty::Error,
+            Expr::Match { scrutinee, arms } => {
+                let s = self.infer_expr(scrutinee, env, amb);
+                let result = self.fresh();
+                for arm in arms.iter() {
+                    let mut bindings = Vec::new();
+                    self.check_pattern(&arm.node.pat, &s, env, &mut bindings);
+                    env.push();
+                    for (name, ty) in bindings {
+                        env.insert(
+                            &name,
+                            Scheme {
+                                vars: Vec::new(),
+                                row_vars: Vec::new(),
+                                ty,
+                            },
+                        );
+                    }
+                    let body_ty = self.infer_expr(&arm.node.body, env, amb);
+                    self.unify(&body_ty, &result, arm.node.body.span);
+                    env.pop();
+                }
+                result
+            }
+        }
+    }
+
+    /// Check a pattern against `expected`, collecting variable bindings. A
+    /// constructor pattern instantiates the constructor's scheme, unifies its
+    /// result with `expected`, and recurses into its field patterns.
+    fn check_pattern(
+        &mut self,
+        pat: &Spanned<Pattern>,
+        expected: &Ty,
+        env: &TyEnv,
+        bindings: &mut Vec<(String, Ty)>,
+    ) {
+        match &pat.node {
+            Pattern::Wild => {}
+            Pattern::Var(x) => bindings.push((x.clone(), expected.clone())),
+            Pattern::Ctor { name, args } => {
+                let Some(scheme) = env.lookup(name).cloned() else {
+                    return; // unknown constructor is E0432 at resolve time
+                };
+                let ty = self.instantiate(&scheme);
+                let (field_tys, result) = match ty {
+                    Ty::Fn(fs, _row, r) => (fs, *r),
+                    other => (Vec::new(), other), // nullary constructor
+                };
+                self.unify(&result, expected, pat.span);
+                if args.len() != field_tys.len() {
+                    self.diags.push(
+                        Diagnostic::error(
+                            "E0402",
+                            format!(
+                                "constructor `{name}` expects {} field(s), found {}",
+                                field_tys.len(),
+                                args.len()
+                            ),
+                        )
+                        .with_label(pat.span, "wrong number of fields in pattern"),
+                    );
+                }
+                for (a, ft) in args.iter().zip(&field_tys) {
+                    self.check_pattern(a, ft, env, bindings);
+                }
+            }
         }
     }
 
@@ -1057,6 +1144,58 @@ impl Infer {
     }
 }
 
+/// Elaborate an ADT field/argument type annotation under a type-parameter
+/// environment: a bare param name → its type variable; a base name → its
+/// `Base`; an `Upper(args)` → a `Ty::Con` (arity-checked against `known`).
+fn elaborate_adt_ty(
+    inf: &mut Infer,
+    ann: &Spanned<TypeAnn>,
+    param_env: &HashMap<String, Ty>,
+    known: &HashMap<String, usize>,
+) -> Ty {
+    let t = &ann.node;
+    if t.args.is_empty() {
+        if let Some(ty) = param_env.get(&t.name) {
+            return ty.clone();
+        }
+    }
+    match t.name.as_str() {
+        "Int" => Ty::int(),
+        "Float" => Ty::float(),
+        "Bool" => Ty::bool(),
+        "String" => Ty::str(),
+        "Unit" => Ty::unit(),
+        other => match known.get(other) {
+            Some(&arity) => {
+                if t.args.len() != arity {
+                    inf.diags.push(
+                        Diagnostic::error(
+                            "E0400",
+                            format!(
+                                "type `{other}` expects {arity} argument(s), found {}",
+                                t.args.len()
+                            ),
+                        )
+                        .with_label(ann.span, "wrong number of type arguments"),
+                    );
+                }
+                let mut args = Vec::new();
+                for a in &t.args {
+                    args.push(elaborate_adt_ty(inf, a, param_env, known));
+                }
+                Ty::Con(other.to_string(), args)
+            }
+            None => {
+                inf.diags.push(
+                    Diagnostic::error("E0432", format!("unknown type `{other}`"))
+                        .with_label(ann.span, "no such type"),
+                );
+                Ty::Error
+            }
+        },
+    }
+}
+
 /// Elaborate an operation-signature type annotation into a `Ty`. Slice 3b
 /// operations are monomorphic over base types; anything else (a generic type,
 /// a type variable, an unknown name) is `E0404` + `Ty::Error`.
@@ -1114,6 +1253,11 @@ fn free_vars(inf: &Infer, t: &Ty, acc: &mut Vec<u32>) {
                 free_vars(inf, x, acc);
             }
         }
+        Ty::Con(_, args) => {
+            for a in &args {
+                free_vars(inf, a, acc);
+            }
+        }
     }
 }
 
@@ -1149,6 +1293,11 @@ fn free_row_vars(inf: &Infer, t: &Ty, acc: &mut Vec<RowVar>) {
         Ty::Tuple(xs) => {
             for x in &xs {
                 free_row_vars(inf, x, acc);
+            }
+        }
+        Ty::Con(_, args) => {
+            for a in &args {
+                free_row_vars(inf, a, acc);
             }
         }
         _ => {}
@@ -1188,6 +1337,10 @@ fn subst_vars(t: &Ty, m: &HashMap<u32, Ty>, rm: &HashMap<RowVar, RowVar>) -> Ty 
             )
         }
         Ty::Tuple(xs) => Ty::Tuple(xs.iter().map(|x| subst_vars(x, m, rm)).collect()),
+        Ty::Con(n, args) => Ty::Con(
+            n.clone(),
+            args.iter().map(|a| subst_vars(a, m, rm)).collect(),
+        ),
         Ty::Error => Ty::Error,
     }
 }
@@ -1206,6 +1359,54 @@ pub fn infer_schemes(
 ) -> (Vec<(String, String)>, Vec<Diagnostic>) {
     let mut inf = Infer::new();
     let mut env = TyEnv::new();
+
+    // Register ADT constructors as polymorphic schemes (two-pass: type-name
+    // arities first — so recursive/mutual types elaborate — then the schemes).
+    let mut known_types: HashMap<String, usize> = HashMap::new();
+    for d in &module.decls {
+        if let Decl::Type(t) = &d.node {
+            known_types.insert(t.name.clone(), t.params.len());
+        }
+    }
+    for d in &module.decls {
+        if let Decl::Type(t) = &d.node {
+            let param_vars: Vec<Ty> = t.params.iter().map(|_| inf.fresh()).collect();
+            let var_ids: Vec<u32> = param_vars
+                .iter()
+                .map(|v| match v {
+                    Ty::Var(id) => *id,
+                    _ => unreachable!(),
+                })
+                .collect();
+            let param_env: HashMap<String, Ty> = t
+                .params
+                .iter()
+                .cloned()
+                .zip(param_vars.iter().cloned())
+                .collect();
+            let result = Ty::Con(t.name.clone(), param_vars.clone());
+            for v in &t.variants {
+                let vd = &v.node;
+                let mut field_tys = Vec::new();
+                for f in &vd.fields {
+                    field_tys.push(elaborate_adt_ty(&mut inf, f, &param_env, &known_types));
+                }
+                let ty = if field_tys.is_empty() {
+                    result.clone()
+                } else {
+                    Ty::Fn(field_tys, EffectRow::pure(), Box::new(result.clone()))
+                };
+                env.insert(
+                    &vd.name,
+                    Scheme {
+                        vars: var_ids.clone(),
+                        row_vars: Vec::new(),
+                        ty,
+                    },
+                );
+            }
+        }
+    }
 
     // Elaborate effect declarations into the operation-signature table, so a
     // call to an operation is recognised as a perform during inference.
