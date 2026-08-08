@@ -1,4 +1,4 @@
-//! Slice 3c: output-verified execution of effect programs on the CEK machine.
+//! Slices 3c/3d: output-verified execution of effect programs on the CEK machine.
 //!
 //! The tree-walker recurses on the host stack and CANNOT capture continuations,
 //! so it is NOT an oracle for effect programs (spec §4.6). The Slice-2 `cek ==
@@ -9,12 +9,14 @@
 //!
 //!   (a) non-resuming / Exn-style   -> `non_resuming_clause_is_exception_like`
 //!   (b) one-shot resume            -> `one_shot_resume_passes_a_value_back`
+//!   (c) multi-shot re-invocation   -> `multi_shot_collects_both_branches`
+//!                                     `multi_shot_three_way_collect`   (3d)
 //!   (d) nested / innermost-match   -> `nested_handlers_match_innermost`
 //!   (e) tail-resumptive            -> `tail_resumptive_loop_runs`
 //!   plus: handle-over-pure-body, and the one-shot E0425 negative test.
 //!
-//! (c) multi-shot re-invocation is deliberately NOT covered here — it lands in
-//! Slice 3d (output-verified). Its absence is intentional, not an oversight.
+//! Row (c) — the multi-shot cash-out — was deferred by 3c and closed in 3d:
+//! `resume` re-invoked and its results combined over String, output-verified.
 
 use elya::{run_source, Session};
 
