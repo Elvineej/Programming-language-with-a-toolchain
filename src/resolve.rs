@@ -3,7 +3,7 @@
 
 use crate::ast::*;
 use crate::diag::Diagnostic;
-use crate::span::Span;
+use crate::span::{Span, Spanned};
 use crate::Session;
 use std::collections::HashSet;
 
@@ -14,6 +14,7 @@ pub fn builtins() -> &'static [&'static str] {
 pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
     let mut fn_names: HashSet<String> = HashSet::new();
     let mut op_names: HashSet<String> = HashSet::new();
+    let mut ctor_names: HashSet<String> = HashSet::new();
     for d in &module.decls {
         match &d.node {
             Decl::Fn(f) => {
@@ -24,12 +25,17 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
                     op_names.insert(op.node.name.clone());
                 }
             }
-            Decl::Type(_) => {} // constructors registered in Task 2
+            Decl::Type(t) => {
+                for v in &t.variants {
+                    ctor_names.insert(v.node.name.clone());
+                }
+            }
         }
     }
     let mut cx = Cx {
         fns: &fn_names,
         ops: &op_names,
+        ctors: &ctor_names,
         in_handler: 0,
         diags: Vec::new(),
     };
@@ -52,6 +58,7 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
 struct Cx<'a> {
     fns: &'a HashSet<String>,
     ops: &'a HashSet<String>,
+    ctors: &'a HashSet<String>,
     /// Nesting depth of handler clauses currently being checked. `resume` is
     /// only legal where this is nonzero (E0210 otherwise).
     in_handler: usize,
@@ -63,6 +70,29 @@ impl Cx<'_> {
         scope.iter().rev().any(|s| s.contains(name))
             || self.fns.contains(name)
             || self.ops.contains(name)
+            || self.ctors.contains(name)
+    }
+
+    /// Walk a pattern: bind its variables into `scope`, and validate that each
+    /// constructor name is known (`E0432` otherwise).
+    fn bind_pattern(&mut self, pat: &Spanned<Pattern>, scope: &mut HashSet<String>) {
+        match &pat.node {
+            Pattern::Wild => {}
+            Pattern::Var(x) => {
+                scope.insert(x.clone());
+            }
+            Pattern::Ctor { name, args } => {
+                if !self.ctors.contains(name) {
+                    self.diags.push(
+                        Diagnostic::error("E0432", format!("unknown constructor `{name}`"))
+                            .with_label(pat.span, "no such constructor"),
+                    );
+                }
+                for a in args {
+                    self.bind_pattern(a, scope);
+                }
+            }
+        }
     }
 
     fn check_block(&mut self, b: &Block, scope: &mut Vec<HashSet<String>>) {
@@ -156,12 +186,14 @@ impl Cx<'_> {
                 }
                 self.check_expr(&arg.node, arg.span, scope);
             }
-            // Provisional (Task 2 adds pattern binding + E0432). Checks the
-            // scrutinee and arm bodies without binding pattern variables.
             Expr::Match { scrutinee, arms } => {
                 self.check_expr(&scrutinee.node, scrutinee.span, scope);
                 for arm in arms.iter() {
+                    let mut bound = HashSet::new();
+                    self.bind_pattern(&arm.node.pat, &mut bound);
+                    scope.push(bound);
                     self.check_expr(&arm.node.body.node, arm.node.body.span, scope);
+                    scope.pop();
                 }
             }
         }

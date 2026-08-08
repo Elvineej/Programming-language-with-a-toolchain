@@ -219,6 +219,12 @@ impl<'a> Parser<'a> {
                     Some(spanned(Expr::Var(name), span))
                 }
             }
+            // A constructor reference (`Nil`, `Cons`, `Some`) is a `Var`; a call
+            // `Cons(h, t)` is handled by the postfix-call rule in `expr`.
+            TokenKind::Upper(name) => {
+                self.bump();
+                Some(spanned(Expr::Var(name), span))
+            }
             _ => {
                 self.error(span, "expected an expression");
                 None
