@@ -49,6 +49,32 @@ fn self_tail_resumptive_is_bounded() {
 }
 
 #[test]
+fn non_tail_resume_grows_with_depth() {
+    // Grow control (the bound's teeth): the clause sequences work AFTER `resume`
+    // (`resume(Unit) <> "."` — resume is NOT in tail position), so each operation
+    // leaves a frame in the continuation. Peak MUST grow with depth — proving the
+    // machine distinguishes tail-resume (flat) from non-tail (grows), so the
+    // bounded assertion can't be quietly loosened to hide a splice leak.
+    let prog = |n: i64| {
+        format!(
+            "effect Tick {{ fn tick() -> Unit }}\n\
+             fn count(n) {{ if n == 0 {{ \"x\" }} else {{ let _ = tick()  count(n - 1) }} }}\n\
+             pub fn main() {{ io.println(handle count({n}) with {{ Tick.tick() -> resume(Unit) <> \".\" }}) }}\n"
+        )
+    };
+    let (_os, shallow) = run_effect(&prog(5));
+    let (_od, deep) = run_effect(&prog(50));
+    assert!(
+        deep > shallow,
+        "non-tail resume must grow: shallow={shallow}, deep={deep}"
+    );
+    assert!(
+        deep >= 45,
+        "expected depth ~proportional to n=50, got {deep}"
+    );
+}
+
+#[test]
 fn mutual_tail_resumptive_is_bounded() {
     // Two mutually-recursive functions, each performing an op resumed in tail
     // position. Output-verified AND depth-bounded.
