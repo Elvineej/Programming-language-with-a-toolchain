@@ -7,7 +7,7 @@ use crate::span::{Span, Spanned};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Value {
     Int(i64),
     Float(f64),
@@ -16,6 +16,26 @@ pub enum Value {
     Unit,
     /// A top-level function, referenced by name (Slice 2 has no lambdas).
     Fn(String),
+    /// A first-class captured continuation (Slice 3c). `resume(v)` re-enters it.
+    Resume(Rc<cek::ResumeData>),
+}
+
+// Hand-written so `Value::Resume` compares `false` (continuations are not
+// comparable, and the type system never lets a base-typed `==` observe one),
+// without forcing `ResumeData`/`Frame` to derive `PartialEq`.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        use Value::*;
+        match (self, other) {
+            (Int(a), Int(b)) => a == b,
+            (Float(a), Float(b)) => a == b,
+            (Str(a), Str(b)) => a == b,
+            (Bool(a), Bool(b)) => a == b,
+            (Unit, Unit) => true,
+            (Fn(a), Fn(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -294,14 +314,45 @@ pub mod tree {
 pub mod cek {
     use super::{apply_binop, apply_unop, fn_table, rt, Env, Fns, Interp, RuntimeError, Value};
     use crate::ast::*;
+    use crate::diag::Diagnostic;
     use crate::span::{Span, Spanned};
+    use std::collections::HashMap;
     use std::rc::Rc;
 
-    #[derive(Clone)]
+    /// Operation name -> its declaring effect. A call to one of these names is a
+    /// *perform*. Built from `effect` declarations, threaded like `fns`.
+    type Ops<'a> = HashMap<&'a str, String>;
+
+    fn op_table<'a>(module: &'a Module) -> Ops<'a> {
+        let mut m = HashMap::new();
+        for d in &module.decls {
+            if let Decl::Effect(e) = &d.node {
+                for op in &e.ops {
+                    m.insert(op.node.name.as_str(), e.name.clone());
+                }
+            }
+        }
+        m
+    }
+
+    /// A first-class captured continuation: the frames above the handler at the
+    /// perform point (`captured`, top-first), the handler to re-install beneath
+    /// them (deep handler), the environment its clauses run in, and the one-shot
+    /// consumed flag (`E0425` on a second `resume`; 3d relaxes this for `multi`).
+    #[derive(Debug)]
+    pub struct ResumeData {
+        captured: Vec<Frame>,
+        handler: Rc<Handler>,
+        ret_env: Env,
+        consumed: std::cell::Cell<bool>,
+    }
+
+    #[derive(Clone, Debug)]
     enum CalleeSlot {
-        Pending,               // still evaluating the callee expression
-        Builtin(&'static str), // e.g. "io.println"
-        Value(Value),          // an evaluated callee (a Value::Fn)
+        Pending,                                  // still evaluating the callee expression
+        Builtin(&'static str),                    // e.g. "io.println"
+        Value(Value),                             // an evaluated callee (a Value::Fn)
+        Operation { effect: String, op: String }, // a perform of an effect op
     }
 
     // Frames own their AST via cheap `Rc` clones (the 3a `Box`->`Rc` groundwork),
@@ -309,7 +360,7 @@ pub mod cek {
     // continuation into a first-class `Value` (Slice 3c). Sliced positions carry
     // an `Rc<[_]>` plus a `usize` cursor (no per-step reslice), keeping the per-step
     // cost O(1) so the pinned TCE depth is unchanged.
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     enum Frame {
         BinRight {
             op: BinOp,
@@ -354,10 +405,15 @@ pub mod cek {
             span: Span,
         },
         // Installed by `handle`; catches the body's normal return (the return
-        // clause) and, in Task 3, is the boundary an operation searches for.
+        // clause) and is the boundary an operation searches for.
         HandleK {
             handler: Rc<Handler>,
             env: Env,
+        },
+        // Evaluating a `resume(arg)`; on return, re-enters the continuation.
+        ResumeApply {
+            resume: Value,
+            span: Span,
         },
     }
 
@@ -380,12 +436,13 @@ pub mod cek {
 
     pub fn run_module(module: &Module) -> Result<Interp, RuntimeError> {
         let fns = fn_table(module);
+        let ops = op_table(module);
         let mut interp = Interp::new();
         let Some(main) = fns.get("main").copied() else {
             return Err(rt(Span::EMPTY, "no `main` function found"));
         };
         let start = eval_block_state(&main.body.node, Env::new(), None);
-        run_loop(&mut interp, &fns, start)?;
+        run_loop(&mut interp, &fns, &ops, start)?;
         Ok(interp)
     }
 
@@ -438,10 +495,15 @@ pub mod cek {
         }
     }
 
-    fn run_loop(interp: &mut Interp, fns: &Fns, mut st: State) -> Result<(), RuntimeError> {
+    fn run_loop(
+        interp: &mut Interp,
+        fns: &Fns,
+        ops: &Ops,
+        mut st: State,
+    ) -> Result<(), RuntimeError> {
         loop {
             interp.note_kont_depth(kont_len(kont_of(&st)));
-            match step(interp, fns, st)? {
+            match step(interp, fns, ops, st)? {
                 Some(next) => st = next,
                 None => return Ok(()),
             }
@@ -465,14 +527,25 @@ pub mod cek {
         }
     }
 
-    fn step(interp: &mut Interp, fns: &Fns, st: State) -> Result<Option<State>, RuntimeError> {
+    fn step(
+        interp: &mut Interp,
+        fns: &Fns,
+        ops: &Ops,
+        st: State,
+    ) -> Result<Option<State>, RuntimeError> {
         match st {
-            State::Eval(e, env, k) => Ok(Some(eval(fns, &e, env, k)?)),
+            State::Eval(e, env, k) => Ok(Some(eval(fns, ops, &e, env, k)?)),
             State::Return(v, k) => ret(interp, fns, v, k),
         }
     }
 
-    fn eval(fns: &Fns, e: &Spanned<Expr>, env: Env, k: Kont) -> Result<State, RuntimeError> {
+    fn eval(
+        fns: &Fns,
+        ops: &Ops,
+        e: &Spanned<Expr>,
+        env: Env,
+        k: Kont,
+    ) -> Result<State, RuntimeError> {
         let span = e.span;
         Ok(match &e.node {
             Expr::Int(n) => State::Return(Value::Int(*n), k),
@@ -535,6 +608,14 @@ pub mod cek {
                     Expr::Qualified { module, name } => {
                         return Err(rt(span, format!("unknown builtin `{module}.{name}`")))
                     }
+                    // A call to an operation name is a perform.
+                    Expr::Var(name) => match ops.get(name.as_str()) {
+                        Some(effect) => CalleeSlot::Operation {
+                            effect: effect.clone(),
+                            op: name.clone(),
+                        },
+                        None => CalleeSlot::Pending,
+                    },
                     _ => CalleeSlot::Pending,
                 };
                 match slot {
@@ -553,7 +634,12 @@ pub mod cek {
                             k,
                         ),
                     ),
-                    builtin => {
+                    // A zero-arg operation performs immediately (no args to eval).
+                    CalleeSlot::Operation { effect, op } if args.is_empty() => {
+                        perform(effect, op, Vec::new(), span, k)?
+                    }
+                    // Builtin or operation with args: evaluate the args, then apply.
+                    other => {
                         if args.is_empty() {
                             return Err(rt(span, "builtin called with no arguments"));
                         }
@@ -562,7 +648,7 @@ pub mod cek {
                             env.clone(),
                             push(
                                 Frame::CallArgs {
-                                    callee: builtin,
+                                    callee: other,
                                     done: Vec::new(),
                                     args: args.clone(),
                                     cursor: 1,
@@ -587,8 +673,16 @@ pub mod cek {
                     k,
                 ),
             ),
-            Expr::Resume { .. } => {
-                return Err(rt(span, "resume is not evaluated yet (Slice 3c Task 3)"))
+            // Evaluate resume's argument, then re-enter the captured continuation.
+            Expr::Resume { arg } => {
+                let resume = env
+                    .get("$resume")
+                    .ok_or_else(|| rt(span, "internal: `resume` outside a handler clause"))?;
+                State::Eval(
+                    arg.clone(),
+                    env,
+                    push(Frame::ResumeApply { resume, span }, k),
+                )
             }
         })
     }
@@ -657,7 +751,127 @@ pub mod cek {
                 }
                 None => State::Return(v, rest),
             },
+            // `resume(v)` re-enters the captured continuation: deep-handler
+            // semantics re-install the handler beneath the captured frames.
+            Frame::ResumeApply { resume, span } => resume_apply(resume, v, span, rest)?,
         }))
+    }
+
+    /// Re-enter a captured continuation with value `u`. One-shot: a second
+    /// resumption of the same continuation is `E0425` (3d relaxes for `multi`).
+    /// Rebuilds `Kont' = k_cap ++ [HandleK] ++ k_now`, deepest-first.
+    fn resume_apply(
+        resume: Value,
+        u: Value,
+        span: Span,
+        k_now: Kont,
+    ) -> Result<State, RuntimeError> {
+        let Value::Resume(rd) = resume else {
+            return Err(rt(span, "internal: `resume` target is not a continuation"));
+        };
+        if rd.consumed.get() {
+            return Err(RuntimeError {
+                diag: Diagnostic::error("E0425", "continuation resumed more than once").with_label(
+                    span,
+                    "this handler is one-shot — use `with multi` for multi-shot",
+                ),
+            });
+        }
+        rd.consumed.set(true);
+        let mut k = k_now;
+        k = push(
+            Frame::HandleK {
+                handler: rd.handler.clone(),
+                env: rd.ret_env.clone(),
+            },
+            k,
+        );
+        for f in rd.captured.iter().rev() {
+            k = push(f.clone(), k);
+        }
+        Ok(State::Return(u, k))
+    }
+
+    /// Perform operation `op` of effect `effect`: walk the continuation for the
+    /// nearest matching handler, split it into the captured prefix `k_cap` and
+    /// the suffix `k_rest`, and run the matching clause with `resume` bound.
+    fn perform(
+        effect: String,
+        op: String,
+        args: Vec<Value>,
+        span: Span,
+        k: Kont,
+    ) -> Result<State, RuntimeError> {
+        let mut cap: Vec<Frame> = Vec::new();
+        let mut cur = k;
+        loop {
+            let Some(node) = cur else {
+                // A well-typed program never gets here (E0420 is static); defensive.
+                return Err(rt(
+                    span,
+                    format!("internal: unhandled effect `{op}` reached the machine"),
+                ));
+            };
+            if let Frame::HandleK { handler, env } = &node.frame {
+                if handler_handles(handler, &effect, &op) {
+                    return run_clause(
+                        cap,
+                        handler.clone(),
+                        env.clone(),
+                        &effect,
+                        &op,
+                        args,
+                        span,
+                        node.rest.clone(),
+                    );
+                }
+            }
+            cap.push(node.frame.clone());
+            cur = node.rest.clone();
+        }
+    }
+
+    fn handler_handles(handler: &Handler, effect: &str, op: &str) -> bool {
+        // Strict (effect, op) matching (plan 5c): unambiguous even if two effects
+        // share an operation name.
+        handler
+            .clauses
+            .iter()
+            .any(|c| c.node.effect.as_deref() == Some(effect) && c.node.op == op)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_clause(
+        cap: Vec<Frame>,
+        handler: Rc<Handler>,
+        ret_env: Env,
+        effect: &str,
+        op: &str,
+        args: Vec<Value>,
+        span: Span,
+        k_rest: Kont,
+    ) -> Result<State, RuntimeError> {
+        let clause = handler
+            .clauses
+            .iter()
+            .find(|c| c.node.effect.as_deref() == Some(effect) && c.node.op == op)
+            .ok_or_else(|| rt(span, format!("internal: handler has no clause for `{op}`")))?;
+        let rd = Rc::new(ResumeData {
+            captured: cap,
+            handler: handler.clone(),
+            ret_env: ret_env.clone(),
+            consumed: std::cell::Cell::new(false),
+        });
+        let mut bindings: Vec<(String, Value)> = clause
+            .node
+            .params
+            .iter()
+            .map(|p| p.node.name.clone())
+            .zip(args)
+            .collect();
+        bindings.push(("$resume".to_string(), Value::Resume(rd)));
+        let clause_env = ret_env.extend(&bindings);
+        Ok(State::Eval(clause.node.body.clone(), clause_env, k_rest))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -745,6 +959,7 @@ pub mod cek {
                 let call_env = Env::new().extend(&bindings);
                 Ok(eval_block_state(&fdecl.body.node, call_env, k)) // reuses `k` — no frame
             }
+            CalleeSlot::Operation { effect, op } => perform(effect, op, args, span, k),
             CalleeSlot::Value(_) => Err(rt(span, "value is not callable")),
             CalleeSlot::Pending => Err(rt(span, "internal: unresolved callee")),
         }

@@ -20,6 +20,40 @@ fn run(src: &str) -> String {
 }
 
 #[test]
+fn one_shot_resume_passes_a_value_back() {
+    // (b) one-shot resume: the operation `ask` is resumed once with "ada", so
+    // `ask()` yields "ada" and `greet` returns "hi ada".
+    let src = "effect Ask {\n\
+               \x20 fn ask() -> String\n\
+               }\n\
+               fn greet() { \"hi \" <> ask() }\n\
+               pub fn main() {\n\
+               \x20 io.println(handle greet() with {\n\
+               \x20   Ask.ask() -> resume(\"ada\")\n\
+               \x20   return(x) -> x\n\
+               \x20 })\n\
+               }\n";
+    assert_eq!(run(src), "hi ada\n");
+}
+
+#[test]
+fn non_resuming_clause_is_exception_like() {
+    // (a) non-resuming / Exn-style: `fail` performs; its clause never resumes,
+    // so the captured continuation is dropped and the clause value is the result.
+    let src = "effect Exn {\n\
+               \x20 fn fail() -> String\n\
+               }\n\
+               fn risky(b) { if b == 0 { fail() } else { \"ok\" } }\n\
+               pub fn main() {\n\
+               \x20 io.println(handle risky(0) with {\n\
+               \x20   Exn.fail() -> \"caught\"\n\
+               \x20   return(x) -> x\n\
+               \x20 })\n\
+               }\n";
+    assert_eq!(run(src), "caught\n");
+}
+
+#[test]
 fn handle_over_pure_body_applies_return_clause() {
     // The body performs no operation; the handler discharges and the return
     // clause transforms the body's value (here, identity).
