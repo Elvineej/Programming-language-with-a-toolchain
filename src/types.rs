@@ -31,6 +31,12 @@ pub enum Ty {
 /// type-variable space that indexes `subst`.
 pub type RowVar = u32;
 
+/// Effects whose duplication under a multi-shot handler is *observable*, and so
+/// worth an `E0426` cleanup lint. A membership set, not a hardcoded label, so
+/// new observable effects (`Net`, device I/O) join it instead of escaping the
+/// lint (spec §11 tracked obligation).
+const OBSERVABLE_EFFECTS: &[&str] = &["IO"];
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowTail {
     /// Exactly the labels present — no more.
@@ -849,6 +855,34 @@ impl Infer {
             }
             // No return clause ⇒ identity: R = type of `e`.
             None => self.unify(&result, &body_ty, span),
+        }
+
+        // Cleanup lint (E0426): a `with multi` handler may re-run its captured
+        // continuation, repeating any observably-duplicable effect the body
+        // performs. Best-effort (spec §8.6) — a full guarantee awaits linear types.
+        if handler.multi {
+            let body_row = self.resolve_row(&EffectRow::open(amb_in));
+            let dup: Vec<&str> = OBSERVABLE_EFFECTS
+                .iter()
+                .copied()
+                .filter(|e| body_row.labels.contains_key(*e))
+                .collect();
+            if !dup.is_empty() {
+                let set = format!("{{{}}}", dup.join(", "));
+                self.diags.push(
+                    Diagnostic::warning(
+                        "E0426",
+                        "a multi-shot handler may run its continuation's effects more than once",
+                    )
+                    .with_label(
+                        span,
+                        format!(
+                            "the handled computation performs {set}; a multi-shot resume repeats those effects"
+                        ),
+                    )
+                    .with_help("best-effort lint — a full guarantee awaits linear/affine types"),
+                );
+            }
         }
 
         // Discharge E: everything `e` performed *except* E flows into the ambient.

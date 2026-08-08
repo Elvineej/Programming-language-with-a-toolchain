@@ -35,6 +35,18 @@ impl Diagnostic {
         }
     }
 
+    /// A non-fatal diagnostic (a lint). Compilation succeeds despite warnings;
+    /// only `Severity::Error` blocks it (see `lib::fail_if_errors`).
+    pub fn warning(code: &str, message: impl Into<String>) -> Diagnostic {
+        Diagnostic {
+            severity: Severity::Warning,
+            code: code.to_string(),
+            message: message.into(),
+            labels: Vec::new(),
+            helps: Vec::new(),
+        }
+    }
+
     pub fn with_label(mut self, span: Span, message: impl Into<String>) -> Diagnostic {
         self.labels.push(Label {
             span,

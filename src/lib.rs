@@ -9,7 +9,7 @@ pub mod resolve;
 pub mod span;
 pub mod types;
 
-use crate::diag::{render, Diagnostic};
+use crate::diag::{render, Diagnostic, Severity};
 use crate::span::SourceMap;
 
 /// Shared, explicitly-threaded compiler state. No globals live outside this.
@@ -55,11 +55,16 @@ pub fn check_source(name: &str, text: &str) -> Result<(), String> {
     }
 }
 
+/// Compilation fails only on `Severity::Error`; warnings (lints, e.g. `E0426`)
+/// are non-fatal. When there is an error, all diagnostics — warnings included —
+/// are rendered together. (Surfacing warnings on a *successful* compile is a
+/// tracked obligation for the CLI output path; spec §11.)
 fn fail_if_errors(diags: &[Diagnostic], sm: &SourceMap) -> Option<String> {
-    if diags.is_empty() {
-        None
-    } else {
+    let has_error = diags.iter().any(|d| d.severity == Severity::Error);
+    if has_error {
         Some(render(diags, sm))
+    } else {
+        None
     }
 }
 
