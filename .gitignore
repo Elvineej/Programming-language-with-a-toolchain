@@ -1,2 +1,5 @@
 /target
 **/*.rs.bk
+
+# Stray local tooling dir (not part of Elya)
+/Continuous-Claude/
