@@ -24,6 +24,7 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
                     op_names.insert(op.node.name.clone());
                 }
             }
+            Decl::Type(_) => {} // constructors registered in Task 2
         }
     }
     let mut cx = Cx {
@@ -42,6 +43,7 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
                 cx.check_block(&f.body.node, &mut scope);
             }
             Decl::Effect(_) => {} // effect operation bodies are just signatures
+            Decl::Type(_) => {}   // type declarations are signatures only
         }
     }
     cx.diags
@@ -153,6 +155,14 @@ impl Cx<'_> {
                     );
                 }
                 self.check_expr(&arg.node, arg.span, scope);
+            }
+            // Provisional (Task 2 adds pattern binding + E0432). Checks the
+            // scrutinee and arm bodies without binding pattern variables.
+            Expr::Match { scrutinee, arms } => {
+                self.check_expr(&scrutinee.node, scrutinee.span, scope);
+                for arm in arms.iter() {
+                    self.check_expr(&arm.node.body.node, arm.node.body.span, scope);
+                }
             }
         }
     }

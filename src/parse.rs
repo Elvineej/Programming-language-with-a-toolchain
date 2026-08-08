@@ -120,6 +120,7 @@ impl<'a> Parser<'a> {
         match self.peek()?.clone() {
             TokenKind::KwIf => self.if_expr(),
             TokenKind::KwHandle => self.handle_expr(),
+            TokenKind::KwMatch => self.match_expr(),
             TokenKind::LBrace => self.block_expr(),
             TokenKind::Int(n) => {
                 self.bump();
@@ -255,9 +256,19 @@ impl<'a> Parser<'a> {
                         self.recover_to_decl();
                     }
                 }
+                Some(TokenKind::KwType) => {
+                    if let Some(t) = self.type_decl() {
+                        decls.push(t);
+                    } else {
+                        self.recover_to_decl();
+                    }
+                }
                 _ => {
                     let span = self.peek_span();
-                    self.error(span, "expected `import`, `fn`, `pub fn`, or `effect`");
+                    self.error(
+                        span,
+                        "expected `import`, `fn`, `pub fn`, `effect`, or `type`",
+                    );
                     self.recover_to_decl();
                 }
             }
@@ -296,6 +307,191 @@ impl<'a> Parser<'a> {
             Decl::Effect(EffectDecl { name, ops }),
             start.merge(end),
         ))
+    }
+
+    // `type NAME(p, …) { Variant, Variant(T, …), … }`
+    fn type_decl(&mut self) -> Option<Spanned<Decl>> {
+        let start = self.peek_span();
+        self.bump(); // type
+        let name = match self.peek()?.clone() {
+            TokenKind::Upper(n) => {
+                self.bump();
+                n
+            }
+            _ => {
+                self.error(self.peek_span(), "expected type name (uppercase)");
+                return None;
+            }
+        };
+        let mut params = Vec::new();
+        if self.eat(&TokenKind::LParen) {
+            if self.peek() != Some(&TokenKind::RParen) {
+                loop {
+                    match self.peek()?.clone() {
+                        TokenKind::Lower(p) => {
+                            self.bump();
+                            params.push(p);
+                        }
+                        _ => {
+                            self.error(self.peek_span(), "expected type parameter (lowercase)");
+                            return None;
+                        }
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            if !self.eat(&TokenKind::RParen) {
+                self.error(self.peek_span(), "expected `)`");
+                return None;
+            }
+        }
+        if !self.eat(&TokenKind::LBrace) {
+            self.error(self.peek_span(), "expected `{`");
+            return None;
+        }
+        let mut variants = Vec::new();
+        if self.peek() != Some(&TokenKind::RBrace) {
+            loop {
+                variants.push(self.variant_decl()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        let end = self.peek_span();
+        if !self.eat(&TokenKind::RBrace) {
+            self.error(self.peek_span(), "expected `}`");
+            return None;
+        }
+        Some(spanned(
+            Decl::Type(TypeDecl {
+                name,
+                params,
+                variants,
+            }),
+            start.merge(end),
+        ))
+    }
+
+    fn variant_decl(&mut self) -> Option<Spanned<VariantDecl>> {
+        let start = self.peek_span();
+        let name = match self.peek()?.clone() {
+            TokenKind::Upper(n) => {
+                self.bump();
+                n
+            }
+            _ => {
+                self.error(self.peek_span(), "expected constructor name (uppercase)");
+                return None;
+            }
+        };
+        let mut fields = Vec::new();
+        let mut end = start;
+        if self.eat(&TokenKind::LParen) {
+            if self.peek() != Some(&TokenKind::RParen) {
+                loop {
+                    fields.push(self.type_ann()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            end = self.peek_span();
+            if !self.eat(&TokenKind::RParen) {
+                self.error(self.peek_span(), "expected `)`");
+                return None;
+            }
+        }
+        Some(spanned(VariantDecl { name, fields }, start.merge(end)))
+    }
+
+    // `match EXPR { PAT -> EXPR … }` — arms are whitespace-separated (no comma).
+    fn match_expr(&mut self) -> Option<Spanned<Expr>> {
+        let start = self.peek_span();
+        self.bump(); // match
+        let scrutinee = self.expr(0)?;
+        if !self.eat(&TokenKind::LBrace) {
+            self.error(self.peek_span(), "expected `{` after match scrutinee");
+            return None;
+        }
+        let mut arms = Vec::new();
+        while self.peek().is_some() && self.peek() != Some(&TokenKind::RBrace) {
+            arms.push(self.match_arm()?);
+        }
+        let end = self.peek_span();
+        if !self.eat(&TokenKind::RBrace) {
+            self.error(self.peek_span(), "expected `}`");
+            return None;
+        }
+        Some(spanned(
+            Expr::Match {
+                scrutinee: Rc::new(scrutinee),
+                arms: arms.into(),
+            },
+            start.merge(end),
+        ))
+    }
+
+    fn match_arm(&mut self) -> Option<Spanned<MatchArm>> {
+        let start = self.peek_span();
+        let pat = self.pattern()?;
+        if !self.eat(&TokenKind::Arrow) {
+            self.error(self.peek_span(), "expected `->` in match arm");
+            return None;
+        }
+        let body = self.expr(0)?;
+        let end = body.span;
+        Some(spanned(
+            MatchArm {
+                pat,
+                body: Rc::new(body),
+            },
+            start.merge(end),
+        ))
+    }
+
+    fn pattern(&mut self) -> Option<Spanned<Pattern>> {
+        let span = self.peek_span();
+        match self.peek()?.clone() {
+            // Constructor pattern: `Nil`, `Some(p)`, `Cons(h, t)`.
+            TokenKind::Upper(name) => {
+                self.bump();
+                let mut args = Vec::new();
+                let mut end = span;
+                if self.eat(&TokenKind::LParen) {
+                    if self.peek() != Some(&TokenKind::RParen) {
+                        loop {
+                            args.push(self.pattern()?);
+                            if !self.eat(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    end = self.peek_span();
+                    if !self.eat(&TokenKind::RParen) {
+                        self.error(self.peek_span(), "expected `)`");
+                        return None;
+                    }
+                }
+                Some(spanned(Pattern::Ctor { name, args }, span.merge(end)))
+            }
+            // `_` is the wildcard; any other lowercase name binds a variable.
+            TokenKind::Lower(name) => {
+                self.bump();
+                let p = if name == "_" {
+                    Pattern::Wild
+                } else {
+                    Pattern::Var(name)
+                };
+                Some(spanned(p, span))
+            }
+            _ => {
+                self.error(span, "expected a pattern");
+                None
+            }
+        }
     }
 
     fn op_sig(&mut self) -> Option<Spanned<OpSig>> {
@@ -787,7 +983,11 @@ impl<'a> Parser<'a> {
         while let Some(k) = self.peek() {
             if matches!(
                 k,
-                TokenKind::KwFn | TokenKind::KwPub | TokenKind::KwImport | TokenKind::KwEffect
+                TokenKind::KwFn
+                    | TokenKind::KwPub
+                    | TokenKind::KwImport
+                    | TokenKind::KwEffect
+                    | TokenKind::KwType
             ) {
                 return;
             }
@@ -889,6 +1089,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_type_decl() {
+        let src = "type List(a) {\n  Nil,\n  Cons(a, List(a))\n}\n";
+        let (m, d) = parse_module(&Session::new(), src);
+        assert!(d.is_empty(), "diags: {d:?}");
+        assert_eq!(
+            crate::ast::pretty(&m),
+            "(module (type List (Nil) (Cons a (List a))))"
+        );
+    }
+
+    #[test]
+    fn parses_match() {
+        let src = "fn f(o) {\n  match o {\n    None -> 0\n    Some(x) -> x\n  }\n}\n";
+        let (m, d) = parse_module(&Session::new(), src);
+        assert!(d.is_empty(), "diags: {d:?}");
+        assert_eq!(
+            crate::ast::pretty(&m),
+            "(module (fn f (o) (block (match o (None 0) (Some (x) x)))))"
+        );
+    }
+
+    #[test]
     fn distinguishes_absent_from_explicit_pure_row() {
         let (m1, _) = parse_module(&Session::new(), "fn f() { 1 }\n");
         let Decl::Fn(f1) = &m1.decls[0].node else {
@@ -970,6 +1192,7 @@ mod tests {
             .filter_map(|d| match &d.node {
                 Decl::Fn(f) => Some(f.name.clone()),
                 Decl::Effect(_) => None,
+                Decl::Type(_) => None,
             })
             .collect();
         assert!(names.contains(&"ok".to_string()), "names: {names:?}");

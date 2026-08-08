@@ -32,6 +32,8 @@ pub enum TokenKind {
     KwElse,
     #[token("type")]
     KwType,
+    #[token("match")]
+    KwMatch,
     #[token("case")]
     KwCase,
     #[token("effect")]
