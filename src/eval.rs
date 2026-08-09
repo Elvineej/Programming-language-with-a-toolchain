@@ -84,6 +84,20 @@ pub(crate) fn match_pattern(value: &Value, pat: &Pattern) -> Option<Vec<(String,
     match pat {
         Pattern::Wild => Some(Vec::new()),
         Pattern::Var(x) => Some(vec![(x.clone(), value.clone())]),
+        Pattern::Lit(l) => {
+            let matches = match (l, value) {
+                (PatLit::Int(a), Value::Int(b)) => a == b,
+                (PatLit::Bool(a), Value::Bool(b)) => a == b,
+                (PatLit::Str(a), Value::Str(b)) => a == b,
+                (PatLit::Unit, Value::Unit) => true,
+                _ => false,
+            };
+            if matches {
+                Some(Vec::new())
+            } else {
+                None
+            }
+        }
         Pattern::Ctor { name, args } => match value {
             Value::Ctor(vname, vargs) if vname == name && vargs.0.len() == args.len() => {
                 let mut binds = Vec::new();

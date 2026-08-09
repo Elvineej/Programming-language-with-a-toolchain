@@ -77,7 +77,7 @@ impl Cx<'_> {
     /// constructor name is known (`E0432` otherwise).
     fn bind_pattern(&mut self, pat: &Spanned<Pattern>, scope: &mut HashSet<String>) {
         match &pat.node {
-            Pattern::Wild => {}
+            Pattern::Wild | Pattern::Lit(_) => {}
             Pattern::Var(x) => {
                 scope.insert(x.clone());
             }

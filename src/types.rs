@@ -1,6 +1,8 @@
 //! Hindley–Milner type inference (Algorithm J).
 
-use crate::ast::{BinOp, Block, Decl, Expr, FnDecl, Handler, Module, Pattern, Stmt, TypeAnn, UnOp};
+use crate::ast::{
+    BinOp, Block, Decl, Expr, FnDecl, Handler, Module, PatLit, Pattern, Stmt, TypeAnn, UnOp,
+};
 use crate::diag::Diagnostic;
 use crate::span::{Span, Spanned};
 use crate::Session;
@@ -813,6 +815,15 @@ impl Infer {
         match &pat.node {
             Pattern::Wild => {}
             Pattern::Var(x) => bindings.push((x.clone(), expected.clone())),
+            Pattern::Lit(l) => {
+                let lit_ty = match l {
+                    PatLit::Int(_) => Ty::int(),
+                    PatLit::Bool(_) => Ty::bool(),
+                    PatLit::Str(_) => Ty::str(),
+                    PatLit::Unit => Ty::unit(),
+                };
+                self.unify(expected, &lit_ty, pat.span);
+            }
             Pattern::Ctor { name, args } => {
                 let Some(scheme) = env.lookup(name).cloned() else {
                     return; // unknown constructor is E0432 at resolve time

@@ -122,6 +122,17 @@ pub enum Pattern {
         name: String,
         args: Vec<Spanned<Pattern>>,
     },
+    Lit(PatLit),
+}
+
+/// A literal pattern (Slice 4a). Float is excluded — matching on float equality
+/// is a footgun.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PatLit {
+    Int(i64),
+    Bool(bool),
+    Str(String),
+    Unit,
 }
 
 /// One arm of a `match`: `pat -> body`.
@@ -286,6 +297,12 @@ fn pretty_pattern(p: &Pattern, s: &mut String) {
                 s.push(')');
             }
         }
+        Pattern::Lit(l) => match l {
+            PatLit::Int(n) => s.push_str(&n.to_string()),
+            PatLit::Bool(b) => s.push_str(if *b { "True" } else { "False" }),
+            PatLit::Str(v) => s.push_str(&format!("{v:?}")),
+            PatLit::Unit => s.push_str("Unit"),
+        },
     }
 }
 
