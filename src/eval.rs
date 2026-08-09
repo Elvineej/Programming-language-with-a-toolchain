@@ -19,7 +19,35 @@ pub enum Value {
     /// A first-class captured continuation (Slice 3c). `resume(v)` re-enters it.
     Resume(Rc<cek::ResumeData>),
     /// A constructed ADT value (Slice 4a): `Cons(1, Nil)` = `Ctor("Cons", [1, Nil])`.
-    Ctor(String, Vec<Value>),
+    /// The fields are `Rc`-shared (via `CtorArgs`) so cloning a value is O(1) —
+    /// list construction is O(n), not O(n²) — and `CtorArgs`'s iterative `Drop`
+    /// keeps a deep chain from overflowing the host stack on destruction.
+    Ctor(String, CtorArgs),
+}
+
+/// The `Rc`-shared payload of a `Value::Ctor`. Its `Drop` is iterative so that
+/// dropping a deeply-nested value (a million-element `Cons` list) dismantles the
+/// chain level by level instead of recursing through nested destructors on the
+/// host stack. Only uniquely-owned children are dismantled here; shared children
+/// are freed by their last owner.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CtorArgs(pub Rc<Vec<Value>>);
+
+impl Drop for CtorArgs {
+    fn drop(&mut self) {
+        let mut stack: Vec<Value> = Vec::new();
+        if let Some(children) = Rc::get_mut(&mut self.0) {
+            stack.append(children);
+        }
+        while let Some(mut v) = stack.pop() {
+            if let Value::Ctor(_, cargs) = &mut v {
+                if let Some(children) = Rc::get_mut(&mut cargs.0) {
+                    stack.append(children);
+                }
+            }
+            // `v` drops here with its children already moved out — O(1).
+        }
+    }
 }
 
 // Hand-written so `Value::Resume` compares `false` (continuations are not
@@ -57,9 +85,9 @@ pub(crate) fn match_pattern(value: &Value, pat: &Pattern) -> Option<Vec<(String,
         Pattern::Wild => Some(Vec::new()),
         Pattern::Var(x) => Some(vec![(x.clone(), value.clone())]),
         Pattern::Ctor { name, args } => match value {
-            Value::Ctor(vname, vargs) if vname == name && vargs.len() == args.len() => {
+            Value::Ctor(vname, vargs) if vname == name && vargs.0.len() == args.len() => {
                 let mut binds = Vec::new();
-                for (v, p) in vargs.iter().zip(args.iter()) {
+                for (v, p) in vargs.0.iter().zip(args.iter()) {
                     binds.extend(match_pattern(v, &p.node)?);
                 }
                 Some(binds)
@@ -267,7 +295,8 @@ pub mod tree {
                 if let Some(v) = env.get(name) {
                     Ok(v)
                 } else if is_ctor_name(name) {
-                    Ok(Value::Ctor(name.clone(), Vec::new())) // nullary constructor
+                    Ok(Value::Ctor(name.clone(), CtorArgs(Rc::new(Vec::new()))))
+                // nullary constructor
                 } else if fns.contains_key(name.as_str()) {
                     Ok(Value::Fn(name.clone()))
                 } else {
@@ -318,7 +347,7 @@ pub mod tree {
                         for a in args.iter() {
                             vals.push(eval_expr(interp, a, env, fns)?);
                         }
-                        return Ok(Value::Ctor(name.clone(), vals));
+                        return Ok(Value::Ctor(name.clone(), CtorArgs(Rc::new(vals))));
                     }
                 }
                 let callee_v = eval_expr(interp, callee, env, fns)?;
@@ -366,8 +395,8 @@ pub mod tree {
 
 pub mod cek {
     use super::{
-        apply_binop, apply_unop, fn_table, is_ctor_name, match_pattern, rt, Env, Fns, Interp,
-        RuntimeError, Value,
+        apply_binop, apply_unop, fn_table, is_ctor_name, match_pattern, rt, CtorArgs, Env, Fns,
+        Interp, RuntimeError, Value,
     };
     use crate::ast::*;
     use crate::diag::Diagnostic;
@@ -620,7 +649,7 @@ pub mod cek {
                 let v = if let Some(v) = env.get(name) {
                     v
                 } else if is_ctor_name(name) {
-                    Value::Ctor(name.clone(), Vec::new()) // nullary constructor
+                    Value::Ctor(name.clone(), CtorArgs(Rc::new(Vec::new()))) // nullary constructor
                 } else if fns.contains_key(name.as_str()) {
                     Value::Fn(name.clone())
                 } else {
@@ -1066,7 +1095,9 @@ pub mod cek {
                 Ok(eval_block_state(&fdecl.body.node, call_env, k)) // reuses `k` — no frame
             }
             CalleeSlot::Operation { effect, op } => perform(effect, op, args, span, k),
-            CalleeSlot::Ctor { name } => Ok(State::Return(Value::Ctor(name, args), k)),
+            CalleeSlot::Ctor { name } => {
+                Ok(State::Return(Value::Ctor(name, CtorArgs(Rc::new(args))), k))
+            }
             CalleeSlot::Value(_) => Err(rt(span, "value is not callable")),
             CalleeSlot::Pending => Err(rt(span, "internal: unresolved callee")),
         }
