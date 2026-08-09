@@ -493,6 +493,27 @@ impl<'a> Parser<'a> {
                 };
                 Some(spanned(p, span))
             }
+            // Literal patterns.
+            TokenKind::Int(n) => {
+                self.bump();
+                Some(spanned(Pattern::Lit(PatLit::Int(n)), span))
+            }
+            TokenKind::Str(s) => {
+                self.bump();
+                Some(spanned(Pattern::Lit(PatLit::Str(s)), span))
+            }
+            TokenKind::True => {
+                self.bump();
+                Some(spanned(Pattern::Lit(PatLit::Bool(true)), span))
+            }
+            TokenKind::False => {
+                self.bump();
+                Some(spanned(Pattern::Lit(PatLit::Bool(false)), span))
+            }
+            TokenKind::Unit => {
+                self.bump();
+                Some(spanned(Pattern::Lit(PatLit::Unit), span))
+            }
             _ => {
                 self.error(span, "expected a pattern");
                 None

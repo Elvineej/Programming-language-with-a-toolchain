@@ -45,6 +45,14 @@ fn list_length_and_option() {
 }
 
 #[test]
+fn literal_patterns_run() {
+    let src = "fn classify(n) { match n { 0 -> \"zero\"  _ -> \"other\" } }\n\
+               fn name(b) { match b { True -> \"t\"  False -> \"f\" } }\n\
+               pub fn main() { io.println(classify(0))\n io.println(name(False)) }\n";
+    assert_eq!(run_both(src), "zero\nf\n");
+}
+
+#[test]
 fn tree_depth() {
     // Nested constructor patterns + recursion over a parametric Tree.
     let src = "type Tree(a) { Leaf, Node(Tree(a), a, Tree(a)) }\n\
