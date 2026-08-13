@@ -25,6 +25,20 @@ The single sentence every later ambiguity appeals to is the **manifesto** (§1).
 - **Ambient mutable loops** — no `while`/`for`/`let mut` in the core; iteration is recursion with **guaranteed tail-call elimination**, and mutable state is the `State` effect.
 - **Boilerplate the compiler can infer** — global Hindley–Milner inference with row-polymorphic effect inference; most code carries no type annotations.
 
+### 1.1 Governance principles (how Elya evolves and learns)
+
+Two principles govern every future change. They are recorded here because the project **already operates this way** since Slice 1; naming them binds all future evolution, and both §13 roadmap items and the far-horizon self-optimizing compiler answer to them.
+
+**Principle 1 — Stable language, evolving implementation, growing knowledge.** Three layers change at different rates and must never be conflated:
+
+- **The language is stable.** The manifesto (§1) and the four axes (§2) define what Elya *is*; they change rarely and only deliberately. Every roadmap item (§13) that conflicts with them loses to them — a rule §13 already states and enforces.
+- **The implementation evolves.** The slices (§12 build order, §13 roadmap) are how the language is *built* — tree-walker → CEK → bytecode → native, then front-end → toolchain → self-hosting. Implementations are replaced freely so long as the language they realize is unchanged, and "unchanged" is *proven*, not assumed (the CEK-as-oracle differential and the stage-2 == stage-3 self-hosting fixed point are exactly those proofs).
+- **Knowledge grows.** A third layer — a persistent, accumulated body of what the toolchain has *learned* about optimizing and building Elya programs (§13, the self-optimizing compiler) — is neither the language nor any single implementation; it is a durable knowledge base that outlives any one compiler version. It only ever grows, and only by Principle 2.
+
+This is not a new way of working; it is a name for the separation the project has followed from the first commit (a fixed manifesto, thin vertical implementation slices). It governs all future evolution: **every change belongs to exactly one layer, and a change to a faster layer may never quietly redefine a slower one.**
+
+**Principle 2 — Learn only by verified improvement, never by blind self-modification.** Every candidate change the project — or a future self-optimizing compiler — considers must pass **hypothesis → test → benchmark → keep only proven wins**: state the expected improvement, implement it behind a gate, measure it against the prior baseline, and retain it *only* if the measurement proves it better; discard it otherwise. Nothing is adopted because it "should" help or because a model proposed it — improvements are **earned by evidence**, regressions are rejected automatically, and the baseline only ever ratchets upward. This is the same **verify-don't-assume** discipline the build already follows — `sh scripts/check.sh` must be green; TCE depth is *measured*, not assumed; `cek == tree` is a differential gate; the value restriction is proven behavior-preserving before it ships — promoted into a standing rule for how the project accumulates knowledge. It is the guardrail that makes a self-optimizing compiler (§13) safe: it can only ever get better, because it keeps nothing it cannot prove.
+
 ---
 
 ## 2. The Four Design Axes (decided) + the Signature Feature
@@ -749,6 +763,26 @@ So device placement, discovery, sync/async I/O, and the event surface are a **na
 - **Multi-device parallel coordination** — a device-level cousin of the AI/HPC **hardware scheduler**: discovery, capability negotiation, and concurrent orchestration across heterogeneous devices. Real scheduler/runtime work, **sequenced after the core language and the compute layer**.
 
 **Summary:** the device *interface* (capability-open, `Device` I/O operations, event handlers, `parallel` as concurrent effects) is a flagship *extension of the effect model*; the device *implementation* (the per-class driver/protocol matrix and multi-device coordination runtime) is separate subsystem work whose cost is acknowledged honestly. Its illustrative syntax must be recast into the effects-first, immutable, recursion-based idiom before it enters the surface. None of it precedes self-hosting (Slice 8), a real `Async` effect, and the compute layer.
+
+### Future major-version direction — the self-optimizing compiler (furthest horizon; roadmap only; requires self-hosting first)
+
+**Status:** the **furthest item on the roadmap**, sequenced *after* self-hosting (Slice 8) — it presupposes a self-hosting Elya compiler *to* optimize. **This does not change any current slice or the implementation bound**, and it does not touch the manifesto (§1) or the four axes (§2). It is governed by both principles of §1.1: it is the "growing knowledge" layer made concrete, and it may adopt nothing it has not proven (hypothesis → test → benchmark → keep only proven wins).
+
+**Disambiguation from §14.5.** This is the **profile-/benchmark-guided AOT** reading that §14.5 explicitly permits as EXTENDS — an *offline* compiler that learns *across* runs and only ships verified wins. It is **not** the runtime-JIT "Self-Optimizing" paradigm of §14.5, which rewrites hot code as it runs, contradicts the locked native-LLVM AOT axis (§2), and is rejected there as REPLACES. Nothing here rewrites a running program.
+
+The capability: a compiler that **improves its own optimization over time** by accumulating verified knowledge, built on the language foundation already specified (§1–§6, §8, §10 — syntax, grammar, the ten examples, the type system, the effect system, and the compiler architecture). Its components:
+
+- **A persistent knowledge base** — a durable store of optimization decisions, their measured outcomes, and program/IR features, carried across compiler runs and versions (the §1.1 "growing knowledge" layer, made concrete).
+- **Learned optimization & failure patterns** — mined from that history: which transformations paid off on which code shapes, and which *failed* (failures are recorded too, so a dead end is never retried blindly — Principle 2).
+- **Automatic benchmark-gated candidate acceptance** — every proposed optimization is applied behind a gate and accepted **only** if it beats the current baseline on a trusted benchmark suite; otherwise it is discarded. This is Principle 2 mechanized: the compiler ratchets upward and never regresses.
+- **Eventual ML-guided optimization** — once the knowledge base and the benchmark gate are real, a learned model may *propose* candidate transformations (inlining, layout, specialization, instruction/schedule choice) for the gate to verify. The model only ever proposes; the benchmark decides.
+
+**Honest cost — this is career-scale research, not a slice.** Learned compiler optimization is an open research frontier (cf. Google's **MLGO** for LLVM inlining and register allocation, and the broader **learned cost-model** literature). Each component — a stable feature representation of programs, a benchmark harness trustworthy enough to *gate* on, a training/evaluation loop that generalizes across unseen code — is a multi-year effort in its own right. It is recorded as the north-star horizon, deliberately the last thing on the map; nothing about it is in scope until Elya self-hosts and its middle-end/codegen are real.
+
+**Already captured elsewhere (cross-references, not new work under this item):**
+
+- **Incremental compilation** is *not* part of this item — it is the **salsa-backed, query-engine LSP** work already in the §13 toolchain roadmap (Slice 7), resting on the pure-pass, salsa-ready discipline of §10.3. A self-optimizing compiler *consumes* incrementality; it does not define it.
+- **Hardware placement annotations** (`@target` / `@accelerate` and kin) are *not* part of this item — they are handler selection for the **§13 AI/HPC hardware scheduler** (the scheduler-as-handler with `@prefer(GPU)` / `@prefer(NPU)` hints, already specified above). Accelerator targeting is a `Compute`-effect concern, not a self-optimization one.
 
 ---
 
