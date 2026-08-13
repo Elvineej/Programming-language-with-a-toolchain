@@ -27,6 +27,7 @@ fn cmd(args: &[String], run: bool) -> ExitCode {
     if run {
         match elya::run_source(path, &text) {
             Ok(out) => {
+                surface_warnings(path, &text);
                 print!("{out}");
                 ExitCode::SUCCESS
             }
@@ -38,6 +39,7 @@ fn cmd(args: &[String], run: bool) -> ExitCode {
     } else {
         match elya::check_source(path, &text) {
             Ok(()) => {
+                surface_warnings(path, &text);
                 println!("ok");
                 ExitCode::SUCCESS
             }
@@ -46,5 +48,13 @@ fn cmd(args: &[String], run: bool) -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+/// On a successful compile, render any non-fatal warnings (e.g. `E0426`,
+/// `E0431`) to stderr so the lint still reaches the user.
+fn surface_warnings(path: &str, text: &str) {
+    if let Some(warns) = elya::warnings(path, text) {
+        eprint!("{warns}");
     }
 }
