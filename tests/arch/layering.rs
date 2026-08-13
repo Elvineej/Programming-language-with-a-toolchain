@@ -15,6 +15,7 @@ fn layer(module: &str) -> Option<i32> {
         ("resolve", 3),
         ("types", 4),
         ("core", 5),
+        ("exhaust", 5),
         ("eval", 6),
         ("main", 7),
     ]);
@@ -40,7 +41,7 @@ fn no_upward_module_references() {
         };
         let src = fs::read_to_string(&path).unwrap();
         for other in [
-            "span", "diag", "lex", "ast", "parse", "resolve", "types", "core", "eval",
+            "span", "diag", "lex", "ast", "parse", "resolve", "types", "core", "exhaust", "eval",
         ] {
             if other == stem {
                 continue;

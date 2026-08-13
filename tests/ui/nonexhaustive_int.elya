@@ -1,0 +1,6 @@
+fn f(n) {
+  match n {
+    0 -> 1
+  }
+}
+//~ ERROR[E0430] not covered
