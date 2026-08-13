@@ -684,7 +684,18 @@ impl Infer {
             match &st.node {
                 Stmt::Let { name, value } => {
                     let t = self.infer_expr(value, env, amb);
-                    let scheme = self.generalize(&t, env);
+                    // Value restriction: generalize only syntactic values (spec
+                    // 4b-1 §2.4). A non-value binding keeps its monotype — sound in
+                    // the presence of first-class functions/continuations.
+                    let scheme = if is_syntactic_value(&value.node) {
+                        self.generalize(&t, env)
+                    } else {
+                        Scheme {
+                            vars: Vec::new(),
+                            row_vars: Vec::new(),
+                            ty: self.resolve(&t),
+                        }
+                    };
                     env.insert(name, scheme);
                 }
                 Stmt::Expr(e) => {
@@ -1695,6 +1706,24 @@ fn tarjan_scc(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
     out
 }
 
+/// The value restriction: only *syntactic values* may have their `let`-bound
+/// type generalized. Generalizing a non-value (an application, `match`, `if`, …)
+/// is unsound once first-class functions or continuations exist — a lambda-bound
+/// or continuation-captured cell could escape its monomorphic use. Names, literals,
+/// and lambdas are values; everything that *computes* is not. (Slice 4b-1 §2.4.)
+fn is_syntactic_value(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Var(_)
+            | Expr::Qualified { .. }
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Str(_)
+            | Expr::Bool(_)
+            | Expr::Unit
+    )
+}
+
 fn generalize_toplevel(
     inf: &mut Infer,
     fnty: &Ty,
@@ -1759,6 +1788,24 @@ mod tests {
         let amb = inf.fresh_row();
         let t = inf.infer_expr(&e, &mut env, amb);
         (display_ty(&inf, &t), inf.diags.len())
+    }
+
+    #[test]
+    fn value_restriction_keeps_values_polymorphic() {
+        // `Nil` is a syntactic value (a Var / nullary ctor), so a let-bound `Nil`
+        // stays polymorphic and unifies at two distinct element types.
+        let src = "type List(a) { Nil, Cons(a, List(a)) }\n\
+                   pub fn main() {\n\
+                     let e = Nil\n\
+                     let _ = Cons(1, e)\n\
+                     let _ = Cons(\"a\", e)\n\
+                     io.println(\"ok\")\n\
+                   }\n";
+        assert!(
+            crate::check_source("t.elya", src).is_ok(),
+            "{:?}",
+            crate::check_source("t.elya", src)
+        );
     }
 
     #[test]
