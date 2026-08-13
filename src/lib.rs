@@ -23,19 +23,26 @@ impl Session {
     }
 }
 
+/// The front-end passes (parse → resolve → infer → exhaustiveness), returning the
+/// module and all diagnostics. Exhaustiveness runs only on an error-free program;
+/// warnings never block a later pass.
+fn front_end(session: &Session, text: &str) -> (ast::Module, Vec<Diagnostic>) {
+    let (module, mut diags) = parse::parse_module(session, text);
+    diags.extend(resolve::check(session, &module));
+    if diags.is_empty() {
+        diags.extend(types::infer(session, &module));
+    }
+    if !diags.iter().any(|d| d.severity == Severity::Error) {
+        diags.extend(exhaust::check(&module));
+    }
+    (module, diags)
+}
+
 /// Full pipeline: returns program output, or rendered diagnostics on failure.
 pub fn run_source(name: &str, text: &str) -> Result<String, String> {
     let session = Session::new();
     let sm = SourceMap::new(name, text);
-    let (module, mut diags) = parse::parse_module(&session, text);
-    diags.extend(resolve::check(&session, &module));
-    if diags.is_empty() {
-        diags.extend(types::infer(&session, &module));
-    }
-    // Exhaustiveness runs on a well-formed (error-free) program; warnings are OK.
-    if !diags.iter().any(|d| d.severity == Severity::Error) {
-        diags.extend(exhaust::check(&module));
-    }
+    let (module, diags) = front_end(&session, text);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
         return Err(rendered);
     }
@@ -49,17 +56,28 @@ pub fn run_source(name: &str, text: &str) -> Result<String, String> {
 pub fn check_source(name: &str, text: &str) -> Result<(), String> {
     let session = Session::new();
     let sm = SourceMap::new(name, text);
-    let (module, mut diags) = parse::parse_module(&session, text);
-    diags.extend(resolve::check(&session, &module));
-    if diags.is_empty() {
-        diags.extend(types::infer(&session, &module));
-    }
-    if !diags.iter().any(|d| d.severity == Severity::Error) {
-        diags.extend(exhaust::check(&module));
-    }
+    let (_module, diags) = front_end(&session, text);
     match fail_if_errors(&diags, &sm) {
         Some(rendered) => Err(rendered),
         None => Ok(()),
+    }
+}
+
+/// Rendered non-fatal warnings for a source, or `None` if there are none. The
+/// CLI surfaces these on a *successful* compile (the spec §11 obligation) so an
+/// `E0426`/`E0431` lint reaches the user even though it does not fail the build.
+pub fn warnings(name: &str, text: &str) -> Option<String> {
+    let session = Session::new();
+    let sm = SourceMap::new(name, text);
+    let (_module, diags) = front_end(&session, text);
+    let warns: Vec<Diagnostic> = diags
+        .into_iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .collect();
+    if warns.is_empty() {
+        None
+    } else {
+        Some(render(&warns, &sm))
     }
 }
 

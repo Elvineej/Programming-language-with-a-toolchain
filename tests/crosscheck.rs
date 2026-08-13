@@ -39,6 +39,10 @@ fn hand_written() -> Vec<&'static str> {
         "pub fn main(){ let s = \"a\" <> \"b\" <> \"c\"\n io.println(s) }\n",
         "fn pick(c, x, y){ if c { x } else { y } }\n\
          pub fn main(){ io.println(pick(1 < 2, \"L\", \"R\")) }\n",
+        // Effect-free ADT program: the differential oracle extends to ADTs (spec §3.4).
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn sum(acc, xs){ match xs { Nil -> acc  Cons(h, t) -> sum(acc + h, t) } }\n\
+         pub fn main(){ if sum(0, Cons(1, Cons(2, Cons(3, Nil)))) == 6 { io.println(\"six\") } else { io.println(\"no\") } }\n",
     ]
 }
 

@@ -45,6 +45,20 @@ fn list_length_and_option() {
 }
 
 #[test]
+fn warnings_surface_on_successful_compile() {
+    // A useless arm is an E0431 warning: the program compiles, and the warning
+    // is retrievable (the CLI renders it to stderr on success).
+    let src = "type Option(a) { None, Some(a) }\n\
+               fn f(o) { match o { Some(x) -> x  Some(y) -> y  None -> 0 } }\n\
+               pub fn main() { io.println(\"ok\") }\n";
+    assert!(check_source("t.elya", src).is_ok(), "warning must not fail");
+    let w = elya::warnings("t.elya", src).expect("expected an E0431 warning");
+    assert!(w.contains("E0431"), "{w}");
+    // A clean program surfaces nothing.
+    assert!(elya::warnings("t.elya", "pub fn main() { io.println(\"ok\") }\n").is_none());
+}
+
+#[test]
 fn literal_patterns_run() {
     let src = "fn classify(n) { match n { 0 -> \"zero\"  _ -> \"other\" } }\n\
                fn name(b) { match b { True -> \"t\"  False -> \"f\" } }\n\
