@@ -104,3 +104,18 @@ fn row_mismatch() {
 fn unapplied_ctor() {
     check_fixture("unapplied_ctor.elya");
 }
+
+#[test]
+fn nonexhaustive_list() {
+    check_fixture("nonexhaustive_list.elya");
+}
+
+#[test]
+fn nonexhaustive_nested() {
+    check_fixture("nonexhaustive_nested.elya");
+}
+
+#[test]
+fn nonexhaustive_int() {
+    check_fixture("nonexhaustive_int.elya");
+}

@@ -3,6 +3,7 @@
 pub mod ast;
 pub mod diag;
 pub mod eval;
+pub mod exhaust;
 pub mod lex;
 pub mod parse;
 pub mod resolve;
@@ -31,6 +32,10 @@ pub fn run_source(name: &str, text: &str) -> Result<String, String> {
     if diags.is_empty() {
         diags.extend(types::infer(&session, &module));
     }
+    // Exhaustiveness runs on a well-formed (error-free) program; warnings are OK.
+    if !diags.iter().any(|d| d.severity == Severity::Error) {
+        diags.extend(exhaust::check(&module));
+    }
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
         return Err(rendered);
     }
@@ -48,6 +53,9 @@ pub fn check_source(name: &str, text: &str) -> Result<(), String> {
     diags.extend(resolve::check(&session, &module));
     if diags.is_empty() {
         diags.extend(types::infer(&session, &module));
+    }
+    if !diags.iter().any(|d| d.severity == Severity::Error) {
+        diags.extend(exhaust::check(&module));
     }
     match fail_if_errors(&diags, &sm) {
         Some(rendered) => Err(rendered),

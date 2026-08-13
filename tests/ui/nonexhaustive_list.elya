@@ -1,0 +1,10 @@
+type List(a) {
+  Nil,
+  Cons(a, List(a))
+}
+fn f(xs) {
+  match xs {
+    Nil -> 0
+  }
+}
+//~ ERROR[E0430] Cons(_, _)
