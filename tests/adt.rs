@@ -59,6 +59,53 @@ fn warnings_surface_on_successful_compile() {
 }
 
 #[test]
+fn lambda_constructs_and_runs() {
+    // The closure is built and discarded; the program runs on both evaluators.
+    let src = "pub fn main() {\n\
+                 let _f = fn(n) { n + 1 }\n\
+                 io.println(\"ok\")\n\
+               }\n";
+    assert_eq!(run_both(src), "ok\n");
+}
+
+#[test]
+fn lambda_bound_identity_is_polymorphic() {
+    // `id` is a syntactic value (a lambda) -> generalized -> typable at two types.
+    // (Type-level only; running it needs the call path from Task 3.)
+    let src = "pub fn main() {\n\
+                 let id = fn(x) { x }\n\
+                 let _ = id(1)\n\
+                 let _ = id(\"a\")\n\
+                 io.println(\"ok\")\n\
+               }\n";
+    assert!(
+        check_source("t.elya", src).is_ok(),
+        "{:?}",
+        check_source("t.elya", src)
+    );
+}
+
+#[test]
+fn value_restriction_blocks_nonvalue_generalization() {
+    // Mirror of `value_restriction_keeps_values_polymorphic`, but the RHS is a
+    // *call* (a non-value): `r : List(?a)` stays a monotype, so using it at two
+    // element types conflicts. It would only type-check if `r` were (unsoundly)
+    // generalized — the value restriction with teeth.
+    let src = "type List(a) { Nil, Cons(a, List(a)) }\n\
+               pub fn main() {\n\
+                 let r = (fn(xs) { xs })(Nil)\n\
+                 let _ = Cons(1, r)\n\
+                 let _ = Cons(\"a\", r)\n\
+                 io.println(\"x\")\n\
+               }\n";
+    let err = check_source("t.elya", src).unwrap_err();
+    assert!(
+        err.contains("E0400"),
+        "expected a type mismatch, got: {err}"
+    );
+}
+
+#[test]
 fn literal_patterns_run() {
     let src = "fn classify(n) { match n { 0 -> \"zero\"  _ -> \"other\" } }\n\
                fn name(b) { match b { True -> \"t\"  False -> \"f\" } }\n\

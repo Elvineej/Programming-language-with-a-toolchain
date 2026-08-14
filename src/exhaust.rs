@@ -309,6 +309,8 @@ fn walk_expr(e: &Spanned<Expr>, sib: &Siblings, out: &mut Vec<Diagnostic>) {
             }
         }
         Expr::Resume { arg } => walk_expr(arg, sib, out),
+        // A `match` inside a lambda body must still be exhaustiveness-checked.
+        Expr::Lambda { body, .. } => walk_block(&body.node, sib, out),
         _ => {}
     }
 }

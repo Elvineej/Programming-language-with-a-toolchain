@@ -810,6 +810,32 @@ impl Infer {
                 }
                 result
             }
+            Expr::Lambda { params, body } => {
+                // Each parameter gets a fresh monomorphic type variable.
+                env.push();
+                let mut param_tys = Vec::with_capacity(params.len());
+                for p in params {
+                    let pv = self.fresh();
+                    env.insert(
+                        &p.node.name,
+                        Scheme {
+                            vars: Vec::new(),
+                            row_vars: Vec::new(),
+                            ty: pv.clone(),
+                        },
+                    );
+                    param_tys.push(pv);
+                }
+                // The lambda has its OWN latent effect row: infer the body under a
+                // fresh ambient. Creating the closure performs nothing, so the row
+                // is NOT added to the enclosing `amb`; only *calling* it pours the
+                // row in (infer_call). This mirrors top-level fn typing (spec §2.1).
+                let lam_amb = self.fresh_row();
+                let body_ty = self.infer_block(&body.node, env, lam_amb);
+                env.pop();
+                let row = self.resolve_row(&EffectRow::open(lam_amb));
+                Ty::Fn(param_tys, row, Box::new(body_ty))
+            }
         }
     }
 
@@ -1721,6 +1747,7 @@ fn is_syntactic_value(e: &Expr) -> bool {
             | Expr::Str(_)
             | Expr::Bool(_)
             | Expr::Unit
+            | Expr::Lambda { .. }
     )
 }
 
