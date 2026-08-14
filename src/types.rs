@@ -665,14 +665,22 @@ impl Infer {
     }
 
     /// `E0433`: an n-ary constructor used unapplied or partially applied.
+    /// A constructor applied to the wrong number of arguments (Slice 4b-1: a bare
+    /// constructor is now a legal function value, so this fires only for genuine
+    /// partial/over-application at a call site — `Cons(1)` where `Cons` needs 2).
     fn emit_unapplied_ctor(&mut self, name: &str, arity: usize, span: Span) {
         let plural = if arity == 1 { "" } else { "s" };
         self.diags.push(
-            Diagnostic::error("E0433", format!("constructor `{name}` needs {arity} argument{plural}"))
-                .with_label(span, "unapplied or partially-applied constructor")
-                .with_help(
-                    "unapplied constructors become first-class function values in Slice 4b; apply it here, e.g. `Some(x)`",
+            Diagnostic::error(
+                "E0433",
+                format!(
+                    "constructor `{name}` takes {arity} argument{plural} but was applied to a different number"
                 ),
+            )
+            .with_label(span, "wrong number of arguments for this constructor")
+            .with_help(format!(
+                "Elya constructors are not curried — apply all {arity} argument{plural}, or wrap it in a lambda, e.g. `fn(x) {{ {name}(x, …) }}`"
+            )),
         );
     }
 
@@ -720,13 +728,10 @@ impl Infer {
             Expr::Bool(_) => Ty::bool(),
             Expr::Unit => Ty::unit(),
             Expr::Var(name) => {
-                if let Some(&arity) = self.ctor_arity.get(name) {
-                    if arity > 0 {
-                        // A bare n-ary constructor: E0433 (needs 4b closures).
-                        self.emit_unapplied_ctor(name, arity, span);
-                        return Ty::Error;
-                    }
-                }
+                // A bare constructor is a first-class function value (Slice 4b-1):
+                // its scheme is already an arrow (`Some : ∀a. (a) -> Option(a)`), so
+                // instantiate it like any other name. Partial application stays an
+                // error, caught at the *call* site (E0433, `infer_call`).
                 match env.lookup(name) {
                     Some(s) => {
                         let s = s.clone();

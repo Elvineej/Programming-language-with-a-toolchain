@@ -581,6 +581,26 @@ pub fn main() {
 
 Register it in `tests/ui.rs`. If a 4a `tests/ui/unapplied_ctor.elya` fixture asserts E0433 on a *bare* constructor, update it to a partial application (or delete it) — the bare case is no longer an error.
 
+Also add a **message-content** assertion (per review: saturation now rests entirely on the type checker, so the one property the representation change could quietly weaken — the clear partial-application diagnostic — gets an explicit guard beyond the bare `E0433` code). In `tests/adt.rs`:
+
+```rust
+#[test]
+fn partial_constructor_application_fires_e0433_with_clear_message() {
+    // `Cons` needs 2 args; applying it to 1 is a partial application — still an
+    // error, and the message must name the arity and the not-curried guidance.
+    let src = "type List(a) { Nil, Cons(a, List(a)) }\n\
+               pub fn main() { let _ = Cons(1)\n io.println(\"x\") }\n";
+    let err = check_source("t.elya", src).unwrap_err();
+    assert!(err.contains("E0433"), "expected E0433, got: {err}");
+    assert!(err.contains("Cons"), "message must name the constructor: {err}");
+    assert!(err.contains('2'), "message must name the required arity: {err}");
+    assert!(
+        err.contains("not curried"),
+        "message must give the not-curried guidance: {err}"
+    );
+}
+```
+
 - [ ] **Step 2: Run — expect failure** (bare `Some` still emits E0433).
 
 Run: `cargo test --test adt bare_constructor 2>&1 | grep -E "test result|FAILED"`

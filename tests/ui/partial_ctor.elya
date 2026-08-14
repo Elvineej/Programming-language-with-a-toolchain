@@ -1,9 +1,9 @@
-type Option(a) {
-  None,
-  Some(a)
+type List(a) {
+  Nil,
+  Cons(a, List(a))
 }
 fn f() {
-  let g = Some
-  g
+  let _ = Cons(1)
+  0
 }
-//~ ERROR[E0433] needs 1 argument
+//~ ERROR[E0433] curried
