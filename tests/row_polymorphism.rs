@@ -76,3 +76,44 @@ fn nonvalue_bound_relay_row_stays_monomorphic() {
         "types must unify cleanly — the sole conflict is the effect row: {err}"
     );
 }
+
+#[test]
+fn map_relays_effectful_callback() {
+    // Row-poly `map` relays the callback's Log through recursion; each element is
+    // logged and resumed with "!", producing ["a!","b!","c!"] -> "a!b!c!".
+    let src = "effect Log { fn log(msg: String) -> String }\n\
+               type List(a) { Nil, Cons(a, List(a)) }\n\
+               fn map(xs, f) { match xs { Nil -> Nil  Cons(h, t) -> Cons(f(h), map(t, f)) } }\n\
+               fn concat_all(xs) { match xs { Nil -> \"\"  Cons(h, t) -> h <> concat_all(t) } }\n\
+               pub fn main() {\n\
+                 let xs = Cons(\"a\", Cons(\"b\", Cons(\"c\", Nil)))\n\
+                 let ys = handle {\n\
+                   map(xs, fn(s) { log(s) })\n\
+                 } with {\n\
+                   Log.log(m) -> resume(m <> \"!\")\n\
+                   return(x) -> x\n\
+                 }\n\
+                 io.println(concat_all(ys))\n\
+               }\n";
+    assert_eq!(run(src), "a!b!c!\n");
+}
+
+#[test]
+fn fold_relays_effectful_callback() {
+    // Row-poly `fold` relays the callback's Log while accumulating; each element
+    // is logged and resumed with ".", producing "a.b.c.".
+    let src = "effect Log { fn log(msg: String) -> String }\n\
+               type List(a) { Nil, Cons(a, List(a)) }\n\
+               fn fold(xs, acc, f) { match xs { Nil -> acc  Cons(h, t) -> fold(t, f(acc, h), f) } }\n\
+               pub fn main() {\n\
+                 let xs = Cons(\"a\", Cons(\"b\", Cons(\"c\", Nil)))\n\
+                 let total = handle {\n\
+                   fold(xs, \"\", fn(acc, s) { acc <> log(s) })\n\
+                 } with {\n\
+                   Log.log(m) -> resume(m <> \".\")\n\
+                   return(x) -> x\n\
+                 }\n\
+                 io.println(total)\n\
+               }\n";
+    assert_eq!(run(src), "a.b.c.\n");
+}
