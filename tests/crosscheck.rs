@@ -43,6 +43,14 @@ fn hand_written() -> Vec<&'static str> {
         "type List(a) { Nil, Cons(a, List(a)) }\n\
          fn sum(acc, xs){ match xs { Nil -> acc  Cons(h, t) -> sum(acc + h, t) } }\n\
          pub fn main(){ if sum(0, Cons(1, Cons(2, Cons(3, Nil)))) == 6 { io.println(\"six\") } else { io.println(\"no\") } }\n",
+        // Effect-free higher-order program: the cek==tree oracle extends to closures (spec §3.4).
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn map(xs, f){ match xs { Nil -> Nil  Cons(h, t) -> Cons(f(h), map(t, f)) } }\n\
+         fn sum(acc, xs){ match xs { Nil -> acc  Cons(h, t) -> sum(acc + h, t) } }\n\
+         pub fn main(){\n\
+           let ys = map(Cons(1, Cons(2, Cons(3, Nil))), fn(n){ n + 100 })\n\
+           if sum(0, ys) == 306 { io.println(\"ho\") } else { io.println(\"no\") }\n\
+         }\n",
     ]
 }
 
