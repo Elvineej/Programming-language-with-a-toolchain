@@ -132,6 +132,44 @@ fn higher_order_map_over_list() {
 }
 
 #[test]
+fn bare_constructor_is_a_function_value() {
+    // `Some` unapplied is now a first-class function value (arity 1), usable as a
+    // mapper. Runs on both evaluators.
+    let src = "type Option(a) { None, Some(a) }\n\
+               type List(a) { Nil, Cons(a, List(a)) }\n\
+               fn map(xs, f) { match xs { Nil -> Nil  Cons(h, t) -> Cons(f(h), map(t, f)) } }\n\
+               pub fn main() {\n\
+                 let xs = Cons(1, Cons(2, Nil))\n\
+                 let _ys = map(xs, Some)\n\
+                 io.println(\"ok\")\n\
+               }\n";
+    assert_eq!(run_both(src), "ok\n");
+}
+
+#[test]
+fn partial_constructor_application_fires_e0433_with_clear_message() {
+    // `Cons` needs 2 args; applying it to 1 is a partial application — still an
+    // error (saturation now rests on the type checker, not an arity field). The
+    // message must name the constructor and the not-curried guidance.
+    let src = "type List(a) { Nil, Cons(a, List(a)) }\n\
+               pub fn main() { let _ = Cons(1)\n io.println(\"x\") }\n";
+    let err = check_source("t.elya", src).unwrap_err();
+    assert!(err.contains("E0433"), "expected E0433, got: {err}");
+    assert!(
+        err.contains("Cons"),
+        "message must name the constructor: {err}"
+    );
+    assert!(
+        err.contains("curried"),
+        "message must give the not-curried guidance: {err}"
+    );
+    assert!(
+        err.contains("argument"),
+        "message must reference the argument arity: {err}"
+    );
+}
+
+#[test]
 fn literal_patterns_run() {
     let src = "fn classify(n) { match n { 0 -> \"zero\"  _ -> \"other\" } }\n\
                fn name(b) { match b { True -> \"t\"  False -> \"f\" } }\n\

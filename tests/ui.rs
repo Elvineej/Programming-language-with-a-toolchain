@@ -101,8 +101,8 @@ fn row_mismatch() {
 }
 
 #[test]
-fn unapplied_ctor() {
-    check_fixture("unapplied_ctor.elya");
+fn partial_ctor() {
+    check_fixture("partial_ctor.elya");
 }
 
 #[test]
