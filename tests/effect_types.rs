@@ -189,6 +189,42 @@ fn multi_over_io_still_compiles_and_runs() {
     );
 }
 
+// A closure that performs {Flip} + {IO}, relayed through `run` and handled by a
+// `multi` handler: the observable IO is duplicated across resumes -> E0426. The
+// same closure under a one-shot handler must NOT warn (4b-2 §5).
+const MULTI_OVER_CLOSURE_IO: &str = "effect Flip { fn flip() -> Bool }\n\
+    fn run(f) { f() }\n\
+    pub fn main() {\n\
+      let _ = handle run(fn() { let x = flip()  let _ = io.println(\"tick\")  x }) with multi { Flip.flip() -> resume(True) }\n\
+      io.println(\"done\")\n\
+    }\n";
+
+#[test]
+fn multi_over_closure_io_warns_e0426() {
+    let diags = infer_diags(MULTI_OVER_CLOSURE_IO);
+    let w = diags
+        .iter()
+        .find(|d| d.code == "E0426")
+        .expect("expected E0426 for a closure performing IO under multi");
+    assert_eq!(w.severity, Severity::Warning, "E0426 must be a warning");
+}
+
+#[test]
+fn one_shot_over_closure_io_does_not_warn() {
+    // Same closure, but a default (one-shot) handler: no duplication, no E0426.
+    let src = "effect Flip { fn flip() -> Bool }\n\
+        fn run(f) { f() }\n\
+        pub fn main() {\n\
+          let _ = handle run(fn() { let x = flip()  let _ = io.println(\"tick\")  x }) with { Flip.flip() -> resume(True) }\n\
+          io.println(\"done\")\n\
+        }\n";
+    let diags = infer_diags(src);
+    assert!(
+        !diags.iter().any(|d| d.code == "E0426"),
+        "one-shot handler must not warn E0426: {diags:?}"
+    );
+}
+
 #[test]
 fn severity_partition_is_locked() {
     // Lock the Error/Warning partition against regression: a warning-only program
