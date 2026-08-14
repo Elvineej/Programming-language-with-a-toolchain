@@ -381,30 +381,60 @@ pub mod tree {
                     }
                 }
                 let callee_v = eval_expr(interp, callee, env, fns)?;
-                let Value::Fn(fname) = callee_v else {
-                    return Err(rt(callee.span, "value is not callable"));
-                };
-                let fdecl = fns
-                    .get(fname.as_str())
-                    .copied()
-                    .ok_or_else(|| rt(span, format!("unknown function `{fname}`")))?;
-                if fdecl.params.len() != args.len() {
-                    return Err(rt(
-                        span,
-                        format!(
-                            "`{}` expects {} argument(s), got {}",
-                            fname,
-                            fdecl.params.len(),
-                            args.len()
-                        ),
-                    ));
+                match callee_v {
+                    Value::Fn(fname) => {
+                        let fdecl = fns
+                            .get(fname.as_str())
+                            .copied()
+                            .ok_or_else(|| rt(span, format!("unknown function `{fname}`")))?;
+                        if fdecl.params.len() != args.len() {
+                            return Err(rt(
+                                span,
+                                format!(
+                                    "`{}` expects {} argument(s), got {}",
+                                    fname,
+                                    fdecl.params.len(),
+                                    args.len()
+                                ),
+                            ));
+                        }
+                        let mut bindings = Vec::with_capacity(fdecl.params.len());
+                        for (p, a) in fdecl.params.iter().zip(args.iter()) {
+                            bindings.push((p.node.name.clone(), eval_expr(interp, a, env, fns)?));
+                        }
+                        let call_env = Env::new().extend(&bindings);
+                        eval_block(interp, &fdecl.body.node, &call_env, fns)
+                    }
+                    Value::Closure {
+                        params,
+                        body,
+                        env: cenv,
+                    } => {
+                        if params.len() != args.len() {
+                            return Err(rt(
+                                span,
+                                "closure applied to the wrong number of arguments",
+                            ));
+                        }
+                        let mut bindings = Vec::with_capacity(params.len());
+                        for (name, a) in params.iter().zip(args.iter()) {
+                            bindings.push((name.clone(), eval_expr(interp, a, env, fns)?));
+                        }
+                        let call_env = cenv.extend(&bindings);
+                        eval_block(interp, &body.node, &call_env, fns)
+                    }
+                    // A bare constructor value (`Some`, `Cons`) applied: append the
+                    // args to build the saturated `Ctor`. Saturation is guaranteed
+                    // by the type checker (§2.3, §6).
+                    Value::Ctor(name, existing) => {
+                        let mut vals: Vec<Value> = (*existing.0).clone();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        Ok(Value::Ctor(name, CtorArgs(Rc::new(vals))))
+                    }
+                    _ => Err(rt(callee.span, "value is not callable")),
                 }
-                let mut bindings = Vec::with_capacity(fdecl.params.len());
-                for (p, a) in fdecl.params.iter().zip(args.iter()) {
-                    bindings.push((p.node.name.clone(), eval_expr(interp, a, env, fns)?));
-                }
-                let call_env = Env::new().extend(&bindings);
-                eval_block(interp, &fdecl.body.node, &call_env, fns)
             }
             Expr::Handle { .. } | Expr::Resume { .. } => {
                 Err(rt(span, "effects are not evaluated yet (Slice 3c)"))
@@ -1138,6 +1168,24 @@ pub mod cek {
             CalleeSlot::Operation { effect, op } => perform(effect, op, args, span, k),
             CalleeSlot::Ctor { name } => {
                 Ok(State::Return(Value::Ctor(name, CtorArgs(Rc::new(args))), k))
+            }
+            CalleeSlot::Value(Value::Closure {
+                params,
+                body,
+                env: cenv,
+            }) => {
+                if params.len() != args.len() {
+                    return Err(rt(span, "closure applied to the wrong number of arguments"));
+                }
+                let bindings: Vec<(String, Value)> = params.iter().cloned().zip(args).collect();
+                let call_env = cenv.extend(&bindings);
+                Ok(eval_block_state(&body.node, call_env, k)) // reuses `k` — TCE-preserving
+            }
+            // A bare constructor value applied: append the args to the saturated `Ctor`.
+            CalleeSlot::Value(Value::Ctor(name, existing)) => {
+                let mut vals: Vec<Value> = (*existing.0).clone();
+                vals.extend(args);
+                Ok(State::Return(Value::Ctor(name, CtorArgs(Rc::new(vals))), k))
             }
             CalleeSlot::Value(_) => Err(rt(span, "value is not callable")),
             CalleeSlot::Pending => Err(rt(span, "internal: unresolved callee")),
