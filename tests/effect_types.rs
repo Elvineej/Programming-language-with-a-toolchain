@@ -50,6 +50,31 @@ fn relay_is_row_polymorphic() {
 }
 
 #[test]
+fn concrete_effect_lambda_row_is_closed() {
+    // A returned concrete-effect lambda infers a MINIMAL closed row {Log} —
+    // not a spurious `forall a. ... {Log | a}` from an unclosed tail (4b-2 §2).
+    let src = "effect Log { fn log(msg: String) -> Unit }\n\
+               fn make_logger() { fn(n) { log(n) } }\n";
+    let (s, d) = schemes(src);
+    assert!(d.is_empty(), "{d:?}");
+    assert_eq!(s["make_logger"], "fn() -> fn(String) / {Log} -> Unit");
+}
+
+#[test]
+fn relay_lambda_stays_row_polymorphic() {
+    // The relay path must be preserved: a function that relays a callback's
+    // effects keeps its open, row-polymorphic tail. This is the guard against
+    // Fork A over-closing a genuine relay (an error in the opposite direction).
+    let src = "fn relay(f, x) { f(x) }\n";
+    let (s, d) = schemes(src);
+    assert!(d.is_empty(), "{d:?}");
+    assert_eq!(
+        s["relay"],
+        "forall a b c. fn(fn(a) / {c} -> b, a) / {c} -> b"
+    );
+}
+
+#[test]
 fn handle_discharges_the_effect() {
     // A function whose body performs Log but handles it is pure again.
     let src = "effect Log { fn log(msg: String) -> Unit }\n\

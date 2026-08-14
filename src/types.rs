@@ -838,6 +838,11 @@ impl Infer {
                 let lam_amb = self.fresh_row();
                 let body_ty = self.infer_block(&body.node, env, lam_amb);
                 env.pop();
+                // Fork A (4b-2 §2): close the lambda's residual tail unless it is
+                // relayed through a parameter — the same discipline top-level fns
+                // use. A concrete-effect lambda gets a minimal closed row (`{Log}`);
+                // a relay lambda keeps its open, row-polymorphic tail.
+                self.close_unrelayed_residual(lam_amb, &param_tys);
                 let row = self.resolve_row(&EffectRow::open(lam_amb));
                 Ty::Fn(param_tys, row, Box::new(body_ty))
             }
