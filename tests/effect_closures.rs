@@ -90,3 +90,50 @@ fn closure_performs_against_call_site_handler_not_definition() {
                }\n";
     assert_eq!(run(src), "inner-A\n");
 }
+
+#[test]
+fn relay_plus_own_effect_runs_when_callback_also_performs() {
+    // Fork C (4b-2 §6): a relay-plus-own-effect fn works when the callback
+    // performs the same effect. `both` logs "own" (discarded) then relays
+    // f("arg") = log("arg") -> resume("arg.") -> flows back out.
+    let src = "effect Log { fn log(msg: String) -> String }\n\
+               fn both(f, x) { let _ = log(\"own\")  f(x) }\n\
+               pub fn main() {\n\
+                 let r = handle {\n\
+                   both(fn(n) { log(n) }, \"arg\")\n\
+                 } with {\n\
+                   Log.log(m) -> resume(m <> \".\")\n\
+                   return(x) -> x\n\
+                 }\n\
+                 io.println(r)\n\
+               }\n";
+    assert_eq!(run(src), "arg.\n");
+}
+
+#[test]
+fn relay_plus_own_effect_rejects_pure_callback_known_limitation() {
+    // KNOWN LIMITATION (pre-existing 3b, documented not fixed): because the
+    // shared ambient leaks `Log` onto the callback's row (see
+    // `relay_plus_own_effect_row_is_the_known_limitation` in effect_types.rs),
+    // `both` wrongly requires its callback to ALSO perform `Log`. A pure
+    // callback is therefore rejected with E0423, even though it is valid (`both`
+    // performs `Log` regardless of `f`). This pins the current wrong-but-sound
+    // behavior; the deferred call-site row fix will make this program compile.
+    let src = "effect Log { fn log(msg: String) -> Unit }\n\
+               fn both(f, x) { let _ = log(x)  f(x) }\n\
+               pub fn main() {\n\
+                 let r = handle {\n\
+                   let _ = both(fn(n) { n }, \"hi\")\n\
+                   \"ok\"\n\
+                 } with {\n\
+                   Log.log(m) -> resume(Unit)\n\
+                   return(x) -> x\n\
+                 }\n\
+                 io.println(r)\n\
+               }\n";
+    let err = check_err(src);
+    assert!(
+        err.contains("E0423"),
+        "known limitation: pure callback rejected by row leak: {err}"
+    );
+}

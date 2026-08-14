@@ -89,7 +89,19 @@ E0426 (the multi-shot cleanup lint for *observable* effects, effects spec §11) 
 
 ## 6. The known limitation — relay plus own effect (Fork C)
 
-The `close_unrelayed_residual` comment flags a function that *both* relays a parameter *and* performs its own concrete effect as possibly "more general than minimal." Lambdas make it trivially writable: `fn(f, x) { log(x)  f(x) }`. With Fork A applied, its tail *is* relayed through `f`, so it is left open and the row is `{Log | ρ}` — which is in fact the **minimal** description ("performs `Log`, plus whatever `f` does"). 4b-2's approach (approved): **activate, test, and document.** Write the relay-plus-own-effect program, pin its inferred row and its runtime behavior with a test, and record the result honestly in this section during implementation. Fix the primitive only if the pinned row proves genuinely wrong (unsound or misleading) rather than merely verbose. This converts a dormant caveat into a covered, documented property.
+The `close_unrelayed_residual` comment flags a function that *both* relays a parameter *and* performs its own concrete effect. 4b-2's approach was **activate, test, document — fix only if genuinely wrong.** On activation the measurement showed the case *is* genuinely wrong (not merely verbose), and per the plan's Fork-C branch execution stopped and put the decision to the user, who chose **document + defer**. Recorded finding:
+
+**Measured behavior.** `fn both(f, x) { let _ = log(x)  f(x) }` infers
+
+```
+forall a b. fn(fn(String) / {Log | b} -> a, String) / {Log | b} -> a
+```
+
+The `{Log | b}` on `both`'s own row is correct ("performs `Log`, plus whatever `f` does"). But the same `{Log | b}` leaks onto the **parameter** `f`, over-constraining the callback to *also* perform `Log`. Verified consequences: `both(fn(m){ log(m) }, "hi")` (callback performs `Log`) is **accepted**; `both(fn(n){ n }, "hi")` (pure callback) is **rejected with E0423** ("rows differ by exactly: {Log}"), as is `both(id, "hi")` with a pure top-level fn — even though a pure callback is valid.
+
+**Root cause & provenance.** `log(x)` and `f(x)` pour into the *same* ambient row, so `f`'s row variable unifies with an ambient that already contains `Log`. This is **pre-existing 3b** (reproduces with no lambdas — a pure top-level-fn callback) — the exact "known limitation" the code comment names. Fork A is unrelated and correct; 4b-1's over-general open lambda tails merely *papered over* it for pure lambda callbacks (their open tails absorbed the spurious `Log`), and Fork A correctly closing those tails is what let this test expose the real defect. It is **sound but over-restrictive** (rejects valid programs), not unsound.
+
+**Disposition.** Pinned as a documented known-limitation by three tests (`relay_plus_own_effect_row_is_the_known_limitation`, `relay_plus_own_effect_runs_when_callback_also_performs`, `relay_plus_own_effect_rejects_pure_callback_known_limitation`) so a future fix flips them visibly. The fix — inferring each call's latent row as an *independent* variable unioned into the ambient rather than unified with it — is deferred as a tracked obligation (§11), because it touches the symmetric core of all effect-row inference (`add_row`/`unify_row`) and is out of scope for a coverage slice.
 
 ## 7. Diagnostics
 
@@ -117,8 +129,8 @@ New file `tests/effect_closures.rs` (CEK-only, via `run_source`, mirroring `test
 - **Row-poly earn-out (§3):** the let-bound `apply` used at a pure row and at `{Log}` in one program type-checks and runs.
 - **Dynamic scoping (§4):** a closure performs against the handler enclosing its call, not its definition (output-verified).
 - **E0426 × closures (§5):** a closure performing an observable effect under `multi` fires `E0426`; under one-shot it does not.
-- **Fork C (§6):** relay-plus-own-effect program — inferred row pinned, runtime output verified, behavior documented.
-- **Regression:** full suite (145) stays green; the effect-free `cek == tree` corpus is untouched.
+- **Fork C (§6):** relay-plus-own-effect — the (wrong-but-sound) row `{Log | b}` pinned, the working case (`Log`-performing callback) runs `arg.`, and the over-restriction (pure callback rejected `E0423`) pinned as a documented known-limitation.
+- **Regression:** the full prior suite stays green; the effect-free `cek == tree` corpus is untouched.
 
 ## 10. Build order (tasks — a plan per this sub-slice)
 
@@ -138,7 +150,7 @@ Concrete-effect lambdas infer minimal closed rows (`make_logger` pinned) while r
 - **Lambda effect-row annotations** (`fn(x) / {E} { … }`) + exact-row checking (Fork B) — deferred; parser + `check_exact_row` wiring, separable.
 - **Row-polymorphic combinator library + the effect-row value-restriction stress test** → 4b-3 (the soundness capstone toward linear/affine).
 - **Deep multi-shot × closure resource safety** — a closure captured into a multiply-resuming continuation; the real guarantee is the linear/affine arc, not 4b-2.
-- **The `close_unrelayed_residual` "known limitation"** — if the Fork-C pin shows the row is acceptable (minimal), the limitation is downgraded from "caveat" to "documented behavior"; a genuine fix stays deferred unless the pin proves it wrong.
+- **TRACKED OBLIGATION — the relay-plus-own-effect row leak (Fork C, confirmed genuinely wrong).** The measurement (§6) proved the case is over-restrictive, not merely verbose: a function that performs its own effect *and* relays a callback leaks that effect onto the callback's row, wrongly rejecting valid (e.g. pure) callbacks with `E0423`. Pinned as a documented known-limitation by three tests. **The fix** — infer each call's latent effect row as an *independent* row variable that is *unioned into* the ambient (via `add_row`) rather than *unified with* it, so a callee's own row var no longer absorbs sibling effects — is deferred to a **focused effect-inference slice adjacent to the linear/affine arc**, because it touches the symmetric core (`add_row`/`unify_row`) used by every call site and carries broad regression surface. When done, the three pinned tests flip to the minimal `{b}` callback row.
 
 ## 12. Milestone Checklist (Slice 4b-2)
 
@@ -147,5 +159,5 @@ Concrete-effect lambdas infer minimal closed rows (`make_logger` pinned) while r
 - [ ] Let-bound HOF lambda is row-polymorphic across a pure and an effectful use in one program.
 - [ ] Closure performs against the call-site handler (dynamic scoping) — output-verified.
 - [ ] E0426 fires for a closure performing an observable effect under `multi`; not under one-shot.
-- [ ] Relay-plus-own-effect row pinned and documented (Fork C).
+- [ ] Relay-plus-own-effect: row `{Log | b}` pinned, working case runs, pure-callback rejection (`E0423`) pinned as a documented known-limitation; fix tracked as an obligation (§11).
 - [ ] Full suite green; `cargo fmt --all` + `sh scripts/check.sh` clean; committed + pushed.

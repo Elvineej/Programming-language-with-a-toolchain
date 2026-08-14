@@ -75,6 +75,27 @@ fn relay_lambda_stays_row_polymorphic() {
 }
 
 #[test]
+fn relay_plus_own_effect_row_is_the_known_limitation() {
+    // Fork C (4b-2 §6): a function that BOTH performs its own effect (Log) AND
+    // relays a callback. The MINIMAL row would be `fn(fn(String)/{b}->a, ..)
+    // / {Log | b} -> a` — Log on `both`, the callback's row independent (`{b}`).
+    //
+    // KNOWN LIMITATION (pre-existing 3b, documented not fixed — see the deferred
+    // obligation in the effects spec): the shared-ambient inference leaks `Log`
+    // onto the *parameter* `f`'s row too, so `f` is over-constrained to `{Log|b}`.
+    // This pins the CURRENT (wrong-but-sound) behavior; a future call-site row
+    // fix will flip this assertion to the minimal `{b}` form above.
+    let src = "effect Log { fn log(msg: String) -> Unit }\n\
+               fn both(f, x) { let _ = log(x)  f(x) }\n";
+    let (s, d) = schemes(src);
+    assert!(d.is_empty(), "{d:?}");
+    assert_eq!(
+        s["both"],
+        "forall a b. fn(fn(String) / {Log | b} -> a, String) / {Log | b} -> a"
+    );
+}
+
+#[test]
 fn handle_discharges_the_effect() {
     // A function whose body performs Log but handles it is pure again.
     let src = "effect Log { fn log(msg: String) -> Unit }\n\
