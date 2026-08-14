@@ -106,6 +106,32 @@ fn value_restriction_blocks_nonvalue_generalization() {
 }
 
 #[test]
+fn closure_call_and_capture_run() {
+    let src = "pub fn main() {\n\
+                 let inc = fn(n) { n + 1 }\n\
+                 let by = 10\n\
+                 let bump = fn(n) { n + by }\n\
+                 let _ = inc(41)\n\
+                 let r = bump(5)\n\
+                 if r == 15 { io.println(\"ok\") } else { io.println(\"no\") }\n\
+               }\n";
+    assert_eq!(run_both(src), "ok\n");
+}
+
+#[test]
+fn higher_order_map_over_list() {
+    let src = "type List(a) { Nil, Cons(a, List(a)) }\n\
+               fn map(xs, f) { match xs { Nil -> Nil  Cons(h, t) -> Cons(f(h), map(t, f)) } }\n\
+               fn sum(acc, xs) { match xs { Nil -> acc  Cons(h, t) -> sum(acc + h, t) } }\n\
+               pub fn main() {\n\
+                 let xs = Cons(1, Cons(2, Cons(3, Nil)))\n\
+                 let ys = map(xs, fn(n) { n * 10 })\n\
+                 if sum(0, ys) == 60 { io.println(\"ok\") } else { io.println(\"no\") }\n\
+               }\n";
+    assert_eq!(run_both(src), "ok\n");
+}
+
+#[test]
 fn literal_patterns_run() {
     let src = "fn classify(n) { match n { 0 -> \"zero\"  _ -> \"other\" } }\n\
                fn name(b) { match b { True -> \"t\"  False -> \"f\" } }\n\
