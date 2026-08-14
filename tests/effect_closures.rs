@@ -71,3 +71,22 @@ fn let_bound_hof_lambda_is_row_polymorphic() {
                }\n";
     assert_eq!(run(src), "hi!\n");
 }
+
+#[test]
+fn closure_performs_against_call_site_handler_not_definition() {
+    // `g` is DEFINED in main with no handler around it, then CALLED inside
+    // `call_it`'s handle. Its Log resolves to the call-site handler (dynamic
+    // scoping), which appends "-A" — so the output is "inner-A".
+    let src = "effect Log { fn log(msg: String) -> String }\n\
+               fn call_it(f) {\n\
+                 handle { f(\"inner\") } with {\n\
+                   Log.log(m) -> resume(m <> \"-A\")\n\
+                   return(x) -> x\n\
+                 }\n\
+               }\n\
+               pub fn main() {\n\
+                 let g = fn(n) { log(n) }\n\
+                 io.println(call_it(g))\n\
+               }\n";
+    assert_eq!(run(src), "inner-A\n");
+}
