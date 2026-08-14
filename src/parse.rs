@@ -120,6 +120,7 @@ impl<'a> Parser<'a> {
         match self.peek()?.clone() {
             TokenKind::KwIf => self.if_expr(),
             TokenKind::KwHandle => self.handle_expr(),
+            TokenKind::KwFn => self.lambda_expr(),
             TokenKind::KwMatch => self.match_expr(),
             TokenKind::LBrace => self.block_expr(),
             TokenKind::Int(n) => {
@@ -414,6 +415,51 @@ impl<'a> Parser<'a> {
     }
 
     // `match EXPR { PAT -> EXPR … }` — arms are whitespace-separated (no comma).
+    /// Parse an anonymous function `fn ( params ) { block }` in expression position.
+    fn lambda_expr(&mut self) -> Option<Spanned<Expr>> {
+        let start = self.peek_span();
+        self.bump(); // `fn`
+        if !self.eat(&TokenKind::LParen) {
+            self.error(self.peek_span(), "expected `(` after `fn` in a lambda");
+            return None;
+        }
+        let mut params = Vec::new();
+        if self.peek() != Some(&TokenKind::RParen) {
+            loop {
+                let pspan = self.peek_span();
+                match self.peek()?.clone() {
+                    TokenKind::Lower(pn) => {
+                        self.bump();
+                        if self.eat(&TokenKind::Colon) {
+                            self.skip_type_annotation();
+                        }
+                        params.push(spanned(Param { name: pn }, pspan));
+                    }
+                    _ => {
+                        self.error(pspan, "expected parameter name");
+                        return None;
+                    }
+                }
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        if !self.eat(&TokenKind::RParen) {
+            self.error(self.peek_span(), "expected `)`");
+            return None;
+        }
+        let body = self.block()?;
+        let end = body.span;
+        Some(spanned(
+            Expr::Lambda {
+                params,
+                body: Rc::new(body),
+            },
+            start.merge(end),
+        ))
+    }
+
     fn match_expr(&mut self) -> Option<Spanned<Expr>> {
         let start = self.peek_span();
         self.bump(); // match
@@ -1090,6 +1136,17 @@ mod tests {
     fn calls_and_qualified() {
         assert_eq!(p(r#"io.println("hi")"#), r#"(call io.println "hi")"#);
         assert_eq!(p("f(1, 2)"), "(call f 1 2)");
+    }
+
+    #[test]
+    fn lambda_parses_and_round_trips() {
+        assert_eq!(p("fn(x, y) { x + y }"), "(fn (x y) (block (+ x y)))");
+        assert_eq!(p("fn() { 0 }"), "(fn () (block 0))");
+        // A lambda as a call argument.
+        assert_eq!(
+            p("map(xs, fn(n) { n * 2 })"),
+            "(call map xs (fn (n) (block (* n 2))))"
+        );
     }
 
     #[test]

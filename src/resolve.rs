@@ -196,6 +196,14 @@ impl Cx<'_> {
                     scope.pop();
                 }
             }
+            Expr::Lambda { params, body } => {
+                scope.push(HashSet::new());
+                for p in params {
+                    scope.last_mut().unwrap().insert(p.node.name.clone());
+                }
+                self.check_block(&body.node, scope);
+                scope.pop();
+            }
         }
     }
 }

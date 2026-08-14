@@ -23,6 +23,14 @@ pub enum Value {
     /// list construction is O(n), not O(n²) — and `CtorArgs`'s iterative `Drop`
     /// keeps a deep chain from overflowing the host stack on destruction.
     Ctor(String, CtorArgs),
+    /// A closure (Slice 4b-1): a lambda plus the environment it captured. The
+    /// effect row is NOT stored — effects thread dynamically to the call site;
+    /// the row lives only in the type. Capturing `env` is an O(1) `Rc` clone.
+    Closure {
+        params: Rc<[String]>,
+        body: Rc<Spanned<Block>>,
+        env: Env,
+    },
 }
 
 /// The `Rc`-shared payload of a `Value::Ctor`. Its `Drop` is iterative so that
@@ -339,6 +347,14 @@ pub mod tree {
                 _ => Err(rt(cond.span, "if condition must be a Bool")),
             },
             Expr::Block(b) => eval_block(interp, b, env, fns),
+            Expr::Lambda { params, body } => {
+                let names: Rc<[String]> = params.iter().map(|p| p.node.name.clone()).collect();
+                Ok(Value::Closure {
+                    params: names,
+                    body: body.clone(),
+                    env: env.clone(),
+                })
+            }
             Expr::Call { callee, args } => {
                 if let Expr::Qualified { module, name } = &callee.node {
                     if module == "io" && name == "println" {
@@ -708,6 +724,17 @@ pub mod cek {
                 ),
             ),
             Expr::Block(b) => step_block(b.stmts.clone(), 0, b.tail.clone(), env, k),
+            Expr::Lambda { params, body } => {
+                let names: Rc<[String]> = params.iter().map(|p| p.node.name.clone()).collect();
+                State::Return(
+                    Value::Closure {
+                        params: names,
+                        body: body.clone(),
+                        env: env.clone(),
+                    },
+                    k,
+                )
+            }
             Expr::Call { callee, args } => {
                 let slot = match &callee.node {
                     Expr::Qualified { module, name } if module == "io" && name == "println" => {

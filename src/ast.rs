@@ -184,6 +184,12 @@ pub enum Expr {
         scrutinee: Rc<Spanned<Expr>>,
         arms: Rc<[Spanned<MatchArm>]>,
     },
+    /// An anonymous function (Slice 4b-1): `fn(x, y) { … }`. Uncurried, block-bodied,
+    /// untyped params (HM infers). Evaluates to a `Value::Closure` capturing its env.
+    Lambda {
+        params: Vec<Spanned<Param>>,
+        body: Rc<Spanned<Block>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -370,6 +376,18 @@ fn pretty_expr(e: &Expr, s: &mut String) {
             s.push(')');
         }
         Expr::Block(b) => pretty_block(b, s),
+        Expr::Lambda { params, body } => {
+            s.push_str("(fn (");
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 {
+                    s.push(' ');
+                }
+                s.push_str(&p.node.name);
+            }
+            s.push_str(") ");
+            pretty_block(&body.node, s);
+            s.push(')');
+        }
         Expr::Handle { body, handler } => {
             s.push_str("(handle ");
             pretty_expr(&body.node, s);
