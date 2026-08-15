@@ -75,6 +75,29 @@ fn relay_lambda_stays_row_polymorphic() {
 }
 
 #[test]
+fn concrete_state_use_names_the_arg_in_the_row() {
+    // Slice 4c-2: `f` uses State at String concretely -> the row carries the
+    // argument, State(String) (proving the type arg rides in the row).
+    let src = "effect State(s) { fn get() -> s  fn set(v: s) -> Unit }\n\
+               fn f() { set(get() <> \"x\") }\n";
+    let (s, d) = schemes(src);
+    assert!(d.is_empty(), "{d:?}");
+    assert_eq!(s["f"], "fn() / {State(String)} -> Unit");
+}
+
+#[test]
+fn effect_arg_only_type_var_is_generalized() {
+    // Slice 4c-2: `s` is reachable ONLY through the effect argument {State(s)} —
+    // not in params or result. Generalizing it REQUIRES free_vars to descend into
+    // effect arguments. No `forall` here would mean the descent is missing.
+    let src = "effect State(s) { fn get() -> s  fn set(v: s) -> Unit }\n\
+               fn touch() { let _ = get()  Unit }\n";
+    let (s, d) = schemes(src);
+    assert!(d.is_empty(), "{d:?}");
+    assert_eq!(s["touch"], "forall a. fn() / {State(a)} -> Unit");
+}
+
+#[test]
 fn relay_plus_own_effect_row_is_the_known_limitation() {
     // Fork C (4b-2 §6): a function that BOTH performs its own effect (Log) AND
     // relays a callback. The MINIMAL row would be `fn(fn(String)/{b}->a, ..)
