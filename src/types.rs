@@ -209,6 +209,14 @@ impl Infer {
                 None => break,
             }
         }
+        // Resolve each label's type arguments (Slice 4c-2), so downstream
+        // consumers (printing, arg reconciliation, generalization) see the
+        // substituted types rather than raw variables.
+        for l in labels.values_mut() {
+            for a in l.args.iter_mut() {
+                *a = self.resolve(a);
+            }
+        }
         EffectRow { labels, tail }
     }
 
