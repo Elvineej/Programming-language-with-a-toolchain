@@ -501,7 +501,9 @@ fn same_effect_at_two_types_in_one_scope_is_e0423() {
 }
 ```
 
-- [ ] **Step 2: Inferred-row scheme pins.** In `tests/effect_types.rs` (using `schemes`), pin that a concrete performer names its argument in the row and a relay keeps it polymorphic:
+- [ ] **Step 2: Inferred-row scheme pins — two distinct properties.** In `tests/effect_types.rs` (using `schemes`), pin BOTH that the row carries a concrete argument AND that the `free_vars` descent generalizes a type var reachable *only* through the effect argument.
+
+**(a) The row carries a concrete argument** (`s = String` is concrete — proves the arg *rides in the row*, but is NOT a test of the descent):
 
 ```rust
 #[test]
@@ -515,12 +517,29 @@ fn concrete_state_use_names_the_arg_in_the_row() {
 }
 ```
 
-(If the printed form differs only in spacing, pin the actual — the invariant is the row names `State(String)`, proving the argument is carried. Confirm a *polymorphic* relay over a generic effect keeps the arg as a quantified variable; add that pin if the exact string is stable.)
+**(b) The `free_vars` descent — the load-bearing pin.** `touch` performs `State(s)` and *discards* the value, so `s` appears **nowhere** in its ordinary type (no params, result `Unit`) — **only inside `{State(s)}`**. It must still be generalized, which happens *only if* `free_vars` descends into the effect argument (Task 1 Step 3). If the descent is missing, `s` is not quantified and this pin fails loudly:
+
+```rust
+#[test]
+fn effect_arg_only_type_var_is_generalized() {
+    // `s` is reachable ONLY through the effect argument {State(s)} — not in params
+    // or result. Generalizing it REQUIRES free_vars to descend into effect args.
+    // (This is the specific shape that tests the descent; the concrete `String`
+    // pin above does not, since String is no variable to generalize.)
+    let src = "effect State(s) { fn get() -> s  fn set(v: s) -> Unit }\n\
+               fn touch() { let _ = get()  Unit }\n";
+    let (s, d) = schemes(src);
+    assert!(d.is_empty(), "{d:?}");
+    assert_eq!(s["touch"], "forall a. fn() / {State(a)} -> Unit");
+}
+```
+
+(For each, if the printed form differs only in spacing/letter, pin the actual — the invariants are: (a) the row names `State(String)`; (b) there is a `forall` quantifying the variable that appears inside `{State(a)}`. If (b) shows **no `forall`** or a leaked/defaulted var, the descent is missing — a real gap in Task 1 Step 3 to fix, not a test to soften.)
 
 - [ ] **Step 3: Run the new tests.**
 
-Run: `cargo test --test generic_effects same_effect_at_two_types --test effect_types concrete_state_use_names 2>&1 | grep -E "test result|FAILED|left|right" | head`
-Expected: PASS. If `concrete_state_use_names_the_arg_in_the_row` fails, read the actual printed row and pin it (invariant: it names `State(String)`); if the row does **not** name the argument, the arg is not riding in the row — a real gap, investigate (do not weaken the assertion).
+Run: `cargo test --test generic_effects same_effect_at_two_types 2>&1 | grep -E "test result|FAILED"; cargo test --test effect_types concrete_state_use_names 2>&1 | grep -E "test result|FAILED"; cargo test --test effect_types effect_arg_only_type_var 2>&1 | grep -E "test result|FAILED|left|right"`
+Expected: all PASS. If `effect_arg_only_type_var_is_generalized` fails with **no `forall`** (or a leaked var), the `free_vars` descent into effect args (Task 1 Step 3) is missing or wrong — investigate and fix the descent; **do not weaken the assertion**. If a pin differs only in spacing/letter, pin the actual per its invariant.
 
 - [ ] **Step 4: The Slice-4c-2 exit gate.**
 
@@ -528,7 +547,7 @@ Expected: PASS. If `concrete_state_use_names_the_arg_in_the_row` fails, read the
 cargo fmt --all
 sh scripts/check.sh
 ```
-Expected: exit 0; full suite green. Confirm these rows pass: `unify_row_reconciles_matching_effect_args`, `unify_row_rejects_conflicting_effect_args_e0423`, `effect_decl_with_type_param_parses`, `generic_effect_declaration_is_accepted`, `one_generic_state_used_at_int_and_string`, `same_effect_at_two_types_in_one_scope_is_e0423`, `concrete_state_use_names_the_arg_in_the_row` — and every prior monomorphic effect/TCE/snapshot test **unchanged**.
+Expected: exit 0; full suite green. Confirm these rows pass: `unify_row_reconciles_matching_effect_args`, `unify_row_rejects_conflicting_effect_args_e0423`, `effect_decl_with_type_param_parses`, `generic_effect_declaration_is_accepted`, `one_generic_state_used_at_int_and_string`, `same_effect_at_two_types_in_one_scope_is_e0423`, `concrete_state_use_names_the_arg_in_the_row`, `effect_arg_only_type_var_is_generalized` — and every prior monomorphic effect/TCE/snapshot test **unchanged**.
 
 - [ ] **Step 5: Commit + push.**
 
