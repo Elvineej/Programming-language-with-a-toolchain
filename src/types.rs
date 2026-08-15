@@ -2181,11 +2181,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_op_type_is_e0404() {
+    fn unknown_op_type_is_e0432() {
+        // An unknown type name in an operation signature is the unified E0432
+        // "unknown type" (Slice 4c-2: operation signatures elaborate via the
+        // general type elaborator; the old E0404 "generic effect ops not supported
+        // yet" is obsolete now that parametric effects exist).
         let (m, _) =
             crate::parse::parse_module(&Session::new(), "effect E { fn op(x: Foo) -> Unit }\n");
         let (_s, d) = infer_schemes(&Session::new(), &m);
-        assert!(d.iter().any(|x| x.code == "E0404"), "expected E0404: {d:?}");
+        assert!(d.iter().any(|x| x.code == "E0432"), "expected E0432: {d:?}");
     }
 
     #[test]
