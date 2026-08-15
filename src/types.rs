@@ -136,6 +136,13 @@ pub struct Scheme {
 #[derive(Clone)]
 struct OpInfo {
     effect: String,
+    /// The effect's type-parameter variables (Slice 4c-2): `params`/`ret` are
+    /// expressed over these. Empty for a monomorphic effect (the arity-0 case).
+    /// A perform instantiates them fresh; a handle fixes them for its scope.
+    // Read by perform/handle instantiation in the next task; declared here with
+    // the parametric surface it belongs to.
+    #[allow(dead_code)]
+    effect_params: Vec<u32>,
     params: Vec<Ty>,
     ret: Ty,
 }
@@ -1368,42 +1375,6 @@ fn elaborate_adt_ty(
     }
 }
 
-/// Elaborate an operation-signature type annotation into a `Ty`. Slice 3b
-/// operations are monomorphic over base types; anything else (a generic type,
-/// a type variable, an unknown name) is `E0404` + `Ty::Error`.
-fn elaborate_ty(inf: &mut Infer, ann: &Spanned<TypeAnn>) -> Ty {
-    let t = &ann.node;
-    if !t.args.is_empty() {
-        inf.diags.push(
-            Diagnostic::error("E0404", "unsupported type in effect operation").with_label(
-                ann.span,
-                "generic effect operations are not supported yet (Slice 3b)",
-            ),
-        );
-        return Ty::Error;
-    }
-    match t.name.as_str() {
-        "Int" => Ty::int(),
-        "Float" => Ty::float(),
-        "Bool" => Ty::bool(),
-        "String" => Ty::str(),
-        "Unit" => Ty::unit(),
-        other => {
-            inf.diags.push(
-                Diagnostic::error(
-                    "E0404",
-                    format!("unknown type `{other}` in effect operation"),
-                )
-                .with_label(
-                    ann.span,
-                    "effect operations use base types: Int, Float, Bool, String, Unit",
-                ),
-            );
-            Ty::Error
-        }
-    }
-}
-
 fn free_vars(inf: &Infer, t: &Ty, acc: &mut Vec<u32>) {
     match inf.resolve(t) {
         Ty::Var(v) => {
@@ -1607,18 +1578,37 @@ pub fn infer_schemes(
     // call to an operation is recognised as a perform during inference.
     for d in &module.decls {
         if let Decl::Effect(e) = &d.node {
+            // The effect's type parameters -> fresh type variables, shared by all
+            // its operation signatures (Slice 4c-2). Empty for a monomorphic
+            // effect. Op signatures elaborate under this param-env (reusing the
+            // ADT elaborator), which is what lifts the old E0404 generic-op reject.
+            let param_vars: Vec<Ty> = e.params.iter().map(|_| inf.fresh()).collect();
+            let effect_params: Vec<u32> = param_vars
+                .iter()
+                .map(|v| match v {
+                    Ty::Var(id) => *id,
+                    _ => unreachable!(),
+                })
+                .collect();
+            let param_env: HashMap<String, Ty> = e
+                .params
+                .iter()
+                .cloned()
+                .zip(param_vars.iter().cloned())
+                .collect();
             for op in &e.ops {
                 let sig = &op.node;
                 let params: Vec<Ty> = sig
                     .param_tys
                     .iter()
-                    .map(|t| elaborate_ty(&mut inf, t))
+                    .map(|t| elaborate_adt_ty(&mut inf, t, &param_env, &known_types))
                     .collect();
-                let ret = elaborate_ty(&mut inf, &sig.ret);
+                let ret = elaborate_adt_ty(&mut inf, &sig.ret, &param_env, &known_types);
                 inf.ops.insert(
                     sig.name.clone(),
                     OpInfo {
                         effect: e.name.clone(),
+                        effect_params: effect_params.clone(),
                         params,
                         ret,
                     },
