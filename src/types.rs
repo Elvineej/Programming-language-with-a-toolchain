@@ -51,12 +51,22 @@ pub enum RowTail {
     ErrorRow,
 }
 
-/// An effect row: a set of effect labels (each with the span that introduced
-/// it, for provenance) and a tail. Labels are kept sorted (`BTreeMap`) so the
-/// printed order is stable and each label appears at most once (idempotent).
+/// One effect in a row: its type arguments (empty for a monomorphic effect —
+/// the arity-0 case that reproduces Slice-3 behavior) and the span that
+/// introduced it, for provenance.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectLabel {
+    pub args: Vec<Ty>,
+    pub span: Span,
+}
+
+/// An effect row: a set of effect labels (each with its type arguments and the
+/// span that introduced it) and a tail. Labels are kept sorted (`BTreeMap`) so
+/// the printed order is stable and each label appears at most once (idempotent);
+/// a label present at two type argumentations is reconciled by `unify_row`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectRow {
-    pub labels: BTreeMap<String, Span>,
+    pub labels: BTreeMap<String, EffectLabel>,
     pub tail: RowTail,
 }
 
@@ -181,8 +191,8 @@ impl Infer {
             let next = match &tail {
                 RowTail::Open(v) => match &self.row_subst[*v as usize] {
                     Some(bound) => {
-                        for (k, sp) in &bound.labels {
-                            labels.entry(k.clone()).or_insert(*sp);
+                        for (k, l) in &bound.labels {
+                            labels.entry(k.clone()).or_insert_with(|| l.clone());
                         }
                         Some(bound.tail.clone())
                     }
@@ -320,19 +330,34 @@ impl Infer {
         if r1.tail == RowTail::ErrorRow || r2.tail == RowTail::ErrorRow {
             return Ok(());
         }
-        // Matching labels are compatible (idempotent; monomorphic ops carry no
-        // payloads to reconcile in Slice 3b). Split out each side's extras.
-        let only1: Vec<(String, Span)> = r1
+        // A label present on BOTH sides must agree on its type arguments (Slice
+        // 4c-2, design B). Monomorphic effects have empty args, so this is a no-op
+        // — exactly the Slice-3 behavior. A conflicting instantiation is `E0423`.
+        let shared: Vec<(String, Vec<Ty>, Vec<Ty>)> = r1
+            .labels
+            .iter()
+            .filter_map(|(k, l1)| {
+                r2.labels
+                    .get(k)
+                    .map(|l2| (k.clone(), l1.args.clone(), l2.args.clone()))
+            })
+            .collect();
+        for (effect, a1, a2) in shared {
+            self.unify_effect_args(&effect, &a1, &a2, span);
+        }
+        // Split out each side's labels absent from the other (their args ride
+        // along, so growing an open tail preserves them).
+        let only1: Vec<(String, EffectLabel)> = r1
             .labels
             .iter()
             .filter(|(k, _)| !r2.labels.contains_key(*k))
-            .map(|(k, s)| (k.clone(), *s))
+            .map(|(k, l)| (k.clone(), l.clone()))
             .collect();
-        let only2: Vec<(String, Span)> = r2
+        let only2: Vec<(String, EffectLabel)> = r2
             .labels
             .iter()
             .filter(|(k, _)| !r1.labels.contains_key(*k))
-            .map(|(k, s)| (k.clone(), *s))
+            .map(|(k, l)| (k.clone(), l.clone()))
             .collect();
 
         let mut conflict = RowConflict::default();
@@ -353,7 +378,7 @@ impl Infer {
     /// cannot absorb non-empty `extra`, so those labels go into `bucket`.
     fn absorb(
         &mut self,
-        extra: &[(String, Span)],
+        extra: &[(String, EffectLabel)],
         tail: &RowTail,
         span: Span,
         bucket: &mut Vec<(String, Span)>,
@@ -364,7 +389,7 @@ impl Infer {
         match tail {
             RowTail::Open(v) => {
                 let fresh = self.fresh_row();
-                let labels: BTreeMap<String, Span> = extra.iter().cloned().collect();
+                let labels: BTreeMap<String, EffectLabel> = extra.iter().cloned().collect();
                 self.bind_row(
                     *v,
                     &EffectRow {
@@ -376,7 +401,7 @@ impl Infer {
                 RowTail::Open(fresh)
             }
             RowTail::Closed => {
-                bucket.extend(extra.iter().cloned());
+                bucket.extend(extra.iter().map(|(k, l)| (k.clone(), l.span)));
                 RowTail::Closed
             }
             RowTail::ErrorRow => RowTail::ErrorRow,
@@ -419,10 +444,16 @@ impl Infer {
 
     /// Force `op ∈ amb`: unify the ambient with `{op@span} | Open(fresh)`, which
     /// rewrites `amb`'s tail to expose `op`. Never fails when `amb` is open.
-    pub fn add_effect(&mut self, amb: RowVar, op: &str, span: Span) -> Result<(), RowConflict> {
+    pub fn add_effect(
+        &mut self,
+        amb: RowVar,
+        op: &str,
+        args: Vec<Ty>,
+        span: Span,
+    ) -> Result<(), RowConflict> {
         let fresh = self.fresh_row();
         let mut labels = BTreeMap::new();
-        labels.insert(op.to_string(), span);
+        labels.insert(op.to_string(), EffectLabel { args, span });
         let target = EffectRow {
             labels,
             tail: RowTail::Open(fresh),
@@ -430,13 +461,38 @@ impl Infer {
         self.unify_row(&EffectRow::open(amb), &target, span)
     }
 
+    /// Reconcile the type arguments of one effect present in two rows (design B).
+    /// A pair of concrete, unequal arguments is an effect used at conflicting
+    /// types — reported as `E0423` (the row-mismatch code) and poisoned so no
+    /// cascading `E0400` is also emitted.
+    fn unify_effect_args(&mut self, effect: &str, a1: &[Ty], a2: &[Ty], span: Span) {
+        for (x, y) in a1.iter().zip(a2) {
+            let rx = self.resolve(x);
+            let ry = self.resolve(y);
+            let both_concrete =
+                !matches!(rx, Ty::Var(_) | Ty::Error) && !matches!(ry, Ty::Var(_) | Ty::Error);
+            if both_concrete && rx != ry {
+                let (dx, dy) = (display_ty(self, &rx), display_ty(self, &ry));
+                self.diags.push(
+                    Diagnostic::error("E0423", "effect row mismatch")
+                        .with_label(span, "the same effect is used at different types here")
+                        .with_help(format!(
+                            "effect `{effect}` is used at conflicting type arguments: `{dx}` vs `{dy}`"
+                        )),
+                );
+                return;
+            }
+            self.unify(x, y, span);
+        }
+    }
+
     /// Pour a callee's latent row into the ambient: `amb ⊇ eff`. Adds each of
     /// `eff`'s labels (keeping `amb` open, so a *closed* callee row never forces
     /// the ambient closed), and relays a polymorphic tail into the ambient.
     pub fn add_row(&mut self, amb: RowVar, eff: &EffectRow, span: Span) -> Result<(), RowConflict> {
         let eff = self.resolve_row(eff);
-        for (label, sp) in &eff.labels {
-            self.add_effect(amb, label, *sp)?;
+        for (label, l) in &eff.labels {
+            self.add_effect(amb, label, l.args.clone(), l.span)?;
         }
         if let RowTail::Open(rho) = eff.tail {
             // The callee's polymorphic effects flow into the ambient.
@@ -593,11 +649,23 @@ fn write_ty(t: &Ty, names: &mut Names, out: &mut String) {
 /// emits a raw row-variable token — the effect-diagnostic no-`%r` discipline.
 fn write_row(row: &EffectRow, names: &mut Names, out: &mut String) {
     out.push('{');
-    for (i, label) in row.labels.keys().enumerate() {
+    for (i, (label, l)) in row.labels.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
         out.push_str(label);
+        // A parametric effect prints its arguments (`State(Int)`); a monomorphic
+        // effect has empty args and prints bare (`Log`), unchanged from Slice 3.
+        if !l.args.is_empty() {
+            out.push('(');
+            for (j, a) in l.args.iter().enumerate() {
+                if j > 0 {
+                    out.push_str(", ");
+                }
+                write_ty(a, names, out);
+            }
+            out.push(')');
+        }
     }
     match &row.tail {
         RowTail::Open(v) => {
@@ -928,7 +996,7 @@ impl Infer {
                 let want = Ty::Fn(vec![Ty::str()], EffectRow::pure(), Box::new(Ty::unit()));
                 let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::unit()));
                 self.unify(&want, &got, span);
-                let _ = self.add_effect(amb, "IO", span); // io.println performs {IO}
+                let _ = self.add_effect(amb, "IO", Vec::new(), span); // io.println performs {IO}
                 return Ty::unit();
             }
             return Ty::Error; // unknown builtin is E0201 from resolution
@@ -966,7 +1034,7 @@ impl Infer {
                 );
                 let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(op.ret.clone()));
                 self.unify(&want, &got, span);
-                let _ = self.add_effect(amb, &op.effect, span);
+                let _ = self.add_effect(amb, &op.effect, Vec::new(), span);
                 return op.ret;
             }
         }
@@ -999,7 +1067,7 @@ impl Infer {
         // `e` may perform E plus a polymorphic remainder.
         let amb_in = self.fresh_row();
         if let Some(e) = &effect {
-            let _ = self.add_effect(amb_in, e, span);
+            let _ = self.add_effect(amb_in, e, Vec::new(), span);
         }
         let body_ty = self.infer_expr(body, env, amb_in);
 
@@ -1178,7 +1246,7 @@ impl Infer {
                     .labels
                     .values()
                     .next()
-                    .copied()
+                    .map(|l| l.span)
                     .unwrap_or(Span::EMPTY);
                 self.diags.push(
                     Diagnostic::error(
@@ -1203,7 +1271,7 @@ impl Infer {
             .labels
             .iter()
             .filter(|(k, _)| !declared_names.contains(&k.as_str()))
-            .map(|(k, s)| (k.clone(), *s))
+            .map(|(k, l)| (k.clone(), l.span))
             .collect();
         if !extra.is_empty() {
             let span = extra[0].1;
@@ -1234,11 +1302,11 @@ impl Infer {
     /// unhandled — `E0420`, naming the perform site from provenance.
     fn check_main_discharge(&mut self, amb: RowVar) {
         let performed = self.resolve_row(&EffectRow::open(amb));
-        for (label, sp) in &performed.labels {
+        for (label, l) in &performed.labels {
             if label != "IO" {
                 self.diags.push(
                     Diagnostic::error("E0420", format!("effect `{label}` is never handled"))
-                        .with_label(*sp, format!("`{label}` is performed here"))
+                        .with_label(l.span, format!("`{label}` is performed here"))
                         .with_help(format!(
                             "`main` may perform only {{IO}}; handle it with `handle … with {{ {label}.op(..) -> … }}`"
                         )),
@@ -1344,11 +1412,17 @@ fn free_vars(inf: &Infer, t: &Ty, acc: &mut Vec<u32>) {
             }
         }
         Ty::Base(_) | Ty::Error => {}
-        Ty::Fn(ps, _row, r) => {
-            // Row variables are generalized separately (Task 4); this collects
-            // only free *type* variables.
+        Ty::Fn(ps, row, r) => {
+            // Row variables are generalized separately; this collects free *type*
+            // variables — including any that appear ONLY inside an effect argument
+            // (e.g. the `s` of `{State(s)}`), which must still be generalized.
             for p in &ps {
                 free_vars(inf, p, acc);
+            }
+            for l in row.labels.values() {
+                for a in &l.args {
+                    free_vars(inf, a, acc);
+                }
             }
             free_vars(inf, &r, acc);
         }
@@ -1392,6 +1466,12 @@ fn free_row_vars(inf: &Infer, t: &Ty, acc: &mut Vec<RowVar>) {
                     acc.push(v);
                 }
             }
+            // An effect argument may itself be a function type carrying a row.
+            for l in row.labels.values() {
+                for a in &l.args {
+                    free_row_vars(inf, a, acc);
+                }
+            }
             free_row_vars(inf, &r, acc);
         }
         Ty::Tuple(xs) => {
@@ -1431,12 +1511,22 @@ fn subst_vars(t: &Ty, m: &HashMap<u32, Ty>, rm: &HashMap<RowVar, RowVar>) -> Ty 
                 RowTail::Open(v) => RowTail::Open(*rm.get(v).unwrap_or(v)),
                 other => other.clone(),
             };
+            let labels = row
+                .labels
+                .iter()
+                .map(|(k, l)| {
+                    (
+                        k.clone(),
+                        EffectLabel {
+                            args: l.args.iter().map(|a| subst_vars(a, m, rm)).collect(),
+                            span: l.span,
+                        },
+                    )
+                })
+                .collect();
             Ty::Fn(
                 ps.iter().map(|p| subst_vars(p, m, rm)).collect(),
-                EffectRow {
-                    labels: row.labels.clone(),
-                    tail,
-                },
+                EffectRow { labels, tail },
                 Box::new(subst_vars(r, m, rm)),
             )
         }
@@ -1952,7 +2042,13 @@ mod tests {
         let mut inf = Infer::new();
         let tail = inf.fresh_row();
         let mut labels = std::collections::BTreeMap::new();
-        labels.insert("Log".to_string(), Span::EMPTY);
+        labels.insert(
+            "Log".to_string(),
+            EffectLabel {
+                args: Vec::new(),
+                span: Span::EMPTY,
+            },
+        );
         let row = EffectRow {
             labels,
             tail: RowTail::Open(tail),
@@ -1998,7 +2094,13 @@ mod tests {
     fn row(labels: &[&str], tail: RowTail) -> EffectRow {
         let mut m = std::collections::BTreeMap::new();
         for l in labels {
-            m.insert((*l).to_string(), Span::EMPTY);
+            m.insert(
+                (*l).to_string(),
+                EffectLabel {
+                    args: Vec::new(),
+                    span: Span::EMPTY,
+                },
+            );
         }
         EffectRow { labels: m, tail }
     }
@@ -2007,11 +2109,52 @@ mod tests {
     fn add_effect_extends_open_row() {
         let mut inf = Infer::new();
         let amb = inf.fresh_row();
-        assert!(inf.add_effect(amb, "Log", Span::EMPTY).is_ok());
+        assert!(inf.add_effect(amb, "Log", Vec::new(), Span::EMPTY).is_ok());
         let r = inf.resolve_row(&EffectRow::open(amb));
         assert!(r.labels.contains_key("Log"), "amb should now contain Log");
         assert!(matches!(r.tail, RowTail::Open(_)), "still open/polymorphic");
         assert!(inf.diags.is_empty());
+    }
+
+    // ---- Slice 4c-2: effect labels carry type arguments ----
+
+    fn state_row(arg: Ty) -> EffectRow {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            "State".to_string(),
+            EffectLabel {
+                args: vec![arg],
+                span: Span::EMPTY,
+            },
+        );
+        EffectRow {
+            labels: m,
+            tail: RowTail::Closed,
+        }
+    }
+
+    #[test]
+    fn unify_row_reconciles_matching_effect_args() {
+        // {State(Int)} unifies with {State(Int)} -> ok, no diagnostic.
+        let mut inf = Infer::new();
+        let a = state_row(Ty::int());
+        let b = state_row(Ty::int());
+        assert!(inf.unify_row(&a, &b, Span::EMPTY).is_ok());
+        assert!(inf.diags.is_empty(), "matching args must not diagnose");
+    }
+
+    #[test]
+    fn unify_row_rejects_conflicting_effect_args_e0423() {
+        // {State(Int)} vs {State(String)} -> E0423 (same effect, different type).
+        let mut inf = Infer::new();
+        let a = state_row(Ty::int());
+        let b = state_row(Ty::str());
+        let _ = inf.unify_row(&a, &b, Span::EMPTY);
+        assert!(
+            inf.diags.iter().any(|d| d.code == "E0423"),
+            "State(Int) vs State(String) must be E0423: {:?}",
+            inf.diags
+        );
     }
 
     #[test]
