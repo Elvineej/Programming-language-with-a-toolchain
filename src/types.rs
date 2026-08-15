@@ -139,9 +139,6 @@ struct OpInfo {
     /// The effect's type-parameter variables (Slice 4c-2): `params`/`ret` are
     /// expressed over these. Empty for a monomorphic effect (the arity-0 case).
     /// A perform instantiates them fresh; a handle fixes them for its scope.
-    // Read by perform/handle instantiation in the next task; declared here with
-    // the parametric surface it belongs to.
-    #[allow(dead_code)]
     effect_params: Vec<u32>,
     params: Vec<Ty>,
     ret: Ty,
@@ -466,6 +463,27 @@ impl Infer {
             tail: RowTail::Open(fresh),
         };
         self.unify_row(&EffectRow::open(amb), &target, span)
+    }
+
+    /// Instantiate an operation's effect type parameters with fresh type
+    /// variables (Slice 4c-2): returns the effect's fresh type arguments (for the
+    /// row), the substituted operation parameters, and the substituted result. A
+    /// monomorphic op returns empty args and its params/ret unchanged.
+    fn instantiate_op(&mut self, op: &OpInfo) -> (Vec<Ty>, Vec<Ty>, Ty) {
+        if op.effect_params.is_empty() {
+            return (Vec::new(), op.params.clone(), op.ret.clone());
+        }
+        let mut m: HashMap<u32, Ty> = HashMap::new();
+        let mut args = Vec::with_capacity(op.effect_params.len());
+        for &p in &op.effect_params {
+            let fresh = self.fresh();
+            m.insert(p, fresh.clone());
+            args.push(fresh);
+        }
+        let rm = HashMap::new();
+        let params = op.params.iter().map(|t| subst_vars(t, &m, &rm)).collect();
+        let ret = subst_vars(&op.ret, &m, &rm);
+        (args, params, ret)
     }
 
     /// Reconcile the type arguments of one effect present in two rows (design B).
@@ -1033,16 +1051,16 @@ impl Infer {
         // and yields the operation's declared result type.
         if let Expr::Var(name) = &callee.node {
             if let Some(op) = self.ops.get(name).cloned() {
+                // Instantiate the effect's type params fresh (Slice 4c-2); the
+                // fresh args ride in the row, so a second perform of the same
+                // effect reconciles against them via `unify_row`.
+                let (eff_args, op_params, op_ret) = self.instantiate_op(&op);
                 let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
-                let want = Ty::Fn(
-                    op.params.clone(),
-                    EffectRow::pure(),
-                    Box::new(op.ret.clone()),
-                );
-                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(op.ret.clone()));
+                let want = Ty::Fn(op_params, EffectRow::pure(), Box::new(op_ret.clone()));
+                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(op_ret.clone()));
                 self.unify(&want, &got, span);
-                let _ = self.add_effect(amb, &op.effect, Vec::new(), span);
-                return op.ret;
+                let _ = self.add_effect(amb, &op.effect, eff_args, span);
+                return op_ret;
             }
         }
         // Ordinary function call: unify the arrow's param/result types, then pour
@@ -1071,10 +1089,24 @@ impl Infer {
         amb: RowVar,
     ) -> Ty {
         let effect = self.handler_effect(handler);
+        // One instantiation of the handled effect's type params (Slice 4c-2),
+        // shared by the seeded ambient AND every clause — so the body's performs
+        // (which unify against the seed via the row) and the clauses agree on the
+        // effect's type arguments. Empty for a monomorphic effect.
+        let effect_param_ids: Vec<u32> = match &effect {
+            Some(e) => self
+                .ops
+                .values()
+                .find(|o| &o.effect == e)
+                .map(|o| o.effect_params.clone())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let eff_args: Vec<Ty> = effect_param_ids.iter().map(|_| self.fresh()).collect();
         // `e` may perform E plus a polymorphic remainder.
         let amb_in = self.fresh_row();
         if let Some(e) = &effect {
-            let _ = self.add_effect(amb_in, e, Vec::new(), span);
+            let _ = self.add_effect(amb_in, e, eff_args.clone(), span);
         }
         let body_ty = self.infer_expr(body, env, amb_in);
 
@@ -1082,8 +1114,26 @@ impl Infer {
         let result = self.fresh();
         for c in &handler.clauses {
             let clause = &c.node;
-            let (params, b) = match self.ops.get(&clause.op) {
-                Some(op) => (op.params.clone(), op.ret.clone()),
+            let (params, b) = match self.ops.get(&clause.op).cloned() {
+                Some(op) => {
+                    // Substitute the effect's type params with this handler's
+                    // shared instantiation, so clause params/`resume` agree with
+                    // the body's performs on the effect's type arguments.
+                    let m: HashMap<u32, Ty> = op
+                        .effect_params
+                        .iter()
+                        .cloned()
+                        .zip(eff_args.iter().cloned())
+                        .collect();
+                    let rm = HashMap::new();
+                    (
+                        op.params
+                            .iter()
+                            .map(|t| subst_vars(t, &m, &rm))
+                            .collect::<Vec<_>>(),
+                        subst_vars(&op.ret, &m, &rm),
+                    )
+                }
                 None => (Vec::new(), Ty::Error),
             };
             env.push();
