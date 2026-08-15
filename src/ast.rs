@@ -74,6 +74,9 @@ pub struct OpSig {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectDecl {
     pub name: String,
+    /// Type parameters (Slice 4c-2): `effect State(s)` has `params = ["s"]`; a
+    /// monomorphic effect has none. Operation signatures may reference them.
+    pub params: Vec<String>,
     pub ops: Vec<Spanned<OpSig>>,
 }
 
@@ -562,6 +565,7 @@ mod tests {
         // effect Log { fn log(msg: String) -> Unit }
         let eff = Decl::Effect(EffectDecl {
             name: "Log".into(),
+            params: vec![],
             ops: vec![sp(OpSig {
                 name: "log".into(),
                 params: vec![sp(Param { name: "msg".into() })],

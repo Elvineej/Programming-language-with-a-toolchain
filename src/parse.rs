@@ -299,6 +299,31 @@ impl<'a> Parser<'a> {
                 return None;
             }
         };
+        // Optional type parameters: `effect State(s)` (mirrors `type_decl`).
+        let mut params = Vec::new();
+        if self.eat(&TokenKind::LParen) {
+            if self.peek() != Some(&TokenKind::RParen) {
+                loop {
+                    match self.peek()?.clone() {
+                        TokenKind::Lower(p) => {
+                            self.bump();
+                            params.push(p);
+                        }
+                        _ => {
+                            self.error(self.peek_span(), "expected type parameter (lowercase)");
+                            return None;
+                        }
+                    }
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            if !self.eat(&TokenKind::RParen) {
+                self.error(self.peek_span(), "expected `)`");
+                return None;
+            }
+        }
         if !self.eat(&TokenKind::LBrace) {
             self.error(self.peek_span(), "expected `{`");
             return None;
@@ -311,7 +336,7 @@ impl<'a> Parser<'a> {
         let end = self.peek_span();
         self.eat(&TokenKind::RBrace);
         Some(spanned(
-            Decl::Effect(EffectDecl { name, ops }),
+            Decl::Effect(EffectDecl { name, params, ops }),
             start.merge(end),
         ))
     }
@@ -1147,6 +1172,18 @@ mod tests {
             p("map(xs, fn(n) { n * 2 })"),
             "(call map xs (fn (n) (block (* n 2))))"
         );
+    }
+
+    #[test]
+    fn effect_decl_with_type_param_parses() {
+        let src = "effect State(s) { fn get() -> s  fn set(v: s) -> Unit }\n\
+                   pub fn main() { io.println(\"x\") }\n";
+        let (m, d) = parse_module(&Session::new(), src);
+        assert!(d.is_empty(), "parse: {d:?}");
+        let Decl::Effect(e) = &m.decls[0].node else {
+            panic!("expected effect")
+        };
+        assert_eq!(e.params, vec!["s".to_string()]);
     }
 
     #[test]
