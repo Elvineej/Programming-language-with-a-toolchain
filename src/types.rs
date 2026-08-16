@@ -156,6 +156,9 @@ pub struct Infer {
     /// Constructor name -> arity. An n-ary constructor used unapplied or
     /// partially applied is `E0433` (unapplied constructors need 4b's closures).
     ctor_arity: HashMap<String, usize>,
+    /// Effect name -> whether it is declared `multi` (Slice 4d-1). Read by the
+    /// `with multi` conformance rule; a declaration fact, NOT a row attribute.
+    effect_multi: HashMap<String, bool>,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -167,6 +170,7 @@ impl Infer {
             ops: HashMap::new(),
             resume_stack: Vec::new(),
             ctor_arity: HashMap::new(),
+            effect_multi: HashMap::new(),
             diags: Vec::new(),
         }
     }
@@ -1097,6 +1101,25 @@ impl Infer {
         amb: RowVar,
     ) -> Ty {
         let effect = self.handler_effect(handler);
+        // Conformance (Slice 4d-1): `with multi` is legal only over a `multi`-
+        // declared effect. Multi-resuming a one-shot effect is E0427. `is_multi`
+        // is looked up by name — no row involvement.
+        if handler.multi {
+            if let Some(e) = &effect {
+                if !self.effect_multi.get(e).copied().unwrap_or(false) {
+                    self.diags.push(
+                        Diagnostic::error(
+                            "E0427",
+                            "a one-shot effect cannot be handled with `multi`".to_string(),
+                        )
+                        .with_label(span, format!("`{e}` is handled `with multi` here"))
+                        .with_help(format!(
+                            "effect `{e}` is one-shot (its continuation resumes at most once); declare it `effect multi {e} {{ … }}` to allow multi-shot resumption, or drop `multi`"
+                        )),
+                    );
+                }
+            }
+        }
         // One instantiation of the handled effect's type params (Slice 4c-2),
         // shared by the seeded ambient AND every clause — so the body's performs
         // (which unify against the seed via the row) and the clauses agree on the
@@ -1636,6 +1659,9 @@ pub fn infer_schemes(
     // call to an operation is recognised as a perform during inference.
     for d in &module.decls {
         if let Decl::Effect(e) = &d.node {
+            // Record the effect's resumption discipline for the `with multi`
+            // conformance rule (Slice 4d-1) — a declaration fact, read by name.
+            inf.effect_multi.insert(e.name.clone(), e.is_multi);
             // The effect's type parameters -> fresh type variables, shared by all
             // its operation signatures (Slice 4c-2). Empty for a monomorphic
             // effect. Op signatures elaborate under this param-env (reusing the

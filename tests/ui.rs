@@ -106,6 +106,11 @@ fn partial_ctor() {
 }
 
 #[test]
+fn multi_on_oneshot() {
+    check_fixture("multi_on_oneshot.elya");
+}
+
+#[test]
 fn nonexhaustive_list() {
     check_fixture("nonexhaustive_list.elya");
 }

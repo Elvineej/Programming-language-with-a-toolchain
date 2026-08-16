@@ -1,0 +1,8 @@
+effect Ask {
+  fn ask() -> String
+}
+fn greet() { "hi " <> ask() }
+pub fn main() {
+  io.println(handle greet() with multi { Ask.ask() -> resume("ada") })
+}
+//~ ERROR[E0427] one-shot

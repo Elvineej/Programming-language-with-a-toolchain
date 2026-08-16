@@ -64,7 +64,7 @@ fn basic_handler_type_checks() {
 
 #[test]
 fn multi_handler_type_checks() {
-    let src = "effect Flip {\n\
+    let src = "effect multi Flip {\n\
                \x20 fn flip() -> Bool\n\
                }\n\
                fn prog() {\n\
