@@ -289,6 +289,8 @@ impl<'a> Parser<'a> {
     fn effect_decl(&mut self) -> Option<Spanned<Decl>> {
         let start = self.peek_span();
         self.bump(); // effect
+                     // Optional resumption modifier: `effect multi Name` (reuses `KwMulti`).
+        let is_multi = self.eat(&TokenKind::KwMulti);
         let name = match self.peek()?.clone() {
             TokenKind::Upper(n) => {
                 self.bump();
@@ -336,7 +338,12 @@ impl<'a> Parser<'a> {
         let end = self.peek_span();
         self.eat(&TokenKind::RBrace);
         Some(spanned(
-            Decl::Effect(EffectDecl { name, params, ops }),
+            Decl::Effect(EffectDecl {
+                name,
+                params,
+                is_multi,
+                ops,
+            }),
             start.merge(end),
         ))
     }
@@ -1172,6 +1179,23 @@ mod tests {
             p("map(xs, fn(n) { n * 2 })"),
             "(call map xs (fn (n) (block (* n 2))))"
         );
+    }
+
+    #[test]
+    fn effect_multi_modifier_parses() {
+        let src = "effect multi Flip { fn flip() -> Bool }\n\
+                   effect Exn { fn fail() -> Unit }\n\
+                   pub fn main() { io.println(\"x\") }\n";
+        let (m, d) = parse_module(&Session::new(), src);
+        assert!(d.is_empty(), "parse: {d:?}");
+        let Decl::Effect(flip) = &m.decls[0].node else {
+            panic!("expected effect")
+        };
+        let Decl::Effect(exn) = &m.decls[1].node else {
+            panic!("expected effect")
+        };
+        assert!(flip.is_multi, "effect multi Flip -> is_multi");
+        assert!(!exn.is_multi, "unmarked effect -> one-shot");
     }
 
     #[test]

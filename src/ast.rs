@@ -77,6 +77,10 @@ pub struct EffectDecl {
     /// Type parameters (Slice 4c-2): `effect State(s)` has `params = ["s"]`; a
     /// monomorphic effect has none. Operation signatures may reference them.
     pub params: Vec<String>,
+    /// Resumption discipline (Slice 4d-1): `effect multi Name` may be resumed
+    /// more than once; unmarked is one-shot (the default). Looked up by the
+    /// `with multi` conformance rule and (later) the affine capture check.
+    pub is_multi: bool,
     pub ops: Vec<Spanned<OpSig>>,
 }
 
@@ -566,6 +570,7 @@ mod tests {
         let eff = Decl::Effect(EffectDecl {
             name: "Log".into(),
             params: vec![],
+            is_multi: false,
             ops: vec![sp(OpSig {
                 name: "log".into(),
                 params: vec![sp(Param { name: "msg".into() })],
