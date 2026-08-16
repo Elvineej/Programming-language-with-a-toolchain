@@ -193,7 +193,7 @@ fn infer_diags(src: &str) -> Vec<Diagnostic> {
 }
 
 // A `with multi` handler whose body performs {IO} (io.println after the flip).
-const MULTI_OVER_IO: &str = "effect Flip { fn flip() -> Bool }\n\
+const MULTI_OVER_IO: &str = "effect multi Flip { fn flip() -> Bool }\n\
     fn noisy() { let x = flip()  let _ = io.println(\"tick\")  x }\n\
     pub fn main() {\n\
       let _ = handle noisy() with multi { Flip.flip() -> resume(True) }\n\
@@ -236,7 +236,7 @@ fn multi_over_io_still_compiles_and_runs() {
 // A closure that performs {Flip} + {IO}, relayed through `run` and handled by a
 // `multi` handler: the observable IO is duplicated across resumes -> E0426. The
 // same closure under a one-shot handler must NOT warn (4b-2 §5).
-const MULTI_OVER_CLOSURE_IO: &str = "effect Flip { fn flip() -> Bool }\n\
+const MULTI_OVER_CLOSURE_IO: &str = "effect multi Flip { fn flip() -> Bool }\n\
     fn run(f) { f() }\n\
     pub fn main() {\n\
       let _ = handle run(fn() { let x = flip()  let _ = io.println(\"tick\")  x }) with multi { Flip.flip() -> resume(True) }\n\
@@ -269,6 +269,53 @@ fn one_shot_over_closure_io_does_not_warn() {
     );
 }
 
+// ---- Slice 4d-1: `with multi` conformance rule (E0427) ----
+
+#[test]
+fn with_multi_over_oneshot_effect_is_e0427() {
+    // A `with multi` handler over a one-shot (default) effect is E0427.
+    let src = "effect Ask { fn ask() -> String }\n\
+               fn greet() { \"hi \" <> ask() }\n\
+               pub fn main() {\n\
+                 io.println(handle greet() with multi { Ask.ask() -> resume(\"ada\") })\n\
+               }\n";
+    let d = infer_diags(src);
+    assert!(
+        d.iter().any(|x| x.code == "E0427"),
+        "with multi over a one-shot effect must be E0427: {d:?}"
+    );
+}
+
+#[test]
+fn with_multi_over_multi_effect_is_ok() {
+    // Declaring the effect `multi` makes the same handler legal.
+    let src = "effect multi Ask { fn ask() -> String }\n\
+               fn greet() { \"hi \" <> ask() }\n\
+               pub fn main() {\n\
+                 io.println(handle greet() with multi { Ask.ask() -> resume(\"ada\") })\n\
+               }\n";
+    let d = infer_diags(src);
+    assert!(
+        !d.iter().any(|x| x.code == "E0427"),
+        "with multi over a multi effect must be accepted: {d:?}"
+    );
+}
+
+#[test]
+fn plain_handler_over_oneshot_effect_is_ok() {
+    // The common case is unchanged: a plain handler over a one-shot effect.
+    let src = "effect Ask { fn ask() -> String }\n\
+               fn greet() { \"hi \" <> ask() }\n\
+               pub fn main() {\n\
+                 io.println(handle greet() with { Ask.ask() -> resume(\"ada\") })\n\
+               }\n";
+    let d = infer_diags(src);
+    assert!(
+        !d.iter().any(|x| x.code == "E0427"),
+        "a plain handler must never be E0427: {d:?}"
+    );
+}
+
 #[test]
 fn severity_partition_is_locked() {
     // Lock the Error/Warning partition against regression: a warning-only program
@@ -295,7 +342,7 @@ fn one_shot_over_io_does_not_warn() {
 #[test]
 fn multi_pure_body_does_not_warn() {
     // choose() performs {Flip} but no observable IO — no duplication, no E0426.
-    let src = "effect Flip { fn flip() -> Bool }\n\
+    let src = "effect multi Flip { fn flip() -> Bool }\n\
         fn choose() { if flip() { \"a\" } else { \"b\" } }\n\
         fn prog() { handle choose() with multi { Flip.flip() -> resume(True) <> resume(False) } }\n";
     assert!(
