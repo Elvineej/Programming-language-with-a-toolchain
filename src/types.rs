@@ -6,7 +6,7 @@ use crate::ast::{
 use crate::diag::Diagnostic;
 use crate::span::{Span, Spanned};
 use crate::Session;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TyCon {
@@ -159,6 +159,11 @@ pub struct Infer {
     /// Effect name -> whether it is declared `multi` (Slice 4d-1). Read by the
     /// `with multi` conformance rule; a declaration fact, NOT a row attribute.
     effect_multi: HashMap<String, bool>,
+    /// Names of `linear`-declared types (Slice 4d-2) — their values are affine.
+    linear_types: HashSet<String>,
+    /// Spans of bindings whose inferred type is linear (affine binding sites),
+    /// exposed to the `affine::check` pass. The one bounded reach for 4d-2.
+    affine_sites: HashSet<Span>,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -171,8 +176,16 @@ impl Infer {
             resume_stack: Vec::new(),
             ctor_arity: HashMap::new(),
             effect_multi: HashMap::new(),
+            linear_types: HashSet::new(),
+            affine_sites: HashSet::new(),
             diags: Vec::new(),
         }
+    }
+
+    /// Whether `t`'s head is a `linear`-declared type (Slice 4d-2): its values
+    /// are affine. Resolves first so a bound variable is seen through.
+    fn ty_is_linear(&self, t: &Ty) -> bool {
+        matches!(self.resolve(t), Ty::Con(n, _) if self.linear_types.contains(&n))
     }
 
     pub fn fresh(&mut self) -> Ty {
@@ -797,6 +810,12 @@ impl Infer {
             match &st.node {
                 Stmt::Let { name, value } => {
                     let t = self.infer_expr(value, env, amb);
+                    // Record an affine binding site (Slice 4d-2): a `let` whose
+                    // value has a `linear`-declared type. Keyed by the value span,
+                    // which the affine pass reads to recognise the binding.
+                    if self.ty_is_linear(&t) {
+                        self.affine_sites.insert(value.span);
+                    }
                     // Value restriction: generalize only syntactic values (spec
                     // 4b-1 §2.4). A non-value binding keeps its monotype — sound in
                     // the presence of first-class functions/continuations.
@@ -1596,14 +1615,36 @@ pub fn infer(session: &Session, module: &Module) -> Vec<Diagnostic> {
     diags
 }
 
-/// Type every top-level function, processing mutually-recursive groups (SCCs of
-/// the call graph) in dependency order so each group is generalized before later
-/// groups use it — giving proper let-polymorphism across the top level.
 pub fn infer_schemes(
     _session: &Session,
     module: &Module,
 ) -> (Vec<(String, String)>, Vec<Diagnostic>) {
+    let (schemes, diags, _sites) = infer_all(module);
+    (schemes, diags)
+}
+
+/// Inference plus the affine binding-site set (Slice 4d-2): which let-bindings /
+/// params have a `linear`-declared type. The one bounded reach the `affine::check`
+/// pass consumes; the affine *logic* lives entirely in that pass.
+pub fn infer_with_sites(_session: &Session, module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
+    let (_schemes, diags, sites) = infer_all(module);
+    (diags, sites)
+}
+
+/// Type every top-level function, processing mutually-recursive groups (SCCs of
+/// the call graph) in dependency order so each group is generalized before later
+/// groups use it — giving proper let-polymorphism across the top level.
+fn infer_all(module: &Module) -> (Vec<(String, String)>, Vec<Diagnostic>, HashSet<Span>) {
     let mut inf = Infer::new();
+    // Names of `linear`-declared types — set before inference so `ty_is_linear`
+    // sees them while recording affine binding sites (Slice 4d-2).
+    for d in &module.decls {
+        if let Decl::Type(t) = &d.node {
+            if t.is_linear {
+                inf.linear_types.insert(t.name.clone());
+            }
+        }
+    }
     let mut env = TyEnv::new();
 
     // Register ADT constructors as polymorphic schemes (two-pass: type-name
@@ -1801,7 +1842,7 @@ pub fn infer_schemes(
         }
     }
 
-    (schemes_out, inf.diags)
+    (schemes_out, inf.diags, inf.affine_sites)
 }
 
 fn collect_refs(b: &Block, acc: &mut Vec<String>) {
@@ -1989,6 +2030,27 @@ mod tests {
         let amb = inf.fresh_row();
         let t = inf.infer_expr(&e, &mut env, amb);
         (display_ty(&inf, &t), inf.diags.len())
+    }
+
+    #[test]
+    fn infer_flags_linear_let_binding_as_affine() {
+        // Slice 4d-2: `infer_with_sites` records exactly the `let t = Tok`
+        // binding as affine (its type is a `linear` type), not `let n = 1`.
+        let src = "linear type Tok { Tok }\n\
+                   pub fn main() {\n\
+                     let t = Tok\n\
+                     let n = 1\n\
+                     io.println(\"x\")\n\
+                   }\n";
+        let (m, pd) = crate::parse::parse_module(&Session::new(), src);
+        assert!(pd.is_empty(), "parse: {pd:?}");
+        let (d, sites) = infer_with_sites(&Session::new(), &m);
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(
+            sites.len(),
+            1,
+            "exactly the `let t = Tok` binding is affine, not `let n = 1`"
+        );
     }
 
     #[test]

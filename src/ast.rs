@@ -27,6 +27,9 @@ pub enum Decl {
 pub struct TypeDecl {
     pub name: String,
     pub params: Vec<String>,
+    /// Resource discipline (Slice 4d-2): `linear type File` makes the type's
+    /// values affine (use at most once; never captured across a multi-perform).
+    pub is_linear: bool,
     pub variants: Vec<Spanned<VariantDecl>>,
 }
 
@@ -484,6 +487,7 @@ mod tests {
         let ty = Decl::Type(TypeDecl {
             name: "Opt".into(),
             params: vec!["a".into()],
+            is_linear: false,
             variants: vec![
                 sp(VariantDecl {
                     name: "None".into(),
