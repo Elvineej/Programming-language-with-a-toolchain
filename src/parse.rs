@@ -263,7 +263,7 @@ impl<'a> Parser<'a> {
                         self.recover_to_decl();
                     }
                 }
-                Some(TokenKind::KwType) => {
+                Some(TokenKind::KwType) | Some(TokenKind::KwLinear) => {
                     if let Some(t) = self.type_decl() {
                         decls.push(t);
                     } else {
@@ -348,10 +348,20 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    // `type NAME(p, …) { Variant, Variant(T, …), … }`
+    // `[linear] type NAME(p, …) { Variant, Variant(T, …), … }`
     fn type_decl(&mut self) -> Option<Spanned<Decl>> {
         let start = self.peek_span();
-        self.bump(); // type
+        // Optional `linear` modifier (Slice 4d-2). Reached via either the `KwType`
+        // or the `KwLinear` dispatch arm in `module()`.
+        let is_linear = self.eat(&TokenKind::KwLinear);
+        if is_linear {
+            if !self.eat(&TokenKind::KwType) {
+                self.error(self.peek_span(), "expected `type` after `linear`");
+                return None;
+            }
+        } else {
+            self.bump(); // type
+        }
         let name = match self.peek()?.clone() {
             TokenKind::Upper(n) => {
                 self.bump();
@@ -408,6 +418,7 @@ impl<'a> Parser<'a> {
             Decl::Type(TypeDecl {
                 name,
                 params,
+                is_linear,
                 variants,
             }),
             start.merge(end),
