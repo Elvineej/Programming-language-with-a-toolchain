@@ -15,8 +15,6 @@ use std::collections::{HashMap, HashSet};
 /// crossed-a-multi-perform).
 struct Ctx<'a> {
     affine_sites: &'a HashSet<Span>,
-    // Read by the E0429 (multi-shot capture) path, added in Task 3.
-    #[allow(dead_code)]
     multi_ops: &'a HashSet<String>,
     live: HashMap<String, (u32, bool)>,
     out: Vec<Diagnostic>,
@@ -74,9 +72,11 @@ impl<'a> Ctx<'a> {
     fn walk_expr(&mut self, e: &Spanned<Expr>) {
         match &e.node {
             Expr::Var(name) => {
-                if let Some((uses, _crossed)) = self.live.get_mut(name) {
+                if let Some((uses, crossed)) = self.live.get_mut(name) {
                     *uses += 1;
-                    if *uses == 2 {
+                    let count = *uses;
+                    let crossed = *crossed;
+                    if count == 2 {
                         self.out.push(
                             Diagnostic::error(
                                 "E0428",
@@ -88,13 +88,38 @@ impl<'a> Ctx<'a> {
                             )),
                         );
                     }
-                    // E0429 (multi-shot capture) is handled in Task 3.
+                    if crossed {
+                        self.out.push(
+                            Diagnostic::error(
+                                "E0429",
+                                format!(
+                                    "affine value `{name}` may be captured by a multi-shot handler"
+                                ),
+                            )
+                            .with_label(e.span, "used after a multi-shot perform")
+                            .with_help(format!(
+                                "`{name}` is used after a perform of a `multi` effect; a multi-shot resume would use it more than once — consume it before the perform"
+                            )),
+                        );
+                    }
                 }
             }
             Expr::Call { callee, args } => {
                 self.walk_expr(callee);
                 for a in args.iter() {
                     self.walk_expr(a);
+                }
+                // A perform of a `multi` effect captures the continuation and may
+                // re-run it, so every affine value still live at this point could
+                // be used again by a later resume. Mark them crossed; a subsequent
+                // use is then E0429. (Keys on `multi`-ness, not on any perform —
+                // a one-shot op is absent from `multi_ops`, so nothing is marked.)
+                if let Expr::Var(op) = &callee.node {
+                    if self.multi_ops.contains(op) {
+                        for v in self.live.values_mut() {
+                            v.1 = true;
+                        }
+                    }
                 }
             }
             Expr::Binary { lhs, rhs, .. } => {

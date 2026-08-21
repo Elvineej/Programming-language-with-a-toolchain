@@ -116,6 +116,11 @@ fn affine_double_use() {
 }
 
 #[test]
+fn affine_multi_capture() {
+    check_fixture("affine_multi_capture.elya");
+}
+
+#[test]
 fn nonexhaustive_list() {
     check_fixture("nonexhaustive_list.elya");
 }
