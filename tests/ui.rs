@@ -111,6 +111,11 @@ fn multi_on_oneshot() {
 }
 
 #[test]
+fn affine_double_use() {
+    check_fixture("affine_double_use.elya");
+}
+
+#[test]
 fn nonexhaustive_list() {
     check_fixture("nonexhaustive_list.elya");
 }

@@ -1,0 +1,8 @@
+linear type Tok { Tok }
+fn use1(t) { match t { Tok -> "ok" } }
+pub fn main() {
+  let t = Tok
+  let _ = use1(t)
+  io.println(use1(t))
+}
+//~ ERROR[E0428] more than once

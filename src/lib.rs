@@ -1,5 +1,6 @@
 //! The Elya compiler (Slice 1: tree-walking interpreter).
 
+pub mod affine;
 pub mod ast;
 pub mod diag;
 pub mod eval;
@@ -30,10 +31,12 @@ fn front_end(session: &Session, text: &str) -> (ast::Module, Vec<Diagnostic>) {
     let (module, mut diags) = parse::parse_module(session, text);
     diags.extend(resolve::check(session, &module));
     if diags.is_empty() {
-        diags.extend(types::infer(session, &module));
-    }
-    if !diags.iter().any(|d| d.severity == Severity::Error) {
-        diags.extend(exhaust::check(&module));
+        let (idiags, affine_sites) = types::infer_with_sites(session, &module);
+        diags.extend(idiags);
+        if !diags.iter().any(|d| d.severity == Severity::Error) {
+            diags.extend(exhaust::check(&module));
+            diags.extend(affine::check(&module, &affine_sites));
+        }
     }
     (module, diags)
 }
