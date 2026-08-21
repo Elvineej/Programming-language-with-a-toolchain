@@ -1,6 +1,6 @@
 //! Byte spans, spanned nodes, and offset→line/col lookup.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Span {
     pub start: u32,
     pub end: u32,

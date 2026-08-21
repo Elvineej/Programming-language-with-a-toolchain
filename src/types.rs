@@ -164,6 +164,11 @@ pub struct Infer {
     /// Spans of bindings whose inferred type is linear (affine binding sites),
     /// exposed to the `affine::check` pass. The one bounded reach for 4d-2.
     affine_sites: HashSet<Span>,
+    /// Every expression node's inferred type, zonked at the end of inference
+    /// (Slice 5a-1). The Core IR arc's feeder; recorded unconditionally, exposed
+    /// only through `infer_with_types`. Keyed by span (Shape A; the span-audit
+    /// gate proves the key is unique).
+    node_types: HashMap<Span, Ty>,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -178,6 +183,7 @@ impl Infer {
             effect_multi: HashMap::new(),
             linear_types: HashSet::new(),
             affine_sites: HashSet::new(),
+            node_types: HashMap::new(),
             diags: Vec::new(),
         }
     }
@@ -843,7 +849,18 @@ impl Infer {
         result
     }
 
+    /// Type an expression and record its (pre-zonk) type against its span. This
+    /// thin wrapper is the single record point (Slice 5a-1): every path — the
+    /// recursive calls inside `infer_expr_inner`, `infer_block`, `infer_call`,
+    /// `infer_handle` — routes through here, so no node escapes recording. The
+    /// final zonk pass runs once in `infer_all`, not at record-time.
     pub fn infer_expr(&mut self, e: &Spanned<Expr>, env: &mut TyEnv, amb: RowVar) -> Ty {
+        let ty = self.infer_expr_inner(e, env, amb);
+        self.node_types.insert(e.span, ty.clone());
+        ty
+    }
+
+    fn infer_expr_inner(&mut self, e: &Spanned<Expr>, env: &mut TyEnv, amb: RowVar) -> Ty {
         let span = e.span;
         match &e.node {
             Expr::Int(_) => Ty::int(),
@@ -1619,7 +1636,7 @@ pub fn infer_schemes(
     _session: &Session,
     module: &Module,
 ) -> (Vec<(String, String)>, Vec<Diagnostic>) {
-    let (schemes, diags, _sites) = infer_all(module);
+    let (schemes, diags, _sites, _typed) = infer_all(module, false);
     (schemes, diags)
 }
 
@@ -1627,14 +1644,44 @@ pub fn infer_schemes(
 /// params have a `linear`-declared type. The one bounded reach the `affine::check`
 /// pass consumes; the affine *logic* lives entirely in that pass.
 pub fn infer_with_sites(_session: &Session, module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
-    let (_schemes, diags, sites) = infer_all(module);
+    let (_schemes, diags, sites, _typed) = infer_all(module, false);
     (diags, sites)
 }
+
+/// Inference plus the per-node type table (Slice 5a-1): every expression node's
+/// zonked type, rendered span-sorted through one shared `Names` so a variable
+/// shared across nodes renders identically. The Core IR arc's feeder; 5a-2's
+/// lowering consumes the underlying `node_types` directly.
+pub fn infer_with_types(
+    _session: &Session,
+    module: &Module,
+) -> (Vec<Diagnostic>, BTreeMap<Span, String>) {
+    let (_schemes, diags, _sites, typed) = infer_all(module, true);
+    let mut names = Names::default();
+    let mut rendered: BTreeMap<Span, String> = BTreeMap::new();
+    for (span, ty) in &typed {
+        let mut out = String::new();
+        write_ty(ty, &mut names, &mut out);
+        rendered.insert(*span, out);
+    }
+    (diags, rendered)
+}
+
+/// Result of a full-module inference pass: generalized top-level schemes (name →
+/// rendered scheme), diagnostics, affine binding sites, and — when requested —
+/// the zonked per-node type table (Slice 5a-1). Empty `BTreeMap` when types
+/// weren't requested.
+type InferAllOut = (
+    Vec<(String, String)>,
+    Vec<Diagnostic>,
+    HashSet<Span>,
+    BTreeMap<Span, Ty>,
+);
 
 /// Type every top-level function, processing mutually-recursive groups (SCCs of
 /// the call graph) in dependency order so each group is generalized before later
 /// groups use it — giving proper let-polymorphism across the top level.
-fn infer_all(module: &Module) -> (Vec<(String, String)>, Vec<Diagnostic>, HashSet<Span>) {
+fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
     let mut inf = Infer::new();
     // Names of `linear`-declared types — set before inference so `ty_is_linear`
     // sees them while recording affine binding sites (Slice 4d-2).
@@ -1842,7 +1889,18 @@ fn infer_all(module: &Module) -> (Vec<(String, String)>, Vec<Diagnostic>, HashSe
         }
     }
 
-    (schemes_out, inf.diags, inf.affine_sites)
+    // Record-then-zonk (spec §3): resolve every recorded node type ONCE here,
+    // after all SCC groups are solved — never at record-time. Skipped unless a
+    // caller wants the table, so the hot inference paths pay nothing.
+    let node_types: BTreeMap<Span, Ty> = if want_types {
+        inf.node_types
+            .iter()
+            .map(|(s, t)| (*s, inf.resolve(t)))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    (schemes_out, inf.diags, inf.affine_sites, node_types)
 }
 
 fn collect_refs(b: &Block, acc: &mut Vec<String>) {
@@ -2050,6 +2108,31 @@ mod tests {
             sites.len(),
             1,
             "exactly the `let t = Tok` binding is affine, not `let n = 1`"
+        );
+    }
+
+    #[test]
+    fn infer_with_types_records_every_node_and_zonks_after_inference() {
+        // `x` and `y` are FRESH VARS when first recorded; `y + 1` forces them to
+        // Int only later. If the final table shows them as `Int` (not variables),
+        // the zonk ran AFTER the SCC loop — proving record-then-zonk ordering, not
+        // a record-time resolve. The node count proves the wrapper records every
+        // node exactly once (no path bypasses it).
+        let (m, pd) =
+            crate::parse::parse_module(&Session::new(), "fn ord(x) { let y = x  y + 1 }\n");
+        assert!(pd.is_empty(), "{pd:?}");
+        let (diags, table) = infer_with_types(&Session::new(), &m);
+        assert!(diags.is_empty(), "{diags:?}");
+        // Coverage: the four expression nodes `x`, `y`, `1`, `y + 1` — each once.
+        assert_eq!(
+            table.len(),
+            4,
+            "wrapper must record every node once: {table:?}"
+        );
+        // Ordering: all four zonked to Int (a record-time table would show vars).
+        assert!(
+            table.values().all(|v| v == "Int"),
+            "record-then-zonk violated — a node kept its pre-zonk var: {table:?}"
         );
     }
 
