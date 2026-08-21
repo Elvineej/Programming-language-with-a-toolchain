@@ -1,0 +1,7 @@
+---
+source: tests/typed_inference.rs
+expression: "render(src, &t)"
+---
+13..14 `n` : Int
+13..18 `n + 1` : Int
+17..18 `1` : Int

@@ -1,0 +1,5 @@
+---
+source: tests/typed_inference.rs
+expression: "render(src, &t)"
+---
+11..12 `x` : a
