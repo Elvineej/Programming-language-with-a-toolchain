@@ -75,3 +75,23 @@ fn affine_across_oneshot_perform_is_accepted() {
         check_source("t.elya", src)
     );
 }
+
+#[test]
+fn callee_duplication_is_currently_accepted_known_gap() {
+    // TRACKED SOUNDNESS OBLIGATION (affine-callee-duplication-obligation): the
+    // intra-function local first cut counts `pair_use(t)` as ONE use of `t` and
+    // does not recurse into `pair_use`, which uses its (generic, non-linear-typed)
+    // parameter TWICE. So this program is CURRENTLY ACCEPTED even though `t` is
+    // duplicated at runtime. Pinned so a future inter-procedural / param-
+    // multiplicity tightening flips this assertion visibly. This is NOT a bug to
+    // fix here; the first cut's guarantee is scoped (spec §6).
+    let src = "linear type Tok { Tok }\n\
+               fn keep(t) { match t { Tok -> \"k\" } }\n\
+               fn pair_use(x) { let _ = keep(x)  keep(x) }\n\
+               pub fn main() { let t = Tok\n io.println(pair_use(t)) }\n";
+    assert!(
+        check_source("t.elya", src).is_ok(),
+        "known gap: callee-duplication is currently accepted (scoped guarantee): {:?}",
+        check_source("t.elya", src)
+    );
+}
