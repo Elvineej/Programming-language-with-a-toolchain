@@ -1,0 +1,8 @@
+---
+source: tests/typed_inference.rs
+expression: "render(src, &t)"
+---
+43..78 `match o { None -> 0  Some(x) -> x }` : Int
+49..50 `o` : Option(Int)
+61..62 `0` : Int
+75..76 `x` : Int

@@ -1,0 +1,12 @@
+---
+source: tests/typed_inference.rs
+expression: "render(src, &t)"
+---
+11..12 `x` : a
+32..34 `id` : fn(Int) -> Int
+32..37 `id(5)` : Int
+35..36 `5` : Int
+47..49 `id` : fn(Bool) -> Bool
+47..55 `id(True)` : Bool
+50..54 `True` : Bool
+57..58 `0` : Int

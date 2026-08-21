@@ -1,0 +1,6 @@
+---
+source: tests/typed_inference.rs
+expression: "render(src, &t)"
+---
+43..46 `Tok` : Tok
+48..49 `t` : Tok
