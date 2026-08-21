@@ -1,0 +1,11 @@
+effect multi Flip { fn flip() -> Bool }
+linear type Tok { Tok }
+fn use1(t) { match t { Tok -> "ok" } }
+pub fn main() {
+  let t = Tok
+  io.println(handle {
+    let _ = flip()
+    use1(t)
+  } with multi { Flip.flip() -> resume(True) })
+}
+//~ ERROR[E0429] multi-shot
