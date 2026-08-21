@@ -171,3 +171,23 @@ Layering (`tests/arch/layering.rs`): `affine` is a new pass module; add it at th
 - [ ] **E0429:** a use across a `multi`-perform is rejected; the same use across a **one-shot** effect is accepted (two-sided teeth).
 - [ ] Non-linear code unaffected; `eval.rs`/GC untouched; full suite green.
 - [ ] The callee-duplication soundness gap is pinned as *currently accepted*; exit criteria state the guarantee is **scoped** and name both tracked obligations.
+
+## 13. Far-Horizon: Full Systems-Programming Capability (the north-star-beyond-the-north-star)
+
+*This section is not part of Slice 4d-2. It is a far-horizon note — its own large arc, sequenced after native compilation and after the linear-types frontier — recorded here because 4d-2 is the first rung of its ladder. It sets direction, not scope; nothing below is a v1 concern.*
+
+**The goal.** One language that does **both** OS/kernel-level systems programming (bootloaders, kernels, drivers, allocators — code that runs with no OS and no runtime beneath it) **and** high-level application programming — fully, not partially. Not "Elya, plus an `unsafe` escape hatch for the hard parts"; the systems tier is a first-class target of the same language, type system, and effect discipline.
+
+**The robust path (explicitly preferred).** Get there with **a single coherent memory model that scales app-to-kernel**, by growing the linear/affine-types frontier (this slice's arc) all the way into **full linear ownership of memory** — GC-optional, GC-free where systems code needs deterministic, manual-grade control over allocation and lifetime. Application code keeps the ergonomic managed default; systems code drops to statically-owned memory *within the same model*, because "owned exactly once, released deterministically" is the same linearity we are already building, pushed to its limit. Robustness here is reached **through Elya's own effect + linearity design**, not by importing a foreign borrow checker — the aim is Rust-class memory safety derived from Elya's semantics, not a bolted-on lifetime system with someone else's rules.
+
+**The fragile alternative to avoid.** A **dual-mode** design — a tracing GC for app code *and* a separate manual/`unsafe` allocation mode for systems code, bridged by a boundary. This is split-brained: two memory models, two mental models, two sets of bugs, and an interior seam that every abstraction has to be aware of. We reject it in favor of the single-model path above. If the single model proves intractable, *that* is the decision to revisit — not a reason to quietly accept the split.
+
+**Dependency chain (each a real subsystem, not a flag).**
+- **Native compilation** — the Core IR → LLVM backend (itself deferred; the AST-direct interpreter is v1). Systems targets need real codegen.
+- **The memory-model arc above** — linear/affine ownership grown into deterministic, GC-free memory management.
+- **Bare-metal / no-runtime targets** — `#![no_std]`-class builds: no GC thread, no runtime services, freestanding binaries, control over the entry point and the machine.
+- **A systems standard library** — a core library that assumes **neither a GC underneath nor an OS underneath**: allocation is explicit and owned, I/O is a capability/effect rather than an ambient syscall, and the managed-heap collections live in a separate, higher tier.
+
+**The tension, flagged honestly.** This arc **extends** the v1 tracing-GC core, and for systems code it eventually **supersedes** it. That is a deliberate future *evolution* of the memory model — the GC remains the right default for application code — not a contradiction with v1 and not something the current slices must accommodate. The two coexist by tier; the systems tier is where the GC is dialed out.
+
+**Revisit trigger.** Re-evaluate the tractability of this whole arc **after the linear-types frontier (4d) lands.** 4d is the first rung of the ladder: its outcome is the direct evidence for whether the linearity-to-full-ownership path is achievable *through Elya's own design*. If affine-at-most-once, then full linear ownership, land cleanly and compose with effects, the ladder is real and this section graduates into its own spec arc. If they fight the effect system or the ergonomics, that is the signal to reconsider the path — before committing to the backend and no-runtime work that assume it.
