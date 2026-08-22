@@ -1667,6 +1667,18 @@ pub fn infer_with_types(
     (diags, rendered)
 }
 
+/// Inference plus the raw per-node type table (Slice 5a-2): the same zonked
+/// `Span → Ty` table `infer_with_types` renders, returned as structured `Ty`
+/// values (not strings) so the Core IR lowering can carry them inline. A sibling
+/// of `infer_with_types`; both run `infer_all(module, true)`.
+pub fn infer_typed_table(
+    _session: &Session,
+    module: &Module,
+) -> (Vec<Diagnostic>, BTreeMap<Span, Ty>) {
+    let (_schemes, diags, _sites, typed) = infer_all(module, true);
+    (diags, typed)
+}
+
 /// Result of a full-module inference pass: generalized top-level schemes (name →
 /// rendered scheme), diagnostics, affine binding sites, and — when requested —
 /// the zonked per-node type table (Slice 5a-1). Empty `BTreeMap` when types
