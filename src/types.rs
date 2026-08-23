@@ -739,6 +739,29 @@ fn write_row(row: &EffectRow, names: &mut Names, out: &mut String) {
     out.push('}');
 }
 
+/// Public rendering facade over the private `Names` map and `write_ty` (spec §5, §7).
+/// A single `TyPrinter` accumulates variable→letter assignments *across* `render`
+/// calls, so two nodes that share a `Ty::Var(n)` render the same letter and two
+/// distinct vars render distinct letters — the cross-node coherence tripwire. It
+/// assumes the type is already zonked (Core carries zonked types inline), so unlike
+/// `display_ty` it does not `resolve`; it never reaches a solver.
+#[derive(Default)]
+pub struct TyPrinter {
+    names: Names,
+}
+
+impl TyPrinter {
+    pub fn new() -> TyPrinter {
+        TyPrinter::default()
+    }
+
+    pub fn render(&mut self, t: &Ty) -> String {
+        let mut out = String::new();
+        write_ty(t, &mut self.names, &mut out);
+        out
+    }
+}
+
 #[derive(Default)]
 pub struct TyEnv {
     scopes: Vec<HashMap<String, Scheme>>,
@@ -1104,6 +1127,29 @@ impl Infer {
                 // effect reconciles against them via `unify_row`.
                 let (eff_args, op_params, op_ret) = self.instantiate_op(&op);
                 let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+                // Record the operation-reference callee node against its span
+                // (Slice 5a-1's recorder invariant). Only the args route through
+                // `infer_expr`, so without this the callee `Var` span is absent
+                // from `node_types` and Core lowering of the perform cannot type
+                // it. The callee denotes the operation as an arrow that performs
+                // its own effect: `fn(op_params) / {Effect(eff_args)} -> op_ret`.
+                let mut op_labels = BTreeMap::new();
+                op_labels.insert(
+                    op.effect.clone(),
+                    EffectLabel {
+                        args: eff_args.clone(),
+                        span: callee.span,
+                    },
+                );
+                let callee_ty = Ty::Fn(
+                    op_params.clone(),
+                    EffectRow {
+                        labels: op_labels,
+                        tail: RowTail::Closed,
+                    },
+                    Box::new(op_ret.clone()),
+                );
+                self.node_types.insert(callee.span, callee_ty);
                 let want = Ty::Fn(op_params, EffectRow::pure(), Box::new(op_ret.clone()));
                 let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(op_ret.clone()));
                 self.unify(&want, &got, span);

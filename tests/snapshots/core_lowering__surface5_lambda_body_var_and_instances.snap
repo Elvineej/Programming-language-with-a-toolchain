@@ -1,0 +1,5 @@
+---
+source: tests/core_lowering.rs
+expression: "pretty_typed(&core, &mut TyPrinter::new())"
+---
+(fn demo () (let f (fn (x) (var x : a) : fn(a) -> a) (let a (app (var f : fn(Int) -> Int) (lit 1 : Int) : Int) (let b (app (var f : fn(Bool) -> Bool) (lit True : Bool) : Bool) (lit 0 : Int) : Int) : Int) : Int))

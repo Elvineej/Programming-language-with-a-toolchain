@@ -1,0 +1,5 @@
+---
+source: tests/core_lowering.rs
+expression: "pretty_typed(&core, &mut TyPrinter::new())"
+---
+(fn id (x) (var x : a))

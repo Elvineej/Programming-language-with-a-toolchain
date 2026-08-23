@@ -1,0 +1,5 @@
+---
+source: tests/core_lowering.rs
+expression: "pretty_typed(&core, &mut TyPrinter::new())"
+---
+(fn add1 (n) (prim Add (var n : Int) (lit 1 : Int) : Int))

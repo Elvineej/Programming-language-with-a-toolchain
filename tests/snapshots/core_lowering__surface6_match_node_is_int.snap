@@ -1,0 +1,5 @@
+---
+source: tests/core_lowering.rs
+expression: "pretty_typed(&core, &mut TyPrinter::new())"
+---
+(fn m (o) (match (var o : Option(Int)) (None (lit 0 : Int)) (Some (x) (var x : Int)) : Int))

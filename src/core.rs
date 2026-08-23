@@ -9,6 +9,7 @@ use std::rc::Rc;
 use crate::ast::{BinOp, Block, Decl, Expr, Module, PatLit, Pattern, Stmt};
 use crate::span::Span;
 use crate::types::Ty;
+use crate::types::TyPrinter;
 
 /// One Core expression: its source provenance, its inline type (Shape C), and shape.
 /// Every child pointer is `Rc`-shared, so a subtree is a refcount clone, not a deep
@@ -201,6 +202,124 @@ fn lower_pat_lit(l: &PatLit) -> CoreLit {
         PatLit::Bool(b) => CoreLit::Bool(*b),
         PatLit::Str(v) => CoreLit::Str(v.clone()),
         PatLit::Unit => CoreLit::Unit,
+    }
+}
+
+/// Render a Core module as a typed S-expression: each expression node is annotated
+/// with its inline type (`… : <ty>`), rendered through ONE shared `TyPrinter` so a
+/// variable shared across nodes renders with one coherent letter. Patterns carry no
+/// annotation (spec §4, §5). This string is the snapshot deliverable.
+pub fn pretty_typed(m: &CoreModule, p: &mut TyPrinter) -> String {
+    let mut s = String::new();
+    for f in &m.fns {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str("(fn ");
+        s.push_str(&f.name);
+        s.push_str(" (");
+        for (i, param) in f.params.iter().enumerate() {
+            if i > 0 {
+                s.push(' ');
+            }
+            s.push_str(param);
+        }
+        s.push_str(") ");
+        pretty_expr(&f.body, p, &mut s);
+        s.push(')');
+    }
+    s
+}
+
+fn pretty_expr(e: &CoreExpr, p: &mut TyPrinter, s: &mut String) {
+    match &e.kind {
+        CoreKind::Lit(l) => {
+            s.push_str("(lit ");
+            push_lit(l, s);
+        }
+        CoreKind::Var(x) => {
+            s.push_str("(var ");
+            s.push_str(x);
+        }
+        CoreKind::App(f, args) => {
+            s.push_str("(app ");
+            pretty_expr(f, p, s);
+            for a in args.iter() {
+                s.push(' ');
+                pretty_expr(a, p, s);
+            }
+        }
+        CoreKind::Prim(op, args) => {
+            s.push_str(&format!("(prim {op:?}"));
+            for a in args.iter() {
+                s.push(' ');
+                pretty_expr(a, p, s);
+            }
+        }
+        CoreKind::Lambda(params, body) => {
+            s.push_str("(fn (");
+            for (i, param) in params.iter().enumerate() {
+                if i > 0 {
+                    s.push(' ');
+                }
+                s.push_str(param);
+            }
+            s.push_str(") ");
+            pretty_expr(body, p, s);
+        }
+        CoreKind::Let(name, value, body) => {
+            s.push_str("(let ");
+            s.push_str(name);
+            s.push(' ');
+            pretty_expr(value, p, s);
+            s.push(' ');
+            pretty_expr(body, p, s);
+        }
+        CoreKind::Match(scrut, arms) => {
+            s.push_str("(match ");
+            pretty_expr(scrut, p, s);
+            for arm in arms.iter() {
+                s.push_str(" (");
+                pretty_pat(&arm.pat, s);
+                s.push(' ');
+                pretty_expr(&arm.body, p, s);
+                s.push(')');
+            }
+        }
+    }
+    // Every expression node is annotated with its inline type.
+    s.push_str(" : ");
+    s.push_str(&p.render(&e.ty));
+    s.push(')');
+}
+
+fn pretty_pat(p: &CorePat, s: &mut String) {
+    match p {
+        CorePat::Wild => s.push('_'),
+        CorePat::Var(x) => s.push_str(x),
+        CorePat::Ctor(name, args) => {
+            s.push_str(name);
+            if !args.is_empty() {
+                s.push_str(" (");
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        s.push(' ');
+                    }
+                    pretty_pat(a, s);
+                }
+                s.push(')');
+            }
+        }
+        CorePat::Lit(l) => push_lit(l, s),
+    }
+}
+
+fn push_lit(l: &CoreLit, s: &mut String) {
+    match l {
+        CoreLit::Int(n) => s.push_str(&n.to_string()),
+        CoreLit::Bool(b) => s.push_str(if *b { "True" } else { "False" }),
+        CoreLit::Str(v) => s.push_str(&format!("{v:?}")),
+        CoreLit::Unit => s.push_str("Unit"),
     }
 }
 

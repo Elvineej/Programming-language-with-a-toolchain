@@ -2,6 +2,7 @@
 source: tests/typed_inference.rs
 expression: "render(src, &t)"
 ---
+70..73 `set` : fn(Int) / {State(Int)} -> Unit
 70..76 `set(1)` : Unit
 74..75 `1` : Int
 101..107 `worker` : fn() / {State(Int)} -> Unit
