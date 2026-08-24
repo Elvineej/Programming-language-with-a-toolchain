@@ -81,13 +81,13 @@ Decision tree:
 
 - [ ] **Step 2: Determine the inkwell feature string empirically**
 
-The `llvmNN-M` feature must match the installed LLVM exactly (zero or two such features fail to build). Edit `Cargo.toml` with the candidate matching Step 1's version (18.1 → `llvm18-1`, 19.1 → `llvm19-1`, 17.0 → `llvm17-0`, …):
+The `llvmNN-M` feature must match the installed LLVM exactly (zero or two such features fail to build). Edit `Cargo.toml` with the candidate matching Step 1's version. **Empirically resolved (Task 1, this machine):** inkwell 0.5 spells its LLVM 18 feature `llvm18-0` (→ `llvm-sys-180`, which targets the 18.1.x library line); there is no `llvm18-1`. The vcpkg LLVM build only compiles x86 targets, so inkwell's default `target-all` must be dropped (`default-features = false`) or linking fails with unresolved `LLVMInitialize<OtherTarget>*` symbols:
 
 ```toml
 [dependencies]
 logos = "0.14"
 ariadne = "0.4"
-inkwell = { version = "0.5", features = ["llvm18-1"], optional = true }
+inkwell = { version = "0.5", default-features = false, features = ["llvm18-0", "target-x86"], optional = true }
 
 [features]
 codegen = ["dep:inkwell"]
@@ -95,6 +95,19 @@ codegen = ["dep:inkwell"]
 
 Run: `$env:CARGO_INCREMENTAL="0"; cargo build --features codegen`
 Expected: compiles (slowly — llvm-sys links a large native library). If llvm-sys' build script errors stating a version/env mismatch, correct the feature string (or the `LLVM_SYS_<NNN>_PREFIX` value) and retry. Record the final working pair (feature string, prefix env var) — they are load-bearing facts for this repo.
+
+> **Task 1 outcome — the working pair on this machine (load-bearing):**
+> LLVM comes from **vcpkg**, port `llvm@18.1.6`, triplet `x64-windows-static-md-rel`
+> (custom release-only triplet at `C:\vcpkg\triplets\x64-windows-static-md-rel.cmake`
+> with `VCPKG_BUILD_TYPE=release`; the stock static-md triplet fails at link with
+> `LNK1140: limit exceeded for program database` in the debug config).
+> Prefix: `LLVM_SYS_180_PREFIX=C:\vcpkg\installed\x64-windows-static-md-rel` (persisted user-level via `setx`).
+> Three bridges make vcpkg's layout acceptable to llvm-sys, which expects a
+> `bin|include|lib` prefix: `bin\llvm-config.exe` copied from `tools\llvm\`,
+> and junctions `C:\vcpkg\installed\{include\llvm, include\llvm-c, lib}` → the
+> triplet tree (llvm-config has `C:\vcpkg\installed` baked in as its prefix).
+> Link driver: winget's clang 22.1.8 (`C:\Program Files\LLVM\bin`, added to User
+> PATH); the driver's version need not match the dev-lib version.
 
 - [ ] **Step 3: Write the smoke test**
 
