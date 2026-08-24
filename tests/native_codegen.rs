@@ -4,6 +4,9 @@
 //! slice, and no test may skip (no #[ignore], no toolchain-probe early return).
 #![cfg(feature = "codegen")]
 
+use elya::core::lower_module;
+use elya::parse::parse_module;
+use elya::Session;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -117,4 +120,50 @@ fn toolchain_smoke() {
         String::from_utf8_lossy(&out.stderr)
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The §5 corpus: (tag, source). Four cases so the proof is not "a program
+/// that prints a hardcoded 3".
+const CORPUS: &[(&str, &str)] = &[
+    ("spine", "pub fn main() { 1 + 2 }\n"),
+    (
+        "lets",
+        "pub fn main() {\n  let x = 6\n  let y = 7\n  x * y\n}\n",
+    ),
+    ("nesting", "pub fn main() { (2 + 3) * 4 - 5 }\n"),
+    ("negative", "pub fn main() { 3 - 10 }\n"),
+];
+
+/// Parse → full front-end check → raw type table → lower. Runs the REAL
+/// pipeline: `check_source` exercises resolve + inference + exhaustiveness +
+/// affinity exactly as `elya check` does; only the table/lowering half is
+/// repeated here because `front_end` is private and the frozen table is the
+/// public accessor's product.
+fn lower_src(src: &str) -> elya::core::CoreModule {
+    assert!(
+        elya::check_source("corpus.elya", src).is_ok(),
+        "front end rejected corpus program: {src}"
+    );
+    let session = Session::new();
+    let (m, pd) = parse_module(&session, src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let (diags, table) = elya::types::infer_typed_table(&session, &m);
+    assert!(diags.is_empty(), "type errors: {diags:?}");
+    lower_module(&m, &table).expect("corpus program must lower to Core")
+}
+
+#[test]
+fn corpus_lowers_to_core_through_the_real_pipeline() {
+    // Task 2 (spec §6.3): measure, don't audit. Each corpus program must reach
+    // CoreModule unchanged. LowerError::Untyped(span) would be a recorder gap ON
+    // THIS SLICE'S PATH — fix it in inference (record the synthesized node's type
+    // at its span, the perform-callee shape from 5a-2 Task 3). LowerError::
+    // Unsupported means the subset was drawn wrong — narrow the corpus, never
+    // widen core.rs. Expected: all four lower today, zero gaps closed.
+    for (tag, src) in CORPUS {
+        let core = lower_src(src);
+        assert_eq!(core.fns.len(), 1, "{tag}: expected exactly one fn");
+        assert_eq!(core.fns[0].name, "main", "{tag}");
+        assert!(core.fns[0].params.is_empty(), "{tag}");
+    }
 }
