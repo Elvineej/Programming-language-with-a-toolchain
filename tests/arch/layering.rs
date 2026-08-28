@@ -18,6 +18,7 @@ fn layer(module: &str) -> Option<i32> {
         ("exhaust", 5),
         ("affine", 5),
         ("eval", 6),
+        ("codegen", 6),
         ("main", 7),
     ]);
     map.get(module).copied()
@@ -43,6 +44,7 @@ fn no_upward_module_references() {
         let src = fs::read_to_string(&path).unwrap();
         for other in [
             "span", "diag", "lex", "ast", "parse", "resolve", "types", "core", "exhaust", "affine",
+            "codegen",
             "eval",
         ] {
             if other == stem {
