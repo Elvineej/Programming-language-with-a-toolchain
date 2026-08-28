@@ -2,6 +2,8 @@
 
 pub mod affine;
 pub mod ast;
+#[cfg(feature = "codegen")]
+pub mod codegen;
 pub mod core;
 pub mod diag;
 pub mod eval;
