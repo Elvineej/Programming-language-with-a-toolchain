@@ -10,12 +10,18 @@
 //! WITHOUT nsw/nuw so overflow is defined two's-complement wrapping.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
+use inkwell::targets::{
+    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+};
 use inkwell::types::IntType;
 use inkwell::values::IntValue;
+use inkwell::AddressSpace;
+use inkwell::OptimizationLevel;
 
 use crate::ast::BinOp;
 use crate::core::{CoreExpr, CoreFn, CoreKind, CoreLit, CoreModule};
@@ -185,6 +191,41 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let result = lower_expr(i64t, &b, &f.body, &mut env)?;
     b.build_return(Some(&result)).map_err(internal)?;
 
+    // §3.5/§4: the print convention is ONE external symbol (printf) plus ONE
+    // generated shim (@main). Elya's namespace stays clean for N2; deleting the
+    // convention later is deleting a function, not unpicking a fold.
+    let i32t = ctx.i32_type();
+    let i8t = ctx.i8_type();
+    let ptrt = ctx.ptr_type(AddressSpace::default());
+    let printf_ty = i32t.fn_type(&[ptrt.into(), i64t.into()], true);
+    let printf = module.add_function("printf", printf_ty, None);
+
+    let fmt_bytes: &[u8] = b"%lld\n\0";
+    let fmt_const = i8t.const_array(
+        &fmt_bytes
+            .iter()
+            .map(|c| i8t.const_int(*c as u64, false))
+            .collect::<Vec<_>>(),
+    );
+    let fmt = module.add_global(fmt_const.get_type(), Some(AddressSpace::default()), ".fmt");
+    fmt.set_initializer(&fmt_const);
+    fmt.set_constant(true);
+    fmt.set_unnamed_addr(true);
+
+    let shim = module.add_function("main", i32t.fn_type(&[], false), None);
+    let shim_entry = ctx.append_basic_block(shim, "entry");
+    b.position_at_end(shim_entry);
+    let v = b
+        .build_call(func, &[], "v")
+        .map_err(internal)?
+        .try_as_basic_value()
+        .left()
+        .ok_or_else(|| internal("elya_main did not return a value"))?;
+    b.build_call(printf, &[fmt.as_pointer_value().into(), v.into()], "p")
+        .map_err(internal)?;
+    b.build_return(Some(&i32t.const_int(0, false)))
+        .map_err(internal)?;
+
     module
         .verify()
         .map_err(|e| CodegenError::Verify(e.to_string()))?;
@@ -198,6 +239,49 @@ pub fn emit_ir(core: &CoreModule) -> Result<String, CodegenError> {
     let ctx = Context::create();
     let module = build_module(&ctx, core)?;
     Ok(module.print_to_string().to_string())
+}
+
+/// Core -> object file on disk. The spine (§3.6): host triple only,
+/// `OptimizationLevel::None`, `verify()` before emission.
+pub fn compile_module(core: &CoreModule, obj_path: &Path) -> Result<(), CodegenError> {
+    let ctx = Context::create();
+    let module = build_module(&ctx, core)?;
+
+    Target::initialize_native(&InitializationConfig::default()).map_err(internal)?;
+    let triple = TargetMachine::get_default_triple();
+    let target = Target::from_triple(&triple).map_err(internal)?;
+    let machine = target
+        .create_target_machine(
+            &triple,
+            "",
+            "",
+            OptimizationLevel::None,
+            RelocMode::Default,
+            CodeModel::Default,
+        )
+        .ok_or_else(|| internal("no host target machine"))?;
+    machine
+        .write_to_file(&module, FileType::Object, obj_path)
+        .map_err(internal)
+}
+
+/// Object file -> executable, via `clang` (hardcoded, §3.6: LLVM is already a
+/// hard prerequisite and clang ships with it). Non-zero exit surfaces clang's
+/// stderr in [`CodegenError::Link`].
+pub fn link(obj: &Path, exe: &Path) -> Result<(), CodegenError> {
+    let out = std::process::Command::new("clang")
+        .arg(obj)
+        .arg("-o")
+        .arg(exe)
+        .output()
+        .map_err(CodegenError::Io)?;
+    if !out.status.success() {
+        return Err(CodegenError::Link {
+            code: out.status.code(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(all(test, feature = "codegen"))]

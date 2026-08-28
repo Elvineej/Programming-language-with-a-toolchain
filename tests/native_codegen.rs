@@ -7,7 +7,7 @@
 use elya::core::lower_module;
 use elya::parse::parse_module;
 use elya::Session;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use inkwell::context::Context;
@@ -166,4 +166,61 @@ fn corpus_lowers_to_core_through_the_real_pipeline() {
         assert_eq!(core.fns[0].name, "main", "{tag}");
         assert!(core.fns[0].params.is_empty(), "{tag}");
     }
+}
+
+/// Compile + link through the LIBRARY API into `dir`. Task 5 adds the CLI path.
+fn compile_and_link(core: &elya::core::CoreModule, dir: &Path, tag: &str) -> PathBuf {
+    let obj = dir.join(format!("{tag}.o"));
+    let exe = dir.join(format!("{tag}{}", std::env::consts::EXE_SUFFIX));
+    elya::codegen::compile_module(core, &obj).expect("compile_module");
+    elya::codegen::link(&obj, &exe).expect("link");
+    exe
+}
+
+/// The three required assertions per case (§5): exit status, stdout, empty stderr.
+fn assert_runs(exe: &Path, expected: &str) {
+    let out = Command::new(exe).output().expect("run produced binary");
+    assert!(out.status.success(), "binary exited {:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), expected);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn spine_prints_three() {
+    let core = lower_src(CORPUS[0].1);
+    let dir = temp_dir("spine");
+    let exe = compile_and_link(&core, &dir, CORPUS[0].0);
+    assert_runs(&exe, "3"); // the spine
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn lets_and_mul_print_forty_two() {
+    let core = lower_src(CORPUS[1].1);
+    let dir = temp_dir("lets");
+    let exe = compile_and_link(&core, &dir, CORPUS[1].0);
+    assert_runs(&exe, "42"); // Let, Var, Mul
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn nesting_and_sub_print_fifteen() {
+    let core = lower_src(CORPUS[2].1);
+    let dir = temp_dir("nesting");
+    let exe = compile_and_link(&core, &dir, CORPUS[2].0);
+    assert_runs(&exe, "15"); // nesting, precedence, Sub
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn negative_result_prints_minus_seven() {
+    let core = lower_src(CORPUS[3].1);
+    let dir = temp_dir("negative");
+    let exe = compile_and_link(&core, &dir, CORPUS[3].0);
+    assert_runs(&exe, "-7"); // signed negatives survive %lld
+    std::fs::remove_dir_all(&dir).ok();
 }
