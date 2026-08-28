@@ -985,6 +985,28 @@ if ($LASTEXITCODE -eq 0) {
 
 The `build` subcommand, one §5 case re-run through the real `elya` binary, and the gate extension (§2.4).
 
+> **Step 0 (added 2026-08-28, carried from Task 3): split codegen into its own crate — do
+> this FIRST, before the rest of Task 5.**
+>
+> `codegen` is currently a feature on the `elya` *lib*, so all 24 integration tests plus
+> the lib and bin test binaries link `llvm_sys` — even though only
+> `tests/native_codegen.rs` touches inkwell. The vcpkg `x64-windows-static-md-rel` LLVM 18
+> is bundled into `libllvm_sys-*.rlib` at **3.73 GiB** (1719 `.obj` members), so on an
+> 8-core / 16 GiB machine parallel link jobs exhaust memory. It shows up nondeterministically
+> as either `crate llvm_sys required to be available in rlib format, but was not found in
+> this form` or `LINK : fatal error LNK1102: out of memory`, and it survives a pristine-target
+> rebuild — it is not stale `target/` state and not a feature-resolution bug.
+>
+> Tasks 3 and 4 work around it by building the feature with `-j 2`. Task 5 must not inherit
+> that cap: it already touches the `elya build` wiring and adds the codegen gate stages, so
+> the split lands before the gate depends on it. After the split, only the codegen crate's
+> own tests link LLVM and the `-j 2` cap is dropped everywhere — the gate's codegen stages
+> in Step 4 run at default parallelism.
+>
+> Dynamic LLVM (inkwell `llvm18-0-prefer-dynamic` / `llvm18-0-force-dynamic`) was considered
+> and rejected: a dynamic LLVM dependency for the shipped compiler is a product decision,
+> not a build-speed fix. Held in reserve only if the split proves insufficient.
+
 **Files:**
 
 - Modify: `src/main.rs`
