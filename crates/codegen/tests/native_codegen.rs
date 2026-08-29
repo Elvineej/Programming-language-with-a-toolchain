@@ -223,3 +223,127 @@ fn negative_result_prints_minus_seven() {
     assert_runs(&exe, "-7"); // signed negatives survive %lld
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The 5b-2 §5 corpus: (tag, source, expected stdout). Seven programs, each
+/// aimed at one thing the diamond can get wrong.
+const CONTROL_FLOW_CORPUS: &[(&str, &str, &str)] = &[
+    // 1-2: both directions of the same branch, so a diamond that always takes
+    // one side fails one of them.
+    (
+        "if_true",
+        "pub fn main() { if 1 < 2 { 10 } else { 20 } }\n",
+        "10",
+    ),
+    (
+        "if_false",
+        "pub fn main() { if 2 < 1 { 10 } else { 20 } }\n",
+        "20",
+    ),
+    // 3: a binding live across the branch — the env must survive the diamond.
+    (
+        "if_over_a_binding",
+        "pub fn main() {\n  let x = 5\n  if x > 3 { x * 2 } else { 0 }\n}\n",
+        "10",
+    ),
+    // 4: THE PHI TRAP, on both sides. `a` nests inside the then-branch, `b`
+    // inside the else-branch; an outer phi that names `then`/`else` instead of
+    // the inner join blocks miscompiles or fails the verifier.
+    (
+        "nested_if",
+        "pub fn main() {\n  let x = 7\n  let a = if x > 0 { if x > 5 { 100 } else { 50 } } else { 0 }\n  let b = if x < 0 { 0 } else { if x > 5 { 7 } else { 3 } }\n  a + b\n}\n",
+        "107",
+    ),
+    // 5: all six predicates, each at its boundary case, so swapping SLT for SLE
+    // (or SGT for SGE) changes the answer. Plus one signedness probe: under an
+    // unsigned compare `(0 - 1) < 1` is false, and the total drops to 6.
+    (
+        "predicates",
+        "pub fn main() {\n  let a = if 1 < 1 { 1 } else { 0 }\n  let b = if 1 < 2 { 1 } else { 0 }\n  let c = if 1 <= 1 { 1 } else { 0 }\n  let d = if 2 <= 1 { 1 } else { 0 }\n  let e = if 1 > 1 { 1 } else { 0 }\n  let f = if 2 > 1 { 1 } else { 0 }\n  let g = if 1 >= 1 { 1 } else { 0 }\n  let h = if 1 >= 2 { 1 } else { 0 }\n  let i = if 1 == 1 { 1 } else { 0 }\n  let j = if 1 == 2 { 1 } else { 0 }\n  let k = if 1 != 2 { 1 } else { 0 }\n  let m = if 1 != 1 { 1 } else { 0 }\n  let n = if (0 - 1) < 1 { 1 } else { 0 }\n  a + b + c + d + e + f + g + h + i + j + k + m + n\n}\n",
+        "7",
+    ),
+    // 6: Eq on Bool operands — the i1 path through the polymorphic operator.
+    (
+        "bool_equality",
+        "pub fn main() { if True == False { 1 } else { 2 } }\n",
+        "2",
+    ),
+    // 7: strict and/or over two comparisons, both truth values of each.
+    (
+        "and_or",
+        "pub fn main() {\n  let a = if 1 < 2 && 3 > 4 { 1 } else { 0 }\n  let b = if 1 < 2 && 3 < 4 { 1 } else { 0 }\n  let c = if 1 > 2 || 3 > 4 { 1 } else { 0 }\n  let d = if 1 > 2 || 3 < 4 { 1 } else { 0 }\n  a + b + c + d\n}\n",
+        "2",
+    ),
+];
+
+/// The reference side of the differential check (§5): what the CEK evaluator
+/// says `main` is worth, rendered the way the native print shim prints it
+/// (`printf("%lld\n", …)`, trimmed by the caller).
+///
+/// `elya run` cannot serve here — it observes only `io.println` output and
+/// discards main's value — which is why `run_module_value` exists.
+fn eval_main_int(src: &str) -> String {
+    let session = Session::new();
+    let (m, pd) = parse_module(&session, src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let (_, v) = elya::eval::run_module_value(&m).expect("evaluator must run corpus program");
+    match v {
+        elya::eval::Value::Int(n) => n.to_string(),
+        other => panic!("corpus main must evaluate to an Int, got {other:?}"),
+    }
+}
+
+#[test]
+fn control_flow_corpus_compiles_links_and_runs() {
+    let dir = temp_dir("control-flow");
+    for (tag, src, expected) in CONTROL_FLOW_CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        assert_runs(&exe, expected);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_control_flow_corpus() {
+    // The fidelity teeth for the whole back-end arc: "native must match the
+    // evaluator" stops being a remembered rule and becomes an enforced test.
+    // This is what would have caught the strictness divergence automatically.
+    let dir = temp_dir("differential");
+    for (tag, src, _) in CONTROL_FLOW_CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        let out = Command::new(&exe).output().expect("run produced binary");
+        assert!(
+            out.status.success(),
+            "{tag}: binary exited {:?}",
+            out.status
+        );
+        let native = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            native,
+            eval_main_int(src),
+            "{tag}: native output diverges from the evaluator"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_differential_check_also_covers_the_arithmetic_corpus() {
+    // The 5b-1 programs predate the check; running them through it costs one
+    // loop and means the whole native surface is covered, not just the new part.
+    let dir = temp_dir("differential-arith");
+    for (tag, src) in CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        let out = Command::new(&exe).output().expect("run produced binary");
+        assert!(
+            out.status.success(),
+            "{tag}: binary exited {:?}",
+            out.status
+        );
+        let native = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(native, eval_main_int(src), "{tag}: native diverges");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

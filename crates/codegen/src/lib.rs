@@ -444,14 +444,21 @@ mod tests {
     fn corpus_verifies() {
         // Layer 1 (§8): verifier-clean IR for the §5 corpus. Cheap structural
         // teeth — NOT the proof (that is execution in tests/native_codegen.rs).
-        // The corpus strings duplicate tests/native_codegen.rs's CORPUS because
-        // integration targets cannot share consts; four lines of duplication is
-        // cheaper than new plumbing.
+        // The corpus strings duplicate tests/native_codegen.rs's CORPUS and
+        // CONTROL_FLOW_CORPUS because integration targets cannot share consts;
+        // eleven lines of duplication is cheaper than new plumbing.
         let corpus = [
             "pub fn main() { 1 + 2 }\n",
             "pub fn main() {\n  let x = 6\n  let y = 7\n  x * y\n}\n",
             "pub fn main() { (2 + 3) * 4 - 5 }\n",
             "pub fn main() { 3 - 10 }\n",
+            "pub fn main() { if 1 < 2 { 10 } else { 20 } }\n",
+            "pub fn main() { if 2 < 1 { 10 } else { 20 } }\n",
+            "pub fn main() {\n  let x = 5\n  if x > 3 { x * 2 } else { 0 }\n}\n",
+            "pub fn main() {\n  let x = 7\n  let a = if x > 0 { if x > 5 { 100 } else { 50 } } else { 0 }\n  let b = if x < 0 { 0 } else { if x > 5 { 7 } else { 3 } }\n  a + b\n}\n",
+            "pub fn main() {\n  let a = if 1 < 1 { 1 } else { 0 }\n  let b = if 1 < 2 { 1 } else { 0 }\n  let c = if 1 <= 1 { 1 } else { 0 }\n  let d = if 2 <= 1 { 1 } else { 0 }\n  let e = if 1 > 1 { 1 } else { 0 }\n  let f = if 2 > 1 { 1 } else { 0 }\n  let g = if 1 >= 1 { 1 } else { 0 }\n  let h = if 1 >= 2 { 1 } else { 0 }\n  let i = if 1 == 1 { 1 } else { 0 }\n  let j = if 1 == 2 { 1 } else { 0 }\n  let k = if 1 != 2 { 1 } else { 0 }\n  let m = if 1 != 1 { 1 } else { 0 }\n  let n = if (0 - 1) < 1 { 1 } else { 0 }\n  a + b + c + d + e + f + g + h + i + j + k + m + n\n}\n",
+            "pub fn main() { if True == False { 1 } else { 2 } }\n",
+            "pub fn main() {\n  let a = if 1 < 2 && 3 > 4 { 1 } else { 0 }\n  let b = if 1 < 2 && 3 < 4 { 1 } else { 0 }\n  let c = if 1 > 2 || 3 > 4 { 1 } else { 0 }\n  let d = if 1 > 2 || 3 < 4 { 1 } else { 0 }\n  a + b + c + d\n}\n",
         ];
         for src in corpus {
             let session = elya::Session::new();
@@ -551,7 +558,7 @@ mod tests {
     #[test]
     fn accepts_eq_on_bool_operands() {
         // The other side of the same door: Bool is a concrete type with a
-        // representation, so `true == false` is an icmp on i1, not a refusal.
+        // representation, so `True == False` is an icmp on i1, not a refusal.
         let t = CoreExpr {
             span: Span::EMPTY,
             ty: Ty::Base(TyCon::Bool),
