@@ -36,6 +36,11 @@ pub enum CoreKind {
     Lambda(Rc<[String]>, Rc<CoreExpr>),
     /// binding spine synthesized from block-flattening: `Let(name, value, body)`.
     Let(String, Rc<CoreExpr>, Rc<CoreExpr>),
+    /// `if cond { .. } else { .. }` — always two-branch, because the AST's
+    /// `else_block` is not optional. Both branches carry the same type (the
+    /// checker unified them), which is what lets the back end join them with a
+    /// single-typed `phi`.
+    If(Rc<CoreExpr>, Rc<CoreExpr>, Rc<CoreExpr>),
     Match(Rc<CoreExpr>, Rc<[CoreArm]>),
 }
 
@@ -152,6 +157,16 @@ fn lower_expr(e: &Expr, span: Span, table: &BTreeMap<Span, Ty>) -> Result<CoreEx
             let r = lower_expr(&rhs.node, rhs.span, table)?;
             CoreKind::Prim(*op, vec![l, r].into())
         }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            let c = lower_expr(&cond.node, cond.span, table)?;
+            let t = lower_block(&then_block.node, table)?;
+            let e = lower_block(&else_block.node, table)?;
+            CoreKind::If(Rc::new(c), Rc::new(t), Rc::new(e))
+        }
         Expr::Lambda { params, body } => {
             let names: Vec<String> = params.iter().map(|p| p.node.name.clone()).collect();
             let b = lower_block(&body.node, table)?;
@@ -174,7 +189,6 @@ fn lower_expr(e: &Expr, span: Span, table: &BTreeMap<Span, Ty>) -> Result<CoreEx
         Expr::Float(_) => return Err(LowerError::Unsupported("Float")),
         Expr::Qualified { .. } => return Err(LowerError::Unsupported("Qualified")),
         Expr::Unary { .. } => return Err(LowerError::Unsupported("Unary")),
-        Expr::If { .. } => return Err(LowerError::Unsupported("If")),
         Expr::Block(_) => return Err(LowerError::Unsupported("Block")),
         Expr::Handle { .. } => return Err(LowerError::Unsupported("Handle")),
         Expr::Resume { .. } => return Err(LowerError::Unsupported("Resume")),
@@ -274,6 +288,14 @@ fn pretty_expr(e: &CoreExpr, p: &mut TyPrinter, s: &mut String) {
             pretty_expr(value, p, s);
             s.push(' ');
             pretty_expr(body, p, s);
+        }
+        CoreKind::If(cond, then_e, else_e) => {
+            s.push_str("(if ");
+            pretty_expr(cond, p, s);
+            s.push(' ');
+            pretty_expr(then_e, p, s);
+            s.push(' ');
+            pretty_expr(else_e, p, s);
         }
         CoreKind::Match(scrut, arms) => {
             s.push_str("(match ");
