@@ -2,7 +2,6 @@
 //! RUNS it, and asserts on exit status, stdout, and stderr. Proof is execution,
 //! never IR inspection: no insta snapshot of LLVM IR exists anywhere in this
 //! slice, and no test may skip (no #[ignore], no toolchain-probe early return).
-#![cfg(feature = "codegen")]
 
 use elya::core::lower_module;
 use elya::parse::parse_module;
@@ -172,8 +171,8 @@ fn corpus_lowers_to_core_through_the_real_pipeline() {
 fn compile_and_link(core: &elya::core::CoreModule, dir: &Path, tag: &str) -> PathBuf {
     let obj = dir.join(format!("{tag}.o"));
     let exe = dir.join(format!("{tag}{}", std::env::consts::EXE_SUFFIX));
-    elya::codegen::compile_module(core, &obj).expect("compile_module");
-    elya::codegen::link(&obj, &exe).expect("link");
+    elya_codegen::compile_module(core, &obj).expect("compile_module");
+    elya_codegen::link(&obj, &exe).expect("link");
     exe
 }
 

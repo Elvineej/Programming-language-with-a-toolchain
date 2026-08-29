@@ -14,17 +14,24 @@ language design (`.../2026-08-05-elya-language-design.md`).
 
 ## Build & run
 
+The repository is a Cargo workspace: `elya` (the front end, deliberately
+LLVM-free), `elya-codegen` (Core → LLVM → native object; the only crate that
+links `llvm_sys`), and `elya-cli` (the `elya` binary).
+
 ```sh
-cargo build
-cargo run -- run examples/01_hello.elya     # prints: Hello, Elya!
-cargo run -- check examples/02_arith.elya   # front-end only (parse + resolve + type-check)
+cargo build --workspace
+cargo run -p elya-cli -- run examples/01_hello.elya     # prints: Hello, Elya!
+cargo run -p elya-cli -- check examples/02_arith.elya   # front-end only (parse + resolve + type-check)
 ```
+
+Native compilation is opt-in behind `--features codegen`, so a default build
+needs no LLVM at all.
 
 ## Local CI
 
 ```sh
-sh scripts/check.sh         # fmt + clippy + tests (POSIX / Git Bash)
-pwsh scripts/check.ps1      # fmt + clippy + tests (PowerShell)
+sh scripts/check.sh         # fmt + clippy + tests, both feature configurations (POSIX / Git Bash)
+pwsh scripts/check.ps1      # fmt + clippy + tests, both feature configurations (PowerShell)
 sh scripts/setup-hooks.sh   # install a pre-push hook that runs check.sh (optional)
 ```
 

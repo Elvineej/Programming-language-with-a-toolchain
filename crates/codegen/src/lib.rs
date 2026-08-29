@@ -23,9 +23,9 @@ use inkwell::values::IntValue;
 use inkwell::AddressSpace;
 use inkwell::OptimizationLevel;
 
-use crate::ast::BinOp;
-use crate::core::{CoreExpr, CoreFn, CoreKind, CoreLit, CoreModule};
-use crate::types::{Ty, TyCon};
+use elya::ast::BinOp;
+use elya::core::{CoreExpr, CoreFn, CoreKind, CoreLit, CoreModule};
+use elya::types::{Ty, TyCon};
 
 #[derive(Debug)]
 pub enum CodegenError {
@@ -284,10 +284,10 @@ pub fn link(obj: &Path, exe: &Path) -> Result<(), CodegenError> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "codegen"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::span::Span;
+    use elya::span::Span;
     use std::rc::Rc;
 
     fn int_lit(n: i64) -> CoreExpr {
@@ -330,12 +330,12 @@ mod tests {
             "pub fn main() { 3 - 10 }\n",
         ];
         for src in corpus {
-            let session = crate::Session::new();
-            let (m, pd) = crate::parse::parse_module(&session, src);
+            let session = elya::Session::new();
+            let (m, pd) = elya::parse::parse_module(&session, src);
             assert!(pd.is_empty(), "parse: {pd:?}");
-            let (diags, table) = crate::types::infer_typed_table(&session, &m);
+            let (diags, table) = elya::types::infer_typed_table(&session, &m);
             assert!(diags.is_empty(), "type errors: {diags:?}");
-            let core = crate::core::lower_module(&m, &table).expect("lowers");
+            let core = elya::core::lower_module(&m, &table).expect("lowers");
             emit_ir(&core).expect("verifier-clean IR");
         }
     }
