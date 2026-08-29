@@ -107,10 +107,26 @@ fn validate_module(core: &CoreModule) -> Result<&CoreFn, CodegenError> {
     Ok(f)
 }
 
-/// §3.2 type mapping: reads the INLINE `ty` field on each Core node (Shape C —
-/// the reason this fold needs no side-table lookups). Polymorphic nodes carry
-/// `Ty::Var(_)` by design; codegen demands monomorphic Int and errors otherwise
-/// (when that fires, that is N7 knocking).
+/// §3.1 type mapping, widened for N3: `Int` -> i64, `Bool` -> i1. Reads the
+/// INLINE `ty` field on each Core node (Shape C — the reason this fold needs no
+/// side-table lookups). Everything else is refused by name, `Ty::Var(_)`
+/// included; when that fires, that is N7 knocking.
+///
+/// A toe-in, not the value-representation decision: two integer widths is the
+/// least that lets a branch have a condition. Heap values arrive with N4.
+fn repr_ty<'ctx>(ctx: &'ctx Context, ty: &Ty) -> Result<IntType<'ctx>, CodegenError> {
+    match ty {
+        Ty::Base(TyCon::Int) => Ok(ctx.i64_type()),
+        Ty::Base(TyCon::Bool) => Ok(ctx.bool_type()),
+        _ => Err(CodegenError::Unsupported("unrepresentable type")),
+    }
+}
+
+/// `main` returns i64: `@elya_main`'s signature says so and the print shim's
+/// format string is `%lld`. A `Bool`-bodied main is a representable value in an
+/// unrepresentable *place*, so it is refused at the module boundary rather than
+/// inside the fold — which is why this message stayed "non-Int value" when the
+/// fold widened.
 fn require_int(ty: &Ty) -> Result<(), CodegenError> {
     if matches!(ty, Ty::Base(TyCon::Int)) {
         Ok(())
@@ -119,28 +135,31 @@ fn require_int(ty: &Ty) -> Result<(), CodegenError> {
     }
 }
 
-/// §3.3 expression lowering: a recursive fold returning an `IntValue`,
-/// threading a binding environment. NO alloca, NO mem2reg — bindings are
-/// immutable and there is no control flow, so values map directly to SSA
-/// registers; the save/restore around `Let` is what makes shadowing correct.
+/// §3.3 expression lowering: a recursive fold returning an `IntValue`, threading
+/// a binding environment. NO alloca, NO mem2reg — bindings are immutable and
+/// values map directly to SSA registers; the save/restore around `Let` is what
+/// makes shadowing correct. Each node's width comes from its own inline type, so
+/// an i1 and an i64 register coexist without a wrapper enum: inkwell's
+/// `IntValue` already carries its width.
 fn lower_expr<'ctx>(
-    i64t: IntType<'ctx>,
+    ctx: &'ctx Context,
     b: &Builder<'ctx>,
     e: &CoreExpr,
     env: &mut HashMap<String, IntValue<'ctx>>,
 ) -> Result<IntValue<'ctx>, CodegenError> {
-    require_int(&e.ty)?;
+    let node_ty = repr_ty(ctx, &e.ty)?;
     match &e.kind {
-        CoreKind::Lit(CoreLit::Int(n)) => Ok(i64t.const_int(*n as u64, true)),
+        CoreKind::Lit(CoreLit::Int(n)) => Ok(node_ty.const_int(*n as u64, true)),
+        CoreKind::Lit(CoreLit::Bool(v)) => Ok(node_ty.const_int(u64::from(*v), false)),
         CoreKind::Lit(_) => Err(CodegenError::Unsupported("non-Int literal")),
         CoreKind::Var(x) => env
             .get(x)
             .copied()
             .ok_or(CodegenError::Unsupported("unbound var")),
         CoreKind::Let(x, rhs, body) => {
-            let v = lower_expr(i64t, b, rhs, env)?;
+            let v = lower_expr(ctx, b, rhs, env)?;
             let prev = env.insert(x.clone(), v);
-            let out = lower_expr(i64t, b, body, env);
+            let out = lower_expr(ctx, b, body, env);
             // Restore any shadowed binding — `let x = 1; let x = x + 1` stays correct.
             match prev {
                 Some(p) => {
@@ -156,8 +175,8 @@ fn lower_expr<'ctx>(
             if args.len() != 2 {
                 return Err(CodegenError::Unsupported("binary Prim arity"));
             }
-            let l = lower_expr(i64t, b, &args[0], env)?;
-            let r = lower_expr(i64t, b, &args[1], env)?;
+            let l = lower_expr(ctx, b, &args[0], env)?;
+            let r = lower_expr(ctx, b, &args[1], env)?;
             // Deliberately NO nsw/nuw flags: defined two's-complement wrapping
             // (§3.4). Overflow reconciliation with the evaluator is tracked in
             // spec §11 — not silently decided here.
@@ -184,6 +203,9 @@ fn lower_expr<'ctx>(
 /// one construction path.
 fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'ctx>, CodegenError> {
     let f = validate_module(core)?;
+    // §3.1: `main` returns i64. The fold now speaks two widths, so this is the
+    // one place that still insists on Int.
+    require_int(&f.body.ty)?;
     let i64t = ctx.i64_type();
     let module = ctx.create_module("elya");
     let func = module.add_function("elya_main", i64t.fn_type(&[], false), None);
@@ -191,7 +213,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let b = ctx.create_builder();
     b.position_at_end(entry);
     let mut env = HashMap::new();
-    let result = lower_expr(i64t, &b, &f.body, &mut env)?;
+    let result = lower_expr(ctx, &b, &f.body, &mut env)?;
     b.build_return(Some(&result)).map_err(internal)?;
 
     // §3.5/§4: the print convention is ONE external symbol (printf) plus ONE
@@ -365,6 +387,53 @@ mod tests {
         let err = emit_ir(&main_fn(e)).unwrap_err();
         assert!(
             matches!(err, CodegenError::Unsupported("non-Int value")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_bool_binding_is_representable_even_though_a_bool_main_is_not() {
+        // Layer-1 teeth only — an i1 constant costs no instruction, so this
+        // proves the type mapping accepts Bool, not that anything computes with
+        // it. The real proof is Task 5's execution corpus. Hand-built because no
+        // source program can produce a Bool-typed node until Task 4 lands `if`.
+        let m = main_fn(CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Int),
+            kind: CoreKind::Let(
+                "b".into(),
+                Rc::new(CoreExpr {
+                    span: Span::EMPTY,
+                    ty: Ty::Base(TyCon::Bool),
+                    kind: CoreKind::Lit(CoreLit::Bool(true)),
+                }),
+                Rc::new(int_lit(1)),
+            ),
+        });
+        emit_ir(&m).expect("a Bool binding must verify");
+    }
+
+    #[test]
+    fn rejects_a_string_typed_node_by_name() {
+        // The widening is exactly two widths wide. Str is not one of them, and
+        // it is refused as an unrepresentable *type*, distinct from the
+        // "non-Int value" that guards main's return type.
+        let m = main_fn(CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Int),
+            kind: CoreKind::Let(
+                "s".into(),
+                Rc::new(CoreExpr {
+                    span: Span::EMPTY,
+                    ty: Ty::Base(TyCon::Str),
+                    kind: CoreKind::Lit(CoreLit::Str("a".into())),
+                }),
+                Rc::new(int_lit(1)),
+            ),
+        });
+        let err = emit_ir(&m).unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported("unrepresentable type")),
             "{err:?}"
         );
     }
