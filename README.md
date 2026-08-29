@@ -19,13 +19,24 @@ LLVM-free), `elya-codegen` (Core → LLVM → native object; the only crate that
 links `llvm_sys`), and `elya-cli` (the `elya` binary).
 
 ```sh
-cargo build --workspace
+cargo build -p elya-cli                                 # the compiler; no LLVM in this graph
 cargo run -p elya-cli -- run examples/01_hello.elya     # prints: Hello, Elya!
 cargo run -p elya-cli -- check examples/02_arith.elya   # front-end only (parse + resolve + type-check)
 ```
 
 Native compilation is opt-in behind `--features codegen`, so a default build
-needs no LLVM at all.
+needs no LLVM at all. With it, `elya build` compiles a program to a real native
+executable (LLVM object + `clang` link):
+
+```sh
+cargo run -p elya-cli --features codegen -- build prog.elya   # -> prog(.exe)
+./prog                                                        # runs natively
+```
+
+Output defaults to the input stem plus the platform executable suffix; `-o <out>`
+overrides it. As of Slice 5b-1 the backend covers the arithmetic subset only
+(`Int` literals, `let`, `+ - *`), so anything outside it is rejected by name
+rather than mis-compiled — the tree-walking `elya run` remains the full language.
 
 ## Local CI
 

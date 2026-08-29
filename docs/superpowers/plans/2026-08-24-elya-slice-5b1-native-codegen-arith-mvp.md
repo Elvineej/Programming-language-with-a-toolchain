@@ -244,7 +244,7 @@ Run: `$env:CARGO_INCREMENTAL="0"; cargo fmt --all; ./scripts/check.ps1`
 Then: `$env:CARGO_INCREMENTAL="0"; cargo clippy --all-targets --features codegen -- -D warnings`
 Expected: PASS. Without the feature, nothing changed (the test file is fully cfg'd out; no LLVM in the default build).
 
-- [ ] **Step 6: Commit and push**
+- [x] **Step 6: Commit and push**
 
 ```powershell
 $env:CARGO_INCREMENTAL="0"
@@ -966,7 +966,7 @@ If a case fails: reproduce with `emit_ir` (debugging aid) by hand if needed, fix
 Run: `$env:CARGO_INCREMENTAL="0"; cargo fmt --all; ./scripts/check.ps1` and the codegen clippy line.
 Expected: PASS.
 
-- [ ] **Step 6: Commit and push**
+- [x] **Step 6: Commit and push**
 
 ```powershell
 $env:CARGO_INCREMENTAL="0"
@@ -1014,7 +1014,7 @@ The `build` subcommand, one §5 case re-run through the real `elya` binary, and 
   `src/main.rs` → `crates/cli/src/main.rs`, `tests/native_codegen.rs` →
   `crates/codegen/tests/native_codegen.rs`, `src/lib.rs`, `tests/arch/layering.rs`,
   `scripts/check.sh`, `scripts/check.ps1`, `README.md`
-- Modify: `crates/cli/src/main.rs`
+- Modify: `crates/cli/src/main.rs`, `README.md`
 - Create: `crates/cli/tests/build_cli.rs`
 
 > **Step 0 outcome (2026-08-28).** The repository is now a three-member workspace:
@@ -1039,7 +1039,7 @@ The `build` subcommand, one §5 case re-run through the real `elya` binary, and 
 > its `native_codegen` integration test), down from 26, so the `-j 2` cap is dropped:
 > the gate runs at default parallelism.
 
-- [ ] **Step 1: Add the subcommand to `crates/cli/src/main.rs`**
+- [x] **Step 1: Add the subcommand to `crates/cli/src/main.rs`**
 
 Diff against current `main.rs`:
 
@@ -1132,7 +1132,7 @@ fn build_cmd(args: &[String]) -> ExitCode {
 }
 ```
 
-- [ ] **Step 2: Add the CLI-driven test**
+- [x] **Step 2: Add the CLI-driven test**
 
 New file `crates/cli/tests/build_cli.rs` (feature-gated as a whole: without
 `codegen` the binary has no `build` subcommand). It is deliberately
@@ -1168,10 +1168,34 @@ stderr: {}",
 }
 ```
 
-- [ ] **Step 3: Run it**
+- [x] **Step 3: Run it**
 
 Run: `$env:CARGO_INCREMENTAL="0"; cargo test --workspace --features elya-cli/codegen`
 Expected: PASS — the six execution-proof tests plus the CLI case; the CLI-produced binary prints `3`.
+
+
+> **Steps 1-3 outcome (2026-08-29).** `elya build` landed as specified and the CLI
+> proof grew from one case to three, because two more became cheap once the binary
+> was the thing under test:
+>
+> - `elya_build_cli_produces_runnable_binary` — `elya build prog.elya -o prog.exe`,
+>   run the result, assert `3`. The §5 obligation.
+> - `elya_build_defaults_output_next_to_the_source` — no `-o`: assert the binary
+>   appears at the input stem + exe suffix and prints `42`.
+> - `elya_build_reports_front_end_errors_and_emits_nothing` — a broken program exits
+>   non-zero with a rendered diagnostic and produces **no** binary. This is the one
+>   the library-level tests structurally cannot make: only the CLI owns the
+>   front-end-before-backend ordering.
+>
+> `crates/cli/tests/build_cli.rs` stayed self-contained (its own `temp_dir` and
+> `assert_runs`, source text inline), so it depends on neither `elya` nor
+> `elya-codegen` and never links LLVM — the CLI test binary is not one of the two.
+>
+> Hand-driven confirmation outside the suite: `elya build` on a `let`/`*` program
+> emitted a `PE32+ x86-64 console` executable that printed `42`. On
+> `examples/02_arith.elya` it correctly refused with
+> `error: core lowering failed: Unsupported("If")` — the arithmetic subset is
+> enforced by name, not mis-compiled. README documents that boundary.
 
 - [x] **Step 4: Extend the gate (both twins)** — landed in Step 0, because the
   crate split changes what the stages have to say. `scripts/check.sh` is now:
@@ -1192,12 +1216,12 @@ cargo test --workspace --features elya-cli/codegen
 `if ($LASTEXITCODE -ne 0) { exit 1 }` guard. No `-j` cap: after the split only two
 test binaries link LLVM, so default parallelism is safe.
 
-- [ ] **Step 5: Full gate — now the extended gate itself**
+- [x] **Step 5: Full gate — now the extended gate itself**
 
 Run: `$env:CARGO_INCREMENTAL="0"; cargo fmt --all; ./scripts/check.ps1`
 Expected: PASS — five stages green, including both clippy configurations and the execution proof.
 
-- [ ] **Step 6: Commit and push**
+- [x] **Step 6: Commit and push**
 
 ```powershell
 $env:CARGO_INCREMENTAL="0"
