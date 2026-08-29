@@ -34,9 +34,12 @@ cargo run -p elya-cli --features codegen -- build prog.elya   # -> prog(.exe)
 ```
 
 Output defaults to the input stem plus the platform executable suffix; `-o <out>`
-overrides it. As of Slice 5b-1 the backend covers the arithmetic subset only
-(`Int` literals, `let`, `+ - *`), so anything outside it is rejected by name
-rather than mis-compiled — the tree-walking `elya run` remains the full language.
+overrides it. As of Slice 5b-2 the backend covers arithmetic and control flow
+(`Int` and `Bool`, `let`, `+ - *`, the six comparisons, strict `&&`/`||`, and
+`if`/`else`), so anything outside it is rejected by name rather than
+mis-compiled — the tree-walking `elya run` remains the full language. Every
+compiled program in the test corpus is additionally checked against what the
+evaluator computes, so the two never drift apart silently.
 
 ## Local CI
 
