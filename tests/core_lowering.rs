@@ -50,6 +50,11 @@ fn nodes(core: &CoreModule) -> Vec<&CoreExpr> {
                 walk(value, out);
                 walk(body, out);
             }
+            CoreKind::If(cond, then_e, else_e) => {
+                walk(cond, out);
+                walk(then_e, out);
+                walk(else_e, out);
+            }
             CoreKind::Match(scrut, arms) => {
                 walk(scrut, out);
                 for arm in arms.iter() {
@@ -265,5 +270,40 @@ fn coherence_two_distinct_vars_render_distinct_letters() {
     assert!(
         letters.len() >= 2,
         "shared TyPrinter should give >=2 distinct var letters: {letters:?}"
+    );
+}
+
+// --- Surface 8 (5b-2): `if` lowers to a two-branch Core node ------------------
+#[test]
+fn if_lowers_to_a_two_branch_core_node() {
+    // `else_block` is `Rc<Spanned<Block>>`, not an Option (src/ast.rs:180-184),
+    // so every surface `if` is already two-branch: Core needs no synthesized
+    // Unit else, and the back end's phi always has exactly two incoming values.
+    let (core, table) = lower_src("pub fn main() { if 1 < 2 { 10 } else { 20 } }\n");
+    let root = &core.fns[0].body;
+    let CoreKind::If(cond, then_e, else_e) = &root.kind else {
+        panic!(
+            "main's body should lower to CoreKind::If, got {:?}",
+            root.kind
+        );
+    };
+    assert_eq!(
+        render1(&root.ty),
+        "Int",
+        "the if node takes its branches' type"
+    );
+    assert_eq!(render1(&cond.ty), "Bool");
+    assert_eq!(render1(&then_e.ty), "Int");
+    assert_eq!(render1(&else_e.ty), "Int");
+
+    // Every `If` node is direct-origin: its span is the surface `if`'s span, so
+    // the frozen table must already hold its type (spec §2.2 — `infer_expr` is
+    // the single record point and `Expr::If` runs through it).
+    both_origin_checks(&core, &table);
+    assert!(
+        nodes(&core)
+            .iter()
+            .any(|n| matches!(n.kind, CoreKind::If(..))),
+        "the walk helper must reach into If children"
     );
 }

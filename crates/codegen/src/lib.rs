@@ -171,6 +171,9 @@ fn lower_expr<'ctx>(
         }
         CoreKind::App(..) => Err(CodegenError::Unsupported("App")),
         CoreKind::Lambda(..) => Err(CodegenError::Unsupported("Lambda")),
+        // Temporary: Core can build `If` (5b-2 Task 1) before the back end can
+        // lower it. Task 4 replaces this with the diamond.
+        CoreKind::If(..) => Err(CodegenError::Unsupported("If")),
         CoreKind::Match(..) => Err(CodegenError::Unsupported("Match")),
     }
 }
