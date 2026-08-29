@@ -1,0 +1,16 @@
+# Core -> LLVM -> object -> native binary. This is the ONLY crate that links
+# `llvm_sys`; the vcpkg static LLVM 18 is bundled into a 3.73 GiB rlib, so
+# keeping it out of the front end keeps `cargo test` off the link marathon.
+[package]
+name = "elya-codegen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "elya_codegen"
+path = "src/lib.rs"
+
+[dependencies]
+elya = { path = "../.." }
+inkwell = { version = "0.5", default-features = false, features = ["llvm18-0", "target-x86"] }

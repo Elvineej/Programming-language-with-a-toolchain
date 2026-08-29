@@ -18,11 +18,11 @@ Every task's requirements implicitly include this section.
 
 - **Rust 2021, MSRV 1.75.** The only sanctioned new dependency this slice is `inkwell` (optional, feature-gated). No `tempfile` (hand-rolled ~10-line unique temp dir), no new dev-dependencies.
 - **Command prelude (this machine is Windows 11 / PowerShell).** Prefix every cargo invocation with `$env:CARGO_INCREMENTAL="0";` — the incremental cache hangs on this machine. Example: `$env:CARGO_INCREMENTAL="0"; cargo test --features codegen --test native_codegen`.
-- **The gate is `scripts/check.ps1`** (this machine's twin of `scripts/check.sh`; both exist today and are kept byte-equivalent in behavior). After Task 5 it runs, in order: `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, `cargo clippy --all-targets --features codegen -- -D warnings`, `cargo test --features codegen --test native_codegen`. **Run `cargo fmt --all` (write mode) before the gate** — the gate fmt-_checks_ and fails hard on any drift.
+- **The gate is `scripts/check.ps1`** (this machine's twin of `scripts/check.sh`; both exist today and are kept byte-equivalent in behavior). After Task 5 Step 0 (the crate split) it runs, in order: `cargo fmt --all -- --check`, `cargo clippy -p elya -p elya-cli --all-targets -- -D warnings`, `cargo test -p elya -p elya-cli`, `cargo clippy --workspace --all-targets --features elya-cli/codegen -- -D warnings`, `cargo test --workspace --features elya-cli/codegen` — the first pair is the LLVM-free configuration, the second the codegen one. **Run `cargo fmt --all` (write mode) before the gate** — the gate fmt-_checks_ and fails hard on any drift.
 - **Clippy is `-D warnings`** in _both_ feature configurations (spec risk #8: feature-gated code must not rot).
 - **Atomic commits, never red.** Structure each commit as: run the gate; `if ($LASTEXITCODE -eq 0) { git add <explicit paths>; git commit …; git push origin main }` — never commit a red tree.
 - **Explicit paths only.** Stage with `git add <explicit paths>`; **never** `git add -A` / `git add .`.
-- **Commit trailer** (last line of every commit message): `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`
+- **Commit trailer** (last line of every commit message): `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`
 - **Push `origin/main` after each task commit.**
 - **Non-negotiable boundary (spec §0, §1, §6):**
   - Proof is **execution**, never IR inspection. No insta snapshot of LLVM IR exists in this slice. Nothing asserts on `emit_ir` output.
@@ -31,7 +31,7 @@ Every task's requirements implicitly include this section.
   - Subset is arith-only: `Int` literals, `Var`, `Prim(Add/Sub/Mul)`, `Let`, one print. **No Div/Rem/And/Or/Bool** (they need branches — deferred to N3). Arithmetic is emitted **without** `nsw`/`nuw` (defined wrapping, §3.4).
   - Native codegen must never be more-undefined than the tree evaluator.
   - The front end and Core are **not modified** (§6.2) — except recorder-gap fixes demanded by real reach in Task 2 (§6.3: expect zero; fix with the perform-callee shape, never audit speculatively).
-  - Default build/test pull in **no LLVM**: `cargo build` / `cargo test --all` with no features behave exactly as today; every existing snapshot unchanged.
+  - Default build/test pull in **no LLVM**: `cargo build` / `cargo test -p elya -p elya-cli` with no features behave exactly as today; every existing snapshot unchanged. (After Task 5 Step 0 this is structural, not just a feature default — the `elya` lib has no path to `inkwell` at all.)
 
 ## File Structure
 
@@ -1009,11 +1009,37 @@ The `build` subcommand, one §5 case re-run through the real `elya` binary, and 
 
 **Files:**
 
-- Modify: `src/main.rs`
-- Modify: `tests/native_codegen.rs`
-- Modify: `scripts/check.sh`, `scripts/check.ps1`
+- Step 0 (landed): `Cargo.toml` (workspace root), `crates/codegen/Cargo.toml`,
+  `crates/cli/Cargo.toml`, `src/codegen.rs` → `crates/codegen/src/lib.rs`,
+  `src/main.rs` → `crates/cli/src/main.rs`, `tests/native_codegen.rs` →
+  `crates/codegen/tests/native_codegen.rs`, `src/lib.rs`, `tests/arch/layering.rs`,
+  `scripts/check.sh`, `scripts/check.ps1`, `README.md`
+- Modify: `crates/cli/src/main.rs`
+- Create: `crates/cli/tests/build_cli.rs`
 
-- [ ] **Step 1: Add the subcommand to `src/main.rs`**
+> **Step 0 outcome (2026-08-28).** The repository is now a three-member workspace:
+> `elya` (root package, front-end lib only), `elya-codegen` (`crates/codegen`; the
+> only crate that depends on `inkwell`), and `elya-cli` (`crates/cli`; the `elya`
+> binary, with `codegen = ["dep:elya-codegen"]` optional). The cycle that forced
+> this shape: `elya-codegen` must depend on the `elya` lib for `ast`/`core`/`types`,
+> so the binary could not stay in the root package — cargo rejects a normal-dependency
+> package cycle. Consequences: the `codegen` feature moved from `elya` to `elya-cli`;
+> `cargo run` needs `-p elya-cli` (README updated); the CLI-driven proof lives in
+> `crates/cli/tests/build_cli.rs`, not `native_codegen.rs`, because
+> `CARGO_BIN_EXE_elya` is only defined for tests of the package that declares the bin.
+>
+> The gate was extended here rather than at Step 4, because the split changes what
+> the stages must say. Its two configurations are now:
+>
+> - **A (LLVM-free)** — `-p elya -p elya-cli`, no features: nothing in the graph
+>   links `llvm_sys`.
+> - **B (codegen)** — `--workspace --features elya-cli/codegen`: everything.
+>
+> Only two test binaries link LLVM after the split (`elya-codegen`'s unit tests and
+> its `native_codegen` integration test), down from 26, so the `-j 2` cap is dropped:
+> the gate runs at default parallelism.
+
+- [ ] **Step 1: Add the subcommand to `crates/cli/src/main.rs`**
 
 Diff against current `main.rs`:
 
@@ -1091,11 +1117,11 @@ fn build_cmd(args: &[String]) -> ExitCode {
         std::process::id(),
         exe.file_stem().and_then(|s| s.to_str()).unwrap_or("out")
     ));
-    if let Err(e) = elya::codegen::compile_module(&core, &obj) {
+    if let Err(e) = elya_codegen::compile_module(&core, &obj) {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
     }
-    let linked = elya::codegen::link(&obj, &exe);
+    let linked = elya_codegen::link(&obj, &exe);
     let _ = std::fs::remove_file(&obj);
     if let Err(e) = linked {
         eprintln!("error: {e}");
@@ -1108,7 +1134,10 @@ fn build_cmd(args: &[String]) -> ExitCode {
 
 - [ ] **Step 2: Add the CLI-driven test**
 
-Append to `tests/native_codegen.rs`:
+New file `crates/cli/tests/build_cli.rs` (feature-gated as a whole: without
+`codegen` the binary has no `build` subcommand). It is deliberately
+self-contained — it spawns the binary and the binary's output, so it needs
+neither `elya` nor `elya-codegen` and therefore never links LLVM:
 
 ```rust
 #[test]
@@ -1141,24 +1170,27 @@ stderr: {}",
 
 - [ ] **Step 3: Run it**
 
-Run: `$env:CARGO_INCREMENTAL="0"; cargo test --features codegen --test native_codegen`
-Expected: PASS — seven tests; the CLI-produced binary prints `3`.
+Run: `$env:CARGO_INCREMENTAL="0"; cargo test --workspace --features elya-cli/codegen`
+Expected: PASS — the six execution-proof tests plus the CLI case; the CLI-produced binary prints `3`.
 
-- [ ] **Step 4: Extend the gate (both twins)**
-
-`scripts/check.sh` becomes:
+- [x] **Step 4: Extend the gate (both twins)** — landed in Step 0, because the
+  crate split changes what the stages have to say. `scripts/check.sh` is now:
 
 ```sh
 #!/usr/bin/env sh
 set -e
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all
-cargo clippy --all-targets --features codegen -- -D warnings
-cargo test --features codegen --test native_codegen
+# Configuration A — LLVM-free
+cargo clippy -p elya -p elya-cli --all-targets -- -D warnings
+cargo test -p elya -p elya-cli
+# Configuration B — codegen
+cargo clippy --workspace --all-targets --features elya-cli/codegen -- -D warnings
+cargo test --workspace --features elya-cli/codegen
 ```
 
-`scripts/check.ps1` gains the same two lines (each followed by its `if ($LASTEXITCODE -ne 0) { exit 1 }` guard, matching the file's existing style).
+`scripts/check.ps1` carries the same five stages, each followed by its
+`if ($LASTEXITCODE -ne 0) { exit 1 }` guard. No `-j` cap: after the split only two
+test binaries link LLVM, so default parallelism is safe.
 
 - [ ] **Step 5: Full gate — now the extended gate itself**
 
@@ -1172,8 +1204,8 @@ $env:CARGO_INCREMENTAL="0"
 cargo fmt --all
 ./scripts/check.ps1
 if ($LASTEXITCODE -eq 0) {
-  git add src/main.rs tests/native_codegen.rs scripts/check.sh scripts/check.ps1
-  git commit -m "feat(codegen): elya build subcommand + CLI-driven proof; gate runs codegen (5b-1 Task 5)" -m "elya build <file.elya> [-o <out>] runs the front end exactly as elya check (diagnostics and warnings surfacing unchanged), lowers to Core, emits an object, links with clang; default output is the input stem + platform exe suffix. The proof covers the real entry point: a test invokes CARGO_BIN_EXE_elya, builds prog.elya, runs the binary, asserts '3'. check.sh/check.ps1 now clip and test BOTH feature configurations with -D warnings, so the codegen feature cannot rot." -m "Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
+  git add crates/cli/src/main.rs crates/cli/tests/build_cli.rs
+  git commit -m "feat(codegen): elya build subcommand + CLI-driven proof (5b-1 Task 5)" -m "elya build <file.elya> [-o <out>] runs the front end exactly as elya check (diagnostics and warnings surfacing unchanged), lowers to Core, emits an object, links with clang; default output is the input stem + platform exe suffix. The proof covers the real entry point: a test invokes CARGO_BIN_EXE_elya, builds prog.elya, runs the binary, asserts '3'." -m "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
   git push origin main
 }
 ```
@@ -1195,7 +1227,7 @@ if ($LASTEXITCODE -eq 0) {
 - No insta snapshot of LLVM IR — structural: the only renderer is `emit_ir`, documented as a debugging aid, never asserted on.
 - No test can skip — no `#[ignore]` anywhere; the feature-gated file is exercised by the gate's explicit `--features codegen` lines.
 - `cargo test --all` (no features) stays green; snapshots unchanged — asserted at every task's gate step.
-- Gate clips/tests both configurations — Task 5 (both script twins).
+- Gate clips/tests both configurations — Task 5 Step 0 (both script twins, five stages, no `-j` cap).
 - Div/Rem/And/Or rejected with §3.4 rationale recorded — Task 3 (code comments cite §3.4; commit body restates it).
 
 **Known risks carried into implementation:** inkwell 0.5 API drift (fallible builders, opaque pointers, exact error types of `verify`/`write_to_file`) — adapt mappings minimally, never the test shapes; `BinOp` may have variants beyond the fourteen listed (`op_label` must stay total); the arch layering test may need additive `codegen` registration (Task 3 Step 2); `pub fn main()` without an effect row is expected to type-check per spec §4 (`check_main_discharge` constrains only the effect row) — Task 2 falsifies this first if wrong.

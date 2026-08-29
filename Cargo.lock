@@ -68,9 +68,24 @@ name = "elya"
 version = "0.0.1"
 dependencies = [
  "ariadne",
- "inkwell",
  "insta",
  "logos",
+]
+
+[[package]]
+name = "elya-cli"
+version = "0.0.1"
+dependencies = [
+ "elya",
+ "elya-codegen",
+]
+
+[[package]]
+name = "elya-codegen"
+version = "0.0.1"
+dependencies = [
+ "elya",
+ "inkwell",
 ]
 
 [[package]]

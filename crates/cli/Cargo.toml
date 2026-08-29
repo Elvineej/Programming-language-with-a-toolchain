@@ -1,0 +1,18 @@
+# The `elya` binary. Native codegen is optional here so the shipped compiler can
+# still be built without LLVM: `--features codegen` pulls in `elya-codegen`.
+[package]
+name = "elya-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "elya"
+path = "src/main.rs"
+
+[dependencies]
+elya = { path = "../.." }
+elya-codegen = { path = "../codegen", optional = true }
+
+[features]
+codegen = ["dep:elya-codegen"]

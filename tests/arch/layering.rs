@@ -1,6 +1,11 @@
-// Enforces the compiler's internal module layering so a future workspace
+// Enforces the compiler's internal module layering so the remaining workspace
 // split stays mechanical. A module may only reference strictly-lower layers
 // (plus equal-layer span/diag and lex/ast).
+//
+// `codegen` and the CLI are no longer listed: Slice 5b-1 Task 5 lifted them into
+// their own crates (`elya-codegen`, `elya-cli`), so their layering is enforced by
+// the crate graph itself — cargo rejects a cycle, which is stronger than this
+// textual check. What remains here is the front end's internal order.
 
 use std::collections::HashMap;
 use std::fs;
@@ -18,8 +23,6 @@ fn layer(module: &str) -> Option<i32> {
         ("exhaust", 5),
         ("affine", 5),
         ("eval", 6),
-        ("codegen", 6),
-        ("main", 7),
     ]);
     map.get(module).copied()
 }
@@ -43,9 +46,8 @@ fn no_upward_module_references() {
         };
         let src = fs::read_to_string(&path).unwrap();
         for other in [
-            "span", "diag", "lex", "ast", "parse", "resolve", "types", "core", "exhaust", "affine",
-            "codegen",
-            "eval",
+            "span", "diag", "lex", "ast", "parse", "resolve", "types", "core", "exhaust",
+            "affine", "eval",
         ] {
             if other == stem {
                 continue;

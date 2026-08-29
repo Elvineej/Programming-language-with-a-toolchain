@@ -1,24 +1,27 @@
-[package]
-name = "elya"
+[workspace]
+members = ["crates/codegen", "crates/cli"]
+
+[workspace.package]
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.75"
+
+# The front end. Deliberately LLVM-free: `elya-codegen` depends on this crate,
+# never the reverse, so nothing here can ever pull in `llvm_sys` (Slice 5b-1
+# Task 5 Step 0 — the crate split).
+[package]
+name = "elya"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "elya"
 path = "src/lib.rs"
 
-[[bin]]
-name = "elya"
-path = "src/main.rs"
-
 [dependencies]
 logos = "0.14"
 ariadne = "0.4"
-inkwell = { version = "0.5", default-features = false, features = ["llvm18-0", "target-x86"], optional = true }
-
-[features]
-codegen = ["dep:inkwell"]
 
 [dev-dependencies]
 insta = "1"
