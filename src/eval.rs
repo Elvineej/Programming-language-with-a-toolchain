@@ -263,6 +263,13 @@ pub fn run_module_tree(module: &Module) -> Result<Interp, RuntimeError> {
     tree::run_module(module)
 }
 
+/// Run `main` under the CEK machine and return its value alongside the
+/// interpreter. Same machine, same evaluation order, same errors as
+/// [`run_module`]; the only difference is that the result is not discarded.
+pub fn run_module_value(module: &Module) -> Result<(Interp, Value), RuntimeError> {
+    cek::run_module_value(module)
+}
+
 pub mod tree {
     use super::*;
 
@@ -586,7 +593,11 @@ pub mod cek {
         Return(Value, Kont),
     }
 
-    pub fn run_module(module: &Module) -> Result<Interp, RuntimeError> {
+    /// Run `main` and hand back both the interpreter and the value `main`
+    /// evaluated to. `run_module` throws that value away — `elya run` observes
+    /// only `io.println` output — but a compiled binary prints it, so the back
+    /// end's differential check needs a way to ask what it should have been.
+    pub fn run_module_value(module: &Module) -> Result<(Interp, Value), RuntimeError> {
         let fns = fn_table(module);
         let ops = op_table(module);
         let mut interp = Interp::new();
@@ -594,8 +605,12 @@ pub mod cek {
             return Err(rt(Span::EMPTY, "no `main` function found"));
         };
         let start = eval_block_state(&main.body.node, Env::new(), None);
-        run_loop(&mut interp, &fns, &ops, start)?;
-        Ok(interp)
+        let v = run_loop(&mut interp, &fns, &ops, start)?;
+        Ok((interp, v))
+    }
+
+    pub fn run_module(module: &Module) -> Result<Interp, RuntimeError> {
+        run_module_value(module).map(|(interp, _)| interp)
     }
 
     // A block's tail is in tail position: evaluating it does not add a frame.
@@ -652,13 +667,28 @@ pub mod cek {
         fns: &Fns,
         ops: &Ops,
         mut st: State,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<Value, RuntimeError> {
         loop {
             interp.note_kont_depth(kont_len(kont_of(&st)));
-            match step(interp, fns, ops, st)? {
-                Some(next) => st = next,
-                None => return Ok(()),
-            }
+            // The machine halts exactly when a `Return` meets an empty
+            // continuation, and that value is `main`'s result. Catching it here
+            // rather than letting `step` fall off the end is what lets the value
+            // escape the loop at all; `run_module` still discards it, so nothing
+            // about `elya run` changes.
+            st = match st {
+                State::Return(v, None) => return Ok(v),
+                other => match step(interp, fns, ops, other)? {
+                    Some(next) => next,
+                    // `ret` returns `None` only for an empty continuation, which
+                    // the arm above already caught. Defensive, not expected.
+                    None => {
+                        return Err(rt(
+                            Span::EMPTY,
+                            "internal: machine halted with frames pending",
+                        ))
+                    }
+                },
+            };
         }
     }
 
