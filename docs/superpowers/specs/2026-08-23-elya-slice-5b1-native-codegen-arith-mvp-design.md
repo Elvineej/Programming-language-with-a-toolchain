@@ -444,6 +444,12 @@ correct outcome, not a missed opportunity.
 
 ### Public surface of `src/codegen.rs`
 
+> Landed at `crates/codegen/src/lib.rs` (the `elya-codegen` crate), not
+> `src/codegen.rs`: Task 5 Step 0 split codegen and the CLI into their own crates
+> so the front end has no path to `llvm_sys`. The surface below is unchanged;
+> only its address is. `elya::codegen::compile_module` reads
+> `elya_codegen::compile_module` today.
+
 ```rust
 pub enum CodegenError {
     Unsupported(&'static str),
@@ -608,24 +614,36 @@ a test that runs it.
 
 ## §12 Milestone checklist
 
-- [ ] `inkwell` is an **optional** dependency behind a `codegen` feature; the
+- [x] `inkwell` is an **optional** dependency behind a `codegen` feature; the
       default build pulls in no LLVM.
-- [ ] Task 1's hand-built LLVM module compiles, links, runs, and prints `3` on
+- [x] Task 1's hand-built LLVM module compiles, links, runs, and prints `3` on
       this machine — proven before any Core→LLVM code exists.
-- [ ] The four corpus programs reach `CoreModule` through the real pipeline, and
+- [x] The four corpus programs reach `CoreModule` through the real pipeline, and
       whether any recorder gap was closed is stated as fact.
-- [ ] `module.verify()` passes for every corpus program.
-- [ ] Out-of-subset constructs produce specific `Unsupported` errors; nothing
+- [x] `module.verify()` passes for every corpus program.
+- [x] Out-of-subset constructs produce specific `Unsupported` errors; nothing
       panics.
-- [ ] Exactly one external symbol (`printf`) and one generated shim. No runtime
+- [x] Exactly one external symbol (`printf`) and one generated shim. No runtime
       library. No front-end change.
-- [ ] **Four native binaries run and print `3`, `42`, `15`, `-7`** — asserted on
+- [x] **Four native binaries run and print `3`, `42`, `15`, `-7`** — asserted on
       exit status, stdout, and empty stderr.
-- [ ] At least one case drives the real `elya build` binary end to end.
-- [ ] **No `insta` snapshot of LLVM IR exists in this slice.**
-- [ ] **No test can skip** — no `#[ignore]`, no toolchain-probe early return.
-- [ ] `cargo test --all` with no features stays green; every existing snapshot is
+- [x] At least one case drives the real `elya build` binary end to end.
+- [x] **No `insta` snapshot of LLVM IR exists in this slice.**
+- [x] **No test can skip** — no `#[ignore]`, no toolchain-probe early return.
+- [x] `cargo test --all` with no features stays green; every existing snapshot is
       unchanged.
-- [ ] `scripts/check.sh` clippies and tests **both** feature configurations with
+- [x] `scripts/check.sh` clippies and tests **both** feature configurations with
       `-D warnings`.
-- [ ] `Div`, `Rem`, `And`, `Or` are rejected, and §3.4 records why.
+- [x] `Div`, `Rem`, `And`, `Or` are rejected, and §3.4 records why.
+
+**Closed 2026-08-29** (Slice 5b-1 complete). Two items need a word on how the
+repository changed under them:
+
+- *"the default build pulls in no LLVM"* is now **structural, not a feature
+  default**: `elya` and `elya-cli` have no path to `inkwell` in their dependency
+  graphs at all. Only `elya-codegen` does, and only `--features codegen` reaches
+  it. Read `cargo test --all` as `cargo test -p elya -p elya-cli` — the crate
+  split (Task 5 Step 0) made the workspace bigger than `--all` used to mean.
+- *"at least one case drives the real `elya build`"* is met by three cases in
+  `crates/cli/tests/build_cli.rs`, including the one only the CLI can prove: a
+  program that fails the front end exits non-zero **and emits no binary**.
