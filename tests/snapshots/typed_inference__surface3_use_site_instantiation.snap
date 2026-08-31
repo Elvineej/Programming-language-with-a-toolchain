@@ -2,6 +2,7 @@
 source: tests/typed_inference.rs
 expression: "render(src, &t)"
 ---
+6..7 `x` : a
 11..12 `x` : a
 32..34 `id` : fn(Int) -> Int
 32..37 `id(5)` : Int

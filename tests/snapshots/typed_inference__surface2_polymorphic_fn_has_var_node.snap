@@ -2,4 +2,5 @@
 source: tests/typed_inference.rs
 expression: "render(src, &t)"
 ---
+6..7 `x` : a
 11..12 `x` : a

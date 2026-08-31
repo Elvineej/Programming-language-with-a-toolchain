@@ -66,10 +66,23 @@ pub enum CoreLit {
     Unit,
 }
 
+/// One function parameter, carrying the type inference recorded at its span
+/// (Slice 5b-3 §3.3). A named struct rather than a `(String, Ty)` pair because
+/// the affine work (4d-2) identified a parameter multiplicity annotation as a
+/// plausible future field — a tuple would have to be rewritten to grow one.
+#[derive(Clone, Debug)]
+pub struct CoreParam {
+    pub name: String,
+    pub ty: Ty,
+}
+
 #[derive(Clone, Debug)]
 pub struct CoreFn {
     pub name: String,
-    pub params: Rc<[String]>,
+    pub params: Rc<[CoreParam]>,
+    /// The body's root type IS the return type: `lower_block` propagates the
+    /// block type onto the synthesized `Let` spine, so a separate `ret` field
+    /// would be a second source of truth (Slice 5b-3 §3.3).
     pub body: CoreExpr,
 }
 
@@ -93,7 +106,20 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
     let mut fns = Vec::new();
     for d in &module.decls {
         if let Decl::Fn(f) = &d.node {
-            let params: Vec<String> = f.params.iter().map(|p| p.node.name.clone()).collect();
+            let mut params = Vec::with_capacity(f.params.len());
+            for p in &f.params {
+                // The same tripwire `lower_expr` uses for expression spans: an
+                // unrecorded span is a recorder-totality bug, surfaced by name
+                // rather than papered over with a fresh variable.
+                let ty = table
+                    .get(&p.span)
+                    .cloned()
+                    .ok_or(LowerError::Untyped(p.span))?;
+                params.push(CoreParam {
+                    name: p.node.name.clone(),
+                    ty,
+                });
+            }
             let body = lower_block(&f.body.node, table)?;
             fns.push(CoreFn {
                 name: f.name.clone(),
@@ -236,7 +262,7 @@ pub fn pretty_typed(m: &CoreModule, p: &mut TyPrinter) -> String {
             if i > 0 {
                 s.push(' ');
             }
-            s.push_str(param);
+            s.push_str(&param.name);
         }
         s.push_str(") ");
         pretty_expr(&f.body, p, &mut s);

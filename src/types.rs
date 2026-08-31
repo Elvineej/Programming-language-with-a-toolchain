@@ -1906,6 +1906,14 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             let (params, amb_f, result) = member_ty[&i].clone();
             env.push();
             for (p, pty) in f.params.iter().zip(&params) {
+                // Slice 5b-3 §3.2: record the parameter's type at its OWN span,
+                // so `lower_module` can look it up the same way it looks up an
+                // expression's. The precedent for recording a non-expression
+                // span is the callee-span insert in the `Call` arm. Recorded
+                // pre-zonk like every other entry — the single zonk pass at the
+                // end of this function maps over the whole table, so these
+                // resolve for free.
+                inf.node_types.insert(p.span, pty.clone());
                 env.insert(
                     &p.node.name,
                     Scheme {
@@ -2181,13 +2189,19 @@ mod tests {
         assert!(pd.is_empty(), "{pd:?}");
         let (diags, table) = infer_with_types(&Session::new(), &m);
         assert!(diags.is_empty(), "{diags:?}");
-        // Coverage: the four expression nodes `x`, `y`, `1`, `y + 1` — each once.
+        // Coverage: the four expression nodes `x`, `y`, `1`, `y + 1`, plus the
+        // PARAMETER span `x` at 7..8 that the SCC loop records (Slice 5b-3
+        // §3.2) — each once. The count is the tripwire: it moved 4 → 5 exactly
+        // when parameters started being recorded, and it would move again if a
+        // second recording path appeared.
         assert_eq!(
             table.len(),
-            4,
+            5,
             "wrapper must record every node once: {table:?}"
         );
-        // Ordering: all four zonked to Int (a record-time table would show vars).
+        // Ordering: all five zonked to Int (a record-time table would show vars).
+        // The parameter entry is included, which is the whole reason §3.2 could
+        // record it pre-zonk: the single zonk pass maps over the WHOLE table.
         assert!(
             table.values().all(|v| v == "Int"),
             "record-then-zonk violated — a node kept its pre-zonk var: {table:?}"

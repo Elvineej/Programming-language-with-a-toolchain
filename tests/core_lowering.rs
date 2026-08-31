@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use elya::core::{lower_module, pretty_typed, CoreExpr, CoreKind, CoreModule};
 use elya::parse::parse_module;
 use elya::span::Span;
-use elya::types::{infer_typed_table, Ty, TyPrinter};
+use elya::types::{infer_typed_table, Ty, TyCon, TyPrinter};
 use elya::Session;
 
 /// A rendered type is a bare type variable iff it is `[a-z][0-9]*`.
@@ -305,5 +305,36 @@ fn if_lowers_to_a_two_branch_core_node() {
             .iter()
             .any(|n| matches!(n.kind, CoreKind::If(..))),
         "the walk helper must reach into If children"
+    );
+}
+
+// --- Slice 5b-3 §3.3: CoreFn carries its signature --------------------------
+
+#[test]
+fn core_parameters_carry_their_inferred_types() {
+    // The back end declares an LLVM function type from these. A parameter that
+    // reached Core as a bare name would leave the back end guessing.
+    let src = "fn add3(x) { x + 3 }
+pub fn main() { add3(4) }
+";
+    let (core, _table) = lower_src(src);
+    let add3 = core
+        .fns
+        .iter()
+        .find(|f| f.name == "add3")
+        .expect("add3 lowered");
+    assert_eq!(add3.params.len(), 1);
+    assert_eq!(add3.params[0].name, "x");
+    assert!(
+        matches!(add3.params[0].ty, Ty::Base(TyCon::Int)),
+        "{:?}",
+        add3.params[0].ty
+    );
+    // The body's root type IS the return type (§3.3) — there is no separate
+    // field that could disagree with it.
+    assert!(
+        matches!(add3.body.ty, Ty::Base(TyCon::Int)),
+        "{:?}",
+        add3.body.ty
     );
 }
