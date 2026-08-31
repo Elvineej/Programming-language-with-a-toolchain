@@ -291,6 +291,16 @@ fn lower_expr<'ctx>(
     e: &CoreExpr,
     env: &mut HashMap<String, IntValue<'ctx>>,
 ) -> Result<IntValue<'ctx>, CodegenError> {
+    // Check for "function used as a value" BEFORE repr_ty, because a function
+    // name in value position has a function type that repr_ty will reject as
+    // "unrepresentable type" — but the correct refusal is the more specific
+    // "function used as a value" (§5.4's companion).
+    if let CoreKind::Var(x) = &e.kind {
+        if !env.contains_key(x) && decls.contains_key(x) {
+            return Err(CodegenError::Unsupported("function used as a value"));
+        }
+    }
+
     let node_ty = repr_ty(ctx, &e.ty)?;
     match &e.kind {
         CoreKind::Lit(CoreLit::Int(n)) => Ok(node_ty.const_int(*n as u64, true)),
@@ -298,15 +308,6 @@ fn lower_expr<'ctx>(
         CoreKind::Lit(_) => Err(CodegenError::Unsupported("non-Int literal")),
         CoreKind::Var(x) => match env.get(x) {
             Some(v) => Ok(*v),
-            // §5.4's companion: a bare top-level function name in value
-            // position. Legal Elya (`let g = worker  g()` type-checks — see
-            // typed_inference's surface4), and it is exactly what N5's closures
-            // will make representable. Until then it gets its own message
-            // rather than the generic "unbound var", because "unbound" would
-            // point the reader at name resolution instead of at this gap.
-            None if decls.contains_key(x) => {
-                Err(CodegenError::Unsupported("function used as a value"))
-            }
             None => Err(CodegenError::Unsupported("unbound var")),
         },
         CoreKind::Let(x, rhs, body) => {
@@ -892,5 +893,134 @@ mod tests {
             kind: CoreKind::Let("x".into(), Rc::new(int_lit(1)), Rc::new(outer_body)),
         };
         emit_ir(&main_fn(body)).expect("shadowed let verifies");
+    }
+
+    // --- §5: the five refusals ---------------------------------------------
+    // Each removes a program from the set BOTH back ends accept, so none of
+    // these violates the §3.4 fidelity rule. Silently mis-compiling would.
+
+    #[test]
+    fn rejects_six_parameters_before_emission_begins() {
+        // §5.1. The most load-bearing refusal in the slice: past five
+        // parameters, a win64 guaranteed tail call hits `LLVM ERROR: Can't
+        // handle guaranteed tail call under win64 yet`, a `report_fatal_error`
+        // with no source span that kills the process outright. No `Result` can
+        // catch it, so the scan must complete before any emission starts.
+        let err = emit_ir(&core_of(
+            "fn six(a, b, c, d, e, f) { a + b + c + d + e + f }\n\
+             pub fn main() { six(1, 2, 3, 4, 5, 6) }\n",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("function takes more than five parameters")
+            ),
+            "{err:?}"
+        );
+        // Five is the boundary, and it is exercised, not only refused: the
+        // `five_params` corpus program compiles and runs in
+        // tests/native_codegen.rs.
+        assert_eq!(MAX_PARAMS, 5);
+    }
+
+    #[test]
+    fn a_polymorphic_function_refuses_the_whole_module() {
+        // §5.2 / obligation T2. `repr_ty` refuses `Ty::Var(_)`, and `declare_all`
+        // runs it over every parameter and body type in the module — so `id`
+        // refuses this module even though `main` never calls it. That
+        // whole-module strictness is deliberate; the relaxation path (emit only
+        // what is reachable from `main`) is recorded as T2, not taken here.
+        let err = emit_ir(&core_of("fn id(x) { x }\npub fn main() { 1 }\n")).unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported("unrepresentable type")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_computed_callee_specifically() {
+        // §5.3, witnessed by a program a user could actually write. The Pratt
+        // parser applies the postfix call loop to ANY atom and `(expr)` unwraps
+        // with no wrapper node, so this parses to `Call { callee: Lambda, .. }`
+        // and lowers to `App(Lambda, ..)` — it really does reach the back end.
+        //
+        // Order matters and is in our control: `build_elya_call` inspects the
+        // callee kind FIRST, so "computed callee" fires before the pre-existing
+        // `Lambda` arm of `lower_expr` is ever visited. If this test starts
+        // reporting `Unsupported("Lambda")`, that ordering has been inverted.
+        let err = emit_ir(&core_of("pub fn main() { (fn(x) { x + 1 })(3) }\n")).unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported("computed callee")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_callee_that_is_not_a_top_level_function() {
+        // §5.4. Hand-built, because the type checker rejects calling an unbound
+        // name in the front end — no surface program can reach this arm today.
+        // The refusal still has to exist: `lower_module` is a public API, and a
+        // future front-end change must fail loudly here rather than emit a call
+        // to a symbol that was never declared.
+        let call = CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Int),
+            kind: CoreKind::App(
+                Rc::new(CoreExpr {
+                    span: Span::EMPTY,
+                    ty: Ty::Base(TyCon::Int),
+                    kind: CoreKind::Var("nope".to_string()),
+                }),
+                Rc::from([]),
+            ),
+        };
+        let err = emit_ir(&main_fn(call)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("callee is not a top-level function")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_function_name_in_value_position() {
+        // §5.4's companion. This IS legal Elya — typed_inference's surface4
+        // type-checks `let g = worker  g()` — so the program reaches the back
+        // end and gets its own message rather than the generic "unbound var",
+        // which would point a reader at name resolution instead of at this gap.
+        // N5 (closures) is what makes it representable.
+        //
+        // The `let` binding is lowered before its body, so this message fires
+        // first; the `f(1)` call never gets as far as `build_elya_call`.
+        let err = emit_ir(&core_of(
+            "fn add3(x) { x + 3 }\npub fn main() {\n  let f = add3\n  f(1)\n}\n",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported("function used as a value")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_bool_returning_helper_compiles_but_a_bool_main_still_refuses() {
+        // §5.5. `require_int`'s SCOPE narrows from "every function" (trivially
+        // just `main` in N1) to "`main` alone". The likely way to get this wrong
+        // is to implement it as scope-PRESERVING — applying `require_int` per
+        // function — which would refuse every ordinary predicate. Both halves
+        // are pinned here, and the first half is exercised end to end by the
+        // `bool_across_a_call` corpus program.
+        emit_ir(&core_of(
+            "fn is_pos(n) { n > 0 }\npub fn main() { if is_pos(3) { 1 } else { 0 } }\n",
+        ))
+        .expect("a Bool-returning helper is legal");
+        let err = emit_ir(&core_of("pub fn main() { 1 < 2 }\n")).unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported("non-Int value")),
+            "{err:?}"
+        );
     }
 }
