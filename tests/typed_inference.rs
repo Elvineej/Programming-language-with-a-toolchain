@@ -181,3 +181,53 @@ fn cross_node_variable_coherence() {
         "shared Names should give >=2 distinct var letters: {t:?}"
     );
 }
+
+// --- Slice 5b-3 §3.2: parameter spans carry their types ----------------------
+// These are assertions, not snapshots. The snapshots below prove the table
+// *renders* right; these prove the specific key the Core lowering will look up
+// is present and resolved. That is the invariant `lower_module` depends on.
+
+#[test]
+fn parameter_spans_carry_their_zonked_types() {
+    let src = "fn add1(n) { n + 1 }\n";
+    let (m, pd) = parse_module(&Session::new(), src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let (diags, table) = infer_with_types(&Session::new(), &m);
+    assert!(diags.is_empty(), "type errors: {diags:?}");
+    let elya::ast::Decl::Fn(f) = &m.decls[0].node else {
+        panic!("expected a fn decl")
+    };
+    let p = &f.params[0];
+    assert_eq!(&src[p.span.start as usize..p.span.end as usize], "n");
+    assert_eq!(
+        table.get(&p.span).map(String::as_str),
+        Some("Int"),
+        "parameter span carries no type: {table:?}"
+    );
+}
+
+#[test]
+fn a_polymorphic_parameter_span_is_a_var_and_survives_zonking() {
+    // The zonk half of the invariant. Types are recorded PRE-zonk (record-then-
+    // zonk, spec §3); the single pass at the end of `infer_all` maps over the
+    // WHOLE table, so a parameter entry resolves like any other. A leaked
+    // internal token or an unresolved var would show up here.
+    let src = "fn id(x) { x }\n";
+    let (m, pd) = parse_module(&Session::new(), src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let (diags, table) = infer_with_types(&Session::new(), &m);
+    assert!(diags.is_empty(), "type errors: {diags:?}");
+    let elya::ast::Decl::Fn(f) = &m.decls[0].node else {
+        panic!("expected a fn decl")
+    };
+    let p = &f.params[0];
+    let rendered = table.get(&p.span).expect("parameter span carries no type");
+    assert!(is_var(rendered), "expected a type variable, got {rendered}");
+    // The parameter and the body are the SAME variable, so the same letter must
+    // render for both — the cross-node coherence property, at a param span.
+    let same: Vec<_> = table.values().filter(|v| *v == rendered).collect();
+    assert!(
+        same.len() >= 2,
+        "param and body should share one var: {table:?}"
+    );
+}

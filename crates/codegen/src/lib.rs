@@ -666,7 +666,10 @@ mod tests {
     #[test]
     fn rejects_parameterised_main_specifically() {
         let mut m = main_fn(int_lit(1));
-        m.fns[0].params = Rc::from(["x".to_string()]);
+        m.fns[0].params = Rc::from([elya::core::CoreParam {
+            name: "x".into(),
+            ty: Ty::Base(TyCon::Int),
+        }]);
         let err = emit_ir(&m).unwrap_err();
         assert!(
             matches!(err, CodegenError::Unsupported("main takes parameters")),
