@@ -180,9 +180,29 @@ fn compile_and_link(core: &elya::core::CoreModule, dir: &Path, tag: &str) -> Pat
     exe
 }
 
+/// Windows STATUS_STACK_OVERFLOW. Observing it from a corpus binary means one
+/// thing: a call that must have been eliminated was not. Inert on other
+/// platforms, where no exit code collides with it.
+const STACK_OVERFLOW: i32 = 0xC00000FDu32 as i32; // -1073741571
+
+/// Spec §7.2: the distinct failure signal, diagnosed BY NAME. Without this, a
+/// tail-call regression surfaces as `binary exited ExitStatus(3221225725)` —
+/// a number nobody recognizes — instead of naming its own cause.
+fn diagnose_stack_overflow(status: &std::process::ExitStatus, tag: &str) {
+    if status.code() == Some(STACK_OVERFLOW) {
+        panic!(
+            "{tag}: STATUS_STACK_OVERFLOW (0x{:08X}). A tail call that `musttail` \
+             was supposed to eliminate grew the machine stack instead. This is the \
+             tail-call guarantee failing, not a generic crash.",
+            STACK_OVERFLOW as u32
+        );
+    }
+}
+
 /// The three required assertions per case (§5): exit status, stdout, empty stderr.
 fn assert_runs(exe: &Path, expected: &str) {
     let out = Command::new(exe).output().expect("run produced binary");
+    diagnose_stack_overflow(&out.status, &exe.display().to_string());
     assert!(out.status.success(), "binary exited {:?}", out.status);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), expected);
     assert!(
@@ -351,6 +371,7 @@ fn native_output_matches_the_evaluator_across_the_function_corpus() {
         let core = lower_src(src);
         let exe = compile_and_link(&core, &dir, tag);
         let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
         assert!(
             out.status.success(),
             "{tag}: binary exited {:?}",
@@ -430,6 +451,7 @@ fn native_output_matches_the_evaluator_across_the_control_flow_corpus() {
         let core = lower_src(src);
         let exe = compile_and_link(&core, &dir, tag);
         let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
         assert!(
             out.status.success(),
             "{tag}: binary exited {:?}",
@@ -454,6 +476,7 @@ fn the_differential_check_also_covers_the_arithmetic_corpus() {
         let core = lower_src(src);
         let exe = compile_and_link(&core, &dir, tag);
         let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
         assert!(
             out.status.success(),
             "{tag}: binary exited {:?}",
@@ -461,6 +484,97 @@ fn the_differential_check_also_covers_the_arithmetic_corpus() {
         );
         let native = String::from_utf8_lossy(&out.stdout).trim().to_string();
         assert_eq!(native, eval_main_int(src), "{tag}: native diverges");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The 5b-3 §7.1 corpus, tail half: (tag, source, expected stdout). These two
+/// are the reason this slice exists. Both recur one million deep; without
+/// `musttail` both overflow the 1 MiB Windows stack long before returning.
+const TAIL_CORPUS: &[(&str, &str, &str)] = &[
+    (
+        "deep_self_tail_recursion",
+        "fn down(n) { if n == 0 { 0 } else { down(n - 1) } }\npub fn main() { down(1000000) }\n",
+        "0",
+    ),
+    (
+        // `main`'s call to `ev` sits in `if`-condition position, so it is an
+        // ordinary non-tail call — one frame, which is fine. The million-deep
+        // recursion is the ev<->od pair, and both of those calls are in tail
+        // position. The `if` wrapper is what keeps `main` Int-returning, which
+        // §5.5's `require_int` demands while `ev` itself returns Bool.
+        "deep_mutual_tail_recursion",
+        "fn ev(n) { if n == 0 { True } else { od(n - 1) } }\n\
+         fn od(n) { if n == 0 { False } else { ev(n - 1) } }\n\
+         pub fn main() { if ev(1000000) { 1 } else { 0 } }\n",
+        "1",
+    ),
+];
+
+#[test]
+fn mutual_tail_recursion_at_one_million_is_eliminated() {
+    // THE primary acceptance criterion for this slice.
+    //
+    // Self-recursion is NOT sufficient evidence. A self-call can be turned into
+    // a branch back to the entry block, so `down(1000000)` could pass with no
+    // tail-call machinery at all — the compiler would have proved something
+    // weaker than what we claim. `ev` and `od` cannot be looped without merging
+    // the two functions, so only the mutual case proves that `musttail`, and
+    // not an accidental loop rewrite, is what bounds the stack.
+    //
+    // The proof is black-box: the binary exits 0 and prints the right answer.
+    // The distinct failure signal is STATUS_STACK_OVERFLOW, diagnosed by name
+    // inside `assert_runs`.
+    let (tag, src, expected) = TAIL_CORPUS[1];
+    assert_eq!(
+        tag, "deep_mutual_tail_recursion",
+        "TAIL_CORPUS was reordered"
+    );
+    let dir = temp_dir("mutual-tail");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, tag);
+    assert_runs(&exe, expected);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn self_tail_recursion_at_one_million_is_eliminated() {
+    // The corroborating case, weaker on its own than the mutual one above but
+    // cheap and a useful bisection point: if this passes and the mutual test
+    // fails, the two-pass declaration scheme is what broke, not `musttail`.
+    let (tag, src, expected) = TAIL_CORPUS[0];
+    assert_eq!(tag, "deep_self_tail_recursion", "TAIL_CORPUS was reordered");
+    let dir = temp_dir("self-tail");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, tag);
+    assert_runs(&exe, expected);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_tail_corpus() {
+    // Both bounds, on the same two programs (spec §6.2). `elya run` bounds these
+    // by TCE in the CEK machine, enforced at test time by tests/tce.rs's K_MAX;
+    // native bounds them by `musttail`, enforced at build time by the LLVM
+    // verifier. This asserts the two agree on the ANSWER — §6.3's L1 is explicit
+    // that the harness does not compare resource behavior.
+    let dir = temp_dir("differential-tail");
+    for (tag, src, _) in TAIL_CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        assert!(
+            out.status.success(),
+            "{tag}: binary exited {:?}",
+            out.status
+        );
+        let native = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            native,
+            eval_main_int(src),
+            "{tag}: native output diverges from the evaluator"
+        );
     }
     std::fs::remove_dir_all(&dir).ok();
 }
