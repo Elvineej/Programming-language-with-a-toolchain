@@ -2,7 +2,9 @@
 //! subset (Int literals, Var, Prim(Add/Sub/Mul), Let); Slice 5b-2 adds control
 //! flow — `If` as a three-block diamond joined by `phi`, `Bool` as i1, the six
 //! comparisons as signed `icmp`, and `&&`/`||` as bit-wise `and`/`or` on i1.
-//! Two value widths (i64, i1), one function (`@elya_main`), no effects.
+//! Slice 5b-3 adds functions: every top-level fn is emitted, mangled `elya_*`
+//! and carrying `tailcc`, in two passes so mutual recursion resolves without
+//! ordering the module. Two value widths (i64, i1), no closures, no effects.
 //!
 //! Proof is EXECUTION (tests/native_codegen.rs), never IR inspection (spec §0):
 //! `emit_ir` is a debugging aid and nothing in the suite asserts on its output.
@@ -24,7 +26,10 @@ use inkwell::module::Module;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
+use inkwell::types::BasicMetadataTypeEnum;
 use inkwell::types::IntType;
+use inkwell::values::BasicMetadataValueEnum;
+use inkwell::values::CallSiteValue;
 use inkwell::values::FunctionValue;
 use inkwell::values::IntValue;
 use inkwell::AddressSpace;
@@ -107,19 +112,37 @@ fn eq_operand_label(op: BinOp) -> &'static str {
     }
 }
 
-/// §3.1 module shape: exactly one function, named `main`, zero parameters.
-/// Rejections are errors, not silent skips. N2 lifts the first and third.
-fn validate_module(core: &CoreModule) -> Result<&CoreFn, CodegenError> {
-    if core.fns.len() > 1 {
-        return Err(CodegenError::Unsupported("multi-function module"));
-    }
+/// Every Elya function gets this prefix (§4.1). Prefixing is injective, so no
+/// two Elya names collide, and no Elya name can collide with the three symbols
+/// this back end generates or imports: `@main` (the print shim), `@printf`
+/// (external), `@.fmt` (the format string). `main` mangles to `elya_main` —
+/// byte-identical to the name 5b-1 already hardcoded, so the shim is unchanged.
+/// An Elya function literally named `elya_main` mangles to `elya_elya_main`.
+fn mangle(name: &str) -> String {
+    format!("elya_{name}")
+}
+
+/// LLVM's `tailcc`. Value from llvm/IR/CallingConv.h: `Tail = 18`. EVERY
+/// declared Elya function and EVERY Elya call site uses it. That uniformity is
+/// what makes `musttail`'s convention-match requirement (Task 4) true by
+/// construction rather than by case analysis.
+const TAILCC: u32 = 18;
+
+/// The flat arity cap (§5.1, from §2's probe matrix). Beyond it, a win64
+/// guaranteed tail call hits `LLVM ERROR: Can't handle guaranteed tail call
+/// under win64 yet` — a `report_fatal_error` with no source span that kills the
+/// process. Refusing at 6 is what keeps that unreachable.
+const MAX_PARAMS: usize = 5;
+
+/// §3.1 module shape, as N2 leaves it: SOME function is named `main` and takes
+/// no parameters. The "exactly one function" half is gone — that is the whole
+/// point of this slice.
+fn find_main(core: &CoreModule) -> Result<&CoreFn, CodegenError> {
     let f = core
         .fns
-        .first()
+        .iter()
+        .find(|f| f.name == "main")
         .ok_or(CodegenError::Unsupported("no `main`"))?;
-    if f.name != "main" {
-        return Err(CodegenError::Unsupported("no `main`"));
-    }
     if !f.params.is_empty() {
         return Err(CodegenError::Unsupported("main takes parameters"));
     }
@@ -154,6 +177,106 @@ fn require_int(ty: &Ty) -> Result<(), CodegenError> {
     }
 }
 
+/// Pass 1 of §4.2: declare every function before any body is emitted, so a body
+/// can call a function whose body does not exist yet. That is what makes mutual
+/// recursion resolve without ordering the module.
+///
+/// The map is keyed by the UNMANGLED Elya name — that is what a `CoreKind::Var`
+/// callee carries. Mangling happens only at `add_function`.
+///
+/// This is also where §5.2 is enforced: `repr_ty` runs over every parameter
+/// type and every body type in the module, so a polymorphic or otherwise
+/// unrepresentable function refuses the whole module here — even one `main`
+/// never calls. That whole-module strictness is deliberate and tracked as
+/// obligation T2.
+fn declare_all<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+    core: &CoreModule,
+) -> Result<HashMap<String, FunctionValue<'ctx>>, CodegenError> {
+    let mut decls: HashMap<String, FunctionValue<'ctx>> = HashMap::new();
+    for f in &core.fns {
+        // Checked BEFORE `add_function`: LLVM silently uniquifies a duplicate
+        // symbol (`elya_f.1`) rather than complaining, which would give us two
+        // functions where Core has one. Belt and braces — the front end already
+        // rejects duplicate definitions.
+        if decls.contains_key(&f.name) {
+            return Err(CodegenError::Unsupported("duplicate top-level function"));
+        }
+        let mut params: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::with_capacity(f.params.len());
+        for p in f.params.iter() {
+            params.push(repr_ty(ctx, &p.ty)?.into());
+        }
+        let fn_ty = repr_ty(ctx, &f.body.ty)?.fn_type(&params, false);
+        let func = module.add_function(&mangle(&f.name), fn_ty, None);
+        // NOTE the plural: `set_call_conventions` is the FunctionValue method.
+        // The call-site method is `set_call_convention`, singular. Both are
+        // needed and they must agree, or the module is wrong.
+        func.set_call_conventions(TAILCC);
+        decls.insert(f.name.clone(), func);
+    }
+    Ok(decls)
+}
+
+/// Pass 2 of §4.2. The value environment starts empty and is seeded from the
+/// LLVM parameters, so each function gets its own — nothing leaks across a
+/// call, which is what `distinct_envs` pins.
+fn emit_body<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    decls: &HashMap<String, FunctionValue<'ctx>>,
+    f: &CoreFn,
+) -> Result<(), CodegenError> {
+    let func = *decls
+        .get(&f.name)
+        .ok_or(CodegenError::Unsupported("undeclared function"))?;
+    let entry = ctx.append_basic_block(func, "entry");
+    b.position_at_end(entry);
+    let mut env: HashMap<String, IntValue<'ctx>> = HashMap::new();
+    for (i, p) in f.params.iter().enumerate() {
+        let v = func
+            .get_nth_param(i as u32)
+            .ok_or_else(|| internal("declared arity disagrees with Core arity"))?;
+        env.insert(p.name.clone(), v.into_int_value());
+    }
+    let result = lower_expr(ctx, func, b, decls, &f.body, &mut env)?;
+    b.build_return(Some(&result)).map_err(internal)?;
+    Ok(())
+}
+
+/// One place where an Elya call becomes an LLVM call, used from both `lower_expr`
+/// (ordinary position) and, in Task 4, `lower_tail` (tail position). The only
+/// difference between the two is the tail-call kind the caller sets afterwards.
+///
+/// The callee kind is inspected FIRST, so §5.3's "computed callee" refusal fires
+/// before any argument is lowered and before the existing `Lambda` arm is ever
+/// reached.
+fn build_elya_call<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    decls: &HashMap<String, FunctionValue<'ctx>>,
+    callee: &CoreExpr,
+    args: &[CoreExpr],
+    env: &mut HashMap<String, IntValue<'ctx>>,
+) -> Result<CallSiteValue<'ctx>, CodegenError> {
+    let CoreKind::Var(name) = &callee.kind else {
+        return Err(CodegenError::Unsupported("computed callee"));
+    };
+    let target = *decls.get(name).ok_or(CodegenError::Unsupported(
+        "callee is not a top-level function",
+    ))?;
+    let mut vals: Vec<BasicMetadataValueEnum<'ctx>> = Vec::with_capacity(args.len());
+    for a in args.iter() {
+        // Left to right, matching the evaluator's argument order.
+        vals.push(lower_expr(ctx, func, b, decls, a, env)?.into());
+    }
+    let site = b.build_call(target, &vals, "c").map_err(internal)?;
+    // Singular here (CallSiteValue), plural on the declaration (FunctionValue).
+    site.set_call_convention(TAILCC);
+    Ok(site)
+}
+
 /// §3.3 expression lowering: a recursive fold returning an `IntValue`, threading
 /// a binding environment. NO alloca, NO mem2reg — bindings are immutable and
 /// values map directly to SSA registers; the save/restore around `Let` is what
@@ -164,6 +287,7 @@ fn lower_expr<'ctx>(
     ctx: &'ctx Context,
     func: FunctionValue<'ctx>,
     b: &Builder<'ctx>,
+    decls: &HashMap<String, FunctionValue<'ctx>>,
     e: &CoreExpr,
     env: &mut HashMap<String, IntValue<'ctx>>,
 ) -> Result<IntValue<'ctx>, CodegenError> {
@@ -172,14 +296,23 @@ fn lower_expr<'ctx>(
         CoreKind::Lit(CoreLit::Int(n)) => Ok(node_ty.const_int(*n as u64, true)),
         CoreKind::Lit(CoreLit::Bool(v)) => Ok(node_ty.const_int(u64::from(*v), false)),
         CoreKind::Lit(_) => Err(CodegenError::Unsupported("non-Int literal")),
-        CoreKind::Var(x) => env
-            .get(x)
-            .copied()
-            .ok_or(CodegenError::Unsupported("unbound var")),
+        CoreKind::Var(x) => match env.get(x) {
+            Some(v) => Ok(*v),
+            // §5.4's companion: a bare top-level function name in value
+            // position. Legal Elya (`let g = worker  g()` type-checks — see
+            // typed_inference's surface4), and it is exactly what N5's closures
+            // will make representable. Until then it gets its own message
+            // rather than the generic "unbound var", because "unbound" would
+            // point the reader at name resolution instead of at this gap.
+            None if decls.contains_key(x) => {
+                Err(CodegenError::Unsupported("function used as a value"))
+            }
+            None => Err(CodegenError::Unsupported("unbound var")),
+        },
         CoreKind::Let(x, rhs, body) => {
-            let v = lower_expr(ctx, func, b, rhs, env)?;
+            let v = lower_expr(ctx, func, b, decls, rhs, env)?;
             let prev = env.insert(x.clone(), v);
-            let out = lower_expr(ctx, func, b, body, env);
+            let out = lower_expr(ctx, func, b, decls, body, env);
             // Restore any shadowed binding — `let x = 1; let x = x + 1` stays correct.
             match prev {
                 Some(p) => {
@@ -206,8 +339,8 @@ fn lower_expr<'ctx>(
             {
                 return Err(CodegenError::Unsupported(eq_operand_label(*op)));
             }
-            let l = lower_expr(ctx, func, b, &args[0], env)?;
-            let r = lower_expr(ctx, func, b, &args[1], env)?;
+            let l = lower_expr(ctx, func, b, decls, &args[0], env)?;
+            let r = lower_expr(ctx, func, b, decls, &args[1], env)?;
             // Deliberately NO nsw/nuw flags: defined two's-complement wrapping
             // (§3.4). Overflow reconciliation with the evaluator is tracked in
             // spec §11 — not silently decided here.
@@ -233,10 +366,18 @@ fn lower_expr<'ctx>(
             };
             built.map_err(internal)
         }
-        CoreKind::App(..) => Err(CodegenError::Unsupported("App")),
+        CoreKind::App(callee, args) => {
+            // Ordinary (non-tail) position: `tailcc` convention, NO tail-call
+            // kind. Task 4 adds the tail-position path.
+            let site = build_elya_call(ctx, func, b, decls, callee, args, env)?;
+            site.try_as_basic_value()
+                .left()
+                .map(|v| v.into_int_value())
+                .ok_or(CodegenError::Unsupported("call returned no value"))
+        }
         CoreKind::Lambda(..) => Err(CodegenError::Unsupported("Lambda")),
         CoreKind::If(cond, then_e, else_e) => {
-            let c = lower_expr(ctx, func, b, cond, env)?;
+            let c = lower_expr(ctx, func, b, decls, cond, env)?;
             // The checker unifies the condition with Bool, so §3.1's mapping
             // makes it i1. Anything else is a bug in our own lowering, surfaced
             // rather than handed to `build_conditional_branch`.
@@ -250,7 +391,7 @@ fn lower_expr<'ctx>(
                 .map_err(internal)?;
 
             b.position_at_end(then_bb);
-            let tv = lower_expr(ctx, func, b, then_e, env)?;
+            let tv = lower_expr(ctx, func, b, decls, then_e, env)?;
             // THE TRAP (§3.2): a nested `if` inside this branch left the builder
             // in ITS join block, not in `then_bb`. `phi` names the block control
             // actually flows FROM, so read the exit block back from the builder
@@ -261,7 +402,7 @@ fn lower_expr<'ctx>(
             b.build_unconditional_branch(join_bb).map_err(internal)?;
 
             b.position_at_end(else_bb);
-            let ev = lower_expr(ctx, func, b, else_e, env)?;
+            let ev = lower_expr(ctx, func, b, decls, else_e, env)?;
             let else_exit = b
                 .get_insert_block()
                 .ok_or(CodegenError::Unsupported("builder left no block"))?;
@@ -285,23 +426,43 @@ fn lower_expr<'ctx>(
 /// and `@main` shim. Returns the handle so `emit_ir` and `compile_module` share
 /// one construction path.
 fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'ctx>, CodegenError> {
-    let f = validate_module(core)?;
-    // §3.1: `main` returns i64. The fold now speaks two widths, so this is the
-    // one place that still insists on Int.
-    require_int(&f.body.ty)?;
+    // §5.1, FIRST STATEMENT ON PURPOSE. The failure this prevents is LLVM's
+    // `report_fatal_error` for a win64 guaranteed tail call: no source span, no
+    // `Result`, the process simply dies. It must therefore be impossible for
+    // any emission to have begun when this fires — so it is a whole-module scan
+    // that runs before the module even exists. Tracked as obligation T1.
+    for f in &core.fns {
+        if f.params.len() > MAX_PARAMS {
+            return Err(CodegenError::Unsupported(
+                "function takes more than five parameters",
+            ));
+        }
+    }
+
+    let main = find_main(core)?;
+    // §5.5: `main` ALONE. The scope narrows from "every function" (which was
+    // trivially just `main` in N1) to "`main`", because `@elya_main`'s signature
+    // says i64 and the shim's format string is `%lld`. Applying this per
+    // function would refuse every ordinary predicate — see `is_pos` in the
+    // corpus — and is the most likely way to implement this section wrong.
+    require_int(&main.body.ty)?;
+
     let i64t = ctx.i64_type();
     let module = ctx.create_module("elya");
-    let func = module.add_function("elya_main", i64t.fn_type(&[], false), None);
-    let entry = ctx.append_basic_block(func, "entry");
+
+    // §4.2: declare everything, then emit every body.
+    let decls = declare_all(ctx, &module, core)?;
     let b = ctx.create_builder();
-    b.position_at_end(entry);
-    let mut env = HashMap::new();
-    let result = lower_expr(ctx, func, &b, &f.body, &mut env)?;
-    b.build_return(Some(&result)).map_err(internal)?;
+    for f in &core.fns {
+        emit_body(ctx, &b, &decls, f)?;
+    }
+    let elya_main = *decls
+        .get("main")
+        .ok_or(CodegenError::Unsupported("no `main`"))?;
 
     // §3.5/§4: the print convention is ONE external symbol (printf) plus ONE
-    // generated shim (@main). Elya's namespace stays clean for N2; deleting the
-    // convention later is deleting a function, not unpicking a fold.
+    // generated shim (@main). The shim stays `ccc` — it is the C entry point —
+    // and its call to @elya_main is an ordinary call.
     let i32t = ctx.i32_type();
     let i8t = ctx.i8_type();
     let ptrt = ctx.ptr_type(AddressSpace::default());
@@ -323,9 +484,15 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let shim = module.add_function("main", i32t.fn_type(&[], false), None);
     let shim_entry = ctx.append_basic_block(shim, "entry");
     b.position_at_end(shim_entry);
-    let v = b
-        .build_call(func, &[], "v")
-        .map_err(internal)?
+    let site = b.build_call(elya_main, &[], "v").map_err(internal)?;
+    // The shim itself stays `ccc`, but @elya_main is now `tailcc`, so THIS CALL
+    // SITE must say so too. A site whose convention disagrees with its callee's
+    // declaration is a miscompile, not a verifier error — LLVM will happily emit
+    // it. "The shim survives untouched" (§2 Finding 4) means the shim is still
+    // `ccc` and its call is not `musttail`; it does NOT mean this line is
+    // unchanged.
+    site.set_call_convention(TAILCC);
+    let v = site
         .try_as_basic_value()
         .left()
         .ok_or_else(|| internal("elya_main did not return a value"))?;
@@ -440,6 +607,18 @@ mod tests {
         }
     }
 
+    /// Parse → infer → lower a real Elya source through the front end. Used by
+    /// every test whose witness must be a program a user could actually write,
+    /// rather than a hand-built `CoreModule`.
+    fn core_of(src: &str) -> elya::core::CoreModule {
+        let session = elya::Session::new();
+        let (m, pd) = elya::parse::parse_module(&session, src);
+        assert!(pd.is_empty(), "parse: {pd:?}");
+        let (diags, table) = elya::types::infer_typed_table(&session, &m);
+        assert!(diags.is_empty(), "type errors: {diags:?}");
+        elya::core::lower_module(&m, &table).expect("lowers")
+    }
+
     #[test]
     fn corpus_verifies() {
         // Layer 1 (§8): verifier-clean IR for the §5 corpus. Cheap structural
@@ -461,14 +640,42 @@ mod tests {
             "pub fn main() {\n  let a = if 1 < 2 && 3 > 4 { 1 } else { 0 }\n  let b = if 1 < 2 && 3 < 4 { 1 } else { 0 }\n  let c = if 1 > 2 || 3 > 4 { 1 } else { 0 }\n  let d = if 1 > 2 || 3 < 4 { 1 } else { 0 }\n  a + b + c + d\n}\n",
         ];
         for src in corpus {
-            let session = elya::Session::new();
-            let (m, pd) = elya::parse::parse_module(&session, src);
-            assert!(pd.is_empty(), "parse: {pd:?}");
-            let (diags, table) = elya::types::infer_typed_table(&session, &m);
-            assert!(diags.is_empty(), "type errors: {diags:?}");
-            let core = elya::core::lower_module(&m, &table).expect("lowers");
-            emit_ir(&core).expect("verifier-clean IR");
+            emit_ir(&core_of(src)).expect("verifier-clean IR");
         }
+    }
+
+    #[test]
+    fn a_multi_function_module_emits_both_functions() {
+        // The headline shape change. `emit_ir` returns IR as a debugging aid
+        // only (spec §7) — it is never snapshotted and never asserted on
+        // structurally. What is asserted here is that `build_module` accepted a
+        // two-function module at all and that the verifier passed it; the
+        // behaviour is proven by execution in tests/native_codegen.rs.
+        emit_ir(&core_of(
+            "fn add3(x) { x + 3 }\npub fn main() { add3(4) }\n",
+        ))
+        .expect("a two-function module must emit verifier-clean IR");
+    }
+
+    #[test]
+    fn rejects_a_duplicate_top_level_function_specifically() {
+        // Hand-built: the front end rejects duplicate definitions, so no surface
+        // program reaches this. The refusal still has to exist, because LLVM
+        // would silently uniquify the second symbol rather than complain.
+        let mut m = main_fn(int_lit(1));
+        m.fns.push(CoreFn {
+            name: "main".into(),
+            params: Rc::from([]),
+            body: int_lit(2),
+        });
+        let err = emit_ir(&m).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("duplicate top-level function")
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -644,21 +851,6 @@ mod tests {
         let err = emit_ir(&main_fn(e)).unwrap_err();
         assert!(
             matches!(err, CodegenError::Unsupported("Lambda")),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_multi_function_module_specifically() {
-        let mut m = main_fn(int_lit(1));
-        m.fns.push(CoreFn {
-            name: "other".into(),
-            params: Rc::from([]),
-            body: int_lit(2),
-        });
-        let err = emit_ir(&m).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("multi-function module")),
             "{err:?}"
         );
     }

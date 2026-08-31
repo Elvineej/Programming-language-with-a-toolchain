@@ -159,6 +159,10 @@ fn corpus_lowers_to_core_through_the_real_pipeline() {
     // at its span, the perform-callee shape from 5a-2 Task 3). LowerError::
     // Unsupported means the subset was drawn wrong — narrow the corpus, never
     // widen core.rs. Expected: all four lower today, zero gaps closed.
+    // Slice 5b-3 §7.3: the `core.fns.len() == 1` assertion below is scoped to
+    // CORPUS on purpose — the 5b-1 arithmetic programs are single-function and
+    // stay that way. Multi-function lowering is asserted by
+    // `the_function_corpus_lowers_to_multi_function_core`.
     for (tag, src) in CORPUS {
         let core = lower_src(src);
         assert_eq!(core.fns.len(), 1, "{tag}: expected exactly one fn");
@@ -274,6 +278,119 @@ const CONTROL_FLOW_CORPUS: &[(&str, &str, &str)] = &[
         "2",
     ),
 ];
+
+/// The 5b-3 §7.1 corpus, non-tail half: (tag, source, expected stdout). Six
+/// programs, each aimed at one thing multi-function emission can get wrong.
+/// The two deep tail-recursive programs live in TAIL_CORPUS (Task 4) because
+/// they only pass once `musttail` is emitted.
+const FUNCTION_CORPUS: &[(&str, &str, &str)] = &[
+    (
+        "two_functions",
+        "fn add3(x) { x + 3 }\npub fn main() { add3(4) }\n",
+        "7",
+    ),
+    (
+        "five_params",
+        "fn add5(a, b, c, d, e) { a + b + c + d + e }\npub fn main() { add5(1, 2, 3, 4, 5) }\n",
+        "15",
+    ),
+    (
+        // Environments are per-function: both `f` and `g` bind a parameter
+        // named `x`, and `f` shadows its own with a `let`. If the value
+        // environment leaked across the call, or the shadow were not restored,
+        // this prints something other than 50. f(10) = 10*2 + 20 = 40; g(10) =
+        // 10 + f(10) = 50.
+        "distinct_envs",
+        "fn f(x) {\n  let x = x * 2\n  x + 20\n}\nfn g(x) { x + f(x) }\npub fn main() { g(10) }\n",
+        "50",
+    ),
+    (
+        // Calls as operands, including a call whose argument is a call.
+        // dbl(dbl(3)) + dbl(1) = 12 + 2 = 14.
+        "call_in_operand_position",
+        "fn dbl(x) { x * 2 }\npub fn main() { dbl(dbl(3)) + dbl(1) }\n",
+        "14",
+    ),
+    (
+        // An i1 crosses the call boundary and is consumed as an `if`
+        // condition. Also §5.5's live proof that `require_int` applies to
+        // `main` ALONE: `is_pos` returns Bool and must compile.
+        "bool_across_a_call",
+        "fn is_pos(n) { n > 0 }\npub fn main() { if is_pos(3) { 1 } else { 0 } }\n",
+        "1",
+    ),
+    (
+        // Ordinary (non-tail) recursion. Deliberately shallow — spec §6.3
+        // Limitation L1: native non-tail recursion grows the machine stack,
+        // which is bounded differently from the evaluator's Kont stack, and the
+        // harness compares answers, not resource behavior. sum(100) = 5050.
+        "shallow_non_tail_recursion",
+        "fn sum(n) { if n == 0 { 0 } else { n + sum(n - 1) } }\npub fn main() { sum(100) }\n",
+        "5050",
+    ),
+];
+
+#[test]
+fn the_function_corpus_compiles_runs_and_prints_the_expected_answer() {
+    let dir = temp_dir("functions");
+    for (tag, src, expected) in FUNCTION_CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        assert_runs(&exe, expected);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_function_corpus() {
+    // The fidelity teeth, extended to N2. The expected strings above are a
+    // human's arithmetic; this asserts against what the CEK evaluator actually
+    // computes, so a wrong expectation cannot make a wrong compiler look right.
+    let dir = temp_dir("differential-functions");
+    for (tag, src, _) in FUNCTION_CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        let out = Command::new(&exe).output().expect("run produced binary");
+        assert!(
+            out.status.success(),
+            "{tag}: binary exited {:?}",
+            out.status
+        );
+        let native = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            native,
+            eval_main_int(src),
+            "{tag}: native output diverges from the evaluator"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_function_corpus_lowers_to_multi_function_core() {
+    // Spec §7.2's recorder-totality assertion for the new key class, stated
+    // directly: `lower_src` unwraps `lower_module`, so a `LowerError::Untyped`
+    // from a parameter span fails here by name. Also the §7.3 counterpart to
+    // `corpus_lowers_to_core_through_the_real_pipeline`, which stays scoped to
+    // the single-function CORPUS.
+    for (tag, src, _) in FUNCTION_CORPUS {
+        let core = lower_src(src);
+        assert!(core.fns.iter().any(|f| f.name == "main"), "{tag}: no main");
+        for f in &core.fns {
+            assert!(
+                f.params.len() <= 5,
+                "{tag}: {} exceeds the arity cap",
+                f.name
+            );
+        }
+    }
+    let multi = lower_src(FUNCTION_CORPUS[0].1);
+    assert_eq!(
+        multi.fns.len(),
+        2,
+        "two_functions must lower to two Core fns"
+    );
+}
 
 /// The reference side of the differential check (§5): what the CEK evaluator
 /// says `main` is worth, rendered the way the native print shim prints it
