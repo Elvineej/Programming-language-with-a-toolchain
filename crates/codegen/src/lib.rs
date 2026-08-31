@@ -32,6 +32,7 @@ use inkwell::values::BasicMetadataValueEnum;
 use inkwell::values::CallSiteValue;
 use inkwell::values::FunctionValue;
 use inkwell::values::IntValue;
+use inkwell::values::LLVMTailCallKind;
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
@@ -239,9 +240,9 @@ fn emit_body<'ctx>(
             .ok_or_else(|| internal("declared arity disagrees with Core arity"))?;
         env.insert(p.name.clone(), v.into_int_value());
     }
-    let result = lower_expr(ctx, func, b, decls, &f.body, &mut env)?;
-    b.build_return(Some(&result)).map_err(internal)?;
-    Ok(())
+    // Every function body is in tail position by definition; `lower_tail` emits
+    // the terminator, so there is no `build_return` here any more.
+    lower_tail(ctx, func, b, decls, &f.body, &mut env)
 }
 
 /// One place where an Elya call becomes an LLVM call, used from both `lower_expr`
@@ -275,6 +276,85 @@ fn build_elya_call<'ctx>(
     // Singular here (CallSiteValue), plural on the declaration (FunctionValue).
     site.set_call_convention(TAILCC);
     Ok(site)
+}
+
+/// §4.3: the tail half of the emission split. `lower_expr` produces a VALUE;
+/// `lower_tail` emits a TERMINATOR. On `Ok` the current block is terminated —
+/// every arm here ends in a `ret` or hands off to a recursive call that does.
+///
+/// The reason for the split is narrow and load-bearing: `musttail` requires the
+/// call to be immediately followed by a `ret` of its result. Threading tail
+/// position through emission is what makes that adjacency structural rather
+/// than something to hope for.
+fn lower_tail<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    decls: &HashMap<String, FunctionValue<'ctx>>,
+    e: &CoreExpr,
+    env: &mut HashMap<String, IntValue<'ctx>>,
+) -> Result<(), CodegenError> {
+    match &e.kind {
+        CoreKind::If(cond, then_e, else_e) => {
+            // NO join block and NO `phi`. Each arm terminates itself, so a tail
+            // call inside an arm is immediately followed by its own `ret` —
+            // which a join block would break by inserting a branch between them.
+            // The `phi` diamond in `lower_expr` stays exercised by the corpus
+            // programs whose `if`s sit in `let`-value position.
+            let c = lower_expr(ctx, func, b, decls, cond, env)?;
+            if c.get_type().get_bit_width() != 1 {
+                return Err(CodegenError::Unsupported("non-Bool if condition"));
+            }
+            let then_bb = ctx.append_basic_block(func, "then");
+            let else_bb = ctx.append_basic_block(func, "else");
+            b.build_conditional_branch(c, then_bb, else_bb)
+                .map_err(internal)?;
+            b.position_at_end(then_bb);
+            lower_tail(ctx, func, b, decls, then_e, env)?;
+            // Position explicitly rather than assuming where the recursive call
+            // left the builder: a nested tail `if` leaves it in ITS else block.
+            b.position_at_end(else_bb);
+            lower_tail(ctx, func, b, decls, else_e, env)?;
+            Ok(())
+        }
+        CoreKind::Let(x, rhs, body) => {
+            // The bound value is NOT in tail position; only the body is.
+            let v = lower_expr(ctx, func, b, decls, rhs, env)?;
+            let prev = env.insert(x.clone(), v);
+            let out = lower_tail(ctx, func, b, decls, body, env);
+            // Restore any shadowed binding, exactly as `lower_expr` does.
+            match prev {
+                Some(p) => {
+                    env.insert(x.clone(), p);
+                }
+                None => {
+                    env.remove(x);
+                }
+            }
+            out
+        }
+        CoreKind::App(callee, args) => {
+            let site = build_elya_call(ctx, func, b, decls, callee, args, env)?;
+            // The guarantee, in one line. `musttail` is VERIFIER-ENFORCED: if
+            // the convention, the return type, or the adjacency of the `ret`
+            // were wrong, `module.verify()` rejects the module rather than
+            // emitting a call that grows the stack. That is the whole reason
+            // §2 chose `musttail` over the unchecked `tail` hint, which built a
+            // binary that overflowed at runtime.
+            site.set_tail_call_kind(LLVMTailCallKind::LLVMTailCallKindMustTail);
+            let v = site
+                .try_as_basic_value()
+                .left()
+                .ok_or(CodegenError::Unsupported("call returned no value"))?;
+            b.build_return(Some(&v)).map_err(internal)?;
+            Ok(())
+        }
+        _ => {
+            let v = lower_expr(ctx, func, b, decls, e, env)?;
+            b.build_return(Some(&v)).map_err(internal)?;
+            Ok(())
+        }
+    }
 }
 
 /// §3.3 expression lowering: a recursive fold returning an `IntValue`, threading
