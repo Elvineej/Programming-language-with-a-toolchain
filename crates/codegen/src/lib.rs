@@ -704,9 +704,10 @@ mod tests {
     fn corpus_verifies() {
         // Layer 1 (§8): verifier-clean IR for the §5 corpus. Cheap structural
         // teeth — NOT the proof (that is execution in tests/native_codegen.rs).
-        // The corpus strings duplicate tests/native_codegen.rs's CORPUS and
-        // CONTROL_FLOW_CORPUS because integration targets cannot share consts;
-        // eleven lines of duplication is cheaper than new plumbing.
+        // The corpus strings duplicate tests/native_codegen.rs's CORPUS,
+        // CONTROL_FLOW_CORPUS, FUNCTION_CORPUS, and TAIL_CORPUS because
+        // integration targets cannot share consts; nineteen lines of
+        // duplication is cheaper than new plumbing.
         let corpus = [
             "pub fn main() { 1 + 2 }\n",
             "pub fn main() {\n  let x = 6\n  let y = 7\n  x * y\n}\n",
@@ -719,6 +720,14 @@ mod tests {
             "pub fn main() {\n  let a = if 1 < 1 { 1 } else { 0 }\n  let b = if 1 < 2 { 1 } else { 0 }\n  let c = if 1 <= 1 { 1 } else { 0 }\n  let d = if 2 <= 1 { 1 } else { 0 }\n  let e = if 1 > 1 { 1 } else { 0 }\n  let f = if 2 > 1 { 1 } else { 0 }\n  let g = if 1 >= 1 { 1 } else { 0 }\n  let h = if 1 >= 2 { 1 } else { 0 }\n  let i = if 1 == 1 { 1 } else { 0 }\n  let j = if 1 == 2 { 1 } else { 0 }\n  let k = if 1 != 2 { 1 } else { 0 }\n  let m = if 1 != 1 { 1 } else { 0 }\n  let n = if (0 - 1) < 1 { 1 } else { 0 }\n  a + b + c + d + e + f + g + h + i + j + k + m + n\n}\n",
             "pub fn main() { if True == False { 1 } else { 2 } }\n",
             "pub fn main() {\n  let a = if 1 < 2 && 3 > 4 { 1 } else { 0 }\n  let b = if 1 < 2 && 3 < 4 { 1 } else { 0 }\n  let c = if 1 > 2 || 3 > 4 { 1 } else { 0 }\n  let d = if 1 > 2 || 3 < 4 { 1 } else { 0 }\n  a + b + c + d\n}\n",
+            "fn add3(x) { x + 3 }\npub fn main() { add3(4) }\n",
+            "fn add5(a, b, c, d, e) { a + b + c + d + e }\npub fn main() { add5(1, 2, 3, 4, 5) }\n",
+            "fn f(x) {\n  let x = x * 2\n  x + 20\n}\nfn g(x) { x + f(x) }\npub fn main() { g(10) }\n",
+            "fn dbl(x) { x * 2 }\npub fn main() { dbl(dbl(3)) + dbl(1) }\n",
+            "fn is_pos(n) { n > 0 }\npub fn main() { if is_pos(3) { 1 } else { 0 } }\n",
+            "fn sum(n) { if n == 0 { 0 } else { n + sum(n - 1) } }\npub fn main() { sum(100) }\n",
+            "fn down(n) { if n == 0 { 0 } else { down(n - 1) } }\npub fn main() { down(1000000) }\n",
+            "fn ev(n) { if n == 0 { True } else { od(n - 1) } }\nfn od(n) { if n == 0 { False } else { ev(n - 1) } }\npub fn main() { if ev(1000000) { 1 } else { 0 } }\n",
         ];
         for src in corpus {
             emit_ir(&core_of(src)).expect("verifier-clean IR");
