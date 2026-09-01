@@ -522,22 +522,22 @@ strings and `io.println` (N6); runtime polymorphism (N7); effects, `handle`, `re
 
 ## §9. Completion checklist
 
-- [ ] Parameter types are recorded at their `Spanned<Param>` spans and survive zonking
-- [ ] `CoreFn.params` carries `CoreParam { name, ty }`; no separate return-type field
-- [ ] A missing parameter type is `LowerError::Untyped`, asserted absent on the corpus
-- [ ] Every emitted function is mangled `elya_*` and carries `tailcc`
-- [ ] Emission is two-pass; mutual recursion resolves; duplicate names are refused
-- [ ] Tail position is threaded: `lower_tail` emits terminators, `lower_expr` values
-- [ ] A tail-position `If` emits no join block and no `phi`
-- [ ] Tail calls emit `musttail` + `tailcc`; non-tail calls emit `tailcc` only
-- [ ] ≥6 parameters refused before emission, by whole-module scan
-- [ ] A polymorphic function refuses the module (`Ty::Var` via `repr_ty`)
-- [ ] A non-`Var` callee refuses, witnessed by an immediately-invoked lambda
-- [ ] A function name in value position refuses with its own message
-- [ ] `require_int` applies to `main` alone; a `Bool`-returning helper compiles
-- [ ] All eight corpus programs pass the direct and the differential harness
-- [ ] Mutual recursion at 1e6 exits 0 with the right answer
-- [ ] `STATUS_STACK_OVERFLOW` is diagnosed by name, not reported as a generic crash
-- [ ] The 5b-1 and 5b-2 corpora pass unchanged
-- [ ] No IR snapshots anywhere; no test skips
-- [ ] Full five-stage gate green, both configurations, default parallelism
+- [x] Parameter types are recorded at their `Spanned<Param>` spans and survive zonking
+- [x] `CoreFn.params` carries `CoreParam { name, ty }`; no separate return-type field
+- [x] A missing parameter type is `LowerError::Untyped`, asserted absent on the corpus
+- [x] Every emitted function is mangled `elya_*` and carries `tailcc`
+- [x] Emission is two-pass; mutual recursion resolves; duplicate names are refused
+- [x] Tail position is threaded: `lower_tail` emits terminators, `lower_expr` values
+- [x] A tail-position `If` emits no join block and no `phi`
+- [x] Tail calls emit `musttail` + `tailcc`; non-tail calls emit `tailcc` only
+- [x] ≥6 parameters refused before emission, by whole-module scan
+- [x] A polymorphic function refuses the module (`Ty::Var` via `repr_ty`)
+- [x] A non-`Var` callee refuses, witnessed by an immediately-invoked lambda
+- [x] A function name in value position refuses with its own message
+- [x] `require_int` applies to `main` alone; a `Bool`-returning helper compiles
+- [x] All eight corpus programs pass the direct and the differential harness
+- [x] Mutual recursion at 1e6 exits 0 with the right answer
+- [x] `STATUS_STACK_OVERFLOW` is diagnosed by name, not reported as a generic crash
+- [x] The 5b-1 and 5b-2 corpora pass unchanged
+- [x] No IR snapshots anywhere; no test skips
+- [x] Full five-stage gate green, both configurations, default parallelism
