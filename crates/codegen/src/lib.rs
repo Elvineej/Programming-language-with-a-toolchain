@@ -27,11 +27,11 @@ use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
 use inkwell::types::BasicMetadataTypeEnum;
-use inkwell::types::IntType;
+use inkwell::types::BasicTypeEnum;
 use inkwell::values::BasicMetadataValueEnum;
+use inkwell::values::BasicValueEnum;
 use inkwell::values::CallSiteValue;
 use inkwell::values::FunctionValue;
-use inkwell::values::IntValue;
 use inkwell::values::LLVMTailCallKind;
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
@@ -150,17 +150,16 @@ fn find_main(core: &CoreModule) -> Result<&CoreFn, CodegenError> {
     Ok(f)
 }
 
-/// §3.1 type mapping, widened for N3: `Int` -> i64, `Bool` -> i1. Reads the
-/// INLINE `ty` field on each Core node (Shape C — the reason this fold needs no
-/// side-table lookups). Everything else is refused by name, `Ty::Var(_)`
-/// included; when that fires, that is N7 knocking.
-///
-/// A toe-in, not the value-representation decision: two integer widths is the
-/// least that lets a branch have a condition. Heap values arrive with N4.
-fn repr_ty<'ctx>(ctx: &'ctx Context, ty: &Ty) -> Result<IntType<'ctx>, CodegenError> {
+/// §3.1 type mapping: `Int` -> i64, `Bool` -> i1, and — since N4 — `Ty::Con`
+/// -> a pointer. Reads the INLINE `ty` field on each Core node (Shape C — the
+/// reason this fold needs no side-table lookups). Everything else is refused by
+/// name, `Ty::Var(_)` included; when that fires, that is N7 knocking.
+fn repr_ty<'ctx>(ctx: &'ctx Context, ty: &Ty) -> Result<BasicTypeEnum<'ctx>, CodegenError> {
     match ty {
-        Ty::Base(TyCon::Int) => Ok(ctx.i64_type()),
-        Ty::Base(TyCon::Bool) => Ok(ctx.bool_type()),
+        Ty::Base(TyCon::Int) => Ok(ctx.i64_type().into()),
+        Ty::Base(TyCon::Bool) => Ok(ctx.bool_type().into()),
+        // N4 (spec §1): an ADT value is a pointer to its heap object.
+        Ty::Con(..) => Ok(ctx.ptr_type(AddressSpace::default()).into()),
         _ => Err(CodegenError::Unsupported("unrepresentable type")),
     }
 }
@@ -208,7 +207,11 @@ fn declare_all<'ctx>(
         for p in f.params.iter() {
             params.push(repr_ty(ctx, &p.ty)?.into());
         }
-        let fn_ty = repr_ty(ctx, &f.body.ty)?.fn_type(&params, false);
+        let fn_ty = match repr_ty(ctx, &f.body.ty)? {
+            BasicTypeEnum::IntType(t) => t.fn_type(&params, false),
+            BasicTypeEnum::PointerType(t) => t.fn_type(&params, false),
+            _ => return Err(CodegenError::Unsupported("unrepresentable type")),
+        };
         let func = module.add_function(&mangle(&f.name), fn_ty, None);
         // NOTE the plural: `set_call_conventions` is the FunctionValue method.
         // The call-site method is `set_call_convention`, singular. Both are
@@ -233,12 +236,12 @@ fn emit_body<'ctx>(
         .ok_or(CodegenError::Unsupported("undeclared function"))?;
     let entry = ctx.append_basic_block(func, "entry");
     b.position_at_end(entry);
-    let mut env: HashMap<String, IntValue<'ctx>> = HashMap::new();
+    let mut env: HashMap<String, BasicValueEnum<'ctx>> = HashMap::new();
     for (i, p) in f.params.iter().enumerate() {
         let v = func
             .get_nth_param(i as u32)
             .ok_or_else(|| internal("declared arity disagrees with Core arity"))?;
-        env.insert(p.name.clone(), v.into_int_value());
+        env.insert(p.name.clone(), v);
     }
     // Every function body is in tail position by definition; `lower_tail` emits
     // the terminator, so there is no `build_return` here any more.
@@ -259,7 +262,7 @@ fn build_elya_call<'ctx>(
     decls: &HashMap<String, FunctionValue<'ctx>>,
     callee: &CoreExpr,
     args: &[CoreExpr],
-    env: &mut HashMap<String, IntValue<'ctx>>,
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
 ) -> Result<CallSiteValue<'ctx>, CodegenError> {
     let CoreKind::Var(name) = &callee.kind else {
         return Err(CodegenError::Unsupported("computed callee"));
@@ -292,7 +295,7 @@ fn lower_tail<'ctx>(
     b: &Builder<'ctx>,
     decls: &HashMap<String, FunctionValue<'ctx>>,
     e: &CoreExpr,
-    env: &mut HashMap<String, IntValue<'ctx>>,
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
 ) -> Result<(), CodegenError> {
     match &e.kind {
         CoreKind::If(cond, then_e, else_e) => {
@@ -301,7 +304,7 @@ fn lower_tail<'ctx>(
             // which a join block would break by inserting a branch between them.
             // The `phi` diamond in `lower_expr` stays exercised by the corpus
             // programs whose `if`s sit in `let`-value position.
-            let c = lower_expr(ctx, func, b, decls, cond, env)?;
+            let c = lower_expr(ctx, func, b, decls, cond, env)?.into_int_value();
             if c.get_type().get_bit_width() != 1 {
                 return Err(CodegenError::Unsupported("non-Bool if condition"));
             }
@@ -357,20 +360,19 @@ fn lower_tail<'ctx>(
     }
 }
 
-/// §3.3 expression lowering: a recursive fold returning an `IntValue`, threading
-/// a binding environment. NO alloca, NO mem2reg — bindings are immutable and
-/// values map directly to SSA registers; the save/restore around `Let` is what
-/// makes shadowing correct. Each node's width comes from its own inline type, so
-/// an i1 and an i64 register coexist without a wrapper enum: inkwell's
-/// `IntValue` already carries its width.
+/// §3.3 expression lowering: a recursive fold returning a `BasicValueEnum`,
+/// threading a binding environment. NO alloca, NO mem2reg — bindings are
+/// immutable and values map directly to SSA registers; the save/restore around
+/// `Let` is what makes shadowing correct. Each node's width comes from its own
+/// inline type, so an i1, an i64, and (with N4) a pointer coexist in one enum.
 fn lower_expr<'ctx>(
     ctx: &'ctx Context,
     func: FunctionValue<'ctx>,
     b: &Builder<'ctx>,
     decls: &HashMap<String, FunctionValue<'ctx>>,
     e: &CoreExpr,
-    env: &mut HashMap<String, IntValue<'ctx>>,
-) -> Result<IntValue<'ctx>, CodegenError> {
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
     // Check for "function used as a value" BEFORE repr_ty, because a function
     // name in value position has a function type that repr_ty will reject as
     // "unrepresentable type" — but the correct refusal is the more specific
@@ -383,8 +385,13 @@ fn lower_expr<'ctx>(
 
     let node_ty = repr_ty(ctx, &e.ty)?;
     match &e.kind {
-        CoreKind::Lit(CoreLit::Int(n)) => Ok(node_ty.const_int(*n as u64, true)),
-        CoreKind::Lit(CoreLit::Bool(v)) => Ok(node_ty.const_int(u64::from(*v), false)),
+        CoreKind::Lit(CoreLit::Int(n)) => {
+            Ok(node_ty.into_int_type().const_int(*n as u64, true).into())
+        }
+        CoreKind::Lit(CoreLit::Bool(v)) => Ok(node_ty
+            .into_int_type()
+            .const_int(u64::from(*v), false)
+            .into()),
         CoreKind::Lit(_) => Err(CodegenError::Unsupported("non-Int literal")),
         CoreKind::Var(x) => match env.get(x) {
             Some(v) => Ok(*v),
@@ -420,8 +427,8 @@ fn lower_expr<'ctx>(
             {
                 return Err(CodegenError::Unsupported(eq_operand_label(*op)));
             }
-            let l = lower_expr(ctx, func, b, decls, &args[0], env)?;
-            let r = lower_expr(ctx, func, b, decls, &args[1], env)?;
+            let l = lower_expr(ctx, func, b, decls, &args[0], env)?.into_int_value();
+            let r = lower_expr(ctx, func, b, decls, &args[1], env)?.into_int_value();
             // Deliberately NO nsw/nuw flags: defined two's-complement wrapping
             // (§3.4). Overflow reconciliation with the evaluator is tracked in
             // spec §11 — not silently decided here.
@@ -445,7 +452,7 @@ fn lower_expr<'ctx>(
                 BinOp::Or => b.build_or(l, r, "or"),
                 other => return Err(CodegenError::Unsupported(op_label(*other))),
             };
-            built.map_err(internal)
+            built.map(|v| v.into()).map_err(internal)
         }
         CoreKind::App(callee, args) => {
             // Ordinary (non-tail) position: `tailcc` convention, NO tail-call
@@ -453,12 +460,11 @@ fn lower_expr<'ctx>(
             let site = build_elya_call(ctx, func, b, decls, callee, args, env)?;
             site.try_as_basic_value()
                 .left()
-                .map(|v| v.into_int_value())
                 .ok_or(CodegenError::Unsupported("call returned no value"))
         }
         CoreKind::Lambda(..) => Err(CodegenError::Unsupported("Lambda")),
         CoreKind::If(cond, then_e, else_e) => {
-            let c = lower_expr(ctx, func, b, decls, cond, env)?;
+            let c = lower_expr(ctx, func, b, decls, cond, env)?.into_int_value();
             // The checker unifies the condition with Bool, so §3.1's mapping
             // makes it i1. Anything else is a bug in our own lowering, surfaced
             // rather than handed to `build_conditional_branch`.
@@ -494,9 +500,14 @@ fn lower_expr<'ctx>(
             // an Option, so there is no one-armed `if` to synthesize a Unit
             // branch for. Both branches carry the same type — the checker
             // unified them — so one phi type is correct.
-            let phi = b.build_phi(tv.get_type(), "iftmp").map_err(internal)?;
+            let phi = match tv.get_type() {
+                BasicTypeEnum::IntType(t) => b.build_phi(t, "iftmp"),
+                BasicTypeEnum::PointerType(t) => b.build_phi(t, "iftmp"),
+                _ => return Err(CodegenError::Unsupported("unrepresentable type")),
+            }
+            .map_err(internal)?;
             phi.add_incoming(&[(&tv, then_exit), (&ev, else_exit)]);
-            Ok(phi.as_basic_value().into_int_value())
+            Ok(phi.as_basic_value())
         }
         CoreKind::Match(..) => Err(CodegenError::Unsupported("Match")),
     }
