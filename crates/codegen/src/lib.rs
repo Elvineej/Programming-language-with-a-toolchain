@@ -709,7 +709,7 @@ fn lower_expr<'ctx>(
 /// instead of four separate ones.
 struct LowerCtx<'ctx> {
     decls: &'ctx HashMap<String, FunctionValue<'ctx>>,
-    /// Constructor name -> (tag index within its type, field types). A name
+    /// Constructor name -> (globally unique tag, field types). A name
     /// missing here is a constructor of a *parametric* ADT, which Task 2
     /// deferred — refused by name in the Ctor/Match arms, never unwrapped.
     ctors: &'ctx HashMap<String, (usize, Vec<Ty>)>,
@@ -718,12 +718,16 @@ struct LowerCtx<'ctx> {
 }
 
 /// Fold `core.types` into a flat constructor table: name -> (tag, field types).
-/// The tag is the constructor's index within its own type's declaration order.
+/// The tag is a GLOBALLY unique id (a running offset across all types), not the
+/// index within its own type — a collector must be able to recover a
+/// constructor's type from the tag alone (5b-5 spec §4).
 fn build_ctor_table(core: &CoreModule) -> HashMap<String, (usize, Vec<Ty>)> {
     let mut out = HashMap::new();
+    let mut next = 0usize;
     for t in &core.types {
-        for (i, c) in t.ctors.iter().enumerate() {
-            out.insert(c.name.clone(), (i, c.fields.clone()));
+        for c in t.ctors.iter() {
+            out.insert(c.name.clone(), (next, c.fields.clone()));
+            next += 1;
         }
     }
     out
