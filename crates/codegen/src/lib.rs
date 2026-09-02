@@ -509,6 +509,7 @@ fn lower_expr<'ctx>(
             phi.add_incoming(&[(&tv, then_exit), (&ev, else_exit)]);
             Ok(phi.as_basic_value())
         }
+        CoreKind::Ctor(..) => Err(CodegenError::Unsupported("Ctor")),
         CoreKind::Match(..) => Err(CodegenError::Unsupported("Match")),
     }
 }
@@ -680,6 +681,7 @@ mod tests {
                 params: Rc::from([]),
                 body,
             }],
+            types: Vec::new(),
         }
     }
 

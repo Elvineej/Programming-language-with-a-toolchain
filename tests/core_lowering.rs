@@ -55,6 +55,11 @@ fn nodes(core: &CoreModule) -> Vec<&CoreExpr> {
                 walk(then_e, out);
                 walk(else_e, out);
             }
+            CoreKind::Ctor(_, fields) => {
+                for f in fields.iter() {
+                    walk(f, out);
+                }
+            }
             CoreKind::Match(scrut, arms) => {
                 walk(scrut, out);
                 for arm in arms.iter() {
@@ -238,13 +243,13 @@ fn surface6_match_node_is_int() {
     insta::assert_snapshot!(pretty_typed(&core, &mut TyPrinter::new()));
 }
 
-// --- Surface 7: nullary ctor — the Var("Tok") node carries Con("Tok", []) ------
+// --- Surface 7: nullary ctor — the Ctor("Tok", []) node carries Con("Tok", []) ----
 #[test]
 fn surface7_nullary_ctor_carries_con() {
     let (core, _t) = lower_src("linear type Tok { Tok }\nfn lin() { let t = Tok\n t }\n");
     let tok_ty = nodes(&core)
         .iter()
-        .find(|n| matches!(&n.kind, CoreKind::Var(x) if x == "Tok"))
+        .find(|n| matches!(&n.kind, CoreKind::Ctor(x, args) if x == "Tok" && args.is_empty()))
         .map(|n| n.ty.clone());
     assert!(
         matches!(tok_ty, Some(Ty::Con(ref n, ref a)) if n == "Tok" && a.is_empty()),
