@@ -285,14 +285,14 @@ representability), **T3** (lambda parameters carry no types in Core). New in N4:
 
 ## §9. Completion checklist
 
-- [ ] `CoreModule.types` + `CoreKind::Ctor` land; lowering emits `Ctor`, never `App(Var(ctor, ..))`
-- [ ] `repr_ty(Ty::Con)` → `ptr`; `lower_expr` returns `BasicValueEnum`
-- [ ] Construction allocates via `elya_alloc` and stores tag + fields per §4.1
-- [ ] `match` lowers to a sequential chain; the join `phi` carries N incoming edges, read back with `get_insert_block()`
-- [ ] The default block traps via `elya_match_fail`; no `unreachable`
-- [ ] The runtime library provides `elya_alloc` (and `elya_match_fail`), linked by clang
-- [ ] ADT corpus passes the direct and the differential harness (construct → match → extract Int)
-- [ ] `require_int` on `main` unchanged; an ADT-valued `main` stays refused
-- [ ] The 5b-1/5b-2/5b-3 corpora pass unchanged
-- [ ] No IR snapshot anywhere; no test skips
-- [ ] Full five-stage gate green, both configurations
+- [x] `CoreModule.types` + `CoreKind::Ctor` land; lowering emits `Ctor`, never `App(Var(ctor, ..))`
+- [x] `repr_ty(Ty::Con)` → `ptr`; `lower_expr` returns `BasicValueEnum`
+- [x] Construction allocates via `elya_alloc` and stores tag + fields per §4.1
+- [x] `match` lowers to a sequential chain; the join `phi` carries N incoming edges, read back with `get_insert_block()`
+- [x] The default block traps via `elya_match_fail`; no `unreachable`
+- [x] The runtime library provides `elya_alloc` (and `elya_match_fail`), linked by clang
+- [x] ADT corpus passes the direct and the differential harness (construct → match → extract Int)
+- [x] `require_int` on `main` unchanged; an ADT-valued `main` stays refused
+- [x] The 5b-1/5b-2/5b-3 corpora pass unchanged
+- [x] No IR snapshot anywhere; no test skips
+- [x] Full five-stage gate green, both configurations
