@@ -4,9 +4,10 @@
 //! it performs no inference. Core is not executed here (spec §6).
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::rc::Rc;
 
-use crate::ast::{BinOp, Block, Decl, Expr, Module, PatLit, Pattern, Stmt};
+use crate::ast::{BinOp, Block, Decl, Expr, Module, PatLit, Pattern, Stmt, TypeAnn};
 use crate::span::Span;
 use crate::types::Ty;
 use crate::types::TyPrinter;
@@ -26,10 +27,13 @@ pub struct CoreExpr {
 #[derive(Clone, Debug)]
 pub enum CoreKind {
     Lit(CoreLit),
-    /// local, top-level fn name, or nullary ctor (e.g. `Tok`).
+    /// local or top-level fn name (a bare constructor is `Ctor`, not `Var`).
     Var(String),
-    /// callee + args (function / ctor / effect-op application).
+    /// callee + args (function / effect-op application).
     App(Rc<CoreExpr>, Rc<[CoreExpr]>),
+    /// ADT construction, syntactically distinct from application (5b-4 §3.2):
+    /// `Ctor(name, fields)` — `name` is the constructor.
+    Ctor(String, Rc<[CoreExpr]>),
     /// `+` etc. — the primitive operator set is reused verbatim from the AST.
     Prim(BinOp, Rc<[CoreExpr]>),
     /// uncurried params; the block body is flattened into a single expression.
@@ -87,8 +91,23 @@ pub struct CoreFn {
 }
 
 #[derive(Clone, Debug)]
+pub struct CoreType {
+    pub name: String,
+    /// Constructors in declaration order — the index IS the tag (5b-4 §2.2).
+    pub ctors: Vec<CoreCtor>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CoreCtor {
+    pub name: String,
+    /// One type per field; len == arity.
+    pub fields: Vec<Ty>,
+}
+
+#[derive(Clone, Debug)]
 pub struct CoreModule {
     pub fns: Vec<CoreFn>,
+    pub types: Vec<CoreType>,
 }
 
 /// Lowering failure. The deferred AST surface is a *typed boundary*, not a panic:
@@ -100,17 +119,47 @@ pub enum LowerError {
     Untyped(Span),
 }
 
-/// Lower a whole module: each `Decl::Fn` becomes a `CoreFn`; `Decl::Type` and
-/// `Decl::Effect` are not re-homed (spec §2 — exhaustiveness-on-Core is out of scope).
+/// Lower a whole module in two passes. Pass 1 collects constructor names and the
+/// ADT declarations (so a function body lowered in pass 2 sees every constructor
+/// regardless of declaration order). Pass 2 lowers each `Decl::Fn` to a `CoreFn`.
+/// `Decl::Effect` is not re-homed (spec §2 — exhaustiveness-on-Core is out of scope).
 pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreModule, LowerError> {
+    let mut ctor_names: HashSet<String> = HashSet::new();
+    let mut types = Vec::new();
+    for d in &module.decls {
+        if let Decl::Type(t) = &d.node {
+            // Collect every constructor name regardless of arity, so a constructor
+            // application — even of a deferred parametric ADT — lowers to `Ctor`.
+            for v in &t.variants {
+                ctor_names.insert(v.node.name.clone());
+            }
+            // Only GROUND (monomorphic) ADTs are recorded in `types`: the back end
+            // is monomorphic-only (5b-4 §6), and a parametric field type would need
+            // a type-parameter substitution this slice deliberately defers. The field
+            // elaboration below is therefore param-free and never sees a type param.
+            if t.params.is_empty() {
+                let mut ctors = Vec::with_capacity(t.variants.len());
+                for v in &t.variants {
+                    let vd = &v.node;
+                    let fields = vd.fields.iter().map(|f| ann_to_ty(&f.node)).collect();
+                    ctors.push(CoreCtor {
+                        name: vd.name.clone(),
+                        fields,
+                    });
+                }
+                types.push(CoreType {
+                    name: t.name.clone(),
+                    ctors,
+                });
+            }
+        }
+    }
+
     let mut fns = Vec::new();
     for d in &module.decls {
         if let Decl::Fn(f) = &d.node {
             let mut params = Vec::with_capacity(f.params.len());
             for p in &f.params {
-                // The same tripwire `lower_expr` uses for expression spans: an
-                // unrecorded span is a recorder-totality bug, surfaced by name
-                // rather than papered over with a fresh variable.
                 let ty = table
                     .get(&p.span)
                     .cloned()
@@ -120,7 +169,7 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
                     ty,
                 });
             }
-            let body = lower_block(&f.body.node, table)?;
+            let body = lower_block(&f.body.node, table, &ctor_names)?;
             fns.push(CoreFn {
                 name: f.name.clone(),
                 params: params.into(),
@@ -128,26 +177,49 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
             });
         }
     }
-    Ok(CoreModule { fns })
+    Ok(CoreModule { fns, types })
+}
+
+/// Elaborate a (monomorphic) ADT field type annotation to a `Ty`. Param-free by
+/// design (5b-4 §6): base names map to their `Base`, any other name is an ADT
+/// reference and maps to `Ty::Con` with its args elaborated. No type parameters
+/// reach here, so there is no substitution.
+fn ann_to_ty(a: &TypeAnn) -> Ty {
+    match a.name.as_str() {
+        "Int" => Ty::int(),
+        "Float" => Ty::float(),
+        "Bool" => Ty::bool(),
+        "String" => Ty::str(),
+        "Unit" => Ty::unit(),
+        other => {
+            let args = a.args.iter().map(|x| ann_to_ty(&x.node)).collect();
+            Ty::Con(other.to_string(), args)
+        }
+    }
 }
 
 /// Flatten a block into a right-nested `Let` spine terminating in the lowered tail.
 /// The `Let` nodes are the only *synthesized* Core nodes: their type is derived by
 /// propagation (`ty = body.ty`), their span is the originating statement's span.
-fn lower_block(block: &Block, table: &BTreeMap<Span, Ty>) -> Result<CoreExpr, LowerError> {
+fn lower_block(
+    block: &Block,
+    table: &BTreeMap<Span, Ty>,
+    ctors: &HashSet<String>,
+) -> Result<CoreExpr, LowerError> {
     let tail = block
         .tail
         .as_ref()
         .ok_or(LowerError::Unsupported("block without tail expression"))?;
-    let mut acc = lower_expr(&tail.node, tail.span, table)?;
+    let mut acc = lower_expr(&tail.node, tail.span, table, ctors)?;
     for stmt in block.stmts.iter().rev() {
         let (name, value) = match &stmt.node {
-            Stmt::Let { name, value } => {
-                (name.clone(), lower_expr(&value.node, value.span, table)?)
-            }
+            Stmt::Let { name, value } => (
+                name.clone(),
+                lower_expr(&value.node, value.span, table, ctors)?,
+            ),
             // A non-tail expression statement: a discarded binding — no separate
             // sequencing node is needed for the corpus.
-            Stmt::Expr(e) => ("_".to_string(), lower_expr(&e.node, e.span, table)?),
+            Stmt::Expr(e) => ("_".to_string(), lower_expr(&e.node, e.span, table, ctors)?),
         };
         let ty = acc.ty.clone();
         acc = CoreExpr {
@@ -162,25 +234,53 @@ fn lower_block(block: &Block, table: &BTreeMap<Span, Ty>) -> Result<CoreExpr, Lo
 /// Lower one expression node. `ty` is copied from the frozen table (`table[span]`);
 /// the map is never consulted again after the tree is built. No solver primitive is
 /// ever called (spec §4, §6).
-fn lower_expr(e: &Expr, span: Span, table: &BTreeMap<Span, Ty>) -> Result<CoreExpr, LowerError> {
+fn lower_expr(
+    e: &Expr,
+    span: Span,
+    table: &BTreeMap<Span, Ty>,
+    ctors: &HashSet<String>,
+) -> Result<CoreExpr, LowerError> {
     let ty = table.get(&span).cloned().ok_or(LowerError::Untyped(span))?;
     let kind = match e {
         Expr::Int(n) => CoreKind::Lit(CoreLit::Int(*n)),
         Expr::Bool(b) => CoreKind::Lit(CoreLit::Bool(*b)),
         Expr::Str(v) => CoreKind::Lit(CoreLit::Str(v.clone())),
         Expr::Unit => CoreKind::Lit(CoreLit::Unit),
-        Expr::Var(x) => CoreKind::Var(x.clone()),
+        Expr::Var(x) => {
+            // A bare constructor name is construction of a nullary ctor (5b-4
+            // §3.2), distinct from a variable reference.
+            if ctors.contains(x) {
+                CoreKind::Ctor(x.clone(), Rc::from([]))
+            } else {
+                CoreKind::Var(x.clone())
+            }
+        }
         Expr::Call { callee, args } => {
-            let f = lower_expr(&callee.node, callee.span, table)?;
+            // A saturated constructor call lowers to a distinct Ctor node, not an
+            // App. Check the callee name before lowering it as a variable.
+            if let Expr::Var(name) = &callee.node {
+                if ctors.contains(name) {
+                    let mut lowered = Vec::with_capacity(args.len());
+                    for a in args.iter() {
+                        lowered.push(lower_expr(&a.node, a.span, table, ctors)?);
+                    }
+                    return Ok(CoreExpr {
+                        span,
+                        ty,
+                        kind: CoreKind::Ctor(name.clone(), lowered.into()),
+                    });
+                }
+            }
+            let f = lower_expr(&callee.node, callee.span, table, ctors)?;
             let mut lowered = Vec::with_capacity(args.len());
             for a in args.iter() {
-                lowered.push(lower_expr(&a.node, a.span, table)?);
+                lowered.push(lower_expr(&a.node, a.span, table, ctors)?);
             }
             CoreKind::App(Rc::new(f), lowered.into())
         }
         Expr::Binary { op, lhs, rhs } => {
-            let l = lower_expr(&lhs.node, lhs.span, table)?;
-            let r = lower_expr(&rhs.node, rhs.span, table)?;
+            let l = lower_expr(&lhs.node, lhs.span, table, ctors)?;
+            let r = lower_expr(&rhs.node, rhs.span, table, ctors)?;
             CoreKind::Prim(*op, vec![l, r].into())
         }
         Expr::If {
@@ -188,21 +288,21 @@ fn lower_expr(e: &Expr, span: Span, table: &BTreeMap<Span, Ty>) -> Result<CoreEx
             then_block,
             else_block,
         } => {
-            let c = lower_expr(&cond.node, cond.span, table)?;
-            let t = lower_block(&then_block.node, table)?;
-            let e = lower_block(&else_block.node, table)?;
+            let c = lower_expr(&cond.node, cond.span, table, ctors)?;
+            let t = lower_block(&then_block.node, table, ctors)?;
+            let e = lower_block(&else_block.node, table, ctors)?;
             CoreKind::If(Rc::new(c), Rc::new(t), Rc::new(e))
         }
         Expr::Lambda { params, body } => {
             let names: Vec<String> = params.iter().map(|p| p.node.name.clone()).collect();
-            let b = lower_block(&body.node, table)?;
+            let b = lower_block(&body.node, table, ctors)?;
             CoreKind::Lambda(names.into(), Rc::new(b))
         }
         Expr::Match { scrutinee, arms } => {
-            let s = lower_expr(&scrutinee.node, scrutinee.span, table)?;
+            let s = lower_expr(&scrutinee.node, scrutinee.span, table, ctors)?;
             let mut lowered = Vec::with_capacity(arms.len());
             for arm in arms.iter() {
-                let body = lower_expr(&arm.node.body.node, arm.node.body.span, table)?;
+                let body = lower_expr(&arm.node.body.node, arm.node.body.span, table, ctors)?;
                 lowered.push(CoreArm {
                     pat: lower_pat(&arm.node.pat.node),
                     body,
@@ -251,6 +351,23 @@ fn lower_pat_lit(l: &PatLit) -> CoreLit {
 /// annotation (spec §4, §5). This string is the snapshot deliverable.
 pub fn pretty_typed(m: &CoreModule, p: &mut TyPrinter) -> String {
     let mut s = String::new();
+    for t in &m.types {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str("(type ");
+        s.push_str(&t.name);
+        for c in &t.ctors {
+            s.push_str(" (");
+            s.push_str(&c.name);
+            for f in &c.fields {
+                s.push(' ');
+                s.push_str(&p.render(f));
+            }
+            s.push(')');
+        }
+        s.push(')');
+    }
     for f in &m.fns {
         if !s.is_empty() {
             s.push('\n');
@@ -287,6 +404,14 @@ fn pretty_expr(e: &CoreExpr, p: &mut TyPrinter, s: &mut String) {
             for a in args.iter() {
                 s.push(' ');
                 pretty_expr(a, p, s);
+            }
+        }
+        CoreKind::Ctor(name, fields) => {
+            s.push_str("(ctor ");
+            s.push_str(name);
+            for f in fields.iter() {
+                s.push(' ');
+                pretty_expr(f, p, s);
             }
         }
         CoreKind::Prim(op, args) => {

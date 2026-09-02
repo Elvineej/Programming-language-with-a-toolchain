@@ -2,4 +2,5 @@
 source: tests/core_lowering.rs
 expression: "pretty_typed(&core, &mut TyPrinter::new())"
 ---
-(fn lin () (let t (var Tok : Tok) (var t : Tok) : Tok))
+(type Tok (Tok))
+(fn lin () (let t (ctor Tok : Tok) (var t : Tok) : Tok))
