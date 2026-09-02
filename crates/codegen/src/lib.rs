@@ -952,8 +952,8 @@ mod tests {
         // Layer 1 (§8): verifier-clean IR for the §5 corpus. Cheap structural
         // teeth — NOT the proof (that is execution in tests/native_codegen.rs).
         // The corpus strings duplicate tests/native_codegen.rs's CORPUS,
-        // CONTROL_FLOW_CORPUS, FUNCTION_CORPUS, and TAIL_CORPUS because
-        // integration targets cannot share consts; nineteen lines of
+        // CONTROL_FLOW_CORPUS, FUNCTION_CORPUS, TAIL_CORPUS, and ADT_CORPUS
+        // because integration targets cannot share consts; twenty-two lines of
         // duplication is cheaper than new plumbing.
         let corpus = [
             "pub fn main() { 1 + 2 }\n",
@@ -975,6 +975,9 @@ mod tests {
             "fn sum(n) { if n == 0 { 0 } else { n + sum(n - 1) } }\npub fn main() { sum(100) }\n",
             "fn down(n) { if n == 0 { 0 } else { down(n - 1) } }\npub fn main() { down(1000000) }\n",
             "fn ev(n) { if n == 0 { True } else { od(n - 1) } }\nfn od(n) { if n == 0 { False } else { ev(n - 1) } }\npub fn main() { if ev(1000000) { 1 } else { 0 } }\n",
+            "type Opt { None, Some(Int) }\npub fn main() { match Some(42) { None -> 0  Some(x) -> x } }\n",
+            "type Nat { Zero, Succ(Nat) }\nfn len(n) { match n { Zero -> 0  Succ(m) -> 1 + len(m) } }\npub fn main() { len(Succ(Succ(Succ(Zero)))) }\n",
+            "type T { A, B, C(Int) }\npub fn main() { match C(7) { A -> 1  B -> 2  C(x) -> x } }\n",
         ];
         for src in corpus {
             emit_ir(&core_of(src)).expect("verifier-clean IR");
