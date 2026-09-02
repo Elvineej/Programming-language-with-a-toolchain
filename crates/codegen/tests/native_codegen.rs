@@ -578,3 +578,141 @@ fn native_output_matches_the_evaluator_across_the_tail_corpus() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The 5b-4 §7 corpus: (tag, source, expected stdout). Monomorphic ADTs only —
+/// construct → match → extract an Int, so `require_int` on `main` stays satisfied.
+const ADT_CORPUS: &[(&str, &str, &str)] = &[
+    (
+        "option_extract",
+        "type Opt { None, Some(Int) }\npub fn main() { match Some(42) { None -> 0  Some(x) -> x } }\n",
+        "42",
+    ),
+    (
+        // Recursive: the Succ field is a *pointer* to another Nat — the load-bearing
+        // representation fact (§6).
+        "recursive_nat",
+        "type Nat { Zero, Succ(Nat) }\nfn len(n) { match n { Zero -> 0  Succ(m) -> 1 + len(m) } }\npub fn main() { len(Succ(Succ(Succ(Zero)))) }\n",
+        "3",
+    ),
+    (
+        // Three constructors, so the join phi has N=3 incoming edges, not two.
+        "three_way",
+        "type T { A, B, C(Int) }\npub fn main() { match C(7) { A -> 1  B -> 2  C(x) -> x } }\n",
+        "7",
+    ),
+];
+
+#[test]
+fn the_adt_corpus_compiles_runs_and_prints_the_expected_answer() {
+    let dir = temp_dir("adts");
+    for (tag, src, expected) in ADT_CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        assert_runs(&exe, expected);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_adt_corpus() {
+    let dir = temp_dir("differential-adts");
+    for (tag, src, _) in ADT_CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        assert!(
+            out.status.success(),
+            "{tag}: binary exited {:?}",
+            out.status
+        );
+        let native = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            native,
+            eval_main_int(src),
+            "{tag}: native output diverges from the evaluator"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_nested_match_joins_through_an_n_armed_phi() {
+    // A match nested inside an arm leaves the builder in the INNER match's join
+    // block; the outer phi must read that block back with get_insert_block(), not
+    // assume the arm's body block (the N3 nested-if trap, one dimension wider).
+    let src = "type T { A, B, C(T) }\nfn f(n) { match n { A -> 0  B -> 1  C(m) -> match m { A -> 10  B -> 11  C(_) -> 12 } } }\npub fn main() { f(C(C(B))) }\n";
+    let dir = temp_dir("nested-match");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "nested-match");
+    assert_runs(&exe, "12");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_failed_match_traps_with_a_named_error() {
+    // The default block is unreachable for well-typed programs (exhaustiveness),
+    // so this hand-builds a Core whose match covers only `A` while the scrutinee
+    // is `B` — the fall-through. The binary must exit non-zero with the
+    // `elya_match_fail` message, not crash generically and not hit `unreachable`.
+    use elya::core::{
+        CoreArm, CoreCtor, CoreExpr, CoreFn, CoreKind, CoreLit, CoreModule, CorePat, CoreType,
+    };
+    use elya::span::Span;
+    use elya::types::{Ty, TyCon};
+    use std::rc::Rc;
+
+    let core = CoreModule {
+        types: vec![CoreType {
+            name: "T".into(),
+            ctors: vec![
+                CoreCtor {
+                    name: "A".into(),
+                    fields: vec![],
+                },
+                CoreCtor {
+                    name: "B".into(),
+                    fields: vec![],
+                },
+            ],
+        }],
+        fns: vec![CoreFn {
+            name: "main".into(),
+            params: Rc::from([]),
+            body: CoreExpr {
+                span: Span::EMPTY,
+                ty: Ty::Base(TyCon::Int),
+                kind: CoreKind::Match(
+                    Rc::new(CoreExpr {
+                        span: Span::EMPTY,
+                        ty: Ty::Con("T".into(), vec![]),
+                        kind: CoreKind::Ctor("B".into(), Rc::from([])),
+                    }),
+                    Rc::from([CoreArm {
+                        pat: CorePat::Ctor("A".into(), Rc::from([])),
+                        body: CoreExpr {
+                            span: Span::EMPTY,
+                            ty: Ty::Base(TyCon::Int),
+                            kind: CoreKind::Lit(CoreLit::Int(0)),
+                        },
+                    }]),
+                ),
+            },
+        }],
+    };
+
+    let dir = temp_dir("trap");
+    let exe = compile_and_link(&core, &dir, "trap");
+    let out = Command::new(&exe).output().expect("run produced binary");
+    assert!(
+        !out.status.success(),
+        "a failed match must exit non-zero, got {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("elya: match failed"),
+        "stderr should name the trap, got: {stderr}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

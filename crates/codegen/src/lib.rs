@@ -38,7 +38,7 @@ use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
 
 use elya::ast::BinOp;
-use elya::core::{CoreExpr, CoreFn, CoreKind, CoreLit, CoreModule};
+use elya::core::{CoreExpr, CoreFn, CoreKind, CoreLit, CoreModule, CorePat};
 use elya::types::{Ty, TyCon};
 
 #[derive(Debug)]
@@ -228,10 +228,11 @@ fn declare_all<'ctx>(
 fn emit_body<'ctx>(
     ctx: &'ctx Context,
     b: &Builder<'ctx>,
-    decls: &HashMap<String, FunctionValue<'ctx>>,
+    lc: &LowerCtx<'ctx>,
     f: &CoreFn,
 ) -> Result<(), CodegenError> {
-    let func = *decls
+    let func = *lc
+        .decls
         .get(&f.name)
         .ok_or(CodegenError::Unsupported("undeclared function"))?;
     let entry = ctx.append_basic_block(func, "entry");
@@ -245,7 +246,7 @@ fn emit_body<'ctx>(
     }
     // Every function body is in tail position by definition; `lower_tail` emits
     // the terminator, so there is no `build_return` here any more.
-    lower_tail(ctx, func, b, decls, &f.body, &mut env)
+    lower_tail(ctx, func, b, lc, &f.body, &mut env)
 }
 
 /// One place where an Elya call becomes an LLVM call, used from both `lower_expr`
@@ -259,7 +260,7 @@ fn build_elya_call<'ctx>(
     ctx: &'ctx Context,
     func: FunctionValue<'ctx>,
     b: &Builder<'ctx>,
-    decls: &HashMap<String, FunctionValue<'ctx>>,
+    lc: &LowerCtx<'ctx>,
     callee: &CoreExpr,
     args: &[CoreExpr],
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
@@ -267,13 +268,13 @@ fn build_elya_call<'ctx>(
     let CoreKind::Var(name) = &callee.kind else {
         return Err(CodegenError::Unsupported("computed callee"));
     };
-    let target = *decls.get(name).ok_or(CodegenError::Unsupported(
+    let target = *lc.decls.get(name).ok_or(CodegenError::Unsupported(
         "callee is not a top-level function",
     ))?;
     let mut vals: Vec<BasicMetadataValueEnum<'ctx>> = Vec::with_capacity(args.len());
     for a in args.iter() {
         // Left to right, matching the evaluator's argument order.
-        vals.push(lower_expr(ctx, func, b, decls, a, env)?.into());
+        vals.push(lower_expr(ctx, func, b, lc, a, env)?.into());
     }
     let site = b.build_call(target, &vals, "c").map_err(internal)?;
     // Singular here (CallSiteValue), plural on the declaration (FunctionValue).
@@ -293,7 +294,7 @@ fn lower_tail<'ctx>(
     ctx: &'ctx Context,
     func: FunctionValue<'ctx>,
     b: &Builder<'ctx>,
-    decls: &HashMap<String, FunctionValue<'ctx>>,
+    lc: &LowerCtx<'ctx>,
     e: &CoreExpr,
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
 ) -> Result<(), CodegenError> {
@@ -304,7 +305,7 @@ fn lower_tail<'ctx>(
             // which a join block would break by inserting a branch between them.
             // The `phi` diamond in `lower_expr` stays exercised by the corpus
             // programs whose `if`s sit in `let`-value position.
-            let c = lower_expr(ctx, func, b, decls, cond, env)?.into_int_value();
+            let c = lower_expr(ctx, func, b, lc, cond, env)?.into_int_value();
             if c.get_type().get_bit_width() != 1 {
                 return Err(CodegenError::Unsupported("non-Bool if condition"));
             }
@@ -313,18 +314,18 @@ fn lower_tail<'ctx>(
             b.build_conditional_branch(c, then_bb, else_bb)
                 .map_err(internal)?;
             b.position_at_end(then_bb);
-            lower_tail(ctx, func, b, decls, then_e, env)?;
+            lower_tail(ctx, func, b, lc, then_e, env)?;
             // Position explicitly rather than assuming where the recursive call
             // left the builder: a nested tail `if` leaves it in ITS else block.
             b.position_at_end(else_bb);
-            lower_tail(ctx, func, b, decls, else_e, env)?;
+            lower_tail(ctx, func, b, lc, else_e, env)?;
             Ok(())
         }
         CoreKind::Let(x, rhs, body) => {
             // The bound value is NOT in tail position; only the body is.
-            let v = lower_expr(ctx, func, b, decls, rhs, env)?;
+            let v = lower_expr(ctx, func, b, lc, rhs, env)?;
             let prev = env.insert(x.clone(), v);
-            let out = lower_tail(ctx, func, b, decls, body, env);
+            let out = lower_tail(ctx, func, b, lc, body, env);
             // Restore any shadowed binding, exactly as `lower_expr` does.
             match prev {
                 Some(p) => {
@@ -337,7 +338,7 @@ fn lower_tail<'ctx>(
             out
         }
         CoreKind::App(callee, args) => {
-            let site = build_elya_call(ctx, func, b, decls, callee, args, env)?;
+            let site = build_elya_call(ctx, func, b, lc, callee, args, env)?;
             // The guarantee, in one line. `musttail` is VERIFIER-ENFORCED: if
             // the convention, the return type, or the adjacency of the `ret`
             // were wrong, `module.verify()` rejects the module rather than
@@ -353,7 +354,7 @@ fn lower_tail<'ctx>(
             Ok(())
         }
         _ => {
-            let v = lower_expr(ctx, func, b, decls, e, env)?;
+            let v = lower_expr(ctx, func, b, lc, e, env)?;
             b.build_return(Some(&v)).map_err(internal)?;
             Ok(())
         }
@@ -369,7 +370,7 @@ fn lower_expr<'ctx>(
     ctx: &'ctx Context,
     func: FunctionValue<'ctx>,
     b: &Builder<'ctx>,
-    decls: &HashMap<String, FunctionValue<'ctx>>,
+    lc: &LowerCtx<'ctx>,
     e: &CoreExpr,
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
 ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
@@ -378,7 +379,7 @@ fn lower_expr<'ctx>(
     // "unrepresentable type" — but the correct refusal is the more specific
     // "function used as a value" (§5.4's companion).
     if let CoreKind::Var(x) = &e.kind {
-        if !env.contains_key(x) && decls.contains_key(x) {
+        if !env.contains_key(x) && lc.decls.contains_key(x) {
             return Err(CodegenError::Unsupported("function used as a value"));
         }
     }
@@ -398,9 +399,9 @@ fn lower_expr<'ctx>(
             None => Err(CodegenError::Unsupported("unbound var")),
         },
         CoreKind::Let(x, rhs, body) => {
-            let v = lower_expr(ctx, func, b, decls, rhs, env)?;
+            let v = lower_expr(ctx, func, b, lc, rhs, env)?;
             let prev = env.insert(x.clone(), v);
-            let out = lower_expr(ctx, func, b, decls, body, env);
+            let out = lower_expr(ctx, func, b, lc, body, env);
             // Restore any shadowed binding — `let x = 1; let x = x + 1` stays correct.
             match prev {
                 Some(p) => {
@@ -427,8 +428,8 @@ fn lower_expr<'ctx>(
             {
                 return Err(CodegenError::Unsupported(eq_operand_label(*op)));
             }
-            let l = lower_expr(ctx, func, b, decls, &args[0], env)?.into_int_value();
-            let r = lower_expr(ctx, func, b, decls, &args[1], env)?.into_int_value();
+            let l = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
+            let r = lower_expr(ctx, func, b, lc, &args[1], env)?.into_int_value();
             // Deliberately NO nsw/nuw flags: defined two's-complement wrapping
             // (§3.4). Overflow reconciliation with the evaluator is tracked in
             // spec §11 — not silently decided here.
@@ -457,14 +458,14 @@ fn lower_expr<'ctx>(
         CoreKind::App(callee, args) => {
             // Ordinary (non-tail) position: `tailcc` convention, NO tail-call
             // kind. Task 4 adds the tail-position path.
-            let site = build_elya_call(ctx, func, b, decls, callee, args, env)?;
+            let site = build_elya_call(ctx, func, b, lc, callee, args, env)?;
             site.try_as_basic_value()
                 .left()
                 .ok_or(CodegenError::Unsupported("call returned no value"))
         }
         CoreKind::Lambda(..) => Err(CodegenError::Unsupported("Lambda")),
         CoreKind::If(cond, then_e, else_e) => {
-            let c = lower_expr(ctx, func, b, decls, cond, env)?.into_int_value();
+            let c = lower_expr(ctx, func, b, lc, cond, env)?.into_int_value();
             // The checker unifies the condition with Bool, so §3.1's mapping
             // makes it i1. Anything else is a bug in our own lowering, surfaced
             // rather than handed to `build_conditional_branch`.
@@ -478,7 +479,7 @@ fn lower_expr<'ctx>(
                 .map_err(internal)?;
 
             b.position_at_end(then_bb);
-            let tv = lower_expr(ctx, func, b, decls, then_e, env)?;
+            let tv = lower_expr(ctx, func, b, lc, then_e, env)?;
             // THE TRAP (§3.2): a nested `if` inside this branch left the builder
             // in ITS join block, not in `then_bb`. `phi` names the block control
             // actually flows FROM, so read the exit block back from the builder
@@ -489,7 +490,7 @@ fn lower_expr<'ctx>(
             b.build_unconditional_branch(join_bb).map_err(internal)?;
 
             b.position_at_end(else_bb);
-            let ev = lower_expr(ctx, func, b, decls, else_e, env)?;
+            let ev = lower_expr(ctx, func, b, lc, else_e, env)?;
             let else_exit = b
                 .get_insert_block()
                 .ok_or(CodegenError::Unsupported("builder left no block"))?;
@@ -509,9 +510,223 @@ fn lower_expr<'ctx>(
             phi.add_incoming(&[(&tv, then_exit), (&ev, else_exit)]);
             Ok(phi.as_basic_value())
         }
-        CoreKind::Ctor(..) => Err(CodegenError::Unsupported("Ctor")),
-        CoreKind::Match(..) => Err(CodegenError::Unsupported("Match")),
+        CoreKind::Ctor(name, fields) => {
+            let i64t = ctx.i64_type();
+            // A miss means the constructor's type was parametric and deferred in
+            // Task 2 — refused by name, never unwrapped.
+            let (tag, field_tys) = lc
+                .ctors
+                .get(name)
+                .cloned()
+                .ok_or(CodegenError::Unsupported("parametric ADT"))?;
+            let vals: Vec<BasicValueEnum<'ctx>> = fields
+                .iter()
+                .map(|f| lower_expr(ctx, func, b, lc, f, env))
+                .collect::<Result<_, _>>()?;
+            let p = b
+                .build_call(
+                    lc.alloc,
+                    &[i64t.const_int((1 + field_tys.len()) as u64, false).into()],
+                    "a",
+                )
+                .map_err(internal)?
+                .try_as_basic_value()
+                .left()
+                .ok_or(CodegenError::Unsupported("elya_alloc returned no value"))?
+                .into_pointer_value();
+            b.build_store(p, i64t.const_int(tag as u64, false))
+                .map_err(internal)?;
+            for (i, fv) in vals.into_iter().enumerate() {
+                let fp =
+                    unsafe { b.build_gep(i64t, p, &[i64t.const_int((i + 1) as u64, false)], "fp") }
+                        .map_err(internal)?;
+                let word = match &field_tys[i] {
+                    Ty::Base(TyCon::Int) => fv.into_int_value(),
+                    Ty::Base(TyCon::Bool) => b
+                        .build_int_z_extend(fv.into_int_value(), i64t, "zw")
+                        .map_err(internal)?,
+                    _ => b
+                        .build_ptr_to_int(fv.into_pointer_value(), i64t, "p2i")
+                        .map_err(internal)?,
+                };
+                b.build_store(fp, word).map_err(internal)?;
+            }
+            Ok(p.into())
+        }
+        CoreKind::Match(scrutinee, arms) => {
+            let i64t = ctx.i64_type();
+            let ptrt = ctx.ptr_type(AddressSpace::default());
+            let s = lower_expr(ctx, func, b, lc, scrutinee, env)?.into_pointer_value();
+            let tag = b
+                .build_load(i64t, s, "tag")
+                .map_err(internal)?
+                .into_int_value();
+            let join_bb = ctx.append_basic_block(func, "mjoin");
+            let mut incoming: Vec<(BasicValueEnum<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> =
+                Vec::new();
+            let mut fallthrough = b
+                .get_insert_block()
+                .ok_or_else(|| internal("builder left no block"))?;
+            let mut terminal = false;
+            for arm in arms.iter() {
+                let body_bb = ctx.append_basic_block(func, "marm");
+                match &arm.pat {
+                    CorePat::Ctor(name, pat_args) => {
+                        let (tag_idx, field_tys) = lc
+                            .ctors
+                            .get(name)
+                            .cloned()
+                            .ok_or(CodegenError::Unsupported("parametric ADT"))?;
+                        b.position_at_end(fallthrough);
+                        let cmp = b
+                            .build_int_compare(
+                                IntPredicate::EQ,
+                                tag,
+                                i64t.const_int(tag_idx as u64, false),
+                                "mc",
+                            )
+                            .map_err(internal)?;
+                        let next = ctx.append_basic_block(func, "mnext");
+                        b.build_conditional_branch(cmp, body_bb, next)
+                            .map_err(internal)?;
+                        fallthrough = next;
+                        b.position_at_end(body_bb);
+                        let mut bindings: Vec<(String, BasicValueEnum<'ctx>)> = Vec::new();
+                        for (pi, p) in pat_args.iter().enumerate() {
+                            let fp = unsafe {
+                                b.build_gep(
+                                    i64t,
+                                    s,
+                                    &[i64t.const_int((pi + 1) as u64, false)],
+                                    "fp",
+                                )
+                            }
+                            .map_err(internal)?;
+                            let loaded = b
+                                .build_load(i64t, fp, "fld")
+                                .map_err(internal)?
+                                .into_int_value();
+                            let field_val: BasicValueEnum<'ctx> = match &field_tys[pi] {
+                                Ty::Base(TyCon::Int) => loaded.into(),
+                                Ty::Base(TyCon::Bool) => b
+                                    .build_int_truncate(loaded, ctx.bool_type(), "bt")
+                                    .map_err(internal)?
+                                    .into(),
+                                _ => b
+                                    .build_int_to_ptr(loaded, ptrt, "i2p")
+                                    .map_err(internal)?
+                                    .into(),
+                            };
+                            match p {
+                                CorePat::Var(v) => bindings.push((v.clone(), field_val)),
+                                CorePat::Wild => {}
+                                CorePat::Ctor(..) => {
+                                    return Err(CodegenError::Unsupported(
+                                        "nested constructor pattern",
+                                    ))
+                                }
+                                CorePat::Lit(_) => {
+                                    return Err(CodegenError::Unsupported("literal pattern"))
+                                }
+                            }
+                        }
+                        for (n, v) in &bindings {
+                            env.insert(n.clone(), *v);
+                        }
+                        let v = lower_expr(ctx, func, b, lc, &arm.body, env)?;
+                        for (n, _) in &bindings {
+                            env.remove(n);
+                        }
+                        let exit = b
+                            .get_insert_block()
+                            .ok_or_else(|| internal("builder left no block"))?;
+                        b.build_unconditional_branch(join_bb).map_err(internal)?;
+                        incoming.push((v, exit));
+                    }
+                    CorePat::Wild => {
+                        b.position_at_end(fallthrough);
+                        b.build_unconditional_branch(body_bb).map_err(internal)?;
+                        b.position_at_end(body_bb);
+                        let v = lower_expr(ctx, func, b, lc, &arm.body, env)?;
+                        let exit = b
+                            .get_insert_block()
+                            .ok_or_else(|| internal("builder left no block"))?;
+                        b.build_unconditional_branch(join_bb).map_err(internal)?;
+                        incoming.push((v, exit));
+                        terminal = true;
+                    }
+                    CorePat::Var(name) => {
+                        b.position_at_end(fallthrough);
+                        b.build_unconditional_branch(body_bb).map_err(internal)?;
+                        b.position_at_end(body_bb);
+                        let prev = env.insert(name.clone(), s.into());
+                        let v = lower_expr(ctx, func, b, lc, &arm.body, env);
+                        match prev {
+                            Some(p) => {
+                                env.insert(name.clone(), p);
+                            }
+                            None => {
+                                env.remove(name);
+                            }
+                        }
+                        let v = v?;
+                        let exit = b
+                            .get_insert_block()
+                            .ok_or_else(|| internal("builder left no block"))?;
+                        b.build_unconditional_branch(join_bb).map_err(internal)?;
+                        incoming.push((v, exit));
+                        terminal = true;
+                    }
+                    CorePat::Lit(_) => return Err(CodegenError::Unsupported("literal pattern")),
+                }
+            }
+            // The default block — reached only if the last arm was a constructor
+            // and no tag matched — traps via elya_match_fail, never UB.
+            if !terminal {
+                b.position_at_end(fallthrough);
+                b.build_call(lc.fail, &[], "fail").map_err(internal)?;
+                // `elya_match_fail` exits (calls exit(1)); this terminator is never
+                // reached — a placeholder, NOT the trap.
+                b.build_unreachable().map_err(internal)?;
+            }
+            b.position_at_end(join_bb);
+            let phi = match node_ty {
+                BasicTypeEnum::IntType(t) => b.build_phi(t, "mph"),
+                BasicTypeEnum::PointerType(t) => b.build_phi(t, "mph"),
+                _ => return Err(CodegenError::Unsupported("unrepresentable type")),
+            }
+            .map_err(internal)?;
+            for (v, bbb) in incoming.iter() {
+                phi.add_incoming(&[(v, *bbb)]);
+            }
+            Ok(phi.as_basic_value())
+        }
     }
+}
+
+/// The shared lowering context: function declarations, the constructor table, and
+/// the two runtime externals. Bundled so the lowering fold threads one reference
+/// instead of four separate ones.
+struct LowerCtx<'ctx> {
+    decls: &'ctx HashMap<String, FunctionValue<'ctx>>,
+    /// Constructor name -> (tag index within its type, field types). A name
+    /// missing here is a constructor of a *parametric* ADT, which Task 2
+    /// deferred — refused by name in the Ctor/Match arms, never unwrapped.
+    ctors: &'ctx HashMap<String, (usize, Vec<Ty>)>,
+    alloc: FunctionValue<'ctx>,
+    fail: FunctionValue<'ctx>,
+}
+
+/// Fold `core.types` into a flat constructor table: name -> (tag, field types).
+/// The tag is the constructor's index within its own type's declaration order.
+fn build_ctor_table(core: &CoreModule) -> HashMap<String, (usize, Vec<Ty>)> {
+    let mut out = HashMap::new();
+    for t in &core.types {
+        for (i, c) in t.ctors.iter().enumerate() {
+            out.insert(c.name.clone(), (i, c.fields.clone()));
+        }
+    }
+    out
 }
 
 /// Build the verified LLVM module for `core` into `ctx`: `@elya_main` lowering
@@ -541,13 +756,31 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     require_int(&main.body.ty)?;
 
     let i64t = ctx.i64_type();
+    let i32t = ctx.i32_type();
+    let i8t = ctx.i8_type();
+    let ptrt = ctx.ptr_type(AddressSpace::default());
     let module = ctx.create_module("elya");
 
-    // §4.2: declare everything, then emit every body.
+    // §4.2: declare everything (functions + the two runtime externals), then emit
+    // every body. The runtime externals are `ccc` (the C-ABI boundary); everything
+    // Elya-internal stays `tailcc`.
     let decls = declare_all(ctx, &module, core)?;
+    let ctors = build_ctor_table(core);
+
+    let alloc_ty = ptrt.fn_type(&[i64t.into()], false);
+    let alloc = module.add_function("elya_alloc", alloc_ty, None); // ccc
+    let fail_ty = ctx.void_type().fn_type(&[], false);
+    let fail = module.add_function("elya_match_fail", fail_ty, None); // ccc
+
+    let lc = LowerCtx {
+        decls: &decls,
+        ctors: &ctors,
+        alloc,
+        fail,
+    };
     let b = ctx.create_builder();
     for f in &core.fns {
-        emit_body(ctx, &b, &decls, f)?;
+        emit_body(ctx, &b, &lc, f)?;
     }
     let elya_main = *decls
         .get("main")
@@ -556,19 +789,8 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     // §3.5/§4: the print convention is ONE external symbol (printf) plus ONE
     // generated shim (@main). The shim stays `ccc` — it is the C entry point —
     // and its call to @elya_main is an ordinary call.
-    let i32t = ctx.i32_type();
-    let i8t = ctx.i8_type();
-    let ptrt = ctx.ptr_type(AddressSpace::default());
     let printf_ty = i32t.fn_type(&[ptrt.into(), i64t.into()], true);
     let printf = module.add_function("printf", printf_ty, None);
-
-    // N4 runtime (spec §2.1, §5): exactly two `ccc` C-ABI externals. Everything
-    // Elya-internal stays `tailcc`; these two are the C boundary and the only
-    // things that are.
-    let alloc_ty = ptrt.fn_type(&[i64t.into()], false);
-    let _alloc = module.add_function("elya_alloc", alloc_ty, None); // ccc
-    let fail_ty = ctx.void_type().fn_type(&[], false);
-    let _fail = module.add_function("elya_match_fail", fail_ty, None); // ccc
 
     let fmt_bytes: &[u8] = b"%lld\n\0";
     let fmt_const = i8t.const_array(
@@ -980,6 +1202,31 @@ mod tests {
         let err = emit_ir(&m).unwrap_err();
         assert!(
             matches!(err, CodegenError::Unsupported("main takes parameters")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_parametric_adt_constructor_by_name() {
+        // `Some` belongs to a parametric ADT (deferred in Task 2), so it is NOT in
+        // `types`. Lowering its `Ctor` must refuse by name — never unwrap, never a
+        // generic unknown-type error.
+        let m = main_fn(CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Int),
+            kind: CoreKind::Let(
+                "o".into(),
+                Rc::new(CoreExpr {
+                    span: Span::EMPTY,
+                    ty: Ty::Con("Option".into(), vec![]),
+                    kind: CoreKind::Ctor("Some".into(), Rc::from([int_lit(1)])),
+                }),
+                Rc::new(int_lit(0)),
+            ),
+        });
+        let err = emit_ir(&m).unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported("parametric ADT")),
             "{err:?}"
         );
     }
