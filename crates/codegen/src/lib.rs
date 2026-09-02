@@ -562,6 +562,14 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let printf_ty = i32t.fn_type(&[ptrt.into(), i64t.into()], true);
     let printf = module.add_function("printf", printf_ty, None);
 
+    // N4 runtime (spec §2.1, §5): exactly two `ccc` C-ABI externals. Everything
+    // Elya-internal stays `tailcc`; these two are the C boundary and the only
+    // things that are.
+    let alloc_ty = ptrt.fn_type(&[i64t.into()], false);
+    let _alloc = module.add_function("elya_alloc", alloc_ty, None); // ccc
+    let fail_ty = ctx.void_type().fn_type(&[], false);
+    let _fail = module.add_function("elya_match_fail", fail_ty, None); // ccc
+
     let fmt_bytes: &[u8] = b"%lld\n\0";
     let fmt_const = i8t.const_array(
         &fmt_bytes
@@ -637,8 +645,12 @@ pub fn compile_module(core: &CoreModule, obj_path: &Path) -> Result<(), CodegenE
 /// hard prerequisite and clang ships with it). Non-zero exit surfaces clang's
 /// stderr in [`CodegenError::Link`].
 pub fn link(obj: &Path, exe: &Path) -> Result<(), CodegenError> {
+    // N4 (spec §2.1): the runtime is a C file clang compiles and links alongside
+    // the object, so the two `ccc` externals resolve.
+    let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime.c");
     let out = std::process::Command::new("clang")
         .arg(obj)
+        .arg(&runtime)
         .arg("-o")
         .arg(exe)
         .output()
