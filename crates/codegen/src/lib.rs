@@ -715,6 +715,17 @@ struct LowerCtx<'ctx> {
     ctors: &'ctx HashMap<String, (usize, Vec<Ty>)>,
     alloc: FunctionValue<'ctx>,
     fail: FunctionValue<'ctx>,
+    /// The shadow-stack pair. Threaded here in Task 2 so the symbols exist and
+    /// link; Task 3 is what instruments the Ctor arm to bracket its live roots
+    /// with them, which is when a collection first becomes safe to trigger.
+    ///
+    /// `expect`, not `allow`, and deliberately: the moment Task 3 reads these
+    /// the expectation goes unfulfilled and `-D warnings` fails, so the gate
+    /// itself deletes this scaffold rather than letting it outlive its reason.
+    #[expect(dead_code)]
+    gc_push: FunctionValue<'ctx>,
+    #[expect(dead_code)]
+    gc_pop: FunctionValue<'ctx>,
 }
 
 /// Fold `core.types` into a flat constructor table: name -> (tag, field types).
@@ -776,11 +787,26 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let fail_ty = ctx.void_type().fn_type(&[], false);
     let fail = module.add_function("elya_match_fail", fail_ty, None); // ccc
 
+    // 5b-5: the collector's four symbols. All `ccc` for the same reason the
+    // first two are — this is the C-ABI boundary. Only `elya_gc_init` is CALLED
+    // in this task; the shadow-stack pair and the stats dump land inert, so
+    // `elya_alloc` stays behaviourally the `calloc` wrapper 5b-4 shipped.
+    let gc_init_ty = ctx.void_type().fn_type(&[ptrt.into(), i64t.into()], false);
+    let gc_init = module.add_function("elya_gc_init", gc_init_ty, None); // ccc
+    let gc_push_ty = ctx.void_type().fn_type(&[ptrt.into()], false);
+    let gc_push = module.add_function("elya_gc_push", gc_push_ty, None); // ccc
+    let gc_pop_ty = ctx.void_type().fn_type(&[], false);
+    let gc_pop = module.add_function("elya_gc_pop", gc_pop_ty, None); // ccc
+    let gc_report_ty = ctx.void_type().fn_type(&[], false);
+    module.add_function("elya_gc_report", gc_report_ty, None); // ccc
+
     let lc = LowerCtx {
         decls: &decls,
         ctors: &ctors,
         alloc,
         fail,
+        gc_push,
+        gc_pop,
     };
     let b = ctx.create_builder();
     for f in &core.fns {
@@ -808,9 +834,56 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     fmt.set_constant(true);
     fmt.set_unnamed_addr(true);
 
+    // 5b-5 §4: one `[arity, ptr_mask]` pair per constructor, in the SAME global
+    // tag order `build_ctor_table` assigns — the tag stored in an object's word
+    // 0 indexes straight into this table. Bit `i` of the mask is set iff field
+    // `i` is a heap pointer, which is what lets the mark phase trace precisely
+    // instead of guessing: an `Int` field is never mistaken for a pointer.
+    let desc: Vec<u64> = core
+        .types
+        .iter()
+        .flat_map(|t| t.ctors.iter())
+        .flat_map(|c| {
+            let arity = c.fields.len() as u64;
+            let mut mask = 0u64;
+            for (i, f) in c.fields.iter().enumerate() {
+                if matches!(f, Ty::Con(..)) {
+                    mask |= 1 << i;
+                }
+            }
+            [arity, mask].into_iter()
+        })
+        .collect();
+    let n_ctors = (desc.len() / 2) as u64;
+    let desc_const = i64t.const_array(
+        &desc
+            .iter()
+            .map(|&d| i64t.const_int(d, false))
+            .collect::<Vec<_>>(),
+    );
+    let desc_global = module.add_global(
+        desc_const.get_type(),
+        Some(AddressSpace::default()),
+        ".gc_desc",
+    );
+    desc_global.set_initializer(&desc_const);
+    desc_global.set_constant(true);
+    desc_global.set_unnamed_addr(true);
+
     let shim = module.add_function("main", i32t.fn_type(&[], false), None);
     let shim_entry = ctx.append_basic_block(shim, "entry");
     b.position_at_end(shim_entry);
+    // BEFORE @elya_main: the collector cannot interpret a single object until it
+    // has the table, so handing it over is the first thing the process does.
+    b.build_call(
+        gc_init,
+        &[
+            desc_global.as_pointer_value().into(),
+            i64t.const_int(n_ctors, false).into(),
+        ],
+        "",
+    )
+    .map_err(internal)?;
     let site = b.build_call(elya_main, &[], "v").map_err(internal)?;
     // The shim itself stays `ccc`, but @elya_main is now `tailcc`, so THIS CALL
     // SITE must say so too. A site whose convention disagrees with its callee's

@@ -2,13 +2,219 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-/* Allocate `words` 8-byte words, zeroed. Spec 5b-4 §2.1: allocate-don't-collect. */
+/* The Elya native runtime: a stop-the-world, non-moving mark-sweep collector.
+ * Single-threaded throughout — Elya has no native concurrency yet, so none of
+ * this state needs synchronisation.
+ *
+ * Object layout (5b-5 plan, pinned). `elya_alloc(words)` reserves `words + 2`
+ * and returns a pointer to word 2, so the collector's prefix sits IN FRONT of
+ * the tag and the visible `[tag][fields]` layout the Ctor arm emits is frozen:
+ *
+ *   [ word0: (size<<1)|mark ] [ word1: in-use next-link ] [ tag ] [ field_0 ] ...
+ *      ^ internal                ^ internal                 ^ what elya_alloc returns
+ *
+ * Two prefix words rather than one because the list link needs a full pointer.
+ */
+
+/* [2*i] = arity, [2*i+1] = ptr_mask. Bit i of the mask is set iff field i
+ * holds a heap pointer, so the mark phase knows which words to trace without
+ * ever guessing. This precision is the point: a conservative stack scan could
+ * read an Int as a pointer and make native MORE undefined than the evaluator,
+ * which 5b-1 §3.4 forbids. */
+static int64_t *gc_descriptors = NULL;
+static int64_t gc_n_ctors = 0;
+
+/* The shadow stack of live roots. Written by elya_gc_push/pop; read by mark.
+ * Task 2 declares it and leaves it empty — Task 3 is what instruments the
+ * Ctor arm to actually push. */
+static void **gc_shadow = NULL;
+static int64_t gc_shadow_top = 0, gc_shadow_cap = 0;
+
+static int64_t gc_allocated = 0, gc_collections = 0, gc_freed = 0;
+
+typedef struct Block {
+    intptr_t meta; /* (size << 1) | mark, where size counts VISIBLE words */
+    struct Block *next;
+} Block;
+
+/* Every block that is currently handed out. A block lives on exactly one of
+ * this list or its size's free list, never both — that is what makes handing
+ * the same block out twice impossible by construction rather than by care.
+ * (The plan calls this the all-blocks list; sweep "moves" dead blocks off it,
+ * so at rest it holds precisely the in-use ones.) */
+static Block *gc_all_blocks = NULL;
+
+enum { GC_MAX_WORDS = 16 };
+static Block *gc_free_lists[GC_MAX_WORDS] = {0};
+
+#define GC_MARK_BIT 1
+
+/* Wired in Task 3. Until then gc_enabled is 0, so elya_alloc is behaviourally
+ * the calloc wrapper 5b-4 shipped and the corpus must not move. */
+enum { GC_THRESHOLD = 1024 };
+static int gc_enabled = 0;
+
+static int64_t *gc_payload(Block *b) { return (int64_t *)(b + 1); }
+
+static Block *gc_block_of(void *payload) { return (Block *)((int64_t *)payload - 2); }
+
+void elya_gc_init(const int64_t *descriptors, int64_t n_ctors) {
+    gc_descriptors = (int64_t *)descriptors;
+    gc_n_ctors = n_ctors;
+}
+
+void elya_gc_push(void *root) {
+    if (gc_shadow_top == gc_shadow_cap) {
+        int64_t cap = gc_shadow_cap ? gc_shadow_cap * 2 : 256;
+        void **grown = (void **)realloc(gc_shadow, (size_t)cap * sizeof(void *));
+        if (!grown) {
+            fputs("elya: out of memory growing the shadow stack\n", stderr);
+            exit(1);
+        }
+        gc_shadow = grown;
+        gc_shadow_cap = cap;
+    }
+    gc_shadow[gc_shadow_top++] = root;
+}
+
+void elya_gc_pop(void) {
+    if (gc_shadow_top > 0) {
+        gc_shadow_top--;
+    }
+}
+
+/* The mark phase: an EXPLICIT worklist, never function recursion.
+ *
+ * This is the CtorArgs lesson applied to the collector as a hard constraint.
+ * The evaluator's Drop already paid for it once on million-element Cons
+ * chains: a recursive walk of a deep chain overflows the HOST stack, which
+ * turns a routine collection into a process crash. A million-element chain is
+ * a million worklist entries in heap memory here, and the host stack stays
+ * flat. Schorr-Waite pointer reversal would remove the worklist's own space
+ * cost; it is deferred as a later optimisation, not needed for correctness. */
+static void **gc_gray = NULL;
+static int64_t gc_gray_top = 0, gc_gray_cap = 0;
+
+static void gc_gray_push(void *p) {
+    if (!p) {
+        return;
+    }
+    Block *b = gc_block_of(p);
+    if (b->meta & GC_MARK_BIT) {
+        return; /* already marked: shared structure and cycles both terminate */
+    }
+    b->meta |= GC_MARK_BIT;
+    if (gc_gray_top == gc_gray_cap) {
+        int64_t cap = gc_gray_cap ? gc_gray_cap * 2 : 256;
+        void **grown = (void **)realloc(gc_gray, (size_t)cap * sizeof(void *));
+        if (!grown) {
+            fputs("elya: out of memory growing the mark worklist\n", stderr);
+            exit(1);
+        }
+        gc_gray = grown;
+        gc_gray_cap = cap;
+    }
+    gc_gray[gc_gray_top++] = p;
+}
+
+static void gc_mark(void) {
+    for (int64_t i = 0; i < gc_shadow_top; i++) {
+        gc_gray_push(gc_shadow[i]);
+    }
+    while (gc_gray_top > 0) {
+        int64_t *obj = (int64_t *)gc_gray[--gc_gray_top];
+        int64_t tag = obj[0];
+        if (tag < 0 || tag >= gc_n_ctors) {
+            continue; /* not a constructor we have a descriptor for */
+        }
+        int64_t arity = gc_descriptors[2 * tag];
+        int64_t mask = gc_descriptors[2 * tag + 1];
+        for (int64_t f = 0; f < arity; f++) {
+            if ((mask >> f) & 1) {
+                gc_gray_push((void *)(intptr_t)obj[1 + f]);
+            }
+        }
+    }
+}
+
+static void gc_sweep(void) {
+    Block **prev = &gc_all_blocks;
+    Block *b = gc_all_blocks;
+    while (b) {
+        Block *next = b->next;
+        if (b->meta & GC_MARK_BIT) {
+            b->meta &= ~(intptr_t)GC_MARK_BIT; /* clear for the next cycle */
+            prev = &b->next;
+        } else {
+            *prev = next; /* move it off the in-use list */
+            intptr_t size = b->meta >> 1;
+            if (size > 0 && size < GC_MAX_WORDS) {
+                /* Thread the free link through the dead tag slot. Safe
+                 * precisely because the object is dead: nothing reads that
+                 * word again until elya_alloc re-zeroes it. */
+                *(Block **)gc_payload(b) = gc_free_lists[size];
+                gc_free_lists[size] = b;
+            } else {
+                free(b); /* no free list this wide: hand it back to malloc */
+            }
+            gc_freed++;
+        }
+        b = next;
+    }
+}
+
+static void gc_collect(void) {
+    gc_collections++;
+    gc_mark();
+    gc_sweep();
+    gc_allocated = 0;
+}
+
+/* Allocate `words` 8-byte words, zeroed. The zeroing is the contract the Ctor
+ * arm relies on, so a recycled block is re-zeroed on the way out. */
 void *elya_alloc(int64_t words) {
-    return calloc((size_t)words, 8);
+    if (gc_enabled && gc_allocated >= GC_THRESHOLD) {
+        gc_collect();
+    }
+    gc_allocated++;
+
+    if (words > 0 && words < GC_MAX_WORDS && gc_free_lists[words]) {
+        Block *b = gc_free_lists[words];
+        gc_free_lists[words] = *(Block **)gc_payload(b);
+        int64_t *payload = gc_payload(b);
+        for (int64_t i = 0; i < words; i++) {
+            payload[i] = 0;
+        }
+        b->meta = (intptr_t)words << 1;
+        b->next = gc_all_blocks;
+        gc_all_blocks = b;
+        return payload;
+    }
+
+    Block *b = (Block *)calloc((size_t)words + 2, 8);
+    if (!b) {
+        fputs("elya: out of memory\n", stderr);
+        exit(1);
+    }
+    b->meta = (intptr_t)words << 1;
+    b->next = gc_all_blocks;
+    gc_all_blocks = b;
+    return gc_payload(b);
 }
 
 /* The deterministic failed-match trap. Spec 5b-4 §5: never `unreachable`. */
 void elya_match_fail(void) {
     fputs("elya: match failed (no arm matched)\n", stderr);
     exit(1);
+}
+
+/* Gated OFF by default, and that is load-bearing: every existing execution
+ * test asserts stderr is empty, so an unconditional dump would break the whole
+ * corpus at once. */
+void elya_gc_report(void) {
+    if (getenv("ELY_GC_STATS")) {
+        fprintf(stderr, "elya-gc: collections=%lld freed=%lld live_after=%lld\n",
+                (long long)gc_collections, (long long)gc_freed,
+                (long long)gc_allocated);
+    }
 }
