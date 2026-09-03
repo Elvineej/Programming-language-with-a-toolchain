@@ -716,3 +716,131 @@ fn a_failed_match_traps_with_a_named_error() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The collector's own counters, read back from a run with `ELY_GC_STATS=1`.
+/// That variable is the only reason `elya_gc_report` prints anything: every
+/// other test in this file asserts stderr is EMPTY, and that stays true.
+#[derive(Debug)]
+struct GcStats {
+    collections: i64,
+    freed: i64,
+}
+
+/// Run `exe` with statistics enabled, returning its stdout and the counters.
+fn run_with_gc_stats(exe: &Path, tag: &str) -> (String, GcStats) {
+    let out = Command::new(exe)
+        .env("ELY_GC_STATS", "1")
+        .output()
+        .expect("run produced binary");
+    diagnose_stack_overflow(&out.status, tag);
+    assert!(
+        out.status.success(),
+        "{tag}: binary exited {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let line = stderr
+        .lines()
+        .find(|l| l.starts_with("elya-gc:"))
+        .unwrap_or_else(|| panic!("{tag}: no elya-gc line in stderr: {stderr}"));
+    let field = |key: &str| -> i64 {
+        line.split_whitespace()
+            .find_map(|f| f.strip_prefix(key))
+            .unwrap_or_else(|| panic!("{tag}: no `{key}` field in: {line}"))
+            .parse()
+            .unwrap_or_else(|e| panic!("{tag}: `{key}` is not a number in `{line}`: {e}"))
+    };
+    let stats = GcStats {
+        collections: field("collections="),
+        freed: field("freed="),
+    };
+    (
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        stats,
+    )
+}
+
+#[test]
+fn an_unbounded_allocating_loop_collects_and_frees() {
+    // 5b-5 Task 3, tooth one: three million words allocated by a program whose
+    // live set never exceeds one object, because the loop discards each
+    // `Link(End)` the moment it is built.
+    //
+    // TWO assertions, and the second is what makes the first mean something.
+    // `collections > 0` on its own also passes for a run that merely reached the
+    // end, and a collection that marked everything and reclaimed nothing would
+    // satisfy it while the heap grew without bound. `freed > 0` is the half that
+    // says memory actually came back.
+    //
+    // The tail call is what keeps the machine stack flat while the heap churns;
+    // if that regressed, this arrives as STATUS_STACK_OVERFLOW and
+    // `diagnose_stack_overflow` names it rather than printing a bare number.
+    let src = "type Node { End, Link(Node) }\nfn loop(n) { if n == 0 { 0 } else { let _ = Link(End)  loop(n - 1) } }\npub fn main() { loop(1000000) }\n";
+    let dir = temp_dir("gc-unbounded");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "gc-unbounded");
+    let (stdout, stats) = run_with_gc_stats(&exe, "gc-unbounded");
+    assert_eq!(stdout, "0");
+    assert!(stats.collections > 0, "the collector never ran: {stats:?}");
+    assert!(
+        stats.freed > 0,
+        "collections ran but reclaimed nothing: {stats:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn ordinary_programs_finish_without_collecting() {
+    // Tooth two, and it is the one that keeps tooth one honest. A threshold low
+    // enough to trip on everyday programs would satisfy `collections > 0`
+    // trivially, proving that the constant is small rather than that the
+    // collector works. `GC_THRESHOLD_WORDS` is pinned at `1 << 16` against a
+    // measured corpus peak of SEVEN words, so nothing here is near the line —
+    // and this test is what would notice if a future change moved it there.
+    let dir = temp_dir("gc-no-trip");
+    for (tag, src, expected) in ADT_CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        let (stdout, stats) = run_with_gc_stats(&exe, tag);
+        assert_eq!(&stdout, expected, "{tag}");
+        assert_eq!(
+            stats.collections, 0,
+            "{tag}: an ordinary program collected — the threshold is too low: {stats:?}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_live_binding_survives_collection_across_a_call() {
+    // The root-discipline proof. `a` is live in `main`'s environment across a
+    // NON-TAIL call that allocates megabytes; nothing on the heap points at it,
+    // only main's frame does. Unless the call site roots the caller's bindings,
+    // the mark phase cannot see `a` and sweep reclaims it while it is still live.
+    //
+    // The payload is what gives this teeth, and that was learned the hard way. An
+    // earlier version of this test matched on a constructor TAG and passed even
+    // with rooting disabled: a swept block's tag slot holds the free-list link,
+    // which fails the first arm and falls into the second, printing the right
+    // answer by luck. `12345` cannot be forged — a recycled block is re-zeroed,
+    // and a block reused as a `Link` holds a pointer. Confirmed by construction:
+    // with `gc_root_env` stubbed to push nothing, this program dies in
+    // `elya_match_fail` instead of printing.
+    //
+    // `churn` is tail-recursive, so the machine stack stays flat while the heap
+    // crosses the threshold several times over.
+    let src = "type L { End, Link(L) }\ntype Box { B(Int) }\nfn churn(n) { if n == 0 { 0 } else { let _ = Link(End)  churn(n - 1) } }\npub fn main() { let a = B(12345)  let _ = churn(100000)  match a { B(x) -> x } }\n";
+    let dir = temp_dir("gc-roots");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "gc-roots");
+    let (stdout, stats) = run_with_gc_stats(&exe, "gc-roots");
+    assert!(
+        stats.collections > 0,
+        "no collection happened across the call, so nothing was proved: {stats:?}"
+    );
+    assert_eq!(
+        stdout, "12345",
+        "the live binding did not survive collection"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
