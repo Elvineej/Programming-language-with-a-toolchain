@@ -34,7 +34,7 @@ cargo run -p elya-cli --features codegen -- build prog.elya   # -> prog(.exe)
 ```
 
 Output defaults to the input stem plus the platform executable suffix; `-o <out>`
-overrides it. As of Slice 5b-4 the backend covers arithmetic, control flow,
+overrides it. As of Slice 5b-5 the backend covers arithmetic, control flow,
 top-level functions, and algebraic data types with `match` (`Int` and `Bool`,
 `let`, `+ - *`, the six comparisons, strict `&&`/`||`, `if`/`else`, calls to
 named functions of up to five parameters, and monomorphic ADTs constructed then
@@ -42,10 +42,14 @@ matched to extract an `Int`), so anything outside it is rejected by name rather
 than mis-compiled — the tree-walking `elya run` remains the full language. Tail
 calls are eliminated under a guarantee the LLVM verifier enforces, so mutually
 recursive functions recur to any depth in a compiled binary just as they do
-under `elya run`. ADT values are heap-allocated (tag + fields), and a failed
-match traps with a defined error rather than undefined behaviour. Every compiled
-program in the test corpus is additionally checked against what the evaluator
-computes, so the two never drift apart silently.
+under `elya run`. ADT values are heap-allocated (tag + fields) and reclaimed by
+a threshold-triggered mark-sweep collector backed by a shadow stack, so a
+compiled binary that allocates unboundedly in a loop runs in bounded memory
+rather than exhausting it; the evaluator refcounts instead, and reclaim timing
+is unobservable in this acyclic subset. A failed match traps with a defined
+error rather than undefined behaviour. Every compiled program in the test
+corpus is additionally checked against what the evaluator computes, so the two
+never drift apart silently.
 
 ## Local CI
 

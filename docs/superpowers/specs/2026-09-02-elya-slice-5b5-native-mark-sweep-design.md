@@ -95,10 +95,10 @@ Given the shadow-stack roots (§3) and the global tag + descriptor table (§4):
 
 **The proof is two-sided, and the second is non-negotiable.**
 
-1. **A program that allocates unboundedly in a loop and terminates in bounded memory.** A tail-recursive function (recursion is available; 5b-3) that allocates and discards a block per iteration, for a count large enough that *without* collection it would exhaust the heap — with collection it runs in bounded live memory and exits 0 with the right answer, checked differentially against the evaluator.
+1. **A program that allocates unboundedly in a loop and terminates in bounded memory.** A tail-recursive function (recursion is available; 5b-3) that allocates and discards a block per iteration — with collection it runs in bounded live memory and exits 0 with the right answer, checked differentially against the evaluator. **Be precise about what this half proves, because the obvious stronger claim is false:** at any iteration count fast enough for a test, an uncollected run does *not* exhaust the heap (a million iterations retains ~56 MB, which no machine here refuses). So this tooth is not "it would die without collection" — exiting 0 rules out a crash on the way, and the counters below are the actual proof. Sizing the loop to genuinely exhaust memory would trade a fast, deterministic test for a slow one whose failure mode is the machine swapping.
 2. **`elya_gc_report` asserting `freed > 0`.** Without this, a green test might be a program that never actually triggered a collection — allocate-don't-collect also "doesn't crash." The collector keeps counters (`allocations`, `collections`, `freed`); a new `elya_gc_report(void)` (`ccc`, like the rest) dumps them to **stderr** when an environment variable gates it in. **Hard requirement: gated off by default** — an ordinary run's stderr stays byte-identical to today's empty output, because every existing execution test asserts empty stderr and an unconditional dump would break the whole corpus. The one test that wants the counters sets the variable and asserts `collections > 0` **and** `freed > 0`.
 
-Both teeth live in `native_codegen.rs` alongside the existing direct + differential runners. The first is "would otherwise consume unbounded memory"; the second is "and a collection demonstrably happened."
+Both teeth live in `native_codegen.rs` alongside the existing direct + differential runners. The first is "it runs to completion in bounded live memory"; the second is "and a collection demonstrably happened."
 ---
 
 ## §7. Semantic fidelity: refcount vs. trace
@@ -122,13 +122,13 @@ Still open, carried over: **T1** (≤5 arity), **T2** (whole-module representabi
 
 ## §9. Completion checklist
 
-- [ ] `build_ctor_table` assigns **globally unique** tags across all types; `Ctor` stores them; the descriptor table carries each constructor's arity + ptr_mask
-- [ ] Runtime reserves a **private prefix word** per block (mark/size/free-list link); codegen still gets a pointer at the tag; `[tag][fields]` visible layout frozen
-- [ ] `elya_alloc` reuses freed blocks (zeroed) via a free list, `calloc`-backed when empty
-- [ ] Mark is an **iterative gray-stack**; sweep is an **iterative free-list walk**; no recursion anywhere
-- [ ] Shadow-stack roots: **whole-live-env** push before each `elya_alloc`, pop after; no conservative scan
-- [ ] Threshold-triggered collection runs inside `elya_alloc`
-- [ ] The unbounded-allocation loop **terminates in bounded memory**, differentially checked
-- [ ] `elya_gc_report` (getenv-gated, off by default) asserts `freed > 0` (a collection demonstrably happened)
-- [ ] 5b-1/2/3/4 corpora pass unchanged; the evaluator is untouched
-- [ ] No IR snapshot; no test skips; full five-stage gate green, both configurations
+- [x] `build_ctor_table` assigns **globally unique** tags across all types; `Ctor` stores them; the descriptor table carries each constructor's arity + ptr_mask
+- [x] Runtime reserves a **private prefix word** per block (mark/size/free-list link); codegen still gets a pointer at the tag; `[tag][fields]` visible layout frozen
+- [x] `elya_alloc` reuses freed blocks (zeroed) via a free list, `calloc`-backed when empty
+- [x] Mark is an **iterative gray-stack**; sweep is an **iterative free-list walk**; no recursion anywhere
+- [x] Shadow-stack roots: **whole-live-env** push before each `elya_alloc`, pop after; no conservative scan
+- [x] Threshold-triggered collection runs inside `elya_alloc`
+- [x] The unbounded-allocation loop **terminates in bounded memory**, differentially checked
+- [x] `elya_gc_report` (getenv-gated, off by default) asserts `freed > 0` (a collection demonstrably happened)
+- [x] 5b-1/2/3/4 corpora pass unchanged; the evaluator is untouched
+- [x] No IR snapshot; no test skips; full five-stage gate green, both configurations
