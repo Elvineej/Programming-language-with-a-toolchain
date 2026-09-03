@@ -253,9 +253,66 @@ fn emit_body<'ctx>(
 /// (ordinary position) and, in Task 4, `lower_tail` (tail position). The only
 /// difference between the two is the tail-call kind the caller sets afterwards.
 ///
+/// Push `v` onto the shadow stack if — and only if — it is a heap reference,
+/// reporting whether it was.
+///
+/// `repr_ty` gives every ADT a pointer and every scalar an integer, so
+/// `is_pointer_value` IS the root predicate: there is nothing to guess. That
+/// precision is the whole reason §3 chose a shadow stack over a conservative
+/// scan of the machine stack, which could read an `Int` as an address and make
+/// native MORE undefined than the evaluator — which 5b-1 §3.4 forbids.
+fn gc_root<'ctx>(
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'ctx>,
+    v: BasicValueEnum<'ctx>,
+) -> Result<bool, CodegenError> {
+    if !v.is_pointer_value() {
+        return Ok(false);
+    }
+    b.build_call(lc.gc_push, &[v.into()], "")
+        .map_err(internal)?;
+    Ok(true)
+}
+
+/// Root every heap binding currently in scope, returning how many went on.
+///
+/// The keys are SORTED first. `HashMap` iteration order varies between
+/// processes, so without this the same input would emit different IR run to
+/// run — reproducibility is nearly free here and expensive to retrofit.
+fn gc_root_env<'ctx>(
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'ctx>,
+    env: &HashMap<String, BasicValueEnum<'ctx>>,
+) -> Result<usize, CodegenError> {
+    let mut names: Vec<&String> = env.keys().collect();
+    names.sort();
+    let mut n = 0usize;
+    for name in names {
+        if gc_root(b, lc, env[name])? {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Pop `n` roots. Every push above is matched by exactly one of these on every
+/// path out. An imbalance never fails loudly: it either retains garbage for the
+/// life of the process or — the direction that matters — un-roots a value that
+/// is still live, which is a silent wrong answer.
+fn gc_unroot<'ctx>(b: &Builder<'ctx>, lc: &LowerCtx<'ctx>, n: usize) -> Result<(), CodegenError> {
+    for _ in 0..n {
+        b.build_call(lc.gc_pop, &[], "").map_err(internal)?;
+    }
+    Ok(())
+}
+
 /// The callee kind is inspected FIRST, so §5.3's "computed callee" refusal fires
 /// before any argument is lowered and before the existing `Lambda` arm is ever
 /// reached.
+///
+/// `tail` is not a hint — it selects the root discipline, and the body explains
+/// why the two cases cannot be unified.
+#[allow(clippy::too_many_arguments)]
 fn build_elya_call<'ctx>(
     ctx: &'ctx Context,
     func: FunctionValue<'ctx>,
@@ -264,6 +321,7 @@ fn build_elya_call<'ctx>(
     callee: &CoreExpr,
     args: &[CoreExpr],
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    tail: bool,
 ) -> Result<CallSiteValue<'ctx>, CodegenError> {
     let CoreKind::Var(name) = &callee.kind else {
         return Err(CodegenError::Unsupported("computed callee"));
@@ -271,14 +329,40 @@ fn build_elya_call<'ctx>(
     let target = *lc.decls.get(name).ok_or(CodegenError::Unsupported(
         "callee is not a top-level function",
     ))?;
+    // Roots, in two layers, and the layering is the whole subtlety.
+    //
+    // The caller's own bindings are rooted ONLY for a non-tail call. A tail
+    // call's frame is dead the instant the call happens — the callee roots its
+    // own parameters at its own allocation sites — so rooting them here would
+    // be pure cost. It would also be fatal twice over: `musttail` requires the
+    // call to be immediately followed by `ret`, leaving nowhere to pop, and a
+    // million tail iterations would then grow the shadow stack without bound.
+    // That would trade N2's constant-stack guarantee away to fix a GC bug.
+    let env_roots = if tail { 0 } else { gc_root_env(b, lc, env)? };
     let mut vals: Vec<BasicMetadataValueEnum<'ctx>> = Vec::with_capacity(args.len());
+    let mut arg_roots = 0usize;
     for a in args.iter() {
-        // Left to right, matching the evaluator's argument order.
-        vals.push(lower_expr(ctx, func, b, lc, a, env)?.into());
+        // Left to right, matching the evaluator's argument order. Each argument
+        // is rooted AS IT IS LOWERED rather than batched afterwards: in
+        // `f(g(), h())` the value of `g()` is a temp nothing names, and
+        // lowering `h()` can allocate.
+        let v = lower_expr(ctx, func, b, lc, a, env)?;
+        if gc_root(b, lc, v)? {
+            arg_roots += 1;
+        }
+        vals.push(v.into());
     }
+    // Unroot the arguments BEFORE the call, LIFO — they went on last. Handing
+    // them over unrooted is safe because the callee roots its parameters at its
+    // own first allocation site, and nothing allocates in between.
+    gc_unroot(b, lc, arg_roots)?;
     let site = b.build_call(target, &vals, "c").map_err(internal)?;
     // Singular here (CallSiteValue), plural on the declaration (FunctionValue).
     site.set_call_convention(TAILCC);
+    // The caller's frame outlives a non-tail call, so its roots come off only
+    // now. For a tail call `env_roots` is zero and this emits nothing, which is
+    // what leaves the `musttail` call adjacent to its `ret`.
+    gc_unroot(b, lc, env_roots)?;
     Ok(site)
 }
 
@@ -338,7 +422,7 @@ fn lower_tail<'ctx>(
             out
         }
         CoreKind::App(callee, args) => {
-            let site = build_elya_call(ctx, func, b, lc, callee, args, env)?;
+            let site = build_elya_call(ctx, func, b, lc, callee, args, env, true)?;
             // The guarantee, in one line. `musttail` is VERIFIER-ENFORCED: if
             // the convention, the return type, or the adjacency of the `ret`
             // were wrong, `module.verify()` rejects the module rather than
@@ -458,7 +542,7 @@ fn lower_expr<'ctx>(
         CoreKind::App(callee, args) => {
             // Ordinary (non-tail) position: `tailcc` convention, NO tail-call
             // kind. Task 4 adds the tail-position path.
-            let site = build_elya_call(ctx, func, b, lc, callee, args, env)?;
+            let site = build_elya_call(ctx, func, b, lc, callee, args, env, false)?;
             site.try_as_basic_value()
                 .left()
                 .ok_or(CodegenError::Unsupported("call returned no value"))
@@ -519,10 +603,24 @@ fn lower_expr<'ctx>(
                 .get(name)
                 .cloned()
                 .ok_or(CodegenError::Unsupported("parametric ADT"))?;
-            let vals: Vec<BasicValueEnum<'ctx>> = fields
-                .iter()
-                .map(|f| lower_expr(ctx, func, b, lc, f, env))
-                .collect::<Result<_, _>>()?;
+            // Two layers again, and here the second one is what a batch push
+            // gets wrong. The live bindings go on first, because lowering a
+            // field can itself allocate and those bindings are not otherwise
+            // reachable from anything the collector can see. Then each field is
+            // rooted AS IT IS LOWERED: in `Pair(Some(1), Some(2))` the value of
+            // `Some(1)` is a temp nothing names, and lowering `Some(2)`
+            // allocates — a push after the loop would root it only after the
+            // collection that could already have freed it.
+            let env_roots = gc_root_env(b, lc, env)?;
+            let mut vals: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(fields.len());
+            let mut field_roots = 0usize;
+            for f in fields.iter() {
+                let v = lower_expr(ctx, func, b, lc, f, env)?;
+                if gc_root(b, lc, v)? {
+                    field_roots += 1;
+                }
+                vals.push(v);
+            }
             let p = b
                 .build_call(
                     lc.alloc,
@@ -551,6 +649,10 @@ fn lower_expr<'ctx>(
                 };
                 b.build_store(fp, word).map_err(internal)?;
             }
+            // The object now holds the fields, so it roots them. Nothing below
+            // this line allocates, so `p` needs no entry of its own — whichever
+            // bracket encloses this expression is what covers it.
+            gc_unroot(b, lc, field_roots + env_roots)?;
             Ok(p.into())
         }
         CoreKind::Match(scrutinee, arms) => {
@@ -715,16 +817,11 @@ struct LowerCtx<'ctx> {
     ctors: &'ctx HashMap<String, (usize, Vec<Ty>)>,
     alloc: FunctionValue<'ctx>,
     fail: FunctionValue<'ctx>,
-    /// The shadow-stack pair. Threaded here in Task 2 so the symbols exist and
-    /// link; Task 3 is what instruments the Ctor arm to bracket its live roots
-    /// with them, which is when a collection first becomes safe to trigger.
-    ///
-    /// `expect`, not `allow`, and deliberately: the moment Task 3 reads these
-    /// the expectation goes unfulfilled and `-D warnings` fails, so the gate
-    /// itself deletes this scaffold rather than letting it outlive its reason.
-    #[expect(dead_code)]
+    /// The shadow-stack pair, now live. Every allocation site is dominated by a
+    /// push of the enclosing frame's heap bindings, so at the moment
+    /// `elya_alloc` may collect, `gc_mark` reads exactly the set of values the
+    /// program can still reach a name for.
     gc_push: FunctionValue<'ctx>,
-    #[expect(dead_code)]
     gc_pop: FunctionValue<'ctx>,
 }
 
@@ -788,9 +885,10 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let fail = module.add_function("elya_match_fail", fail_ty, None); // ccc
 
     // 5b-5: the collector's four symbols. All `ccc` for the same reason the
-    // first two are — this is the C-ABI boundary. Only `elya_gc_init` is CALLED
-    // in this task; the shadow-stack pair and the stats dump land inert, so
-    // `elya_alloc` stays behaviourally the `calloc` wrapper 5b-4 shipped.
+    // first two are — this is the C-ABI boundary. Task 3 calls all four:
+    // `elya_gc_init` hands over the descriptor table before `@elya_main` runs,
+    // the shadow-stack pair brackets every allocation, and the stats dump
+    // closes the shim.
     let gc_init_ty = ctx.void_type().fn_type(&[ptrt.into(), i64t.into()], false);
     let gc_init = module.add_function("elya_gc_init", gc_init_ty, None); // ccc
     let gc_push_ty = ctx.void_type().fn_type(&[ptrt.into()], false);
@@ -798,7 +896,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let gc_pop_ty = ctx.void_type().fn_type(&[], false);
     let gc_pop = module.add_function("elya_gc_pop", gc_pop_ty, None); // ccc
     let gc_report_ty = ctx.void_type().fn_type(&[], false);
-    module.add_function("elya_gc_report", gc_report_ty, None); // ccc
+    let gc_report = module.add_function("elya_gc_report", gc_report_ty, None); // ccc
 
     let lc = LowerCtx {
         decls: &decls,
@@ -898,6 +996,10 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         .ok_or_else(|| internal("elya_main did not return a value"))?;
     b.build_call(printf, &[fmt.as_pointer_value().into(), v.into()], "p")
         .map_err(internal)?;
+    // AFTER the answer, so a stats dump can never interleave with the value the
+    // execution proofs assert on, and gated on ELY_GC_STATS inside the runtime
+    // so stderr stays empty unless a test asks for the counters.
+    b.build_call(gc_report, &[], "").map_err(internal)?;
     b.build_return(Some(&i32t.const_int(0, false)))
         .map_err(internal)?;
 

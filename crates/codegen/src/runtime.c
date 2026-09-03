@@ -25,11 +25,16 @@ static int64_t *gc_descriptors = NULL;
 static int64_t gc_n_ctors = 0;
 
 /* The shadow stack of live roots. Written by elya_gc_push/pop; read by mark.
- * Task 2 declares it and leaves it empty — Task 3 is what instruments the
- * Ctor arm to actually push. */
+ * The codegen brackets every allocation and every non-tail call with pushes and
+ * pops, so when gc_mark runs this array holds exactly the heap values the
+ * program can still reach a name for. */
 static void **gc_shadow = NULL;
 static int64_t gc_shadow_top = 0, gc_shadow_cap = 0;
 
+/* gc_allocated counts WORDS handed out since the last collection, not objects.
+ * Words are the memory-pressure proxy the threshold is denominated in: a
+ * one-word `Nil` should not push toward a collection as hard as a sixteen-word
+ * record does. */
 static int64_t gc_allocated = 0, gc_collections = 0, gc_freed = 0;
 
 typedef struct Block {
@@ -49,10 +54,19 @@ static Block *gc_free_lists[GC_MAX_WORDS] = {0};
 
 #define GC_MARK_BIT 1
 
-/* Wired in Task 3. Until then gc_enabled is 0, so elya_alloc is behaviourally
- * the calloc wrapper 5b-4 shipped and the corpus must not move. */
-enum { GC_THRESHOLD = 1024 };
-static int gc_enabled = 0;
+/* Pinned by measurement, not by taste. Built with collection disabled, the ADT
+ * corpus reports its whole lifetime allocation at exit: option_extract 2 words,
+ * recursive_nat 7, three_way 2, nested_match 5. The arithmetic, control-flow and
+ * tail-call corpora allocate nothing at all. Seven words is therefore the FLOOR
+ * this constant has to clear -- below it, ordinary programs would start
+ * collecting incidentally and "no collection during an ordinary build" would
+ * stop proving anything.
+ *
+ * The pin is 1<<16 words, half a mebibyte of payload and some nine thousand
+ * times that floor, so the no-trip question is not a close call. The upper end
+ * is purely an amortisation choice: at three words an iteration a
+ * million-iteration allocating loop still collects about forty-five times. */
+enum { GC_THRESHOLD_WORDS = 1 << 16 };
 
 static int64_t *gc_payload(Block *b) { return (int64_t *)(b + 1); }
 
@@ -173,10 +187,15 @@ static void gc_collect(void) {
 /* Allocate `words` 8-byte words, zeroed. The zeroing is the contract the Ctor
  * arm relies on, so a recycled block is re-zeroed on the way out. */
 void *elya_alloc(int64_t words) {
-    if (gc_enabled && gc_allocated >= GC_THRESHOLD) {
+    /* Roots for a collection triggered HERE are already on the shadow stack:
+     * the Ctor arm pushes both the live bindings and the just-lowered fields
+     * before the call, precisely so that this line is safe. Marking runs before
+     * the block is handed out, so the new object is never itself a mark
+     * target -- nothing yet points at it. */
+    if (gc_allocated >= GC_THRESHOLD_WORDS) {
         gc_collect();
     }
-    gc_allocated++;
+    gc_allocated += words;
 
     if (words > 0 && words < GC_MAX_WORDS && gc_free_lists[words]) {
         Block *b = gc_free_lists[words];
@@ -213,7 +232,7 @@ void elya_match_fail(void) {
  * corpus at once. */
 void elya_gc_report(void) {
     if (getenv("ELY_GC_STATS")) {
-        fprintf(stderr, "elya-gc: collections=%lld freed=%lld live_after=%lld\n",
+        fprintf(stderr, "elya-gc: collections=%lld freed=%lld words_since_gc=%lld\n",
                 (long long)gc_collections, (long long)gc_freed,
                 (long long)gc_allocated);
     }
