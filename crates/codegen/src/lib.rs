@@ -17,14 +17,6 @@
 //! undefined than `elya run`, observable the moment Div lands. Short-circuiting
 //! is a front-end question, not a back-end one.
 
-// TEMPORARY, for exactly one commit. This module is complete and unit-tested,
-// but nothing in the emitter reads it until Task 3 wires closure conversion in,
-// so the *lib* target — the only target clippy B builds under `-D warnings` —
-// sees every item as unreachable. `#[expect]` would retire itself here, but the
-// crate's `rust-version = "1.75"` predates its stabilisation (1.81). Task 3
-// DELETES these two lines; the gate staying green without them is the proof the
-// deadness was temporary rather than a suppression that outlived its reason.
-#[allow(dead_code)]
 mod closure;
 
 use std::collections::HashMap;
@@ -38,6 +30,7 @@ use inkwell::targets::{
 };
 use inkwell::types::BasicMetadataTypeEnum;
 use inkwell::types::BasicTypeEnum;
+use inkwell::types::FunctionType;
 use inkwell::values::BasicMetadataValueEnum;
 use inkwell::values::BasicValueEnum;
 use inkwell::values::CallSiteValue;
@@ -47,6 +40,7 @@ use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
 
+use crate::closure::LambdaSite;
 use elya::ast::BinOp;
 use elya::core::{CoreExpr, CoreFn, CoreKind, CoreLit, CoreModule, CorePat};
 use elya::types::{Ty, TyCon};
@@ -143,7 +137,29 @@ const TAILCC: u32 = 18;
 /// guaranteed tail call hits `LLVM ERROR: Can't handle guaranteed tail call
 /// under win64 yet` — a `report_fatal_error` with no source span that kills the
 /// process. Refusing at 6 is what keeps that unreachable.
+///
+/// This cap applies to the CONVERTED arity — the arity LLVM actually sees. A
+/// lambda gets a separate, lower cap (`MAX_LAMBDA_PARAMS`) because closure
+/// conversion prepends the closure pointer, so its source arity is one less.
 const MAX_PARAMS: usize = 5;
+
+/// The lambda arity cap (5b-6 §5.1). A lambda of `P` source parameters
+/// converts to a lifted function of arity `P + 1` — the closure block is
+/// parameter 0 — so the source cap is `MAX_PARAMS - 1`, stated as its own
+/// constant because it is refused at its own site with its own message.
+///
+/// C-ii probe, `scratchpad/n5-indirect-probe`, LLVM 18.1.6 /
+/// `x86_64-pc-windows-msvc`, 2026-09-03. Sweeping caller arity C × callee arity
+/// K over 1..8 for a `musttail` call under `tailcc`, the indirect-callee matrix
+/// is cell-for-cell identical to the direct-callee matrix: K <= 5 compiles for
+/// every C; K in {6,7} only when C >= 6; K = 8 only when C >= 8. Every passing
+/// cell emits a real tail jump (`jmpq *%rax` for the indirect ones); every
+/// failing cell is `LLVM ERROR: Can't handle guaranteed tail call under win64
+/// yet`, a `report_fatal_error` that kills the process with no source span.
+///
+/// This number is MEASURED. Do not raise it to make a program compile; re-run
+/// the probe, or lower it.
+const MAX_LAMBDA_PARAMS: usize = 4;
 
 /// §3.1 module shape, as N2 leaves it: SOME function is named `main` and takes
 /// no parameters. The "exactly one function" half is gone — that is the whole
@@ -170,6 +186,23 @@ fn repr_ty<'ctx>(ctx: &'ctx Context, ty: &Ty) -> Result<BasicTypeEnum<'ctx>, Cod
         Ty::Base(TyCon::Bool) => Ok(ctx.bool_type().into()),
         // N4 (spec §1): an ADT value is a pointer to its heap object.
         Ty::Con(..) => Ok(ctx.ptr_type(AddressSpace::default()).into()),
+        // N5 (5b-6 §3): a function value is a pointer to its closure block.
+        Ty::Fn(..) => Ok(ctx.ptr_type(AddressSpace::default()).into()),
+        _ => Err(CodegenError::Unsupported("unrepresentable type")),
+    }
+}
+
+/// The `BasicTypeEnum` -> `FunctionType` step, factored out of `declare_all`
+/// because `declare_lifted` (5b-6 §4.3) needs exactly the same match: a lifted
+/// lambda body is declared the same way a top-level function is, only with the
+/// closure pointer spliced in as parameter 0.
+fn fn_type_of<'ctx>(
+    ret: BasicTypeEnum<'ctx>,
+    params: &[BasicMetadataTypeEnum<'ctx>],
+) -> Result<FunctionType<'ctx>, CodegenError> {
+    match ret {
+        BasicTypeEnum::IntType(t) => Ok(t.fn_type(params, false)),
+        BasicTypeEnum::PointerType(t) => Ok(t.fn_type(params, false)),
         _ => Err(CodegenError::Unsupported("unrepresentable type")),
     }
 }
@@ -217,11 +250,7 @@ fn declare_all<'ctx>(
         for p in f.params.iter() {
             params.push(repr_ty(ctx, &p.ty)?.into());
         }
-        let fn_ty = match repr_ty(ctx, &f.body.ty)? {
-            BasicTypeEnum::IntType(t) => t.fn_type(&params, false),
-            BasicTypeEnum::PointerType(t) => t.fn_type(&params, false),
-            _ => return Err(CodegenError::Unsupported("unrepresentable type")),
-        };
+        let fn_ty = fn_type_of(repr_ty(ctx, &f.body.ty)?, &params)?;
         let func = module.add_function(&mangle(&f.name), fn_ty, None);
         // NOTE the plural: `set_call_conventions` is the FunctionValue method.
         // The call-site method is `set_call_convention`, singular. Both are
@@ -230,6 +259,86 @@ fn declare_all<'ctx>(
         decls.insert(f.name.clone(), func);
     }
     Ok(decls)
+}
+
+/// One LLVM function per lambda site. Parameter 0 is the closure pointer — the
+/// environment IS the closure (5b-6 §3, C-iii) — then the source parameters in
+/// order. `tailcc` on every one of them, for the same reason every top-level
+/// Elya function gets it: `musttail`'s convention-match requirement is then true
+/// by construction.
+fn declare_lifted<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+    sites: &[LambdaSite],
+) -> Result<HashMap<String, FunctionValue<'ctx>>, CodegenError> {
+    let ptrt = ctx.ptr_type(AddressSpace::default());
+    let mut out = HashMap::new();
+    for site in sites {
+        let mut params: Vec<BasicMetadataTypeEnum<'ctx>> =
+            Vec::with_capacity(site.params.len() + 1);
+        params.push(ptrt.into());
+        for p in site.params.iter() {
+            params.push(repr_ty(ctx, &p.ty)?.into());
+        }
+        let fn_ty = fn_type_of(repr_ty(ctx, &site.ret)?, &params)?;
+        let f = module.add_function(&mangle(&site.symbol), fn_ty, None);
+        f.set_call_conventions(TAILCC);
+        out.insert(site.symbol.clone(), f);
+    }
+    Ok(out)
+}
+
+/// Emit one lifted body. Captures are loaded ONCE, at entry, into the same `env`
+/// the lowering fold already threads — so from that point a captured name is an
+/// ordinary SSA binding and `gc_root_env` roots it exactly as it roots a
+/// parameter. That is why the closure pointer itself needs no root inside the
+/// body: nothing re-reads it, and a non-recursive lambda never self-calls.
+fn emit_lifted<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'ctx>,
+    site: &LambdaSite,
+) -> Result<(), CodegenError> {
+    let func = *lc
+        .lifted
+        .get(&site.symbol)
+        .ok_or(CodegenError::Unsupported("lambda body was never declared"))?;
+    let entry = ctx.append_basic_block(func, "entry");
+    b.position_at_end(entry);
+    let i64t = ctx.i64_type();
+    let ptrt = ctx.ptr_type(AddressSpace::default());
+    let clos = func
+        .get_nth_param(0)
+        .ok_or_else(|| internal("lifted body has no environment parameter"))?
+        .into_pointer_value();
+    let mut env: HashMap<String, BasicValueEnum<'ctx>> = HashMap::new();
+    for (i, (name, ty)) in site.captures.iter().enumerate() {
+        let cs = unsafe { b.build_gep(i64t, clos, &[i64t.const_int((i + 2) as u64, false)], "cs") }
+            .map_err(internal)?;
+        let loaded = b
+            .build_load(i64t, cs, "cv")
+            .map_err(internal)?
+            .into_int_value();
+        let v: BasicValueEnum<'ctx> = match ty {
+            Ty::Base(TyCon::Int) => loaded.into(),
+            Ty::Base(TyCon::Bool) => b
+                .build_int_truncate(loaded, ctx.bool_type(), "bt")
+                .map_err(internal)?
+                .into(),
+            _ => b
+                .build_int_to_ptr(loaded, ptrt, "i2p")
+                .map_err(internal)?
+                .into(),
+        };
+        env.insert(name.clone(), v);
+    }
+    for (i, p) in site.params.iter().enumerate() {
+        let v = func
+            .get_nth_param((i + 1) as u32)
+            .ok_or_else(|| internal("declared lambda arity disagrees with Core"))?;
+        env.insert(p.name.clone(), v);
+    }
+    lower_tail(ctx, func, b, lc, &site.body, &mut env)
 }
 
 /// Pass 2 of §4.2. The value environment starts empty and is seeded from the
@@ -316,12 +425,13 @@ fn gc_unroot<'ctx>(b: &Builder<'ctx>, lc: &LowerCtx<'ctx>, n: usize) -> Result<(
     Ok(())
 }
 
-/// The callee kind is inspected FIRST, so §5.3's "computed callee" refusal fires
-/// before any argument is lowered and before the existing `Lambda` arm is ever
-/// reached.
+/// Dispatch one Elya call. A callee that names a LOCAL holds a closure pointer,
+/// so the call is indirect; a callee that names a top-level function is direct.
+/// `env` is consulted before `decls`, the same order `lower_expr`'s head guard
+/// uses, so a local shadowing a top-level name resolves to the local.
 ///
-/// `tail` is not a hint — it selects the root discipline, and the body explains
-/// why the two cases cannot be unified.
+/// `tail` is not a hint — it selects the root discipline, and both bodies below
+/// explain why the two cases cannot be unified.
 #[allow(clippy::too_many_arguments)]
 fn build_elya_call<'ctx>(
     ctx: &'ctx Context,
@@ -333,12 +443,36 @@ fn build_elya_call<'ctx>(
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
     tail: bool,
 ) -> Result<CallSiteValue<'ctx>, CodegenError> {
+    // §9: dispatch is by BINDING, not by type. A callee that is not a name at
+    // all — an immediately-applied lambda, say — is still 5b-3 §5.3's computed
+    // callee, and refusing it here keeps that cut exactly where N2 drew it.
+    // Reading `Ty::Fn` off any callee whatsoever would have moved it silently.
     let CoreKind::Var(name) = &callee.kind else {
         return Err(CodegenError::Unsupported("computed callee"));
     };
+    // `env` before `decls`, the same order `lower_expr`'s head guard uses, so a
+    // local shadowing a top-level name resolves to the local.
+    if env.contains_key(name) {
+        return build_closure_call(ctx, func, b, lc, callee, args, env, tail);
+    }
     let target = *lc.decls.get(name).ok_or(CodegenError::Unsupported(
         "callee is not a top-level function",
     ))?;
+    build_direct_call(ctx, func, b, lc, target, args, env, tail)
+}
+
+/// The N2 path, unchanged: a statically known `tailcc` callee, called by name.
+#[allow(clippy::too_many_arguments)]
+fn build_direct_call<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'ctx>,
+    target: FunctionValue<'ctx>,
+    args: &[CoreExpr],
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    tail: bool,
+) -> Result<CallSiteValue<'ctx>, CodegenError> {
     // Roots, in two layers, and the layering is the whole subtlety.
     //
     // The caller's own bindings are rooted ONLY for a non-tail call. A tail
@@ -372,6 +506,75 @@ fn build_elya_call<'ctx>(
     // The caller's frame outlives a non-tail call, so its roots come off only
     // now. For a tail call `env_roots` is zero and this emits nothing, which is
     // what leaves the `musttail` call adjacent to its `ret`.
+    gc_unroot(b, lc, env_roots)?;
+    Ok(site)
+}
+
+/// Call through a closure. The signature is read WHOLE off the callee's own
+/// recorded `Ty::Fn` — not reconstructed from surrounding context, which is the
+/// reconstruction 5b-6 §4 rejected. Parameter 0 is the closure pointer itself.
+///
+/// Reached only for a `Var` bound in `env`, so the `Ty::Fn` guard below is the
+/// second half of §9's predicate, not the whole of it: it catches a local of
+/// non-function type in callee position. The syntactic half stays in the
+/// dispatcher, which is what keeps 5b-3 §5.3's cut where N2 drew it.
+#[allow(clippy::too_many_arguments)]
+fn build_closure_call<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'ctx>,
+    callee: &CoreExpr,
+    args: &[CoreExpr],
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    tail: bool,
+) -> Result<CallSiteValue<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    let ptrt = ctx.ptr_type(AddressSpace::default());
+    let Ty::Fn(param_tys, _, ret_ty) = &callee.ty else {
+        return Err(CodegenError::Unsupported("computed callee"));
+    };
+    if param_tys.len() != args.len() {
+        return Err(CodegenError::Unsupported("closure call arity mismatch"));
+    }
+    let mut sig: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::with_capacity(args.len() + 1);
+    sig.push(ptrt.into());
+    for t in param_tys.iter() {
+        sig.push(repr_ty(ctx, t)?.into());
+    }
+    let fn_ty = fn_type_of(repr_ty(ctx, ret_ty)?, &sig)?;
+
+    let env_roots = if tail { 0 } else { gc_root_env(b, lc, env)? };
+    let clos = lower_expr(ctx, func, b, lc, callee, env)?.into_pointer_value();
+    // The closure is rooted UNCONDITIONALLY — including at a tail call, where
+    // `env_roots` is 0 by design. It is about to become argument 0, and lowering
+    // an argument can allocate, so this is the one root a tail call still needs.
+    b.build_call(lc.gc_push, &[clos.into()], "")
+        .map_err(internal)?;
+    let mut vals: Vec<BasicMetadataValueEnum<'ctx>> = Vec::with_capacity(args.len() + 1);
+    vals.push(clos.into());
+    let mut arg_roots = 0usize;
+    for a in args.iter() {
+        let v = lower_expr(ctx, func, b, lc, a, env)?;
+        if gc_root(b, lc, v)? {
+            arg_roots += 1;
+        }
+        vals.push(v.into());
+    }
+    // Word 1 is the code pointer. Loading is not an allocation, so it is safe
+    // after the arguments and before the unroot.
+    let slot =
+        unsafe { b.build_gep(i64t, clos, &[i64t.const_int(1, false)], "cp") }.map_err(internal)?;
+    let code = b
+        .build_load(i64t, slot, "cw")
+        .map_err(internal)?
+        .into_int_value();
+    let fp = b.build_int_to_ptr(code, ptrt, "i2f").map_err(internal)?;
+    gc_unroot(b, lc, arg_roots + 1)?;
+    let site = b
+        .build_indirect_call(fn_ty, fp, &vals, "ci")
+        .map_err(internal)?;
+    site.set_call_convention(TAILCC);
     gc_unroot(b, lc, env_roots)?;
     Ok(site)
 }
@@ -557,7 +760,70 @@ fn lower_expr<'ctx>(
                 .left()
                 .ok_or(CodegenError::Unsupported("call returned no value"))
         }
-        CoreKind::Lambda(..) => Err(CodegenError::Unsupported("Lambda")),
+        CoreKind::Lambda(..) => {
+            let i64t = ctx.i64_type();
+            // Identity by node address: the pre-pass and this emitter hold the
+            // same immutable `&CoreModule`, so a miss is a real bug, not a
+            // tolerable absence.
+            let key = e as *const CoreExpr as usize;
+            let idx = *lc.lambda_index.get(&key).ok_or(CodegenError::Unsupported(
+                "lambda site missing from the pre-pass",
+            ))?;
+            let site = &lc.lambdas[idx];
+            let code_fn = *lc
+                .lifted
+                .get(&site.symbol)
+                .ok_or(CodegenError::Unsupported("lambda body was never declared"))?;
+            // Same bracket shape as `CoreKind::Ctor`: `elya_alloc` is the one
+            // call here that can collect, so the environment is rooted across it.
+            let env_roots = gc_root_env(b, lc, env)?;
+            let p = b
+                .build_call(
+                    lc.alloc,
+                    &[i64t
+                        .const_int((2 + site.captures.len()) as u64, false)
+                        .into()],
+                    "cl",
+                )
+                .map_err(internal)?
+                .try_as_basic_value()
+                .left()
+                .ok_or(CodegenError::Unsupported("elya_alloc returned no value"))?
+                .into_pointer_value();
+            // Word 0: the synthetic tag, so `gc_mark` finds a descriptor row for
+            // this block exactly as it does for a constructor (Task 4).
+            b.build_store(p, i64t.const_int(site.tag as u64, false))
+                .map_err(internal)?;
+            // Word 1: the code pointer, stored as a word and NOT traced.
+            let cp = unsafe { b.build_gep(i64t, p, &[i64t.const_int(1, false)], "cp") }
+                .map_err(internal)?;
+            let code = b
+                .build_ptr_to_int(code_fn.as_global_value().as_pointer_value(), i64t, "f2i")
+                .map_err(internal)?;
+            b.build_store(cp, code).map_err(internal)?;
+            // Words 2..: the captures, in name order. Values come straight out of
+            // `env` — nothing here allocates, so `env_roots` already covers them.
+            for (i, (name, ty)) in site.captures.iter().enumerate() {
+                let v = *env
+                    .get(name)
+                    .ok_or(CodegenError::Unsupported("captured name is not in scope"))?;
+                let word = match ty {
+                    Ty::Base(TyCon::Int) => v.into_int_value(),
+                    Ty::Base(TyCon::Bool) => b
+                        .build_int_z_extend(v.into_int_value(), i64t, "zw")
+                        .map_err(internal)?,
+                    _ => b
+                        .build_ptr_to_int(v.into_pointer_value(), i64t, "p2i")
+                        .map_err(internal)?,
+                };
+                let cs =
+                    unsafe { b.build_gep(i64t, p, &[i64t.const_int((i + 2) as u64, false)], "cs") }
+                        .map_err(internal)?;
+                b.build_store(cs, word).map_err(internal)?;
+            }
+            gc_unroot(b, lc, env_roots)?;
+            Ok(p.into())
+        }
         CoreKind::If(cond, then_e, else_e) => {
             let c = lower_expr(ctx, func, b, lc, cond, env)?.into_int_value();
             // The checker unifies the condition with Bool, so §3.1's mapping
@@ -825,6 +1091,12 @@ struct LowerCtx<'ctx> {
     /// missing here is a constructor of a *parametric* ADT, which Task 2
     /// deferred — refused by name in the Ctor/Match arms, never unwrapped.
     ctors: &'ctx HashMap<String, (usize, Vec<Ty>)>,
+    /// Every lambda site in the module, in the pre-order `collect_lambdas` fixed.
+    lambdas: &'ctx [LambdaSite],
+    /// Core node address -> index into `lambdas`.
+    lambda_index: &'ctx HashMap<usize, usize>,
+    /// `LambdaSite::symbol` -> the declared lifted function.
+    lifted: &'ctx HashMap<String, FunctionValue<'ctx>>,
     alloc: FunctionValue<'ctx>,
     fail: FunctionValue<'ctx>,
     /// The shadow-stack pair, now live. Every allocation site is dominated by a
@@ -869,6 +1141,28 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         }
     }
 
+    // The closure tags continue the constructor numbering, so `first_tag` is the
+    // number of REAL descriptor rows — computed the same way the descriptor table
+    // below counts them, from `core.types`.
+    let n_real_ctors: usize = core.types.iter().map(|t| t.ctors.len()).sum();
+    let lambdas = closure::collect_lambdas(core, n_real_ctors);
+    // §5.1, and for the same reason the scan above is first: over-cap is a
+    // `report_fatal_error` inside LLVM, so it must be refused BEFORE anything is
+    // emitted. One site governs the whole module: every `Ty::Fn` value in a
+    // whole-module compile originates at a lambda site this loop has seen.
+    for site in &lambdas {
+        if site.params.len() > MAX_LAMBDA_PARAMS {
+            return Err(CodegenError::Unsupported(
+                "lambda takes more than four parameters",
+            ));
+        }
+    }
+    let lambda_index: HashMap<usize, usize> = lambdas
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.key, i))
+        .collect();
+
     let main = find_main(core)?;
     // §5.5: `main` ALONE. The scope narrows from "every function" (which was
     // trivially just `main` in N1) to "`main`", because `@elya_main`'s signature
@@ -908,9 +1202,14 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let gc_report_ty = ctx.void_type().fn_type(&[], false);
     let gc_report = module.add_function("elya_gc_report", gc_report_ty, None); // ccc
 
+    let lifted = declare_lifted(ctx, &module, &lambdas)?;
+
     let lc = LowerCtx {
         decls: &decls,
         ctors: &ctors,
+        lambdas: &lambdas,
+        lambda_index: &lambda_index,
+        lifted: &lifted,
         alloc,
         fail,
         gc_push,
@@ -919,6 +1218,9 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let b = ctx.create_builder();
     for f in &core.fns {
         emit_body(ctx, &b, &lc, f)?;
+    }
+    for site in lc.lambdas {
+        emit_lifted(ctx, &b, &lc, site)?;
     }
     let elya_main = *decls
         .get("main")
@@ -1370,22 +1672,42 @@ mod tests {
         );
     }
 
+    /// 5b-6 §5.1. A lambda converts to a lifted function of arity `P + 1` (the
+    /// closure is parameter 0), so the source cap is FOUR, not five.
+    ///
+    /// C-ii probe, `scratchpad/n5-indirect-probe`, LLVM 18.1.6 /
+    /// `x86_64-pc-windows-msvc`, 2026-09-03. Sweeping caller arity C × callee
+    /// arity K over 1..8 for a `musttail` call under `tailcc`, the indirect-callee
+    /// matrix is cell-for-cell identical to the direct-callee matrix: K <= 5
+    /// compiles for every C; K in {6,7} only when C >= 6; K = 8 only when C >= 8.
+    /// Every passing cell emits a real tail jump; every failing cell is
+    /// `LLVM ERROR: Can't handle guaranteed tail call under win64 yet`, a
+    /// `report_fatal_error` that kills the process with no source span. Refusing
+    /// at five source parameters is what keeps that unreachable.
     #[test]
-    fn rejects_lambda_specifically() {
+    fn rejects_a_lambda_with_five_parameters() {
+        let p = |n: &str| elya::core::CoreParam {
+            name: n.to_string(),
+            ty: Ty::Base(TyCon::Int),
+        };
         let e = CoreExpr {
             span: Span::EMPTY,
-            ty: Ty::Base(TyCon::Int),
+            ty: Ty::Fn(
+                vec![Ty::Base(TyCon::Int); 5],
+                elya::types::EffectRow::pure(),
+                Box::new(Ty::Base(TyCon::Int)),
+            ),
             kind: CoreKind::Lambda(
-                Rc::from([elya::core::CoreParam {
-                    name: "x".to_string(),
-                    ty: Ty::Base(TyCon::Int),
-                }]),
+                Rc::from([p("a"), p("b"), p("c"), p("d"), p("e")]),
                 Rc::new(int_lit(1)),
             ),
         };
         let err = emit_ir(&main_fn(e)).unwrap_err();
         assert!(
-            matches!(err, CodegenError::Unsupported("Lambda")),
+            matches!(
+                err,
+                CodegenError::Unsupported("lambda takes more than four parameters")
+            ),
             "{err:?}"
         );
     }
