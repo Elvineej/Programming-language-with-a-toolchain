@@ -3,6 +3,7 @@ source: tests/typed_inference.rs
 expression: "render(src, &t)"
 ---
 20..31 `fn(x) { x }` : fn(a) -> a
+23..24 `x` : a
 28..29 `x` : a
 41..42 `f` : fn(Int) -> Int
 41..45 `f(1)` : Int

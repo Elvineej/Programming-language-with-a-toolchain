@@ -343,3 +343,28 @@ pub fn main() { add3(4) }
         add3.body.ty
     );
 }
+
+/// Slice 5b-6 Task 1 (obligation T3, CR-1 route (a)). A lambda parameter's type
+/// is RECORDED at its span by the checker and carried into Core, rather than
+/// reconstructed in the back end from call-site context. The lambda here is
+/// applied to an `Int` at a monomorphic use, so the recorded type zonks to a
+/// concrete `Int` — which is exactly what the back end needs to build the lifted
+/// function's signature.
+#[test]
+fn lambda_parameters_carry_recorded_types() {
+    let (core, _table) = lower_src("pub fn main() {\n  let f = fn(x) { x + 1 }\n  f(41)\n}\n");
+    let lam = nodes(&core)
+        .into_iter()
+        .find(|n| matches!(&n.kind, CoreKind::Lambda(..)))
+        .expect("the program contains a lambda");
+    let CoreKind::Lambda(params, _) = &lam.kind else {
+        unreachable!("just matched")
+    };
+    assert_eq!(params.len(), 1, "one parameter");
+    assert_eq!(params[0].name, "x", "the name survives lowering");
+    assert_eq!(
+        params[0].ty,
+        Ty::Base(TyCon::Int),
+        "the TYPE survives lowering — this is what T3 was about"
+    );
+}
