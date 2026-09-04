@@ -36,8 +36,9 @@ pub enum CoreKind {
     Ctor(String, Rc<[CoreExpr]>),
     /// `+` etc. — the primitive operator set is reused verbatim from the AST.
     Prim(BinOp, Rc<[CoreExpr]>),
-    /// uncurried params; the block body is flattened into a single expression.
-    Lambda(Rc<[String]>, Rc<CoreExpr>),
+    /// uncurried params, each carrying the type recorded at its span (5b-6 §4,
+    /// obligation T3); the block body is flattened into a single expression.
+    Lambda(Rc<[CoreParam]>, Rc<CoreExpr>),
     /// binding spine synthesized from block-flattening: `Let(name, value, body)`.
     Let(String, Rc<CoreExpr>, Rc<CoreExpr>),
     /// `if cond { .. } else { .. }` — always two-branch, because the AST's
@@ -294,9 +295,22 @@ fn lower_expr(
             CoreKind::If(Rc::new(c), Rc::new(t), Rc::new(e))
         }
         Expr::Lambda { params, body } => {
-            let names: Vec<String> = params.iter().map(|p| p.node.name.clone()).collect();
+            // Same shape as the top-level fn parameter loop above: the type comes
+            // out of the frozen table keyed by the parameter's own span. A lambda
+            // parameter missing from the table is `Untyped`, not a guess.
+            let mut ps = Vec::with_capacity(params.len());
+            for p in params {
+                let ty = table
+                    .get(&p.span)
+                    .cloned()
+                    .ok_or(LowerError::Untyped(p.span))?;
+                ps.push(CoreParam {
+                    name: p.node.name.clone(),
+                    ty,
+                });
+            }
             let b = lower_block(&body.node, table, ctors)?;
-            CoreKind::Lambda(names.into(), Rc::new(b))
+            CoreKind::Lambda(ps.into(), Rc::new(b))
         }
         Expr::Match { scrutinee, arms } => {
             let s = lower_expr(&scrutinee.node, scrutinee.span, table, ctors)?;
@@ -427,7 +441,7 @@ fn pretty_expr(e: &CoreExpr, p: &mut TyPrinter, s: &mut String) {
                 if i > 0 {
                     s.push(' ');
                 }
-                s.push_str(param);
+                s.push_str(&param.name);
             }
             s.push_str(") ");
             pretty_expr(body, p, s);

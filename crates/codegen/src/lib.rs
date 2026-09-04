@@ -1365,7 +1365,13 @@ mod tests {
         let e = CoreExpr {
             span: Span::EMPTY,
             ty: Ty::Base(TyCon::Int),
-            kind: CoreKind::Lambda(Rc::from(["x".to_string()]), Rc::new(int_lit(1))),
+            kind: CoreKind::Lambda(
+                Rc::from([elya::core::CoreParam {
+                    name: "x".to_string(),
+                    ty: Ty::Base(TyCon::Int),
+                }]),
+                Rc::new(int_lit(1)),
+            ),
         };
         let err = emit_ir(&main_fn(e)).unwrap_err();
         assert!(

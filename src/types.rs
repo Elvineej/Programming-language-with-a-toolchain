@@ -993,6 +993,11 @@ impl Infer {
                             ty: pv.clone(),
                         },
                     );
+                    // 5b-6 §4 (obligation T3): record the parameter's type at its
+                    // own span, exactly as a top-level fn parameter is recorded.
+                    // The back end then READS a lambda parameter's type instead of
+                    // reconstructing it from call-site context.
+                    self.node_types.insert(p.span, pv.clone());
                     param_tys.push(pv);
                 }
                 // The lambda has its OWN latent effect row: infer the body under a
