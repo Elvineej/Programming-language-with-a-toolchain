@@ -17,6 +17,16 @@
 //! undefined than `elya run`, observable the moment Div lands. Short-circuiting
 //! is a front-end question, not a back-end one.
 
+// TEMPORARY, for exactly one commit. This module is complete and unit-tested,
+// but nothing in the emitter reads it until Task 3 wires closure conversion in,
+// so the *lib* target — the only target clippy B builds under `-D warnings` —
+// sees every item as unreachable. `#[expect]` would retire itself here, but the
+// crate's `rust-version = "1.75"` predates its stabilisation (1.81). Task 3
+// DELETES these two lines; the gate staying green without them is the proof the
+// deadness was temporary rather than a suppression that outlived its reason.
+#[allow(dead_code)]
+mod closure;
+
 use std::collections::HashMap;
 use std::path::Path;
 
