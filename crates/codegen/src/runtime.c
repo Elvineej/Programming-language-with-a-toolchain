@@ -39,7 +39,7 @@ static int64_t gc_shadow_top = 0, gc_shadow_cap = 0;
  * gc_live is the odd one out: a LEVEL, not a flow. gc_collections and gc_freed
  * only ever climb; gc_live is recomputed from scratch by every sweep and
  * answers "how much is still reachable", which is the one place a
- * refcounting/tracing divergence could ever show up (5b-6 s11, obligation T7). */
+ * refcounting/tracing divergence could ever show up (5b-6 §11, obligation T7). */
 static int64_t gc_allocated = 0, gc_collections = 0, gc_freed = 0, gc_live = 0;
 
 typedef struct Block {
