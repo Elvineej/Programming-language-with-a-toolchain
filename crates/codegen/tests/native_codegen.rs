@@ -724,6 +724,9 @@ fn a_failed_match_traps_with_a_named_error() {
 struct GcStats {
     collections: i64,
     freed: i64,
+    /// Visible words still live at the end of the LAST collection -- the LEVEL,
+    /// where `freed` and `words_since_gc` are flows (5b-6 s11, obligation T7).
+    live: i64,
 }
 
 /// Run `exe` with statistics enabled, returning its stdout and the counters.
@@ -753,6 +756,7 @@ fn run_with_gc_stats(exe: &Path, tag: &str) -> (String, GcStats) {
     let stats = GcStats {
         collections: field("collections="),
         freed: field("freed="),
+        live: field("live="),
     };
     (
         String::from_utf8_lossy(&out.stdout).trim().to_string(),
@@ -943,4 +947,104 @@ fn a_captured_closure_is_traced_mask_covers_ty_fn() {
          because the predicate only recognised Ty::Con"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 5b-6 s11, obligation T7. The steady-state live set of a program whose live data
+/// does NOT grow with its iteration count is INDEPENDENT of that count. The same
+/// program is run at four counts spanning an 8x range and the `live` figures are
+/// asserted equal -- which makes the claim without pinning a magic number, so there
+/// is no constant here a future change could be tempted to nudge and no expected
+/// value to edit.
+///
+/// FOUR points rather than two, deliberately. Two figures agreeing is weak evidence
+/// that a level SETTLES: the last collection of a single pair could land at the same
+/// loop phase by luck. Agreement across an 8x spread is the settling claim itself.
+/// `a_growing_live_set_moves_the_instrument` is the other half -- it proves this
+/// equality is capable of failing, so satisfying it means something.
+///
+/// This is the instrument obligation T7 will be measured with. It is built now,
+/// while acyclicity makes refcount/tracing divergence unconstructible, so the day a
+/// cycle becomes constructible (N8, `Value::Resume` holding captured frames) the
+/// measurement already exists rather than being invented under pressure.
+#[test]
+fn the_live_set_settles_independent_of_iteration_count() {
+    let prog = |n: i64| {
+        format!(
+            "type L {{ Nil, Cons(Int, L) }}\n\
+             fn churn(n) {{ if n == 0 {{ 0 }} else {{ let _ = Cons(1, Nil)  churn(n - 1) }} }}\n\
+             pub fn main() {{ let keep = Cons(5, Cons(6, Nil))  let _ = churn({n})  \
+             match keep {{ Nil -> 0  Cons(h, t) -> h }} }}\n"
+        )
+    };
+    let mut seen: Vec<(i64, i64)> = Vec::new();
+    for n in [50000i64, 100000, 200000, 400000] {
+        let tag = format!("gc-live-{n}");
+        let dir = temp_dir(&tag);
+        let core = lower_src(&prog(n));
+        let exe = compile_and_link(&core, &dir, &tag);
+        let (stdout, stats) = run_with_gc_stats(&exe, &tag);
+        assert_eq!(stdout, "5", "{tag}: the retained list did not survive");
+        assert!(
+            stats.collections > 0,
+            "{tag}: no collection happened, so `live` was never computed: {stats:?}"
+        );
+        assert!(
+            stats.live > 0,
+            "{tag}: a live retained list must contribute live words: {stats:?}"
+        );
+        seen.push((n, stats.live));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    println!("live by iteration count: {seen:?}");
+    let first = seen[0].1;
+    assert!(
+        seen.iter().all(|&(_, live)| live == first),
+        "the live set must not grow with the iteration count -- it settles: {seen:?}"
+    );
+}
+
+/// The control that makes `the_live_set_settles_independent_of_iteration_count`
+/// mean something. That test asserts `live` figures are EQUAL, and an instrument
+/// stuck at a constant -- or reporting a number unrelated to the live set -- would
+/// satisfy it vacuously. Here the retained data DOES grow with the iteration count,
+/// so `live` must move. If it does not, the equality next door proves nothing.
+///
+/// `build` is tail-recursive with the list in its accumulator, so the machine stack
+/// stays flat while the retained chain crosses the threshold repeatedly. Nothing is
+/// discarded, so every collection marks everything and frees nothing -- exactly the
+/// shape that separates a LEVEL from a flow.
+///
+/// The assertion is a strict inequality, not a pinned figure: the claim is that the
+/// instrument tracks the level, not that it equals any particular number.
+#[test]
+fn a_growing_live_set_moves_the_instrument() {
+    let prog = |n: i64| {
+        format!(
+            "type L {{ Nil, Cons(Int, L) }}\n\
+             fn build(n, acc) {{ if n == 0 {{ acc }} else {{ build(n - 1, Cons(1, acc)) }} }}\n\
+             pub fn main() {{ let keep = build({n}, Nil)  \
+             match keep {{ Nil -> 0  Cons(h, t) -> h }} }}\n"
+        )
+    };
+    let mut seen: Vec<(i64, i64)> = Vec::new();
+    for n in [30000i64, 70000] {
+        let tag = format!("gc-grow-{n}");
+        let dir = temp_dir(&tag);
+        let core = lower_src(&prog(n));
+        let exe = compile_and_link(&core, &dir, &tag);
+        let (stdout, stats) = run_with_gc_stats(&exe, &tag);
+        assert_eq!(stdout, "1", "{tag}: the retained list did not survive");
+        assert!(
+            stats.collections > 0,
+            "{tag}: no collection happened, so `live` was never computed: {stats:?}"
+        );
+        seen.push((n, stats.live));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    println!("live by retained-list length: {seen:?}");
+    assert!(
+        seen[1].1 > seen[0].1,
+        "a live set that grows with the iteration count must move `live` -- the \
+         instrument is not tracking the level: {seen:?}"
+    );
 }
