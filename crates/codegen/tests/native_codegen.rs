@@ -724,8 +724,8 @@ fn a_failed_match_traps_with_a_named_error() {
 struct GcStats {
     collections: i64,
     freed: i64,
-    /// Visible words still live at the end of the LAST collection -- the LEVEL,
-    /// where `freed` and `words_since_gc` are flows (5b-6 s11, obligation T7).
+    /// Visible words still live at the end of the LAST collection — the LEVEL,
+    /// where `freed` and `words_since_gc` are flows (5b-6 §11, obligation T7).
     live: i64,
 }
 
@@ -949,17 +949,17 @@ fn a_captured_closure_is_traced_mask_covers_ty_fn() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// 5b-6 s11, obligation T7. The steady-state live set of a program whose live data
+/// 5b-6 §11, obligation T7. The steady-state live set of a program whose live data
 /// does NOT grow with its iteration count is INDEPENDENT of that count. The same
 /// program is run at four counts spanning an 8x range and the `live` figures are
-/// asserted equal -- which makes the claim without pinning a magic number, so there
+/// asserted equal — which makes the claim without pinning a magic number, so there
 /// is no constant here a future change could be tempted to nudge and no expected
 /// value to edit.
 ///
 /// FOUR points rather than two, deliberately. Two figures agreeing is weak evidence
 /// that a level SETTLES: the last collection of a single pair could land at the same
 /// loop phase by luck. Agreement across an 8x spread is the settling claim itself.
-/// `a_growing_live_set_moves_the_instrument` is the other half -- it proves this
+/// `a_growing_live_set_moves_the_instrument` is the other half — it proves this
 /// equality is capable of failing, so satisfying it means something.
 ///
 /// This is the instrument obligation T7 will be measured with. It is built now,
@@ -999,19 +999,19 @@ fn the_live_set_settles_independent_of_iteration_count() {
     let first = seen[0].1;
     assert!(
         seen.iter().all(|&(_, live)| live == first),
-        "the live set must not grow with the iteration count -- it settles: {seen:?}"
+        "the live set must not grow with the iteration count — it settles: {seen:?}"
     );
 }
 
 /// The control that makes `the_live_set_settles_independent_of_iteration_count`
 /// mean something. That test asserts `live` figures are EQUAL, and an instrument
-/// stuck at a constant -- or reporting a number unrelated to the live set -- would
+/// stuck at a constant — or reporting a number unrelated to the live set — would
 /// satisfy it vacuously. Here the retained data DOES grow with the iteration count,
 /// so `live` must move. If it does not, the equality next door proves nothing.
 ///
 /// `build` is tail-recursive with the list in its accumulator, so the machine stack
 /// stays flat while the retained chain crosses the threshold repeatedly. Nothing is
-/// discarded, so every collection marks everything and frees nothing -- exactly the
+/// discarded, so every collection marks everything and frees nothing — exactly the
 /// shape that separates a LEVEL from a flow.
 ///
 /// The assertion is a strict inequality, not a pinned figure: the claim is that the
@@ -1044,7 +1044,7 @@ fn a_growing_live_set_moves_the_instrument() {
     println!("live by retained-list length: {seen:?}");
     assert!(
         seen[1].1 > seen[0].1,
-        "a live set that grows with the iteration count must move `live` -- the \
+        "a live set that grows with the iteration count must move `live` — the \
          instrument is not tracking the level: {seen:?}"
     );
 }

@@ -307,9 +307,30 @@ A silent failure needs a test that fails loudly *before* the fix exists. The
 acceptance test builds a closure that captures another closure which captures a
 heap ADT, forces at least one collection (the `GC_THRESHOLD_WORDS = 1 << 16`
 threshold is reached by an allocating loop), then calls through both and reads
-the ADT's payload. Run against the un-widened mask, it reads freed memory and
-must fail differently — that failure is observed and recorded when the test is
-written, in the 5b-5 discipline. Passing on the fixed build alone proves nothing.
+the ADT's payload. Run against the un-fixed build it must fail — and that
+failure is observed and recorded when the test is written, in the 5b-5
+discipline. Passing on the fixed build alone proves nothing.
+
+**Corrected after measurement: it does not crash, in either direction.** This
+section was written expecting a use-after-free to announce itself — an access
+violation, a wild dereference in `gc_mark`. Both directions were falsified
+against real un-fixed builds during Task 4, and both exited 0 with a wrong
+number. Direction (a): the swept `Cons(7, Nil)` block was recycled by the
+allocating loop and field 0 read back as another allocation's live data, so
+the program printed `1` instead of `7`. Direction (b) is worse, because the
+recycled object is a *closure*: `inner`'s block came back as one of the loop's
+own closures — a valid tag, a valid code pointer — so the indirect call through
+it succeeded and returned `12650` (`32 + 12618`, the recycled capture) instead
+of `42`. A freed closure is still callable.
+
+The consequence is a requirement, not a footnote: **the acceptance tests assert
+on the VALUE read back, never on survival, exit status, or the absence of a
+crash.** A test shaped as "call it and see whether we die" passes on the broken
+build in both directions and controls nothing. The collector recycles rather
+than unmaps (`GC_MAX_WORDS = 16` keeps small blocks on a free list), so memory
+freed while live is not merely readable but *plausible*, and plausible wrong
+answers are exactly what a crash-shaped test cannot see. Any future control for
+a tracing hazard in this runtime inherits this rule.
 
 ---
 
@@ -384,9 +405,18 @@ elya-gc: collections=N freed=N words_since_gc=N live=N
 ```
 
 The acceptance test runs a compiled program that allocates unboundedly in a loop
-while retaining a bounded working set, and asserts `live` settles at a pinned
-bound across many collections — a measured constant, pinned in the `K_MAX`
-discipline, never nudged to make a test pass.
+while retaining a bounded working set — at four iteration counts spanning an 8x
+range — and asserts the four `live` figures are EQUAL.
+
+**This is deliberately not a pinned constant, and that is stricter than the
+`K_MAX` discipline, not looser.** Pinning a measured bound would put a number
+in the test that a later change could be tempted to nudge; asserting that four
+runs agree states the settling claim itself and admits no number to edit. The
+cost is that an equality can be satisfied vacuously — an instrument stuck at a
+constant, or reporting something unrelated to the live set, passes it — so the
+sibling control `a_growing_live_set_moves_the_instrument` runs a program whose
+retained data DOES grow with the count and asserts `live` moves. The pair is
+the proof; either alone is not.
 
 Today that test passes and proves the current claim. The day N8 makes a cycle
 constructible, the same instrument is the thing that shows whether the tracer
@@ -525,8 +555,9 @@ evaluator by the existing differential harness.
    built and observed, not argued.
 6. **Arity refusal** — a 5-parameter lambda is refused by name, before emission,
    with `"lambda takes more than four parameters"`.
-7. **Space observation** (§7.1) — `live` settles at a pinned bound across many
-   collections.
+7. **Space observation** (§7.1) — `live` is equal across four iteration
+   counts, and its control shows the same figure moving when the retained set
+   really does grow. No constant is pinned.
 8. **The refusals that stay** — `"function used as a value"` for a top-level
    function name in value position; a polymorphic lambda still refused by `repr_ty`.
 

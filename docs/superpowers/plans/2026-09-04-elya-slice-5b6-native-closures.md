@@ -68,7 +68,7 @@ The back end must know each lambda parameter's type to build the lifted function
 
 **Ordering note for the implementer — the two edits are one task on purpose.** `tests/core_lowering.rs:113` and `:210` already lower a program containing a lambda (`"fn demo() { let f = fn(x) { x } ..."`). Reshaping `CoreKind::Lambda` *without* the `types.rs` insert makes `lower_module` return `Err(LowerError::Untyped(p.span))` on that existing program and the existing corpus tests panic. Do not split this task.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/core_lowering.rs`:
 
@@ -101,7 +101,7 @@ fn lambda_parameters_carry_recorded_types() {
 
 `lower_src` here returns a tuple `(CoreModule, BTreeMap<Span, Ty>)` (`tests/core_lowering.rs:22-30`) — destructure it. `nodes(&core)` is the pre-order walker already in that file. `Ty` derives `PartialEq` (`src/types.rs:20`), so `assert_eq!` on a `Ty` compiles.
 
-- [ ] **Step 2: Run it and watch it fail to compile**
+- [x] **Step 2: Run it and watch it fail to compile**
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p elya --test core_lowering lambda_parameters_carry_recorded_types
@@ -109,7 +109,7 @@ CARGO_INCREMENTAL=0 cargo test -p elya --test core_lowering lambda_parameters_ca
 
 Expected: **compile error**, `error[E0609]: no field 'name' on type '&String'` (and the same for `ty`) — because `CoreKind::Lambda` still carries `Rc<[String]>`. A compile failure is the correct falsification here: the test asserts on structure that does not yet exist.
 
-- [ ] **Step 3: Record the type at the parameter span**
+- [x] **Step 3: Record the type at the parameter span**
 
 In `src/types.rs`, in the `Expr::Lambda` arm of `infer_expr_inner`, insert one line between `env.insert(...)` and `param_tys.push(pv);`:
 
@@ -139,7 +139,7 @@ In `src/types.rs`, in the `Expr::Lambda` arm of `infer_expr_inner`, insert one l
 
 The receiver is `self`, not `inf` — this arm is inside a `&mut self` method. Leave the rest of the arm (the fresh ambient row, `close_unrelayed_residual`, the returned `Ty::Fn`) untouched.
 
-- [ ] **Step 4: Reshape the Core variant**
+- [x] **Step 4: Reshape the Core variant**
 
 In `src/core.rs`, at the `Lambda` variant:
 
@@ -149,7 +149,7 @@ In `src/core.rs`, at the `Lambda` variant:
     Lambda(Rc<[CoreParam]>, Rc<CoreExpr>),
 ```
 
-- [ ] **Step 5: Read the recorded types in the lowering arm**
+- [x] **Step 5: Read the recorded types in the lowering arm**
 
 In `src/core.rs`, replace the `Expr::Lambda` arm of the expression lowerer:
 
@@ -174,7 +174,7 @@ In `src/core.rs`, replace the `Expr::Lambda` arm of the expression lowerer:
         }
 ```
 
-- [ ] **Step 6: Keep `pretty_expr`'s rendering byte-identical**
+- [x] **Step 6: Keep `pretty_expr`'s rendering byte-identical**
 
 In `src/core.rs`'s `pretty_expr`, the `Lambda` arm changes exactly one line — `s.push_str(param)` becomes `s.push_str(&param.name)` — so the existing `insta` corpus snapshots of pretty-printed Core render unchanged and need no acceptance:
 
@@ -192,7 +192,7 @@ In `src/core.rs`'s `pretty_expr`, the `Lambda` arm changes exactly one line — 
         }
 ```
 
-- [ ] **Step 7: Fix the one hand-built `CoreKind::Lambda` in the back end**
+- [x] **Step 7: Fix the one hand-built `CoreKind::Lambda` in the back end**
 
 In `crates/codegen/src/lib.rs`, `rejects_lambda_specifically` constructs a `Lambda` by hand. Keep the test's meaning (Task 3 replaces it wholesale); make it compile:
 
@@ -208,7 +208,7 @@ In `crates/codegen/src/lib.rs`, `rejects_lambda_specifically` constructs a `Lamb
 
 Add `CoreParam` to the `elya::core::{...}` import list in that file if it is not already there.
 
-- [ ] **Step 8: Run the new test and the existing corpus**
+- [x] **Step 8: Run the new test and the existing corpus**
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p elya --test core_lowering
@@ -216,7 +216,7 @@ CARGO_INCREMENTAL=0 cargo test -p elya --test core_lowering
 
 Expected: PASS, including `lambda_parameters_carry_recorded_types` **and** the pre-existing tests at `:113` / `:210` that lower a lambda program (they are what would break if Step 3 were skipped).
 
-- [ ] **Step 9: Run the full gate**
+- [x] **Step 9: Run the full gate**
 
 ```sh
 cargo fmt --all
@@ -225,7 +225,7 @@ powershell -NoProfile -File scripts/check.ps1
 
 Expected: all five stages green.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add src/types.rs src/core.rs tests/core_lowering.rs crates/codegen/src/lib.rs
@@ -257,7 +257,7 @@ Closure conversion's analysis half, in its own module, with no `inkwell` import.
 1. **`free_vars` returns `BTreeMap<String, Ty>`, not the spec's `BTreeSet<String>`.** A capture needs its type (to widen a `Bool` into a word, to pick the mask bit, to load it back). `CorePat::Ctor(String, Rc<[CorePat]>)` binders carry no types, so a type environment cannot be threaded through a pure Core walk. The type instead comes from the free `CoreKind::Var(x)` occurrence's own `CoreExpr.ty` — first occurrence wins, and all occurrences of a monomorphic local agree. `BTreeMap` also fixes capture order = name order, deterministically.
 2. **A global is "free in the enclosing function too", not "found in a symbol table".** The capture set is `free_vars(lambda) − free_vars_under(enclosing_fn_body, enclosing_fn_params)`. A name free in the whole function body is module-level; a name bound by an enclosing `let`, parameter, or pattern is a capture. This is purely structural, needs no module symbol table, and gets `let churn = fn(x){...}` shadowing a top-level `churn` right, where a by-name filter would silently drop the capture and then silently call the global.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/codegen/src/closure.rs` with **only** the test module for now (the implementation lands in Step 3):
 
@@ -426,7 +426,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run them and watch them fail to compile**
+- [x] **Step 2: Run them and watch them fail to compile**
 
 Add `mod closure;` to `crates/codegen/src/lib.rs`, next to the existing module declarations, then:
 
@@ -436,7 +436,7 @@ CARGO_INCREMENTAL=0 cargo test -p elya-codegen --lib closure::
 
 Expected: **compile error** — `cannot find function 'free_vars' in this scope`, `cannot find function 'collect_lambdas' in this scope`, `cannot find struct 'LambdaSite'`. Nothing is implemented yet.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Prepend to `crates/codegen/src/closure.rs`, above the test module:
 
@@ -664,7 +664,7 @@ fn collect_in(
 
 `EffectRow` is imported for the tests' `Ty::Fn(..)` construction; if clippy flags it as unused in the non-test build, move that import into the test module.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p elya-codegen --lib closure::
@@ -672,7 +672,7 @@ CARGO_INCREMENTAL=0 cargo test -p elya-codegen --lib closure::
 
 Expected: PASS, all six.
 
-- [ ] **Step 5: Confirm the task is inert**
+- [x] **Step 5: Confirm the task is inert**
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test --workspace --features elya-cli/codegen
@@ -680,7 +680,7 @@ CARGO_INCREMENTAL=0 cargo test --workspace --features elya-cli/codegen
 
 Expected: PASS with **no change to any pre-existing test's outcome**. Nothing in `lib.rs` calls `collect_lambdas` yet; the `Lambda` arm still returns `Unsupported("Lambda")`. This step exists so that when Task 3 changes behaviour, the change is attributable.
 
-- [ ] **Step 6: Run the full gate**
+- [x] **Step 6: Run the full gate**
 
 ```sh
 cargo fmt --all
@@ -689,7 +689,7 @@ powershell -NoProfile -File scripts/check.ps1
 
 Expected: all five stages green.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/codegen/src/closure.rs crates/codegen/src/lib.rs
@@ -715,7 +715,7 @@ The emission half. After this task a compiled program can build a closure, call 
   - Heap layout, relied on verbatim by Task 4's descriptor rows: word 0 = tag, word 1 = code pointer, word `i + 2` = capture `i`. Allocation size `2 + n_captures`.
   - A new refusal string: `"lambda takes more than four parameters"`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 First, in `crates/codegen/src/lib.rs`, **replace** `rejects_lambda_specifically` (it asserted the refusal this task removes) with the refusal that replaces it:
 
@@ -795,7 +795,7 @@ fn a_closure_tail_call_recurs_in_bounded_stack() {
 }
 ```
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p elya-codegen --lib rejects_a_lambda_with_five_parameters
@@ -804,7 +804,7 @@ CARGO_INCREMENTAL=0 cargo test -p elya-codegen --test native_codegen a_closure_
 
 Expected: the unit test fails with the *old* refusal, `CodegenError::Unsupported("Lambda")`, not the new one. Both execution tests fail the same way — `Unsupported("Lambda")` out of `compile_and_link`. Lambdas are rejected wholesale today.
 
-- [ ] **Step 3: Widen `repr_ty` and factor `fn_type_of`**
+- [x] **Step 3: Widen `repr_ty` and factor `fn_type_of`**
 
 In `crates/codegen/src/lib.rs`, add to the imports: `use inkwell::types::FunctionType;` and `use elya::core::CoreParam;` (if Task 1 did not already add the latter). Then:
 
@@ -842,7 +842,7 @@ fn fn_type_of<'ctx>(
 
 Rewrite `declare_all`'s type construction to call `fn_type_of(repr_ty(ctx, &f.body.ty)?, &params)?` in place of its inline `match`, leaving its `func.set_call_conventions(TAILCC)` line untouched.
 
-- [ ] **Step 4: State the lambda cap next to the function cap**
+- [x] **Step 4: State the lambda cap next to the function cap**
 
 Immediately below `const MAX_PARAMS: usize = 5;` in `crates/codegen/src/lib.rs`:
 
@@ -876,7 +876,7 @@ Append to `MAX_PARAMS`'s existing docstring (do not replace its text):
 /// both — applied to the CONVERTED arity.
 ```
 
-- [ ] **Step 5: Extend `LowerCtx` and split the call path**
+- [x] **Step 5: Extend `LowerCtx` and split the call path**
 
 ```rust
 struct LowerCtx<'ctx> {
@@ -1023,7 +1023,7 @@ fn build_closure_call<'ctx>(
 
 `lower_tail`'s `App` arm needs **no change**: both paths return a `CallSiteValue`, and it sets `LLVMTailCallKindMustTail` on whichever it gets.
 
-- [ ] **Step 6: Allocate the closure**
+- [x] **Step 6: Allocate the closure**
 
 Replace `CoreKind::Lambda(..) => Err(CodegenError::Unsupported("Lambda"))` in `lower_expr` with:
 
@@ -1094,7 +1094,7 @@ Replace `CoreKind::Lambda(..) => Err(CodegenError::Unsupported("Lambda"))` in `l
         }
 ```
 
-- [ ] **Step 7: Declare and emit the lifted bodies**
+- [x] **Step 7: Declare and emit the lifted bodies**
 
 Add two functions to `crates/codegen/src/lib.rs`:
 
@@ -1180,7 +1180,7 @@ fn emit_lifted<'ctx>(
 }
 ```
 
-- [ ] **Step 8: Wire it into `build_module`**
+- [x] **Step 8: Wire it into `build_module`**
 
 In `build_module`, immediately after the existing `MAX_PARAMS` scan (keep that scan first — the comment says so on purpose):
 
@@ -1238,7 +1238,7 @@ and emit the lifted bodies alongside the top-level ones:
 
 If the borrow checker objects to `&lambdas` living in `lc` while `lambdas` is also iterated, take the iteration over `lc.lambdas` instead — the data is the same slice.
 
-- [ ] **Step 9: Run the three tests**
+- [x] **Step 9: Run the three tests**
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p elya-codegen --lib rejects_a_lambda_with_five_parameters
@@ -1254,7 +1254,7 @@ Expected: all four PASS. `a_closure_tail_call_recurs_in_bounded_stack` at 1,000,
 $p = Start-Process -NoNewWindow -Wait -PassThru <exe>; "0x{0:X8}" -f $p.ExitCode
 ```
 
-- [ ] **Step 10: Run the full gate**
+- [x] **Step 10: Run the full gate**
 
 ```sh
 cargo fmt --all
@@ -1263,7 +1263,7 @@ powershell -NoProfile -File scripts/check.ps1
 
 Expected: all five stages green. Note for the reviewer: at this point the collector **cannot** trace a closure. That is the state Task 4 measures against.
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add crates/codegen/src/lib.rs crates/codegen/tests/native_codegen.rs
@@ -1300,7 +1300,7 @@ This is the slice's only **silent** failure mode, so it gets the strongest avail
 - Produces: `fn is_heap_ty(ty: &Ty) -> bool`, used by **both** the constructor rows and the closure rows.
 - Descriptor row for lambda site *i*: `arity = 1 + captures.len()`; `ptr_mask` has bit 0 **clear** (the code pointer is not a heap object) and bit `j + 1` set iff `is_heap_ty(&captures[j].1)`.
 
-- [ ] **Step 1: Write both failing tests, named for their predicates**
+- [x] **Step 1: Write both failing tests, named for their predicates**
 
 Append to `crates/codegen/tests/native_codegen.rs`:
 
@@ -1378,7 +1378,7 @@ fn a_captured_closure_is_traced_mask_covers_ty_fn() {
 
 **Churn arithmetic, so `collections > 0` is not a hope.** `GC_THRESHOLD_WORDS = 1 << 16 = 65536` words (`runtime.c:52`). Direction (a)'s `Cons(1, Nil)` is `elya_alloc(1 + 2)` = 3 visible words; 100000 iterations = 300000 words. Direction (b)'s `mk(n)` allocates a closure with one capture, `elya_alloc(2 + 1)` = 3 words; likewise 300000 words. Both are comfortably over the threshold — and the `collections > 0` assertion checks it by measurement rather than trusting this paragraph.
 
-- [ ] **Step 2: Run direction (a) against un-fixed HEAD**
+- [x] **Step 2: Run direction (a) against un-fixed HEAD**
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p elya-codegen --test native_codegen a_closure_capture_survives_collection
@@ -1388,7 +1388,7 @@ Expected: **FAIL**, with the assertion on `stdout` — a number that is not `7` 
 
 Record the observed wrong value in the commit message. If instead the process dies, note that too — but do **not** relax the assertion; the point is that the un-fixed build produces a defined-looking wrong answer.
 
-- [ ] **Step 3: Add the synthetic descriptor rows — and only those**
+- [x] **Step 3: Add the synthetic descriptor rows — and only those**
 
 In `crates/codegen/src/lib.rs`'s descriptor-table construction, after the loop that appends one row per real constructor, append one row per lambda site. Leave the constructor rows' mask predicate **exactly as it is** for now:
 
@@ -1423,7 +1423,7 @@ In `crates/codegen/src/lib.rs`'s descriptor-table construction, after the loop t
 
 Adapt the two `rows.push(...)` lines to however the existing table accumulates its `[arity, mask]` pairs (`crates/codegen/src/lib.rs:935-969`) — same vector, same `i64` constant shape, appended after the real rows. `n_real_ctors` and `lambdas` are already in scope from Task 3's Step 8; if the descriptor table is built in a helper, pass both in.
 
-- [ ] **Step 4: Re-run direction (a), then run direction (b)**
+- [x] **Step 4: Re-run direction (a), then run direction (b)**
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p elya-codegen --test native_codegen a_closure_capture_survives_collection
@@ -1432,9 +1432,25 @@ CARGO_INCREMENTAL=0 cargo test -p elya-codegen --test native_codegen a_captured_
 
 Expected: direction (a) now **PASSES** — the descriptor row alone fixed it. Direction (b) **FAILS**, and it fails for exactly its own predicate: `outer` now has a row and is traced, but `inner`'s mask bit is clear because `matches!(ty, Ty::Con(..))` does not recognise `Ty::Fn`. This is the staging that makes each control control.
 
-- [ ] **Step 5: Widen the predicate — once, shared**
+- [x] **Step 5: Widen the predicate — once, shared**
 
-Add to `crates/codegen/src/lib.rs`:
+Add to `crates/codegen/src/lib.rs`, **immediately after `repr_ty`**.
+
+Anchor on `repr_ty`'s `Ty::Fn` arm, NOT on its trailing `_ => Err(..)` arm:
+that three-line tail is byte-identical in `repr_ty` and in `fn_type_of` two
+functions below, so anchoring on it matches twice (measured: 2 occurrences vs
+1 for the anchor below) and a scripted insertion lands after the wrong
+function. It would still compile and every test would still pass, so neither
+the gate nor the corpus catches it — only a `count == 1` guard on the patch
+does. Insert after:
+
+```rust
+        // N5 (5b-6 §3): a function value is a pointer to its closure block.
+        Ty::Fn(..) => Ok(ctx.ptr_type(AddressSpace::default()).into()),
+        _ => Err(CodegenError::Unsupported("unrepresentable type")),
+    }
+}
+```
 
 ```rust
 /// Does a value of this type live on the heap, so the collector must trace it?
@@ -1483,7 +1499,7 @@ fn mask_and_repr_agree_on_pointers() {
 }
 ```
 
-- [ ] **Step 6: Run both directions and the whole corpus**
+- [x] **Step 6: Run both directions and the whole corpus**
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p elya-codegen --lib mask_and_repr_agree_on_pointers
@@ -1492,7 +1508,7 @@ CARGO_INCREMENTAL=0 cargo test -p elya-codegen --test native_codegen
 
 Expected: PASS throughout — both CR-3 directions, the invariant test, and every pre-existing ADT/GC test (the constructor rows are unchanged in behaviour: `is_heap_ty` agrees with `matches!(f, Ty::Con(..))` on every type an ADT field can currently have).
 
-- [ ] **Step 7: Run the full gate**
+- [x] **Step 7: Run the full gate**
 
 ```sh
 cargo fmt --all
@@ -1501,7 +1517,7 @@ powershell -NoProfile -File scripts/check.ps1
 
 Expected: all five stages green.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/codegen/src/lib.rs crates/codegen/tests/native_codegen.rs
@@ -1518,19 +1534,19 @@ Report both staged failures with their observed output, and flag the direction-(
 
 ## Task 5: The `live=` space instrument
 
-Obligation T7 was re-filed this slice on a corrected premise: Elya's value graph is acyclic **by construction of the binding forms** (`src/resolve.rs:102-104` resolves a `let`'s right-hand side before binding the name), so a refcounting evaluator and a tracing collector cannot currently diverge in what they reclaim. That makes today the wrong day to *test* for divergence and the right day to build the instrument that will **measure** it, at N8, when `Value::Resume` holding captured frames plausibly makes a cycle constructible (marked `? INFERRED`).
+Obligation T7 was re-filed this slice on a corrected premise: Elya's value graph is acyclic **by construction of the binding forms** (`src/resolve.rs:103-104` resolves a `let`'s right-hand side before binding the name), so a refcounting evaluator and a tracing collector cannot currently diverge in what they reclaim. That makes today the wrong day to *test* for divergence and the right day to build the instrument that will **measure** it, at N8, when `Value::Resume` holding captured frames plausibly makes a cycle constructible (marked `? INFERRED`).
 
 The collector currently reports `collections`, `freed`, and `words_since_gc` — all flow, no level. `live` is the level: total visible words surviving a collection. A refcounting/tracing divergence shows up there and nowhere else.
 
 **Files:**
 - Modify: `crates/codegen/src/runtime.c:154-178` (`gc_sweep`), `:230-239` (`elya_gc_report`)
-- Test: `crates/codegen/tests/native_codegen.rs` (extend `GcStats` / `run_with_gc_stats`, add one test)
+- Test: `crates/codegen/tests/native_codegen.rs` (extend `GcStats` / `run_with_gc_stats`, add two tests: the settling sweep and its control)
 
 **Interfaces:**
 - Consumes: `GcStats { collections, freed }` and `run_with_gc_stats` as they exist at `crates/codegen/tests/native_codegen.rs:722-761`.
 - Produces: `GcStats { collections: i64, freed: i64, live: i64 }`; report line `elya-gc: collections=%lld freed=%lld live=%lld words_since_gc=%lld`. Field order is immaterial to the parser — it is `split_whitespace().find_map(strip_prefix)` — but it is pinned anyway so the line stays readable.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Extend the existing helpers **in place** (do not add a parallel helper):
 
@@ -1539,7 +1555,7 @@ Extend the existing helpers **in place** (do not add a parallel helper):
 struct GcStats {
     collections: i64,
     freed: i64,
-    /// Visible words still live at the end of the LAST collection — the level,
+    /// Visible words still live at the end of the LAST collection — the LEVEL,
     /// where `freed` and `words_since_gc` are flows (5b-6 §11, obligation T7).
     live: i64,
 }
@@ -1558,16 +1574,23 @@ and, in `run_with_gc_stats`, add the third field to the struct literal:
 Then append the test:
 
 ```rust
-/// 5b-6 §11. The steady-state live set of a program whose live data does NOT grow
-/// with its iteration count is INDEPENDENT of that count. Running the same program
-/// at two iteration counts and asserting the two `live` figures are equal makes
-/// the claim without pinning a magic number — so there is no constant here that a
-/// future change could be tempted to nudge, and no expected value to edit.
+/// 5b-6 §11, obligation T7. The steady-state live set of a program whose live data
+/// does NOT grow with its iteration count is INDEPENDENT of that count. The same
+/// program is run at four counts spanning an 8x range and the `live` figures are
+/// asserted equal — which makes the claim without pinning a magic number, so there
+/// is no constant here a future change could be tempted to nudge and no expected
+/// value to edit.
+///
+/// FOUR points rather than two, deliberately. Two figures agreeing is weak evidence
+/// that a level SETTLES: the last collection of a single pair could land at the same
+/// loop phase by luck. Agreement across an 8x spread is the settling claim itself.
+/// `a_growing_live_set_moves_the_instrument` is the other half — it proves this
+/// equality is capable of failing, so satisfying it means something.
 ///
 /// This is the instrument obligation T7 will be measured with. It is built now,
-/// while acyclicity makes divergence unconstructible, so the day a cycle becomes
-/// constructible (N8, `Value::Resume` holding captured frames) the measurement
-/// already exists rather than being invented under pressure.
+/// while acyclicity makes refcount/tracing divergence unconstructible, so the day a
+/// cycle becomes constructible (N8, `Value::Resume` holding captured frames) the
+/// measurement already exists rather than being invented under pressure.
 #[test]
 fn the_live_set_settles_independent_of_iteration_count() {
     let prog = |n: i64| {
@@ -1578,9 +1601,9 @@ fn the_live_set_settles_independent_of_iteration_count() {
              match keep {{ Nil -> 0  Cons(h, t) -> h }} }}\n"
         )
     };
-    let mut seen: Vec<i64> = Vec::new();
-    for (i, n) in [100000i64, 200000].into_iter().enumerate() {
-        let tag = format!("gc-live-{i}");
+    let mut seen: Vec<(i64, i64)> = Vec::new();
+    for n in [50000i64, 100000, 200000, 400000] {
+        let tag = format!("gc-live-{n}");
         let dir = temp_dir(&tag);
         let core = lower_src(&prog(n));
         let exe = compile_and_link(&core, &dir, &tag);
@@ -1594,17 +1617,65 @@ fn the_live_set_settles_independent_of_iteration_count() {
             stats.live > 0,
             "{tag}: a live retained list must contribute live words: {stats:?}"
         );
-        seen.push(stats.live);
+        seen.push((n, stats.live));
         std::fs::remove_dir_all(&dir).ok();
     }
-    assert_eq!(
-        seen[0], seen[1],
-        "the live set must not grow with the iteration count — it settles"
+    println!("live by iteration count: {seen:?}");
+    let first = seen[0].1;
+    assert!(
+        seen.iter().all(|&(_, live)| live == first),
+        "the live set must not grow with the iteration count — it settles: {seen:?}"
+    );
+}
+
+/// The control that makes `the_live_set_settles_independent_of_iteration_count`
+/// mean something. That test asserts `live` figures are EQUAL, and an instrument
+/// stuck at a constant — or reporting a number unrelated to the live set — would
+/// satisfy it vacuously. Here the retained data DOES grow with the iteration count,
+/// so `live` must move. If it does not, the equality next door proves nothing.
+///
+/// `build` is tail-recursive with the list in its accumulator, so the machine stack
+/// stays flat while the retained chain crosses the threshold repeatedly. Nothing is
+/// discarded, so every collection marks everything and frees nothing — exactly the
+/// shape that separates a LEVEL from a flow.
+///
+/// The assertion is a strict inequality, not a pinned figure: the claim is that the
+/// instrument tracks the level, not that it equals any particular number.
+#[test]
+fn a_growing_live_set_moves_the_instrument() {
+    let prog = |n: i64| {
+        format!(
+            "type L {{ Nil, Cons(Int, L) }}\n\
+             fn build(n, acc) {{ if n == 0 {{ acc }} else {{ build(n - 1, Cons(1, acc)) }} }}\n\
+             pub fn main() {{ let keep = build({n}, Nil)  \
+             match keep {{ Nil -> 0  Cons(h, t) -> h }} }}\n"
+        )
+    };
+    let mut seen: Vec<(i64, i64)> = Vec::new();
+    for n in [30000i64, 70000] {
+        let tag = format!("gc-grow-{n}");
+        let dir = temp_dir(&tag);
+        let core = lower_src(&prog(n));
+        let exe = compile_and_link(&core, &dir, &tag);
+        let (stdout, stats) = run_with_gc_stats(&exe, &tag);
+        assert_eq!(stdout, "1", "{tag}: the retained list did not survive");
+        assert!(
+            stats.collections > 0,
+            "{tag}: no collection happened, so `live` was never computed: {stats:?}"
+        );
+        seen.push((n, stats.live));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    println!("live by retained-list length: {seen:?}");
+    assert!(
+        seen[1].1 > seen[0].1,
+        "a live set that grows with the iteration count must move `live` — the \
+         instrument is not tracking the level: {seen:?}"
     );
 }
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p elya-codegen --test native_codegen the_live_set_settles
@@ -1612,7 +1683,7 @@ CARGO_INCREMENTAL=0 cargo test -p elya-codegen --test native_codegen the_live_se
 
 Expected: **FAIL** with the panic `run_with_gc_stats`'s `field` closure raises — `no 'live=' field in: elya-gc: collections=... freed=... words_since_gc=...`. The runtime does not report it yet.
 
-- [ ] **Step 3: Accumulate the live level in the sweep**
+- [x] **Step 3: Accumulate the live level in the sweep**
 
 In `crates/codegen/src/runtime.c`, add the counter next to the existing ones (`:38`):
 
@@ -1642,7 +1713,7 @@ static void gc_sweep(void) {
 
 Leave the unmarked branch, the free-list recycling, and `gc_freed++` untouched.
 
-- [ ] **Step 4: Report it**
+- [x] **Step 4: Report it**
 
 ```c
 void elya_gc_report(void) {
@@ -1655,7 +1726,7 @@ void elya_gc_report(void) {
 }
 ```
 
-- [ ] **Step 5: Run the test**
+- [x] **Step 5: Run the test**
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p elya-codegen --test native_codegen the_live_set_settles
@@ -1665,7 +1736,7 @@ Expected: PASS. Both runs report the same positive `live`.
 
 **Caveat to record, measured not nudged:** `GC_MAX_WORDS = 16` (`runtime.c:48`) caps the size-segregated free lists, so blocks of 16+ visible words are `free()`d rather than recycled. Closures with 14+ captures fall outside the recycling path. This is a note about allocator behaviour, not a correctness bound, and `GC_MAX_WORDS` is **not** to be raised to make anything pass.
 
-- [ ] **Step 6: Confirm the whole GC corpus still holds**
+- [x] **Step 6: Confirm the whole GC corpus still holds**
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p elya-codegen --test native_codegen
@@ -1673,7 +1744,7 @@ CARGO_INCREMENTAL=0 cargo test -p elya-codegen --test native_codegen
 
 Expected: PASS, including the 5b-5 tests that parse the report line — the parser is order-insensitive, so adding a field between `freed=` and `words_since_gc=` cannot break them.
 
-- [ ] **Step 7: Run the full gate**
+- [x] **Step 7: Run the full gate**
 
 ```sh
 cargo fmt --all
@@ -1682,7 +1753,7 @@ powershell -NoProfile -File scripts/check.ps1
 
 Expected: all five stages green.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/codegen/src/runtime.c crates/codegen/tests/native_codegen.rs
@@ -1704,7 +1775,7 @@ git commit -m "feat(codegen): report the live word level, and prove it settles (
 - Consumes: everything Tasks 1–5 shipped.
 - Produces: no code interface. This task's deliverable is that the repository's claims about itself match what it does.
 
-- [ ] **Step 1: Amend the backend-coverage paragraph**
+- [x] **Step 1: Amend the backend-coverage paragraph**
 
 Replace `README.md` lines 37–52 (the paragraph beginning "As of Slice 5b-5 the backend covers") with:
 
@@ -1733,17 +1804,17 @@ the test corpus is additionally checked against what the evaluator computes, so
 the two never drift apart silently.
 ```
 
-- [ ] **Step 2: Refresh the knowledge graph**
+- [x] **Step 2: Refresh the knowledge graph**
 
 ```sh
 graphify update .
 ```
 
-- [ ] **Step 3: Tick the checklists**
+- [x] **Step 3: Tick the checklists**
 
 Mark every `- [ ]` in this plan `- [x]`, and tick the acceptance checklist in the design spec.
 
-- [ ] **Step 4: Update the slice ledger in memory**
+- [x] **Step 4: Update the slice ledger in memory**
 
 Rewrite the body of `memory/next-slice-decision.md` so the 5b arc's state is current: 5b-6 (N5, closures) **CLOSED**; the frontier is N6 (strings/io) or N7 (runtime polymorphism), the user's sequencing call. Record the two obligations this slice leaves open, both as tracked items rather than prose:
 
@@ -1754,7 +1825,7 @@ Rewrite the body of `memory/next-slice-decision.md` so the 5b arc's state is cur
 
 Add the corresponding one-line pointer to `MEMORY.md` if the ledger entry's hook changes.
 
-- [ ] **Step 5: Run the full gate one last time**
+- [x] **Step 5: Run the full gate one last time**
 
 ```sh
 cargo fmt --all
@@ -1763,7 +1834,7 @@ powershell -NoProfile -File scripts/check.ps1
 
 Expected: all five stages green.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add README.md docs/superpowers/plans/2026-09-04-elya-slice-5b6-native-closures.md docs/superpowers/specs/2026-09-03-elya-slice-5b6-native-closures-design.md graphify-out
