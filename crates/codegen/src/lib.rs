@@ -192,6 +192,18 @@ fn repr_ty<'ctx>(ctx: &'ctx Context, ty: &Ty) -> Result<BasicTypeEnum<'ctx>, Cod
     }
 }
 
+/// Does a value of this type live on the heap, so the collector must trace it?
+///
+/// ONE predicate, used by both the constructor descriptor rows and the closure
+/// descriptor rows, so a single negative control falsifies both call sites. It
+/// must agree with `repr_ty`: exactly the types `repr_ty` represents as a pointer
+/// are the types the mask marks traced. `a_captured_closure_is_traced_mask_covers_ty_fn`
+/// is the execution proof of the `Ty::Fn` half; `mask_and_repr_agree_on_pointers`
+/// pins the correspondence itself.
+fn is_heap_ty(ty: &Ty) -> bool {
+    matches!(ty, Ty::Con(..) | Ty::Fn(..))
+}
+
 /// The `BasicTypeEnum` -> `FunctionType` step, factored out of `declare_all`
 /// because `declare_lifted` (5b-6 §4.3) needs exactly the same match: a lifted
 /// lambda body is declared the same way a top-level function is, only with the
@@ -1249,7 +1261,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     // 0 indexes straight into this table. Bit `i` of the mask is set iff field
     // `i` is a heap pointer, which is what lets the mark phase trace precisely
     // instead of guessing: an `Int` field is never mistaken for a pointer.
-    let desc: Vec<u64> = core
+    let mut desc: Vec<u64> = core
         .types
         .iter()
         .flat_map(|t| t.ctors.iter())
@@ -1257,13 +1269,40 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
             let arity = c.fields.len() as u64;
             let mut mask = 0u64;
             for (i, f) in c.fields.iter().enumerate() {
-                if matches!(f, Ty::Con(..)) {
+                if is_heap_ty(f) {
                     mask |= 1 << i;
                 }
             }
             [arity, mask].into_iter()
         })
         .collect();
+    // One SYNTHETIC constructor row per lambda site, continuing the tag
+    // numbering. This is what keeps `gc_mark` byte-identical: a closure is just
+    // an object whose descriptor happens to have been synthesized rather than
+    // declared, so the one function whose failure mode is silent gains no second
+    // dispatch path.
+    for (i, site) in lambdas.iter().enumerate() {
+        // Assigned in `collect_lambdas`'s pre-order; checked here rather than
+        // assumed, because a drift between the tag stored in word 0 and the row
+        // index would mis-trace silently. A hard error, not a `debug_assert` —
+        // release builds must not skip it.
+        if site.tag != n_real_ctors + i {
+            return Err(CodegenError::Unsupported(
+                "lambda tag disagrees with its descriptor row index",
+            ));
+        }
+        // arity = 1 (the code pointer) + the captures.
+        desc.push(1 + site.captures.len() as u64);
+        // Bit 0 is CLEAR: word 1 is a code pointer into the text segment, not a
+        // heap object. Bit j+1 is set iff capture j is a heap value.
+        let mut mask: u64 = 0;
+        for (j, (_, ty)) in site.captures.iter().enumerate() {
+            if is_heap_ty(ty) {
+                mask |= 1 << (j + 1);
+            }
+        }
+        desc.push(mask);
+    }
     let n_ctors = (desc.len() / 2) as u64;
     let desc_const = i64t.const_array(
         &desc
@@ -1903,5 +1942,32 @@ mod tests {
             matches!(err, CodegenError::Unsupported("non-Int value")),
             "{err:?}"
         );
+    }
+
+    /// `repr_ty` says pointer <=> `is_heap_ty` says traced. If these ever disagree,
+    /// some value is passed around as a pointer and never traced (a use-after-free)
+    /// or traced without being one (a wild dereference in `gc_mark`). Cheap to check,
+    /// and it catches the next `repr_ty` widening that forgets the mask.
+    #[test]
+    fn mask_and_repr_agree_on_pointers() {
+        let ctx = Context::create();
+        let cases = [
+            Ty::Base(TyCon::Int),
+            Ty::Base(TyCon::Bool),
+            Ty::Con("List".to_string(), vec![]),
+            Ty::Fn(
+                vec![Ty::Base(TyCon::Int)],
+                elya::types::EffectRow::pure(),
+                Box::new(Ty::Base(TyCon::Int)),
+            ),
+        ];
+        for ty in cases {
+            let repr = repr_ty(&ctx, &ty).expect("every case is representable");
+            assert_eq!(
+                repr.is_pointer_type(),
+                is_heap_ty(&ty),
+                "repr_ty and is_heap_ty disagree on {ty:?}"
+            );
+        }
     }
 }

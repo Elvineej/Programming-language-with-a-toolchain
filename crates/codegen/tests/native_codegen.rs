@@ -874,3 +874,73 @@ fn a_closure_tail_call_recurs_in_bounded_stack() {
     assert_runs(&exe, "7");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// CR-3, direction (a) — the predicate this trips is `gc_mark`'s
+/// `tag >= gc_n_ctors` skip (`runtime.c:141`).
+///
+/// Without a descriptor row for the closure's synthetic tag, the mark phase hits
+/// that `continue` and never traces the closure's captures. `wrap` exists because
+/// a function return is the only scope-ender in Elya: after it, the list is
+/// reachable ONLY through the closure. `churn` then forces a real collection, and
+/// the captured `Cons(7, Nil)` is swept while still live.
+///
+/// This fails SILENTLY on the un-fixed build — it prints a wrong `Int`, it does
+/// not crash — which is why the assertion is on the VALUE, not on survival.
+#[test]
+fn a_closure_capture_survives_collection_descriptor_row_present() {
+    let src = "type L { Nil, Cons(Int, L) }\n\
+               fn head_or(d, xs) { match xs { Nil -> d  Cons(h, t) -> h } }\n\
+               fn wrap(xs) { fn(d) { head_or(d, xs) } }\n\
+               fn churn(n) { if n == 0 { 0 } else { let _ = Cons(1, Nil)  churn(n - 1) } }\n\
+               pub fn main() { let f = wrap(Cons(7, Nil))  let _ = churn(100000)  f(0) }\n";
+    let dir = temp_dir("clos-gc-tag");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "clos-gc-tag");
+    let (stdout, stats) = run_with_gc_stats(&exe, "clos-gc-tag");
+    assert!(
+        stats.collections > 0,
+        "no collection happened across the call, so nothing was proved: {stats:?}"
+    );
+    assert_eq!(
+        stdout, "7",
+        "the captured list did not survive collection — the closure's tag has no \
+         descriptor row, so gc_mark skipped it"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// CR-3, direction (b) — the predicate this trips is the descriptor table's
+/// pointer-mask test, `matches!(f, Ty::Con(..))`, un-widened for `Ty::Fn`.
+///
+/// `outer` captures `inner`, whose type is `Ty::Fn`. Under the un-widened
+/// predicate `inner`'s mask bit is CLEAR, so `outer`'s row says "not a pointer"
+/// and `inner` is never traced — even though `outer` itself has a descriptor row
+/// and is traced fine. An ADT capture cannot show this: `Ty::Con` already sets the
+/// bit, so an ADT test passes on the un-fixed build and controls nothing.
+///
+/// On the un-fixed build this dereferences a swept block. The exit code is
+/// deliberately NOT pinned (an access violation is not a defined outcome); what
+/// is pinned is that it does not print 42.
+#[test]
+fn a_captured_closure_is_traced_mask_covers_ty_fn() {
+    let src = "fn churn(n) { if n == 0 { 0 } else { let _ = mk(n)  churn(n - 1) } }\n\
+               fn mk(k) { fn(z) { z + k } }\n\
+               fn wrap(k) { let inner = fn(x) { x + k }\n\
+                            let outer = fn(y) { inner(y) }\n\
+                            outer }\n\
+               pub fn main() { let f = wrap(10)  let _ = churn(100000)  f(32) }\n";
+    let dir = temp_dir("clos-gc-mask");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "clos-gc-mask");
+    let (stdout, stats) = run_with_gc_stats(&exe, "clos-gc-mask");
+    assert!(
+        stats.collections > 0,
+        "no collection happened across the call, so nothing was proved: {stats:?}"
+    );
+    assert_eq!(
+        stdout, "42",
+        "the captured CLOSURE did not survive collection — its mask bit was clear \
+         because the predicate only recognised Ty::Con"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
