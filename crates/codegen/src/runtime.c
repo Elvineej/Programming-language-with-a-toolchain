@@ -34,8 +34,13 @@ static int64_t gc_shadow_top = 0, gc_shadow_cap = 0;
 /* gc_allocated counts WORDS handed out since the last collection, not objects.
  * Words are the memory-pressure proxy the threshold is denominated in: a
  * one-word `Nil` should not push toward a collection as hard as a sixteen-word
- * record does. */
-static int64_t gc_allocated = 0, gc_collections = 0, gc_freed = 0;
+ * record does.
+ *
+ * gc_live is the odd one out: a LEVEL, not a flow. gc_collections and gc_freed
+ * only ever climb; gc_live is recomputed from scratch by every sweep and
+ * answers "how much is still reachable", which is the one place a
+ * refcounting/tracing divergence could ever show up (5b-6 s11, obligation T7). */
+static int64_t gc_allocated = 0, gc_collections = 0, gc_freed = 0, gc_live = 0;
 
 typedef struct Block {
     intptr_t meta; /* (size << 1) | mark, where size counts VISIBLE words */
@@ -154,9 +159,15 @@ static void gc_mark(void) {
 static void gc_sweep(void) {
     Block **prev = &gc_all_blocks;
     Block *b = gc_all_blocks;
+    /* Reset per cycle: gc_live is what survived THIS collection, not a running
+     * total the way gc_freed is. */
+    gc_live = 0;
     while (b) {
         Block *next = b->next;
         if (b->meta & GC_MARK_BIT) {
+            /* The shift drops the mark bit, so this reads the same size whether
+             * it runs before or after the clear below. */
+            gc_live += b->meta >> 1;
             b->meta &= ~(intptr_t)GC_MARK_BIT; /* clear for the next cycle */
             prev = &b->next;
         } else {
@@ -232,8 +243,9 @@ void elya_match_fail(void) {
  * corpus at once. */
 void elya_gc_report(void) {
     if (getenv("ELY_GC_STATS")) {
-        fprintf(stderr, "elya-gc: collections=%lld freed=%lld words_since_gc=%lld\n",
-                (long long)gc_collections, (long long)gc_freed,
+        fprintf(stderr,
+                "elya-gc: collections=%lld freed=%lld live=%lld words_since_gc=%lld\n",
+                (long long)gc_collections, (long long)gc_freed, (long long)gc_live,
                 (long long)gc_allocated);
     }
 }
