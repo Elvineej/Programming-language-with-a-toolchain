@@ -140,7 +140,7 @@
   to Task 3's Step 1 checklist when you get there.
 
 - [ ] **Step 8: Refusal tests** (in `lib.rs` `mod tests`, beside `rejects_a_function_name_in_value_position`):
-  - `rejects_concat_by_name` — `emit_ir(&core_of("pub fn main() { let s = \"a\" <> \"b\" in 1 }"))`
+  - `rejects_concat_by_name` — `emit_ir(&core_of("pub fn main() {\n  let s = \"a\" <> \"b\"\n  1\n}\n"))`
     errors with `Unsupported("Concat")`. **`main` must return Int.** With the concatenation as
     `main`'s own body, `main` types as `String` and `require_int` (`lib.rs:227`) refuses with
     `"non-Int value"` before the `Prim` arm is ever reached — the test would be pinning the
