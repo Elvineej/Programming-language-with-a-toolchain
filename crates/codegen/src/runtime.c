@@ -20,7 +20,13 @@
  * holds a heap pointer, so the mark phase knows which words to trace without
  * ever guessing. This precision is the point: a conservative stack scan could
  * read an Int as a pointer and make native MORE undefined than the evaluator,
- * which 5b-1 §3.4 forbids. */
+ * which 5b-1 §3.4 forbids.
+ *
+ * `arity` is the count of traced-candidate words FOLLOWING the tag, NOT the
+ * block's size: gc_sweep reads the size out of Block::meta and never consults a
+ * descriptor, so a row may legitimately describe fewer words than the block
+ * holds. N6's string row is exactly that case — [0, 0] for a block whose bytes
+ * follow the tag but are not words to trace. */
 static int64_t *gc_descriptors = NULL;
 static int64_t gc_n_ctors = 0;
 

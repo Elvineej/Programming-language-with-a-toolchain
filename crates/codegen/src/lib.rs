@@ -176,10 +176,11 @@ fn find_main(core: &CoreModule) -> Result<&CoreFn, CodegenError> {
     Ok(f)
 }
 
-/// §3.1 type mapping: `Int` -> i64, `Bool` -> i1, and — since N4 — `Ty::Con`
-/// -> a pointer. Reads the INLINE `ty` field on each Core node (Shape C — the
-/// reason this fold needs no side-table lookups). Everything else is refused by
-/// name, `Ty::Var(_)` included; when that fires, that is N7 knocking.
+/// §3.1 type mapping: `Int` -> i64, `Bool` -> i1, `Ty::Con` -> a pointer (N4),
+/// and — since N6 — `Str` -> a pointer and `Unit` -> i64. Reads the INLINE `ty`
+/// field on each Core node (Shape C — the reason this fold needs no side-table
+/// lookups). Everything else is refused by name, `Ty::Var(_)` included; when that
+/// fires, that is N7 knocking.
 fn repr_ty<'ctx>(ctx: &'ctx Context, ty: &Ty) -> Result<BasicTypeEnum<'ctx>, CodegenError> {
     match ty {
         Ty::Base(TyCon::Int) => Ok(ctx.i64_type().into()),
@@ -188,6 +189,10 @@ fn repr_ty<'ctx>(ctx: &'ctx Context, ty: &Ty) -> Result<BasicTypeEnum<'ctx>, Cod
         Ty::Con(..) => Ok(ctx.ptr_type(AddressSpace::default()).into()),
         // N5 (5b-6 §3): a function value is a pointer to its closure block.
         Ty::Fn(..) => Ok(ctx.ptr_type(AddressSpace::default()).into()),
+        // N6 (spec §1.1, §3): a string is a pointer to its heap block; Unit is the
+        // immediate i64 zero, never dereferenced, never traced, never rooted.
+        Ty::Base(TyCon::Str) => Ok(ctx.ptr_type(AddressSpace::default()).into()),
+        Ty::Base(TyCon::Unit) => Ok(ctx.i64_type().into()),
         _ => Err(CodegenError::Unsupported("unrepresentable type")),
     }
 }
@@ -201,7 +206,7 @@ fn repr_ty<'ctx>(ctx: &'ctx Context, ty: &Ty) -> Result<BasicTypeEnum<'ctx>, Cod
 /// is the execution proof of the `Ty::Fn` half; `mask_and_repr_agree_on_pointers`
 /// pins the correspondence itself.
 fn is_heap_ty(ty: &Ty) -> bool {
-    matches!(ty, Ty::Con(..) | Ty::Fn(..))
+    matches!(ty, Ty::Con(..) | Ty::Fn(..) | Ty::Base(TyCon::Str))
 }
 
 /// The `BasicTypeEnum` -> `FunctionType` step, factored out of `declare_all`
@@ -737,6 +742,12 @@ fn lower_expr<'ctx>(
             {
                 return Err(CodegenError::Unsupported(eq_operand_label(*op)));
             }
+            // N6 §8.2: `<>` is String × String → String; its operands are pointers, so
+            // `.into_int_value()` at the lines below would PANIC (inkwell, not a Result).
+            // Refused by name, reusing op_label's existing "Concat" message.
+            if matches!(op, BinOp::Concat) {
+                return Err(CodegenError::Unsupported(op_label(*op)));
+            }
             let l = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
             let r = lower_expr(ctx, func, b, lc, &args[1], env)?.into_int_value();
             // Deliberately NO nsw/nuw flags: defined two's-complement wrapping
@@ -944,6 +955,12 @@ fn lower_expr<'ctx>(
             Ok(p.into())
         }
         CoreKind::Match(scrutinee, arms) => {
+            // N6 §8.4: a scrutinee must be an ADT (a pointer with a real tag word). A
+            // non-Con scrutinee panics `.into_pointer_value()` today; a Str scrutinee
+            // would load its tag and fall through to elya_match_fail. Refuse by name.
+            if !matches!(scrutinee.ty, Ty::Con(..)) {
+                return Err(CodegenError::Unsupported("match scrutinee is not an ADT"));
+            }
             let i64t = ctx.i64_type();
             let ptrt = ctx.ptr_type(AddressSpace::default());
             let s = lower_expr(ctx, func, b, lc, scrutinee, env)?.into_pointer_value();
@@ -1303,6 +1320,18 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         }
         desc.push(mask);
     }
+    // N6 (§1.2): ONE string row — arity 0, mask 0. Nothing after the tag is a
+    // heap reference, so the mark phase traces nothing for a string. The tag is
+    // this row's index; the guard below makes "tag agrees with its row index" a
+    // compile-time property, exactly as the lambda guard above does.
+    let string_tag = n_real_ctors + lambdas.len();
+    if string_tag != desc.len() / 2 {
+        return Err(CodegenError::Unsupported(
+            "string tag disagrees with its descriptor row index",
+        ));
+    }
+    desc.push(0); // arity = 0: no traced-candidate words follow the tag
+    desc.push(0); // mask = 0
     let n_ctors = (desc.len() / 2) as u64;
     let desc_const = i64t.const_array(
         &desc
@@ -1687,10 +1716,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_string_typed_node_by_name() {
-        // The widening is exactly two widths wide. Str is not one of them, and
-        // it is refused as an unrepresentable *type*, distinct from the
-        // "non-Int value" that guards main's return type.
+    fn rejects_a_string_literal_until_the_allocator_lands() {
+        // N6 gave `Str` a width — a pointer to its heap block — so `repr_ty` no
+        // longer refuses this node at the *type* boundary. What is still unbuilt
+        // is the literal's allocation, so the node falls through to the
+        // `CoreKind::Lit(_)` arm and is refused as a "non-Int literal": the
+        // *literal* boundary, one step further in. That is still distinct from
+        // the "non-Int value" that guards main's return type — a different
+        // question (what can this place hold?) with a different message.
+        //
+        // Task 3 lifts this refusal entirely, and must delete this test in the
+        // same commit that adds the `Lit(CoreLit::Str(v))` arm.
         let m = main_fn(CoreExpr {
             span: Span::EMPTY,
             ty: Ty::Base(TyCon::Int),
@@ -1706,7 +1742,7 @@ mod tests {
         });
         let err = emit_ir(&m).unwrap_err();
         assert!(
-            matches!(err, CodegenError::Unsupported("unrepresentable type")),
+            matches!(err, CodegenError::Unsupported("non-Int literal")),
             "{err:?}"
         );
     }
@@ -1926,6 +1962,65 @@ mod tests {
     }
 
     #[test]
+    fn rejects_concat_by_name() {
+        // N6 §8.2. `repr_ty` no longer refuses `Str`, so `<>` now reaches the
+        // `Prim` arm, where its pointer operands would panic `.into_int_value()`
+        // without the by-name guard.
+        //
+        // The concatenation is BOUND in a `let` whose body is `1` on purpose. As
+        // `main`'s own body it would type `main` as `String` and `require_int`
+        // would refuse with "non-Int value" before the `Prim` arm was ever
+        // reached — the test would be pinning the return-type guard while
+        // claiming, by name, to pin the Concat guard. If this assertion ever
+        // reports "non-Int value", the test has stopped testing anything.
+        let err = emit_ir(&core_of(
+            "pub fn main() {\n  let s = \"a\" <> \"b\"\n  1\n}\n",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported("Concat")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_non_adt_match_scrutinee() {
+        // N6 §8.4. An Int scrutinee has no tag word; `.into_pointer_value()`
+        // would panic on it (inkwell, not a Result), and a `Str` scrutinee —
+        // newly representable — would load the string's tag and fall through to
+        // elya_match_fail, which is wrong behaviour rather than a crash. Both are
+        // refused by name, at the top of the arm, before any lowering happens.
+        let err = emit_ir(&core_of("pub fn main() { match 1 { _ -> 2 } }")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("match scrutinee is not an ADT")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_eq_on_strings_by_name() {
+        // `==` is polymorphic (src/types.rs:920-922 unifies the operands and pins
+        // neither), so the refusal is dispatched on the OPERAND type. This one
+        // already fires today; it is pinned here because the widening makes a
+        // `Str` operand representable, and the guard's allow-list — Int and Bool,
+        // named explicitly — is the only thing still keeping it out.
+        let err = emit_ir(&core_of(
+            "pub fn main() { if \"a\" == \"a\" { 1 } else { 0 } }",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("Eq on an unrepresentable operand type")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn a_bool_returning_helper_compiles_but_a_bool_main_still_refuses() {
         // §5.5. `require_int`'s SCOPE narrows from "every function" (trivially
         // just `main` in N1) to "`main` alone". The likely way to get this wrong
@@ -1960,6 +2055,10 @@ mod tests {
                 elya::types::EffectRow::pure(),
                 Box::new(Ty::Base(TyCon::Int)),
             ),
+            // N6: the two widths Task 1 admits. Str is a pointer AND traced;
+            // Unit is an i64 immediate and must never be traced.
+            Ty::Base(TyCon::Str),
+            Ty::Base(TyCon::Unit),
         ];
         for ty in cases {
             let repr = repr_ty(&ctx, &ty).expect("every case is representable");
