@@ -31,10 +31,12 @@ use inkwell::targets::{
 use inkwell::types::BasicMetadataTypeEnum;
 use inkwell::types::BasicTypeEnum;
 use inkwell::types::FunctionType;
+use inkwell::types::{IntType, PointerType};
 use inkwell::values::BasicMetadataValueEnum;
 use inkwell::values::BasicValueEnum;
 use inkwell::values::CallSiteValue;
 use inkwell::values::FunctionValue;
+use inkwell::values::IntValue;
 use inkwell::values::LLVMTailCallKind;
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
@@ -336,17 +338,7 @@ fn emit_lifted<'ctx>(
             .build_load(i64t, cs, "cv")
             .map_err(internal)?
             .into_int_value();
-        let v: BasicValueEnum<'ctx> = match ty {
-            Ty::Base(TyCon::Int) => loaded.into(),
-            Ty::Base(TyCon::Bool) => b
-                .build_int_truncate(loaded, ctx.bool_type(), "bt")
-                .map_err(internal)?
-                .into(),
-            _ => b
-                .build_int_to_ptr(loaded, ptrt, "i2p")
-                .map_err(internal)?
-                .into(),
-        };
+        let v = word_to_value(b, loaded, ty, ctx.bool_type(), ptrt)?;
         env.insert(name.clone(), v);
     }
     for (i, p) in site.params.iter().enumerate() {
@@ -408,6 +400,48 @@ fn gc_root<'ctx>(
     b.build_call(lc.gc_push, &[v.into()], "")
         .map_err(internal)?;
     Ok(true)
+}
+
+/// Convert values at the shared closure-capture/ADT-field heap-word boundary.
+/// Unit already has the i64 word representation, so its conversion is identity.
+fn value_to_word<'ctx>(
+    b: &Builder<'ctx>,
+    v: BasicValueEnum<'ctx>,
+    ty: &Ty,
+    i64t: IntType<'ctx>,
+) -> Result<IntValue<'ctx>, CodegenError> {
+    match ty {
+        Ty::Base(TyCon::Int) => Ok(v.into_int_value()),
+        Ty::Base(TyCon::Unit) => Ok(v.into_int_value()),
+        Ty::Base(TyCon::Bool) => b
+            .build_int_z_extend(v.into_int_value(), i64t, "zw")
+            .map_err(internal),
+        _ => b
+            .build_ptr_to_int(v.into_pointer_value(), i64t, "p2i")
+            .map_err(internal),
+    }
+}
+
+/// Restore a typed value from that same word boundary; Unit remains unchanged.
+fn word_to_value<'ctx>(
+    b: &Builder<'ctx>,
+    w: IntValue<'ctx>,
+    ty: &Ty,
+    boolt: IntType<'ctx>,
+    ptrt: PointerType<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    match ty {
+        Ty::Base(TyCon::Int) => Ok(w.into()),
+        Ty::Base(TyCon::Unit) => Ok(w.into()),
+        Ty::Base(TyCon::Bool) => b
+            .build_int_truncate(w, boolt, "bt")
+            .map(Into::into)
+            .map_err(internal),
+        _ => b
+            .build_int_to_ptr(w, ptrt, "i2p")
+            .map(Into::into)
+            .map_err(internal),
+    }
 }
 
 /// Root every heap binding currently in scope, returning how many went on.
@@ -830,15 +864,7 @@ fn lower_expr<'ctx>(
                 let v = *env
                     .get(name)
                     .ok_or(CodegenError::Unsupported("captured name is not in scope"))?;
-                let word = match ty {
-                    Ty::Base(TyCon::Int) => v.into_int_value(),
-                    Ty::Base(TyCon::Bool) => b
-                        .build_int_z_extend(v.into_int_value(), i64t, "zw")
-                        .map_err(internal)?,
-                    _ => b
-                        .build_ptr_to_int(v.into_pointer_value(), i64t, "p2i")
-                        .map_err(internal)?,
-                };
+                let word = value_to_word(b, v, ty, i64t)?;
                 let cs =
                     unsafe { b.build_gep(i64t, p, &[i64t.const_int((i + 2) as u64, false)], "cs") }
                         .map_err(internal)?;
@@ -937,15 +963,7 @@ fn lower_expr<'ctx>(
                 let fp =
                     unsafe { b.build_gep(i64t, p, &[i64t.const_int((i + 1) as u64, false)], "fp") }
                         .map_err(internal)?;
-                let word = match &field_tys[i] {
-                    Ty::Base(TyCon::Int) => fv.into_int_value(),
-                    Ty::Base(TyCon::Bool) => b
-                        .build_int_z_extend(fv.into_int_value(), i64t, "zw")
-                        .map_err(internal)?,
-                    _ => b
-                        .build_ptr_to_int(fv.into_pointer_value(), i64t, "p2i")
-                        .map_err(internal)?,
-                };
+                let word = value_to_word(b, fv, &field_tys[i], i64t)?;
                 b.build_store(fp, word).map_err(internal)?;
             }
             // The object now holds the fields, so it roots them. Nothing below
@@ -1013,17 +1031,8 @@ fn lower_expr<'ctx>(
                                 .build_load(i64t, fp, "fld")
                                 .map_err(internal)?
                                 .into_int_value();
-                            let field_val: BasicValueEnum<'ctx> = match &field_tys[pi] {
-                                Ty::Base(TyCon::Int) => loaded.into(),
-                                Ty::Base(TyCon::Bool) => b
-                                    .build_int_truncate(loaded, ctx.bool_type(), "bt")
-                                    .map_err(internal)?
-                                    .into(),
-                                _ => b
-                                    .build_int_to_ptr(loaded, ptrt, "i2p")
-                                    .map_err(internal)?
-                                    .into(),
-                            };
+                            let field_val =
+                                word_to_value(b, loaded, &field_tys[pi], ctx.bool_type(), ptrt)?;
                             match p {
                                 CorePat::Var(v) => bindings.push((v.clone(), field_val)),
                                 CorePat::Wild => {}
