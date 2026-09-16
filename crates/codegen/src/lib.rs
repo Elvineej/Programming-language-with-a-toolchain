@@ -52,6 +52,8 @@ pub enum CodegenError {
     /// Out-of-subset construct. A typed boundary, not a panic (mirrors
     /// `LowerError::Unsupported`); the payload names the construct.
     Unsupported(&'static str),
+    /// A builtin whose owned Core name is outside the supported set.
+    UnsupportedBuiltin(String),
     /// `module.verify()` failed — a bug in our own emission, surfaced loudly.
     Verify(String),
     Io(std::io::Error),
@@ -66,6 +68,9 @@ impl std::fmt::Display for CodegenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CodegenError::Unsupported(w) => write!(f, "codegen: unsupported construct ({w})"),
+            CodegenError::UnsupportedBuiltin(name) => {
+                write!(f, "codegen: unsupported builtin ({name})")
+            }
             CodegenError::Verify(e) => write!(f, "codegen: verification failed: {e}"),
             CodegenError::Io(e) => write!(f, "codegen: {e}"),
             CodegenError::Link { code, stderr } => {
@@ -786,6 +791,21 @@ fn lower_expr<'ctx>(
             gc_unroot(b, lc, env_roots)?;
             Ok(p.into())
         }
+        CoreKind::Builtin(builtin, args) => {
+            // Refuse by the actual owned Core name before touching any argument.
+            if builtin != "io.println" {
+                return Err(CodegenError::UnsupportedBuiltin(builtin.clone()));
+            }
+            if args.len() != 1 {
+                return Err(CodegenError::Unsupported(
+                    "io.println takes exactly one argument",
+                ));
+            }
+            let s = lower_expr(ctx, func, b, lc, &args[0], env)?.into_pointer_value();
+            b.build_call(lc.println, &[s.into()], "pl")
+                .map_err(internal)?;
+            Ok(ctx.i64_type().const_int(0, false).into())
+        }
         CoreKind::Lit(_) => Err(CodegenError::Unsupported("non-Int literal")),
         CoreKind::Var(x) => match env.get(x) {
             Some(v) => Ok(*v),
@@ -1182,6 +1202,7 @@ struct LowerCtx<'a, 'ctx> {
     lifted: &'a HashMap<String, FunctionValue<'ctx>>,
     alloc: FunctionValue<'ctx>,
     str_lit: FunctionValue<'ctx>,
+    println: FunctionValue<'ctx>,
     string_tag: usize,
     fail: FunctionValue<'ctx>,
     /// The shadow-stack pair, now live. Every allocation site is dominated by a
@@ -1272,6 +1293,8 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let alloc = module.add_function("elya_alloc", alloc_ty, None); // ccc
     let str_lit_ty = ptrt.fn_type(&[i64t.into(), ptrt.into(), i64t.into()], false);
     let str_lit = module.add_function("elya_str_lit", str_lit_ty, None); // ccc
+    let println_ty = ctx.void_type().fn_type(&[ptrt.into()], false);
+    let println = module.add_function("elya_println", println_ty, None); // ccc
     let fail_ty = ctx.void_type().fn_type(&[], false);
     let fail = module.add_function("elya_match_fail", fail_ty, None); // ccc
 
@@ -1300,6 +1323,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         lifted: &lifted,
         alloc,
         str_lit,
+        println,
         string_tag,
         fail,
         gc_push,
@@ -2007,6 +2031,56 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, CodegenError::Unsupported("Concat")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_builtin_by_its_owned_name_before_arguments() {
+        let poisonous_arg = CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Int),
+            kind: CoreKind::Var("unbound".to_string()),
+        };
+        let builtin = CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Unit),
+            kind: CoreKind::Builtin("io.not_println".to_string(), Rc::from([poisonous_arg])),
+        };
+        let body = CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Int),
+            kind: CoreKind::Let("u".to_string(), Rc::new(builtin), Rc::new(int_lit(0))),
+        };
+        let err = emit_ir(&main_fn(body)).unwrap_err();
+        assert!(
+            matches!(err, CodegenError::UnsupportedBuiltin(ref name) if name == "io.not_println"),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "codegen: unsupported builtin (io.not_println)"
+        );
+    }
+
+    #[test]
+    fn io_println_refuses_the_wrong_arity_before_lowering_arguments() {
+        let builtin = CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Unit),
+            kind: CoreKind::Builtin("io.println".to_string(), Rc::from([])),
+        };
+        let body = CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Int),
+            kind: CoreKind::Let("u".to_string(), Rc::new(builtin), Rc::new(int_lit(0))),
+        };
+        let err = emit_ir(&main_fn(body)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("io.println takes exactly one argument")
+            ),
             "{err:?}"
         );
     }

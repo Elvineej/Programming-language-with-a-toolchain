@@ -1098,6 +1098,25 @@ impl Infer {
                 let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::unit()));
                 self.unify(&want, &got, span);
                 let _ = self.add_effect(amb, "IO", Vec::new(), span); // io.println performs {IO}
+                let mut io_labels = BTreeMap::new();
+                io_labels.insert(
+                    "IO".to_string(),
+                    EffectLabel {
+                        args: Vec::new(),
+                        span: callee.span,
+                    },
+                );
+                self.node_types.insert(
+                    callee.span,
+                    Ty::Fn(
+                        vec![Ty::str()],
+                        EffectRow {
+                            labels: io_labels,
+                            tail: RowTail::Closed,
+                        },
+                        Box::new(Ty::unit()),
+                    ),
+                );
                 return Ty::unit();
             }
             return Ty::Error; // unknown builtin is E0201 from resolution

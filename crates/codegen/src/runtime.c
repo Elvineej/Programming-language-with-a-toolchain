@@ -2,6 +2,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 /* The Elya native runtime: a stop-the-world, non-moving mark-sweep collector.
  * Single-threaded throughout — Elya has no native concurrency yet, so none of
@@ -266,4 +270,17 @@ void elya_gc_report(void) {
                 (long long)gc_collections, (long long)gc_freed, (long long)gc_live,
                 (long long)gc_allocated);
     }
+}
+
+/* N6 §6.2: stdout is the program-output channel; stderr remains reserved for
+ * collector diagnostics and runtime failures. */
+void elya_println(void *s) {
+#ifdef _WIN32
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+    int64_t *p = (int64_t *)s;
+    int64_t len = p[1];
+    const char *bytes = (const char *)&p[2];
+    fwrite(bytes, 1, (size_t)len, stdout);
+    fputc('\n', stdout);
 }

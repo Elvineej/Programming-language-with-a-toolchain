@@ -81,6 +81,11 @@ fn fv_walk(e: &CoreExpr, scope: &mut Vec<String>, out: &mut BTreeMap<String, Ty>
                 fv_walk(a, scope, out);
             }
         }
+        CoreKind::Builtin(_, args) => {
+            for a in args.iter() {
+                fv_walk(a, scope, out);
+            }
+        }
         CoreKind::Ctor(_, fields) => {
             for f in fields.iter() {
                 fv_walk(f, scope, out);
@@ -186,6 +191,11 @@ fn collect_in(
         CoreKind::Lit(_) | CoreKind::Var(_) => {}
         CoreKind::App(f, args) => {
             collect_in(f, enclosing, n, module_level, first_tag, out);
+            for a in args.iter() {
+                collect_in(a, enclosing, n, module_level, first_tag, out);
+            }
+        }
+        CoreKind::Builtin(_, args) => {
             for a in args.iter() {
                 collect_in(a, enclosing, n, module_level, first_tag, out);
             }
@@ -297,6 +307,37 @@ mod tests {
     fn a_free_var_carries_its_own_type() {
         let fv = free_vars(&var("a"));
         assert_eq!(fv.get("a"), Some(&int()));
+    }
+
+    #[test]
+    fn builtin_arguments_contribute_free_vars_and_nested_lambdas() {
+        let nested = e(
+            Ty::Fn(vec![int()], EffectRow::pure(), Box::new(int())),
+            CoreKind::Lambda(Rc::from([param("x")]), Rc::new(var("captured"))),
+        );
+        let expr = e(
+            int(),
+            CoreKind::Builtin("io.println".to_string(), Rc::from([var("message"), nested])),
+        );
+        let fv = free_vars(&expr);
+        assert_eq!(
+            fv.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["captured", "message"],
+            "the builtin name is not a variable, but every argument is walked"
+        );
+        let core = CoreModule {
+            fns: vec![CoreFn {
+                name: "main".to_string(),
+                params: Rc::from([]),
+                body: expr,
+            }],
+            types: Vec::new(),
+        };
+        assert_eq!(
+            collect_lambdas(&core, 0).len(),
+            1,
+            "collect_in must descend into builtin arguments"
+        );
     }
 
     /// `fn wrap(k) { fn(x) { x + k } }` — `k` is captured; a module-level name
