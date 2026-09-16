@@ -24,7 +24,7 @@ use std::path::Path;
 
 use inkwell::builder::Builder;
 use inkwell::context::Context;
-use inkwell::module::Module;
+use inkwell::module::{Linkage, Module};
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
@@ -315,7 +315,7 @@ fn declare_lifted<'ctx>(
 fn emit_lifted<'ctx>(
     ctx: &'ctx Context,
     b: &Builder<'ctx>,
-    lc: &LowerCtx<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
     site: &LambdaSite,
 ) -> Result<(), CodegenError> {
     let func = *lc
@@ -356,7 +356,7 @@ fn emit_lifted<'ctx>(
 fn emit_body<'ctx>(
     ctx: &'ctx Context,
     b: &Builder<'ctx>,
-    lc: &LowerCtx<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
     f: &CoreFn,
 ) -> Result<(), CodegenError> {
     let func = *lc
@@ -391,7 +391,7 @@ fn emit_body<'ctx>(
 /// native MORE undefined than the evaluator — which 5b-1 §3.4 forbids.
 fn gc_root<'ctx>(
     b: &Builder<'ctx>,
-    lc: &LowerCtx<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
     v: BasicValueEnum<'ctx>,
 ) -> Result<bool, CodegenError> {
     if !v.is_pointer_value() {
@@ -451,7 +451,7 @@ fn word_to_value<'ctx>(
 /// run — reproducibility is nearly free here and expensive to retrofit.
 fn gc_root_env<'ctx>(
     b: &Builder<'ctx>,
-    lc: &LowerCtx<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
     env: &HashMap<String, BasicValueEnum<'ctx>>,
 ) -> Result<usize, CodegenError> {
     let mut names: Vec<&String> = env.keys().collect();
@@ -469,7 +469,11 @@ fn gc_root_env<'ctx>(
 /// path out. An imbalance never fails loudly: it either retains garbage for the
 /// life of the process or — the direction that matters — un-roots a value that
 /// is still live, which is a silent wrong answer.
-fn gc_unroot<'ctx>(b: &Builder<'ctx>, lc: &LowerCtx<'ctx>, n: usize) -> Result<(), CodegenError> {
+fn gc_unroot<'ctx>(
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    n: usize,
+) -> Result<(), CodegenError> {
     for _ in 0..n {
         b.build_call(lc.gc_pop, &[], "").map_err(internal)?;
     }
@@ -488,7 +492,7 @@ fn build_elya_call<'ctx>(
     ctx: &'ctx Context,
     func: FunctionValue<'ctx>,
     b: &Builder<'ctx>,
-    lc: &LowerCtx<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
     callee: &CoreExpr,
     args: &[CoreExpr],
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
@@ -518,7 +522,7 @@ fn build_direct_call<'ctx>(
     ctx: &'ctx Context,
     func: FunctionValue<'ctx>,
     b: &Builder<'ctx>,
-    lc: &LowerCtx<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
     target: FunctionValue<'ctx>,
     args: &[CoreExpr],
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
@@ -574,7 +578,7 @@ fn build_closure_call<'ctx>(
     ctx: &'ctx Context,
     func: FunctionValue<'ctx>,
     b: &Builder<'ctx>,
-    lc: &LowerCtx<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
     callee: &CoreExpr,
     args: &[CoreExpr],
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
@@ -642,7 +646,7 @@ fn lower_tail<'ctx>(
     ctx: &'ctx Context,
     func: FunctionValue<'ctx>,
     b: &Builder<'ctx>,
-    lc: &LowerCtx<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
     e: &CoreExpr,
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
 ) -> Result<(), CodegenError> {
@@ -718,7 +722,7 @@ fn lower_expr<'ctx>(
     ctx: &'ctx Context,
     func: FunctionValue<'ctx>,
     b: &Builder<'ctx>,
-    lc: &LowerCtx<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
     e: &CoreExpr,
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
 ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
@@ -741,6 +745,47 @@ fn lower_expr<'ctx>(
             .into_int_type()
             .const_int(u64::from(*v), false)
             .into()),
+        // N6 §1.5/§6.4: the .rodata bytes are static source data, not heap
+        // roots. Build the full byte array explicitly: Inkwell's string-global
+        // helper truncates at an embedded NUL, while elya_str_lit copies len.
+        CoreKind::Lit(CoreLit::Str(v)) => {
+            let i64t = ctx.i64_type();
+            let i8t = ctx.i8_type();
+            let env_roots = gc_root_env(b, lc, env)?;
+            let bytes = v.as_bytes().iter().copied().chain(std::iter::once(0));
+            let bytes_const = i8t.const_array(
+                &bytes
+                    .map(|byte| i8t.const_int(byte as u64, false))
+                    .collect::<Vec<_>>(),
+            );
+            let source = lc.module.add_global(
+                bytes_const.get_type(),
+                Some(AddressSpace::default()),
+                "cstr",
+            );
+            source.set_initializer(&bytes_const);
+            source.set_constant(true);
+            source.set_linkage(Linkage::Private);
+            source.set_unnamed_addr(true);
+            let bytes_ptr = source.as_pointer_value();
+            let p = b
+                .build_call(
+                    lc.str_lit,
+                    &[
+                        i64t.const_int(lc.string_tag as u64, false).into(),
+                        bytes_ptr.into(),
+                        i64t.const_int(v.len() as u64, false).into(),
+                    ],
+                    "str",
+                )
+                .map_err(internal)?
+                .try_as_basic_value()
+                .left()
+                .ok_or(CodegenError::Unsupported("elya_str_lit returned no value"))?
+                .into_pointer_value();
+            gc_unroot(b, lc, env_roots)?;
+            Ok(p.into())
+        }
         CoreKind::Lit(_) => Err(CodegenError::Unsupported("non-Int literal")),
         CoreKind::Var(x) => match env.get(x) {
             Some(v) => Ok(*v),
@@ -1120,22 +1165,24 @@ fn lower_expr<'ctx>(
     }
 }
 
-/// The shared lowering context: function declarations, the constructor table, and
-/// the two runtime externals. Bundled so the lowering fold threads one reference
-/// instead of four separate ones.
-struct LowerCtx<'ctx> {
-    decls: &'ctx HashMap<String, FunctionValue<'ctx>>,
+/// The shared lowering context: declarations, constructor and string tags, and
+/// runtime externals. Bundled so the lowering fold threads one reference.
+struct LowerCtx<'a, 'ctx> {
+    module: &'a Module<'ctx>,
+    decls: &'a HashMap<String, FunctionValue<'ctx>>,
     /// Constructor name -> (globally unique tag, field types). A name
     /// missing here is a constructor of a *parametric* ADT, which Task 2
     /// deferred — refused by name in the Ctor/Match arms, never unwrapped.
-    ctors: &'ctx HashMap<String, (usize, Vec<Ty>)>,
+    ctors: &'a HashMap<String, (usize, Vec<Ty>)>,
     /// Every lambda site in the module, in the pre-order `collect_lambdas` fixed.
-    lambdas: &'ctx [LambdaSite],
+    lambdas: &'a [LambdaSite],
     /// Core node address -> index into `lambdas`.
-    lambda_index: &'ctx HashMap<usize, usize>,
+    lambda_index: &'a HashMap<usize, usize>,
     /// `LambdaSite::symbol` -> the declared lifted function.
-    lifted: &'ctx HashMap<String, FunctionValue<'ctx>>,
+    lifted: &'a HashMap<String, FunctionValue<'ctx>>,
     alloc: FunctionValue<'ctx>,
+    str_lit: FunctionValue<'ctx>,
+    string_tag: usize,
     fail: FunctionValue<'ctx>,
     /// The shadow-stack pair, now live. Every allocation site is dominated by a
     /// push of the enclosing frame's heap bindings, so at the moment
@@ -1184,6 +1231,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     // below counts them, from `core.types`.
     let n_real_ctors: usize = core.types.iter().map(|t| t.ctors.len()).sum();
     let lambdas = closure::collect_lambdas(core, n_real_ctors);
+    let string_tag = n_real_ctors + lambdas.len();
     // §5.1, and for the same reason the scan above is first: over-cap is a
     // `report_fatal_error` inside LLVM, so it must be refused BEFORE anything is
     // emitted. One site governs the whole module: every `Ty::Fn` value in a
@@ -1215,14 +1263,15 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let ptrt = ctx.ptr_type(AddressSpace::default());
     let module = ctx.create_module("elya");
 
-    // §4.2: declare everything (functions + the two runtime externals), then emit
-    // every body. The runtime externals are `ccc` (the C-ABI boundary); everything
-    // Elya-internal stays `tailcc`.
+    // §4.2: declare Elya functions and runtime externals, then emit every body.
+    // Runtime externals are `ccc` at the C-ABI boundary; Elya functions stay `tailcc`.
     let decls = declare_all(ctx, &module, core)?;
     let ctors = build_ctor_table(core);
 
     let alloc_ty = ptrt.fn_type(&[i64t.into()], false);
     let alloc = module.add_function("elya_alloc", alloc_ty, None); // ccc
+    let str_lit_ty = ptrt.fn_type(&[i64t.into(), ptrt.into(), i64t.into()], false);
+    let str_lit = module.add_function("elya_str_lit", str_lit_ty, None); // ccc
     let fail_ty = ctx.void_type().fn_type(&[], false);
     let fail = module.add_function("elya_match_fail", fail_ty, None); // ccc
 
@@ -1243,12 +1292,15 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let lifted = declare_lifted(ctx, &module, &lambdas)?;
 
     let lc = LowerCtx {
+        module: &module,
         decls: &decls,
         ctors: &ctors,
         lambdas: &lambdas,
         lambda_index: &lambda_index,
         lifted: &lifted,
         alloc,
+        str_lit,
+        string_tag,
         fail,
         gc_push,
         gc_pop,
@@ -1333,7 +1385,6 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     // heap reference, so the mark phase traces nothing for a string. The tag is
     // this row's index; the guard below makes "tag agrees with its row index" a
     // compile-time property, exactly as the lambda guard above does.
-    let string_tag = n_real_ctors + lambdas.len();
     if string_tag != desc.len() / 2 {
         return Err(CodegenError::Unsupported(
             "string tag disagrees with its descriptor row index",
@@ -1722,38 +1773,6 @@ mod tests {
             ),
         });
         emit_ir(&m).expect("a Bool binding must verify");
-    }
-
-    #[test]
-    fn rejects_a_string_literal_until_the_allocator_lands() {
-        // N6 gave `Str` a width — a pointer to its heap block — so `repr_ty` no
-        // longer refuses this node at the *type* boundary. What is still unbuilt
-        // is the literal's allocation, so the node falls through to the
-        // `CoreKind::Lit(_)` arm and is refused as a "non-Int literal": the
-        // *literal* boundary, one step further in. That is still distinct from
-        // the "non-Int value" that guards main's return type — a different
-        // question (what can this place hold?) with a different message.
-        //
-        // Task 3 lifts this refusal entirely, and must delete this test in the
-        // same commit that adds the `Lit(CoreLit::Str(v))` arm.
-        let m = main_fn(CoreExpr {
-            span: Span::EMPTY,
-            ty: Ty::Base(TyCon::Int),
-            kind: CoreKind::Let(
-                "s".into(),
-                Rc::new(CoreExpr {
-                    span: Span::EMPTY,
-                    ty: Ty::Base(TyCon::Str),
-                    kind: CoreKind::Lit(CoreLit::Str("a".into())),
-                }),
-                Rc::new(int_lit(1)),
-            ),
-        });
-        let err = emit_ir(&m).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("non-Int literal")),
-            "{err:?}"
-        );
     }
 
     /// 5b-6 §5.1. A lambda converts to a lifted function of arity `P + 1` (the

@@ -231,6 +231,25 @@ fn lets_and_mul_print_forty_two() {
 }
 
 #[test]
+fn string_literals_allocate_and_main_returns_forty_two() {
+    // Content is not observable until native println lands. These cases smoke
+    // the allocation path, including lengths that need NUL room and raw NUL.
+    for (tag, literal) in [
+        ("hi", "hi"),
+        ("empty", ""),
+        ("eight", "abcdefgh"),
+        ("embedded-nul", "a\0b"),
+    ] {
+        let src = format!("pub fn main() {{\n  let s = \"{literal}\"\n  42\n}}\n");
+        let core = lower_src(&src);
+        let dir = temp_dir(&format!("string-literal-{tag}"));
+        let exe = compile_and_link(&core, &dir, tag);
+        assert_runs(&exe, "42");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[test]
 fn nesting_and_sub_print_fifteen() {
     let core = lower_src(CORPUS[2].1);
     let dir = temp_dir("nesting");

@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 /* The Elya native runtime: a stop-the-world, non-moving mark-sweep collector.
  * Single-threaded throughout — Elya has no native concurrency yet, so none of
@@ -205,10 +206,10 @@ static void gc_collect(void) {
  * arm relies on, so a recycled block is re-zeroed on the way out. */
 void *elya_alloc(int64_t words) {
     /* Roots for a collection triggered HERE are already on the shadow stack:
-     * the Ctor arm pushes both the live bindings and the just-lowered fields
-     * before the call, precisely so that this line is safe. Marking runs before
-     * the block is handed out, so the new object is never itself a mark
-     * target -- nothing yet points at it. */
+     * allocation sites push live heap bindings, and constructors also push
+     * just-lowered fields. Marking runs before the block is handed out, so
+     * the new object is never itself a mark target -- nothing yet points at
+     * it. */
     if (gc_allocated >= GC_THRESHOLD_WORDS) {
         gc_collect();
     }
@@ -236,6 +237,17 @@ void *elya_alloc(int64_t words) {
     b->next = gc_all_blocks;
     gc_all_blocks = b;
     return gc_payload(b);
+}
+
+/* Copy static literal bytes into a tagged heap block. The extra byte reserves
+ * the NUL terminator; elya_alloc zeroes it even when len is a multiple of 8. */
+void *elya_str_lit(int64_t tag, const char *bytes, int64_t len) {
+    int64_t words = 2 + ((len + 1) + 7) / 8;
+    int64_t *p = (int64_t *)elya_alloc(words);
+    p[0] = tag;
+    p[1] = len;
+    memcpy(&p[2], bytes, (size_t)len);
+    return p;
 }
 
 /* The deterministic failed-match trap. Spec 5b-4 §5: never `unreachable`. */
