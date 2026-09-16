@@ -31,6 +31,8 @@ pub enum CoreKind {
     Var(String),
     /// callee + args (function / effect-op application).
     App(Rc<CoreExpr>, Rc<[CoreExpr]>),
+    /// A compiler builtin, syntactically distinct from `App` just as `Ctor` is.
+    Builtin(String, Rc<[CoreExpr]>),
     /// ADT construction, syntactically distinct from application (5b-4 §3.2):
     /// `Ctor(name, fields)` — `name` is the constructor.
     Ctor(String, Rc<[CoreExpr]>),
@@ -257,6 +259,19 @@ fn lower_expr(
             }
         }
         Expr::Call { callee, args } => {
+            if let Expr::Qualified { module, name } = &callee.node {
+                if module == "io" && name == "println" {
+                    let mut lowered = Vec::with_capacity(args.len());
+                    for a in args.iter() {
+                        lowered.push(lower_expr(&a.node, a.span, table, ctors)?);
+                    }
+                    return Ok(CoreExpr {
+                        span,
+                        ty,
+                        kind: CoreKind::Builtin("io.println".to_string(), lowered.into()),
+                    });
+                }
+            }
             // A saturated constructor call lowers to a distinct Ctor node, not an
             // App. Check the callee name before lowering it as a variable.
             if let Expr::Var(name) = &callee.node {
@@ -415,6 +430,14 @@ fn pretty_expr(e: &CoreExpr, p: &mut TyPrinter, s: &mut String) {
         CoreKind::App(f, args) => {
             s.push_str("(app ");
             pretty_expr(f, p, s);
+            for a in args.iter() {
+                s.push(' ');
+                pretty_expr(a, p, s);
+            }
+        }
+        CoreKind::Builtin(name, args) => {
+            s.push_str("(builtin ");
+            s.push_str(name);
             for a in args.iter() {
                 s.push(' ');
                 pretty_expr(a, p, s);

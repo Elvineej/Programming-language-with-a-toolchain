@@ -133,6 +133,27 @@ const CORPUS: &[(&str, &str)] = &[
     ("negative", "pub fn main() { 3 - 10 }\n"),
 ];
 
+const PRINTING_CORPUS: &[(&str, &str, &str, &str)] = &[
+    (
+        "println-hello",
+        "pub fn main() { io.println(\"hello\") 42 }\n",
+        "hello\n",
+        "42",
+    ),
+    (
+        "println-two-lines",
+        "pub fn main() { io.println(\"hello\") io.println(\"world\") 7 }\n",
+        "hello\nworld\n",
+        "7",
+    ),
+    (
+        "println-empty",
+        "pub fn main() { io.println(\"\") 9 }\n",
+        "\n",
+        "9",
+    ),
+];
+
 /// Parse → full front-end check → raw type table → lower. Runs the REAL
 /// pipeline: `check_source` exercises resolve + inference + exhaustiveness +
 /// affinity exactly as `elya check` does; only the table/lowering half is
@@ -210,6 +231,66 @@ fn assert_runs(exe: &Path, expected: &str) {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn native_text_value(exe: &Path, tag: &str) -> (String, String) {
+    let out = Command::new(exe).output().expect("run produced binary");
+    diagnose_stack_overflow(&out.status, tag);
+    assert!(
+        out.status.success(),
+        "{tag}: binary exited {:?}",
+        out.status
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{tag}: stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("native stdout must be UTF-8");
+    let without_result_newline = stdout
+        .strip_suffix('\n')
+        .unwrap_or_else(|| panic!("{tag}: stdout has no result newline: {stdout:?}"));
+    let (text, value) = without_result_newline
+        .rsplit_once('\n')
+        .unwrap_or_else(|| panic!("{tag}: stdout has no println/result boundary: {stdout:?}"));
+    (format!("{text}\n"), value.to_string())
+}
+
+#[test]
+fn io_println_writes_exact_text_then_main_value() {
+    let dir = temp_dir("printing-corpus");
+    for (tag, src, expected_text, expected_value) in PRINTING_CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        assert_eq!(
+            native_text_value(&exe, tag),
+            ((*expected_text).to_string(), (*expected_value).to_string()),
+            "{tag}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn io_println_preserves_string_bytes() {
+    let dir = temp_dir("printing-content");
+    for (tag, content) in [
+        ("raw-nul", "a\0b"),
+        ("eight-bytes", "abcdefgh"),
+        ("utf8-whitespace", "  héλlo  "),
+        ("embedded-newline", "first\nsecond"),
+        ("embedded-crlf", "first\r\nsecond"),
+    ] {
+        let src = format!("pub fn main() {{ io.println(\"{content}\") 5 }}\n");
+        let core = lower_src(&src);
+        let exe = compile_and_link(&core, &dir, tag);
+        assert_eq!(
+            native_text_value(&exe, tag),
+            (format!("{content}\n"), "5".to_string()),
+            "{tag}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

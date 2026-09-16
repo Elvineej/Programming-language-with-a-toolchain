@@ -40,6 +40,11 @@ fn nodes(core: &CoreModule) -> Vec<&CoreExpr> {
                     walk(a, out);
                 }
             }
+            CoreKind::Builtin(_, args) => {
+                for a in args.iter() {
+                    walk(a, out);
+                }
+            }
             CoreKind::Prim(_, args) => {
                 for a in args.iter() {
                     walk(a, out);
@@ -367,4 +372,49 @@ fn lambda_parameters_carry_recorded_types() {
         Ty::Base(TyCon::Int),
         "the TYPE survives lowering — this is what T3 was about"
     );
+}
+
+#[test]
+fn io_println_is_a_distinct_typed_builtin_with_an_io_callee() {
+    let src = "pub fn main() { io.println(\"hello\") 42 }\n";
+    let (core, table) = lower_src(src);
+    let builtin = nodes(&core)
+        .into_iter()
+        .find(|n| matches!(&n.kind, CoreKind::Builtin(name, _) if name == "io.println"))
+        .expect("io.println must lower to a distinct Builtin node");
+    let CoreKind::Builtin(name, args) = &builtin.kind else {
+        unreachable!("just matched")
+    };
+    assert_eq!(name, "io.println");
+    assert_eq!(args.len(), 1);
+    assert!(matches!(builtin.ty, Ty::Base(TyCon::Unit)));
+    assert!(
+        !nodes(&core)
+            .iter()
+            .any(|n| matches!(n.kind, CoreKind::App(..))),
+        "the builtin call must not travel through App"
+    );
+    both_origin_checks(&core, &table);
+
+    let io_callees: Vec<&Ty> = table
+        .values()
+        .filter(|ty| match ty {
+            Ty::Fn(params, row, result) => {
+                params == &vec![Ty::str()]
+                    && row.labels.len() == 1
+                    && row.labels.contains_key("IO")
+                    && matches!(&row.tail, elya::types::RowTail::Closed)
+                    && **result == Ty::unit()
+            }
+            _ => false,
+        })
+        .collect();
+    assert_eq!(
+        io_callees.len(),
+        1,
+        "exactly the callee span records fn(String) / {{IO}} -> Unit"
+    );
+
+    let rendered = pretty_typed(&core, &mut TyPrinter::new());
+    assert!(rendered.contains("(builtin io.println"), "{rendered}");
 }
