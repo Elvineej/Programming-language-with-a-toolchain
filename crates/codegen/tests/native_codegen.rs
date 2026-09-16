@@ -272,6 +272,31 @@ fn io_println_writes_exact_text_then_main_value() {
 }
 
 #[test]
+fn native_output_matches_the_evaluator_across_the_printing_corpus() {
+    // §7.1's split is deliberately mechanical: the shim prints main's Int last,
+    // while the evaluator retains io.println text in Interp's output buffer.
+    // Both halves are compared so neither an empty-vs-empty text check nor a
+    // right-text/wrong-value result can pass vacuously.
+    let dir = temp_dir("differential-printing");
+    for (tag, src, _, _) in PRINTING_CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        let (text, value) = native_text_value(&exe, tag);
+        assert_eq!(
+            text,
+            eval_main_text(src),
+            "{tag}: native println text diverges from the evaluator"
+        );
+        assert_eq!(
+            value,
+            eval_main_int(src),
+            "{tag}: native main value diverges from the evaluator"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn io_println_preserves_string_bytes() {
     let dir = temp_dir("printing-content");
     for (tag, content) in [
@@ -526,6 +551,20 @@ fn eval_main_int(src: &str) -> String {
     let (_, v) = elya::eval::run_module_value(&m).expect("evaluator must run corpus program");
     match v {
         elya::eval::Value::Int(n) => n.to_string(),
+        other => panic!("corpus main must evaluate to an Int, got {other:?}"),
+    }
+}
+
+/// The evaluator's buffered program-output channel, alongside the Int
+/// result used for the native shim's final line. Keeping the Int assertion here
+/// makes the §7.1 split meaningful: native stdout always ends in that value line.
+fn eval_main_text(src: &str) -> String {
+    let session = Session::new();
+    let (m, pd) = parse_module(&session, src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let (interp, v) = elya::eval::run_module_value(&m).expect("evaluator must run corpus program");
+    match v {
+        elya::eval::Value::Int(_) => interp.output().to_string(),
         other => panic!("corpus main must evaluate to an Int, got {other:?}"),
     }
 }
@@ -945,6 +984,38 @@ fn a_live_binding_survives_collection_across_a_call() {
     assert_eq!(
         stdout, "12345",
         "the live binding did not survive collection"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// N6 §2 / §10.3, direction (b). A String in an ADT field is traced ONLY by
+/// the descriptor mask; if `is_heap_ty` omits `Ty::Base(TyCon::Str)`, its bit is
+/// clear, so collection sweeps the still-live string and a same-sized `Two`
+/// allocation recycles its block. The proof is the string CONTENT, not survival.
+#[test]
+fn a_string_in_an_adt_field_survives_collection() {
+    // `"hello"` occupies three visible words: tag, length, and bytes plus its
+    // NUL. `Two(Int, Int)` has the same three-word block size, so after a
+    // collection it deterministically overwrites a swept string with a zero
+    // length. `b` itself remains rooted; this isolates tracing through Mk's
+    // descriptor mask from shadow-stack rooting.
+    let src = "type Box { Mk(String) }\n\
+               type Waste { Two(Int, Int) }\n\
+               fn churn(n) { if n == 0 { 0 } else { let _ = Two(0, 0)  churn(n - 1) } }\n\
+               pub fn main() { let b = Mk(\"hello\")  let _ = churn(100000)  \
+               let _ = match b { Mk(s) -> io.println(s) }  0 }\n";
+    let dir = temp_dir("string-adt-gc-mask");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "string-adt-gc-mask");
+    let (stdout, stats) = run_with_gc_stats(&exe, "string-adt-gc-mask");
+    assert!(
+        stats.collections > 0,
+        "no collection happened, so the String field was never tested: {stats:?}"
+    );
+    assert_eq!(
+        stdout, "hello\n0",
+        "the String field did not survive collection — its descriptor mask bit \
+         was clear because is_heap_ty did not recognise Ty::Base(TyCon::Str)"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
