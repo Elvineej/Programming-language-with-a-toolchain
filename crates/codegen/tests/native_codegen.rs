@@ -233,6 +233,24 @@ fn assert_runs(exe: &Path, expected: &str) {
     );
 }
 
+/// §7.1's split, as ONE rule so every caller parses printing output the same
+/// way: the shim prints main's Int last, so the final newline ends the value
+/// line and everything before it is io.println text.
+///
+/// The `None` arm is load-bearing. An absent boundary means main printed
+/// nothing, which is exactly what a silenced io.println looks like; panicking
+/// here would report the C5-a control as a harness failure instead of as the
+/// text mismatch it is.
+fn split_text_and_value(stdout: &str, tag: &str) -> (String, String) {
+    let without_result_newline = stdout
+        .strip_suffix('\n')
+        .unwrap_or_else(|| panic!("{tag}: stdout has no result newline: {stdout:?}"));
+    match without_result_newline.rsplit_once('\n') {
+        Some((text, value)) => (format!("{text}\n"), value.to_string()),
+        None => (String::new(), without_result_newline.to_string()),
+    }
+}
+
 fn native_text_value(exe: &Path, tag: &str) -> (String, String) {
     let out = Command::new(exe).output().expect("run produced binary");
     diagnose_stack_overflow(&out.status, tag);
@@ -247,13 +265,7 @@ fn native_text_value(exe: &Path, tag: &str) -> (String, String) {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("native stdout must be UTF-8");
-    let without_result_newline = stdout
-        .strip_suffix('\n')
-        .unwrap_or_else(|| panic!("{tag}: stdout has no result newline: {stdout:?}"));
-    let (text, value) = without_result_newline
-        .rsplit_once('\n')
-        .unwrap_or_else(|| panic!("{tag}: stdout has no println/result boundary: {stdout:?}"));
-    (format!("{text}\n"), value.to_string())
+    split_text_and_value(&stdout, tag)
 }
 
 #[test]
@@ -868,8 +880,12 @@ struct GcStats {
     live: i64,
 }
 
-/// Run `exe` with statistics enabled, returning its stdout and the counters.
-fn run_with_gc_stats(exe: &Path, tag: &str) -> (String, GcStats) {
+/// Run `exe` with statistics enabled, returning its RAW stdout and the
+/// counters. Raw because §8.5 requires the stats path stay consistent with
+/// §7.1's split, and trimming destroys the trailing newlines that split is
+/// defined on — a check that trimmed and then re-added one would be asserting
+/// its own reconstruction rather than byte preservation.
+fn run_with_gc_stats_raw(exe: &Path, tag: &str) -> (String, GcStats) {
     let out = Command::new(exe)
         .env("ELY_GC_STATS", "1")
         .output()
@@ -897,10 +913,14 @@ fn run_with_gc_stats(exe: &Path, tag: &str) -> (String, GcStats) {
         freed: field("freed="),
         live: field("live="),
     };
-    (
-        String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        stats,
-    )
+    (String::from_utf8_lossy(&out.stdout).to_string(), stats)
+}
+
+/// The trimmed view the non-printing GC corpora already use, as a wrapper over
+/// the raw form so both share one run and one parse of the counters.
+fn run_with_gc_stats(exe: &Path, tag: &str) -> (String, GcStats) {
+    let (stdout, stats) = run_with_gc_stats_raw(exe, tag);
+    (stdout.trim().to_string(), stats)
 }
 
 #[test]
@@ -1218,4 +1238,95 @@ fn a_growing_live_set_moves_the_instrument() {
         "a live set that grows with the iteration count must move `live` — the \
          instrument is not tracking the level: {seen:?}"
     );
+}
+
+/// §8.3 / §10 item 8. `Unit` is the one base type whose word conversion is an
+/// identity, and its arms in `value_to_word`/`word_to_value` were dead until
+/// `io.println` gave the language any way to produce a `Unit` value. Here a
+/// `Unit`-typed ADT field round-trips through BOTH arms: `Mk(u)` stores the
+/// word, the match binding reads it back, and re-storing that binding stores a
+/// word that was itself read back. Under the `_` fallthrough the store side
+/// calls `.into_pointer_value()` on an `IntValue` and panics the compiler.
+#[test]
+fn a_unit_typed_adt_field_round_trips_through_the_word_helpers() {
+    let src = "type Box { Mk(Unit) }\n\
+               pub fn main() { let u = io.println(\"x\")  let b = Mk(u)  \
+               let c = match b { Mk(v) -> Mk(v) }  match c { Mk(w) -> 5 } }\n";
+    let dir = temp_dir("unit-adt-field");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "unit-adt-field");
+    let (text, value) = native_text_value(&exe, "unit-adt-field");
+    assert_eq!(
+        text, "x\n",
+        "unit-adt-field: the println that produced the Unit lost its text"
+    );
+    assert_eq!(
+        value, "5",
+        "unit-adt-field: the Unit field did not survive the store/read round trip"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// §8.3 / §10 item 8, the capture side. `u` is `Unit`, so the capture-store arm
+/// converts an i64 zero without a `ptrtoint` and the capture-read arm returns it
+/// without an `inttoptr`. Both sites funnel through the same helper pair, so this
+/// and the field test together cover all four §8.3 conversion sites.
+///
+/// The lambda is inline in `main` rather than returned from a helper, and `z` is
+/// pinned to `Int` on purpose. A helper like `fn wrap(u) { fn(z) { u } }` is
+/// polymorphic, and `repr_ty` refuses `Ty::Var(_)` for the WHOLE module — see
+/// `a_polymorphic_function_refuses_the_whole_module`. That shape dies before the
+/// `Unit` arm is ever reached, so it would prove nothing about it: N7 knocking,
+/// not N6 failing.
+#[test]
+fn a_unit_typed_closure_capture_round_trips_through_the_word_helpers() {
+    let src = "pub fn main() { let u = io.println(\"x\")  \
+               let f = fn(z) { let _ = z + 1  u }  \
+               let _ = f(1)  7 }\n";
+    let dir = temp_dir("unit-capture");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "unit-capture");
+    let (text, value) = native_text_value(&exe, "unit-capture");
+    assert_eq!(
+        text, "x\n",
+        "unit-capture: the println that produced the Unit lost its text"
+    );
+    assert_eq!(
+        value, "7",
+        "unit-capture: the captured Unit word did not read back intact"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// §8.5. The stats path also returns stdout, so it must parse printing output by
+/// §7.1's rule and not a second one of its own. It shares that rule literally:
+/// the raw run feeds `split_text_and_value`, the same function the differential
+/// uses, so the two cannot drift. Raw rather than trimmed because trimming
+/// destroys the trailing newline the split is defined on, and a check that
+/// trimmed and then re-added one would assert its own reconstruction.
+///
+/// Allocations stay trivial so the run never reaches `GC_THRESHOLD_WORDS`
+/// (§7.3: never lower it) — asserted, not assumed.
+#[test]
+fn a_printing_program_under_gc_stats_splits_by_the_same_rule() {
+    let (tag, src, want_text, want_value) = PRINTING_CORPUS[0];
+    let dir = temp_dir("stats-printing-split");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, tag);
+    let (stdout, stats) = run_with_gc_stats_raw(&exe, tag);
+    let (text, value) = split_text_and_value(&stdout, tag);
+    assert_eq!(
+        text, want_text,
+        "{tag}: the stats path parsed different println text than §7.1's split"
+    );
+    assert_eq!(
+        value, want_value,
+        "{tag}: the stats path parsed a different value line than §7.1's split"
+    );
+    assert_eq!(
+        stats.collections, 0,
+        "{tag}: the consistency gate tripped the collector, so it is no longer \
+         the trivial-allocation check §7.3 requires: {stats:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
