@@ -81,9 +81,31 @@ written, and this slice makes it safe on purpose by writing the contract into
 
 **Tag assignment.** The string row goes after the lambda rows:
 `n_real_ctors + lambdas.len()`. It gets the same hard drift guard the lambda rows
-got at `crates/codegen/src/lib.rs:1287-1292` — a `Unsupported` error, not a
+got at `crates/codegen/src/lib.rs:1391-1395` — a `Unsupported` error, not a
 `debug_assert`, because release builds must not skip it, and because a tag that
-disagrees with its row index mis-traces silently.
+disagrees with its row index mis-traces silently. As built, the string guard sits
+at `lib.rs:1412-1416`.
+
+**Corrected after implementation: this guard is proven by its own existence, and
+no test proves it.** §10 item 4 called it *"a compile-time refusal, tested as
+one"*, and that is the one claim in this spec implementation did not support. A
+**refusal** is program-triggerable: some source text reaches it and gets a message
+back, and every other refusal this slice adds (§8) is tested exactly that way. This
+is not one. `string_tag` is *computed* as `n_real_ctors + lambdas.len()` and `desc`
+is *built* to precisely that many rows, a few lines apart in the same function —
+so the two agree by construction, and **no Elya program can make them disagree**.
+What the guard defends against is a future edit that changes one and not the
+other; that edit fails the build, which is the entire point. The lambda guard it
+was modelled on has no test either, for the same reason, and that should have been
+the tell when §10 was written.
+
+The plan's acceptance table has it right: it names the guard's
+`Unsupported("string tag disagrees with its descriptor row index")` as the proof,
+not a test of it. The discipline this settles, for every slice after: **a
+structural invariant is discharged by the check that enforces it; only a
+reachable refusal owes an execution test.** Writing a test here would mean
+reaching into the compiler to break an invariant no program can break — a test of
+the test, not of the language.
 
 ### 1.3 Why a descriptor row at all
 
@@ -567,10 +589,12 @@ native arc began. N6 is a back-end slice with one two-line front-end recorder fi
 
 ## 10. Testing
 
-Every guarantee below is proven by a built-and-run execution test, with one
-stated exception: item 9 is a review check, because `gc_mark` not changing is
-not a behaviour a test can observe. No IR snapshots for native behaviour, no
-`#[ignore]`.
+Every guarantee below is proven by a built-and-run execution test, with two
+exceptions. Item 9 is a review check, because `gc_mark` not changing is not a
+behaviour a test can observe — that exception was stated from the start. Item 4
+turned out to be a second, found during implementation: it is a structural
+invariant no program can trip, discharged by the check that enforces it (§1.2).
+No IR snapshots for native behaviour, no `#[ignore]`.
 
 1. **The corpus prints.** New printing corpus entries, at least one printing
    **more than one line** and at least one printing the empty string (§7.3), each
@@ -580,7 +604,12 @@ not a behaviour a test can observe. No IR snapshots for native behaviour, no
 3. **Direction (b), the headline hazard** (§2): a `String` in an ADT field, with
    `is_heap_ty` un-widened, built and run, asserting on the **string content read
    back** — and shown producing a wrong value rather than a crash.
-4. **The tag/row drift guard** (§1.2): a compile-time refusal, tested as one.
+4. **The tag/row drift guard** (§1.2) — **corrected: proven by its own
+   existence, not by a test.** It is a structural invariant, not a reachable
+   refusal: no surface program can make the tag and the row index disagree, so
+   there is nothing to write an execution test against. The plan's acceptance
+   table already named the guard itself as the proof; this item was the single
+   place this spec overclaimed. See §1.2.
 5. **`mask_and_repr_agree_on_pointers` gains `Str` and `Unit`** (§3).
 6. **Sequencing works**: a program with a `println` statement followed by more
    statements compiles and runs — the direct test of §3.
@@ -613,3 +642,24 @@ match chain is an unoptimised floor), T6 (literal-pattern match unfocused), T7
 
 **Re-filed by this slice:** the ADT-field `Ty::Fn` execution test now files
 against **N7** rather than hanging between N6 and N7 (§5).
+
+**Settled by execution, recorded at close-out:**
+
+- **`gc_mark` came out byte-identical**, as §10 item 9 required and §2 predicted.
+  Measured rather than eyeballed: the function extracted from `runtime.c` at
+  `1578db9` and at close-out is **638 bytes on both sides, byte-for-byte equal**.
+  The collector traces a string-bearing heap with exactly the code 5b-5 shipped;
+  N6 added a descriptor row and touched the tracer not at all. `runtime.c`'s
+  whole change is +40/-5, and all of it is `elya_str_lit`, the `<string.h>` and
+  Win32 `<fcntl.h>`/`<io.h>` includes that keep stdout binary, and comment text.
+- **§10 item 4 overclaimed** and is corrected in place (above, and §1.2). Of the
+  nine testing items, seven are discharged by execution, item 9 by review as
+  stated from the start, and item 4 by the guard's own existence — which is what
+  the plan's acceptance table said all along. No test was invented to close it
+  and no code was changed to suit it.
+- **The differential's two negative controls failed differently, and were
+  removed** (§7.2, item 2). The text arm compares `""` against `"hello\n"` and the
+  empty-stderr arm fails on a different assertion in a different test. Both were
+  built, run, observed failing, and reverted in the same commit that added the
+  proofs they control — so the harness is shown to be able to fail before it is
+  trusted to pass.
