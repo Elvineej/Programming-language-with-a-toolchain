@@ -55,7 +55,7 @@
 
 ### Steps
 
-- [ ] **Step 1: Widen `repr_ty` and `is_heap_ty`.** In `lib.rs:183-193` add two arms before the `_`:
+- [x] **Step 1: Widen `repr_ty` and `is_heap_ty`.** In `lib.rs:183-193` add two arms before the `_`:
 
   ```rust
   // N6 (spec §1.1, §3): a string is a pointer to its heap block; Unit is the
@@ -72,7 +72,7 @@
   }
   ```
 
-- [ ] **Step 2: The descriptor row + drift guard.** In `build_module`, after the lambda-row loop (`lib.rs:1305`) and before `let n_ctors = (desc.len() / 2) as u64;` (`:1306`):
+- [x] **Step 2: The descriptor row + drift guard.** In `build_module`, after the lambda-row loop (`lib.rs:1305`) and before `let n_ctors = (desc.len() / 2) as u64;` (`:1306`):
 
   ```rust
   // N6 (§1.2): ONE string row — arity 0, mask 0. Nothing after the tag is a
@@ -89,7 +89,7 @@
   desc.push(0); // mask = 0
   ```
 
-- [ ] **Step 3: Refuse `<>` by name.** In the `Prim` arm, immediately after the Eq/Ne guard (`lib.rs:735-739`) and before the operand lowering at `:740-741`, add:
+- [x] **Step 3: Refuse `<>` by name.** In the `Prim` arm, immediately after the Eq/Ne guard (`lib.rs:735-739`) and before the operand lowering at `:740-741`, add:
 
   ```rust
   // N6 §8.2: `<>` is String × String → String; its operands are pointers, so
@@ -100,7 +100,7 @@
   }
   ```
 
-- [ ] **Step 4: Refuse a non-`Ty::Con` match scrutinee.** At the top of the `CoreKind::Match` arm (`lib.rs:946`), before the `.into_pointer_value()` at `:949`:
+- [x] **Step 4: Refuse a non-`Ty::Con` match scrutinee.** At the top of the `CoreKind::Match` arm (`lib.rs:946`), before the `.into_pointer_value()` at `:949`:
 
   ```rust
   // N6 §8.4: a scrutinee must be an ADT (a pointer with a real tag word). A
@@ -111,11 +111,11 @@
   }
   ```
 
-- [ ] **Step 5: The arity contract comment.** In `runtime.c`, the comment block above `gc_descriptors` (near `runtime.c:19-25`) gains one sentence stating that `arity` is "the count of traced-candidate words following the tag, NOT the block's size" and that `gc_sweep` reads `Block::meta`, never the descriptor.
+- [x] **Step 5: The arity contract comment.** In `runtime.c`, the comment block above `gc_descriptors` (near `runtime.c:19-25`) gains one sentence stating that `arity` is "the count of traced-candidate words following the tag, NOT the block's size" and that `gc_sweep` reads `Block::meta`, never the descriptor.
 
-- [ ] **Step 6: Extend `mask_and_repr_agree_on_pointers`** (`lib.rs:1952-1972`) — add `Ty::Base(TyCon::Str)` (pointer, heap) and `Ty::Base(TyCon::Unit)` (i64, not heap) to the `cases` array. This is the one test that would otherwise let a future `repr_ty` widening drift from the mask.
+- [x] **Step 6: Extend `mask_and_repr_agree_on_pointers`** (`lib.rs:1952-1972`) — add `Ty::Base(TyCon::Str)` (pointer, heap) and `Ty::Base(TyCon::Unit)` (i64, not heap) to the `cases` array. This is the one test that would otherwise let a future `repr_ty` widening drift from the mask.
 
-- [ ] **Step 7: Re-point `rejects_a_string_typed_node_by_name`** (`lib.rs:1690-1712`). Step 1 moves
+- [x] **Step 7: Re-point `rejects_a_string_typed_node_by_name`** (`lib.rs:1690-1712`). Step 1 moves
   this test's refusal, so the test moves with it. This is **not** an edit-to-make-something-pass
   (Global Constraints): the widening relocating this boundary is the specified behaviour, and the
   test's job is to keep pinning whatever the current boundary is, by name.
@@ -140,7 +140,7 @@
   test named "until the allocator lands" that outlives the allocator is a lie. Add that deletion
   to Task 3's Step 1 checklist when you get there.
 
-- [ ] **Step 8: Refusal tests** (in `lib.rs` `mod tests`, beside `rejects_a_function_name_in_value_position`):
+- [x] **Step 8: Refusal tests** (in `lib.rs` `mod tests`, beside `rejects_a_function_name_in_value_position`):
   - `rejects_concat_by_name` — `emit_ir(&core_of("pub fn main() {\n  let s = \"a\" <> \"b\"\n  1\n}\n"))`
     errors with `Unsupported("Concat")`. **`main` must return Int.** With the concatenation as
     `main`'s own body, `main` types as `String` and `require_int` (`lib.rs:227`) refuses with
@@ -155,7 +155,7 @@
 
   These three fire at `emit_ir`/compile time, so the whole gate (including `cargo test`) is their proof — no execution corpus entry is involved.
 
-- [ ] **Step 9: Gate, then commit.** `cargo fmt --all`, then the full gate. Commit with `git add crates/codegen/src/lib.rs crates/codegen/src/runtime.c`, message `feat(codegen): represent Str as a heap pointer and Unit as i64`, trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Push. Pause.
+- [x] **Step 9: Gate, then commit.** `cargo fmt --all`, then the full gate. Commit with `git add crates/codegen/src/lib.rs crates/codegen/src/runtime.c`, message `feat(codegen): represent Str as a heap pointer and Unit as i64`, trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Push. Pause.
 
 ## Task 2 — One word-conversion helper pair, with the `Unit` arm
 
@@ -176,9 +176,9 @@ The four sites are exercised today by the ADT and closure corpora with `Int`, `B
 
 ### Steps
 
-- [ ] **Step 1: Write the helpers** (place near `gc_root`, `lib.rs:395-438`, which already owns `i64t`/`ptrt`/`ctx`-style plumbing). The `Bool` branch needs the bool type — pass `ctx` or a `bool_type` parameter rather than reconstructing it.
-- [ ] **Step 2: Splice the four sites** — replace each inline `match` with the matching helper call.
-- [ ] **Step 3: Gate, then commit.** `git add crates/codegen/src/lib.rs`, message `refactor(codegen): one word<->value helper pair for the four conversion sites`, trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Push. Pause.
+- [x] **Step 1: Write the helpers** (place near `gc_root`, `lib.rs:395-438`, which already owns `i64t`/`ptrt`/`ctx`-style plumbing). The `Bool` branch needs the bool type — pass `ctx` or a `bool_type` parameter rather than reconstructing it.
+- [x] **Step 2: Splice the four sites** — replace each inline `match` with the matching helper call.
+- [x] **Step 3: Gate, then commit.** `git add crates/codegen/src/lib.rs`, message `refactor(codegen): one word<->value helper pair for the four conversion sites`, trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Push. Pause.
 
 ## Task 3 — The string-literal arm and `elya_str_lit`
 
@@ -196,7 +196,7 @@ A `CoreKind::Lit(CoreLit::Str(v))` node must become an allocation site: `elya_al
 
 ### Step
 
-- [ ] **Step 1: Write the literal arm, declare the symbol, wire the context.** The `CoreKind::Lit(CoreLit::Str(v))` arm:
+- [x] **Step 1: Write the literal arm, declare the symbol, wire the context.** The `CoreKind::Lit(CoreLit::Str(v))` arm:
 
   ```rust
   // N6 §1.5/§6.4: a string literal allocates a heap block. The bytes are a
@@ -229,12 +229,12 @@ A `CoreKind::Lit(CoreLit::Str(v))` node must become an allocation site: `elya_al
   }
   ```
 
-- [ ] **Step 2: Write `elya_str_lit`** in `runtime.c` (after `elya_alloc`, before `elya_match_fail`). Add `#include <string.h>` at the top.
+- [x] **Step 2: Write `elya_str_lit`** in `runtime.c` (after `elya_alloc`, before `elya_match_fail`). Add `#include <string.h>` at the top.
 
-- [ ] **Step 3: Test.** Add a corpus entry to `native_codegen.rs` (a new `PRINTING_CORPUS`, or extend one):
+- [x] **Step 3: Test.** Add a corpus entry to `native_codegen.rs` (a new `PRINTING_CORPUS`, or extend one):
   - `let s = "hi"` → `pub fn main() { let s = "hi" in 42 }` expected stdout `"42"`. This proves the literal arm allocates, roots, and runs without crashing (content is not yet observable without `println`).
 
-- [ ] **Step 4: Gate, then commit.** `git add crates/codegen/src/lib.rs crates/codegen/src/runtime.c crates/codegen/tests/native_codegen.rs`, message `feat(codegen): string literals are heap blocks via elya_str_lit`, trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Push. Pause.
+- [x] **Step 4: Gate, then commit.** `git add crates/codegen/src/lib.rs crates/codegen/src/runtime.c crates/codegen/tests/native_codegen.rs`, message `feat(codegen): string literals are heap blocks via elya_str_lit`, trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Push. Pause.
 
 ## Task 4 — `io.println` reaches the back end and prints
 
@@ -287,13 +287,13 @@ The builtin branch of `infer_call` (`types.rs:1094-1103`) currently returns `Ty:
 
 ### Steps
 
-- [ ] **Step 1: The recorder fix.** In `types.rs`, inside the `io.println` branch of `infer_call` (`:1094-1102`), after `add_effect` and before `return Ty::unit()`, insert the callee-type recording exactly as shown above.
-- [ ] **Step 2: The `Builtin` Core node.** In `src/core.rs`:
+- [x] **Step 1: The recorder fix.** In `types.rs`, inside the `io.println` branch of `infer_call` (`:1094-1102`), after `add_effect` and before `return Ty::unit()`, insert the callee-type recording exactly as shown above.
+- [x] **Step 2: The `Builtin` Core node.** In `src/core.rs`:
   - Add `Builtin(String, Rc<[CoreExpr]>)` to the `CoreKind` enum (`:27-50`), with a doc comment noting it is syntactically distinct from `App` the way `Ctor` is.
   - In `lower_expr`'s `Expr::Call` arm (`:259`), insert the `Expr::Qualified { module, name }` check **before** the `Expr::Var` ctor check, lowering to `CoreKind::Builtin(format!("{module}.{name}"), args)`.
   - Add a `CoreKind::Builtin` arm to `pretty_expr` (`:406`) mirroring `Ctor`.
-- [ ] **Step 3: The analysis arms.** In `closure.rs`, add `CoreKind::Builtin(_, args)` arms to `fv_walk` (`:71`) and `collect_in` (`:167`) that recurse into `args`. Add the arm to `tests/core_lowering.rs` `walk` (`:35`). The compiler's exhaustiveness errors on each are the anchor.
-- [ ] **Step 4: The codegen arm.** In `lib.rs`, declare `elya_println` as `ccc` in `build_module` and store it in `LowerCtx.println`. Add a `CoreKind::Builtin(builtin, args)` arm to `lower_expr` (after the `Str` literal arm from Task 3):
+- [x] **Step 3: The analysis arms.** In `closure.rs`, add `CoreKind::Builtin(_, args)` arms to `fv_walk` (`:71`) and `collect_in` (`:167`) that recurse into `args`. Add the arm to `tests/core_lowering.rs` `walk` (`:35`). The compiler's exhaustiveness errors on each are the anchor.
+- [x] **Step 4: The codegen arm.** In `lib.rs`, declare `elya_println` as `ccc` in `build_module` and store it in `LowerCtx.println`. Add a `CoreKind::Builtin(builtin, args)` arm to `lower_expr` (after the `Str` literal arm from Task 3):
 
   ```rust
   CoreKind::Builtin(builtin, args) => {
@@ -314,7 +314,7 @@ The builtin branch of `infer_call` (`types.rs:1094-1103`) currently returns `Ty:
   }
   ```
 
-- [ ] **Step 5: `elya_println` in `runtime.c`.** After `elya_gc_report` (end of file), write it reading the length from the block and writing to **stdout** only:
+- [x] **Step 5: `elya_println` in `runtime.c`.** After `elya_gc_report` (end of file), write it reading the length from the block and writing to **stdout** only:
 
   ```c
   /* N6 §6.2: stdout, never stderr. stderr is the collector's diagnostic
@@ -329,14 +329,14 @@ The builtin branch of `infer_call` (`types.rs:1094-1103`) currently returns `Ty:
   }
   ```
 
-- [ ] **Step 6: Tests (prove the end-to-end path).** Add a `PRINTING_CORPUS` and the `native_text_value` sibling helper (§7.1 split) to `native_codegen.rs`:
+- [x] **Step 6: Tests (prove the end-to-end path).** Add a `PRINTING_CORPUS` and the `native_text_value` sibling helper (§7.1 split) to `native_codegen.rs`:
   - `io.println("hello") 42` → text `"hello\n"`, value `"42"`.
   - `io.println("hello") io.println("world") 7` → text `"hello\nworld\n"`, value `"7"` (§7.3: more than one line).
   - `io.println("") 9` → text `"\n"` (the empty-string case §7.1's `strip_suffix` exists for), value `"9"`.
 
   Each asserts `(text, value) == expected` and that stderr is empty.
 
-- [ ] **Step 7: Gate, then commit.** `git add src/types.rs src/core.rs crates/codegen/src/lib.rs crates/codegen/src/runtime.c crates/codegen/src/closure.rs tests/core_lowering.rs crates/codegen/tests/native_codegen.rs`, message `feat(codegen): io.println reaches the back end and writes stdout`, trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Push. Pause.
+- [x] **Step 7: Gate, then commit.** `git add src/types.rs src/core.rs crates/codegen/src/lib.rs crates/codegen/src/runtime.c crates/codegen/src/closure.rs tests/core_lowering.rs crates/codegen/tests/native_codegen.rs`, message `feat(codegen): io.println reaches the back end and writes stdout`, trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Push. Pause.
 
 ## Task 5 — The text-comparing differential and the direction-(b) control
 
@@ -371,10 +371,10 @@ The program: declare `type Box { Mk(String) }`, build `Mk("hello")`, force a col
 
 ### Steps
 
-- [ ] **Step 1: `eval_main_text`.** Mirror `eval_main_int`, but bind `let (interp, v) = elya::eval::run_module_value(&m)` and `return interp.output().to_string();` (still panic if `v` is not `Int`, to keep the value line guaranteed).
-- [ ] **Step 2: The differential loop.** `native_output_matches_the_evaluator_across_the_printing_corpus` over `PRINTING_CORPUS`.
-- [ ] **Step 3: The direction-(b) test (as above, three gates).**
-- [ ] **Step 4: Gate, then commit.** `git add crates/codegen/tests/native_codegen.rs`, message `test(codegen): differential text check vs the evaluator + direction-(b) control`, trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Push. Pause.
+- [x] **Step 1: `eval_main_text`.** Mirror `eval_main_int`, but bind `let (interp, v) = elya::eval::run_module_value(&m)` and `return interp.output().to_string();` (still panic if `v` is not `Int`, to keep the value line guaranteed).
+- [x] **Step 2: The differential loop.** `native_output_matches_the_evaluator_across_the_printing_corpus` over `PRINTING_CORPUS`.
+- [x] **Step 3: The direction-(b) test (as above, three gates).**
+- [x] **Step 4: Gate, then commit.** `git add crates/codegen/tests/native_codegen.rs`, message `test(codegen): differential text check vs the evaluator + direction-(b) control`, trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Push. Pause.
 
 ## Task 6 — Negative controls, the `Unit` word-conversion proofs, and review checks
 
@@ -386,24 +386,47 @@ This task does not add feature code. It proves the slice's guarantees have teeth
 
 Both are demonstrated by a one-line sabotage of `elya_println` in `runtime.c`, run, observed, then restored — the differential's green only counts *after* both are shown to fail distinctly.
 
-- [ ] **C5-a — `elya_println` writes nothing.** Sabotage: make `elya_println` a no-op (`(void)s;`). Run the differential. **Expected failure signature:** a **text mismatch** (`"hello\n"` ≠ `""` on the `text` arm) — specifically *not* exit status, specifically *not* the value line. (If it failed on the value line, the §7.1 split is wrong; if on exit status, the test measures the wrong thing.)
-- [ ] **C5-b — `elya_println` writes to stderr instead of stdout.** Sabotage: swap `stdout` → `stderr` for the `fwrite`/`fputc`. Run the differential. **Expected failure signature:** `assert_runs`/`native_text_value`'s empty-stderr assertion fires (stdout is empty so the text is `""` *and* stderr is non-empty) — a **distinct** failure from C5-a.
-- [ ] **Distinctness check.** C5-a fails on the `text` comparison; C5-b fails on the stderr-is-empty assertion. If both fail the same way, neither is discriminating — do not count green. Restore `elya_println`, run the differential green. No commit of the sabotage (it is demonstrated, never committed).
+- [x] **C5-a — `elya_println` writes nothing.** Sabotage: make `elya_println` a no-op (`(void)s;`). Run the differential. **Expected failure signature:** a **text mismatch** (`"hello\n"` ≠ `""` on the `text` arm) — specifically *not* exit status, specifically *not* the value line. (If it failed on the value line, the §7.1 split is wrong; if on exit status, the test measures the wrong thing.)
+- [x] **C5-b — `elya_println` writes to stderr instead of stdout.** Sabotage: swap `stdout` → `stderr` for the `fwrite`/`fputc`. Run the differential. **Expected failure signature:** `assert_runs`/`native_text_value`'s empty-stderr assertion fires (stdout is empty so the text is `""` *and* stderr is non-empty) — a **distinct** failure from C5-a.
+- [x] **Distinctness check.** C5-a fails on the `text` comparison; C5-b fails on the stderr-is-empty assertion. If both fail the same way, neither is discriminating — do not count green. Restore `elya_println`, run the differential green. No commit of the sabotage (it is demonstrated, never committed).
+
+  **As built:** C5-a needed one helper correction first, reported and approved
+  before it was made. `split_text_and_value` panicked when no boundary was
+  found; a silenced `elya_println` leaves `"42\n"`, so the helper would have
+  died before reaching the comparison the control exists to exercise — proving
+  nothing about that comparison. It now implements §7.1's `None` branch (no
+  boundary means empty text). No passing test depended on the panic; that was
+  confirmed before the change.
 
 ### The `Unit` word-conversion arm (§8.3, §10 item 8)
 
 The two `Unit` arms the Task 2 helpers gained are dead until a `Unit` value can be built. Now they are exercised, and *only* through the helpers (four inline arms would have left three unproven — spec §8.3):
 
-- [ ] **Unit-typed ADT field.** `type Box { Mk(Unit) }` is not constructible without a `Unit` value, so build it through `io.println`: `let u = io.println("x") in Mk(u)` (or `match` a field). Lowered and run, asserting the `Unit` word read back is `0` (e.g. a field typed `Unit` stored and re-read produces no crash and the surrounding Int result is intact).
-- [ ] **Unit-typed closure capture.** `let u = io.println("x") in let f = fn(_) { u } in f(1)` — `u` (Unit) is captured; the capture-store arm converts the i64 zero word without panicking, and the capture-read arm re-reads it without an `inttoptr`. Assert via the program compiling and running.
-- [ ] **Sabotage variant (optional, strongest).** Revert **only** the `Unit` arm from `word_to_value`/`value_to_word` (back to the `_ => inttoptr/ptrtoint` path) and show the Unit-field program panics the compiler (`into_pointer_value()` on an `IntValue`) — proving the arm is reached through the shared helpers and that the negative control covers all four sites.
+- [x] **Unit-typed ADT field.** `type Box { Mk(Unit) }` is not constructible without a `Unit` value, so build it through `io.println`: `let u = io.println("x") in Mk(u)` (or `match` a field). Lowered and run, asserting the `Unit` word read back is `0` (e.g. a field typed `Unit` stored and re-read produces no crash and the surrounding Int result is intact).
+- [x] **Unit-typed closure capture.** `let u = io.println("x") in let f = fn(_) { u } in f(1)` — `u` (Unit) is captured; the capture-store arm converts the i64 zero word without panicking, and the capture-read arm re-reads it without an `inttoptr`. Assert via the program compiling and running.
+
+  **As built:** the lambda is kept inline in `main` with its parameter pinned to
+  `Int`. The shape written here is polymorphic in that parameter, and `repr_ty`
+  refuses `Ty::Var(_)` for the whole module — so it dies before the `Unit` arm
+  is reached and would prove nothing about it (N7 knocking, not N6 failing).
+  The corpus was narrowed rather than `core.rs` widened, and the reason is
+  recorded in the test's doc comment so the shape is not reintroduced.
+- [x] **Sabotage variant (optional, strongest).** Revert **only** the `Unit` arm from `word_to_value`/`value_to_word` (back to the `_ => inttoptr/ptrtoint` path) and show the Unit-field program panics the compiler (`into_pointer_value()` on an `IntValue`) — proving the arm is reached through the shared helpers and that the negative control covers all four sites.
 
 ### Review-only checks
 
-- [ ] **§8.5 — `run_with_gc_stats` consistency.** `run_with_gc_stats` (`native_codegen.rs:733-765`) trims `.trim()`s stdout into one string. A printing program run under `ELY_GC_STATS=1` must still split correctly via the §7.1 rule. Add one printing corpus entry under `ELY_GC_STATS` and confirm the counters parse and the text/value split holds. (§7.3 says "do not lower `GC_THRESHOLD_WORDS`" — this gate must not trip the threshold, so keep allocations trivial.)
-- [ ] **§10 item 9 — `gc_mark` is byte-identical.** `git diff HEAD~1 -- crates/codegen/src/runtime.c` over the `gc_mark` region (`runtime.c:139-157`) must be empty — a string is a leaf with `arity = 0`, so the mark phase traces nothing for it and gains no second dispatch path. (This is a review check, as in 5b-6: a non-empty diff means the representation is wrong, not that `gc_mark` should be patched.)
+- [x] **§8.5 — `run_with_gc_stats` consistency.** `run_with_gc_stats` (`native_codegen.rs:733-765`) trims `.trim()`s stdout into one string. A printing program run under `ELY_GC_STATS=1` must still split correctly via the §7.1 rule. Add one printing corpus entry under `ELY_GC_STATS` and confirm the counters parse and the text/value split holds. (§7.3 says "do not lower `GC_THRESHOLD_WORDS`" — this gate must not trip the threshold, so keep allocations trivial.)
 
-- [ ] **Gate, then commit.** `git add crates/codegen/src/runtime.c crates/codegen/tests/native_codegen.rs`, message `test(codegen): negative controls for the string/io differential + Unit conversion proofs`, trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Push. Pause.
+  **As built:** `run_with_gc_stats` could not be used as-is. Its `.trim()`
+  destroys the trailing newline §7.1's split rule is defined on, so a test built
+  on it would assert its own reconstruction rather than byte preservation.
+  `run_with_gc_stats_raw` was added to expose stdout untrimmed, with
+  `run_with_gc_stats` preserved unchanged as a thin wrapper over it. The test
+  asserts `collections == 0` rather than assuming the run stays under
+  `GC_THRESHOLD_WORDS`.
+- [x] **§10 item 9 — `gc_mark` is byte-identical.** `git diff HEAD~1 -- crates/codegen/src/runtime.c` over the `gc_mark` region (`runtime.c:139-157`) must be empty — a string is a leaf with `arity = 0`, so the mark phase traces nothing for it and gains no second dispatch path. (This is a review check, as in 5b-6: a non-empty diff means the representation is wrong, not that `gc_mark` should be patched.)
+
+- [x] **Gate, then commit.** `git add crates/codegen/src/runtime.c crates/codegen/tests/native_codegen.rs`, message `test(codegen): negative controls for the string/io differential + Unit conversion proofs`, trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Push. Pause.
 
 ## Acceptance
 
