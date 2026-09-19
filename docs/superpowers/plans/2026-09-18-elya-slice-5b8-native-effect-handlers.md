@@ -2449,7 +2449,7 @@ fn a_tail_resuming_handler_settles_its_live_set() {
 }
 ```
 
-- [ ] **Step 2: Run it, and apply the one pre-authorized weakening if it fires**
+- [ ] **Step 2: Run it. Four equal levels, or stop.**
 
 ```
 $env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_tail_resuming_handler_settles -- --nocapture
@@ -2457,25 +2457,23 @@ $env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_tail_r
 
 Expected: PASS, four equal levels.
 
-**If the four levels are not equal, there is exactly one legal response, and it is
-bounded.** `live` is sampled at the *last* collection, and where that collection lands
-relative to the loop's iteration varies with N — so small, non-monotonic jitter between
-readings is a measurement artifact, not a leak. Replace the equality loop with:
+**If the four levels are not equal: stop and report. Do not weaken the assertion.** There
+is no pre-authorized fallback here, and that is deliberate. The strength of this
+instrument is that four equal readings pin no constant — there is nothing in it to nudge.
+A bound admitted in advance reintroduces exactly the slack the equality removed, and
+worse, it converts a signal into a pass.
 
-```rust
-    let (_, small) = levels[0];
-    let (_, large) = levels[3];
-    assert!(
-        large < 2 * small,
-        "live set must be sub-linear in N over an 8x spread (a linear leak would be ~8x): {levels:?}"
-    );
-```
+Unequal readings are **information**, and this plan does not know ahead of time which kind:
 
-This still fails loudly on a real leak — a linear leak over an 8× spread is ~8×, not
-<2× — and still pins no constant. **Take this branch only if Step 2 actually fails**, and
-**record it in the commit message as an observed deviation from A4's "settles"**, with the
-four measured numbers. Do not take it pre-emptively, and do not weaken it further; a
-bound that a linear leak could satisfy is not a bound.
+- a real frame leak — the thing Invariant N8-1 exists to catch;
+- a threshold interaction — `live` is sampled at the *last* collection, and where that
+  collection lands relative to the loop's iteration varies with N;
+- something about frame-list residency this slice has not yet understood.
+
+Report the four measured numbers, say which N diverged and by how much, and let the next
+decision be made **after** seeing why equality failed. A sub-linear bound may well turn
+out to be the right answer — as a conclusion drawn from the measurement, never as a branch
+authorized before it.
 
 - [ ] **Step 3: Write the A5 control — a growing control must move the instrument**
 
@@ -2906,16 +2904,20 @@ items are both settled in the Pre-Plan Decisions section and implemented in Task
 
 **2. Placeholder scan.** Searched for `TBD`, `TODO`, `implement later`, "appropriate error
 handling", "add validation", "handle edge cases", "similar to Task N", and steps that
-describe without showing. None remain. Three places look like escapes and are not — each
-is a *bounded, pre-authorized* branch with a stated trigger, a stated bound, and a
-reporting obligation:
+describe without showing. None remain. Two places look like escapes and are not — each
+is a *bounded* branch with a stated trigger, a stated bound, and a reporting obligation:
 
-- Task 10 Step 2's `live(8x) < 2 * live(1x)` fallback — taken only on an actual failure,
-  still fails on a linear leak, recorded as a deviation.
 - Task 10 Step 4's N halving on stack overflow — preserves the 8× ratio; A5 fixes a
   direction, not an N.
 - Task 9 Step 4's "if the prediction missed" branch — the evaluator is the arbiter, and
   the miss is recorded.
+
+**A4 has no fallback, by decision.** An earlier draft pre-authorized weakening Task 10
+Step 2's equality to `live(8x) < 2 * live(1x)` if the four readings disagreed. That was
+revoked: the instrument's force is that four equal readings pin no constant, and a bound
+admitted in advance reintroduces the slack the equality removed while converting a signal
+into a pass. Unequal readings stop the task and get reported. A sub-linear bound may still
+be the right answer — reached after seeing why equality failed, not before.
 
 Two known spec-vs-code deviations are carried as *reported findings* rather than patched:
 §6.3's frame mask (`0b11` in the spec, `0b10` against the measured descriptor convention,
