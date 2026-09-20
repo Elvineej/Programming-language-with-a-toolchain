@@ -97,3 +97,32 @@ fn nested_handlers_type_check() {
 //  effects now evaluate on the CEK machine, so its "not evaluated yet" premise
 //  is obsolete. Execution is verified by the output-checked golden corpus in
 //  tests/effects_run.rs — the deliberate replacement for the missing oracle.)
+
+#[test]
+fn multi_declared_ops_is_keyed_by_operation_name_not_effect_name() {
+    // Two `multi` effects (one single-op, one two-op) and one non-`multi`.
+    let src = "effect multi Flip { fn flip() -> Bool }\n\
+               effect multi Choice { fn pick() -> Int  fn stop() -> Unit }\n\
+               effect State { fn get() -> String  fn set(v: String) -> Unit }\n";
+    let (m, pd) = parse_module(&Session::new(), src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+
+    let ops = elya::ast::multi_declared_ops(&m);
+
+    // Keyed by OPERATION name, and every op of a multi effect is present —
+    // the two-op effect proves the per-effect loop, not just the outer one.
+    assert!(ops.contains("flip"), "{ops:?}");
+    assert!(ops.contains("pick"), "{ops:?}");
+    assert!(ops.contains("stop"), "{ops:?}");
+
+    // Effect names must never leak into the set (this is the D4 distinction:
+    // the set is op-keyed, unlike inference's effect-keyed `effect_multi`).
+    assert!(!ops.contains("Flip"), "effect name leaked: {ops:?}");
+    assert!(!ops.contains("Choice"), "effect name leaked: {ops:?}");
+
+    // Operations of a non-`multi` effect are absent — both of them.
+    assert!(!ops.contains("get"), "{ops:?}");
+    assert!(!ops.contains("set"), "{ops:?}");
+
+    assert_eq!(ops.len(), 3, "exactly the three multi ops: {ops:?}");
+}

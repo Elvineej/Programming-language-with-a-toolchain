@@ -472,6 +472,29 @@ fn unop_sym(op: UnOp) -> &'static str {
     }
 }
 
+/// Operation names belonging to a `multi`-declared effect, keyed by **operation**
+/// name. Op-keyed and not effect-keyed on purpose: `Handler` carries no
+/// effect-name field and `OpClause.effect` is `Option<String>`, so a consumer
+/// outside inference cannot always name a clause's effect — it can only ask
+/// "is this op from a multi effect?" (Slice 5b-8 D4).
+///
+/// Deliberately NOT unified with `Infer.effect_multi`, which is effect-keyed
+/// (`HashMap<String, bool>`) and serves the `with multi` conformance rule
+/// E0427. They are two different indexes, not two copies of one.
+pub fn multi_declared_ops(module: &Module) -> std::collections::HashSet<String> {
+    let mut ops: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for d in &module.decls {
+        if let Decl::Effect(e) = &d.node {
+            if e.is_multi {
+                for op in &e.ops {
+                    ops.insert(op.node.name.clone());
+                }
+            }
+        }
+    }
+    ops
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

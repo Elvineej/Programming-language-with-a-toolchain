@@ -21,19 +21,9 @@ struct Ctx<'a> {
 }
 
 pub fn check(module: &Module, affine_sites: &HashSet<Span>) -> Vec<Diagnostic> {
-    // Operation names belonging to a `multi`-declared effect (rebuilt locally,
-    // exactly as Slice 4d-1 built `Infer.effect_multi` — keeps the pass
-    // self-contained, no dependency on inference internals).
-    let mut multi_ops: HashSet<String> = HashSet::new();
-    for d in &module.decls {
-        if let Decl::Effect(e) = &d.node {
-            if e.is_multi {
-                for op in &e.ops {
-                    multi_ops.insert(op.node.name.clone());
-                }
-            }
-        }
-    }
+    // Operation names belonging to a `multi`-declared effect (Slice 5b-8 §9.4).
+    // This is the sole call site of `multi_declared_ops` in this slice.
+    let multi_ops: HashSet<String> = multi_declared_ops(module);
     let mut out = Vec::new();
     for d in &module.decls {
         if let Decl::Fn(f) = &d.node {
