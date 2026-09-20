@@ -3,9 +3,11 @@
 An effects-first, statically-typed, natively-compiled language (in progress).
 Elya is a **Hindley–Milner type-checked** language with **row-polymorphic
 algebraic effects**, running on a **CEK abstract machine**. Tail calls execute
-in **bounded continuation depth** (a measured guarantee). The current frontier
-is an **affine resource** discipline that turns "don't use this twice" from a
-best-effort lint into a type-checked guarantee.
+in **bounded continuation depth** (a measured guarantee). An **affine resource**
+discipline turns "don't use this twice" from a best-effort lint into a
+type-checked guarantee. The current frontier is the **native back end**, grown
+to meet the evaluator feature by feature under a differential test that runs
+every program both ways and compares them.
 
 The language is grown in reviewed vertical slices: brainstorm → spec → plan →
 implement. Design specs and implementation plans live under
@@ -100,11 +102,14 @@ Elya is a typed language on a CEK machine, built up through these slices:
 - **Effect resumption discipline** — an effect declared `multi` may resume its
   continuation more than once; a handler that resumes a one-shot effect
   multiply is rejected (`E0427`).
+- **Affine resources** — a type declared `linear` makes its values usable at
+  most once (`E0428`), and an affine value may not be captured into a
+  multiply-resuming continuation (`E0429`) — the double-free that a tracing
+  collector cannot catch.
 
-### Frontier: affine resources
+### Affine resources
 
-The signature in-progress feature. A type declared `linear` makes its values
-**affine** — usable at most once:
+A type declared `linear` makes its values **affine** — usable at most once:
 
 ```elya
 linear type File { File }
@@ -118,10 +123,11 @@ pub fn main() {
 }
 ```
 
-Use-at-most-once is enforced today (`E0428`, `tests/affine.rs`). The payoff —
-statically forbidding an affine value from being **captured into a
-multiply-resuming continuation** (the double-free that a tracing GC cannot
-catch) — is landing next as `E0429`.
+Use-at-most-once is enforced today (`E0428`, `tests/affine.rs`), and so is the
+payoff that motivated it: an affine value may not be **captured into a
+multiply-resuming continuation** (`E0429`) — the double-free that a tracing GC
+cannot catch. Each rule is checked both ways — the violation fires, and the
+legitimate neighbouring program still compiles.
 
 The guarantee is scoped honestly: it is **intra-function local** and models
 create-and-consume within a single function body. Two deliberate
