@@ -418,3 +418,34 @@ fn io_println_is_a_distinct_typed_builtin_with_an_io_callee() {
     let rendered = pretty_typed(&core, &mut TyPrinter::new());
     assert!(rendered.contains("(builtin io.println"), "{rendered}");
 }
+
+#[test]
+fn a_user_declared_io_effect_is_refused_at_lowering() {
+    // `IO` is the one effect label codegen treats as built in (Task 7a reads the
+    // partition off `label != "IO"`). A user-declared `IO` makes that read
+    // ambiguous, so lowering — the last pass that still sees `Decl::Effect` —
+    // refuses it by name.
+    let src = "effect IO { fn write(s: String) -> Unit }\n\
+               pub fn main() -> Int { 0 }\n";
+    let (m, _pd) = parse_module(&Session::new(), src);
+    let (_diags, table) = infer_typed_table(&Session::new(), &m);
+    // `CoreModule` does not derive `PartialEq` (only `LowerError` does), so
+    // `assert_eq!` on the bare `Result` does not typecheck; compare the
+    // unwrapped error instead — this still exercises `LowerError`'s derive.
+    assert_eq!(
+        lower_module(&m, &table).unwrap_err(),
+        elya::core::LowerError::Unsupported("effect IO"),
+    );
+}
+
+#[test]
+fn an_effect_not_named_io_still_lowers() {
+    // Negative control: the refusal is keyed on the NAME, not on effect
+    // declarations in general. Without this, an implementation that rejected
+    // every `Decl::Effect` would pass the test above.
+    let src = "effect State { fn get() -> Int  fn set(v: Int) -> Unit }\n\
+               pub fn main() -> Int { 0 }\n";
+    let (m, _pd) = parse_module(&Session::new(), src);
+    let (_diags, table) = infer_typed_table(&Session::new(), &m);
+    assert!(lower_module(&m, &table).is_ok());
+}
