@@ -126,3 +126,78 @@ fn multi_declared_ops_is_keyed_by_operation_name_not_effect_name() {
 
     assert_eq!(ops.len(), 3, "exactly the three multi ops: {ops:?}");
 }
+
+#[test]
+fn a3_polymorphic_effects_are_refused_nowhere_in_the_front_end() {
+    // Acceptance criterion A3, which the spec marked UNCERTAIN: where does a
+    // polymorphic effect get refused?
+    //
+    // Prediction, recorded before measuring: the front end rejects it somewhere
+    // upstream of codegen, with no confident claim about where; the stated
+    // fallback was that nothing may refuse it.
+    //
+    // Measured: the fallback. Nothing refuses it, at any stage. Both programs
+    // below are clean through parse, resolve and types, and `check_source`
+    // returns Ok. The declaration additionally lowers to Core successfully.
+    //
+    // That is a real gap, not a curiosity. The back end is monomorphic-only
+    // (5b-4 6), and parametric ADTs are at least silently skipped by the
+    // `t.params.is_empty()` guard at src/core.rs:143. Effects have no analogous
+    // guard: `lower_module`'s Decl::Effect arm refuses `effect IO` and nothing
+    // else. A polymorphic effect therefore reaches codegen unannounced.
+    //
+    // This test pins the measurement rather than the desired behaviour. If a
+    // refusal is added later it fails loudly, which is the point: the next
+    // person to touch this should see that A3's answer moved.
+
+    // (a) Declaration alone: clean front end, and Core lowering accepts it.
+    let decl = "effect State(s) { fn get() -> s  fn set(v: s) -> Unit }
+                pub fn main() -> Int { 0 }
+";
+    assert!(
+        elya::check_source("a3-decl.elya", decl).is_ok(),
+        "A3: a polymorphic effect declaration was refused by the front end"
+    );
+    let st = stages(decl);
+    assert!(
+        st.parse.is_empty() && st.resolve.is_empty() && st.types.is_empty(),
+        "A3 declaration: parse={:?} resolve={:?} types={:?}",
+        st.parse,
+        st.resolve,
+        st.types
+    );
+    let (m, _) = parse_module(&Session::new(), decl);
+    let (_, table) = types::infer_typed_table(&Session::new(), &m);
+    assert!(
+        elya::core::lower_module(&m, &table).is_ok(),
+        "A3: Core lowering refused a polymorphic effect declaration"
+    );
+
+    // (b) The load-bearing half: a declaration nothing uses proves little. This
+    // one invokes a polymorphic op and handles it. Core lowering refuses every
+    // handler until Task 5, so the question here is strictly the front end's --
+    // asserting on lowering would couple this test to that task.
+    let used = "effect State(s) {
+                  fn get() -> s
+                  fn set(v: s) -> Unit
+                }
+                fn prog() {
+                  handle get() with {
+                    State.get() -> resume(7)
+                    return(r) -> r
+                  }
+                }
+";
+    assert!(
+        elya::check_source("a3-use.elya", used).is_ok(),
+        "A3: using and handling a polymorphic op was refused by the front end"
+    );
+    let st = stages(used);
+    assert!(
+        st.parse.is_empty() && st.resolve.is_empty() && st.types.is_empty(),
+        "A3 use+handle: parse={:?} resolve={:?} types={:?}",
+        st.parse,
+        st.resolve,
+        st.types
+    );
+}
