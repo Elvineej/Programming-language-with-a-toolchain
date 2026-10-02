@@ -348,12 +348,23 @@ fn lower_expr(
             }
             CoreKind::Match(Rc::new(s), lowered.into())
         }
+        // §3.1(b): a block in expression position is exactly a function body in
+        // expression position — same statements, same tail. `lower_block` already
+        // builds the `Let` chain, and it emits no CoreKind that did not already
+        // exist, so nothing downstream of Core widens.
+        //
+        // This arm RETURNS rather than yielding a `CoreKind`: `lower_block` hands
+        // back a whole `CoreExpr` (the outermost `Let`, or the tail itself) that
+        // already carries its own span and type. Against spec §3.1, the brace span
+        // IS queried — by the `table.get(&span)` at the top of this function, before
+        // the match — so an untyped block is `Untyped` here, never lowered; the type
+        // that lookup returns is then unused.
+        Expr::Block(b) => return lower_block(b, table, ctors),
         // The deferred surface (spec §4, §11): a typed boundary, not a panic. None
         // of these occur in the 5a-2 corpus.
         Expr::Float(_) => return Err(LowerError::Unsupported("Float")),
         Expr::Qualified { .. } => return Err(LowerError::Unsupported("Qualified")),
         Expr::Unary { .. } => return Err(LowerError::Unsupported("Unary")),
-        Expr::Block(_) => return Err(LowerError::Unsupported("Block")),
         Expr::Handle { .. } => return Err(LowerError::Unsupported("Handle")),
         Expr::Resume { .. } => return Err(LowerError::Unsupported("Resume")),
     };
