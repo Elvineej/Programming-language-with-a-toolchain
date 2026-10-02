@@ -87,6 +87,14 @@ Bit `f` governs word `1 + f`. For `[tag][code_ptr][next]`: bit 0 is `code_ptr`, 
 
 With `0b11`, `gc_mark` pushes a **text-segment address** into the gray set, then reads the first eight bytes of machine code as `obj[0]` and traces onward if that garbage lands in `[0, gc_n_ctors)`. Correct value: **arity 2, mask `0b10`.** Per A7's standing rule, spec deviations are **reported, not patched** — Task 6 implements `0b10` and its commit message records the deviation.
 
+> *(2026-10-02.)* Spec §6.3 has since been corrected in place, by explicit decision, so
+> "§6.3 specifies" above records what it said. One refinement to the failure path, from
+> reading `runtime.c`: before anything reads machine code as `obj[0]`, `gc_gray_push`
+> **writes** the mark bit at `gc_block_of(p)` — 16 bytes before the code address, in the
+> read-only text segment. Measured with the lambda rows' bit 0 forced on:
+> `a_captured_closure_is_traced_mask_covers_ty_fn`'s binary died with signal 11. The
+> exact faulting instruction was not traced. The conclusion, `0b10`, is unchanged.
+
 ### D6 — Two refusal boundaries with two different test homes (easy to blur, structurally real)
 
 | Refusal | Error type | Lives in | Tested in |
@@ -1184,7 +1192,7 @@ against the code**, and the code is right. The descriptor convention is stated a
 A code pointer is deliberately **not traced**. So a frame `[tag][code_ptr][next]` is
 `arity = 1 + 1 = 2`, `mask = 1 << (0 + 1) = 0b10`. Use `0b10`. Do not "fix" the code to
 match the spec; record the spec deviation in the commit message and it will be carried to
-close-out.
+close-out. *(Done in b370191; spec §6.3 itself was corrected in place on 2026-10-02.)*
 
 **Why this is one row and not zero.** Two true statements that sound contradictory:
 
@@ -1550,6 +1558,9 @@ git commit -F /tmp/msg-t7a.txt
 **Interfaces:**
 - Consumes: `cps::needs_cps` (Task 7a); `frame_tag` (Task 6); `CoreKind::Handle` /
   `CoreKind::Resume` and the `CoreHandle`/`CoreClause`/`CoreReturn` structs (Task 5).
+- **`frame_tag` (added 2026-10-02):** frame_tag is computed inside descriptor_rows (Task 6
+  deviation 4). 7b must get it from there. Don't recompute it, and don't add a second
+  source of truth.
 - Produces: the frame-cell constructor and the effectful-call convention that Task 8's
   dispatch, splice and trampoline are written against. Its exact signatures are **fixed
   by Step 2's measurement** and must be written into the checkpoint report before any
@@ -2947,7 +2958,7 @@ be the right answer — reached after seeing why equality failed, not before.
 
 Two known spec-vs-code deviations are carried as *reported findings* rather than patched:
 §6.3's frame mask (`0b11` in the spec, `0b10` against the measured descriptor convention,
-recorded in Task 6) and A9's `assert_runs` prescription (impossible against `lib.rs:202`,
+recorded in Task 6 — and, since 2026-10-02, corrected in the spec itself) and A9's `assert_runs` prescription (impossible against `lib.rs:202`,
 `:1349`, `:1461`; recorded in Task 11).
 
 **3. Type and name consistency.** Checked across tasks:
