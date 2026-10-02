@@ -449,3 +449,83 @@ fn an_effect_not_named_io_still_lowers() {
     let (_diags, table) = infer_typed_table(&Session::new(), &m);
     assert!(lower_module(&m, &table).is_ok());
 }
+
+/// `Ty::Error` at any depth: a function's params, result, or effect-label
+/// arguments, a tuple's elements, or a constructor's arguments.
+fn has_error(t: &Ty) -> bool {
+    match t {
+        Ty::Error => true,
+        Ty::Var(_) | Ty::Base(_) => false,
+        Ty::Fn(ps, row, r) => {
+            ps.iter().any(has_error)
+                || row.labels.values().any(|l| l.args.iter().any(has_error))
+                || has_error(r)
+        }
+        Ty::Tuple(ts) | Ty::Con(_, ts) => ts.iter().any(has_error),
+    }
+}
+
+#[test]
+fn a_block_in_expression_position_lowers_to_nested_lets() {
+    // §3.1(b): `handle { ... }` parses its body through `block_expr()`, so Task 5
+    // needs blocks lowerable in expression position. A `let` initializer is the
+    // smallest program that reaches the same arm today.
+    //
+    // Two assertions deviate from the 5b-8 plan's text, on purpose: (a) is
+    // widened from literal nodes to every node, at any depth; (c) exempts the
+    // synthesized `Let` nodes from span membership (they carry their
+    // statement's span, which the typed table need not hold — the same
+    // exemption `both_origin_checks` makes) and verifies each by derivation
+    // instead.
+    let src = "pub fn main() -> Int {\n\
+               \x20 let x = { let a = 1  a + 2 }\n\
+               \x20 x\n\
+               }\n";
+    let (core, table) = lower_src(src);
+
+    // (a) No node carries `Ty::Error`, anywhere in its type.
+    for n in nodes(&core) {
+        assert!(
+            !has_error(&n.ty),
+            "node at {:?} carries Ty::Error: {:?}",
+            n.span,
+            n.ty
+        );
+    }
+
+    // (b) The inner block became a `Let` — not a new node kind.
+    let lets = nodes(&core)
+        .iter()
+        .filter(|n| matches!(n.kind, CoreKind::Let(ref name, _, _) if name == "a"))
+        .count();
+    assert_eq!(
+        lets, 1,
+        "the block's `let a` should survive as a CoreKind::Let"
+    );
+
+    // (c) The frozen table gained nothing. Every direct node's span is a span
+    //     the inference table already knows; every synthesized `Let` is
+    //     exempt from that and is checked by derivation (its type is its
+    //     body's) instead — so the exemption is verified, not a free pass.
+    let mut derived = 0;
+    for n in nodes(&core) {
+        match &n.kind {
+            CoreKind::Let(_, _, body) => {
+                assert_eq!(
+                    n.ty, body.ty,
+                    "synthesized Let at {:?}: its type must be its body's (derivation check)",
+                    n.span
+                );
+                derived += 1;
+            }
+            _ => assert!(
+                table.contains_key(&n.span),
+                "node at {:?} has a span absent from the typed table",
+                n.span
+            ),
+        }
+    }
+    // `let x` (main's body) and `let a` (the block): the derivation check must
+    // have seen both, or the exemption covered nothing and proved nothing.
+    assert_eq!(derived, 2, "expected exactly two synthesized Lets");
+}
