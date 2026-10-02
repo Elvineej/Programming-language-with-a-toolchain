@@ -1513,13 +1513,17 @@ pub fn link(obj: &Path, exe: &Path) -> Result<(), CodegenError> {
     // N4 (spec §2.1): the runtime is a C file clang compiles and links alongside
     // the object, so the two `ccc` externals resolve.
     let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime.c");
-    let out = std::process::Command::new("clang")
-        .arg(obj)
-        .arg(&runtime)
-        .arg("-o")
-        .arg(exe)
-        .output()
-        .map_err(CodegenError::Io)?;
+    let mut cmd = std::process::Command::new("clang");
+    cmd.arg(obj).arg(&runtime).arg("-o").arg(exe);
+    // `compile_module` emits with `RelocMode::Default`, which on Linux is
+    // non-PIC: a string literal is addressed by an absolute `R_X86_64_32`
+    // relocation. Distribution clangs (Ubuntu's among them) link PIE by default
+    // and reject that relocation, so link non-PIE here. Linux only, and the
+    // emitted code is unchanged: making the object PIC instead would change
+    // codegen on every platform (PARKED.md).
+    #[cfg(target_os = "linux")]
+    cmd.arg("-no-pie");
+    let out = cmd.output().map_err(CodegenError::Io)?;
     if !out.status.success() {
         return Err(CodegenError::Link {
             code: out.status.code(),
