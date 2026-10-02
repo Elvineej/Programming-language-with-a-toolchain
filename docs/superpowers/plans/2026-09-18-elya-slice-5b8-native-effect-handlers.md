@@ -2057,6 +2057,20 @@ the `multi` branch above it. If `the_multi_refusal_fires_before_any_clause_body_
 now reports `unbound`, the refusal has drifted below the clause lowering — fix the order,
 do not relax the assertion.
 
+- [ ] **Step 11a: Re-run the A3 handled-perform probe** *(added 2026-10-02; numbered 11a so
+  no later step, and none of Task 12's or the Self-Review's references to Task 8's steps,
+  is renumbered)*
+
+Re-run the A3 handled-perform probe (polymorphic effect, op performed at a concrete type
+inside a handler). Prediction: compiles and runs, matching the evaluator. Record the measured
+result in spec §11 A3.
+
+Why it is here: d50f3b1 measured A3 through codegen for everything that could reach it before
+dispatch existed, and left exactly this half open — Core refused `Handle` until Task 5, and
+codegen has no handler until this task's Step 9. Write the probe program and the prediction
+down before running it; if the program does not type-check, fix the program, never the
+prediction.
+
 - [ ] **Step 12: Re-measure A7**
 
 ```
