@@ -18,6 +18,7 @@
 //! is a front-end question, not a back-end one.
 
 mod closure;
+mod cps;
 
 use std::collections::HashMap;
 use std::path::Path;
