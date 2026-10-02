@@ -1330,3 +1330,24 @@ fn a_printing_program_under_gc_stats_splits_by_the_same_rule() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A3 (spec §11), through codegen as the plan's `Ok` branch requires. Task 3
+/// measured that nothing in the front end refuses a polymorphic effect; this is
+/// the same declaration carried the rest of the way. Prediction, written before
+/// the run: Core carries no effect declarations, so codegen never sees one, and
+/// the program compiles, links, runs and prints main's `0`. Measured: exactly
+/// that. Not a miscompile and not a refusal — the effect is invisible here.
+///
+/// The `Ty::Var` half of the answer (an unconstrained type parameter) is a
+/// refusal and produces no binary, so it lives beside its sibling in `lib.rs`'s
+/// `mod tests`: `a3_an_unconstrained_polymorphic_effect_meets_the_ty_var_refusal`.
+#[test]
+fn a3_a_polymorphic_effect_declaration_compiles_and_runs_natively() {
+    let src = "effect State(s) { fn get() -> s  fn set(v: s) -> Unit }\n\
+               pub fn main() -> Int { 0 }\n";
+    let dir = temp_dir("a3-poly-decl");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "a3-poly-decl");
+    assert_runs(&exe, "0");
+    std::fs::remove_dir_all(&dir).ok();
+}
