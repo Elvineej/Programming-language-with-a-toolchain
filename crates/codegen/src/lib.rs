@@ -1951,6 +1951,36 @@ mod tests {
     }
 
     #[test]
+    fn a3_an_unconstrained_polymorphic_effect_meets_the_ty_var_refusal() {
+        // A3 (spec §11), measured. A polymorphic effect has no refusal of its
+        // own: when `reader` leaves the effect's parameter unconstrained, the
+        // parameter survives into `reader`'s type as a `Ty::Var`, and that is
+        // refused by the SAME `repr_ty` rule as `id` above (5b-8 plan D2).
+        // Constrain it (`get() + 1`) and the measured refusal moves to the
+        // monomorphic program's, so the `Ty::Var` is the cause, not the effect.
+        let core = core_of(
+            "effect State(s) { fn get() -> s  fn set(v: s) -> Unit }\n\
+             fn reader() { get() }\n\
+             pub fn main() -> Int { 0 }\n",
+        );
+        let reader = core
+            .fns
+            .iter()
+            .find(|f| f.name == "reader")
+            .expect("reader");
+        assert!(
+            matches!(reader.body.ty, Ty::Var(_)),
+            "the unconstrained parameter should reach Core as a Ty::Var: {:?}",
+            reader.body.ty
+        );
+        let err = emit_ir(&core).unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported("unrepresentable type")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn rejects_a_computed_callee_specifically() {
         // §5.3, witnessed by a program a user could actually write. The Pratt
         // parser applies the postfix call loop to ANY atom and `(expr)` unwraps

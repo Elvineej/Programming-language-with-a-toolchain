@@ -793,7 +793,7 @@ checks that enforce them.
 |---|---|---|
 | A1 | A `State`-effect program with a **non-tail** `resume` compiles natively, and its output equals the evaluator's — both the value and the exact bytes written. | differential execution |
 | A2 | `with multi` is refused at codegen by a message naming `multi`, before any clause body is lowered. | execution (reachable refusal) |
-| A3 | A polymorphic effect is refused. **✗ UNCERTAIN** whether this reaches a distinct refusal or falls into the existing `Ty::Var` refusal; must be determined in planning. If reachable, it owes its own execution test. | execution (pending) |
+| A3 | ~~A polymorphic effect is refused.~~ **✓ VERIFIED by execution (2026-10-02): a polymorphic effect has no refusal of its own, at any stage.** Its declaration passes the front end, lowers, and compiles and runs natively (`a3_a_polymorphic_effect_declaration_compiles_and_runs_natively`). An op performed at one concrete type reaches codegen as a monomorphic op does — the identical refusal, until this slice's handlers land. Only a type parameter left unconstrained survives, as `Ty::Var`, and it falls into the existing `Ty::Var` refusal, `unrepresentable type` (`a3_an_unconstrained_polymorphic_effect_meets_the_ty_var_refusal`). So it is the existing refusal, not a distinct one. Plan D2 stands; Task 3's prediction of a refusal was wrong. | execution (measured) |
 | A4 | On a **handler** program, the live set settles across four N over an 8× spread, **no constant pinned**. `collections > 0` and `live > 0` are retained as guards that `live` was computed at all — **not** as Invariant N8-1 guards, which they cannot be (§7.3, ground 2). | execution |
 | A5 | A growing control moves the heap instrument (strict inequality), written without `<>` (§9.1). | execution |
 | A6 | A deep handler resumed inside a loop performs more than once and finds the same handler each time (§4 point 4). | differential execution |
@@ -806,7 +806,8 @@ the heap frame list, A9 watches the machine stack, and §7.1's coupling hazard i
 precisely that each is blind where the other sees (§7.2).
 
 **A3 is the one criterion this spec cannot fully specify**, and it is marked rather
-than guessed.
+than guessed. *(2026-10-02: no longer — A3 was measured and its row above now states
+the result.)*
 
 ---
 
