@@ -418,8 +418,17 @@ byte-identical for a **third** consecutive slice.
 
 ### 6.3 What this costs
 
-**Exactly one new descriptor row:** arity 2, mask `0b11` (both `code_ptr` and
-`next` are pointers). ✓ VERIFIED that tag allocation is linear and computed
+**Exactly one new descriptor row:** arity 2, mask `0b10`. Bit `f` of a row's mask
+governs word `1 + f` (`gc_mark`), so for `[tag][code_ptr][next]` bit 0 is `code_ptr`
+and bit 1 is `next`. Only `next` is a heap pointer, so only bit 1 is set: `code_ptr`
+is a text-segment address stored as an integer word — exactly as a closure's word 1
+is — and is never traced. *(Corrected in place 2026-10-02. This sentence first read
+"mask `0b11` (both `code_ptr` and `next` are pointers)": true of the machine words,
+wrong for the mask, which marks HEAP pointers. Tracing the code pointer makes
+`gc_gray_push` write a mark bit 16 bytes before a text-segment address; measured with
+the lambda rows' bit 0 forced on, a closure program that collects dies with signal
+11. See plan D5; implemented in b370191 and pinned by
+`the_frame_row_follows_the_string_row_with_mask_0b10`.)* ✓ VERIFIED that tag allocation is linear and computed
 (`crates/codegen/src/lib.rs:1253-1255`):
 
 ```rust
