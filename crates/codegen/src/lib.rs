@@ -1190,6 +1190,91 @@ fn lower_expr<'ctx>(
     }
 }
 
+/// The collector's descriptor table: one `[arity, ptr_mask]` row per tag, in tag
+/// order -- the real constructors, then one synthetic row per lambda site, then
+/// the string row. Pure: it reads Core and the lambda table and emits nothing,
+/// so a unit test can read the very rows `build_module` hands the runtime.
+fn descriptor_rows(
+    core: &CoreModule,
+    lambdas: &[closure::LambdaSite],
+    n_real_ctors: usize,
+    string_tag: usize,
+) -> Result<Vec<u64>, CodegenError> {
+    // 5b-5 §4: one `[arity, ptr_mask]` pair per constructor, in the SAME global
+    // tag order `build_ctor_table` assigns — the tag stored in an object's word
+    // 0 indexes straight into this table. Bit `i` of the mask is set iff field
+    // `i` is a heap pointer, which is what lets the mark phase trace precisely
+    // instead of guessing: an `Int` field is never mistaken for a pointer.
+    let mut desc: Vec<u64> = core
+        .types
+        .iter()
+        .flat_map(|t| t.ctors.iter())
+        .flat_map(|c| {
+            let arity = c.fields.len() as u64;
+            let mut mask = 0u64;
+            for (i, f) in c.fields.iter().enumerate() {
+                if is_heap_ty(f) {
+                    mask |= 1 << i;
+                }
+            }
+            [arity, mask].into_iter()
+        })
+        .collect();
+    // One SYNTHETIC constructor row per lambda site, continuing the tag
+    // numbering. This is what keeps `gc_mark` byte-identical: a closure is just
+    // an object whose descriptor happens to have been synthesized rather than
+    // declared, so the one function whose failure mode is silent gains no second
+    // dispatch path.
+    for (i, site) in lambdas.iter().enumerate() {
+        // Assigned in `collect_lambdas`'s pre-order; checked here rather than
+        // assumed, because a drift between the tag stored in word 0 and the row
+        // index would mis-trace silently. A hard error, not a `debug_assert` —
+        // release builds must not skip it.
+        if site.tag != n_real_ctors + i {
+            return Err(CodegenError::Unsupported(
+                "lambda tag disagrees with its descriptor row index",
+            ));
+        }
+        // arity = 1 (the code pointer) + the captures.
+        desc.push(1 + site.captures.len() as u64);
+        // Bit 0 is CLEAR: word 1 is a code pointer into the text segment, not a
+        // heap object. Bit j+1 is set iff capture j is a heap value.
+        let mut mask: u64 = 0;
+        for (j, (_, ty)) in site.captures.iter().enumerate() {
+            if is_heap_ty(ty) {
+                mask |= 1 << (j + 1);
+            }
+        }
+        desc.push(mask);
+    }
+    // N6 (§1.2): ONE string row — arity 0, mask 0. Nothing after the tag is a
+    // heap reference, so the mark phase traces nothing for a string. The tag is
+    // this row's index; the guard below makes "tag agrees with its row index" a
+    // compile-time property, exactly as the lambda guard above does.
+    if string_tag != desc.len() / 2 {
+        return Err(CodegenError::Unsupported(
+            "string tag disagrees with its descriptor row index",
+        ));
+    }
+    desc.push(0); // arity = 0: no traced-candidate words follow the tag
+    desc.push(0); // mask = 0
+                  // N8 §6.1 / §6.3 / A8: ONE row for a captured-continuation frame cell,
+                  // `[tag][code_ptr][next]`. Its tag continues the same linear numbering as the
+                  // lambda tags and the string tag, and the row is appended AFTER the string
+                  // row, so the string guard above still sees the table length it expects. Same
+                  // guard shape as the string tag's: "the tag agrees with its row index" is a
+                  // compile-time property rather than a comment.
+    let frame_tag = string_tag + 1;
+    if frame_tag != desc.len() / 2 {
+        return Err(CodegenError::Unsupported(
+            "frame tag disagrees with its descriptor row index",
+        ));
+    }
+    desc.push(2); // arity = 2: the code pointer and `next` follow the tag
+    desc.push(0b10); // bit 0 clear (code pointer, not traced); bit 1 set (`next` is heap)
+    Ok(desc)
+}
+
 /// The shared lowering context: declarations, constructor and string tags, and
 /// runtime externals. Bundled so the lowering fold threads one reference.
 struct LowerCtx<'a, 'ctx> {
@@ -1363,64 +1448,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     fmt.set_constant(true);
     fmt.set_unnamed_addr(true);
 
-    // 5b-5 §4: one `[arity, ptr_mask]` pair per constructor, in the SAME global
-    // tag order `build_ctor_table` assigns — the tag stored in an object's word
-    // 0 indexes straight into this table. Bit `i` of the mask is set iff field
-    // `i` is a heap pointer, which is what lets the mark phase trace precisely
-    // instead of guessing: an `Int` field is never mistaken for a pointer.
-    let mut desc: Vec<u64> = core
-        .types
-        .iter()
-        .flat_map(|t| t.ctors.iter())
-        .flat_map(|c| {
-            let arity = c.fields.len() as u64;
-            let mut mask = 0u64;
-            for (i, f) in c.fields.iter().enumerate() {
-                if is_heap_ty(f) {
-                    mask |= 1 << i;
-                }
-            }
-            [arity, mask].into_iter()
-        })
-        .collect();
-    // One SYNTHETIC constructor row per lambda site, continuing the tag
-    // numbering. This is what keeps `gc_mark` byte-identical: a closure is just
-    // an object whose descriptor happens to have been synthesized rather than
-    // declared, so the one function whose failure mode is silent gains no second
-    // dispatch path.
-    for (i, site) in lambdas.iter().enumerate() {
-        // Assigned in `collect_lambdas`'s pre-order; checked here rather than
-        // assumed, because a drift between the tag stored in word 0 and the row
-        // index would mis-trace silently. A hard error, not a `debug_assert` —
-        // release builds must not skip it.
-        if site.tag != n_real_ctors + i {
-            return Err(CodegenError::Unsupported(
-                "lambda tag disagrees with its descriptor row index",
-            ));
-        }
-        // arity = 1 (the code pointer) + the captures.
-        desc.push(1 + site.captures.len() as u64);
-        // Bit 0 is CLEAR: word 1 is a code pointer into the text segment, not a
-        // heap object. Bit j+1 is set iff capture j is a heap value.
-        let mut mask: u64 = 0;
-        for (j, (_, ty)) in site.captures.iter().enumerate() {
-            if is_heap_ty(ty) {
-                mask |= 1 << (j + 1);
-            }
-        }
-        desc.push(mask);
-    }
-    // N6 (§1.2): ONE string row — arity 0, mask 0. Nothing after the tag is a
-    // heap reference, so the mark phase traces nothing for a string. The tag is
-    // this row's index; the guard below makes "tag agrees with its row index" a
-    // compile-time property, exactly as the lambda guard above does.
-    if string_tag != desc.len() / 2 {
-        return Err(CodegenError::Unsupported(
-            "string tag disagrees with its descriptor row index",
-        ));
-    }
-    desc.push(0); // arity = 0: no traced-candidate words follow the tag
-    desc.push(0); // mask = 0
+    let desc = descriptor_rows(core, &lambdas, n_real_ctors, string_tag)?;
     let n_ctors = (desc.len() / 2) as u64;
     let desc_const = i64t.const_array(
         &desc
@@ -2209,5 +2237,48 @@ mod tests {
                 "repr_ty and is_heap_ty disagree on {ty:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_frame_row_follows_the_string_row_with_mask_0b10() {
+        // N8 §6.1 / §6.3, A8, and plan D5. A captured-continuation frame cell is
+        // `[tag][code_ptr][next]`: arity 2, mask 0b10. Bit 0 is CLEAR because word
+        // 1 is a code pointer into the text segment (the lambda rows' own
+        // convention); bit 1 is SET because `next` is a heap frame. The spec's
+        // §6.3 says 0b11 -- the silent-corruption error D5 records -- and this
+        // pins the correction. The frame row is the table's last, right after the
+        // string row, so the frame tag is `string_tag + 1`.
+        //
+        // A real program carrying every earlier kind of row (a constructor with a
+        // heap field, and a lambda), so the frame row is placed after all of them.
+        let core = core_of(
+            "type L { Nil, Cons(Int, L) }\n\
+             fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }\n\
+             pub fn main() -> Int {\n\
+             \x20 let f = fn(x) { x + 1 }\n\
+             \x20 f(len(Cons(1, Nil)))\n\
+             }\n",
+        );
+        let n_real_ctors: usize = core.types.iter().map(|t| t.ctors.len()).sum();
+        let lambdas = closure::collect_lambdas(&core, n_real_ctors);
+        assert_eq!(lambdas.len(), 1, "the program must carry one lambda row");
+        let string_tag = n_real_ctors + lambdas.len();
+        let rows = descriptor_rows(&core, &lambdas, n_real_ctors, string_tag).expect("rows");
+        let frame_tag = string_tag + 1;
+        assert_eq!(
+            rows.len() / 2,
+            frame_tag + 1,
+            "the frame row must be the table's last row: {rows:?}"
+        );
+        assert_eq!(
+            &rows[2 * string_tag..2 * string_tag + 2],
+            &[0, 0],
+            "the string row is unchanged"
+        );
+        assert_eq!(
+            &rows[2 * frame_tag..],
+            &[2, 0b10],
+            "frame row: arity 2, mask 0b10 (D5) -- not the spec's 0b11"
+        );
     }
 }
