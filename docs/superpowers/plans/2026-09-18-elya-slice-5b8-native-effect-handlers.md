@@ -1250,7 +1250,7 @@ variant on `CodegenError` — the payload string is new but the variant is the e
 - [ ] **Step 3: Build and run the codegen suite**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen
 ```
 
 Expected: PASS, with the same test count as before this task. A `frame_tag` that is
@@ -1262,7 +1262,7 @@ continuing.
 - [ ] **Step 4: Prove the new guard is live, then revert**
 
 Temporarily change Step 1's line to `let frame_tag = string_tag + 2;` and re-run
-`cargo test -p codegen`. Expected: failures naming
+`cargo test -p elya-codegen`. Expected: failures naming
 `frame tag disagrees with its descriptor row index`.
 
 Then restore `string_tag + 1` and re-run to confirm green. **Do not commit the broken
@@ -1444,7 +1444,7 @@ mod cps;
 Run:
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --lib cps
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --lib cps
 ```
 
 Expected: **compile error**, `cannot find function 'needs_cps' in this scope`. The tests
@@ -1498,7 +1498,7 @@ fn row_needs_cps(row: &EffectRow) -> bool {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --lib cps
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --lib cps
 ```
 
 Expected: PASS, 6 tests (or 5 if you dropped the `Open` case per Step 1).
@@ -1665,7 +1665,7 @@ Do not add a second `assert_runs`. If the program does not type-check as written
 - [ ] **Step 5: Run it and confirm the failure is the one you expect**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_non_tail_resume -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_non_tail_resume -- --nocapture
 ```
 
 Expected before any emission work: a `CodegenError::Unsupported` naming the handle node,
@@ -1689,7 +1689,7 @@ allocation, because `elya_alloc` can collect and the environment must be rooted 
 - [ ] **Step 7: Run the test to verify it passes**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_non_tail_resume -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_non_tail_resume -- --nocapture
 ```
 
 Expected: PASS, stdout `42`.
@@ -1910,7 +1910,7 @@ it in one command.
 - [ ] **Step 3: Run all three tests and verify they fail**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --lib multi -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --lib multi -- --nocapture
 ```
 
 Note `--lib`, not `--test native_codegen`: these are unit tests now.
@@ -1945,7 +1945,7 @@ dispatch. It is removed inside this same task, before the task's commit.
 - [ ] **Step 5: Run the tests to verify they pass**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --lib multi -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --lib multi -- --nocapture
 ```
 
 Expected: PASS, all three.
@@ -2015,7 +2015,7 @@ is calibrated to distinguish it from success.
 - [ ] **Step 8: Run it and verify it fails on the temporary floor**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture
 ```
 
 Expected: FAIL with `Unsupported("handle")` — Step 4's floor.
@@ -2041,7 +2041,7 @@ nothing here needs a row at runtime. Do not reach for `EffectRow` in emitted cod
 - [ ] **Step 10: Run the dispatch test to verify it passes**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture
 ```
 
 Expected: PASS, status 6.
@@ -2049,7 +2049,7 @@ Expected: PASS, status 6.
 - [ ] **Step 11: Confirm the refusal tests still pass**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --lib multi -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --lib multi -- --nocapture
 ```
 
 Expected: PASS, all three. Step 9 removed the temporary floor but must not have removed
@@ -2240,7 +2240,7 @@ fn the_handler_corpus_compiles_and_runs() {
 - [ ] **Step 4: Run it, and read a failure as a prediction miss before reading it as a bug**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen the_handler_corpus -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen the_handler_corpus -- --nocapture
 ```
 
 Expected: PASS.
@@ -2250,7 +2250,7 @@ first — Step 5's differential is the arbiter, and it compares against the eval
 is this project's reference semantics:
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen native_output_matches_the_evaluator_across_the_handler -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen native_output_matches_the_evaluator_across_the_handler -- --nocapture
 ```
 
 If the evaluator agrees with the prediction and native does not, the defect is in Task 8.
@@ -2286,7 +2286,7 @@ fn native_output_matches_the_evaluator_across_the_handler_corpus() {
 - [ ] **Step 6: Run it**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen native_output_matches_the_evaluator_across_the_handler -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen native_output_matches_the_evaluator_across_the_handler -- --nocapture
 ```
 
 Expected: PASS.
@@ -2339,7 +2339,7 @@ un-refused. If this reports `Unsupported`, Task 4's sweep missed a site; fix it 
 - [ ] **Step 8: Run it**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_printing_clause_body -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_printing_clause_body -- --nocapture
 ```
 
 Expected: PASS, text `asked\nasked\n`, value `2`.
@@ -2452,7 +2452,7 @@ fn a_tail_resuming_handler_settles_its_live_set() {
 - [ ] **Step 2: Run it. Four equal levels, or stop.**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_tail_resuming_handler_settles -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_tail_resuming_handler_settles -- --nocapture
 ```
 
 Expected: PASS, four equal levels.
@@ -2528,7 +2528,7 @@ rather than short-circuiting.
 - [ ] **Step 4: Run it**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_growing_control_moves -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_growing_control_moves -- --nocapture
 ```
 
 Expected: PASS, `levels[1].1 > levels[0].1`.
@@ -2592,6 +2592,18 @@ a state-passing tail loop at small N completes on any implementation, including 
 grows the stack linearly. Task 12's fifth control demonstrates precisely that. If the test
 overflows at 1 000 000, the finding is *a tail-call regression*, which is what
 `diagnose_stack_overflow` exists to name — not a reason to pick a smaller number.
+
+**Platform note — Linux (added 2026-10-02; nothing above is changed).** On Linux a stack
+overflow shows up as **signal 11 (SIGSEGV)**, not as Windows' `STATUS_STACK_OVERFLOW`.
+Measured in the cloud container (Ubuntu 24.04, clang 18.1.3, 8 MiB stack): a C program
+that recurses without bound dies with `Segmentation fault`, shell status `139`, and Rust's
+`ExitStatus` reports `code() == None`, `signal() == Some(11)`. `diagnose_stack_overflow`
+matches only `code() == Some(0xC00000FD)`, so on Linux it stays silent, and a tail-call
+regression surfaces as the generic `binary exited …` assertion — unnamed. **The helper must
+recognise SIGSEGV by name (e.g. `std::os::unix::process::ExitStatusExt::signal()`) before A9
+means anything on Linux.** One caveat for whoever writes that: SIGSEGV is not unique to stack
+overflow the way `0xC00000FD` is — a collector or codegen fault raises the same signal — so
+the Linux diagnosis names a *likely* cause, not a certain one.
 
 **A measured deviation from A9's wording, reported rather than patched.** A9 says the
 program runs "through `assert_runs`, printing exactly `x`". Against the code, it cannot:
@@ -2673,7 +2685,7 @@ returns `Unit`, and the annotation would be wrong. This row is copied, not autho
 - [ ] **Step 3: Run it**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_state_passing_tail_loop -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_state_passing_tail_loop -- --nocapture
 ```
 
 Expected: PASS, text `x\n`.
@@ -2749,7 +2761,7 @@ In Task 8's Step 9 point 4, change `k_cap ++ [handler] ++ k_now` to
 
 - Predicate tripped: deep re-installation, §4 point 4 — the handler must sit *beneath* the
   captured frames so it is found again on the next perform.
-- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture`
+- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture`
 - Required symptom: the A6 test prints **2**, not 6 — the handler was found once and then
   lost. Task 8's Step 7 prose predicts this exact number, which is what makes it a
   calibration rather than a guess.
@@ -2760,7 +2772,7 @@ In Task 8's Step 9 point 4, change `k_cap ++ [handler] ++ k_now` to
 Make dispatch always select clause 0 rather than matching the op name.
 
 - Predicate tripped: the two-name match in Task 8's Step 9 point 3.
-- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen the_handler_corpus -- --nocapture`
+- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen the_handler_corpus -- --nocapture`
 - Required symptom: the `two-ops` row prints **20**, not 14 — both performs resumed with
   `10`. Task 9's Step 1 predicts this number for this failure.
 - **Distinctness check:** this must *not* also break `ask-nontail`, which has one clause and
@@ -2775,7 +2787,7 @@ Remove the frame's row from the descriptor table (Task 6).
 - Predicate tripped: `gc_mark`'s `tag >= gc_n_ctors` skip, `crates/codegen/src/runtime.c:141`
   — a tag with no row is skipped, so the frame is never traced. This is the same predicate
   the closure-capture control at `:1073` trips.
-- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture`
+- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture`
 - Required symptom: a **wrong value**, not a crash. `:1080`'s comment is explicit about the
   shape of this failure — "This fails SILENTLY on the un-fixed build — it prints a wrong
   `Int`, it does not crash — which is why the assertion is on the VALUE." Expect the same
@@ -2790,7 +2802,7 @@ pointer, taking the mask from `0b10` to `0b00`.
 - Predicate tripped: the descriptor table's pointer-mask test. Per the measured convention,
   bit 0 is clear (the code pointer) and bit j+1 is set iff capture j is heap; the frame's
   one capture is `next`, so bit 1 is the tail of the captured chain.
-- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_growing_control_moves -- --nocapture`
+- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_growing_control_moves -- --nocapture`
 - Required symptom: **different from 2a.** 2a loses the whole frame; 2b keeps the frame and
   loses everything behind it, so it needs a *long* chain to show — which is why it is run
   against Task 10's growing control rather than against the A6 test. Expect a wrong value
@@ -2809,7 +2821,7 @@ Temporarily change Task 11's `loop(1000000)` to `loop(1000)`.
 
 - Predicate tripped: none — that is the finding. §12 says lowering N "silently converts A9
   into a tautology," and this demonstrates it rather than asserting it.
-- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_state_passing_tail_loop -- --nocapture`
+- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_state_passing_tail_loop -- --nocapture`
 - Required symptom: **PASS**. A state-passing tail loop at N = 1 000 completes on an
   implementation that grows the stack linearly, so at that N the test distinguishes
   nothing. This is the concrete reason the N is fixed and not a tuning knob.
