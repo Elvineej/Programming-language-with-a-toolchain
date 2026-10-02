@@ -653,29 +653,45 @@ fn an_applied_resume_is_a_normalized_but_a_bare_one_is_not() {
     );
 }
 
+/// Spec §5.2-§5.3 and plan D4: `is_multi_declared` comes from the EFFECT'S
+/// DECLARATION, op-keyed through `multi_declared_ops` — not from the handler's
+/// own `multi` flag. Lowers `effect multi Flip` handled by `with_kw` and returns
+/// the stamp. One `#[test]` per keyword, so each case fails on its own.
+fn flip_handled_with_is_stamped_multi(with_kw: &str) -> bool {
+    let src = format!(
+        "effect multi Flip {{ fn flip() -> Bool }}\n\
+         fn g() -> Int {{ if flip() {{ 1 }} else {{ 0 }} }}\n\
+         pub fn main() -> Int {{\n\
+         \x20 handle {{ g() }} {with_kw} {{\n\
+         \x20   Flip.flip() -> resume(True)\n\
+         \x20   return(x) -> x\n\
+         \x20 }}\n\
+         }}\n"
+    );
+    let (core, _table) = lower_src(&src);
+    first_handle(&core).is_multi_declared
+}
+
 #[test]
-fn the_multi_stamp_is_keyed_on_the_declaration_not_the_handler() {
-    // Spec §5.2-§5.3 and plan D4: `is_multi_declared` comes from the EFFECT'S
-    // DECLARATION, op-keyed through `multi_declared_ops` — not from the
-    // handler's own `multi` flag. So a PLAIN `with` over a `multi`-declared
-    // effect is stamped too: the deliberate over-refusal §5.2 records.
-    let decl = "effect multi Flip { fn flip() -> Bool }\n\
-                fn g() -> Int { if flip() { 1 } else { 0 } }\n";
-    for (what, with) in [("plain `with`", "with"), ("`with multi`", "with multi")] {
-        let src = format!(
-            "{decl}pub fn main() -> Int {{\n\
-             \x20 handle {{ g() }} {with} {{\n\
-             \x20   Flip.flip() -> resume(True)\n\
-             \x20   return(x) -> x\n\
-             \x20 }}\n\
-             }}\n"
-        );
-        let (core, _table) = lower_src(&src);
-        assert!(
-            first_handle(&core).is_multi_declared,
-            "{what} over a `multi`-declared effect must be stamped multi"
-        );
-    }
+fn a_plain_with_over_a_multi_declared_effect_is_stamped_multi() {
+    // §5.2's deliberate over-refusal: the handler is plain, the DECLARATION is
+    // `multi`, and the declaration decides. This is the case that tells
+    // declaration-keying apart from `Handler::multi`-keying.
+    assert!(
+        flip_handled_with_is_stamped_multi("with"),
+        "plain `with` over a `multi`-declared effect must be stamped multi"
+    );
+}
+
+#[test]
+fn a_with_multi_over_a_multi_declared_effect_is_stamped_multi() {
+    // Both keyings agree here (the handler flag and the declaration are both
+    // multi), so this case pins the stamp itself, not which source it is read
+    // from.
+    assert!(
+        flip_handled_with_is_stamped_multi("with multi"),
+        "`with multi` over a `multi`-declared effect must be stamped multi"
+    );
 }
 
 #[test]
