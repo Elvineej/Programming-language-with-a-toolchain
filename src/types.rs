@@ -1276,6 +1276,11 @@ impl Infer {
             env.push();
             for (idx, p) in clause.params.iter().enumerate() {
                 let pty = params.get(idx).cloned().unwrap_or_else(|| self.fresh());
+                // Slice 5b-8 Task 5: record the clause parameter's type at its own
+                // span, exactly as a lambda parameter is recorded (obligation T3).
+                // Core lowering then READS it out of the frozen table, the same
+                // lookup it makes for a lambda parameter, instead of guessing it.
+                self.node_types.insert(p.span, pty.clone());
                 env.insert(
                     &p.node.name,
                     Scheme {

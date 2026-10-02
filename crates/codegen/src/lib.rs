@@ -1182,6 +1182,11 @@ fn lower_expr<'ctx>(
             }
             Ok(phi.as_basic_value())
         }
+        // 5b-8: Core carries handlers from Task 5; native dispatch arrives in Task
+        // 8. Until then a handler that reaches the back end is refused by name,
+        // never mis-lowered.
+        CoreKind::Handle(_) => Err(CodegenError::Unsupported("handle")),
+        CoreKind::Resume(_) => Err(CodegenError::Unsupported("resume")),
     }
 }
 

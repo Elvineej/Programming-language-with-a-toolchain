@@ -126,6 +126,26 @@ fn fv_walk(e: &CoreExpr, scope: &mut Vec<String>, out: &mut BTreeMap<String, Ty>
                 scope.truncate(depth);
             }
         }
+        // The handled body is outside every binder; each clause's params bind in
+        // that clause's body only; the return binder binds in the return body only.
+        CoreKind::Handle(h) => {
+            fv_walk(&h.body, scope, out);
+            for c in h.clauses.iter() {
+                let depth = scope.len();
+                for p in c.params.iter() {
+                    scope.push(p.name.clone());
+                }
+                fv_walk(&c.body, scope, out);
+                scope.truncate(depth);
+            }
+            if let Some(r) = &h.ret {
+                let depth = scope.len();
+                scope.push(r.binder.clone());
+                fv_walk(&r.body, scope, out);
+                scope.truncate(depth);
+            }
+        }
+        CoreKind::Resume(v) => fv_walk(v, scope, out),
     }
 }
 
@@ -225,13 +245,23 @@ fn collect_in(
                 collect_in(&arm.body, enclosing, n, module_level, first_tag, out);
             }
         }
+        CoreKind::Handle(h) => {
+            collect_in(&h.body, enclosing, n, module_level, first_tag, out);
+            for c in h.clauses.iter() {
+                collect_in(&c.body, enclosing, n, module_level, first_tag, out);
+            }
+            if let Some(r) = &h.ret {
+                collect_in(&r.body, enclosing, n, module_level, first_tag, out);
+            }
+        }
+        CoreKind::Resume(v) => collect_in(v, enclosing, n, module_level, first_tag, out),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use elya::core::{CoreArm, CoreFn, CoreLit, CoreType};
+    use elya::core::{CoreArm, CoreClause, CoreFn, CoreHandle, CoreLit, CoreReturn, CoreType};
     use elya::span::Span;
     use elya::types::{EffectRow, TyCon};
 
@@ -447,5 +477,106 @@ mod tests {
         for (i, s) in sites.iter().enumerate() {
             assert_eq!(s.tag, i, "tag {i} must be `first_tag + i`");
         }
+    }
+
+    /// `f(a)` with both names as `Var`s — a two-name use with no new binders.
+    fn uses(f: &str, a: &str) -> CoreExpr {
+        e(int(), CoreKind::App(Rc::new(var(f)), Rc::from([var(a)])))
+    }
+
+    fn handle(body: CoreExpr, clauses: Vec<CoreClause>, ret: Option<(&str, CoreExpr)>) -> CoreExpr {
+        let ret = ret.map(|(binder, body)| {
+            Rc::new(CoreReturn {
+                binder: binder.to_string(),
+                body: Rc::new(body),
+            })
+        });
+        e(
+            int(),
+            CoreKind::Handle(Rc::new(CoreHandle {
+                body: Rc::new(body),
+                clauses: clauses.into(),
+                ret,
+                is_multi_declared: false,
+            })),
+        )
+    }
+
+    fn clause(params: &[&str], body: CoreExpr) -> CoreClause {
+        CoreClause {
+            effect: "E".to_string(),
+            op: "op".to_string(),
+            params: params.iter().map(|p| param(p)).collect::<Vec<_>>().into(),
+            body: Rc::new(body),
+        }
+    }
+
+    /// A handler's binders (5b-8 Task 5). Each clause's params bind in THAT
+    /// clause's body only, the return binder binds in the return body only, and
+    /// the handled body is outside both. Under-capture here is the
+    /// use-after-free the match's doc comment warns of, so both directions are
+    /// pinned: a binder that fails to bind, and one that leaks past its clause.
+    #[test]
+    fn handler_clause_params_and_the_return_binder_bind_only_their_own_body() {
+        // Binding: `k` and `r` are bound; `a`, `b` and the body's `x` are free.
+        let bound = handle(
+            var("x"),
+            vec![clause(
+                &["k"],
+                e(int(), CoreKind::Resume(Rc::new(uses("k", "a")))),
+            )],
+            Some(("r", uses("r", "b"))),
+        );
+        let fv = free_vars(&bound);
+        assert_eq!(
+            fv.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["a", "b", "x"],
+            "a clause param and the return binder bind in their own bodies"
+        );
+
+        // Scoping: clause 1's `k` must not leak into clause 2 or the return
+        // clause, both of which use `k` free.
+        let scoped = handle(
+            var("x"),
+            vec![clause(&["k"], var("a")), clause(&[], var("k"))],
+            Some(("r", var("k"))),
+        );
+        assert!(
+            free_vars(&scoped).contains_key("k"),
+            "a clause param leaked past its own clause"
+        );
+    }
+
+    /// `collect_in` descends into every handler subtree — the handled body, each
+    /// clause body (through a `resume`), and the return body — so a lambda in
+    /// any of them gets a site and a descriptor row.
+    #[test]
+    fn collect_descends_into_every_handler_subtree() {
+        let lam = |p: &str| {
+            e(
+                Ty::Fn(vec![int()], EffectRow::pure(), Box::new(int())),
+                CoreKind::Lambda(Rc::from([param(p)]), Rc::new(lit(0))),
+            )
+        };
+        let body = handle(
+            lam("u"),
+            vec![clause(&[], e(int(), CoreKind::Resume(Rc::new(lam("v")))))],
+            Some(("r", lam("w"))),
+        );
+        let core = CoreModule {
+            fns: vec![CoreFn {
+                name: "h".to_string(),
+                params: Rc::from([]),
+                body,
+            }],
+            types: Vec::<CoreType>::new(),
+        };
+        let sites = collect_lambdas(&core, 0);
+        let params: Vec<&str> = sites.iter().map(|s| s.params[0].name.as_str()).collect();
+        assert_eq!(
+            params,
+            vec!["u", "v", "w"],
+            "body, clause (under resume) and return lambdas, in pre-order"
+        );
     }
 }

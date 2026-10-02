@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use crate::ast::{BinOp, Block, Decl, Expr, Module, PatLit, Pattern, Stmt, TypeAnn};
+use crate::ast::{
+    multi_declared_ops, BinOp, Block, Decl, Expr, Module, PatLit, Pattern, Stmt, TypeAnn,
+};
 use crate::span::Span;
 use crate::types::Ty;
 use crate::types::TyPrinter;
@@ -49,12 +51,48 @@ pub enum CoreKind {
     /// single-typed `phi`.
     If(Rc<CoreExpr>, Rc<CoreExpr>, Rc<CoreExpr>),
     Match(Rc<CoreExpr>, Rc<[CoreArm]>),
+    /// `handle <body> with { .. }` (5b-8 §4). Clause bodies are ordinary
+    /// `CoreExpr`: `resume` is a syntactic form, not a value, so a captured
+    /// continuation needs no Core node of its own.
+    Handle(Rc<CoreHandle>),
+    /// `resume(e)` — only well-formed inside a clause body. The type checker
+    /// has already established that; Core does not re-check it.
+    Resume(Rc<CoreExpr>),
 }
 
 #[derive(Clone, Debug)]
 pub struct CoreArm {
     pub pat: CorePat,
     pub body: CoreExpr,
+}
+
+#[derive(Clone, Debug)]
+pub struct CoreHandle {
+    pub body: Rc<CoreExpr>,
+    pub clauses: Rc<[CoreClause]>,
+    pub ret: Option<Rc<CoreReturn>>,
+    /// §5.3: lowering STAMPS this bit from the handled effect's DECLARATION,
+    /// op-keyed (D4) — never from `Handler::multi`, so a plain `with` over a
+    /// `multi`-declared effect is stamped too (§5.2's deliberate over-refusal).
+    /// §5.4 puts the REFUSAL in codegen, where an execution test can observe it.
+    pub is_multi_declared: bool,
+}
+
+/// One `Effect.op(params) -> body` clause. `effect` is always the name the
+/// source wrote: an unqualified clause is refused at lowering, not resolved.
+#[derive(Clone, Debug)]
+pub struct CoreClause {
+    pub effect: String,
+    pub op: String,
+    pub params: Rc<[CoreParam]>,
+    pub body: Rc<CoreExpr>,
+}
+
+/// `return(binder) -> body`. The binder's type is the handled body's type.
+#[derive(Clone, Debug)]
+pub struct CoreReturn {
+    pub binder: String,
+    pub body: Rc<CoreExpr>,
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +205,13 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
         }
     }
 
+    let cx = LowerCx {
+        ctors: ctor_names,
+        // One construction, two call sites (Slice 5b-8 §9.4, D4): this one and
+        // `affine.rs`'s.
+        multi_ops: multi_declared_ops(module),
+    };
+
     let mut fns = Vec::new();
     for d in &module.decls {
         if let Decl::Fn(f) = &d.node {
@@ -181,7 +226,7 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
                     ty,
                 });
             }
-            let body = lower_block(&f.body.node, table, &ctor_names)?;
+            let body = lower_block(&f.body.node, table, &cx)?;
             fns.push(CoreFn {
                 name: f.name.clone(),
                 params: params.into(),
@@ -190,6 +235,16 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
         }
     }
     Ok(CoreModule { fns, types })
+}
+
+/// The module-wide facts the lowering fold reads below `lower_module`, gathered
+/// in pass 1. It was a bare constructor set until 5b-8 Task 5's `Handle` arm
+/// needed the `multi`-declared operations as well.
+struct LowerCx {
+    /// Every constructor name: a bare or applied constructor lowers to `Ctor`.
+    ctors: HashSet<String>,
+    /// `multi_declared_ops(module)` — op-keyed (D4), read by the `Handle` stamp.
+    multi_ops: HashSet<String>,
 }
 
 /// Elaborate a (monomorphic) ADT field type annotation to a `Ty`. Param-free by
@@ -216,22 +271,22 @@ fn ann_to_ty(a: &TypeAnn) -> Ty {
 fn lower_block(
     block: &Block,
     table: &BTreeMap<Span, Ty>,
-    ctors: &HashSet<String>,
+    cx: &LowerCx,
 ) -> Result<CoreExpr, LowerError> {
     let tail = block
         .tail
         .as_ref()
         .ok_or(LowerError::Unsupported("block without tail expression"))?;
-    let mut acc = lower_expr(&tail.node, tail.span, table, ctors)?;
+    let mut acc = lower_expr(&tail.node, tail.span, table, cx)?;
     for stmt in block.stmts.iter().rev() {
         let (name, value) = match &stmt.node {
             Stmt::Let { name, value } => (
                 name.clone(),
-                lower_expr(&value.node, value.span, table, ctors)?,
+                lower_expr(&value.node, value.span, table, cx)?,
             ),
             // A non-tail expression statement: a discarded binding — no separate
             // sequencing node is needed for the corpus.
-            Stmt::Expr(e) => ("_".to_string(), lower_expr(&e.node, e.span, table, ctors)?),
+            Stmt::Expr(e) => ("_".to_string(), lower_expr(&e.node, e.span, table, cx)?),
         };
         let ty = acc.ty.clone();
         acc = CoreExpr {
@@ -250,7 +305,7 @@ fn lower_expr(
     e: &Expr,
     span: Span,
     table: &BTreeMap<Span, Ty>,
-    ctors: &HashSet<String>,
+    cx: &LowerCx,
 ) -> Result<CoreExpr, LowerError> {
     let ty = table.get(&span).cloned().ok_or(LowerError::Untyped(span))?;
     let kind = match e {
@@ -261,7 +316,7 @@ fn lower_expr(
         Expr::Var(x) => {
             // A bare constructor name is construction of a nullary ctor (5b-4
             // §3.2), distinct from a variable reference.
-            if ctors.contains(x) {
+            if cx.ctors.contains(x) {
                 CoreKind::Ctor(x.clone(), Rc::from([]))
             } else {
                 CoreKind::Var(x.clone())
@@ -272,7 +327,7 @@ fn lower_expr(
                 if module == "io" && name == "println" {
                     let mut lowered = Vec::with_capacity(args.len());
                     for a in args.iter() {
-                        lowered.push(lower_expr(&a.node, a.span, table, ctors)?);
+                        lowered.push(lower_expr(&a.node, a.span, table, cx)?);
                     }
                     return Ok(CoreExpr {
                         span,
@@ -284,10 +339,10 @@ fn lower_expr(
             // A saturated constructor call lowers to a distinct Ctor node, not an
             // App. Check the callee name before lowering it as a variable.
             if let Expr::Var(name) = &callee.node {
-                if ctors.contains(name) {
+                if cx.ctors.contains(name) {
                     let mut lowered = Vec::with_capacity(args.len());
                     for a in args.iter() {
-                        lowered.push(lower_expr(&a.node, a.span, table, ctors)?);
+                        lowered.push(lower_expr(&a.node, a.span, table, cx)?);
                     }
                     return Ok(CoreExpr {
                         span,
@@ -296,16 +351,47 @@ fn lower_expr(
                     });
                 }
             }
-            let f = lower_expr(&callee.node, callee.span, table, ctors)?;
+            if let Expr::Resume { .. } = &callee.node {
+                // A-normalize an APPLIED resume (spec §3.2) so codegen meets a `Var`
+                // callee, never a computed one:
+                //     resume(v)(args)  ==>  let $k = resume(v) in $k(args)
+                // A bare `resume(v)` never reaches here — it is not a Call. `$k` is
+                // SYNTHESIZED (D7): the Let and the `$k` Var take the resume's span,
+                // and the Var's type is cloned from the resume node, never looked up.
+                let k = lower_expr(&callee.node, callee.span, table, cx)?;
+                let k_ty = k.ty.clone();
+                let mut lowered = Vec::with_capacity(args.len());
+                for a in args.iter() {
+                    lowered.push(lower_expr(&a.node, a.span, table, cx)?);
+                }
+                let call = CoreExpr {
+                    span,
+                    ty: ty.clone(),
+                    kind: CoreKind::App(
+                        Rc::new(CoreExpr {
+                            span: callee.span,
+                            ty: k_ty,
+                            kind: CoreKind::Var("$k".to_string()),
+                        }),
+                        lowered.into(),
+                    ),
+                };
+                return Ok(CoreExpr {
+                    span: callee.span,
+                    ty,
+                    kind: CoreKind::Let("$k".to_string(), Rc::new(k), Rc::new(call)),
+                });
+            }
+            let f = lower_expr(&callee.node, callee.span, table, cx)?;
             let mut lowered = Vec::with_capacity(args.len());
             for a in args.iter() {
-                lowered.push(lower_expr(&a.node, a.span, table, ctors)?);
+                lowered.push(lower_expr(&a.node, a.span, table, cx)?);
             }
             CoreKind::App(Rc::new(f), lowered.into())
         }
         Expr::Binary { op, lhs, rhs } => {
-            let l = lower_expr(&lhs.node, lhs.span, table, ctors)?;
-            let r = lower_expr(&rhs.node, rhs.span, table, ctors)?;
+            let l = lower_expr(&lhs.node, lhs.span, table, cx)?;
+            let r = lower_expr(&rhs.node, rhs.span, table, cx)?;
             CoreKind::Prim(*op, vec![l, r].into())
         }
         Expr::If {
@@ -313,9 +399,9 @@ fn lower_expr(
             then_block,
             else_block,
         } => {
-            let c = lower_expr(&cond.node, cond.span, table, ctors)?;
-            let t = lower_block(&then_block.node, table, ctors)?;
-            let e = lower_block(&else_block.node, table, ctors)?;
+            let c = lower_expr(&cond.node, cond.span, table, cx)?;
+            let t = lower_block(&then_block.node, table, cx)?;
+            let e = lower_block(&else_block.node, table, cx)?;
             CoreKind::If(Rc::new(c), Rc::new(t), Rc::new(e))
         }
         Expr::Lambda { params, body } => {
@@ -333,14 +419,14 @@ fn lower_expr(
                     ty,
                 });
             }
-            let b = lower_block(&body.node, table, ctors)?;
+            let b = lower_block(&body.node, table, cx)?;
             CoreKind::Lambda(ps.into(), Rc::new(b))
         }
         Expr::Match { scrutinee, arms } => {
-            let s = lower_expr(&scrutinee.node, scrutinee.span, table, ctors)?;
+            let s = lower_expr(&scrutinee.node, scrutinee.span, table, cx)?;
             let mut lowered = Vec::with_capacity(arms.len());
             for arm in arms.iter() {
-                let body = lower_expr(&arm.node.body.node, arm.node.body.span, table, ctors)?;
+                let body = lower_expr(&arm.node.body.node, arm.node.body.span, table, cx)?;
                 lowered.push(CoreArm {
                     pat: lower_pat(&arm.node.pat.node),
                     body,
@@ -359,14 +445,78 @@ fn lower_expr(
         // IS queried — by the `table.get(&span)` at the top of this function, before
         // the match — so an untyped block is `Untyped` here, never lowered; the type
         // that lookup returns is then unused.
-        Expr::Block(b) => return lower_block(b, table, ctors),
+        Expr::Block(b) => return lower_block(b, table, cx),
+        Expr::Handle { body, handler } => {
+            // An unqualified clause (`op(..) -> ..`) type-checks, but the evaluator
+            // — the reference semantics — never dispatches to one:
+            // `handler_handles` (src/eval.rs) matches `effect == Some(..)` only, and
+            // the run ends in E0300. There is no behaviour to reproduce, so it is
+            // refused by name, before anything in the handle is lowered.
+            let effects = handler
+                .clauses
+                .iter()
+                .map(|c| {
+                    c.node
+                        .effect
+                        .clone()
+                        .ok_or(LowerError::Unsupported("unqualified handler clause"))
+                })
+                .collect::<Result<Vec<String>, LowerError>>()?;
+            let b = lower_expr(&body.node, body.span, table, cx)?;
+            let mut clauses = Vec::with_capacity(handler.clauses.len());
+            for (c, effect) in handler.clauses.iter().zip(effects) {
+                // Same param-type lookup as the Lambda arm: the type comes out of
+                // the frozen table keyed by the param's own span (the checker
+                // records it there, as it does a lambda's), and a missing entry is
+                // `Untyped`, never a guess.
+                let mut ps = Vec::with_capacity(c.node.params.len());
+                for p in &c.node.params {
+                    let ty = table
+                        .get(&p.span)
+                        .cloned()
+                        .ok_or(LowerError::Untyped(p.span))?;
+                    ps.push(CoreParam {
+                        name: p.node.name.clone(),
+                        ty,
+                    });
+                }
+                clauses.push(CoreClause {
+                    effect,
+                    op: c.node.op.clone(),
+                    params: ps.into(),
+                    body: Rc::new(lower_expr(&c.node.body.node, c.node.body.span, table, cx)?),
+                });
+            }
+            let ret = match &handler.ret {
+                Some(r) => Some(Rc::new(CoreReturn {
+                    binder: r.binder.clone(),
+                    body: Rc::new(lower_expr(&r.body.node, r.body.span, table, cx)?),
+                })),
+                None => None,
+            };
+            // §5.3 / D4: stamped from the DECLARATION, op-keyed — `Handler` has no
+            // effect field to key on, and `Handler::multi` would be a second,
+            // narrower partition (§5.2: refusing too much is a diagnostic, refusing
+            // too little a wrong answer). Codegen refuses on the bit (§5.4).
+            let is_multi_declared = handler
+                .clauses
+                .iter()
+                .any(|c| cx.multi_ops.contains(&c.node.op));
+            CoreKind::Handle(Rc::new(CoreHandle {
+                body: Rc::new(b),
+                clauses: clauses.into(),
+                ret,
+                is_multi_declared,
+            }))
+        }
+        Expr::Resume { arg } => {
+            CoreKind::Resume(Rc::new(lower_expr(&arg.node, arg.span, table, cx)?))
+        }
         // The deferred surface (spec §4, §11): a typed boundary, not a panic. None
         // of these occur in the 5a-2 corpus.
         Expr::Float(_) => return Err(LowerError::Unsupported("Float")),
         Expr::Qualified { .. } => return Err(LowerError::Unsupported("Qualified")),
         Expr::Unary { .. } => return Err(LowerError::Unsupported("Unary")),
-        Expr::Handle { .. } => return Err(LowerError::Unsupported("Handle")),
-        Expr::Resume { .. } => return Err(LowerError::Unsupported("Resume")),
     };
     Ok(CoreExpr { span, ty, kind })
 }
@@ -515,6 +665,40 @@ fn pretty_expr(e: &CoreExpr, p: &mut TyPrinter, s: &mut String) {
                 pretty_expr(&arm.body, p, s);
                 s.push(')');
             }
+        }
+        CoreKind::Handle(h) => {
+            s.push_str("(handle ");
+            pretty_expr(&h.body, p, s);
+            if h.is_multi_declared {
+                s.push_str(" multi");
+            }
+            for c in h.clauses.iter() {
+                s.push_str(" (");
+                s.push_str(&c.effect);
+                s.push('.');
+                s.push_str(&c.op);
+                s.push_str(" (");
+                for (i, param) in c.params.iter().enumerate() {
+                    if i > 0 {
+                        s.push(' ');
+                    }
+                    s.push_str(&param.name);
+                }
+                s.push_str(") ");
+                pretty_expr(&c.body, p, s);
+                s.push(')');
+            }
+            if let Some(r) = &h.ret {
+                s.push_str(" (return ");
+                s.push_str(&r.binder);
+                s.push(' ');
+                pretty_expr(&r.body, p, s);
+                s.push(')');
+            }
+        }
+        CoreKind::Resume(v) => {
+            s.push_str("(resume ");
+            pretty_expr(v, p, s);
         }
     }
     // Every expression node is annotated with its inline type.
