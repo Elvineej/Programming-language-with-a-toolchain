@@ -462,6 +462,48 @@ fn word_to_value<'ctx>(
     }
 }
 
+/// The prefix of the hidden keys `bind_local` parks shadowed values under. No
+/// source identifier can begin with `$`, so `Var` lookup never sees one.
+const SHADOW: &str = "$shadow:";
+
+/// What `unbind_local` needs to undo a `bind_local`.
+struct Shadowed(Option<String>);
+
+/// Bind `x` to `v`. If that shadows an existing binding, the outer value is
+/// NOT moved into a Rust local (where `gc_root_env` cannot see it -- a live
+/// heap value left unrooted while the inner scope allocates): it stays in
+/// `env` under a hidden key, so every allocation inside the inner scope roots
+/// it, and `unbind_local` restores it exactly. Bindings nest LIFO, so the
+/// count of hidden keys present is a unique, deterministic suffix.
+fn bind_local<'ctx>(
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    x: &str,
+    v: BasicValueEnum<'ctx>,
+) -> Shadowed {
+    match env.insert(x.to_string(), v) {
+        None => Shadowed(None),
+        Some(prev) => {
+            let n = env.keys().filter(|k| k.starts_with(SHADOW)).count();
+            let key = format!("{SHADOW}{n:06}:{x}");
+            env.insert(key.clone(), prev);
+            Shadowed(Some(key))
+        }
+    }
+}
+
+fn unbind_local<'ctx>(env: &mut HashMap<String, BasicValueEnum<'ctx>>, x: &str, s: Shadowed) {
+    match s.0 {
+        None => {
+            env.remove(x);
+        }
+        Some(key) => {
+            if let Some(prev) = env.remove(&key) {
+                env.insert(x.to_string(), prev);
+            }
+        }
+    }
+}
+
 /// Root every heap binding currently in scope, returning how many went on.
 ///
 /// The keys are SORTED first. `HashMap` iteration order varies between
@@ -704,17 +746,10 @@ fn lower_tail<'ctx>(
         CoreKind::Let(x, rhs, body) => {
             // The bound value is NOT in tail position; only the body is.
             let v = lower_expr(ctx, func, b, lc, rhs, env)?;
-            let prev = env.insert(x.clone(), v);
+            // A shadowed outer binding stays rooted (`bind_local`).
+            let shadowed = bind_local(env, x, v);
             let out = lower_tail(ctx, func, b, lc, body, env);
-            // Restore any shadowed binding, exactly as `lower_expr` does.
-            match prev {
-                Some(p) => {
-                    env.insert(x.clone(), p);
-                }
-                None => {
-                    env.remove(x);
-                }
-            }
+            unbind_local(env, x, shadowed);
             out
         }
         CoreKind::App(callee, args) => {
@@ -872,17 +907,11 @@ fn lower_expr<'ctx>(
         },
         CoreKind::Let(x, rhs, body) => {
             let v = lower_expr(ctx, func, b, lc, rhs, env)?;
-            let prev = env.insert(x.clone(), v);
+            // Restore any shadowed binding -- `let x = 1; let x = x + 1` stays
+            // correct -- and keep it ROOTED meanwhile (`bind_local`).
+            let shadowed = bind_local(env, x, v);
             let out = lower_expr(ctx, func, b, lc, body, env);
-            // Restore any shadowed binding — `let x = 1; let x = x + 1` stays correct.
-            match prev {
-                Some(p) => {
-                    env.insert(x.clone(), p);
-                }
-                None => {
-                    env.remove(x);
-                }
-            }
+            unbind_local(env, x, shadowed);
             out
         }
         CoreKind::Prim(op, args) => {
@@ -1147,13 +1176,19 @@ fn lower_expr<'ctx>(
                                 }
                             }
                         }
+                        // Bound with `bind_local` and undone in reverse: an arm
+                        // binder that shadows an outer name used to REMOVE the
+                        // outer binding after the arm (and leave it unrooted
+                        // during it).
+                        let mut shadowed = Vec::with_capacity(bindings.len());
                         for (n, v) in &bindings {
-                            env.insert(n.clone(), *v);
+                            shadowed.push((n.clone(), bind_local(env, n, *v)));
                         }
-                        let v = lower_expr(ctx, func, b, lc, &arm.body, env)?;
-                        for (n, _) in &bindings {
-                            env.remove(n);
+                        let v = lower_expr(ctx, func, b, lc, &arm.body, env);
+                        for (n, sh) in shadowed.into_iter().rev() {
+                            unbind_local(env, &n, sh);
                         }
+                        let v = v?;
                         let exit = b
                             .get_insert_block()
                             .ok_or_else(|| internal("builder left no block"))?;
@@ -1176,16 +1211,9 @@ fn lower_expr<'ctx>(
                         b.position_at_end(fallthrough);
                         b.build_unconditional_branch(body_bb).map_err(internal)?;
                         b.position_at_end(body_bb);
-                        let prev = env.insert(name.clone(), s.into());
+                        let shadowed = bind_local(env, name, s.into());
                         let v = lower_expr(ctx, func, b, lc, &arm.body, env);
-                        match prev {
-                            Some(p) => {
-                                env.insert(name.clone(), p);
-                            }
-                            None => {
-                                env.remove(name);
-                            }
-                        }
+                        unbind_local(env, name, shadowed);
                         let v = v?;
                         let exit = b
                             .get_insert_block()

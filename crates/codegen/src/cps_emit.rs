@@ -41,9 +41,11 @@ use elya::types::{Ty, TyCon};
 
 use crate::cps::{self, contains_effect, is_tail_slot, needs_cps, ContSite, HandlerSite, Saved};
 use crate::{
-    eq_operand_label, fn_type_of, gc_root_env, gc_unroot, internal, lower_expr, mangle, op_label,
-    prim_values, repr_ty, value_to_word, word_to_value, CodegenError, LowerCtx, MAX_PARAMS, TAILCC,
+    bind_local, eq_operand_label, fn_type_of, gc_root_env, gc_unroot, internal, lower_expr, mangle,
+    op_label, prim_values, repr_ty, value_to_word, word_to_value, CodegenError, LowerCtx,
+    MAX_PARAMS, TAILCC,
 };
+use crate::{unbind_local, Shadowed};
 
 /// The region's continuation, kept in the name environment under a name no
 /// source identifier can spell, so the existing env-rooting discipline roots it
@@ -320,33 +322,30 @@ impl<'ctx> St<'ctx> {
         }
     }
 
+    /// The name view at `depth`: each name's innermost binding under its own
+    /// name, and every binding it shadows parked under a hidden key
+    /// (`bind_local`), so the direct emitter's `gc_root_env` roots shadowed
+    /// heap values too (found by the review of the shadowing fix).
     fn rebuild_env(&mut self) {
         self.env.clear();
         for (_, (n, v)) in self.binds.range(..self.depth) {
-            self.env.insert(n.clone(), *v);
+            let _ = bind_local(&mut self.env, n, *v);
         }
         self.env.insert(KONT.to_string(), self.kont.into());
     }
 
     /// Bind `x` at the next index; returns what `unbind` needs.
-    fn bind(&mut self, x: &str, v: BasicValueEnum<'ctx>) -> (usize, Option<BasicValueEnum<'ctx>>) {
+    fn bind(&mut self, x: &str, v: BasicValueEnum<'ctx>) -> (usize, Shadowed) {
         let at = self.depth;
         self.binds.insert(at, (x.to_string(), v));
         self.depth += 1;
-        (at, self.env.insert(x.to_string(), v))
+        (at, bind_local(&mut self.env, x, v))
     }
 
-    fn unbind(&mut self, x: &str, (at, prev): (usize, Option<BasicValueEnum<'ctx>>)) {
+    fn unbind(&mut self, x: &str, (at, shadowed): (usize, Shadowed)) {
         self.binds.remove(&at);
         self.depth = at;
-        match prev {
-            Some(p) => {
-                self.env.insert(x.to_string(), p);
-            }
-            None => {
-                self.env.remove(x);
-            }
-        }
+        unbind_local(&mut self.env, x, shadowed);
     }
 }
 
