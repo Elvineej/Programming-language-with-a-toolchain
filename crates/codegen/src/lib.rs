@@ -239,7 +239,10 @@ fn fn_type_of<'ctx>(
 /// inside the fold — which is why this message stayed "non-Int value" when the
 /// fold widened.
 fn require_int(ty: &Ty) -> Result<(), CodegenError> {
-    if matches!(ty, Ty::Base(TyCon::Int)) {
+    // 5b-8 Task 11: a `Unit` main is also an i64 word (0), so the shim's
+    // `%lld` prints it as-is; A9's main ends in `io.println(..)`. A `Bool`
+    // main stays refused (an i1 is not the shim's word).
+    if matches!(ty, Ty::Base(TyCon::Int) | Ty::Base(TyCon::Unit)) {
         Ok(())
     } else {
         Err(CodegenError::Unsupported("non-Int value"))
@@ -902,7 +905,9 @@ fn lower_expr<'ctx>(
                 .map_err(internal)?;
             Ok(ctx.i64_type().const_int(0, false).into())
         }
-        CoreKind::Lit(_) => Err(CodegenError::Unsupported("non-Int literal")),
+        // 5b-8 Task 11: `Unit` is the immediate i64 word 0 (`repr_ty`), never
+        // dereferenced, traced or rooted. A9's source needs `resume(Unit)`.
+        CoreKind::Lit(CoreLit::Unit) => Ok(ctx.i64_type().const_int(0, false).into()),
         CoreKind::Var(x) => match env.get(x) {
             Some(v) => Ok(*v),
             None => Err(CodegenError::Unsupported("unbound var")),

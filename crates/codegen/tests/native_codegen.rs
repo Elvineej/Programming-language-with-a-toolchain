@@ -220,6 +220,26 @@ fn diagnose_stack_overflow(status: &std::process::ExitStatus, tag: &str) {
     }
 }
 
+/// The Linux half of the stack-overflow diagnosis (plan Task 11's platform
+/// note): there an overflow is SIGSEGV, not STATUS_STACK_OVERFLOW. SIGSEGV is
+/// NOT unique to an overflow -- a collector or codegen fault raises it too --
+/// so this names the LIKELY cause. Used by the million-step tests only: the
+/// corpus loops keep collecting per-case failures instead of panicking.
+fn diagnose_crash(status: &std::process::ExitStatus, tag: &str) {
+    diagnose_stack_overflow(status, tag);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal() == Some(11) {
+            panic!(
+                "{tag}: SIGSEGV. Most likely the machine stack overflowed -- a tail call or \
+                 resume that was supposed to keep the stack flat grew it instead -- but a \
+                 collector or codegen fault raises the same signal."
+            );
+        }
+    }
+}
+
 /// The three required assertions per case (§5): exit status, stdout, empty stderr.
 fn assert_runs(exe: &Path, expected: &str) {
     let out = Command::new(exe).output().expect("run produced binary");
@@ -2347,6 +2367,86 @@ fn a_growing_control_moves_the_live_set() {
     assert!(
         levels[1].1 > levels[0].1,
         "a growing control must move the live set, or A4's settling proves nothing: {levels:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_unit_literal_compiles_natively() {
+    // `Unit` is the i64 word 0 (`repr_ty`); codegen refused the literal itself
+    // until A9's source needed `resume(Unit)` (plan Task 11).
+    let src = "fn f() { Unit }\n\
+               pub fn main() -> Int { let u = f()  7 }\n";
+    let dir = temp_dir("unit-literal");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "unit-literal");
+    assert_runs(&exe, "7");
+    assert_eq!(eval_main_int(src), "7");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_unit_main_prints_its_text_then_its_word() {
+    // A Unit-valued main compiles: the shim prints main's word, which for Unit
+    // is 0, after the program's text (plan Task 11: A9's main is
+    // `io.println(...)`). The text is compared with the evaluator's output.
+    let src = "pub fn main() { io.println(\"hi\") }\n";
+    let dir = temp_dir("unit-main");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "unit-main");
+    let (text, value) = native_text_value(&exe, "unit-main");
+    let session = Session::new();
+    let (m, pd) = parse_module(&session, src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let (interp, _) = elya::eval::run_module_value(&m).expect("evaluator runs it");
+    assert_eq!(
+        text,
+        interp.output(),
+        "native text diverges from the evaluator"
+    );
+    assert_eq!(text, "hi\n");
+    assert_eq!(value, "0", "Unit's word");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A9, the machine-stack half of Invariant N8-1 (plan Task 11) -- the other
+/// half from Task 10's heap measurement; neither subsumes the other.
+///
+/// The source is copied verbatim from `tests/state_effect.rs`
+/// (`state_tail_loop`) at N = 1,000,000. Its PEAK assertions are an evaluator
+/// instrument and are deliberately not ported.
+///
+/// DEVIATION FROM A9, REPORTED NOT PATCHED: A9 says `assert_runs` "printing
+/// exactly `x`", but main returns Unit and the shim prints main's word, so
+/// stdout is "x\n0\n". The splitter separates them and the TEXT half is
+/// asserted, which also pins the newline `assert_runs`'s `.trim()` would
+/// drop. The value half is a shim artifact and is not pinned.
+///
+/// N MUST NOT BE LOWERED: at small N this completes even on an implementation
+/// that grows the stack linearly (Task 12's fifth control shows exactly that).
+#[test]
+fn a_state_passing_tail_loop_is_bounded_natively_at_a_million() {
+    let src = "effect State { fn get() -> String  fn set(v: String) -> Unit }\n\
+               fn loop(n) { if n == 0 { get() } else { let _ = set(\"x\")  loop(n - 1) } }\n\
+               pub fn main() {\n\
+               \x20 let program = handle { loop(1000000) } with {\n\
+               \x20   State.get() -> fn(s) { (resume(s))(s) }\n\
+               \x20   State.set(v) -> fn(s) { (resume(Unit))(v) }\n\
+               \x20   return(x) -> fn(s) { x }\n\
+               \x20 }\n\
+               \x20 io.println(program(\"init\"))\n\
+               }\n";
+    let dir = temp_dir("state-tail-million");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "state-tail-million");
+    let out = Command::new(&exe).output().expect("run produced binary");
+    diagnose_crash(&out.status, "state-tail-million");
+    assert!(out.status.success(), "binary exited {:?}", out.status);
+    let (text, _unit_word) =
+        split_text_and_value(&String::from_utf8_lossy(&out.stdout), "state-tail-million");
+    assert_eq!(
+        text, "x\n",
+        "the state-passing tail loop must run to completion at N = 1_000_000 and print exactly one line"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
