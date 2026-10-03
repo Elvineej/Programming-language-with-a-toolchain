@@ -2257,3 +2257,96 @@ fn a_printing_clause_body_matches_the_evaluator_byte_for_byte() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A4, the heap half of Invariant N8-1 (plan Task 10). Four N over an 8x
+/// spread. `live` is the LEVEL -- visible words still live at the end of the
+/// LAST collection -- where `freed` and `words_since_gc` are flows.
+///
+/// NO CONSTANT IS PINNED. The claim is that the level does not grow with N.
+/// `collections > 0` and `live > 0` are guards that `live` was computed at
+/// all, NOT invariant guards (spec 7.3, ground 2).
+#[test]
+fn a_tail_resuming_handler_settles_its_live_set() {
+    let dir = temp_dir("handler-settles");
+    let mut levels = Vec::new();
+    for n in [25_000, 50_000, 100_000, 200_000] {
+        let src = format!(
+            "effect Tick {{ fn tick() -> Int }}\n\
+             fn spin(n) {{ if n == 0 {{ 0 }} else {{ let _ = tick()  spin(n - 1) }} }}\n\
+             pub fn main() -> Int {{\n\
+             \x20 handle {{ spin({n}) }} with {{\n\
+             \x20   Tick.tick() -> resume(1)\n\
+             \x20   return(x) -> x\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        let tag = format!("settles-{n}");
+        let core = lower_src(&src);
+        let exe = compile_and_link(&core, &dir, &tag);
+        let (stdout, stats) = run_with_gc_stats(&exe, &tag);
+        assert_eq!(stdout, "0", "{tag}: the loop must run to completion");
+        assert!(
+            stats.collections > 0,
+            "{tag}: no collection happened, so `live` measures nothing"
+        );
+        assert!(
+            stats.live > 0,
+            "{tag}: live=0 means the level was never computed"
+        );
+        levels.push((n, stats.live));
+    }
+    println!("A4 levels: {levels:?}");
+    let (_, first) = levels[0];
+    for (n, live) in &levels {
+        assert_eq!(
+            *live, first,
+            "live set must not grow with N (a growing level is a frame leak): {levels:?}, diverged at N={n}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A5. The same handler with the recursive call under `+` instead of in
+/// tail position: each level holds a pending frame, so the captured chain
+/// grows with N and the level must move. STRICT inequality -- an instrument
+/// that a deliberately-growing control cannot move is measuring nothing.
+#[test]
+fn a_growing_control_moves_the_live_set() {
+    let dir = temp_dir("handler-grows");
+    let mut levels = Vec::new();
+    // 10k/80k, not the plan's 5k/40k (8x kept; approved 2026-10-04): at 5k the
+    // control allocates 60,004 words, under the 64K first-collection floor,
+    // so it never collects and `live` measures nothing (measured).
+    for n in [10_000, 80_000] {
+        let src = format!(
+            "effect Tick {{ fn tick() -> Int }}\n\
+             fn spin(n) {{ if n == 0 {{ 0 }} else {{ tick() + spin(n - 1) }} }}\n\
+             pub fn main() -> Int {{\n\
+             \x20 handle {{ spin({n}) }} with {{\n\
+             \x20   Tick.tick() -> resume(1)\n\
+             \x20   return(x) -> x\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        let tag = format!("grows-{n}");
+        let core = lower_src(&src);
+        let exe = compile_and_link(&core, &dir, &tag);
+        let (stdout, stats) = run_with_gc_stats(&exe, &tag);
+        assert_eq!(
+            stdout,
+            n.to_string(),
+            "{tag}: each of the N performs resumes with 1"
+        );
+        assert!(
+            stats.collections > 0,
+            "{tag}: no collection happened, so `live` measures nothing"
+        );
+        levels.push((n, stats.live));
+    }
+    println!("A5 levels: {levels:?}");
+    assert!(
+        levels[1].1 > levels[0].1,
+        "a growing control must move the live set, or A4's settling proves nothing: {levels:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
