@@ -1410,11 +1410,12 @@ fn descriptor_rows(
         desc.push(mask);
     }
     // D13: ONE row for the continuation object a clause receives,
-    // `[tag][k][consumed]`: `k` is the captured frame chain (traced, bit 0);
-    // `consumed` is the one-shot flag (a plain word, bit 1 clear).
+    // `[tag][k][consumed][handler]`: `k` is the captured frame chain (traced,
+    // bit 0); `consumed` is the one-shot flag (a plain word, bit 1 clear);
+    // `handler` is the handler frame a resume re-installs (traced, bit 2).
     let cont_tag = desc.len() / 2;
-    desc.push(2);
-    desc.push(0b01);
+    desc.push(3);
+    desc.push(0b101);
     Ok(Descriptors {
         rows: desc,
         frame_tag,
@@ -1471,9 +1472,9 @@ struct LowerCtx<'a, 'ctx> {
     /// Task 8: every `(effect, op)` the module performs or handles -> its index
     /// in each handle's clause table.
     op_ids: &'a HashMap<(String, String), usize>,
-    /// Task 8 runtime: `elya_handler_of`, `elya_resume_twice`,
-    /// `elya_unhandled_effect` (all `ccc`).
-    handler_of: FunctionValue<'ctx>,
+    /// Task 8 runtime: the address of `elya_current_handler`, and
+    /// `elya_resume_twice`, `elya_unhandled_effect` (both `ccc`).
+    current_handler: inkwell::values::PointerValue<'ctx>,
     resume_twice: FunctionValue<'ctx>,
     unhandled: FunctionValue<'ctx>,
 }
@@ -1598,8 +1599,12 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let trap_ty = ctx.void_type().fn_type(&[], false);
     let resume_twice = module.add_function("elya_resume_twice", trap_ty, None); // ccc
     let unhandled = module.add_function("elya_unhandled_effect", trap_ty, None); // ccc
-    let handler_of_ty = ptrt.fn_type(&[ptrt.into()], false);
-    let handler_of = module.add_function("elya_handler_of", handler_of_ty, None); // ccc
+
+    // `elya_current_handler`: a declaration (no initializer); the definition
+    // lives in runtime.c.
+    let current_handler = module
+        .add_global(ptrt, Some(AddressSpace::default()), "elya_current_handler")
+        .as_pointer_value();
     let op_ids = cps_emit::op_ids(core);
     let (resume_fns, handler_fns) =
         cps_emit::declare(ctx, &module, &nodes, &sites, &handlers, &op_ids)?;
@@ -1628,7 +1633,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         resume_fns: &resume_fns,
         handler_fns: &handler_fns,
         op_ids: &op_ids,
-        handler_of,
+        current_handler,
         resume_twice,
         unhandled,
     };
@@ -2686,7 +2691,7 @@ mod tests {
         let frame_tag = string_tag + 1;
         // Task 8 (D13, approved expected-value change): with no sites and no
         // handles, the frame row is followed by exactly ONE more row -- the
-        // continuation object's `[2, 0b01]` -- where it used to be the last.
+        // continuation object's `[3, 0b101]` -- where it used to be the last.
         assert_eq!(
             rows.len() / 2,
             frame_tag + 2,
@@ -2699,8 +2704,8 @@ mod tests {
         assert_eq!(d.cont_tag, frame_tag + 1);
         assert_eq!(
             &rows[2 * d.cont_tag..],
-            &[2, 0b01],
-            "continuation object: k traced, consumed flag not"
+            &[3, 0b101],
+            "continuation object: k and handler traced, consumed flag not"
         );
         assert_eq!(
             &rows[2 * string_tag..2 * string_tag + 2],

@@ -1869,6 +1869,18 @@ const HANDLER_8: &[(&str, &str, &str)] = &[
         "43",
     ),
     (
+        // A pure function called from a handled body runs its OWN handle;
+        // when it returns, the outer handler must be current again for the
+        // body's next perform.
+        "dynamically-nested-handle",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         fn g() -> Int { handle { t() + 1 } with { T.t() -> resume(100)  return(r) -> r } }\n\
+         fn body() -> Int { let a = g()  a + get() }\n\
+         pub fn main() -> Int { handle { body() } with { S.get() -> resume(5)  return(r) -> r } }\n",
+        "106",
+    ),
+    (
         "perform-reached-at-run-time",
         "effect S { fn get() -> Int }\n\
          fn w(b) { if b { get() } else { 2 } }\n\
@@ -2065,5 +2077,46 @@ fn a_handler_frame_keeps_its_saved_heap_values_across_a_collection() {
         "native diverges from the evaluator"
     );
     assert_eq!(stdout, "58");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_deep_non_tail_effectful_recursion_finds_its_handler_in_constant_time() {
+    // 400,000 performs, each from a frame chain 400,000 deep at its deepest.
+    // Walking the chain to the handler on every perform is quadratic: it did
+    // not finish in 30 s at this N (measured before the fix; 80k took 15 s).
+    // With the handler found in O(1) it takes well under a second. The 20 s
+    // deadline makes a regression fail by NAME instead of hanging the suite.
+    let src = "effect S { fn get() -> Int }\n\
+         fn loop(n) { if n == 0 { 0 } else { get() + loop(n - 1) } }\n\
+         pub fn main() -> Int { handle { loop(400000) } with { S.get() -> resume(1)  return(r) -> r } }\n";
+    let dir = temp_dir("handler-lookup-8");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "deeploop");
+    let mut child = Command::new(&exe)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("wait") {
+            break st;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().ok();
+            panic!("400k performs did not finish in 20 s: the handler lookup is not O(1)");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let mut out = String::new();
+    use std::io::Read;
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut out)
+        .expect("read");
+    assert!(status.success(), "{status:?}");
+    assert_eq!(out.trim(), "400000");
     std::fs::remove_dir_all(&dir).ok();
 }

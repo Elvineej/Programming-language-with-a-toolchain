@@ -260,15 +260,14 @@ void elya_match_fail(void) {
     exit(1);
 }
 
-/* 5b-8 Task 8 (D10, D17): walk a continuation's frames, word 2 of each
- * (`next`), to its end -- the handler frame, whose `next` is null. Reads words
- * only; never calls back into emitted code and never allocates. */
-void *elya_handler_of(int64_t *k) {
-    while (k[2] != 0) {
-        k = (int64_t *)k[2];
-    }
-    return k;
-}
+/* 5b-8 Task 8: the handler the running computation performs to. A handle
+ * site sets it around its body and restores it after; a resume installs the
+ * continuation's own handler around the resumed computation. A perform reads
+ * it in O(1) -- walking the frame chain to its end on every perform made deep
+ * non-tail effectful recursion quadratic (measured: 80k deep, 15 s). Not a GC
+ * root: whenever it is read, the handler frame is reachable from the live
+ * continuation, whose chain ends at it. Single-threaded, like the runtime. */
+void *elya_current_handler = 0;
 
 /* 5b-8 D13: one-shot is enforced natively. A second resume stops here -- a
  * named message and a non-zero exit, never a re-run. */

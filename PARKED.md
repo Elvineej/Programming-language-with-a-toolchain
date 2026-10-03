@@ -143,7 +143,7 @@ did not finish in 10 minutes. The 7b-3 deep-frames test uses n = 4000 because of
 
 ## Task 8 review follow-ups (2026-10-03)
 
-- **Finding the handler is O(depth) per perform.** `elya_handler_of` walks every frame's `next`
+- **RESOLVED (commit after 9ac2074): finding the handler is O(depth) per perform.** Replaced by `elya_current_handler`, set by the handle site, re-installed by every resume (the continuation object now records its handler: `[tag][k][consumed][handler]`). 400k deep: >30 s before, 0.7 s after; pinned by `a_deep_non_tail_effectful_recursion_finds_its_handler_in_constant_time`. Original report: `elya_handler_of` walks every frame's `next`
   to the handler frame, so non-tail effectful recursion is quadratic. Measured (review,
   `fn loop(n) { if n == 0 { 0 } else { get() + loop(n - 1) } }`, `resume(1)`): 10k 0.12 s, 20k
   0.5 s, 40k 2.9 s, 80k 15.2 s; 1M did not finish. One perform at depth 80k: 0.009 s. Answers
@@ -158,3 +158,21 @@ did not finish in 10 minutes. The 7b-3 deep-frames test uses n = 4000 because of
   Task 11 note) must name it.
 - Refusals that Task 8 did not lift were renamed from "(Task 8)" to "(not yet compiled
   natively)": effectful lambdas, effectful closure calls, effectful calls inside a `match`.
+
+## Collector: a fixed 64K-word threshold makes deep live structures quadratic (found 2026-10-03)
+
+`elya_alloc` collects every `GC_THRESHOLD_WORDS` (1 << 16) words regardless of the live set,
+and every collection marks everything live. With a growing live set the total marking is
+O(live^2 / threshold). Measured on the 400k/1M deep effectful loop (1M live frames): 73
+collections at 400k (0.7 s), 183 at 1M (6.8 s, live 4M words). Fix in the allocator, NOT in
+`gc_mark` (A7): grow the threshold with the live set (e.g. collect when allocation since the
+last collection exceeds max(64K, live)). Needs its own step: it changes when collections
+happen, which several GC tests calibrate against.
+
+## `elya_current_handler` depends on today's handle refusals (review of the lookup fix, 2026-10-03)
+
+The global equals "the handler at the end of k's chain" because clauses never perform (D17:
+no handle inside a handle or inside an effectful function). When those refusals are lifted, a
+clause must run with the global set to the handler OUTSIDE its handle -- a perform must switch
+it before jumping to the clause -- and the tail-resume install in `clause_tail` (redundant today)
+becomes load-bearing. Revisit both together with D17.
