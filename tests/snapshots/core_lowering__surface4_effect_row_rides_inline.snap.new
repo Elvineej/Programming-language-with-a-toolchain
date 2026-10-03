@@ -1,0 +1,7 @@
+---
+source: tests/core_lowering.rs
+assertion_line: 224
+expression: "pretty_typed(&core, &mut TyPrinter::new())"
+---
+(fn worker () (perform State.set (lit 1 : Int) : Unit))
+(fn use_it () (let g (var worker : fn() / {State(Int)} -> Unit) (app (var g : fn() / {State(Int)} -> Unit) : Unit) : Unit))

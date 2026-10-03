@@ -4,11 +4,13 @@
 //! it performs no inference. Core is not executed here (spec §6).
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::ast::{
-    multi_declared_ops, BinOp, Block, Decl, Expr, Module, PatLit, Pattern, Stmt, TypeAnn,
+    multi_declared_ops, op_effects, BinOp, Block, Decl, Expr, Module, PatLit, Pattern, Stmt,
+    TypeAnn,
 };
 use crate::span::Span;
 use crate::types::Ty;
@@ -58,6 +60,10 @@ pub enum CoreKind {
     /// `resume(e)` — only well-formed inside a clause body. The type checker
     /// has already established that; Core does not re-check it.
     Resume(Rc<CoreExpr>),
+    /// A call of an effect operation — a PERFORM (5b-8 D11). Resolved ops-first,
+    /// exactly as inference and the evaluator resolve a call, so a function that
+    /// shares the op's name is never what this node calls.
+    Perform(Rc<CorePerform>),
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +99,15 @@ pub struct CoreClause {
 pub struct CoreReturn {
     pub binder: String,
     pub body: Rc<CoreExpr>,
+}
+
+/// `op(args)` where `op` is an operation of `effect` (D11). Both names are
+/// carried: the handler match is strict on `(effect, op)` (§4 point 2).
+#[derive(Clone, Debug)]
+pub struct CorePerform {
+    pub effect: String,
+    pub op: String,
+    pub args: Rc<[CoreExpr]>,
 }
 
 #[derive(Clone, Debug)]
@@ -210,6 +225,9 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
         // One construction, two call sites (Slice 5b-8 §9.4, D4): this one and
         // `affine.rs`'s.
         multi_ops: multi_declared_ops(module),
+        // D11: the op -> effect index, built by the rule `Infer.ops` and the
+        // evaluator's `op_table` both use (last declaration wins).
+        op_effects: op_effects(module),
     };
 
     let mut fns = Vec::new();
@@ -245,6 +263,9 @@ struct LowerCx {
     ctors: HashSet<String>,
     /// `multi_declared_ops(module)` — op-keyed (D4), read by the `Handle` stamp.
     multi_ops: HashSet<String>,
+    /// `op_effects(module)` — op name -> declaring effect, read by the `Perform`
+    /// stamp (D11).
+    op_effects: HashMap<String, String>,
 }
 
 /// Elaborate a (monomorphic) ADT field type annotation to a `Ty`. Param-free by
@@ -348,6 +369,28 @@ fn lower_expr(
                         span,
                         ty,
                         kind: CoreKind::Ctor(name.clone(), lowered.into()),
+                    });
+                }
+            }
+            // D11: a call whose callee names an operation is a PERFORM. Resolved
+            // exactly where inference (`infer_call`) and the evaluator
+            // (`CalleeSlot::Operation`) resolve it: after `io.println` and
+            // constructors, BEFORE any variable. So a function sharing the op's
+            // name is not what this calls -- both reference layers perform.
+            if let Expr::Var(name) = &callee.node {
+                if let Some(effect) = cx.op_effects.get(name) {
+                    let mut lowered = Vec::with_capacity(args.len());
+                    for a in args.iter() {
+                        lowered.push(lower_expr(&a.node, a.span, table, cx)?);
+                    }
+                    return Ok(CoreExpr {
+                        span,
+                        ty,
+                        kind: CoreKind::Perform(Rc::new(CorePerform {
+                            effect: effect.clone(),
+                            op: name.clone(),
+                            args: lowered.into(),
+                        })),
                     });
                 }
             }
@@ -699,6 +742,16 @@ fn pretty_expr(e: &CoreExpr, p: &mut TyPrinter, s: &mut String) {
         CoreKind::Resume(v) => {
             s.push_str("(resume ");
             pretty_expr(v, p, s);
+        }
+        CoreKind::Perform(pf) => {
+            s.push_str("(perform ");
+            s.push_str(&pf.effect);
+            s.push('.');
+            s.push_str(&pf.op);
+            for a in pf.args.iter() {
+                s.push(' ');
+                pretty_expr(a, p, s);
+            }
         }
     }
     // Every expression node is annotated with its inline type.
