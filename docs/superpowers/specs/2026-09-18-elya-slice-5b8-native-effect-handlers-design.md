@@ -818,7 +818,7 @@ checks that enforce them.
 |---|---|---|
 | A1 | A `State`-effect program with a **non-tail** `resume` compiles natively, and its output equals the evaluator's — both the value and the exact bytes written. | differential execution |
 | A2 | `with multi` is refused at codegen by a message naming `multi`, before any clause body is lowered. | execution (reachable refusal) |
-| A3 | ~~A polymorphic effect is refused.~~ **✓ VERIFIED by execution (2026-10-02): a polymorphic effect has no refusal of its own, at any stage.** Its declaration passes the front end, lowers, and compiles and runs natively (`a3_a_polymorphic_effect_declaration_compiles_and_runs_natively`). An op performed at one concrete type reaches codegen as a monomorphic op does — the identical refusal, until this slice's handlers land. Only a type parameter left unconstrained survives, as `Ty::Var`, and it falls into the existing `Ty::Var` refusal, `unrepresentable type` (`a3_an_unconstrained_polymorphic_effect_meets_the_ty_var_refusal`). So it is the existing refusal, not a distinct one. Plan D2 stands; Task 3's prediction of a refusal was wrong. | execution (measured) |
+| A3 | ~~A polymorphic effect is refused.~~ **✓ VERIFIED by execution (2026-10-02): a polymorphic effect has no refusal of its own, at any stage.** Its declaration passes the front end, lowers, and compiles and runs natively (`a3_a_polymorphic_effect_declaration_compiles_and_runs_natively`). An op performed at one concrete type reaches codegen as a monomorphic op does — the identical refusal, until this slice's handlers land. Only a type parameter left unconstrained survives, as `Ty::Var`, and it falls into the existing `Ty::Var` refusal, `unrepresentable type` (`a3_an_unconstrained_polymorphic_effect_meets_the_ty_var_refusal`). So it is the existing refusal, not a distinct one. Plan D2 stands; Task 3's prediction of a refusal was wrong. *(2026-10-03, Task 8 Step 11a: the handled half, measured. `effect State(s) { fn get() -> s }` performed at `Int` inside a handler compiles, runs and prints 40, matching the evaluator -- the `a3-polymorphic-effect-at-int` case of the Task 8 handler corpus. Prediction held.)* | execution (measured) |
 | A4 | On a **handler** program, the live set settles across four N over an 8× spread, **no constant pinned**. `collections > 0` and `live > 0` are retained as guards that `live` was computed at all — **not** as Invariant N8-1 guards, which they cannot be (§7.3, ground 2). | execution |
 | A5 | A growing control moves the heap instrument (strict inequality), written without `<>` (§9.1). | execution |
 | A6 | A deep handler resumed inside a loop performs more than once and finds the same handler each time (§4 point 4). | differential execution |
@@ -901,3 +901,13 @@ numbers; each section amended above carries a dated pointer here.
 - **D17 (§8.3).** A `handle` compiles only in a region that does not need CPS and not inside
   another handle; otherwise it is refused by name.
 - **D18.** Until Task 8, a `Perform` compiles to the named trap `elya_perform_unimplemented`.
+- **Task 8, as built (2026-10-03).** Dispatch follows from D14 and D17. A perform's continuation is
+  the frame chain as it stands; under D17 that chain always ends at the handler frame, so the
+  handler is already beneath the captured frames (§4 point 4) with no copying. A handler frame is
+  `[tag][code = return clause][next = null][clause table][saved..]` (the table is a static array
+  of clause code addresses indexed by a module-wide `(effect, op)` number; its word is never
+  traced, so saved value j is mask bit j + 3). A clause receives the op's arguments, a one-shot
+  continuation object `[tag][k][consumed]` (one descriptor row, mask `0b01`) and the handler
+  frame; an op with more than three parameters is refused by name (MAX_PARAMS). `resume` is a
+  native nesting call; in a clause's tail position it is a `musttail` jump. `with multi` is
+  refused on the handle node before anything else (A2).
