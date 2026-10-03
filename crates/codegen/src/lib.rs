@@ -1196,12 +1196,28 @@ fn lower_expr<'ctx>(
 /// order -- the real constructors, then one synthetic row per lambda site, then
 /// the string row. Pure: it reads Core and the lambda table and emits nothing,
 /// so a unit test can read the very rows `build_module` hands the runtime.
+/// The descriptor table and the tags read off it. `frame_tag` and `site_tags`
+/// are the single source of truth for 7b-3's emitter (plan: "frame_tag comes
+/// from descriptor_rows, never recomputed").
+pub(crate) struct Descriptors {
+    pub(crate) rows: Vec<u64>,
+    /// No reader outside the tests until 7b-3's emission; delete this `allow`
+    /// there (7b-3 acceptance: no `allow(dead_code)` left in the tree).
+    #[allow(dead_code)]
+    pub(crate) frame_tag: usize,
+    /// Continuation site key (`ContSite::key`) -> the tag its frames carry.
+    /// Same `allow`, same deletion point.
+    #[allow(dead_code)]
+    pub(crate) site_tags: std::collections::BTreeMap<usize, usize>,
+}
+
 fn descriptor_rows(
     core: &CoreModule,
     lambdas: &[closure::LambdaSite],
+    sites: &[cps::ContSite],
     n_real_ctors: usize,
     string_tag: usize,
-) -> Result<Vec<u64>, CodegenError> {
+) -> Result<Descriptors, CodegenError> {
     // 5b-5 §4: one `[arity, ptr_mask]` pair per constructor, in the SAME global
     // tag order `build_ctor_table` assigns — the tag stored in an object's word
     // 0 indexes straight into this table. Bit `i` of the mask is set iff field
@@ -1274,7 +1290,35 @@ fn descriptor_rows(
     }
     desc.push(2); // arity = 2: the code pointer and `next` follow the tag
     desc.push(0b10); // bit 0 clear (code pointer, not traced); bit 1 set (`next` is heap)
-    Ok(desc)
+                     // 5b-8 D10: one row per continuation site that saves anything,
+                     // `[tag][code_ptr][next][saved_0..]`, appended after the frame row; a site
+                     // that saves nothing shares the frame row above. The tag IS the row index
+                     // at the moment the row is pushed, and `site_tags` is the only place an
+                     // emitter reads it from -- so there is no second assignment for a guard to
+                     // compare against (unlike the lambda tags, assigned in `collect_lambdas`).
+    let mut site_tags = std::collections::BTreeMap::new();
+    for site in sites {
+        if site.saved.is_empty() {
+            site_tags.insert(site.key, frame_tag);
+            continue;
+        }
+        site_tags.insert(site.key, desc.len() / 2);
+        desc.push(2 + site.saved.len() as u64);
+        // Bit 0 clear (code pointer), bit 1 set (`next`), bit j+2 set iff saved
+        // value j is a heap value -- the lambda rows' convention shifted by one.
+        let mut mask: u64 = 0b10;
+        for (j, (_, ty)) in site.saved.iter().enumerate() {
+            if is_heap_ty(ty) {
+                mask |= 1 << (j + 2);
+            }
+        }
+        desc.push(mask);
+    }
+    Ok(Descriptors {
+        rows: desc,
+        frame_tag,
+        site_tags,
+    })
 }
 
 /// The shared lowering context: declarations, constructor and string tags, and
@@ -1450,7 +1494,8 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     fmt.set_constant(true);
     fmt.set_unnamed_addr(true);
 
-    let desc = descriptor_rows(core, &lambdas, n_real_ctors, string_tag)?;
+    let sites = cps::collect_sites(core);
+    let desc = descriptor_rows(core, &lambdas, &sites, n_real_ctors, string_tag)?.rows;
     let n_ctors = (desc.len() / 2) as u64;
     let desc_const = i64t.const_array(
         &desc
@@ -2283,7 +2328,9 @@ mod tests {
         let lambdas = closure::collect_lambdas(&core, n_real_ctors);
         assert_eq!(lambdas.len(), 1, "the program must carry one lambda row");
         let string_tag = n_real_ctors + lambdas.len();
-        let rows = descriptor_rows(&core, &lambdas, n_real_ctors, string_tag).expect("rows");
+        let rows = descriptor_rows(&core, &lambdas, &[], n_real_ctors, string_tag)
+            .expect("rows")
+            .rows;
         let frame_tag = string_tag + 1;
         assert_eq!(
             rows.len() / 2,
