@@ -704,22 +704,37 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
         let mut extra: Vec<BasicValueEnum<'ctx>> = vec![k.into()];
         extra.extend_from_slice(args);
         let roots = self.root_live(st, &extra)?;
-        let cont = self.alloc(3)?;
+        let cont = self.alloc(4)?;
         gc_unroot(self.b, self.lc, roots)?;
         self.store_word(cont, 0, i64t.const_int(self.lc.desc.cont_tag as u64, false))?;
         let kw = self.b.build_ptr_to_int(k, i64t, "kw").map_err(internal)?;
         self.store_word(cont, 1, kw)?;
         self.store_word(cont, 2, i64t.const_int(0, false))?;
+        // O(1): the handler this computation performs to (set by the handle
+        // site, re-installed by every resume). Read AFTER the allocation; the
+        // global does not move, and nothing here can collect.
         let h = self
             .b
-            .build_call(self.lc.handler_of, &[k.into()], "h")
+            .build_load(self.ptrt(), self.lc.current_handler, "h")
             .map_err(internal)?
-            .try_as_basic_value()
-            .left()
-            .ok_or(CodegenError::Unsupported(
-                "elya_handler_of returned no value",
-            ))?
             .into_pointer_value();
+        let hw = self.b.build_ptr_to_int(h, i64t, "hw").map_err(internal)?;
+        self.store_word(cont, 3, hw)?;
+        // No handler at all: unreachable under D17 (main is never CPS and
+        // effectful closure calls are refused), but a perform with nothing to
+        // perform to must stop by NAME, not dereference null.
+        let none = self.b.build_is_null(h, "noh").map_err(internal)?;
+        let nobody = self.ctx.append_basic_block(self.func, "no_handler");
+        let found = self.ctx.append_basic_block(self.func, "handler");
+        self.b
+            .build_conditional_branch(none, nobody, found)
+            .map_err(internal)?;
+        self.b.position_at_end(nobody);
+        self.b
+            .build_call(self.lc.unhandled, &[], "nh")
+            .map_err(internal)?;
+        self.b.build_unreachable().map_err(internal)?;
+        self.b.position_at_end(found);
         let table = self.load_word(h, 3)?;
         let table = self
             .b
@@ -1263,10 +1278,18 @@ pub(crate) fn emit_handle_site<'ctx>(
         cx.store_word(p, HANDLER_SAVED + j, w)?;
     }
     gc_unroot(b, lc, roots)?;
+    // This handle's frame is the current handler for its body; the previous
+    // one is restored when the body's answer comes back.
+    let ptrt = ctx.ptr_type(AddressSpace::default());
+    let outer = b
+        .build_load(ptrt, lc.current_handler, "oh")
+        .map_err(internal)?;
+    b.build_store(lc.current_handler, p).map_err(internal)?;
     let roots = gc_root_env(b, lc, env)?;
     let call = b.build_call(body_fn, &[p.into()], "hb").map_err(internal)?;
     call.set_call_convention(TAILCC);
     gc_unroot(b, lc, roots)?;
+    b.build_store(lc.current_handler, outer).map_err(internal)?;
     let word = call
         .try_as_basic_value()
         .left()
@@ -1491,7 +1514,10 @@ fn clause_tail<'ctx>(
             clause_tail(cx, f, answer, env)
         }
         CoreKind::Resume(arg) => {
-            let (word, k, code) = resume_prologue(cx, e, arg, env)?;
+            let (word, k, code, handler) = resume_prologue(cx, e, arg, env)?;
+            // The resumed computation performs to ITS handler.
+            cx.b.build_store(cx.lc.current_handler, handler)
+                .map_err(internal)?;
             let code_ty = cx
                 .i64t()
                 .fn_type(&[cx.i64t().into(), cx.ptrt().into()], false);
@@ -1517,7 +1543,12 @@ fn resume_prologue<'ctx>(
     e: &CoreExpr,
     arg: &CoreExpr,
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
-) -> R<(IntValue<'ctx>, PointerValue<'ctx>, PointerValue<'ctx>)> {
+) -> R<(
+    IntValue<'ctx>,
+    PointerValue<'ctx>,
+    PointerValue<'ctx>,
+    PointerValue<'ctx>,
+)> {
     let _ = e;
     let v = lower_expr(cx.ctx, cx.func, cx.b, cx.lc, arg, env)?;
     let cont = env
@@ -1553,8 +1584,12 @@ fn resume_prologue<'ctx>(
     let code =
         cx.b.build_int_to_ptr(code, cx.ptrt(), "rc")
             .map_err(internal)?;
+    let hw = cx.load_word(cont, 3)?;
+    let handler =
+        cx.b.build_int_to_ptr(hw, cx.ptrt(), "rh")
+            .map_err(internal)?;
     let word = value_to_word(cx.b, v, &arg.ty, cx.i64t())?;
-    Ok((word, k, code))
+    Ok((word, k, code, handler))
 }
 
 /// Task 8: `resume(arg)` in value position -- a native NESTING call of the
@@ -1571,9 +1606,16 @@ pub(crate) fn emit_resume_call<'ctx>(
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
 ) -> R<BasicValueEnum<'ctx>> {
     let cx = Cx { ctx, func, b, lc };
-    let (word, k, code) = resume_prologue(&cx, e, arg, env)?;
+    let (word, k, code, handler) = resume_prologue(&cx, e, arg, env)?;
     let i64t = ctx.i64_type();
     let code_ty = i64t.fn_type(&[i64t.into(), cx.ptrt().into()], false);
+    // The resumed computation performs to ITS handler; the caller's comes
+    // back when it returns.
+    let outer = b
+        .build_load(cx.ptrt(), lc.current_handler, "oh")
+        .map_err(internal)?;
+    b.build_store(lc.current_handler, handler)
+        .map_err(internal)?;
     // Everything live in this function survives the resumed computation.
     let roots = gc_root_env(b, lc, env)?;
     let call = b
@@ -1581,6 +1623,7 @@ pub(crate) fn emit_resume_call<'ctx>(
         .map_err(internal)?;
     call.set_call_convention(TAILCC);
     gc_unroot(b, lc, roots)?;
+    b.build_store(lc.current_handler, outer).map_err(internal)?;
     let w = call
         .try_as_basic_value()
         .left()
