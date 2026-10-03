@@ -31,14 +31,17 @@ fn row_needs_cps(row: &EffectRow) -> bool {
         return true;
     }
     match row.tail {
-        RowTail::Closed => false,
-        // A row we cannot see the end of might carry a user-declared effect.
-        // Answer conservatively: over-CPS costs speed, under-CPS is a wrong
-        // answer -- the asymmetry `closure.rs` states for over- vs
-        // under-capture. If the codegen suite starts hitting this arm in
-        // practice, that is a signal to investigate why an unresolved row
-        // survived inference, NOT a signal to flip the default.
-        RowTail::Open(_) | RowTail::ErrorRow => true,
+        // D16: an open tail ALONE is direct. A row-polymorphic function is
+        // compiled once, so the convention must not depend on what its row
+        // variable is later instantiated with; an instantiation at a user
+        // effect is refused by name instead (`ty_names_user_effect` +
+        // `ty_has_open_row`, checked at every reference). 7a answered `true`
+        // here "conservatively", but over-CPS is not safe across a convention
+        // boundary: `apply(fn(x) { x * 10 })` would call a direct lambda with
+        // the CPS convention (measured: it compiles and prints 11 at 831b023).
+        RowTail::Closed | RowTail::Open(_) => false,
+        // Poison: never survives a clean front end. Kept conservative.
+        RowTail::ErrorRow => true,
     }
 }
 
@@ -55,11 +58,27 @@ pub enum Saved {
     Temp(usize),
 }
 
+/// One ancestor step from a site's region root down to the site (7b-3 reads
+/// it to emit the site's resumption function from the hole upward).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathStep {
+    /// The ancestor node's address.
+    pub key: usize,
+    /// Which child of it the walk descended into.
+    pub slot: usize,
+    /// Scope depth AT the ancestor: the bindings its later children see.
+    pub depth: usize,
+}
+
 /// One continuation site (D10): a call that may capture its continuation,
 /// in a position where something still runs after it returns.
 pub struct ContSite {
     /// The address of the site's `CoreExpr` (see `Saved::Temp`).
     pub key: usize,
+    /// The top-level function whose body (or nested region) holds the site.
+    pub owner: String,
+    /// Region root (outermost) to the site's parent (innermost).
+    pub path: Vec<PathStep>,
     /// Slot order in the frame after `[tag][code_ptr][next]`: temporaries in
     /// path order (outermost ancestor first, left to right), then bindings in
     /// binding order (outermost first). Deterministic, and the bit order of the
@@ -77,13 +96,134 @@ pub struct ContSite {
 /// are nesting calls (D14), so they are not sites, and each of their bodies
 /// is a region of its own.
 pub fn collect_sites(core: &CoreModule) -> Vec<ContSite> {
-    let mut out = Vec::new();
+    collect(core).sites
+}
+
+/// One `handle` node (7b-3, D17): what its handler frame must carry.
+pub struct HandlerSite {
+    /// The `Handle` node's address.
+    pub key: usize,
+    /// The top-level function that contains it.
+    pub owner: String,
+    /// Scope depth at the handle: the binding indices its body continues from.
+    pub depth: usize,
+    /// Locals in scope at the handle that the handled body, any clause body
+    /// (its params and the continuation bound) or the return body (its binder
+    /// bound) uses -- in binding order. The body runs in its own function and
+    /// the return clause in another, so these travel in the handler frame,
+    /// after `[tag][code_ptr][next]`, exactly as a site's saved values do.
+    pub saved: Vec<(Saved, Ty)>,
+}
+
+/// Every `handle` in the module, in the same pre-order as `collect_sites`.
+pub fn collect_handlers(core: &CoreModule) -> Vec<HandlerSite> {
+    collect(core).handlers
+}
+
+struct Out {
+    sites: Vec<ContSite>,
+    handlers: Vec<HandlerSite>,
+}
+
+fn collect(core: &CoreModule) -> Out {
+    let mut out = Out {
+        sites: Vec::new(),
+        handlers: Vec::new(),
+    };
     for f in &core.fns {
         let mut scope: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
         let mut path = Vec::new();
-        walk(&f.body, &mut scope, &mut path, &mut out);
+        walk(&f.body, &f.name, &mut scope, &mut path, &mut out);
     }
     out
+}
+
+/// The locals a handler frame carries: free in the body, the clause bodies
+/// (params and `$cont` bound) or the return body (binder bound), and bound in
+/// `scope` -- keyed by binding, outermost first.
+fn handler_saved(h: &elya::core::CoreHandle, scope: &[String]) -> Vec<(Saved, Ty)> {
+    let mut vars: std::collections::BTreeMap<usize, (String, Ty)> =
+        std::collections::BTreeMap::new();
+    let mut need = |fv: std::collections::BTreeMap<String, Ty>| {
+        for (n, t) in fv {
+            if let Some(b) = scope.iter().rposition(|x| *x == n) {
+                vars.entry(b).or_insert((n, t));
+            }
+        }
+    };
+    need(free_vars_under(&h.body, &[]));
+    for c in h.clauses.iter() {
+        let mut bound: Vec<String> = c.params.iter().map(|p| p.name.clone()).collect();
+        bound.push(CONT.to_string());
+        need(free_vars_under(&c.body, &bound));
+    }
+    if let Some(r) = &h.ret {
+        need(free_vars_under(&r.body, std::slice::from_ref(&r.binder)));
+    }
+    vars.into_iter()
+        .map(|(binding, (name, ty))| (Saved::Var { name, binding }, ty))
+        .collect()
+}
+
+/// True iff `e` needs the CPS machinery in its OWN region: it contains a
+/// `Perform`, or a call whose callee type `needs_cps`, outside any lambda body
+/// and outside any `handle` (both are regions of their own). D16: a top-level
+/// function is CPS iff its body answers true.
+pub fn contains_effect(e: &CoreExpr) -> bool {
+    if is_call_site(e) {
+        return true;
+    }
+    match &e.kind {
+        CoreKind::Lit(_) | CoreKind::Var(_) | CoreKind::Lambda(..) | CoreKind::Handle(_) => false,
+        CoreKind::App(f, args) => contains_effect(f) || args.iter().any(contains_effect),
+        CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
+            a.iter().any(contains_effect)
+        }
+        CoreKind::Perform(p) => p.args.iter().any(contains_effect),
+        CoreKind::Let(_, v, b) => contains_effect(v) || contains_effect(b),
+        CoreKind::If(c, t, f) => contains_effect(c) || contains_effect(t) || contains_effect(f),
+        CoreKind::Match(s, arms) => {
+            contains_effect(s) || arms.iter().any(|a| contains_effect(&a.body))
+        }
+        CoreKind::Resume(v) => contains_effect(v),
+    }
+}
+
+/// Does `ty` NAME a user-declared effect anywhere -- in its own row, or in a
+/// row inside a parameter, result or constructor argument? (D16's refusal.)
+pub fn ty_names_user_effect(ty: &Ty) -> bool {
+    match ty {
+        Ty::Fn(ps, row, r) => {
+            row.labels.keys().any(|l| l != BUILTIN_EFFECT)
+                || ps.iter().any(ty_names_user_effect)
+                || ty_names_user_effect(r)
+        }
+        Ty::Con(_, args) => args.iter().any(ty_names_user_effect),
+        _ => false,
+    }
+}
+
+/// Does `ty` contain an open row tail anywhere -- is it effect-polymorphic?
+pub fn ty_has_open_row(ty: &Ty) -> bool {
+    match ty {
+        Ty::Fn(ps, row, r) => {
+            matches!(row.tail, RowTail::Open(_))
+                || ps.iter().any(ty_has_open_row)
+                || ty_has_open_row(r)
+        }
+        Ty::Con(_, args) => args.iter().any(ty_has_open_row),
+        _ => false,
+    }
+}
+
+/// Is child `slot` of `e` in tail position of `e` (its value is `e`'s value,
+/// with nothing left to do)? The one rule `in_tail` and 7b-3's emitter share.
+pub fn is_tail_slot(e: &CoreExpr, slot: usize) -> bool {
+    match &e.kind {
+        CoreKind::Let(..) => slot == 1,
+        CoreKind::If(..) | CoreKind::Match(..) => slot >= 1,
+        _ => false,
+    }
 }
 
 /// An ancestor of the node being visited, inside the current region: the
@@ -106,12 +246,7 @@ fn is_call_site(e: &CoreExpr) -> bool {
 /// Tail slots: a `Let` body, an `If` branch, a `Match` arm body. Nothing else
 /// returns its child's value as its own without further work.
 fn in_tail(path: &[Step]) -> bool {
-    path.iter().all(|s| match &s.node.kind {
-        CoreKind::Let(..) => s.slot == 1,
-        CoreKind::If(..) => s.slot >= 1,
-        CoreKind::Match(..) => s.slot >= 1,
-        _ => false,
-    })
+    path.iter().all(|s| is_tail_slot(s.node, s.slot))
 }
 
 /// The match is EXHAUSTIVE with no catch-all, for the reason `fv_walk` gives:
@@ -119,13 +254,23 @@ fn in_tail(path: &[Step]) -> bool {
 /// exist when the continuation is captured.
 fn walk<'a>(
     e: &'a CoreExpr,
+    owner: &str,
     scope: &mut Vec<String>,
     path: &mut Vec<Step<'a>>,
-    out: &mut Vec<ContSite>,
+    out: &mut Out,
 ) {
     if is_call_site(e) && !in_tail(path) {
-        out.push(ContSite {
+        out.sites.push(ContSite {
             key: e as *const CoreExpr as usize,
+            owner: owner.to_string(),
+            path: path
+                .iter()
+                .map(|s| PathStep {
+                    key: s.node as *const CoreExpr as usize,
+                    slot: s.slot,
+                    depth: s.depth,
+                })
+                .collect(),
             saved: saved_at(path, scope),
         });
     }
@@ -133,13 +278,13 @@ fn walk<'a>(
                  slot: usize,
                  scope: &mut Vec<String>,
                  path: &mut Vec<Step<'a>>,
-                 out: &mut Vec<ContSite>| {
+                 out: &mut Out| {
         path.push(Step {
             node: e,
             slot,
             depth: scope.len(),
         });
-        walk(child, scope, path, out);
+        walk(child, owner, scope, path, out);
         path.pop();
     };
     match &e.kind {
@@ -188,24 +333,30 @@ fn walk<'a>(
             for p in params.iter() {
                 scope.push(p.name.clone());
             }
-            walk(body, scope, &mut Vec::new(), out);
+            walk(body, owner, scope, &mut Vec::new(), out);
             scope.truncate(depth);
         }
         CoreKind::Handle(h) => {
-            walk(&h.body, scope, &mut Vec::new(), out);
+            out.handlers.push(HandlerSite {
+                key: e as *const CoreExpr as usize,
+                owner: owner.to_string(),
+                depth: scope.len(),
+                saved: handler_saved(h, scope),
+            });
+            walk(&h.body, owner, scope, &mut Vec::new(), out);
             for c in h.clauses.iter() {
                 let depth = scope.len();
                 for p in c.params.iter() {
                     scope.push(p.name.clone());
                 }
                 scope.push(CONT.to_string());
-                walk(&c.body, scope, &mut Vec::new(), out);
+                walk(&c.body, owner, scope, &mut Vec::new(), out);
                 scope.truncate(depth);
             }
             if let Some(r) = &h.ret {
                 let depth = scope.len();
                 scope.push(r.binder.clone());
-                walk(&r.body, scope, &mut Vec::new(), out);
+                walk(&r.body, owner, scope, &mut Vec::new(), out);
                 scope.truncate(depth);
             }
         }
@@ -361,10 +512,11 @@ mod tests {
     }
 
     #[test]
-    fn an_open_row_tail_selects_cps_conservatively() {
-        // A row-polymorphic function's row stays open after the freeze: its
-        // tail is a row variable that may yet carry a user-declared effect.
-        assert!(needs_cps(&func(row(&[], RowTail::Open(0)))));
+    fn an_open_row_tail_alone_is_a_direct_call() {
+        // D16 (approved expected-value change; 7a asserted `true`). A
+        // row-polymorphic function is compiled once, direct; instantiating it
+        // at a user effect is refused by name instead (N7).
+        assert!(!needs_cps(&func(row(&[], RowTail::Open(0)))));
     }
 
     #[test]
@@ -397,7 +549,15 @@ mod tests {
         let n_real_ctors: usize = core.types.iter().map(|t| t.ctors.len()).sum();
         let lambdas = crate::closure::collect_lambdas(core, n_real_ctors);
         let string_tag = n_real_ctors + lambdas.len();
-        crate::descriptor_rows(core, &lambdas, sites, n_real_ctors, string_tag).expect("rows")
+        crate::descriptor_rows(
+            core,
+            &lambdas,
+            sites,
+            &collect_handlers(core),
+            n_real_ctors,
+            string_tag,
+        )
+        .expect("rows")
     }
 
     fn row_at(d: &crate::Descriptors, tag: usize) -> [u64; 2] {

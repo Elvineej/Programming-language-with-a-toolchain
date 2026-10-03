@@ -19,8 +19,9 @@
 
 mod closure;
 mod cps;
+mod cps_emit;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use inkwell::builder::Builder;
@@ -261,6 +262,7 @@ fn declare_all<'ctx>(
     ctx: &'ctx Context,
     module: &Module<'ctx>,
     core: &CoreModule,
+    cps_fns: &HashSet<String>,
 ) -> Result<HashMap<String, FunctionValue<'ctx>>, CodegenError> {
     let mut decls: HashMap<String, FunctionValue<'ctx>> = HashMap::new();
     for f in &core.fns {
@@ -275,7 +277,17 @@ fn declare_all<'ctx>(
         for p in f.params.iter() {
             params.push(repr_ty(ctx, &p.ty)?.into());
         }
-        let fn_ty = fn_type_of(repr_ty(ctx, &f.body.ty)?, &params)?;
+        // D14/D16: an effectful function takes its continuation as a trailing
+        // pointer and answers with the handle's answer as a word: it never
+        // returns its own value, it passes it to the continuation. Its body
+        // type is still checked representable, as every function's is.
+        let ret = repr_ty(ctx, &f.body.ty)?;
+        let fn_ty = if cps_fns.contains(&f.name) {
+            params.push(ctx.ptr_type(AddressSpace::default()).into());
+            ctx.i64_type().fn_type(&params, false)
+        } else {
+            fn_type_of(ret, &params)?
+        };
         let func = module.add_function(&mangle(&f.name), fn_ty, None);
         // NOTE the plural: `set_call_conventions` is the FunctionValue method.
         // The call-site method is `set_call_convention`, singular. Both are
@@ -519,6 +531,13 @@ fn build_elya_call<'ctx>(
     let target = *lc.decls.get(name).ok_or(CodegenError::Unsupported(
         "callee is not a top-level function",
     ))?;
+    // D16: an effectful callee takes a continuation; only the CPS emitter can
+    // supply one. Reaching here with one is an emitter bug, refused by name.
+    if lc.cps_fns.contains(name) {
+        return Err(CodegenError::Unsupported(
+            "effectful call outside an effectful region",
+        ));
+    }
     build_direct_call(ctx, func, b, lc, target, args, env, tail)
 }
 
@@ -595,6 +614,9 @@ fn build_closure_call<'ctx>(
     let Ty::Fn(param_tys, _, ret_ty) = &callee.ty else {
         return Err(CodegenError::Unsupported("computed callee"));
     };
+    if cps::needs_cps(&callee.ty) {
+        return Err(CodegenError::Unsupported("effectful closure call (Task 8)"));
+    }
     if param_tys.len() != args.len() {
         return Err(CodegenError::Unsupported("closure call arity mismatch"));
     }
@@ -717,6 +739,42 @@ fn lower_tail<'ctx>(
             Ok(())
         }
     }
+}
+
+/// The binary `Prim` operators on two already-lowered operands. Extracted from
+/// `lower_expr` (5b-8 7b-3) so the CPS emitter, which meets operands whose
+/// values were computed before a continuation site, applies exactly the same
+/// operators -- one table, not two that could drift.
+fn prim_values<'ctx>(
+    b: &Builder<'ctx>,
+    op: BinOp,
+    l: IntValue<'ctx>,
+    r: IntValue<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    // Deliberately NO nsw/nuw flags: defined two's-complement wrapping
+    // (§3.4). Overflow reconciliation with the evaluator is tracked in
+    // spec §11 — not silently decided here.
+    //
+    // Comparisons are SIGNED: Elya's Int is i64 two's-complement, so
+    // `(0 - 1) < 1` must be true. `and`/`or` are strict and bit-wise on
+    // i1 because BOTH evaluators are strict (spec §4.1) — a
+    // short-circuit diamond here would make native less-undefined than
+    // `elya run`, which is the mirror image of the Div trade.
+    let built = match op {
+        BinOp::Add => b.build_int_add(l, r, "add"),
+        BinOp::Sub => b.build_int_sub(l, r, "sub"),
+        BinOp::Mul => b.build_int_mul(l, r, "mul"),
+        BinOp::Lt => b.build_int_compare(IntPredicate::SLT, l, r, "lt"),
+        BinOp::Le => b.build_int_compare(IntPredicate::SLE, l, r, "le"),
+        BinOp::Gt => b.build_int_compare(IntPredicate::SGT, l, r, "gt"),
+        BinOp::Ge => b.build_int_compare(IntPredicate::SGE, l, r, "ge"),
+        BinOp::Eq => b.build_int_compare(IntPredicate::EQ, l, r, "eq"),
+        BinOp::Ne => b.build_int_compare(IntPredicate::NE, l, r, "ne"),
+        BinOp::And => b.build_and(l, r, "and"),
+        BinOp::Or => b.build_or(l, r, "or"),
+        other => return Err(CodegenError::Unsupported(op_label(other))),
+    };
+    built.map(|v| v.into()).map_err(internal)
 }
 
 /// §3.3 expression lowering: a recursive fold returning a `BasicValueEnum`,
@@ -850,30 +908,7 @@ fn lower_expr<'ctx>(
             }
             let l = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
             let r = lower_expr(ctx, func, b, lc, &args[1], env)?.into_int_value();
-            // Deliberately NO nsw/nuw flags: defined two's-complement wrapping
-            // (§3.4). Overflow reconciliation with the evaluator is tracked in
-            // spec §11 — not silently decided here.
-            //
-            // Comparisons are SIGNED: Elya's Int is i64 two's-complement, so
-            // `(0 - 1) < 1` must be true. `and`/`or` are strict and bit-wise on
-            // i1 because BOTH evaluators are strict (spec §4.1) — a
-            // short-circuit diamond here would make native less-undefined than
-            // `elya run`, which is the mirror image of the Div trade.
-            let built = match op {
-                BinOp::Add => b.build_int_add(l, r, "add"),
-                BinOp::Sub => b.build_int_sub(l, r, "sub"),
-                BinOp::Mul => b.build_int_mul(l, r, "mul"),
-                BinOp::Lt => b.build_int_compare(IntPredicate::SLT, l, r, "lt"),
-                BinOp::Le => b.build_int_compare(IntPredicate::SLE, l, r, "le"),
-                BinOp::Gt => b.build_int_compare(IntPredicate::SGT, l, r, "gt"),
-                BinOp::Ge => b.build_int_compare(IntPredicate::SGE, l, r, "ge"),
-                BinOp::Eq => b.build_int_compare(IntPredicate::EQ, l, r, "eq"),
-                BinOp::Ne => b.build_int_compare(IntPredicate::NE, l, r, "ne"),
-                BinOp::And => b.build_and(l, r, "and"),
-                BinOp::Or => b.build_or(l, r, "or"),
-                other => return Err(CodegenError::Unsupported(op_label(*other))),
-            };
-            built.map(|v| v.into()).map_err(internal)
+            prim_values(b, *op, l, r)
         }
         CoreKind::App(callee, args) => {
             // Ordinary (non-tail) position: `tailcc` convention, NO tail-call
@@ -1186,9 +1221,14 @@ fn lower_expr<'ctx>(
         // 5b-8: Core carries handlers from Task 5; native dispatch arrives in Task
         // 8. Until then a handler that reaches the back end is refused by name,
         // never mis-lowered.
-        CoreKind::Handle(_) => Err(CodegenError::Unsupported("handle")),
-        CoreKind::Resume(_) => Err(CodegenError::Unsupported("resume")),
-        CoreKind::Perform(_) => Err(CodegenError::Unsupported("perform")),
+        // D17: a handle is a nesting native call from a region that needs no
+        // CPS (the prepass refused every other position).
+        CoreKind::Handle(_) => cps_emit::emit_handle_site(ctx, func, b, lc, e, env),
+        CoreKind::Resume(_) => Err(CodegenError::Unsupported("resume (Task 8)")),
+        // Only CPS regions perform; reaching one here is an emitter bug.
+        CoreKind::Perform(_) => Err(CodegenError::Unsupported(
+            "perform outside an effectful region",
+        )),
     }
 }
 
@@ -1201,20 +1241,18 @@ fn lower_expr<'ctx>(
 /// from descriptor_rows, never recomputed").
 pub(crate) struct Descriptors {
     pub(crate) rows: Vec<u64>,
-    /// No reader outside the tests until 7b-3's emission; delete this `allow`
-    /// there (7b-3 acceptance: no `allow(dead_code)` left in the tree).
-    #[allow(dead_code)]
     pub(crate) frame_tag: usize,
     /// Continuation site key (`ContSite::key`) -> the tag its frames carry.
-    /// Same `allow`, same deletion point.
-    #[allow(dead_code)]
     pub(crate) site_tags: std::collections::BTreeMap<usize, usize>,
+    /// Handle key (`HandlerSite::key`) -> the tag its handler frame carries.
+    pub(crate) handler_tags: std::collections::BTreeMap<usize, usize>,
 }
 
 fn descriptor_rows(
     core: &CoreModule,
     lambdas: &[closure::LambdaSite],
     sites: &[cps::ContSite],
+    handlers: &[cps::HandlerSite],
     n_real_ctors: usize,
     string_tag: usize,
 ) -> Result<Descriptors, CodegenError> {
@@ -1296,28 +1334,39 @@ fn descriptor_rows(
                      // at the moment the row is pushed, and `site_tags` is the only place an
                      // emitter reads it from -- so there is no second assignment for a guard to
                      // compare against (unlike the lambda tags, assigned in `collect_lambdas`).
-    let mut site_tags = std::collections::BTreeMap::new();
-    for site in sites {
-        if site.saved.is_empty() {
-            site_tags.insert(site.key, frame_tag);
-            continue;
+                     // A handler frame (7b-3, D17) is the same shape -- `[tag][code_ptr =
+                     // the return clause][next = null][saved..]` -- so it takes a row by the
+                     // same rule, appended after the site rows.
+    let frame_row = |saved: &[(cps::Saved, Ty)], desc: &mut Vec<u64>| -> usize {
+        if saved.is_empty() {
+            return frame_tag;
         }
-        site_tags.insert(site.key, desc.len() / 2);
-        desc.push(2 + site.saved.len() as u64);
+        let tag = desc.len() / 2;
+        desc.push(2 + saved.len() as u64);
         // Bit 0 clear (code pointer), bit 1 set (`next`), bit j+2 set iff saved
         // value j is a heap value -- the lambda rows' convention shifted by one.
         let mut mask: u64 = 0b10;
-        for (j, (_, ty)) in site.saved.iter().enumerate() {
+        for (j, (_, ty)) in saved.iter().enumerate() {
             if is_heap_ty(ty) {
                 mask |= 1 << (j + 2);
             }
         }
         desc.push(mask);
+        tag
+    };
+    let mut site_tags = std::collections::BTreeMap::new();
+    for site in sites {
+        site_tags.insert(site.key, frame_row(&site.saved, &mut desc));
+    }
+    let mut handler_tags = std::collections::BTreeMap::new();
+    for h in handlers {
+        handler_tags.insert(h.key, frame_row(&h.saved, &mut desc));
     }
     Ok(Descriptors {
         rows: desc,
         frame_tag,
         site_tags,
+        handler_tags,
     })
 }
 
@@ -1347,6 +1396,26 @@ struct LowerCtx<'a, 'ctx> {
     /// program can still reach a name for.
     gc_push: FunctionValue<'ctx>,
     gc_pop: FunctionValue<'ctx>,
+    /// 5b-8 7b-3 (D16): the top-level functions compiled with the CPS
+    /// convention -- `(params.., ptr k) -> i64`.
+    cps_fns: &'a HashSet<String>,
+    /// Every Core node by address, so the CPS emitter can walk a site's
+    /// recorded path back up to its region root.
+    nodes: &'a HashMap<usize, &'a CoreExpr>,
+    /// Continuation sites (D10) and their index by node address.
+    sites: &'a [cps::ContSite],
+    site_index: &'a HashMap<usize, usize>,
+    /// Handles (D17) and their index by node address.
+    handlers: &'a [cps::HandlerSite],
+    handler_index: &'a HashMap<usize, usize>,
+    /// The descriptor table's tags: per site, per handler.
+    desc: &'a Descriptors,
+    /// Site key -> its resumption function `(i64 value, ptr frame) -> i64`.
+    resume_fns: &'a HashMap<usize, FunctionValue<'ctx>>,
+    /// Handle key -> (body `(ptr frame) -> i64`, return `(i64, ptr frame) -> i64`).
+    handler_fns: &'a HashMap<usize, (FunctionValue<'ctx>, FunctionValue<'ctx>)>,
+    /// D18: `elya_perform_unimplemented`, until Task 8.
+    perform_trap: FunctionValue<'ctx>,
 }
 
 /// Fold `core.types` into a flat constructor table: name -> (tag, field types).
@@ -1406,6 +1475,23 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         .map(|(i, s)| (s.key, i))
         .collect();
 
+    // 5b-8 7b-3: which functions are effectful (D16), and the refusals that
+    // keep the convention and D17's handle cut sound -- all before anything
+    // is emitted, like the arity caps above.
+    let cps_fns = cps_emit::cps_functions(core);
+    cps_emit::prepass(core, &cps_fns)?;
+    let sites = cps::collect_sites(core);
+    let handlers = cps::collect_handlers(core);
+    let site_index: HashMap<usize, usize> =
+        sites.iter().enumerate().map(|(i, s)| (s.key, i)).collect();
+    let handler_index: HashMap<usize, usize> = handlers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (h.key, i))
+        .collect();
+    let nodes = cps_emit::index_nodes(core);
+    let descriptors = descriptor_rows(core, &lambdas, &sites, &handlers, n_real_ctors, string_tag)?;
+
     let main = find_main(core)?;
     // §5.5: `main` ALONE. The scope narrows from "every function" (which was
     // trivially just `main` in N1) to "`main`", because `@elya_main`'s signature
@@ -1422,7 +1508,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
 
     // §4.2: declare Elya functions and runtime externals, then emit every body.
     // Runtime externals are `ccc` at the C-ABI boundary; Elya functions stay `tailcc`.
-    let decls = declare_all(ctx, &module, core)?;
+    let decls = declare_all(ctx, &module, core, &cps_fns)?;
     let ctors = build_ctor_table(core);
 
     let alloc_ty = ptrt.fn_type(&[i64t.into()], false);
@@ -1449,6 +1535,9 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let gc_report = module.add_function("elya_gc_report", gc_report_ty, None); // ccc
 
     let lifted = declare_lifted(ctx, &module, &lambdas)?;
+    let trap_ty = ctx.void_type().fn_type(&[], false);
+    let perform_trap = module.add_function("elya_perform_unimplemented", trap_ty, None); // ccc
+    let (resume_fns, handler_fns) = cps_emit::declare(ctx, &module, &nodes, &sites, &handlers);
 
     let lc = LowerCtx {
         module: &module,
@@ -1464,11 +1553,26 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         fail,
         gc_push,
         gc_pop,
+        cps_fns: &cps_fns,
+        nodes: &nodes,
+        sites: &sites,
+        site_index: &site_index,
+        handlers: &handlers,
+        handler_index: &handler_index,
+        desc: &descriptors,
+        resume_fns: &resume_fns,
+        handler_fns: &handler_fns,
+        perform_trap,
     };
     let b = ctx.create_builder();
     for f in &core.fns {
-        emit_body(ctx, &b, &lc, f)?;
+        if cps_fns.contains(&f.name) {
+            cps_emit::emit_cps_fn(ctx, &b, &lc, f)?;
+        } else {
+            emit_body(ctx, &b, &lc, f)?;
+        }
     }
+    cps_emit::emit_sites_and_handlers(ctx, &b, &lc)?;
     for site in lc.lambdas {
         emit_lifted(ctx, &b, &lc, site)?;
     }
@@ -1494,8 +1598,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     fmt.set_constant(true);
     fmt.set_unnamed_addr(true);
 
-    let sites = cps::collect_sites(core);
-    let desc = descriptor_rows(core, &lambdas, &sites, n_real_ctors, string_tag)?.rows;
+    let desc = descriptors.rows.clone();
     let n_ctors = (desc.len() / 2) as u64;
     let desc_const = i64t.const_array(
         &desc
@@ -2030,20 +2133,116 @@ mod tests {
         );
     }
 
+    // ---- 5b-8 7b-3 refusals (D16, D17, and what Task 8 owns) ----------------
+
+    const S_W: &str = "effect S { fn get() -> Int }\n\
+                       fn w(b) { if b { get() } else { 2 } }\n";
+
+    fn refused(prog: &str) -> CodegenError {
+        emit_ir(&core_of(&format!("{S_W}{prog}"))).unwrap_err()
+    }
+
     #[test]
-    fn a_perform_is_refused_by_name_until_dispatch_exists() {
-        // 5b-8 D11 / 7b-1: Core now says "perform" (CoreKind::Perform), so the
-        // back end refuses it by that name rather than misreporting it as a call
-        // to an undeclared function. Task 8 lifts the refusal and deletes this
-        // test on purpose.
-        let err = emit_ir(&core_of(
-            "effect E { fn ping() -> Int }\n\
-             fn worker() -> Int { ping() }\n\
-             pub fn main() -> Int { 0 }\n",
-        ))
-        .unwrap_err();
+    fn an_effect_polymorphic_function_used_at_a_user_effect_is_refused() {
+        // D16: `apply` is compiled once, direct; this instantiation would call
+        // an effectful lambda with the direct convention. N7's territory.
+        let err = refused(
+            "fn apply(f) { f(1) + 1 }\n\
+             pub fn main() -> Int {\n\
+             \x20 handle { apply(fn(x) { x * get() }) } with {\n\
+             \x20   S.get() -> resume(10)\n    return(r) -> r\n  }\n}\n",
+        );
         assert!(
-            matches!(err, CodegenError::Unsupported("perform")),
+            matches!(
+                err,
+                CodegenError::Unsupported("effect-polymorphic function used at a user effect")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_handle_nested_inside_another_handle_is_refused() {
+        // D17: the inner handle is a nesting call the outer capture cannot see past.
+        let err = refused(
+            "pub fn main() -> Int {\n\
+             \x20 handle {\n\
+             \x20   handle { w(False) } with { S.get() -> resume(1)  return(r) -> r }\n\
+             \x20 } with { S.get() -> resume(2)  return(r) -> r }\n}\n",
+        );
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("handle nested inside another handle")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_handle_inside_an_effectful_function_is_refused() {
+        // D17: `g` performs S outside its handle, so it is CPS, and a perform
+        // inside its handle could need the code after it.
+        let err = refused(
+            "effect T { fn t() -> Int }\n\
+             fn g() -> Int {\n\
+             \x20 let a = handle { w(False) } with { S.get() -> resume(1)  return(r) -> r }\n\
+             \x20 a + t()\n}\n\
+             pub fn main() -> Int {\n\
+             \x20 handle { g() } with { T.t() -> resume(1)  return(r) -> r }\n}\n",
+        );
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("handle inside an effectful function")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_effectful_lambda_is_refused_until_task_8() {
+        let err = refused(
+            "pub fn main() -> Int {\n\
+             \x20 handle { let f = fn(x) { x + get() }  f(1) } with {\n\
+             \x20   S.get() -> resume(1)\n    return(r) -> r\n  }\n}\n",
+        );
+        assert!(
+            matches!(err, CodegenError::Unsupported("effectful lambda (Task 8)")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_effectful_function_with_five_parameters_is_refused() {
+        // D14: the continuation is a sixth LLVM parameter, past MAX_PARAMS.
+        let err = refused(
+            "fn five(a, b, c, d, e) { a + b + c + d + e + get() }\n\
+             pub fn main() -> Int {\n\
+             \x20 handle { five(1, 2, 3, 4, 5) } with {\n\
+             \x20   S.get() -> resume(1)\n    return(r) -> r\n  }\n}\n",
+        );
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("effectful function takes more than four parameters")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_resume_reached_by_emission_is_refused_until_task_8() {
+        // A lambda inside a clause is emitted as an ordinary lifted function;
+        // its `resume` must stop the build, never compile to something.
+        let err = refused(
+            "pub fn main() -> Int {\n\
+             \x20 let f = handle { w(False) } with {\n\
+             \x20   S.get() -> fn(s) { (resume(s))(s) }\n\
+             \x20   return(x) -> fn(s) { x }\n  }\n  f(1)\n}\n",
+        );
+        assert!(
+            matches!(err, CodegenError::Unsupported("resume (Task 8)")),
             "{err:?}"
         );
     }
@@ -2328,7 +2527,7 @@ mod tests {
         let lambdas = closure::collect_lambdas(&core, n_real_ctors);
         assert_eq!(lambdas.len(), 1, "the program must carry one lambda row");
         let string_tag = n_real_ctors + lambdas.len();
-        let rows = descriptor_rows(&core, &lambdas, &[], n_real_ctors, string_tag)
+        let rows = descriptor_rows(&core, &lambdas, &[], &[], n_real_ctors, string_tag)
             .expect("rows")
             .rows;
         let frame_tag = string_tag + 1;

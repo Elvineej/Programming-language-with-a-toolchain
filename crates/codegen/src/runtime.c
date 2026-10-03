@@ -260,6 +260,14 @@ void elya_match_fail(void) {
     exit(1);
 }
 
+/* 5b-8 D18: until Task 8 lands native effect dispatch, a perform that is
+ * reached at run time stops here -- a named message and a non-zero exit, never
+ * a wrong answer. Task 8 replaces every call to it. */
+void elya_perform_unimplemented(void) {
+    fputs("elya: perform: native effect dispatch is not implemented yet (5b-8 Task 8)\n", stderr);
+    exit(1);
+}
+
 /* Gated OFF by default, and that is load-bearing: every existing execution
  * test asserts stderr is empty, so an unconditional dump would break the whole
  * corpus at once. */
