@@ -2120,3 +2120,26 @@ fn a_deep_non_tail_effectful_recursion_finds_its_handler_in_constant_time() {
     assert_eq!(out.trim(), "400000");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_growing_live_set_is_collected_a_logarithmic_number_of_times() {
+    // A fixed 64K-word threshold re-marks a growing live set every 64K words,
+    // so total marking is quadratic (measured before the fix: 46 collections
+    // building this 1M list; 183 for the 1M-deep effectful loop, 6.8 s).
+    // Collecting when allocation since the last collection reaches
+    // max(64K, live) doubles the heap between collections: O(log n) of them.
+    let src = "type L { Nil, Cons(Int, L) }\n\
+         fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(1, acc)) } }\n\
+         pub fn main() -> Int { let keep = build(1000000, Nil)  match keep { Nil -> 0  Cons(h, t) -> h } }\n";
+    let dir = temp_dir("gc-doubling");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "build1m");
+    let (stdout, stats) = run_with_gc_stats(&exe, "build1m");
+    assert_eq!(stdout, "1");
+    assert!(stats.collections >= 1, "{stats:?}");
+    assert!(
+        stats.collections <= 10,
+        "a live set growing to 3M words must not be re-marked every 64K words: {stats:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

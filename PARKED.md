@@ -159,7 +159,9 @@ did not finish in 10 minutes. The 7b-3 deep-frames test uses n = 4000 because of
 - Refusals that Task 8 did not lift were renamed from "(Task 8)" to "(not yet compiled
   natively)": effectful lambdas, effectful closure calls, effectful calls inside a `match`.
 
-## Collector: a fixed 64K-word threshold makes deep live structures quadratic (found 2026-10-03)
+## RESOLVED (commit after e2c112a): a fixed 64K-word threshold made deep live structures quadratic (found 2026-10-03)
+
+`elya_alloc` now collects when allocation since the last collection reaches max(64K, live). 1M list: 45 -> 6 collections; 1M-deep effectful loop: 6.8 s -> 0.4 s. Pinned by `a_growing_live_set_is_collected_a_logarithmic_number_of_times`. Original report:
 
 `elya_alloc` collects every `GC_THRESHOLD_WORDS` (1 << 16) words regardless of the live set,
 and every collection marks everything live. With a growing live set the total marking is
