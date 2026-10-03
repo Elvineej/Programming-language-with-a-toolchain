@@ -893,3 +893,11 @@ numbers; each section amended above carries a dated pointer here.
   function therefore has at most 4 source parameters. A9's N = 1 000 000 is unchanged.
 - **D15.** Plan-only: the plan's 7b test moves to Task 8, its predicted failure corrected
   to the measured one.
+- **D16 (§8.1, §8.2).** The CPS key is "the row NAMES a user-declared effect"; an open tail
+  alone is direct. An effect-polymorphic function used at a user effect is refused by name (N7),
+  and a call whose callee type disagrees with the callee's convention is refused. Measured
+  motive: `apply(fn(x) { x * 10 })` compiles and prints 11 at `831b023`, and would crash under
+  "open means CPS".
+- **D17 (§8.3).** A `handle` compiles only in a region that does not need CPS and not inside
+  another handle; otherwise it is refused by name.
+- **D18.** Until Task 8, a `Perform` compiles to the named trap `elya_perform_unimplemented`.

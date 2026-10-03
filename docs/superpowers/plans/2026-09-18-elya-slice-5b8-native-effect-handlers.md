@@ -257,6 +257,55 @@ Task 8's red step re-measures instead of assuming.
 
 ---
 
+## Decisions taken at the Task 7b-3 checkpoint (2026-10-03; settled — do not re-litigate)
+
+Reading the emitter before writing 7b-3 found three forks. The reviewer took A1, B1 and C1.
+
+### D16 — The calling convention follows the user effects a type NAMES; an effect-polymorphic function used at a user effect is refused (N7)
+
+**Why.** 7a's `needs_cps` answered `true` for an open row tail, "conservatively". Measured at
+`831b023`: `fn apply(f) { f(1) + 1 }` with `pub fn main() -> Int { apply(fn(x) { x * 10 }) }`
+compiles natively today and prints `11`. Compiled once, `apply` would call `f` with the CPS
+convention while the pure lambda passed to it is compiled direct: a wrong-convention call, so a
+program that works today would crash. Over-CPS is not "safe" across a convention boundary.
+
+**What.** `needs_cps` is true iff the row names a user-declared effect; an open tail alone is
+direct (`an_open_row_tail_selects_cps_conservatively` flips to `false` — an approved
+expected-value change). A top-level function is CPS iff its body region (lambda and handle
+subtrees excluded) contains a `Perform` or a call whose callee type `needs_cps`. Two refusals keep
+that sound: (1) a reference to a top-level function whose generic signature (its params' and
+body's types) contains an open row, at an instantiated type that names a user effect, is refused
+as "effect-polymorphic function used at a user effect" — N7's territory, like `Ty::Var`
+(`apply(fn(x) { x * get() })` type-checks and the evaluator runs it; native refuses it by name);
+(2) any call whose callee type disagrees with the callee's own convention is refused, as a guard
+on the emitter itself. Effectful lambdas and indirect effectful calls are refused by name in 7b-3
+and are Task 8's.
+
+### D17 — A `handle` compiles only where nothing outside it can be captured
+
+**Why.** Under D14 a handle is a nesting native call. A perform of an OUTER effect inside it
+would need to capture the code after the `handle`, which is on the machine stack, not in the
+frame chain (the 7b-2 review's concern (b), confirmed by reading).
+
+**What.** A `handle` is accepted only in a region that does not need CPS (its function is not
+CPS; effectful lambdas are refused anyway) and not lexically inside another handle. Everything
+else is refused by name. The handler corpus (sequential handles in `main`), A6 and A9 are inside
+this cut. Lifting it means making a non-tail `handle` a continuation site — a later slice.
+
+### D18 — Until Task 8, a `Perform` compiles to a named runtime trap
+
+**Why.** Effect annotations are exact (measured: `/ {S}` on a body that never performs is
+E0423), so every effectful body contains a `Perform` somewhere, and 7b-3's first execution test
+("a handle whose body does not perform at run time") could not even build while codegen refused
+`Perform` at compile time.
+
+**What.** A `Perform` emits a call to `elya_perform_unimplemented`, which prints a named message
+and exits non-zero: never a wrong answer, only a loud stop. The compile-time refusal test
+`a_perform_is_refused_by_name_until_dispatch_exists`, which Task 8 was to delete, is replaced by
+an execution test of the trap — an approved expected-value change. Task 8 replaces the trap.
+
+---
+
 ## File Structure
 
 | File | Responsibility | Tasks |
