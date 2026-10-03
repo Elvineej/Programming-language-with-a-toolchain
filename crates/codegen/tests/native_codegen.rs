@@ -2143,3 +2143,117 @@ fn a_growing_live_set_is_collected_a_logarithmic_number_of_times() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A1 (plan Task 9). Three shapes, each chosen for one property dispatch can
+/// get wrong: a NON-TAIL resume (the value flows back through `+` in the
+/// clause body), TWO ops under one handler (the `(effect, op)` match must read
+/// the op name), and TWO sequential handles (the handler record must be
+/// scoped to its body). No `<>`, no `with multi`, every main Int-valued.
+/// Values were predicted in writing before the first run.
+const HANDLER_CORPUS: &[(&str, &str, &str)] = &[
+    (
+        "ask-nontail",
+        "effect Ask { fn ask() -> Int }\n\
+         fn one() { ask() }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { one() } with {\n\
+         \x20   Ask.ask() -> 1 + resume(2)\n\
+         \x20   return(x) -> x\n\
+         \x20 }\n\
+         }\n",
+        "3",
+    ),
+    (
+        "two-ops",
+        "effect Two { fn a() -> Int  fn b() -> Int }\n\
+         fn both() { a() + b() }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { both() } with {\n\
+         \x20   Two.a() -> resume(10)\n\
+         \x20   Two.b() -> resume(4)\n\
+         \x20   return(x) -> x\n\
+         \x20 }\n\
+         }\n",
+        "14",
+    ),
+    (
+        "two-handles",
+        "effect Ask { fn ask() -> Int }\n\
+         fn one() { ask() }\n\
+         pub fn main() -> Int {\n\
+         \x20 let x = handle { one() } with { Ask.ask() -> resume(1)  return(v) -> v }\n\
+         \x20 let y = handle { one() } with { Ask.ask() -> resume(20)  return(v) -> v }\n\
+         \x20 x + y\n\
+         }\n",
+        "21",
+    ),
+];
+
+#[test]
+fn the_handler_corpus_compiles_and_runs() {
+    let dir = temp_dir("handler-corpus");
+    for (tag, src, expected) in HANDLER_CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        assert_runs(&exe, expected);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_handler_corpus() {
+    let dir = temp_dir("differential-handler");
+    for (tag, src, _) in HANDLER_CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        assert!(
+            out.status.success(),
+            "{tag}: binary exited {:?}",
+            out.status
+        );
+        let native = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            native,
+            eval_main_int(src),
+            "{tag}: native output diverges from the evaluator"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A1's second half: the exact bytes. The `io.println` sits INSIDE the clause
+/// body, so the text also witnesses that the body ran once per perform -- two
+/// lines, in order. Both halves are compared with the evaluator, and the text
+/// is also pinned, so an empty-vs-empty comparison cannot pass vacuously.
+#[test]
+fn a_printing_clause_body_matches_the_evaluator_byte_for_byte() {
+    let src = "effect Ask { fn ask() -> Int }\n\
+               fn twice() { ask() + ask() }\n\
+               pub fn main() -> Int {\n\
+               \x20 handle { twice() } with {\n\
+               \x20   Ask.ask() -> { io.println(\"asked\")  resume(1) }\n\
+               \x20   return(x) -> x\n\
+               \x20 }\n\
+               }\n";
+    let dir = temp_dir("handler-printing");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "handler-printing");
+    let (text, value) = native_text_value(&exe, "handler-printing");
+    assert_eq!(
+        text,
+        eval_main_text(src),
+        "native println text diverges from the evaluator"
+    );
+    assert_eq!(
+        value,
+        eval_main_int(src),
+        "native main value diverges from the evaluator"
+    );
+    assert_eq!(
+        text, "asked\nasked\n",
+        "the clause body must run once per perform, in order"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
