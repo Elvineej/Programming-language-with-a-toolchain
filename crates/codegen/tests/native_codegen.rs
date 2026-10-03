@@ -1351,3 +1351,369 @@ fn a3_a_polymorphic_effect_declaration_compiles_and_runs_natively() {
     assert_runs(&exe, "0");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- 5b-8 Task 7b-3: the effectful calling convention, frames, handle entry,
+// the return clause and the handler frame (D10, D14, D16-D18). No perform
+// happens at run time in this corpus -- dispatch is Task 8 -- but every body
+// calls an effectful function, so the CPS convention, per-site frames and
+// the handler frame all execute.
+
+/// `compile_and_link`, reporting a refusal instead of panicking, so a corpus
+/// loop can collect every case's outcome.
+fn try_compile_and_link(
+    core: &elya::core::CoreModule,
+    dir: &Path,
+    tag: &str,
+) -> Result<PathBuf, String> {
+    let obj = dir.join(format!("{tag}.o"));
+    let exe = dir.join(format!("{tag}{}", std::env::consts::EXE_SUFFIX));
+    elya_codegen::compile_module(core, &obj).map_err(|e| format!("compile: {e:?}"))?;
+    elya_codegen::link(&obj, &exe).map_err(|e| format!("link: {e:?}"))?;
+    Ok(exe)
+}
+
+const S_W: &str = "effect S { fn get() -> Int }\n\
+                   fn w(b) { if b { get() } else { 2 } }\n";
+
+/// (tag, program after S_W, expected). Expected values were measured with the
+/// evaluator before any emitter code was written (7b-3 predictions).
+const HANDLE_7B3: &[(&str, &str, &str)] = &[
+    (
+        "tail-cps-in-body",
+        "pub fn main() -> Int {\n\
+         \x20 handle { w(False) } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r * 10\n\
+         \x20 }\n\
+         }\n",
+        "20",
+    ),
+    (
+        // A non-tail effectful call in `u` (a site saving `a` and `x`) and one
+        // in the handled body (a site saving `y`).
+        "site-saves-local-and-temp",
+        "fn u(x) {\n\
+         \x20 let a = x * 3\n\
+         \x20 a + w(False) + x\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 let y = 7\n\
+         \x20 handle { y + u(5) } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r * 10\n\
+         \x20 }\n\
+         }\n",
+        "290",
+    ),
+    (
+        "return-reads-local",
+        "pub fn main() -> Int {\n\
+         \x20 let m = 3\n\
+         \x20 handle { w(False) } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r * m\n\
+         \x20 }\n\
+         }\n",
+        "6",
+    ),
+    (
+        "no-return-clause",
+        "pub fn main() -> Int {\n\
+         \x20 handle { w(False) + 1 } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20 }\n\
+         }\n",
+        "3",
+    ),
+    (
+        "sequential-handles",
+        "pub fn main() -> Int {\n\
+         \x20 let x = handle { w(False) } with { S.get() -> resume(1)  return(v) -> v }\n\
+         \x20 let y = handle { w(False) + 40 } with { S.get() -> resume(1)  return(v) -> v * 2 }\n\
+         \x20 x + y\n\
+         }\n",
+        "86",
+    ),
+    (
+        // The resumption reads an already-evaluated operand (`x * 3`) back
+        // out of the frame as a temporary, not by recomputing it.
+        "site-saves-a-temporary",
+        "fn v(x) { (x * 3) + w(False) }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { v(5) } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r\n\
+         \x20 }\n\
+         }\n",
+        "17",
+    ),
+    (
+        // The hole is an `if` condition: the resumption branches.
+        "site-in-an-if-condition",
+        "pub fn main() -> Int {\n\
+         \x20 handle { if w(False) == 2 { 10 } else { 20 } } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r + 1\n\
+         \x20 }\n\
+         }\n",
+        "11",
+    ),
+    (
+        // Two sites in one operand list: the second site's frame saves the
+        // first site's value, which the resumption holds as `cur` (found by
+        // the 7b-3 review: it was refused as "saved temporary is not
+        // available").
+        "two-sites-in-one-expression",
+        "pub fn main() -> Int {\n\
+         \x20 handle { w(False) + w(False) * w(False) } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r\n\
+         \x20 }\n\
+         }\n",
+        "6",
+    ),
+    (
+        "two-sites-in-one-call",
+        "fn u(a, b) { a * 100 + b }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { u(w(False), w(False) + 1) } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r\n\
+         \x20 }\n\
+         }\n",
+        "203",
+    ),
+    (
+        // D16's regression pin: an effect-polymorphic function used at a pure
+        // lambda stays direct and keeps working.
+        "apply-pure-stays-direct",
+        "fn apply(f) { f(1) + 1 }\n\
+         pub fn main() -> Int { apply(fn(x) { x * 10 }) }\n",
+        "11",
+    ),
+];
+
+const DEEP_FRAMES: &str = "type L { Nil, Cons(Int, L) }\n\
+     effect S { fn get() -> Int }\n\
+     fn w(b) { if b { get() } else { 2 } }\n\
+     fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n\
+     fn deep(n, b) {\n\
+     \x20 if n == 0 { w(b) } else {\n\
+     \x20   let junk = Cons(1, Cons(2, Cons(3, Cons(4, Nil))))\n\
+     \x20   let c = Cons(n, Nil)\n\
+     \x20   let r = deep(n - 1, b)\n\
+     \x20   r + head(c)\n\
+     \x20 }\n\
+     }\n\
+     pub fn main() -> Int {\n\
+     \x20 handle { deep(4000, False) } with {\n\
+     \x20   S.get() -> resume(1)\n\
+     \x20   return(r) -> r\n\
+     \x20 }\n\
+     }\n";
+
+#[test]
+fn the_7b3_handle_corpus_compiles_runs_and_prints_the_expected_answer() {
+    // Every case runs and is reported before the assertion, so a negative
+    // control shows exactly WHICH cases it breaks (one assertion path per case).
+    let dir = temp_dir("handle-7b3");
+    let mut failures = Vec::new();
+    for (tag, prog, expected) in HANDLE_7B3 {
+        let src = format!("{S_W}{prog}");
+        let core = lower_src(&src);
+        let exe = match try_compile_and_link(&core, &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || got != *expected {
+            failures.push(format!(
+                "{tag}: {:?} stdout={got:?} want={expected}",
+                out.status
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_7b3_handle_corpus() {
+    let dir = temp_dir("differential-handle-7b3");
+    let mut failures = Vec::new();
+    for (tag, prog, _) in HANDLE_7B3 {
+        let src = format!("{S_W}{prog}");
+        let core = lower_src(&src);
+        let exe = match try_compile_and_link(&core, &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let want = eval_main_int(&src);
+        if !out.status.success() || got != want {
+            failures.push(format!(
+                "{tag}: {:?} native={got:?} evaluator={want}",
+                out.status
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        failures.is_empty(),
+        "native diverges from the evaluator: {failures:#?}"
+    );
+}
+
+#[test]
+fn frames_holding_heap_values_survive_collections_and_match_the_evaluator() {
+    // D10's rows under load: 4000 non-tail effectful calls deep, each frame
+    // saving a heap `Cons` across the call while garbage forces collections.
+    // A frame row that failed to trace its saved value would let the
+    // collector reuse it, and `head(c)` would read garbage.
+    let dir = temp_dir("deep-frames-7b3");
+    let core = lower_src(DEEP_FRAMES);
+    let exe = compile_and_link(&core, &dir, "deep");
+    let (stdout, stats) = run_with_gc_stats(&exe, "deep");
+    assert!(stats.collections >= 1, "no collection ran: {stats:?}");
+    assert_eq!(
+        stdout,
+        eval_main_int(DEEP_FRAMES),
+        "native diverges from the evaluator"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_perform_reached_at_run_time_traps_with_a_named_error() {
+    // D18: until Task 8, a perform compiles to a named trap -- a loud stop,
+    // never a wrong answer.
+    let dir = temp_dir("perform-trap-7b3");
+    let src = format!(
+        "{S_W}pub fn main() -> Int {{\n  handle {{ w(True) }} with {{\n    \
+         S.get() -> resume(1)\n    return(r) -> r\n  }}\n}}\n"
+    );
+    let core = lower_src(&src);
+    let exe = compile_and_link(&core, &dir, "trap");
+    let out = Command::new(&exe).output().expect("run produced binary");
+    assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("elya: perform: native effect dispatch is not implemented yet"),
+        "stderr should name the trap, got: {stderr}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Programs from the 7b-3 independent review whose heap values were live
+/// across allocations in CPS code without a root. Each runs under collection
+/// pressure and is compared to the evaluator, text and value.
+const CPS_ROOTING: &[(&str, &str)] = &[
+    (
+        // D-1: the value a site returned, held by the resumption while a
+        // later operand (`garbage(100)`) allocates.
+        "hole-value-across-a-later-operand",
+        "type L { Nil, Cons(Int, L) }\n\
+         effect S { fn get() -> Int }\n\
+         fn w(b) { if b { get() } else { 2 } }\n\
+         fn mkl(n, b) { let x = w(b)  Cons(n + x, Nil) }\n\
+         fn garbage(n) { if n == 0 { Cons(7777, Nil) } else { let j = Cons(n, Cons(n, Nil))  garbage(n - 1) } }\n\
+         fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n\
+         fn pair(a, z) { head(a) + head(z) - 7777 }\n\
+         fn lp(i, acc, b) { if i == 0 { acc } else { lp(i - 1, acc + pair(mkl(i, b), garbage(100)), b) } }\n\
+         pub fn main() -> Int { handle { lp(2000, 0, False) } with { S.get() -> resume(1)  return(r) -> r } }\n",
+    ),
+    (
+        // D-3: a string literal operand of a resumption, live while a later
+        // operand allocates.
+        "string-literal-in-a-resumption",
+        "type L { Nil, Cons(Int, L) }\n\
+         effect S { fn get() -> Int }\n\
+         fn w(b) { if b { get() } else { 2 } }\n\
+         fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n\
+         fn garbage(n) { if n == 0 { Cons(7777, Nil) } else { let j = Cons(n, Cons(n, Nil))  garbage(n - 1) } }\n\
+         fn pr(n, s, l) { let z = io.println(s)  n + head(l) }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { pr(w(False), \"hello\", garbage(12000)) } with { S.get() -> resume(1)  return(r) -> r }\n\
+         }\n",
+    ),
+    (
+        // D-3: a string literal LEFT of the site is re-lowered by the
+        // resumption, and must be rooted while a later operand allocates.
+        "string-literal-left-of-a-site",
+        "type L { Nil, Cons(Int, L) }\n\
+         effect S { fn get() -> Int }\n\
+         fn w(b) { if b { get() } else { 2 } }\n\
+         fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n\
+         fn garbage(n) { if n == 0 { Cons(7777, Nil) } else { let j = Cons(n, Cons(n, Nil))  garbage(n - 1) } }\n\
+         fn pr(s, n, l) { let z = io.println(s)  n + head(l) }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { pr(\"hello\", w(False), garbage(12000)) } with { S.get() -> resume(1)  return(r) -> r }\n\
+         }\n",
+    ),
+    (
+        // D-3: the same, in forward CPS code on a path that takes no site.
+        "string-literal-before-an-untaken-site",
+        "type L { Nil, Cons(Int, L) }\n\
+         effect S { fn get() -> Int }\n\
+         fn w(b) { if b { get() } else { 2 } }\n\
+         fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n\
+         fn garbage(n) { if n == 0 { Cons(7777, Nil) } else { let j = Cons(n, Cons(n, Nil))  garbage(n - 1) } }\n\
+         fn pr(s, l, n) { let z = io.println(s)  n + head(l) }\n\
+         fn go(c) { pr(\"hello\", garbage(12000), if c { w(False) } else { 1 }) }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { go(False) } with { S.get() -> resume(1)  return(r) -> r }\n\
+         }\n",
+    ),
+];
+
+#[test]
+fn heap_values_live_across_cps_operands_survive_collections() {
+    let dir = temp_dir("cps-rooting-7b3");
+    let mut failures = Vec::new();
+    for (tag, src) in CPS_ROOTING {
+        let core = lower_src(src);
+        let exe = match try_compile_and_link(&core, &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let out = Command::new(&exe)
+            .env("ELY_GC_STATS", "1")
+            .output()
+            .expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        if !out.status.success() {
+            failures.push(format!("{tag}: {:?} stderr={stderr:?}", out.status));
+            continue;
+        }
+        if !stderr
+            .lines()
+            .any(|l| l.starts_with("elya-gc:") && !l.contains("collections=0"))
+        {
+            failures.push(format!("{tag}: no collection ran: {stderr:?}"));
+        }
+        let (text, value) = split_text_and_value(&stdout, tag);
+        let (want_text, want_value) = (eval_main_text(src), eval_main_int(src));
+        if text != want_text || value != want_value {
+            failures.push(format!(
+                "{tag}: native text={text:?} value={value} evaluator text={want_text:?} value={want_value}"
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}

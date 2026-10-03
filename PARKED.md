@@ -99,3 +99,42 @@ effect index, after `Infer.ops` (richer: it carries signatures, like
 `effect_multi` it stays separate) and the evaluator's `op_table`. Redirecting
 `op_table` to the helper touches the reference semantics, so it was not done in
 5b-8; do it, gated, in a later slice.
+
+## HIGH: shadowed heap bindings are not rooted by the direct emitter (pre-existing, found 2026-10-03)
+
+`lower_expr`'s `Let` saves a shadowed binding in a Rust local (`prev`) and roots only the
+`env` view, so an outer heap binding hidden by an inner `let` of the same name is NOT on the
+shadow stack while the inner scope allocates. A collection frees it; after the inner scope
+the outer name reads a reused block. Measured at 831b023+ (the last commit before 7b-3, and
+unchanged by 7b-3): prints `33792`, expected `30049` (`7 + 30000 + 42`).
+
+```
+type L { Nil, Cons(Int, L) }
+fn churn(n, acc) { if n == 0 { acc } else { let g = Cons(n, Cons(n, Cons(n, Nil)))  churn(n - 1, acc + 1) } }
+fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }
+pub fn main() -> Int {
+  let s = Cons(42, Nil)
+  let r = { let s = Cons(7, Nil)  let z = churn(30000, 0)  head(s) + z }
+  r + head(s)
+}
+```
+
+The CPS emitter (7b-3) roots by binding index (`St::binds`), not by the name view, so its own
+allocations do not have this hole -- but the direct code it calls into does. Fix in its own
+slice: root every live binding (shadowed ones included), with this program as the red test.
+
+## 7b-3 review follow-ups (Task 8 and later)
+
+- Resumption functions are declared and emitted for EVERY call site, including sites inside
+  clause bodies, which 7b-3 never emits. A site whose path runs through `resume(..)` would
+  stop the build with "resume (Task 8)". Every such program the reviewer could build is
+  refused earlier today; Task 8 must emit clause bodies and revisit this.
+- D16's refusal is conservative: `fn ap(f) { f(1) + get() }` is refused at every use that
+  names a user effect, even with a pure lambda (its generic signature has an open row). Lift
+  with N7.
+
+## Evaluator: non-tail recursion under a handler is quadratic (found 2026-10-03)
+
+`deep(n)` (non-tail recursion that keeps a `Cons` per level) under a `handle` takes 0.12 s at
+n = 1000, 0.43 s at 2000, 1.70 s at 4000 (debug `elya run`): ~4x per doubling, and n = 100 000
+did not finish in 10 minutes. The 7b-3 deep-frames test uses n = 4000 because of this.
