@@ -260,11 +260,27 @@ void elya_match_fail(void) {
     exit(1);
 }
 
-/* 5b-8 D18: until Task 8 lands native effect dispatch, a perform that is
- * reached at run time stops here -- a named message and a non-zero exit, never
- * a wrong answer. Task 8 replaces every call to it. */
-void elya_perform_unimplemented(void) {
-    fputs("elya: perform: native effect dispatch is not implemented yet (5b-8 Task 8)\n", stderr);
+/* 5b-8 Task 8 (D10, D17): walk a continuation's frames, word 2 of each
+ * (`next`), to its end -- the handler frame, whose `next` is null. Reads words
+ * only; never calls back into emitted code and never allocates. */
+void *elya_handler_of(int64_t *k) {
+    while (k[2] != 0) {
+        k = (int64_t *)k[2];
+    }
+    return k;
+}
+
+/* 5b-8 D13: one-shot is enforced natively. A second resume stops here -- a
+ * named message and a non-zero exit, never a re-run. */
+void elya_resume_twice(void) {
+    fputs("elya: resume: a one-shot continuation was resumed twice\n", stderr);
+    exit(1);
+}
+
+/* A perform whose handler has no clause for it. The type checker makes this
+ * unreachable; a guard, never `unreachable`. */
+void elya_unhandled_effect(void) {
+    fputs("elya: perform: the handler has no clause for this operation\n", stderr);
     exit(1);
 }
 

@@ -166,7 +166,14 @@ fn check(
         CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
             a.iter().try_for_each(|x| go(x, scope))
         }
-        CoreKind::Perform(p) => p.args.iter().try_for_each(|a| go(a, scope)),
+        CoreKind::Perform(p) => {
+            if p.args.len() + 2 > MAX_PARAMS {
+                return Err(CodegenError::Unsupported(
+                    "effect operation takes more than three parameters",
+                ));
+            }
+            p.args.iter().try_for_each(|a| go(a, scope))
+        }
         CoreKind::Resume(v) => go(v, scope),
         CoreKind::Let(x, v, body) => {
             go(v, scope)?;
@@ -193,7 +200,9 @@ fn check(
         }
         CoreKind::Lambda(params, body) => {
             if needs_cps(&e.ty) {
-                return Err(CodegenError::Unsupported("effectful lambda (Task 8)"));
+                return Err(CodegenError::Unsupported(
+                    "effectful lambda (not yet compiled natively)",
+                ));
             }
             let depth = scope.len();
             scope.extend(params.iter().map(|p| p.name.clone()));
@@ -202,9 +211,24 @@ fn check(
             r
         }
         CoreKind::Handle(h) => {
+            // spec 5.4 / A2: refused on the handle node, FIRST -- before any
+            // other check and before any clause body is looked at. Keyed on the
+            // bit lowering stamped from the effect's declaration (D4).
+            if h.is_multi_declared {
+                return Err(CodegenError::Unsupported(
+                    "multi-shot handler (`with multi`)",
+                ));
+            }
             if in_handle {
                 return Err(CodegenError::Unsupported(
                     "handle nested inside another handle",
+                ));
+            }
+            // A clause takes the op's arguments, the continuation and the
+            // handler frame (Task 8): MAX_PARAMS is the measured win64 limit.
+            if h.clauses.iter().any(|c| c.params.len() + 2 > MAX_PARAMS) {
+                return Err(CodegenError::Unsupported(
+                    "effect operation takes more than three parameters",
                 ));
             }
             if region_cps {
@@ -251,9 +275,43 @@ fn check_reference(target: &elya::core::CoreFn, at: &Ty, cps_fns: &HashSet<Strin
 
 // ------------------------------------------------------------ declarations --
 
-/// One resumption function per continuation site whose node is a call (a
-/// perform site has none until Task 8), and a body and return function per
-/// handle.
+/// Task 8: every `(effect, op)` the module performs or handles, numbered in
+/// sorted order -- the index into every handle's clause table.
+pub(crate) fn op_ids(core: &CoreModule) -> HashMap<(String, String), usize> {
+    let mut all = std::collections::BTreeSet::new();
+    for e in index_nodes(core).values() {
+        match &e.kind {
+            CoreKind::Perform(p) => {
+                all.insert((p.effect.clone(), p.op.clone()));
+            }
+            CoreKind::Handle(h) => {
+                for c in h.clauses.iter() {
+                    all.insert((c.effect.clone(), c.op.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    all.into_iter().enumerate().map(|(i, k)| (k, i)).collect()
+}
+
+/// A handle's functions (7b-3 and Task 8).
+#[derive(Clone)]
+pub(crate) struct HandlerFns<'ctx> {
+    /// `(ptr frame) -> i64`: the handled body, a CPS region.
+    pub(crate) body: FunctionValue<'ctx>,
+    /// `(i64, ptr frame) -> i64`: the return clause, the frame's code.
+    pub(crate) ret: FunctionValue<'ctx>,
+    /// One per clause, in clause order: `(op args.., ptr cont, ptr frame) -> i64`.
+    pub(crate) clauses: Vec<FunctionValue<'ctx>>,
+    /// The static clause table, indexed by `op_ids`: a clause's code address,
+    /// or 0 where this handle has no clause for that op.
+    pub(crate) table: PointerValue<'ctx>,
+}
+
+/// One resumption function per continuation site (calls and, since Task 8,
+/// performs), and per handle its body, return clause, clause functions and
+/// static clause table.
 #[allow(clippy::type_complexity)]
 pub(crate) fn declare<'ctx>(
     ctx: &'ctx Context,
@@ -261,17 +319,21 @@ pub(crate) fn declare<'ctx>(
     nodes: &HashMap<usize, &CoreExpr>,
     sites: &[ContSite],
     handlers: &[HandlerSite],
-) -> (
+    op_ids: &HashMap<(String, String), usize>,
+) -> R<(
     HashMap<usize, FunctionValue<'ctx>>,
-    HashMap<usize, (FunctionValue<'ctx>, FunctionValue<'ctx>)>,
-) {
+    HashMap<usize, HandlerFns<'ctx>>,
+)> {
     let i64t = ctx.i64_type();
     let ptrt = ctx.ptr_type(AddressSpace::default());
     let code_ty = i64t.fn_type(&[i64t.into(), ptrt.into()], false);
     let body_ty = i64t.fn_type(&[ptrt.into()], false);
     let mut resume = HashMap::new();
     for (i, s) in sites.iter().enumerate() {
-        if !matches!(nodes.get(&s.key).map(|n| &n.kind), Some(CoreKind::App(..))) {
+        if !matches!(
+            nodes.get(&s.key).map(|n| &n.kind),
+            Some(CoreKind::App(..)) | Some(CoreKind::Perform(_))
+        ) {
             continue;
         }
         let f = module.add_function(&mangle(&format!("{}.k.{i}", s.owner)), code_ty, None);
@@ -284,9 +346,46 @@ pub(crate) fn declare<'ctx>(
         body.set_call_conventions(TAILCC);
         let ret = module.add_function(&mangle(&format!("{}.h.{i}.ret", h.owner)), code_ty, None);
         ret.set_call_conventions(TAILCC);
-        hfns.insert(h.key, (body, ret));
+        let Some(CoreKind::Handle(hd)) = nodes.get(&h.key).map(|n| &n.kind) else {
+            return Err(internal("a handler key names a non-handle node"));
+        };
+        let mut clauses = Vec::with_capacity(hd.clauses.len());
+        let mut entries = vec![i64t.const_int(0, false); op_ids.len()];
+        for (j, c) in hd.clauses.iter().enumerate() {
+            let mut sig: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
+            for p in c.params.iter() {
+                sig.push(repr_ty(ctx, &p.ty)?.into());
+            }
+            sig.push(ptrt.into());
+            sig.push(ptrt.into());
+            let f = module.add_function(
+                &mangle(&format!("{}.h.{i}.c.{j}", h.owner)),
+                i64t.fn_type(&sig, false),
+                None,
+            );
+            f.set_call_conventions(TAILCC);
+            let id = *op_ids
+                .get(&(c.effect.clone(), c.op.clone()))
+                .ok_or_else(|| internal("a clause's op has no id"))?;
+            entries[id] = f.as_global_value().as_pointer_value().const_to_int(i64t);
+            clauses.push(f);
+        }
+        let arr = i64t.const_array(&entries);
+        let g = module.add_global(arr.get_type(), Some(AddressSpace::default()), "ctab");
+        g.set_initializer(&arr);
+        g.set_constant(true);
+        g.set_linkage(inkwell::module::Linkage::Private);
+        hfns.insert(
+            h.key,
+            HandlerFns {
+                body,
+                ret,
+                clauses,
+                table: g.as_pointer_value(),
+            },
+        );
     }
-    (resume, hfns)
+    Ok((resume, hfns))
 }
 
 // ------------------------------------------------------------------- state --
@@ -481,30 +580,17 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
         self.tail_jump(site)
     }
 
-    /// D18: a perform stops the program by name until Task 8.
-    fn trap(&self, st: &mut St<'ctx>) -> R<()> {
-        self.pop_pending(st)?;
-        self.b
-            .build_call(self.lc.perform_trap, &[], "trap")
-            .map_err(internal)?;
-        // `elya_perform_unimplemented` exits; this terminator is never reached
-        // -- a placeholder, NOT the trap (the `elya_match_fail` precedent).
-        self.b.build_unreachable().map_err(internal)?;
-        Ok(())
-    }
-
     // ------------------------------------------------------------- calls --
 
     /// A continuation site (D10): save what the rest of the region needs in a
     /// frame whose code is the site's resumption function, then `musttail`
     /// the callee with that frame as its continuation.
-    fn site_call(
+    fn site_frame(
         &self,
         st: &mut St<'ctx>,
         node: &CoreExpr,
-        target: FunctionValue<'ctx>,
         args: &[BasicValueEnum<'ctx>],
-    ) -> R<()> {
+    ) -> R<PointerValue<'ctx>> {
         let key = node as *const CoreExpr as usize;
         let site =
             &self.lc.sites[*self
@@ -572,11 +658,120 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             self.store_word(p, 3 + j, w)?;
         }
         gc_unroot(self.b, self.lc, roots)?;
+        Ok(p)
+    }
+
+    /// A non-tail call of an effectful function: build the site's frame, then
+    /// `musttail` the callee with it as its continuation.
+    fn site_call(
+        &self,
+        st: &mut St<'ctx>,
+        node: &CoreExpr,
+        target: FunctionValue<'ctx>,
+        args: &[BasicValueEnum<'ctx>],
+    ) -> R<()> {
+        let p = self.site_frame(st, node, args)?;
         self.pop_pending(st)?;
         let mut vals: Vec<BasicMetadataValueEnum<'ctx>> =
             args.iter().map(|v| (*v).into()).collect();
         vals.push(p.into());
         let call = self.b.build_call(target, &vals, "sc").map_err(internal)?;
+        self.tail_jump(call)
+    }
+
+    /// Task 8: a perform. Its continuation is the current one (tail position)
+    /// or a fresh site frame linked to it. With D17 the chain always ends at
+    /// the handler frame, so the handler is already BENEATH the captured frames
+    /// (spec 4 point 4) -- deep re-installation with no copying. Wrap the chain
+    /// in a one-shot continuation object (D13), find the handler at the chain's
+    /// end, and jump to its clause for this `(effect, op)`.
+    fn perform(
+        &self,
+        st: &mut St<'ctx>,
+        node: &CoreExpr,
+        args: &[BasicValueEnum<'ctx>],
+        tail: bool,
+    ) -> R<()> {
+        let CoreKind::Perform(pf) = &node.kind else {
+            return Err(internal("perform on a non-perform node"));
+        };
+        let k = if tail {
+            st.kont
+        } else {
+            self.site_frame(st, node, args)?
+        };
+        let i64t = self.i64t();
+        let mut extra: Vec<BasicValueEnum<'ctx>> = vec![k.into()];
+        extra.extend_from_slice(args);
+        let roots = self.root_live(st, &extra)?;
+        let cont = self.alloc(3)?;
+        gc_unroot(self.b, self.lc, roots)?;
+        self.store_word(cont, 0, i64t.const_int(self.lc.desc.cont_tag as u64, false))?;
+        let kw = self.b.build_ptr_to_int(k, i64t, "kw").map_err(internal)?;
+        self.store_word(cont, 1, kw)?;
+        self.store_word(cont, 2, i64t.const_int(0, false))?;
+        let h = self
+            .b
+            .build_call(self.lc.handler_of, &[k.into()], "h")
+            .map_err(internal)?
+            .try_as_basic_value()
+            .left()
+            .ok_or(CodegenError::Unsupported(
+                "elya_handler_of returned no value",
+            ))?
+            .into_pointer_value();
+        let table = self.load_word(h, 3)?;
+        let table = self
+            .b
+            .build_int_to_ptr(table, self.ptrt(), "tab")
+            .map_err(internal)?;
+        let id = *self
+            .lc
+            .op_ids
+            .get(&(pf.effect.clone(), pf.op.clone()))
+            .ok_or_else(|| internal("a performed op has no id"))?;
+        let entry = self.load_word(table, id)?;
+        let missing = self
+            .b
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                entry,
+                i64t.const_int(0, false),
+                "nc",
+            )
+            .map_err(internal)?;
+        let bad = self.ctx.append_basic_block(self.func, "unhandled");
+        let ok = self.ctx.append_basic_block(self.func, "dispatch");
+        self.b
+            .build_conditional_branch(missing, bad, ok)
+            .map_err(internal)?;
+        self.b.position_at_end(bad);
+        self.b
+            .build_call(self.lc.unhandled, &[], "uh")
+            .map_err(internal)?;
+        // `elya_unhandled_effect` exits; a placeholder terminator, NOT the trap.
+        self.b.build_unreachable().map_err(internal)?;
+        self.b.position_at_end(ok);
+        self.pop_pending(st)?;
+        let mut sig: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
+        for a in pf.args.iter() {
+            sig.push(repr_ty(self.ctx, &a.ty)?.into());
+        }
+        sig.push(self.ptrt().into());
+        sig.push(self.ptrt().into());
+        let clause_ty = i64t.fn_type(&sig, false);
+        let fp = self
+            .b
+            .build_int_to_ptr(entry, self.ptrt(), "cl")
+            .map_err(internal)?;
+        let mut vals: Vec<BasicMetadataValueEnum<'ctx>> =
+            args.iter().map(|v| (*v).into()).collect();
+        vals.push(cont.into());
+        vals.push(h.into());
+        let call = self
+            .b
+            .build_indirect_call(clause_ty, fp, &vals, "pc")
+            .map_err(internal)?;
         self.tail_jump(call)
     }
 
@@ -622,7 +817,9 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             return Err(CodegenError::Unsupported("computed callee"));
         };
         if needs_cps(&callee.ty) {
-            return Err(CodegenError::Unsupported("effectful closure call (Task 8)"));
+            return Err(CodegenError::Unsupported(
+                "effectful closure call (not yet compiled natively)",
+            ));
         }
         if param_tys.len() != args.len() {
             return Err(CodegenError::Unsupported("closure call arity mismatch"));
@@ -771,10 +968,10 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
         let before = st.pending;
         match &e.kind {
             CoreKind::Perform(p) => {
-                if self.operands(st, &p.args)?.is_none() {
+                let Some(vals) = self.operands(st, &p.args)? else {
                     return Ok(None);
-                }
-                self.trap(st)?;
+                };
+                self.perform(st, e, &vals, false)?;
                 Ok(None)
             }
             CoreKind::App(callee, args) => {
@@ -844,9 +1041,11 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                 self.branch_value(st, cv, t, f)
             }
             CoreKind::Match(..) => Err(CodegenError::Unsupported(
-                "effectful call inside a match (Task 8)",
+                "effectful call inside a match (not yet compiled natively)",
             )),
-            CoreKind::Resume(_) => Err(CodegenError::Unsupported("resume (Task 8)")),
+            CoreKind::Resume(_) => {
+                Err(CodegenError::Unsupported("resume outside a handler clause"))
+            }
             _ => Err(internal("an effect-free node reached the CPS fold")),
         }
     }
@@ -943,10 +1142,10 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                 self.tail_value(st, e)
             }
             CoreKind::Perform(p) => {
-                if self.operands(st, &p.args)?.is_none() {
+                let Some(vals) = self.operands(st, &p.args)? else {
                     return Ok(());
-                }
-                self.trap(st)
+                };
+                self.perform(st, e, &vals, true)
             }
             CoreKind::Let(x, v, body) => {
                 let Some(val) = self.expr(st, v)? else {
@@ -964,9 +1163,11 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                 self.branch_tail(st, cv, t, f)
             }
             CoreKind::Match(..) if contains_effect(e) => Err(CodegenError::Unsupported(
-                "effectful call inside a match (Task 8)",
+                "effectful call inside a match (not yet compiled natively)",
             )),
-            CoreKind::Resume(_) => Err(CodegenError::Unsupported("resume (Task 8)")),
+            CoreKind::Resume(_) => {
+                Err(CodegenError::Unsupported("resume outside a handler clause"))
+            }
             _ => self.tail_value(st, e),
         }
     }
@@ -1028,17 +1229,24 @@ pub(crate) fn emit_handle_site<'ctx>(
         .handler_tags
         .get(&key)
         .ok_or(CodegenError::Unsupported("handle has no descriptor row"))?;
-    let (body_fn, ret_fn) = *lc
+    let fns = lc
         .handler_fns
         .get(&key)
         .ok_or(CodegenError::Unsupported("handle has no functions"))?;
+    let (body_fn, ret_fn) = (fns.body, fns.ret);
     let cx = Cx { ctx, func, b, lc };
     let i64t = ctx.i64_type();
     let roots = gc_root_env(b, lc, env)?;
-    let p = cx.alloc(3 + h.saved.len())?;
+    let p = cx.alloc(4 + h.saved.len())?;
     cx.store_word(p, 0, i64t.const_int(tag as u64, false))?;
     cx.store_word(p, 1, cx.fn_word(ret_fn)?)?;
     cx.store_word(p, 2, i64t.const_int(0, false))?;
+    // Task 8: word 3 is the static clause table (not heap; its mask bit is
+    // clear), so a perform can find this handle's clause for its op.
+    let tw = b
+        .build_ptr_to_int(fns.table, i64t, "tw")
+        .map_err(internal)?;
+    cx.store_word(p, 3, tw)?;
     for (j, (sv, ty)) in h.saved.iter().enumerate() {
         let Saved::Var { name, .. } = sv else {
             return Err(internal("a handler frame saves bindings only"));
@@ -1052,7 +1260,7 @@ pub(crate) fn emit_handle_site<'ctx>(
             .get(name)
             .ok_or(CodegenError::Unsupported("handler binding is not in scope"))?;
         let w = value_to_word(b, v, ty, i64t)?;
-        cx.store_word(p, 3 + j, w)?;
+        cx.store_word(p, HANDLER_SAVED + j, w)?;
     }
     gc_unroot(b, lc, roots)?;
     let roots = gc_root_env(b, lc, env)?;
@@ -1073,15 +1281,21 @@ pub(crate) fn emit_handle_site<'ctx>(
     )
 }
 
-/// Load a frame's saved values (words `3..`) into `st`.
+/// Where a site frame's saved values start: after `[tag][code][next]`.
+const SITE_SAVED: usize = 3;
+/// Where a handler frame's saved values start: after `[tag][code][next][table]`.
+const HANDLER_SAVED: usize = 4;
+
+/// Load a frame's saved values (words `first..`) into `st`.
 fn load_saved<'ctx>(
     cx: &Cx<'_, '_, 'ctx>,
     st: &mut St<'ctx>,
     frame: PointerValue<'ctx>,
     saved: &[(Saved, Ty)],
+    first: usize,
 ) -> R<()> {
     for (j, (sv, ty)) in saved.iter().enumerate() {
-        let w = cx.load_word(frame, 3 + j)?;
+        let w = cx.load_word(frame, first + j)?;
         let v = word_to_value(cx.b, w, ty, cx.ctx.bool_type(), cx.ptrt())?;
         match sv {
             Saved::Temp(a) => {
@@ -1111,7 +1325,8 @@ pub(crate) fn emit_sites_and_handlers<'ctx>(
         }
     }
     for h in lc.handlers {
-        let (body_fn, ret_fn) = lc.handler_fns[&h.key];
+        let fns = lc.handler_fns[&h.key].clone();
+        let (body_fn, ret_fn) = (fns.body, fns.ret);
         let node = *lc.nodes.get(&h.key).ok_or(CodegenError::Unsupported(
             "handle missing from the node index",
         ))?;
@@ -1133,7 +1348,7 @@ pub(crate) fn emit_sites_and_handlers<'ctx>(
             lc,
         };
         let mut st = St::new(hf);
-        load_saved(&cx, &mut st, hf, &h.saved)?;
+        load_saved(&cx, &mut st, hf, &h.saved, HANDLER_SAVED)?;
         st.depth = h.depth;
         st.rebuild_env();
         cx.tail(&mut st, &hd.body)?;
@@ -1161,30 +1376,217 @@ pub(crate) fn emit_sites_and_handlers<'ctx>(
             b.build_return(Some(&v)).map_err(internal)?;
             continue;
         };
-        let mut env: HashMap<String, BasicValueEnum<'ctx>> = HashMap::new();
-        let mut binds: Vec<(usize, String, BasicValueEnum<'ctx>)> = Vec::new();
-        for (j, (sv, ty)) in h.saved.iter().enumerate() {
-            let Saved::Var { name, binding } = sv else {
-                return Err(internal("a handler frame saves bindings only"));
-            };
-            let w = cx.load_word(hf, 3 + j)?;
-            binds.push((
-                *binding,
-                name.clone(),
-                word_to_value(b, w, ty, ctx.bool_type(), cx.ptrt())?,
-            ));
-        }
-        binds.sort_by_key(|(i, _, _)| *i);
-        for (_, n, val) in binds {
-            env.insert(n, val);
-        }
+        let mut env = handler_env(&cx, hf, h)?;
         let bound = word_to_value(b, v, &hd.body.ty, ctx.bool_type(), cx.ptrt())?;
-        env.insert(r.binder.clone(), bound);
+        // `bind_local`: the binder may shadow a saved name, which must stay rooted.
+        let _ = bind_local(&mut env, &r.binder, bound);
         let out = lower_expr(ctx, ret_fn, b, lc, &r.body, &mut env)?;
         let word = value_to_word(b, out, &node.ty, ctx.i64_type())?;
         b.build_return(Some(&word)).map_err(internal)?;
     }
+    for h in lc.handlers {
+        emit_clauses(ctx, b, lc, h)?;
+    }
     Ok(())
+}
+
+/// The handler frame's saved bindings as a name environment, in binding
+/// order through `bind_local`, so a binding shadowed by a later one of the
+/// same name stays rooted.
+fn handler_env<'ctx>(
+    cx: &Cx<'_, '_, 'ctx>,
+    hf: PointerValue<'ctx>,
+    h: &HandlerSite,
+) -> R<HashMap<String, BasicValueEnum<'ctx>>> {
+    let mut binds: Vec<(usize, String, BasicValueEnum<'ctx>)> = Vec::new();
+    for (j, (sv, ty)) in h.saved.iter().enumerate() {
+        let Saved::Var { name, binding } = sv else {
+            return Err(internal("a handler frame saves bindings only"));
+        };
+        let w = cx.load_word(hf, HANDLER_SAVED + j)?;
+        binds.push((
+            *binding,
+            name.clone(),
+            word_to_value(cx.b, w, ty, cx.ctx.bool_type(), cx.ptrt())?,
+        ));
+    }
+    binds.sort_by_key(|(i, _, _)| *i);
+    let mut env = HashMap::new();
+    for (_, n, v) in binds {
+        let _ = bind_local(&mut env, &n, v);
+    }
+    Ok(env)
+}
+
+/// Task 8: one function per clause, `(op args.., ptr cont, ptr frame) -> i64`.
+/// A clause body is direct code (D17: nothing outside the handle can be
+/// captured, so it performs nothing unhandled); its answer is the handle's
+/// answer, returned as a word. `cont` is bound as the clause's continuation
+/// (`closure::CONT`), which `resume` -- and any lambda that captured it --
+/// reads.
+fn emit_clauses<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    h: &HandlerSite,
+) -> R<()> {
+    let fns = lc.handler_fns[&h.key].clone();
+    let node = *lc.nodes.get(&h.key).ok_or(CodegenError::Unsupported(
+        "handle missing from the node index",
+    ))?;
+    let CoreKind::Handle(hd) = &node.kind else {
+        return Err(internal("a handler key names a non-handle node"));
+    };
+    for (c, &func) in hd.clauses.iter().zip(fns.clauses.iter()) {
+        let entry = ctx.append_basic_block(func, "entry");
+        b.position_at_end(entry);
+        let cx = Cx { ctx, func, b, lc };
+        let n = c.params.len() as u32;
+        let cont = func
+            .get_nth_param(n)
+            .ok_or_else(|| internal("clause has no continuation parameter"))?;
+        let hf = func
+            .get_nth_param(n + 1)
+            .ok_or_else(|| internal("clause has no frame parameter"))?
+            .into_pointer_value();
+        let mut env = handler_env(&cx, hf, h)?;
+        for (i, p) in c.params.iter().enumerate() {
+            let v = func
+                .get_nth_param(i as u32)
+                .ok_or_else(|| internal("declared clause arity disagrees with Core"))?;
+            let _ = bind_local(&mut env, &p.name, v);
+        }
+        let _ = bind_local(&mut env, crate::closure::CONT, cont);
+        clause_tail(&cx, &c.body, &node.ty, &mut env)?;
+    }
+    Ok(())
+}
+
+/// Tail position in a clause body: a `resume` here is a `musttail` jump into
+/// the continuation (so a resume-in-a-loop handler keeps a flat stack, D14);
+/// anything else returns its value as the handle's answer.
+fn clause_tail<'ctx>(
+    cx: &Cx<'_, '_, 'ctx>,
+    e: &CoreExpr,
+    answer: &Ty,
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+) -> R<()> {
+    match &e.kind {
+        CoreKind::Let(x, v, body) => {
+            let val = lower_expr(cx.ctx, cx.func, cx.b, cx.lc, v, env)?;
+            let sh = bind_local(env, x, val);
+            let out = clause_tail(cx, body, answer, env);
+            unbind_local(env, x, sh);
+            out
+        }
+        CoreKind::If(c, t, f) => {
+            let cv = lower_expr(cx.ctx, cx.func, cx.b, cx.lc, c, env)?.into_int_value();
+            let then_bb = cx.ctx.append_basic_block(cx.func, "rthen");
+            let else_bb = cx.ctx.append_basic_block(cx.func, "relse");
+            cx.b.build_conditional_branch(cv, then_bb, else_bb)
+                .map_err(internal)?;
+            cx.b.position_at_end(then_bb);
+            clause_tail(cx, t, answer, env)?;
+            cx.b.position_at_end(else_bb);
+            clause_tail(cx, f, answer, env)
+        }
+        CoreKind::Resume(arg) => {
+            let (word, k, code) = resume_prologue(cx, e, arg, env)?;
+            let code_ty = cx
+                .i64t()
+                .fn_type(&[cx.i64t().into(), cx.ptrt().into()], false);
+            let site =
+                cx.b.build_indirect_call(code_ty, code, &[word.into(), k.into()], "rj")
+                    .map_err(internal)?;
+            cx.tail_jump(site)
+        }
+        _ => {
+            let v = lower_expr(cx.ctx, cx.func, cx.b, cx.lc, e, env)?;
+            let w = value_to_word(cx.b, v, answer, cx.i64t())?;
+            cx.b.build_return(Some(&w)).map_err(internal)?;
+            Ok(())
+        }
+    }
+}
+
+/// The shared half of `resume(arg)`: lower the argument, enforce one-shot
+/// (D13: a second resume calls the named trap, never re-runs), mark the
+/// continuation consumed, and load its chain and code.
+fn resume_prologue<'ctx>(
+    cx: &Cx<'_, '_, 'ctx>,
+    e: &CoreExpr,
+    arg: &CoreExpr,
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+) -> R<(IntValue<'ctx>, PointerValue<'ctx>, PointerValue<'ctx>)> {
+    let _ = e;
+    let v = lower_expr(cx.ctx, cx.func, cx.b, cx.lc, arg, env)?;
+    let cont = env
+        .get(crate::closure::CONT)
+        .copied()
+        .ok_or(CodegenError::Unsupported("resume outside a handler clause"))?
+        .into_pointer_value();
+    let used = cx.load_word(cont, 2)?;
+    let twice =
+        cx.b.build_int_compare(
+            inkwell::IntPredicate::NE,
+            used,
+            cx.i64t().const_int(0, false),
+            "used",
+        )
+        .map_err(internal)?;
+    let bad = cx.ctx.append_basic_block(cx.func, "resumed_twice");
+    let ok = cx.ctx.append_basic_block(cx.func, "resume");
+    cx.b.build_conditional_branch(twice, bad, ok)
+        .map_err(internal)?;
+    cx.b.position_at_end(bad);
+    cx.b.build_call(cx.lc.resume_twice, &[], "rt")
+        .map_err(internal)?;
+    // `elya_resume_twice` exits; a placeholder terminator, NOT the trap.
+    cx.b.build_unreachable().map_err(internal)?;
+    cx.b.position_at_end(ok);
+    cx.store_word(cont, 2, cx.i64t().const_int(1, false))?;
+    let k = cx.load_word(cont, 1)?;
+    let k =
+        cx.b.build_int_to_ptr(k, cx.ptrt(), "rk")
+            .map_err(internal)?;
+    let code = cx.load_word(k, 1)?;
+    let code =
+        cx.b.build_int_to_ptr(code, cx.ptrt(), "rc")
+            .map_err(internal)?;
+    let word = value_to_word(cx.b, v, &arg.ty, cx.i64t())?;
+    Ok((word, k, code))
+}
+
+/// Task 8: `resume(arg)` in value position -- a native NESTING call of the
+/// continuation (D14). It returns when the resumed computation reaches the
+/// handler, with the handle's answer (return clause applied), which is the
+/// value of `resume(..)` (deep handlers, spec 4).
+pub(crate) fn emit_resume_call<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    e: &CoreExpr,
+    arg: &CoreExpr,
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+) -> R<BasicValueEnum<'ctx>> {
+    let cx = Cx { ctx, func, b, lc };
+    let (word, k, code) = resume_prologue(&cx, e, arg, env)?;
+    let i64t = ctx.i64_type();
+    let code_ty = i64t.fn_type(&[i64t.into(), cx.ptrt().into()], false);
+    // Everything live in this function survives the resumed computation.
+    let roots = gc_root_env(b, lc, env)?;
+    let call = b
+        .build_indirect_call(code_ty, code, &[word.into(), k.into()], "rs")
+        .map_err(internal)?;
+    call.set_call_convention(TAILCC);
+    gc_unroot(b, lc, roots)?;
+    let w = call
+        .try_as_basic_value()
+        .left()
+        .ok_or(CodegenError::Unsupported("call returned no value"))?
+        .into_int_value();
+    word_to_value(b, w, &e.ty, ctx.bool_type(), cx.ptrt())
 }
 
 /// A site's resumption function: `(i64 value, ptr frame) -> i64`. Reload what
@@ -1216,7 +1618,7 @@ fn emit_resume_fn<'ctx>(
     let next = cx.load_word(frame, 2)?;
     let kont = b.build_int_to_ptr(next, cx.ptrt(), "k").map_err(internal)?;
     let mut st = St::new(kont);
-    load_saved(&cx, &mut st, frame, &site.saved)?;
+    load_saved(&cx, &mut st, frame, &site.saved, SITE_SAVED)?;
     let hole = node(site.key)?;
     let mut cur = word_to_value(b, v, &hole.ty, ctx.bool_type(), cx.ptrt())?;
     let root = node(
@@ -1296,10 +1698,10 @@ fn emit_resume_fn<'ctx>(
                 cur = cx.ctor(&st, name, &vals)?;
             }
             CoreKind::Perform(p) => {
-                if resume_operands(&cx, &mut st, &p.args, step.slot, cur)?.is_none() {
+                let Some(vals) = resume_operands(&cx, &mut st, &p.args, step.slot, cur)? else {
                     return Ok(());
-                }
-                return cx.trap(&mut st);
+                };
+                return cx.perform(&mut st, a, &vals, tail_i);
             }
             CoreKind::Let(x, _, body) => {
                 if step.slot == 0 {
@@ -1328,10 +1730,12 @@ fn emit_resume_fn<'ctx>(
             }
             CoreKind::Match(..) => {
                 return Err(CodegenError::Unsupported(
-                    "effectful call inside a match (Task 8)",
+                    "effectful call inside a match (not yet compiled natively)",
                 ))
             }
-            CoreKind::Resume(_) => return Err(CodegenError::Unsupported("resume (Task 8)")),
+            CoreKind::Resume(_) => {
+                return Err(CodegenError::Unsupported("resume outside a handler clause"))
+            }
             _ => {
                 return Err(internal(
                     "a site's path runs through a leaf or a region boundary",

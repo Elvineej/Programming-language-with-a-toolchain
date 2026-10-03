@@ -657,7 +657,9 @@ fn build_closure_call<'ctx>(
         return Err(CodegenError::Unsupported("computed callee"));
     };
     if cps::needs_cps(&callee.ty) {
-        return Err(CodegenError::Unsupported("effectful closure call (Task 8)"));
+        return Err(CodegenError::Unsupported(
+            "effectful closure call (not yet compiled natively)",
+        ));
     }
     if param_tys.len() != args.len() {
         return Err(CodegenError::Unsupported("closure call arity mismatch"));
@@ -1252,7 +1254,9 @@ fn lower_expr<'ctx>(
         // D17: a handle is a nesting native call from a region that needs no
         // CPS (the prepass refused every other position).
         CoreKind::Handle(_) => cps_emit::emit_handle_site(ctx, func, b, lc, e, env),
-        CoreKind::Resume(_) => Err(CodegenError::Unsupported("resume (Task 8)")),
+        // Task 8: a resume inside a clause body (or a lambda in one) is a
+        // native nesting call of the continuation (D14).
+        CoreKind::Resume(arg) => cps_emit::emit_resume_call(ctx, func, b, lc, e, arg, env),
         // Only CPS regions perform; reaching one here is an emitter bug.
         CoreKind::Perform(_) => Err(CodegenError::Unsupported(
             "perform outside an effectful region",
@@ -1274,6 +1278,8 @@ pub(crate) struct Descriptors {
     pub(crate) site_tags: std::collections::BTreeMap<usize, usize>,
     /// Handle key (`HandlerSite::key`) -> the tag its handler frame carries.
     pub(crate) handler_tags: std::collections::BTreeMap<usize, usize>,
+    /// D13: the continuation object's tag.
+    pub(crate) cont_tag: usize,
 }
 
 fn descriptor_rows(
@@ -1386,15 +1392,35 @@ fn descriptor_rows(
     for site in sites {
         site_tags.insert(site.key, frame_row(&site.saved, &mut desc));
     }
+    // Task 8: a handler frame is `[tag][code_ptr = the return clause][next =
+    // null][table][saved..]`. Word 3 is the address of the handle's static
+    // clause table (text/rodata, not heap), so it is never traced: bit 2
+    // clear, and saved value j is bit j+3. Always its own row -- its arity is
+    // never the frame row's.
     let mut handler_tags = std::collections::BTreeMap::new();
     for h in handlers {
-        handler_tags.insert(h.key, frame_row(&h.saved, &mut desc));
+        handler_tags.insert(h.key, desc.len() / 2);
+        desc.push(3 + h.saved.len() as u64);
+        let mut mask: u64 = 0b10;
+        for (j, (_, ty)) in h.saved.iter().enumerate() {
+            if is_heap_ty(ty) {
+                mask |= 1 << (j + 3);
+            }
+        }
+        desc.push(mask);
     }
+    // D13: ONE row for the continuation object a clause receives,
+    // `[tag][k][consumed]`: `k` is the captured frame chain (traced, bit 0);
+    // `consumed` is the one-shot flag (a plain word, bit 1 clear).
+    let cont_tag = desc.len() / 2;
+    desc.push(2);
+    desc.push(0b01);
     Ok(Descriptors {
         rows: desc,
         frame_tag,
         site_tags,
         handler_tags,
+        cont_tag,
     })
 }
 
@@ -1441,9 +1467,15 @@ struct LowerCtx<'a, 'ctx> {
     /// Site key -> its resumption function `(i64 value, ptr frame) -> i64`.
     resume_fns: &'a HashMap<usize, FunctionValue<'ctx>>,
     /// Handle key -> (body `(ptr frame) -> i64`, return `(i64, ptr frame) -> i64`).
-    handler_fns: &'a HashMap<usize, (FunctionValue<'ctx>, FunctionValue<'ctx>)>,
-    /// D18: `elya_perform_unimplemented`, until Task 8.
-    perform_trap: FunctionValue<'ctx>,
+    handler_fns: &'a HashMap<usize, cps_emit::HandlerFns<'ctx>>,
+    /// Task 8: every `(effect, op)` the module performs or handles -> its index
+    /// in each handle's clause table.
+    op_ids: &'a HashMap<(String, String), usize>,
+    /// Task 8 runtime: `elya_handler_of`, `elya_resume_twice`,
+    /// `elya_unhandled_effect` (all `ccc`).
+    handler_of: FunctionValue<'ctx>,
+    resume_twice: FunctionValue<'ctx>,
+    unhandled: FunctionValue<'ctx>,
 }
 
 /// Fold `core.types` into a flat constructor table: name -> (tag, field types).
@@ -1564,8 +1596,13 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
 
     let lifted = declare_lifted(ctx, &module, &lambdas)?;
     let trap_ty = ctx.void_type().fn_type(&[], false);
-    let perform_trap = module.add_function("elya_perform_unimplemented", trap_ty, None); // ccc
-    let (resume_fns, handler_fns) = cps_emit::declare(ctx, &module, &nodes, &sites, &handlers);
+    let resume_twice = module.add_function("elya_resume_twice", trap_ty, None); // ccc
+    let unhandled = module.add_function("elya_unhandled_effect", trap_ty, None); // ccc
+    let handler_of_ty = ptrt.fn_type(&[ptrt.into()], false);
+    let handler_of = module.add_function("elya_handler_of", handler_of_ty, None); // ccc
+    let op_ids = cps_emit::op_ids(core);
+    let (resume_fns, handler_fns) =
+        cps_emit::declare(ctx, &module, &nodes, &sites, &handlers, &op_ids)?;
 
     let lc = LowerCtx {
         module: &module,
@@ -1590,7 +1627,10 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         desc: &descriptors,
         resume_fns: &resume_fns,
         handler_fns: &handler_fns,
-        perform_trap,
+        op_ids: &op_ids,
+        handler_of,
+        resume_twice,
+        unhandled,
     };
     let b = ctx.create_builder();
     for f in &core.fns {
@@ -2170,6 +2210,105 @@ mod tests {
         emit_ir(&core_of(&format!("{S_W}{prog}"))).unwrap_err()
     }
 
+    // ---- 5b-8 Task 8 refusals (A2, and the clause arity cap) ---------------
+
+    fn handle_expr(clauses: Vec<elya::core::CoreClause>, multi: bool) -> CoreExpr {
+        CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Int),
+            kind: CoreKind::Handle(Rc::new(elya::core::CoreHandle {
+                body: Rc::new(int_lit(0)),
+                clauses: clauses.into(),
+                ret: None,
+                is_multi_declared: multi,
+            })),
+        }
+    }
+
+    #[test]
+    fn a_multi_shot_handler_is_refused_by_its_own_name() {
+        let err = emit_ir(&main_fn(handle_expr(Vec::new(), true))).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multi"),
+            "the message must name the feature: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_multi_refusal_fires_before_any_clause_body_is_lowered() {
+        // `Var("unbound")` in the clause body would refuse with its OWN
+        // message; seeing "multi" proves the handle-node refusal fired first
+        // (spec 5.4).
+        let poisonous = CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Int),
+            kind: CoreKind::Var("unbound".to_string()),
+        };
+        let clause = elya::core::CoreClause {
+            effect: "Flip".to_string(),
+            op: "flip".to_string(),
+            params: Rc::from([]),
+            body: Rc::new(poisonous),
+        };
+        let err = emit_ir(&main_fn(handle_expr(vec![clause], true))).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("multi"), "{msg}");
+        assert!(
+            !msg.contains("unbound"),
+            "the clause body was lowered before the refusal fired: {msg}"
+        );
+    }
+
+    /// Source -> Core, with the front end allowed to WARN: `with multi` is
+    /// deliberately not an error (E0426 stays a warning), so it type-checks
+    /// and lowers; the refusal is codegen's alone.
+    fn lower_warned_source(src: &str) -> CoreModule {
+        let session = elya::Session::new();
+        let (m, pd) = elya::parse::parse_module(&session, src);
+        assert!(pd.is_empty(), "parse: {pd:?}");
+        let (diags, table) = elya::types::infer_typed_table(&session, &m);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.severity == elya::diag::Severity::Error),
+            "type errors: {diags:?}"
+        );
+        elya::core::lower_module(&m, &table).expect("must lower to Core")
+    }
+
+    #[test]
+    fn a_multi_shot_handler_written_in_source_reaches_the_codegen_refusal() {
+        let src = "effect multi Flip { fn flip() -> Bool }\n\
+                   fn g() -> Int { if flip() { 1 } else { 0 } }\n\
+                   pub fn main() -> Int {\n\
+                   \x20 handle g() with multi { Flip.flip() -> resume(True) }\n\
+                   }\n";
+        let err = emit_ir(&lower_warned_source(src)).unwrap_err();
+        assert!(err.to_string().contains("multi"), "{err:?}");
+    }
+
+    #[test]
+    fn an_effect_operation_with_four_parameters_is_refused() {
+        // The clause takes the op's arguments, the continuation and the
+        // handler frame: 4 + 2 is past MAX_PARAMS, the measured win64 limit.
+        let err = emit_ir(&core_of(
+            "effect E { fn op(a: Int, b: Int, c: Int, d: Int) -> Int }\n\
+             fn body() -> Int { op(1, 2, 3, 4) }\n\
+             pub fn main() -> Int {\n\
+             \x20 handle { body() } with { E.op(a, b, c, d) -> resume(a + d)  return(r) -> r }\n\
+             }\n",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("effect operation takes more than three parameters")
+            ),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn an_effect_polymorphic_function_used_at_a_user_effect_is_refused() {
         // D16: `apply` is compiled once, direct; this instantiation would call
@@ -2229,14 +2368,17 @@ mod tests {
     }
 
     #[test]
-    fn an_effectful_lambda_is_refused_until_task_8() {
+    fn an_effectful_lambda_is_refused_by_name() {
         let err = refused(
             "pub fn main() -> Int {\n\
              \x20 handle { let f = fn(x) { x + get() }  f(1) } with {\n\
              \x20   S.get() -> resume(1)\n    return(r) -> r\n  }\n}\n",
         );
         assert!(
-            matches!(err, CodegenError::Unsupported("effectful lambda (Task 8)")),
+            matches!(
+                err,
+                CodegenError::Unsupported("effectful lambda (not yet compiled natively)")
+            ),
             "{err:?}"
         );
     }
@@ -2255,22 +2397,6 @@ mod tests {
                 err,
                 CodegenError::Unsupported("effectful function takes more than four parameters")
             ),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn a_resume_reached_by_emission_is_refused_until_task_8() {
-        // A lambda inside a clause is emitted as an ordinary lifted function;
-        // its `resume` must stop the build, never compile to something.
-        let err = refused(
-            "pub fn main() -> Int {\n\
-             \x20 let f = handle { w(False) } with {\n\
-             \x20   S.get() -> fn(s) { (resume(s))(s) }\n\
-             \x20   return(x) -> fn(s) { x }\n  }\n  f(1)\n}\n",
-        );
-        assert!(
-            matches!(err, CodegenError::Unsupported("resume (Task 8)")),
             "{err:?}"
         );
     }
@@ -2555,14 +2681,26 @@ mod tests {
         let lambdas = closure::collect_lambdas(&core, n_real_ctors);
         assert_eq!(lambdas.len(), 1, "the program must carry one lambda row");
         let string_tag = n_real_ctors + lambdas.len();
-        let rows = descriptor_rows(&core, &lambdas, &[], &[], n_real_ctors, string_tag)
-            .expect("rows")
-            .rows;
+        let d = descriptor_rows(&core, &lambdas, &[], &[], n_real_ctors, string_tag).expect("rows");
+        let rows = d.rows;
         let frame_tag = string_tag + 1;
+        // Task 8 (D13, approved expected-value change): with no sites and no
+        // handles, the frame row is followed by exactly ONE more row -- the
+        // continuation object's `[2, 0b01]` -- where it used to be the last.
         assert_eq!(
             rows.len() / 2,
-            frame_tag + 1,
-            "the frame row must be the table's last row: {rows:?}"
+            frame_tag + 2,
+            "frame row, then only the continuation-object row: {rows:?}"
+        );
+        assert_eq!(
+            d.frame_tag, frame_tag,
+            "descriptor_rows reports the frame tag"
+        );
+        assert_eq!(d.cont_tag, frame_tag + 1);
+        assert_eq!(
+            &rows[2 * d.cont_tag..],
+            &[2, 0b01],
+            "continuation object: k traced, consumed flag not"
         );
         assert_eq!(
             &rows[2 * string_tag..2 * string_tag + 2],
@@ -2570,7 +2708,7 @@ mod tests {
             "the string row is unchanged"
         );
         assert_eq!(
-            &rows[2 * frame_tag..],
+            &rows[2 * frame_tag..2 * frame_tag + 2],
             &[2, 0b10],
             "frame row: arity 2, mask 0b10 (D5) -- not the spec's 0b11"
         );
