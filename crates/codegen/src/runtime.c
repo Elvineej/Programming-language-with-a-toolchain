@@ -214,7 +214,13 @@ void *elya_alloc(int64_t words) {
      * just-lowered fields. Marking runs before the block is handed out, so
      * the new object is never itself a mark target -- nothing yet points at
      * it. */
-    if (gc_allocated >= GC_THRESHOLD_WORDS) {
+    /* Collect when allocation since the last collection reaches the larger of
+     * the fixed floor and the last measured live set: the heap doubles
+     * between collections, so a growing live set is marked O(log n) times,
+     * not every 64K words (which made total marking quadratic -- measured:
+     * 45 collections to build a 1M list, 183 for a 1M-deep effectful loop).
+     * Small programs see the old 64K floor unchanged. */
+    if (gc_allocated >= (gc_live > GC_THRESHOLD_WORDS ? gc_live : GC_THRESHOLD_WORDS)) {
         gc_collect();
     }
     gc_allocated += words;
