@@ -140,3 +140,21 @@ slice: root every live binding (shadowed ones included), with this program as th
 `deep(n)` (non-tail recursion that keeps a `Cons` per level) under a `handle` takes 0.12 s at
 n = 1000, 0.43 s at 2000, 1.70 s at 4000 (debug `elya run`): ~4x per doubling, and n = 100 000
 did not finish in 10 minutes. The 7b-3 deep-frames test uses n = 4000 because of this.
+
+## Task 8 review follow-ups (2026-10-03)
+
+- **Finding the handler is O(depth) per perform.** `elya_handler_of` walks every frame's `next`
+  to the handler frame, so non-tail effectful recursion is quadratic. Measured (review,
+  `fn loop(n) { if n == 0 { 0 } else { get() + loop(n - 1) } }`, `resume(1)`): 10k 0.12 s, 20k
+  0.5 s, 40k 2.9 s, 80k 15.2 s; 1M did not finish. One perform at depth 80k: 0.009 s. Answers
+  are correct. The evaluator is also super-linear here (see the evaluator entry). Fix: give each
+  frame O(1) access to its handler (e.g. a handler word in every site frame, or the handler
+  passed alongside `k`) -- a frame-layout change, so its own step with its own controls. Must be
+  settled before any N = 1 000 000 obligation that recurses non-tail through a perform.
+- **Native stack overflow is an unnamed SIGSEGV.** A clause with a NON-tail `resume` over a
+  1M-perform tail loop segfaults (rc 139, no message); 100k works. Each nested resume is a
+  native frame (D14's nesting call). Plain non-tail recursion at 1M segfaults the same way, so it
+  is the existing backend limit; A9/Task 11 must state it and the Linux overflow diagnosis (the
+  Task 11 note) must name it.
+- Refusals that Task 8 did not lift were renamed from "(Task 8)" to "(not yet compiled
+  natively)": effectful lambdas, effectful closure calls, effectful calls inside a `match`.
