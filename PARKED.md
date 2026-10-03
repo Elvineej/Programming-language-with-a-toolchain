@@ -63,6 +63,28 @@ pub fn main() {
 - `elya check` → `ok`, exit 0
 - `elya run` → `evaluator PERFORMED the op`, exit 0
 
+Ops-first also beats a local binding: `let ping = …; ping()` performs the op.
+Matches inference + evaluator; probably should be local-first in the language.
+Decide with the collision question. Measured (2026-10-03, at 40c09a0 + 7b-1):
+
+```
+effect E { fn ping() -> Int }
+fn user() -> Int {
+  let ping = fn() { 5 }
+  ping()
+}
+pub fn main() {
+  let v = handle { user() } with {
+    E.ping() -> resume(1)
+    return(x) -> x
+  }
+  if v == 1 { io.println("evaluator PERFORMED the op") } else { io.println("evaluator CALLED the local") }
+}
+```
+
+- `elya check` → `ok`, exit 0
+- `elya run` → `evaluator PERFORMED the op`, exit 0
+
 ## Slice close-out doc fixes
 
 - Spec §6.3 says both existing guards "must be extended" to cover the frame

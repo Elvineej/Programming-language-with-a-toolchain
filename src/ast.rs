@@ -495,6 +495,24 @@ pub fn multi_declared_ops(module: &Module) -> std::collections::HashSet<String> 
     ops
 }
 
+/// Operation name -> the effect that declares it: the op -> effect index Core
+/// lowering needs to stamp a `Perform` (Slice 5b-8 D11). Built the way both
+/// existing copies build it -- `Infer.ops` and the evaluator's `op_table` --
+/// walking `module.decls` in order, so a later declaration of the same op name
+/// wins. Matching that rule exactly is the point: lowering must resolve a perform
+/// to the effect inference typed it with and the evaluator dispatches it on.
+pub fn op_effects(module: &Module) -> std::collections::HashMap<String, String> {
+    let mut m: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for d in &module.decls {
+        if let Decl::Effect(e) = &d.node {
+            for op in &e.ops {
+                m.insert(op.node.name.clone(), e.name.clone());
+            }
+        }
+    }
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

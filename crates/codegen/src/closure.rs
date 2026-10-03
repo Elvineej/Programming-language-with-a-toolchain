@@ -146,6 +146,12 @@ fn fv_walk(e: &CoreExpr, scope: &mut Vec<String>, out: &mut BTreeMap<String, Ty>
             }
         }
         CoreKind::Resume(v) => fv_walk(v, scope, out),
+        // The op name is not a variable (D11); only the arguments are walked.
+        CoreKind::Perform(p) => {
+            for a in p.args.iter() {
+                fv_walk(a, scope, out);
+            }
+        }
     }
 }
 
@@ -255,13 +261,20 @@ fn collect_in(
             }
         }
         CoreKind::Resume(v) => collect_in(v, enclosing, n, module_level, first_tag, out),
+        CoreKind::Perform(p) => {
+            for a in p.args.iter() {
+                collect_in(a, enclosing, n, module_level, first_tag, out);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use elya::core::{CoreArm, CoreClause, CoreFn, CoreHandle, CoreLit, CoreReturn, CoreType};
+    use elya::core::{
+        CoreArm, CoreClause, CoreFn, CoreHandle, CoreLit, CorePerform, CoreReturn, CoreType,
+    };
     use elya::span::Span;
     use elya::types::{EffectRow, TyCon};
 
@@ -577,6 +590,52 @@ mod tests {
             params,
             vec!["u", "v", "w"],
             "body, clause (under resume) and return lambdas, in pre-order"
+        );
+    }
+
+    fn perform(op: &str, args: Vec<CoreExpr>) -> CoreExpr {
+        e(
+            int(),
+            CoreKind::Perform(Rc::new(CorePerform {
+                effect: "E".to_string(),
+                op: op.to_string(),
+                op_ty: int(),
+                args: args.into(),
+            })),
+        )
+    }
+
+    /// D11: a perform's arguments are expressions and are walked, but its op name
+    /// is not a variable. Treating it as one would make `ping` look free -- and,
+    /// in a lambda, look like a capture of whatever the name happens to bind.
+    #[test]
+    fn a_perform_walks_its_arguments_but_its_op_name_is_not_a_variable() {
+        let fv = free_vars(&perform("ping", vec![var("a")]));
+        assert_eq!(
+            fv.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["a"],
+            "only the argument is free"
+        );
+    }
+
+    #[test]
+    fn collect_descends_into_perform_arguments() {
+        let lam = e(
+            Ty::Fn(vec![int()], EffectRow::pure(), Box::new(int())),
+            CoreKind::Lambda(Rc::from([param("x")]), Rc::new(var("x"))),
+        );
+        let core = CoreModule {
+            fns: vec![CoreFn {
+                name: "p".to_string(),
+                params: Rc::from([]),
+                body: perform("ping", vec![lam]),
+            }],
+            types: Vec::<CoreType>::new(),
+        };
+        assert_eq!(
+            collect_lambdas(&core, 0).len(),
+            1,
+            "a lambda passed to an op gets its site and descriptor row"
         );
     }
 }

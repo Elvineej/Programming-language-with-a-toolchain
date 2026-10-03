@@ -1188,6 +1188,7 @@ fn lower_expr<'ctx>(
         // never mis-lowered.
         CoreKind::Handle(_) => Err(CodegenError::Unsupported("handle")),
         CoreKind::Resume(_) => Err(CodegenError::Unsupported("resume")),
+        CoreKind::Perform(_) => Err(CodegenError::Unsupported("perform")),
     }
 }
 
@@ -1980,6 +1981,24 @@ mod tests {
         let err = emit_ir(&core_of("fn id(x) { x }\npub fn main() { 1 }\n")).unwrap_err();
         assert!(
             matches!(err, CodegenError::Unsupported("unrepresentable type")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_perform_is_refused_by_name_until_dispatch_exists() {
+        // 5b-8 D11 / 7b-1: Core now says "perform" (CoreKind::Perform), so the
+        // back end refuses it by that name rather than misreporting it as a call
+        // to an undeclared function. Task 8 lifts the refusal and deletes this
+        // test on purpose.
+        let err = emit_ir(&core_of(
+            "effect E { fn ping() -> Int }\n\
+             fn worker() -> Int { ping() }\n\
+             pub fn main() -> Int { 0 }\n",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported("perform")),
             "{err:?}"
         );
     }
