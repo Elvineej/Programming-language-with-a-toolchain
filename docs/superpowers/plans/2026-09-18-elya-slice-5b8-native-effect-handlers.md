@@ -1690,6 +1690,17 @@ git commit -F /tmp/msg-t7a.txt
 >   does not perform at run time. **Acceptance:** `grep -rn "allow(dead_code)" crates/ src/`
 >   returns 0 matches, recorded in the report.
 >
+> - **7b-3 obligations from the 7b-2 independent review (2026-10-03, unconfirmed concerns,
+>   recorded so emission cannot skip them):** (a) a saved value can carry an unresolved
+>   `Ty::Var` (`fn f(x, y) { if get() == 1 { x } else { y } }` saves `x`, `y` at `Var`),
+>   and `is_heap_ty(Var)` is false, so its mask bit is clear -- emission must refuse a site
+>   whose saved type is a `Ty::Var` by name (as `repr_ty` refuses it), never emit it untraced;
+>   lambda captures share the exposure. (b) A site inside a handled body saves only that body's
+>   remainder; whatever follows the `handle` (`let a = handle {..}  a + x`) relies on the
+>   handle being a native nested call (D14). 7b-3/Task 8 must keep it one even when a clause
+>   stores the continuation and the handle returns early, and Task 8 adds an execution test of
+>   exactly that shape.
+>
 > Standing rules for all three: predictions first; red before the fix; every negative control
 > built, run, recorded and reverted with a hash check; before a control runs, the test it
 > targets has one assertion path per case it must discriminate; exact gate counts.

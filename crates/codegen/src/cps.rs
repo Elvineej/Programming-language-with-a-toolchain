@@ -3,7 +3,10 @@
 //! Deliberately LLVM-free: this is a pure question about a `Ty`, so it needs no
 //! `Context` and its tests are unit tests.
 
+use elya::core::{CoreExpr, CoreKind, CoreModule};
 use elya::types::{EffectRow, RowTail, Ty};
+
+use crate::closure::{cont_ty, free_vars_under, pat_binders, CONT};
 
 /// The one effect label the back end treats as builtin. Sound as a *name* test
 /// only because lowering refuses a user-declared `effect IO` (D1, Task 2) --
@@ -15,9 +18,7 @@ const BUILTIN_EFFECT: &str = "IO";
 ///
 /// A non-function type is not a call site and answers `false`.
 ///
-/// No caller outside the tests until Task 7b's call-site check; delete this
-/// `allow` there, when the first caller lands.
-#[allow(dead_code)]
+/// Called by `collect_sites` (7b-2) to recognise an effectful call.
 pub fn needs_cps(ty: &Ty) -> bool {
     match ty {
         Ty::Fn(_, row, _) => row_needs_cps(row),
@@ -39,6 +40,264 @@ fn row_needs_cps(row: &EffectRow) -> bool {
         // survived inference, NOT a signal to flip the default.
         RowTail::Open(_) | RowTail::ErrorRow => true,
     }
+}
+
+/// One value a suspended computation still needs (D10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Saved {
+    /// A local binding, identified by BINDING, not by name: `binding` is its
+    /// index in the scope stack at the site, so two live bindings that share a
+    /// name (`let x = 1  (let x = 2  get() + x) + x`) get two slots.
+    Var { name: String, binding: usize },
+    /// An operand already evaluated before the site, keyed by its node's
+    /// address (closure.rs's `LambdaSite::key` rule). Its VALUE is saved:
+    /// recomputing it after resumption would repeat whatever it did.
+    Temp(usize),
+}
+
+/// One continuation site (D10): a call that may capture its continuation,
+/// in a position where something still runs after it returns.
+pub struct ContSite {
+    /// The address of the site's `CoreExpr` (see `Saved::Temp`).
+    pub key: usize,
+    /// Slot order in the frame after `[tag][code_ptr][next]`: temporaries in
+    /// path order (outermost ancestor first, left to right), then bindings in
+    /// binding order (outermost first). Deterministic, and the bit order of the
+    /// frame row's mask.
+    pub saved: Vec<(Saved, Ty)>,
+}
+
+/// Every continuation site in the module, in a fixed pre-order: the functions
+/// in order, each walked through all of its regions -- the body, every lambda
+/// body, every handled body, every clause body and every return body.
+///
+/// A site is a `Perform`, or an `App` whose callee's type `needs_cps`, that is
+/// NOT in tail position of its region: a tail call passes the current
+/// continuation straight on (D14), so it needs no frame. A handle and a resume
+/// are nesting calls (D14), so they are not sites, and each of their bodies
+/// is a region of its own.
+pub fn collect_sites(core: &CoreModule) -> Vec<ContSite> {
+    let mut out = Vec::new();
+    for f in &core.fns {
+        let mut scope: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+        let mut path = Vec::new();
+        walk(&f.body, &mut scope, &mut path, &mut out);
+    }
+    out
+}
+
+/// An ancestor of the node being visited, inside the current region: the
+/// node, which child the walk descended into, and the scope depth AT the
+/// ancestor (the bindings its later children can see).
+struct Step<'a> {
+    node: &'a CoreExpr,
+    slot: usize,
+    depth: usize,
+}
+
+fn is_call_site(e: &CoreExpr) -> bool {
+    match &e.kind {
+        CoreKind::Perform(_) => true,
+        CoreKind::App(f, _) => needs_cps(&f.ty),
+        _ => false,
+    }
+}
+
+/// Tail slots: a `Let` body, an `If` branch, a `Match` arm body. Nothing else
+/// returns its child's value as its own without further work.
+fn in_tail(path: &[Step]) -> bool {
+    path.iter().all(|s| match &s.node.kind {
+        CoreKind::Let(..) => s.slot == 1,
+        CoreKind::If(..) => s.slot >= 1,
+        CoreKind::Match(..) => s.slot >= 1,
+        _ => false,
+    })
+}
+
+/// The match is EXHAUSTIVE with no catch-all, for the reason `fv_walk` gives:
+/// a missed region is a missed site, and a missed site is a frame that does not
+/// exist when the continuation is captured.
+fn walk<'a>(
+    e: &'a CoreExpr,
+    scope: &mut Vec<String>,
+    path: &mut Vec<Step<'a>>,
+    out: &mut Vec<ContSite>,
+) {
+    if is_call_site(e) && !in_tail(path) {
+        out.push(ContSite {
+            key: e as *const CoreExpr as usize,
+            saved: saved_at(path, scope),
+        });
+    }
+    let visit = |child: &'a CoreExpr,
+                 slot: usize,
+                 scope: &mut Vec<String>,
+                 path: &mut Vec<Step<'a>>,
+                 out: &mut Vec<ContSite>| {
+        path.push(Step {
+            node: e,
+            slot,
+            depth: scope.len(),
+        });
+        walk(child, scope, path, out);
+        path.pop();
+    };
+    match &e.kind {
+        CoreKind::Lit(_) | CoreKind::Var(_) => {}
+        CoreKind::App(f, args) => {
+            visit(f, 0, scope, path, out);
+            for (i, a) in args.iter().enumerate() {
+                visit(a, i + 1, scope, path, out);
+            }
+        }
+        CoreKind::Builtin(_, args) | CoreKind::Ctor(_, args) | CoreKind::Prim(_, args) => {
+            for (i, a) in args.iter().enumerate() {
+                visit(a, i, scope, path, out);
+            }
+        }
+        CoreKind::Perform(p) => {
+            for (i, a) in p.args.iter().enumerate() {
+                visit(a, i, scope, path, out);
+            }
+        }
+        CoreKind::Let(name, value, body) => {
+            visit(value, 0, scope, path, out);
+            let depth = scope.len();
+            scope.push(name.clone());
+            visit(body, 1, scope, path, out);
+            scope.truncate(depth);
+        }
+        CoreKind::If(c, t, f) => {
+            visit(c, 0, scope, path, out);
+            visit(t, 1, scope, path, out);
+            visit(f, 2, scope, path, out);
+        }
+        CoreKind::Match(scrutinee, arms) => {
+            visit(scrutinee, 0, scope, path, out);
+            for (i, arm) in arms.iter().enumerate() {
+                let depth = scope.len();
+                pat_binders(&arm.pat, scope);
+                visit(&arm.body, i + 1, scope, path, out);
+                scope.truncate(depth);
+            }
+        }
+        CoreKind::Resume(v) => visit(v, 0, scope, path, out),
+        // New regions: each starts with an empty path and the scope it sees.
+        CoreKind::Lambda(params, body) => {
+            let depth = scope.len();
+            for p in params.iter() {
+                scope.push(p.name.clone());
+            }
+            walk(body, scope, &mut Vec::new(), out);
+            scope.truncate(depth);
+        }
+        CoreKind::Handle(h) => {
+            walk(&h.body, scope, &mut Vec::new(), out);
+            for c in h.clauses.iter() {
+                let depth = scope.len();
+                for p in c.params.iter() {
+                    scope.push(p.name.clone());
+                }
+                scope.push(CONT.to_string());
+                walk(&c.body, scope, &mut Vec::new(), out);
+                scope.truncate(depth);
+            }
+            if let Some(r) = &h.ret {
+                let depth = scope.len();
+                scope.push(r.binder.clone());
+                walk(&r.body, scope, &mut Vec::new(), out);
+                scope.truncate(depth);
+            }
+        }
+    }
+}
+
+/// What the rest of the region needs once the site's call returns.
+fn saved_at(path: &[Step], scope: &[String]) -> Vec<(Saved, Ty)> {
+    let mut temps: Vec<(Saved, Ty)> = Vec::new();
+    let mut vars: std::collections::BTreeMap<usize, (String, Ty)> =
+        std::collections::BTreeMap::new();
+    // A name free in something an ancestor still has to run refers to the
+    // binding visible AT that ancestor -- the innermost one below its depth.
+    let mut need = |name: &str, ty: &Ty, depth: usize| {
+        if let Some(b) = scope[..depth].iter().rposition(|n| n == name) {
+            vars.entry(b)
+                .or_insert_with(|| (name.to_string(), ty.clone()));
+        }
+    };
+    for step in path {
+        let operands: Vec<&CoreExpr> = match &step.node.kind {
+            CoreKind::App(f, args) => std::iter::once(&**f).chain(args.iter()).collect(),
+            CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
+                a.iter().collect()
+            }
+            CoreKind::Perform(p) => p.args.iter().collect(),
+            CoreKind::Let(name, _, body) => {
+                if step.slot == 0 {
+                    for (n, t) in free_vars_under(body, std::slice::from_ref(name)) {
+                        need(&n, &t, step.depth);
+                    }
+                }
+                continue;
+            }
+            CoreKind::If(_, t, f) => {
+                if step.slot == 0 {
+                    for b in [t, f] {
+                        for (n, ty) in free_vars_under(b, &[]) {
+                            need(&n, &ty, step.depth);
+                        }
+                    }
+                }
+                continue;
+            }
+            CoreKind::Match(_, arms) => {
+                if step.slot == 0 {
+                    for arm in arms.iter() {
+                        let mut binders = Vec::new();
+                        pat_binders(&arm.pat, &mut binders);
+                        for (n, ty) in free_vars_under(&arm.body, &binders) {
+                            need(&n, &ty, step.depth);
+                        }
+                    }
+                }
+                continue;
+            }
+            // The resume still has to RUN after the site returns, and it needs
+            // the clause's continuation -- whose native stack is gone once the
+            // site suspends. (Found by independent review: before this arm, a
+            // site inside `resume(..)`'s argument saved nothing.)
+            CoreKind::Resume(v) => {
+                need(CONT, &cont_ty(&v.ty, &step.node.ty), step.depth);
+                continue;
+            }
+            // Lit, Var, Lambda and Handle are never on a path (they are leaves
+            // or region boundaries).
+            CoreKind::Lit(_) | CoreKind::Var(_) | CoreKind::Lambda(..) | CoreKind::Handle(_) => {
+                continue
+            }
+        };
+        for (i, op) in operands.iter().enumerate() {
+            if i < step.slot {
+                // Evaluated before the site; its value is used after it.
+                match &op.kind {
+                    CoreKind::Lit(_) => {}
+                    CoreKind::Var(x) => need(x, &op.ty, step.depth),
+                    _ => temps.push((Saved::Temp(*op as *const CoreExpr as usize), op.ty.clone())),
+                }
+            } else if i > step.slot {
+                for (n, ty) in free_vars_under(op, &[]) {
+                    need(&n, &ty, step.depth);
+                }
+            }
+        }
+    }
+    temps
+        .into_iter()
+        .chain(
+            vars.into_iter()
+                .map(|(binding, (name, ty))| (Saved::Var { name, binding }, ty)),
+        )
+        .collect()
 }
 
 #[cfg(test)]
@@ -111,5 +370,206 @@ mod tests {
     #[test]
     fn a_non_function_type_is_not_a_call_site_at_all() {
         assert!(!needs_cps(&Ty::Base(TyCon::Int)));
+    }
+
+    // ---- 7b-2: continuation sites (D10) and the implicit capture (D12) ----
+
+    fn core_of(src: &str) -> elya::core::CoreModule {
+        let session = elya::Session::new();
+        let (m, pd) = elya::parse::parse_module(&session, src);
+        assert!(pd.is_empty(), "parse: {pd:?}");
+        let (diags, table) = elya::types::infer_typed_table(&session, &m);
+        assert!(diags.is_empty(), "type errors: {diags:?}");
+        elya::core::lower_module(&m, &table).expect("lowers")
+    }
+
+    const S: &str = "effect S { fn get() -> Int }\n";
+
+    fn sites_of(src: &str) -> (elya::core::CoreModule, Vec<ContSite>) {
+        let core = core_of(&format!("{S}{src}"));
+        let sites = collect_sites(&core);
+        (core, sites)
+    }
+
+    /// The table `build_module` emits, for the same module: real ctors, then
+    /// lambdas, then the string row, the frame row, then one row per site.
+    fn rows_of(core: &elya::core::CoreModule, sites: &[ContSite]) -> crate::Descriptors {
+        let n_real_ctors: usize = core.types.iter().map(|t| t.ctors.len()).sum();
+        let lambdas = crate::closure::collect_lambdas(core, n_real_ctors);
+        let string_tag = n_real_ctors + lambdas.len();
+        crate::descriptor_rows(core, &lambdas, sites, n_real_ctors, string_tag).expect("rows")
+    }
+
+    fn row_at(d: &crate::Descriptors, tag: usize) -> [u64; 2] {
+        [d.rows[2 * tag], d.rows[2 * tag + 1]]
+    }
+
+    fn names(site: &ContSite) -> Vec<String> {
+        site.saved
+            .iter()
+            .map(|(s, _)| match s {
+                Saved::Var { name, .. } => name.clone(),
+                Saved::Temp(_) => "<temp>".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tail_perform_needs_no_frame() {
+        // The current continuation is passed straight through (D14).
+        let (_c, sites) = sites_of("fn tail() -> Int { get() }\n");
+        assert!(
+            sites.is_empty(),
+            "a tail perform is not a site: {}",
+            sites.len()
+        );
+    }
+
+    #[test]
+    fn a_non_tail_perform_is_a_site_and_a_literal_sibling_is_not_saved() {
+        let (core, sites) = sites_of("fn nontail() -> Int { get() + 1 }\n");
+        assert_eq!(sites.len(), 1);
+        assert!(names(&sites[0]).is_empty(), "{:?}", names(&sites[0]));
+        let d = rows_of(&core, &sites);
+        assert_eq!(
+            d.site_tags[&sites[0].key], d.frame_tag,
+            "no saved values -> Task 6's row"
+        );
+    }
+
+    #[test]
+    fn a_live_local_is_saved_by_the_site() {
+        let (_c, sites) = sites_of("fn g(x) { x + get() }\nfn u() -> Int { g(1) }\n");
+        assert_eq!(sites.len(), 1, "g's perform only; u's call is a tail call");
+        assert_eq!(names(&sites[0]), vec!["x"]);
+    }
+
+    #[test]
+    fn an_already_evaluated_operand_is_saved_as_a_temporary_not_recomputed() {
+        // `x * 2` ran before the perform; re-running it after resumption would
+        // repeat effects in general, so its VALUE is saved, and `x` itself is
+        // dead after it.
+        let (_c, sites) = sites_of("fn h(x) { (x * 2) + get() }\nfn u() -> Int { h(1) }\n");
+        assert_eq!(sites.len(), 1);
+        assert_eq!(names(&sites[0]), vec!["<temp>"]);
+    }
+
+    #[test]
+    fn a_heap_saved_value_is_listed_with_its_type() {
+        let (_c, sites) = sites_of("fn g() -> Str { let s = \"a\"  let n = get()  s }\n");
+        assert_eq!(sites.len(), 1);
+        assert_eq!(names(&sites[0]), vec!["s"]);
+    }
+
+    #[test]
+    fn a_site_row_sets_bit_j_plus_2_for_a_heap_saved_value() {
+        // D10: [tag][code_ptr][next][saved_0..] -- bit 0 clear (code), bit 1
+        // set (next), bit j+2 set iff saved j is heap.
+        let (core, sites) = sites_of("fn g() -> Str { let s = \"a\"  let n = get()  s }\n");
+        let d = rows_of(&core, &sites);
+        let tag = d.site_tags[&sites[0].key];
+        assert_eq!(row_at(&d, tag), [3, 0b110]);
+    }
+
+    #[test]
+    fn a_site_whose_remainder_needs_nothing_uses_the_frame_row() {
+        let (core, sites) = sites_of("fn g() -> Int { let n = get()  n + 1 }\n");
+        assert_eq!(sites.len(), 1);
+        let d = rows_of(&core, &sites);
+        assert_eq!(d.site_tags[&sites[0].key], d.frame_tag);
+    }
+
+    #[test]
+    fn a_non_tail_call_of_an_effectful_function_is_a_site() {
+        let (_c, sites) =
+            sites_of("fn w() -> Int { get() }\nfn u(x) { w() + x }\nfn v() -> Int { u(1) }\n");
+        assert_eq!(sites.len(), 1, "only u's `w()`");
+        assert_eq!(names(&sites[0]), vec!["x"]);
+    }
+
+    #[test]
+    fn a_site_in_a_handled_body_saves_the_enclosing_local() {
+        let (_c, sites) = sites_of(
+            "pub fn main() -> Int {\n  let y = 5\n  handle { y + get() } with {\n    \
+             S.get() -> resume(1)\n    return(r) -> r\n  }\n}\n",
+        );
+        assert_eq!(sites.len(), 1);
+        assert_eq!(names(&sites[0]), vec!["y"]);
+    }
+
+    const RESUME_IN_LAMBDA: &str =
+        "pub fn main() -> Int {\n  let f = handle { get() } with {\n    \
+         S.get() -> fn(s) { (resume(s))(s) }\n    return(x) -> fn(s) { x }\n  }\n  f(1)\n}\n";
+
+    #[test]
+    fn a_lambda_that_resumes_captures_the_continuation() {
+        // D12: the lambda runs after the handle returned, so it must carry the
+        // clause's continuation.
+        let core = core_of(&format!("{S}{RESUME_IN_LAMBDA}"));
+        let lambdas = crate::closure::collect_lambdas(&core, 0);
+        assert!(
+            lambdas
+                .iter()
+                .any(|l| l.captures.iter().any(|(n, _)| n == crate::closure::CONT)),
+            "no lambda captures {}",
+            crate::closure::CONT
+        );
+    }
+
+    #[test]
+    fn the_captured_continuation_is_traced_by_its_lambda_row() {
+        // D12: a clear bit leaves the frame chain untraced, and a collection
+        // between the handle returning and the lambda resuming frees it.
+        let core = core_of(&format!("{S}{RESUME_IN_LAMBDA}"));
+        let n_real_ctors: usize = core.types.iter().map(|t| t.ctors.len()).sum();
+        let lambdas = crate::closure::collect_lambdas(&core, n_real_ctors);
+        let (site, j) = lambdas
+            .iter()
+            .find_map(|l| {
+                l.captures
+                    .iter()
+                    .position(|(n, _)| n == crate::closure::CONT)
+                    .map(|j| (l, j))
+            })
+            .expect("a lambda captures the continuation");
+        let d = rows_of(&core, &collect_sites(&core));
+        let mask = d.rows[2 * site.tag + 1];
+        assert_ne!(
+            mask & (1 << (j + 1)),
+            0,
+            "continuation capture bit clear: {mask:#b}"
+        );
+    }
+
+    #[test]
+    fn two_live_bindings_sharing_a_name_get_two_slots() {
+        // Both `x`s are live after the perform: the inner one in `get() + x`,
+        // the outer one in `r + x`. The evaluator answers 10 + 2 + 1 = 13 with
+        // `resume(10)`; saving by NAME would keep one `x` and compute 14 or 12.
+        let (_c, sites) = sites_of(
+            "fn g() -> Int {\n  let x = 1\n  let r = { let x = 2  get() + x }\n  r + x\n}\n",
+        );
+        assert_eq!(sites.len(), 1);
+        assert_eq!(names(&sites[0]), vec!["x", "x"]);
+    }
+
+    #[test]
+    fn a_site_inside_a_resume_argument_saves_the_continuation() {
+        // Found by independent review. After `t()` returns, the remainder must
+        // still RESUME, and the clause's native stack is gone -- so the clause's
+        // continuation must be in the frame. (`{ let v = t()  resume(v) }`
+        // already saved it, through the Let step; the direct-ancestor case did not.)
+        let (_c, sites) = sites_of(
+            "effect T { fn t() -> Int }\n\
+             pub fn main() -> Int {\n  handle {\n    handle { get() + 1 } with {\n      \
+             S.get() -> resume(t())\n      return(r) -> r\n    }\n  } with {\n    \
+             T.t() -> resume(10)\n    return(r) -> r\n  }\n}\n",
+        );
+        assert_eq!(sites.len(), 2, "get() + 1 and t()");
+        assert!(
+            sites.iter().any(|s| names(s) == vec![crate::closure::CONT]),
+            "the t() site must save the continuation: {:?}",
+            sites.iter().map(names).collect::<Vec<_>>()
+        );
     }
 }
