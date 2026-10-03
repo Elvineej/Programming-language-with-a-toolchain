@@ -1647,6 +1647,24 @@ const CPS_ROOTING: &[(&str, &str)] = &[
          }\n",
     ),
     (
+        // A heap binding SHADOWED inside an effectful region, live while pure
+        // code allocates -- before and after the resumption (found by the
+        // review of the shadowing fix; the direct-emitter half is pinned by
+        // `a_shadowed_heap_binding_stays_rooted_and_in_scope`).
+        "shadowed-binding-in-an-effectful-region",
+        "type L { Nil, Cons(Int, L) }\n\
+         fn churn(n, acc) { if n == 0 { acc } else { let g = Cons(n, Cons(n, Cons(n, Nil)))  churn(n - 1, acc + 1) } }\n\
+         fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n\
+         effect S { fn get() -> Int }\n\
+         fn w(b) { if b { get() } else { 2 } }\n\
+         fn u(x) {\n\
+         \x20 let s = Cons(42, Nil)\n\
+         \x20 let r = { let s = Cons(7, Nil)  let z0 = churn(30000, 0)  let q = w(False)  let z = churn(30000, 0) + z0 - 30000  head(s) + z + q }\n\
+         \x20 r + head(s) + x\n\
+         }\n\
+         pub fn main() -> Int { handle { u(1) } with { S.get() -> resume(3)  return(r) -> r } }\n",
+    ),
+    (
         // D-3: a string literal LEFT of the site is re-lowered by the
         // resumption, and must be rooted while a later operand allocates.
         "string-literal-left-of-a-site",
@@ -1712,6 +1730,66 @@ fn heap_values_live_across_cps_operands_survive_collections() {
             failures.push(format!(
                 "{tag}: native text={text:?} value={value} evaluator text={want_text:?} value={want_value}"
             ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A heap binding SHADOWED by an inner binding of the same name stays live and
+/// must stay rooted while the inner scope allocates (found 2026-10-03 while
+/// reading the emitter for 5b-8 7b-3; pre-existing since the collector landed).
+const SHADOW_PRELUDE: &str = "type L { Nil, Cons(Int, L) }\n\
+     fn churn(n, acc) { if n == 0 { acc } else { let g = Cons(n, Cons(n, Cons(n, Nil)))  churn(n - 1, acc + 1) } }\n\
+     fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n";
+
+const SHADOWING: &[(&str, &str)] = &[
+    (
+        "let-in-value-position",
+        "pub fn main() -> Int {\n\
+         \x20 let s = Cons(42, Nil)\n\
+         \x20 let r = { let s = Cons(7, Nil)  let z = churn(30000, 0)  head(s) + z }\n\
+         \x20 r + head(s)\n\
+         }\n",
+    ),
+    (
+        "let-in-tail-position",
+        "fn f(s) { let r = { let s = Cons(7, Nil)  let z = churn(30000, 0)  head(s) + z }  r + head(s) }\n\
+         pub fn main() -> Int { f(Cons(42, Nil)) }\n",
+    ),
+    (
+        // The arm used to REMOVE the outer binding after the arm instead of
+        // restoring it ("unbound var" at compile time).
+        "match-arm-binder",
+        "pub fn main() -> Int {\n\
+         \x20 let s = Cons(42, Nil)\n\
+         \x20 let r = match Cons(7, Cons(8, Nil)) { Nil -> 0  Cons(h, s) -> head(s) + churn(30000, 0) }\n\
+         \x20 r + head(s)\n\
+         }\n",
+    ),
+];
+
+#[test]
+fn a_shadowed_heap_binding_stays_rooted_and_in_scope() {
+    let dir = temp_dir("shadowing");
+    let mut failures = Vec::new();
+    for (tag, prog) in SHADOWING {
+        let src = format!("{SHADOW_PRELUDE}{prog}");
+        let core = lower_src(&src);
+        let exe = match try_compile_and_link(&core, &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let (stdout, stats) = run_with_gc_stats(&exe, tag);
+        if stats.collections < 1 {
+            failures.push(format!("{tag}: no collection ran"));
+        }
+        let want = eval_main_int(&src);
+        if stdout != want {
+            failures.push(format!("{tag}: native={stdout} evaluator={want}"));
         }
     }
     std::fs::remove_dir_all(&dir).ok();

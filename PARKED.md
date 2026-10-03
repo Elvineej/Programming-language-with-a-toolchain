@@ -100,7 +100,9 @@ effect index, after `Infer.ops` (richer: it carries signatures, like
 `op_table` to the helper touches the reference semantics, so it was not done in
 5b-8; do it, gated, in a later slice.
 
-## HIGH: shadowed heap bindings are not rooted by the direct emitter (pre-existing, found 2026-10-03)
+## RESOLVED (next commit after b24b96d): shadowed heap bindings were not rooted by the direct emitter (pre-existing, found 2026-10-03)
+
+Fixed by `bind_local`/`unbind_local` in `lib.rs`; pinned by `a_shadowed_heap_binding_stays_rooted_and_in_scope`. A match-arm binder that shadowed an outer name also REMOVED the outer binding after the arm ("unbound var" on a valid program); fixed and pinned by the same test. The CPS emitter had the same hole (its name view kept only the innermost binding); `St::bind`/`rebuild_env` now park shadowed bindings the same way, pinned by the `shadowed-binding-in-an-effectful-region` case. Original report:
 
 `lower_expr`'s `Let` saves a shadowed binding in a Rust local (`prev`) and roots only the
 `env` view, so an outer heap binding hidden by an inner `let` of the same name is NOT on the
