@@ -82,6 +82,11 @@ fn nodes(core: &CoreModule) -> Vec<&CoreExpr> {
                 }
             }
             CoreKind::Resume(v) => walk(v, out),
+            CoreKind::Perform(p) => {
+                for a in p.args.iter() {
+                    walk(a, out);
+                }
+            }
         }
     }
     let mut out = Vec::new();
@@ -721,4 +726,77 @@ fn an_unqualified_handler_clause_is_refused_at_lowering() {
     // Control: the same program with the clause qualified lowers, so the
     // refusal is keyed on the missing effect name, not on handlers.
     lower_src(&unqualified.replace("ask() -> resume", "Ask.ask() -> resume"));
+}
+
+#[test]
+fn a_perform_lowers_to_a_perform_node() {
+    // D11: a call whose callee names an operation is a PERFORM, and Core says
+    // so -- effect and op by name, the arguments lowered -- instead of
+    // passing it off as an application of a `Var`.
+    let (core, table) = lower_src(LOG_HANDLE);
+    let (node, p) = nodes(&core)
+        .into_iter()
+        .find_map(|n| match &n.kind {
+            CoreKind::Perform(p) => Some((n, p.clone())),
+            _ => None,
+        })
+        .expect("the perform should have lowered to a CoreKind::Perform");
+    assert_eq!(p.effect, "Log");
+    assert_eq!(p.op, "log");
+    assert_eq!(p.args.len(), 1);
+    assert_eq!(
+        node.ty,
+        Ty::Base(TyCon::Str),
+        "a perform's type is the op's result"
+    );
+    both_origin_checks(&core, &table);
+}
+
+#[test]
+fn an_op_wins_over_a_same_named_fn_as_inference_and_the_evaluator_resolve_it() {
+    // D11. Inference (`infer_call`: ops before the environment) and the
+    // evaluator (`CalleeSlot::Operation`) both resolve an op name before any
+    // variable; measured, this program's evaluator run PERFORMS the op. So
+    // `user`'s `ping()` must lower to a Perform -- never to a call to `fn ping`.
+    let src = "effect E { fn ping() -> Int }\n\
+               fn ping() -> Int { 5 }\n\
+               fn user() -> Int { ping() }\n\
+               pub fn main() -> Int {\n\
+               \x20 handle { user() } with {\n\
+               \x20   E.ping() -> resume(1)\n\
+               \x20   return(x) -> x\n\
+               \x20 }\n\
+               }\n";
+    let (core, _table) = lower_src(src);
+    let user = core.fns.iter().find(|f| f.name == "user").expect("user");
+    assert!(
+        matches!(&user.body.kind, CoreKind::Perform(p) if p.effect == "E" && p.op == "ping"),
+        "`ping()` must be the op's perform, not a call to `fn ping`: {:?}",
+        user.body.kind
+    );
+}
+
+#[test]
+fn a_perform_carries_the_effect_instantiation() {
+    // D11 + Shape C: the perform keeps the op's type as inference instantiated
+    // it, so the effect's argument (`State(Int)`) is still on the node -- the
+    // names `State`/`set` alone would lose it. Step 11a (a polymorphic effect
+    // performed at a concrete type) reads it.
+    let (core, _t) = lower_src(
+        "effect State(s) { fn get() -> s  fn set(v: s) -> Unit }\n\
+         fn worker() { set(1) }\n",
+    );
+    let worker = core
+        .fns
+        .iter()
+        .find(|f| f.name == "worker")
+        .expect("worker");
+    let CoreKind::Perform(p) = &worker.body.kind else {
+        panic!("worker's body should be a Perform: {:?}", worker.body.kind);
+    };
+    assert_eq!(
+        TyPrinter::new().render(&p.op_ty),
+        "fn(Int) / {State(Int)} -> Unit",
+        "the perform must carry the op's instantiated type"
+    );
 }
