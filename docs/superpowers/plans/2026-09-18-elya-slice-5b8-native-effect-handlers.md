@@ -139,6 +139,124 @@ Two further facts from the same read, both load-bearing:
 
 ---
 
+## Decisions taken at the Task 7b checkpoint (2026-10-03; settled — do not re-litigate)
+
+Task 7b's Step 3 checkpoint (Steps 1–2 measured at `adbd854`) found that 7b could not be
+built as written: its own test needs Task 8's machinery, and the spec's frame shape cannot
+hold a suspended computation. The reviewer took six decisions on the evidence below. They
+amend the spec (its §13) and re-split Task 7b into 7b-1, 7b-2 and 7b-3.
+
+### D10 — A frame is shaped per continuation site, `[tag][code_ptr][next][saved…]`, with one guarded descriptor row per site
+
+**Why.** A frame must hold what the suspended computation still needs, and
+`[tag][code_ptr][next]` has no slot for it: `x + get()` must keep `x` across the perform,
+and A6's `get() + loop_body(n - 1)` must keep `get()`'s value while `loop_body` runs. Spec
+§0 item 3 already says a frame "points at a next frame *and* at saved values of unrelated
+types"; §6.1's fixed shape and §6.3's "exactly one new descriptor row" contradicted it.
+
+**What.** Each continuation site gets a frame shaped like a closure,
+`[tag][code_ptr][next][saved_0..]` — a fixed arity *per site*, known at compile time — and
+one descriptor row, appended after the existing rows and guarded "tag == row index" exactly
+as the lambda, string and frame tags already are. Mask: bit 0 clear (`code_ptr` is a
+text-segment address), bit 1 set (`next` is a heap frame), bit `j + 2` set iff saved value
+`j` is a heap value (`is_heap_ty`) — the lambda rows' convention shifted by one. A site with
+no saved values uses the `[2, 0b10]` row Task 6 laid down.
+
+**Evidence.** `gc_mark` reads arity and mask generically per tag (`runtime.c`), and lambdas
+already get one synthesized row per site (`descriptor_rows`). Per-site frame rows therefore
+add rows, not a `gc_mark` case: A7 still holds (637 bytes by Task 1's command at
+`adbd854`). The variable-length block §6.2 rejects has a per-OBJECT length; a per-SITE fixed
+arity is exactly what a lambda already is.
+
+**A8 becomes:** one descriptor row per continuation site, each guarded; Task 6's `[2, 0b10]`
+row is the no-saved-values case.
+
+### D11 — `CoreKind::Perform`, resolved ops-first to match inference and the evaluator
+
+**Why.** Core had no perform node: `get()` lowered to `App(Var("get"), ..)`, and codegen
+resolves a callee as a local, then a top-level function. Inference (`infer_call` checks
+`self.ops` before `env.lookup`) and the evaluator (`eval.rs`, `CalleeSlot::Operation` from
+`op_table`) both resolve `io.println`, then constructors, then **op names**, before any
+variable. Measured at `adbd854` with `effect E { fn ping() -> Int }` and
+`fn ping() -> Int { 5 }` both declared: `elya check` → `ok`; `elya run` → "evaluator
+PERFORMED the op". Once handlers compile, codegen's order would call `fn ping` instead — a
+silent miscompile.
+
+**What.** Lowering emits a `Perform` node carrying the effect name, the op name and the
+lowered arguments, at the same point in the same order as inference and the evaluator: after
+`io.println` and constructors, before the applied-`resume` rewrite and the generic callee.
+The op → effect index is built from `Decl::Effect` with the same last-declaration-wins rule
+both existing tables use, through one helper (`ast::op_effects`) — the third construction of
+that index, after `Infer.ops` and the evaluator's `op_table`, so it is extracted rather than
+rebuilt locally (§9.4's rule). Redirecting the evaluator's `op_table` to the helper touches
+the reference semantics and is parked, not done here. Codegen refuses `Perform` by name until
+Task 8.
+
+**Recorded against the plan:** this is a **third** new Core node, after `Handle` and
+`Resume`, against Task 5's "No fifth node kind" and spec §3.1's "no fifth Core node is
+needed".
+
+### D12 — Closure conversion captures the continuation implicitly; its mask bit MUST be set
+
+**Why.** `resume` can run after its `handle` has returned. A9's own program is
+`State.get() -> fn(s) { (resume(s))(s) }`, and `program("init")` calls that lambda after
+the handle produced it. The lambda needs the clause's continuation, but Task 5's `fv_walk`
+gives `Resume(v)` only `v`'s free variables, so nothing captures it.
+
+**What.** A `resume` makes the clause's continuation free, as a synthetic binder (in the
+house style of D7's `$k`) that the clause binds. A lambda containing a `resume` — at any
+depth — therefore captures it by the ordinary free-variable rule, and an enclosing lambda
+captures it to pass inward. The continuation is a heap pointer to the frame chain, so its bit
+in the lambda's descriptor row MUST be set: a clear bit leaves the chain untraced, and a
+collection between the handle returning and the lambda calling `resume` frees frames still
+in use.
+
+**Required tests:** 7b-2 — the implicit capture's bit is set in the lambda's row, and a
+negative control that clears it fails the test. Task 8 — the GC-stress test (see Task 8).
+
+### D13 — One-shot is enforced natively by a consumed flag that traps with a named error
+
+**Why.** The evaluator enforces one-shot dynamically (`ResumeData.consumed: Cell<bool>`,
+E0425; spec §4 point 5). Native frames are immutable heap cells, so without a check a second
+`resume` silently re-runs the captured frames — a native answer where the evaluator stops
+with an error.
+
+**What.** The continuation object carries a consumed word, which is not a heap pointer, so its
+mask bit is clear. `resume` checks and sets it. A second `resume` calls a runtime trap in the
+style of `elya_match_fail` — a named message on stderr and a non-zero exit — and never
+re-executes. The differential test expects BOTH sides to fail: the evaluator with E0425, native
+with the named trap.
+
+### D14 — `musttail` transfers instead of a runtime trampoline; the N = 1 000 000 obligation is unchanged
+
+**Why.** Measured at the checkpoint: `runtime.c` contains no function-pointer call, so no
+extern calls back into emitted code; and every Elya function and call site is `tailcc`,
+which C cannot call, so a trampoline loop in `runtime.c` (the plan's shape A) would need a
+C-callable thunk for every resumable code pointer. Every Elya call already supports
+`musttail`, and four 1 000 000-deep tests already prove it keeps the machine stack flat.
+
+**What.** Shape B. Every transfer — perform → clause, and one frame's code → the next — is a
+`musttail` jump. The only nesting calls into effectful code are the handle site and the
+resume site, and each returns when the computation it started reaches its handler. That is
+§7.2's requirement (the perform → clause transfer must not nest), met without a trampoline
+loop. A9 at N = 1 000 000 is unchanged and remains the machine-stack criterion.
+
+**Consequence.** The continuation is an extra parameter, so a CPS function may have at most
+4 source parameters (`MAX_PARAMS` = 5, the measured win64 limit, minus one), refused by name
+in 7b-3 the way `MAX_LAMBDA_PARAMS` is. It is untested on win64 (PARKED.md).
+
+### D15 — The plan's 7b test moves to Task 8, with its predicted failure corrected
+
+**Why.** `a_non_tail_resume_compiles_and_runs` needs performs, handler installation,
+dispatch and resume — Task 8's machinery — so it cannot pass in 7b. Its predicted
+pre-implementation failure, "a `CodegenError::Unsupported` naming the handle node", was
+wrong. Measured at `adbd854`, `elya build` refuses that program with
+`callee is not a top-level function`, because `body()` is emitted before `main`. After 7b-1
+the perform is a `Perform` node and the first refusal becomes codegen's `Perform` refusal, so
+Task 8's red step re-measures instead of assuming.
+
+---
+
 ## File Structure
 
 | File | Responsibility | Tasks |
@@ -1550,6 +1668,32 @@ git commit -F /tmp/msg-t7a.txt
 
 ### Task 7b: The effectful calling convention — measure the seam, then build it
 
+> **Re-split at the checkpoint (2026-10-03; D10–D15).** Steps 1–3 below were run and
+> reported at `adbd854`. Steps 4–10 are SUPERSEDED: Step 4's test moved to Task 8 (D15), and
+> Step 6's single frame constructor is replaced by per-site frames (D10). The work is three
+> separately gated commits, each stopped after and reported:
+>
+> - **7b-1 — `CoreKind::Perform` (D11).** Lowering stamps performs ops-first, through
+>   `ast::op_effects`; the exhaustive Core matches learn the node; codegen refuses it by name
+>   until Task 8. **Required test:** the fn/op name-collision program
+>   (`effect E { fn ping() -> Int }` + `fn ping() -> Int { 5 }`) lowers to a `Perform`, not to
+>   a call to `fn ping`.
+> - **7b-2 — continuation-site analysis (D10, D12), LLVM-free like `closure.rs`.** The
+>   continuation sites of CPS functions, their saved values, per-site tags and guarded
+>   descriptor rows (Task 6's `[2, 0b10]` is the no-saved-values case), and the implicit
+>   continuation capture. `frame_tag` comes from `descriptor_rows`, never recomputed.
+>   **Required test:** the implicit capture's bit is SET in the lambda's descriptor row; a
+>   negative control that clears it makes the test fail.
+> - **7b-3 — emission (D10, D14).** The CPS calling convention for `needs_cps` functions,
+>   with the ≤ 4-source-parameter refusal; per-site frame allocation; the handle entry, the
+>   return clause and the handler frame. First execution test: a handle whose effectful body
+>   does not perform at run time. **Acceptance:** `grep -rn "allow(dead_code)" crates/ src/`
+>   returns 0 matches, recorded in the report.
+>
+> Standing rules for all three: predictions first; red before the fix; every negative control
+> built, run, recorded and reverted with a hash check; before a control runs, the test it
+> targets has one assertion path per case it must discriminate; exact gate counts.
+
 **Files:**
 - Modify: `crates/codegen/src/cps.rs`, `crates/codegen/src/lib.rs`
 - Possibly modify: `crates/codegen/src/runtime.c` — **only outside `gc_mark`** (A7)
@@ -1750,6 +1894,20 @@ Explicit paths; never `-A`.
 ---
 
 ### Task 8: Handler dispatch, the splice, the trampoline, and the `with multi` refusal (A2)
+
+> **Added at the 7b checkpoint (2026-10-03; D11–D15).** There is no runtime trampoline: the
+> transfers are `musttail` jumps (D14), so "the trampoline" in this task's title and steps
+> means that. Required tests, in addition to the steps below:
+>
+> - **The moved 7b test** (D15), `a_non_tail_resume_compiles_and_runs`: program and
+>   expected `42` unchanged. Its red step re-measures the refusal instead of assuming it.
+> - **Name collision, differential** (D11): the `effect E { fn ping() -> Int }` +
+>   `fn ping() -> Int { 5 }` program. Native must match the evaluator's
+>   "evaluator PERFORMED the op".
+> - **GC stress** (D12): a collection runs between the handle returning and a lambda calling
+>   `resume`; the result matches the evaluator.
+> - **Double resume** (D13): native traps with the named error; the evaluator gives E0425.
+>   Both sides must fail.
 
 **Files:**
 - Modify: `crates/codegen/src/lib.rs`

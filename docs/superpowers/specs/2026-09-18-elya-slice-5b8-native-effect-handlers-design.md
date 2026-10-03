@@ -49,7 +49,8 @@ for the first time:
    neighbour* rather than looked up, and it will not be the last).
 2. **A calling convention for handler clauses** — clauses are not functions in the
    existing sense; they receive an operation's arguments *and* a continuation, and
-   they may return to a trampoline rather than to their caller (§8.3).
+   they may return to a trampoline rather than to their caller (§8.3). *(2026-10-03:
+   no runtime trampoline — every transfer is a `musttail` jump; §13 D14.)*
 3. **The first heterogeneous pointer-bearing heap object** — every heap shape so
    far has been homogeneous in what it points at. A frame cell points at a next
    frame *and* at saved values of unrelated types (§6.1).
@@ -151,7 +152,9 @@ is the one that costs something.
 `Rc<Spanned<Expr>>` (`src/ast.rs:96, 102`) — **not** `Rc<Spanned<Block>>`, which
 is what `Expr::Lambda` carries. ✓ VERIFIED at `src/parse.rs:753` (return clause)
 and `src/parse.rs:840` (op clause): both are parsed by `self.expr(0)`. So a clause
-body is lowered by `lower_expr`, and **no fifth Core node is needed for it.** The
+body is lowered by `lower_expr`, and **no fifth Core node is needed for it.** *(2026-10-03:
+performs DO get a node of their own, `CoreKind::Perform` — a third new Core node, §13
+D11. Clause bodies still need none.)* The
 corpus's actual handler shape —
 
 ```
@@ -276,7 +279,9 @@ implementation — jump back into the captured frames — drops the handler and 
 the *second* perform in a loop escape. The fidelity test in §7 is a loop
 precisely so that it performs more than once.
 
-Point 5 is where the native back end **diverges deliberately**: see §5.
+Point 5 is where the native back end **diverges deliberately**: see §5. *(2026-10-03:
+for a one-shot effect, native enforces point 5 with a consumed flag that traps with a
+named error, never by re-executing — §13 D13.)*
 
 ---
 
@@ -398,6 +403,11 @@ continuation, or null at the base. **A continuation frame is a closure.** That i
 not an analogy used to explain the design — it is the design, and it is why the
 design is cheap.
 
+*(2026-10-03, §13 D10: the cell above has no room for the values a suspended
+computation still needs. A frame is shaped per continuation site,
+`[tag][code_ptr][next][saved…]` — a closure in exactly the lambda sense — and the
+three-word shape above is its no-saved-values case.)*
+
 ### 6.2 Why 3(a) and not a variable-length block
 
 A continuation is variable-length, pointer-bearing, and **heterogeneous** — the
@@ -502,6 +512,8 @@ required, not incidental.
 
 **Consequence for the design, not just for the tests:** the transfer must return
 to a trampoline rather than nest, and §8.3's dispatch is where that is discharged.
+*(2026-10-03, §13 D14: "must not nest" stands; it is met by `musttail` transfers, not
+by a trampoline loop.)*
 General resume position (§0) forces the issue anyway — a clause that applies
 `resume`'s result, as the corpus's does, cannot be a nested call — but the
 instrument must be able to catch it if the implementation drifts back.
@@ -651,6 +663,10 @@ frames, per §4 point 4.
 
 The strict `(effect, op)` match of §4 point 2 is reproduced as-is. Nothing here
 needs a row at runtime; the match is on two names.
+
+*(2026-10-03: the perform site is a `CoreKind::Perform` carrying both names, resolved
+ops-first as inference and the evaluator resolve it — §13 D11; transfers are `musttail`
+jumps — §13 D14.)*
 
 ---
 
@@ -807,7 +823,7 @@ checks that enforce them.
 | A5 | A growing control moves the heap instrument (strict inequality), written without `<>` (§9.1). | execution |
 | A6 | A deep handler resumed inside a loop performs more than once and finds the same handler each time (§4 point 4). | differential execution |
 | A7 | `gc_mark` is byte-identical to its form at the slice base, measured by byte count, not eyeballed — third consecutive slice. If it is not, the deviation is **reported, not patched**. | measurement |
-| A8 | The tag/row guards at `crates/codegen/src/lib.rs:1391` and `:1412` are extended to cover the frame tag. | structural (discharged by the check) |
+| A8 | One descriptor row per continuation site, each guarded by "tag == row index"; Task 6's `[2, 0b10]` row is the no-saved-values case (§13 D10). *(Was: "The tag/row guards at `crates/codegen/src/lib.rs:1391` and `:1412` are extended to cover the frame tag.")* | structural (discharged by the check) |
 | A9 | **The other half of Invariant N8-1 — the machine stack.** `state_tail_loop`'s source (§9.1, the one row that transfers) compiles natively as written and runs to completion at **N = 1 000 000** through `assert_runs`, printing exactly `x`. Non-vacuous by the calibration in §7.3, not by a control test. **The N must not be lowered.** | execution (differential bytes) |
 
 **A4 and A9 are not interchangeable and neither subsumes the other** — A4 watches
@@ -847,3 +863,33 @@ the result.)*
 - **Open for decision before planning:** §9.2 (whether `IO` can be user-declared)
   and §9.4 (extract the `multi_declared_ops` helper, or accept a third local
   rebuild).
+
+---
+
+## 13. Amendments at the Task 7b checkpoint (2026-10-03)
+
+Taken by the reviewer on evidence measured at the plan's Task 7b checkpoint (at
+`adbd854`). The full rationale and evidence are the plan's D10–D15, with the same
+numbers; each section amended above carries a dated pointer here.
+
+- **D10 (§0 item 3, §6.1, §6.3, §11 A8).** Frames are shaped per continuation site,
+  `[tag][code_ptr][next][saved…]`, each site with one descriptor row guarded "tag == row
+  index". Bit 0 is clear, bit 1 is set, and bit `j + 2` is set iff saved value `j` is a heap
+  value. The row Task 6 laid down, `[2, 0b10]`, is the no-saved-values case. `gc_mark` is
+  still untouched (A7): rows are generic, and lambdas already have one row per site.
+- **D11 (§3.1, §8.3).** `CoreKind::Perform` carries the effect, the op and the arguments,
+  resolved ops-first exactly as inference and the evaluator resolve a call. Measured: with a
+  function and an op both named `ping`, the front end accepts the program and the evaluator
+  performs the op; codegen's local-then-function order would have called the function. It is
+  a third new Core node, against §3.1's "no fifth Core node".
+- **D12 (§2.1, §3.2).** A lambda that calls `resume` captures the clause's continuation
+  implicitly, as a synthetic binder the ordinary free-variable rule carries inward. It is a
+  heap pointer to the frame chain, so its mask bit MUST be set.
+- **D13 (§4 point 5, §5).** Natively, one-shot is enforced by a consumed flag that traps
+  with a named runtime error, never by re-executing; the differential test expects both
+  sides to fail (E0425, and the trap).
+- **D14 (§0 item 2, §7.2, §8.3).** No runtime trampoline: every transfer is a `musttail`
+  jump, and the only nesting calls into effectful code are the handle and resume sites. A CPS
+  function therefore has at most 4 source parameters. A9's N = 1 000 000 is unchanged.
+- **D15.** Plan-only: the plan's 7b test moves to Task 8, its predicted failure corrected
+  to the measured one.
