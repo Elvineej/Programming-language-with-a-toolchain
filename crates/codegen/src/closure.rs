@@ -12,6 +12,26 @@ use std::rc::Rc;
 use elya::core::{CoreExpr, CoreKind, CoreModule, CoreParam, CorePat};
 use elya::types::Ty;
 
+/// The synthetic binder for a handler clause's continuation (5b-8 D12). A
+/// `resume` makes it free; the clause that owns the continuation binds it. So a
+/// lambda that resumes -- and may run after its `handle` has returned --
+/// captures the continuation by the ordinary free-variable rule. `$` cannot
+/// begin a source identifier, so no user name collides with it (the house
+/// style of D7's `$k`, which is a different binder: the RESULT of a resume).
+pub const CONT: &str = "$cont";
+
+/// The continuation's type, as `fv_walk` records it at a `resume(v)` whose
+/// result has type `result`: a function from the resumed value to the handle's
+/// answer. Only its heap-ness is read today -- `is_heap_ty` must answer true,
+/// because the continuation is a pointer to the frame chain (D12).
+pub fn cont_ty(arg: &Ty, result: &Ty) -> Ty {
+    Ty::Fn(
+        vec![arg.clone()],
+        elya::types::EffectRow::pure(),
+        Box::new(result.clone()),
+    )
+}
+
 /// One lambda in the module, in a fixed pre-order.
 pub struct LambdaSite {
     /// Identity: the ADDRESS of the `CoreExpr` node this site was built from.
@@ -135,6 +155,8 @@ fn fv_walk(e: &CoreExpr, scope: &mut Vec<String>, out: &mut BTreeMap<String, Ty>
                 for p in c.params.iter() {
                     scope.push(p.name.clone());
                 }
+                // D12: the clause owns its continuation.
+                scope.push(CONT.to_string());
                 fv_walk(&c.body, scope, out);
                 scope.truncate(depth);
             }
@@ -145,7 +167,15 @@ fn fv_walk(e: &CoreExpr, scope: &mut Vec<String>, out: &mut BTreeMap<String, Ty>
                 scope.truncate(depth);
             }
         }
-        CoreKind::Resume(v) => fv_walk(v, scope, out),
+        // D12: a resume uses the enclosing clause's continuation, so the
+        // continuation is free here exactly like a variable occurrence.
+        CoreKind::Resume(v) => {
+            if !scope.iter().any(|b| b == CONT) {
+                out.entry(CONT.to_string())
+                    .or_insert_with(|| cont_ty(&v.ty, &e.ty));
+            }
+            fv_walk(v, scope, out)
+        }
         // The op name is not a variable (D11); only the arguments are walked.
         CoreKind::Perform(p) => {
             for a in p.args.iter() {
@@ -155,7 +185,7 @@ fn fv_walk(e: &CoreExpr, scope: &mut Vec<String>, out: &mut BTreeMap<String, Ty>
     }
 }
 
-fn pat_binders(p: &CorePat, scope: &mut Vec<String>) {
+pub(crate) fn pat_binders(p: &CorePat, scope: &mut Vec<String>) {
     match p {
         CorePat::Wild | CorePat::Lit(_) => {}
         CorePat::Var(x) => scope.push(x.clone()),
