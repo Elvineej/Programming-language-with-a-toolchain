@@ -1831,6 +1831,20 @@ const HANDLER_8: &[(&str, &str, &str)] = &[
         "6",
     ),
     (
+        // Slice 5c-1: an UNQUALIFIED clause means its op's effect; the native
+        // back end gets it from Core, which always names the effect.
+        "unqualified-clause",
+        "effect Ask { fn ask() -> Int }\n\
+         fn one() { ask() }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { one() } with {\n\
+         \x20   ask() -> resume(2)\n\
+         \x20   return(x) -> x\n\
+         \x20 }\n\
+         }\n",
+        "2",
+    ),
+    (
         "frame-capture",
         "effect State { fn get() -> Int }\n\
          fn body() -> Int { get() + 1 }\n\
