@@ -1067,13 +1067,20 @@ pub mod cek {
         }
     }
 
+    /// Does this clause handle a perform of `(effect, op)`? Its op must match,
+    /// and its qualifier, if written, must be `effect`. An UNQUALIFIED clause
+    /// means its op's effect (slice 5c-1): op names are unique per module (E0202)
+    /// and a qualifier must name the op's own effect (E0203), so the op name
+    /// alone decides -- no table is threaded here.
+    fn clause_matches(c: &OpClause, effect: &str, op: &str) -> bool {
+        c.op == op && c.effect.as_deref().map_or(true, |e| e == effect)
+    }
+
     fn handler_handles(handler: &Handler, effect: &str, op: &str) -> bool {
-        // Strict (effect, op) matching (plan 5c): unambiguous even if two effects
-        // share an operation name.
         handler
             .clauses
             .iter()
-            .any(|c| c.node.effect.as_deref() == Some(effect) && c.node.op == op)
+            .any(|c| clause_matches(&c.node, effect, op))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1090,7 +1097,7 @@ pub mod cek {
         let clause = handler
             .clauses
             .iter()
-            .find(|c| c.node.effect.as_deref() == Some(effect) && c.node.op == op)
+            .find(|c| clause_matches(&c.node, effect, op))
             .ok_or_else(|| rt(span, format!("internal: handler has no clause for `{op}`")))?;
         let rd = Rc::new(ResumeData {
             captured: cap,
