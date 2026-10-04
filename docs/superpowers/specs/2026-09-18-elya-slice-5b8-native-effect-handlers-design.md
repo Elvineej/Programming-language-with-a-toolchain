@@ -452,6 +452,9 @@ extended with it: the per-lambda guard at `:1391` and the row-count guard
 `string_tag != desc.len() / 2` at `:1412`. Those guards are structural invariants
 — no Elya program can make them disagree — so per the standing rule they are
 discharged by the check that enforces them and owe no execution test.
+*(As built, 2026-10-04: b370191 left both existing guards unchanged and added a
+separate frame guard of the same shape, `frame_tag != desc.len() / 2`; D10 then
+gave every site its own row, whose tag IS the row index when pushed (§14).)*
 
 ### 6.4 The cost this design does carry
 
@@ -907,7 +910,43 @@ numbers; each section amended above carries a dated pointer here.
   `[tag][code = return clause][next = null][clause table][saved..]` (the table is a static array
   of clause code addresses indexed by a module-wide `(effect, op)` number; its word is never
   traced, so saved value j is mask bit j + 3). A clause receives the op's arguments, a one-shot
-  continuation object `[tag][k][consumed]` (one descriptor row, mask `0b01`) and the handler
+  continuation object `[tag][k][consumed]` (one descriptor row, mask `0b01`; *since e2c112a
+`[tag][k][consumed][handler]`, mask `0b101` -- §14*) and the handler
   frame; an op with more than three parameters is refused by name (MAX_PARAMS). `resume` is a
   native nesting call; in a clause's tail position it is a `musttail` jump. `with multi` is
   refused on the handle node before anything else (A2).
+
+---
+
+## 14. Close-out (2026-10-04)
+
+Every §11 criterion, the commit that discharged it, and the test that holds it.
+All gated on Linux (`scripts/check.sh`, 59 suites, 593 passed at `6bede80`).
+**Not yet gated on Windows** -- see PARKED.md; `main` does not take this branch
+until `scripts/check.ps1` exits 0.
+
+| # | Status | Held by |
+|---|---|---|
+| A1 | ✓ `334a292` | `HANDLER_CORPUS` (value, both corpus tests) and `a_printing_clause_body_matches_the_evaluator_byte_for_byte` (exact bytes, pinned `"asked\nasked\n"`). |
+| A2 | ✓ `9ac2074` | `a_multi_shot_handler_is_refused_by_its_own_name`, `the_multi_refusal_fires_before_any_clause_body_is_lowered`, `a_multi_shot_handler_written_in_source_reaches_the_codegen_refusal` (`lib.rs` unit tests). |
+| A3 | ✓ measured | §11's row; both halves measured (`d50f3b1`, Task 8 Step 11a). |
+| A4 | ✓ `2db4b9d` | `a_tail_resuming_handler_settles_its_live_set`: four equal levels over 25k-200k, no constant pinned. |
+| A5 | ✓ `2db4b9d` | `a_growing_control_moves_the_live_set`, at **10k/80k**, not the plan's 5k/40k (approved 2026-10-04: at 5k nothing is collected, so `live` measured nothing). 8x kept. |
+| A6 | ✓ `9ac2074` -- **with a finding** | `deep-reinstall` prints 6. Task 12 control 1a showed it does **not** witness re-installation in this design: with one live handler (D17) every resume in it runs while that handler is current, so it still printed 6 with re-installation removed. The witnesses are the resumes that run after their handle returned (`state-passing-lambda-resumes-later`, A9, the lambda-held-continuation test) -- exactly those failed. |
+| A7 | ✓ | `gc_mark` 637 bytes at every re-measure through `6bede80`. Third consecutive slice. |
+| A8 | ✓ `b370191`, `b24b96d` | One row per site, tag == row index at push; `[2, 0b10]` is the no-saved-values row (D10). |
+| A9 | ✓ `636f98c` -- **with a deviation** | `a_state_passing_tail_loop_is_bounded_natively_at_a_million`, source verbatim, N = 1 000 000. Codegen was widened (Unit literal, Unit `main`) rather than the source adapted. `assert_runs` "printing exactly `x`" is impossible as written (stdout is `"x\n0\n"`, the shim prints main's word); the TEXT half is asserted. On Linux an overflow is SIGSEGV, named by `diagnose_crash`. |
+| §9.3 step 7 | ✓ `6bede80` | Six controls, each failing differently, reverted; recorded as doc comments on the proofs. 3a + 3b demonstrates §12's tautology: at N = 1 000 with `musttail` removed, A9 still passes. |
+| §9.2 / §9.4 | ✓ | Task 2 (D1) / Task 1. |
+
+**Beyond the plan, found and fixed on the way** (each with its own red test):
+shadowed heap bindings unrooted (`c89c5ad`, pre-existing); O(depth) handler lookup
+replaced by `elya_current_handler` (`e2c112a`); a fixed 64K-word collection threshold
+made deep live sets quadratic, now `max(64K, live)` (`d04e457`). None touches `gc_mark`.
+
+**§12 obligations, at close.** T7's out-of-repo ledger line (naming N8 as its arrival
+point) is outside this repository and is the maintainer's to update. Invariant N8-1
+holds and is guarded by A4 and A9 as §12 requires. The §5.2 over-refusal and the
+carried items are unchanged. New carried items are in PARKED.md, chiefly: D17's refusals
+make the tail-resume install in `clause_tail` redundant today, and lifting them makes it
+load-bearing.
