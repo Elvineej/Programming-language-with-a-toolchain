@@ -700,12 +700,11 @@ fn a_with_multi_over_a_multi_declared_effect_is_stamped_multi() {
 }
 
 #[test]
-fn an_unqualified_handler_clause_is_refused_at_lowering() {
-    // `ask() -> ..` (no `Ask.`) type-checks, but the evaluator — the reference
-    // semantics — never dispatches to it: `handler_handles` (src/eval.rs)
-    // matches `effect == Some(..)` only, and the run ends in E0300 "unhandled
-    // effect reached the machine". There is no behaviour to reproduce, so
-    // lowering refuses it by name rather than invent one.
+fn an_unqualified_handler_clause_lowers_with_its_ops_effect() {
+    // Slice 5c-1 (replaces 5b-8's `an_unqualified_handler_clause_is_refused_at_
+    // lowering`, which pinned the refusal this slice lifts). Op names are unique
+    // per module (E0202), so `ask() -> ..` means `Ask.ask() -> ..`, and the
+    // evaluator now dispatches to it. Core clauses always carry the effect.
     let unqualified = "effect Ask { fn ask() -> Int }\n\
                        fn one() { ask() }\n\
                        pub fn main() -> Int {\n\
@@ -714,18 +713,29 @@ fn an_unqualified_handler_clause_is_refused_at_lowering() {
                        \x20   return(x) -> x\n\
                        \x20 }\n\
                        }\n";
-    let (m, pd) = parse_module(&Session::new(), unqualified);
-    assert!(pd.is_empty(), "parse: {pd:?}");
-    let (diags, table) = infer_typed_table(&Session::new(), &m);
-    assert!(diags.is_empty(), "the front end accepts it: {diags:?}");
+    let clause_names = |src: &str| -> Vec<(String, String)> {
+        let (core, _) = lower_src(src);
+        nodes(&core)
+            .into_iter()
+            .filter_map(|e| match &e.kind {
+                CoreKind::Handle(h) => Some(
+                    h.clauses
+                        .iter()
+                        .map(|c| (c.effect.clone(), c.op.clone()))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    };
+    let want = vec![("Ask".to_string(), "ask".to_string())];
+    assert_eq!(clause_names(unqualified), want);
+    // Control: the qualified spelling lowers to the same clause.
     assert_eq!(
-        lower_module(&m, &table).unwrap_err(),
-        elya::core::LowerError::Unsupported("unqualified handler clause"),
+        clause_names(&unqualified.replace("ask() -> resume", "Ask.ask() -> resume")),
+        want
     );
-
-    // Control: the same program with the clause qualified lowers, so the
-    // refusal is keyed on the missing effect name, not on handlers.
-    lower_src(&unqualified.replace("ask() -> resume", "Ask.ask() -> resume"));
 }
 
 #[test]
