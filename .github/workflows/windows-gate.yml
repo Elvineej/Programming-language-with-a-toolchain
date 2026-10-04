@@ -1,0 +1,58 @@
+# The Windows gate PARKED.md requires before `main` takes a branch: the
+# unmodified scripts/check.ps1 on x86_64-pc-windows-msvc. LLVM 18 comes from
+# the official 18.1.8 release archive (static libs + llvm-config), not vcpkg,
+# so this proves the code and the win64 calling-convention limits, not a
+# particular local LLVM install.
+name: windows-gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['claude/**']
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every step logs to a file and, on failure, surfaces its tail as an
+      # annotation, so the failure is readable through the checks API alone.
+      - name: Fetch LLVM 18.1.8
+        shell: bash
+        run: |
+          set -o pipefail
+          report() { echo "::error title=$1::$(tail -n 40 "$2" | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"; }
+          {
+            curl -fsSL -o llvm.tar.xz https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz &&
+            mkdir -p /c/llvm18 &&
+            { tar -xJf llvm.tar.xz -C /c/llvm18 --strip-components=1 || echo "tar reported errors (symlinks); verifying"; } &&
+            /c/llvm18/bin/llvm-config.exe --version &&
+            /c/llvm18/bin/clang.exe --version
+          } > llvm.log 2>&1 || { report llvm llvm.log; exit 1; }
+          cat llvm.log
+          echo 'LLVM_SYS_180_PREFIX=C:\llvm18' >> "$GITHUB_ENV"
+          echo 'C:\llvm18\bin' >> "$GITHUB_PATH"
+
+      # The release archive's llvm-config names libxml2s.lib (LLVM's
+      # WindowsManifest support) but does not ship it. Supply it: static
+      # libxml2, core features only (no iconv/zlib/lzma), dynamic CRT to match
+      # Rust's /MD.
+      - name: Provide libxml2s.lib
+        shell: bash
+        run: |
+          report() { echo "::error title=$1::$(tail -n 40 "$2" | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"; }
+          "$VCPKG_INSTALLATION_ROOT/vcpkg.exe" install "libxml2[core]:x64-windows-static-md" > xml.log 2>&1 || { report libxml2 xml.log; exit 1; }
+          cp "$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md/lib/libxml2.lib" /c/llvm18/lib/libxml2s.lib || { ls "$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md/lib" > xml.log 2>&1; report "libxml2 lib name" xml.log; exit 1; }
+
+      - name: Gate (scripts/check.ps1)
+        shell: bash
+        run: |
+          report() { echo "::error title=$1::$(tail -n 40 "$2" | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"; }
+          set +e
+          powershell -NoProfile -File scripts/check.ps1 > gate.log 2>&1
+          rc=$?
+          cat gate.log
+          grep -E "^test result" gate.log | awk '{p+=$4;f+=$6} END{print "::notice title=tests::passed="p" failed="f}'
+          if [ $rc -ne 0 ]; then report "check.ps1 exit $rc" gate.log; exit $rc; fi

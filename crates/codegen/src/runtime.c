@@ -91,6 +91,14 @@ static Block *gc_block_of(void *payload) { return (Block *)((int64_t *)payload -
 void elya_gc_init(const int64_t *descriptors, int64_t n_ctors) {
     gc_descriptors = (int64_t *)descriptors;
     gc_n_ctors = n_ctors;
+#ifdef _WIN32
+    /* The shim calls this first, so stdout is byte-exact for the WHOLE run --
+     * including main's value line, which a program that never prints would
+     * otherwise write in text mode as "\r\n" (found by the Windows gate on the
+     * non-printing CPS-rooting corpus, 2026-10-04). elya_println keeps its own
+     * call; it is now redundant but harmless. */
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
 }
 
 void elya_gc_push(void *root) {
@@ -214,7 +222,13 @@ void *elya_alloc(int64_t words) {
      * just-lowered fields. Marking runs before the block is handed out, so
      * the new object is never itself a mark target -- nothing yet points at
      * it. */
-    if (gc_allocated >= GC_THRESHOLD_WORDS) {
+    /* Collect when allocation since the last collection reaches the larger of
+     * the fixed floor and the last measured live set: the heap doubles
+     * between collections, so a growing live set is marked O(log n) times,
+     * not every 64K words (which made total marking quadratic -- measured:
+     * 45 collections to build a 1M list, 183 for a 1M-deep effectful loop).
+     * Small programs see the old 64K floor unchanged. */
+    if (gc_allocated >= (gc_live > GC_THRESHOLD_WORDS ? gc_live : GC_THRESHOLD_WORDS)) {
         gc_collect();
     }
     gc_allocated += words;
@@ -257,6 +271,29 @@ void *elya_str_lit(int64_t tag, const char *bytes, int64_t len) {
 /* The deterministic failed-match trap. Spec 5b-4 §5: never `unreachable`. */
 void elya_match_fail(void) {
     fputs("elya: match failed (no arm matched)\n", stderr);
+    exit(1);
+}
+
+/* 5b-8 Task 8: the handler the running computation performs to. A handle
+ * site sets it around its body and restores it after; a resume installs the
+ * continuation's own handler around the resumed computation. A perform reads
+ * it in O(1) -- walking the frame chain to its end on every perform made deep
+ * non-tail effectful recursion quadratic (measured: 80k deep, 15 s). Not a GC
+ * root: whenever it is read, the handler frame is reachable from the live
+ * continuation, whose chain ends at it. Single-threaded, like the runtime. */
+void *elya_current_handler = 0;
+
+/* 5b-8 D13: one-shot is enforced natively. A second resume stops here -- a
+ * named message and a non-zero exit, never a re-run. */
+void elya_resume_twice(void) {
+    fputs("elya: resume: a one-shot continuation was resumed twice\n", stderr);
+    exit(1);
+}
+
+/* A perform whose handler has no clause for it. The type checker makes this
+ * unreachable; a guard, never `unreachable`. */
+void elya_unhandled_effect(void) {
+    fputs("elya: perform: the handler has no clause for this operation\n", stderr);
     exit(1);
 }
 

@@ -220,6 +220,26 @@ fn diagnose_stack_overflow(status: &std::process::ExitStatus, tag: &str) {
     }
 }
 
+/// The Linux half of the stack-overflow diagnosis (plan Task 11's platform
+/// note): there an overflow is SIGSEGV, not STATUS_STACK_OVERFLOW. SIGSEGV is
+/// NOT unique to an overflow -- a collector or codegen fault raises it too --
+/// so this names the LIKELY cause. Used by the million-step tests only: the
+/// corpus loops keep collecting per-case failures instead of panicking.
+fn diagnose_crash(status: &std::process::ExitStatus, tag: &str) {
+    diagnose_stack_overflow(status, tag);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal() == Some(11) {
+            panic!(
+                "{tag}: SIGSEGV. Most likely the machine stack overflowed -- a tail call or \
+                 resume that was supposed to keep the stack flat grew it instead -- but a \
+                 collector or codegen fault raises the same signal."
+            );
+        }
+    }
+}
+
 /// The three required assertions per case (§5): exit status, stdout, empty stderr.
 fn assert_runs(exe: &Path, expected: &str) {
     let out = Command::new(exe).output().expect("run produced binary");
@@ -1327,6 +1347,1177 @@ fn a_printing_program_under_gc_stats_splits_by_the_same_rule() {
         stats.collections, 0,
         "{tag}: the consistency gate tripped the collector, so it is no longer \
          the trivial-allocation check §7.3 requires: {stats:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A3 (spec §11), through codegen as the plan's `Ok` branch requires. Task 3
+/// measured that nothing in the front end refuses a polymorphic effect; this is
+/// the same declaration carried the rest of the way. Prediction, written before
+/// the run: Core carries no effect declarations, so codegen never sees one, and
+/// the program compiles, links, runs and prints main's `0`. Measured: exactly
+/// that. Not a miscompile and not a refusal — the effect is invisible here.
+///
+/// The `Ty::Var` half of the answer (an unconstrained type parameter) is a
+/// refusal and produces no binary, so it lives beside its sibling in `lib.rs`'s
+/// `mod tests`: `a3_an_unconstrained_polymorphic_effect_meets_the_ty_var_refusal`.
+#[test]
+fn a3_a_polymorphic_effect_declaration_compiles_and_runs_natively() {
+    let src = "effect State(s) { fn get() -> s  fn set(v: s) -> Unit }\n\
+               pub fn main() -> Int { 0 }\n";
+    let dir = temp_dir("a3-poly-decl");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "a3-poly-decl");
+    assert_runs(&exe, "0");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- 5b-8 Task 7b-3: the effectful calling convention, frames, handle entry,
+// the return clause and the handler frame (D10, D14, D16-D18). No perform
+// happens at run time in this corpus -- dispatch is Task 8 -- but every body
+// calls an effectful function, so the CPS convention, per-site frames and
+// the handler frame all execute.
+
+/// `compile_and_link`, reporting a refusal instead of panicking, so a corpus
+/// loop can collect every case's outcome.
+fn try_compile_and_link(
+    core: &elya::core::CoreModule,
+    dir: &Path,
+    tag: &str,
+) -> Result<PathBuf, String> {
+    let obj = dir.join(format!("{tag}.o"));
+    let exe = dir.join(format!("{tag}{}", std::env::consts::EXE_SUFFIX));
+    elya_codegen::compile_module(core, &obj).map_err(|e| format!("compile: {e:?}"))?;
+    elya_codegen::link(&obj, &exe).map_err(|e| format!("link: {e:?}"))?;
+    Ok(exe)
+}
+
+const S_W: &str = "effect S { fn get() -> Int }\n\
+                   fn w(b) { if b { get() } else { 2 } }\n";
+
+/// (tag, program after S_W, expected). Expected values were measured with the
+/// evaluator before any emitter code was written (7b-3 predictions).
+const HANDLE_7B3: &[(&str, &str, &str)] = &[
+    (
+        "tail-cps-in-body",
+        "pub fn main() -> Int {\n\
+         \x20 handle { w(False) } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r * 10\n\
+         \x20 }\n\
+         }\n",
+        "20",
+    ),
+    (
+        // A non-tail effectful call in `u` (a site saving `a` and `x`) and one
+        // in the handled body (a site saving `y`).
+        "site-saves-local-and-temp",
+        "fn u(x) {\n\
+         \x20 let a = x * 3\n\
+         \x20 a + w(False) + x\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 let y = 7\n\
+         \x20 handle { y + u(5) } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r * 10\n\
+         \x20 }\n\
+         }\n",
+        "290",
+    ),
+    (
+        "return-reads-local",
+        "pub fn main() -> Int {\n\
+         \x20 let m = 3\n\
+         \x20 handle { w(False) } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r * m\n\
+         \x20 }\n\
+         }\n",
+        "6",
+    ),
+    (
+        "no-return-clause",
+        "pub fn main() -> Int {\n\
+         \x20 handle { w(False) + 1 } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20 }\n\
+         }\n",
+        "3",
+    ),
+    (
+        "sequential-handles",
+        "pub fn main() -> Int {\n\
+         \x20 let x = handle { w(False) } with { S.get() -> resume(1)  return(v) -> v }\n\
+         \x20 let y = handle { w(False) + 40 } with { S.get() -> resume(1)  return(v) -> v * 2 }\n\
+         \x20 x + y\n\
+         }\n",
+        "86",
+    ),
+    (
+        // The resumption reads an already-evaluated operand (`x * 3`) back
+        // out of the frame as a temporary, not by recomputing it.
+        "site-saves-a-temporary",
+        "fn v(x) { (x * 3) + w(False) }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { v(5) } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r\n\
+         \x20 }\n\
+         }\n",
+        "17",
+    ),
+    (
+        // The hole is an `if` condition: the resumption branches.
+        "site-in-an-if-condition",
+        "pub fn main() -> Int {\n\
+         \x20 handle { if w(False) == 2 { 10 } else { 20 } } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r + 1\n\
+         \x20 }\n\
+         }\n",
+        "11",
+    ),
+    (
+        // Two sites in one operand list: the second site's frame saves the
+        // first site's value, which the resumption holds as `cur` (found by
+        // the 7b-3 review: it was refused as "saved temporary is not
+        // available").
+        "two-sites-in-one-expression",
+        "pub fn main() -> Int {\n\
+         \x20 handle { w(False) + w(False) * w(False) } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r\n\
+         \x20 }\n\
+         }\n",
+        "6",
+    ),
+    (
+        "two-sites-in-one-call",
+        "fn u(a, b) { a * 100 + b }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { u(w(False), w(False) + 1) } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r\n\
+         \x20 }\n\
+         }\n",
+        "203",
+    ),
+    (
+        // D16's regression pin: an effect-polymorphic function used at a pure
+        // lambda stays direct and keeps working.
+        "apply-pure-stays-direct",
+        "fn apply(f) { f(1) + 1 }\n\
+         pub fn main() -> Int { apply(fn(x) { x * 10 }) }\n",
+        "11",
+    ),
+];
+
+const DEEP_FRAMES: &str = "type L { Nil, Cons(Int, L) }\n\
+     effect S { fn get() -> Int }\n\
+     fn w(b) { if b { get() } else { 2 } }\n\
+     fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n\
+     fn deep(n, b) {\n\
+     \x20 if n == 0 { w(b) } else {\n\
+     \x20   let junk = Cons(1, Cons(2, Cons(3, Cons(4, Nil))))\n\
+     \x20   let c = Cons(n, Nil)\n\
+     \x20   let r = deep(n - 1, b)\n\
+     \x20   r + head(c)\n\
+     \x20 }\n\
+     }\n\
+     pub fn main() -> Int {\n\
+     \x20 handle { deep(4000, False) } with {\n\
+     \x20   S.get() -> resume(1)\n\
+     \x20   return(r) -> r\n\
+     \x20 }\n\
+     }\n";
+
+#[test]
+fn the_7b3_handle_corpus_compiles_runs_and_prints_the_expected_answer() {
+    // Every case runs and is reported before the assertion, so a negative
+    // control shows exactly WHICH cases it breaks (one assertion path per case).
+    let dir = temp_dir("handle-7b3");
+    let mut failures = Vec::new();
+    for (tag, prog, expected) in HANDLE_7B3 {
+        let src = format!("{S_W}{prog}");
+        let core = lower_src(&src);
+        let exe = match try_compile_and_link(&core, &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || got != *expected {
+            failures.push(format!(
+                "{tag}: {:?} stdout={got:?} want={expected}",
+                out.status
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_7b3_handle_corpus() {
+    let dir = temp_dir("differential-handle-7b3");
+    let mut failures = Vec::new();
+    for (tag, prog, _) in HANDLE_7B3 {
+        let src = format!("{S_W}{prog}");
+        let core = lower_src(&src);
+        let exe = match try_compile_and_link(&core, &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let want = eval_main_int(&src);
+        if !out.status.success() || got != want {
+            failures.push(format!(
+                "{tag}: {:?} native={got:?} evaluator={want}",
+                out.status
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        failures.is_empty(),
+        "native diverges from the evaluator: {failures:#?}"
+    );
+}
+
+/// Task 12 controls 2a and 2b both fail this test, the same way (exit 1), as
+/// they do the 400,000-deep constant-time-handler test (SIGSEGV): a deep chain
+/// under collection is exposed by losing either the frames' rows or their
+/// `next` bit. The pair is told apart by
+/// `a_continuation_held_by_a_lambda_survives_a_collection`.
+#[test]
+fn frames_holding_heap_values_survive_collections_and_match_the_evaluator() {
+    // D10's rows under load: 4000 non-tail effectful calls deep, each frame
+    // saving a heap `Cons` across the call while garbage forces collections.
+    // A frame row that failed to trace its saved value would let the
+    // collector reuse it, and `head(c)` would read garbage.
+    let dir = temp_dir("deep-frames-7b3");
+    let core = lower_src(DEEP_FRAMES);
+    let exe = compile_and_link(&core, &dir, "deep");
+    let (stdout, stats) = run_with_gc_stats(&exe, "deep");
+    assert!(stats.collections >= 1, "no collection ran: {stats:?}");
+    assert_eq!(
+        stdout,
+        eval_main_int(DEEP_FRAMES),
+        "native diverges from the evaluator"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Programs from the 7b-3 independent review whose heap values were live
+/// across allocations in CPS code without a root. Each runs under collection
+/// pressure and is compared to the evaluator, text and value.
+const CPS_ROOTING: &[(&str, &str)] = &[
+    (
+        // D-1: the value a site returned, held by the resumption while a
+        // later operand (`garbage(100)`) allocates.
+        "hole-value-across-a-later-operand",
+        "type L { Nil, Cons(Int, L) }\n\
+         effect S { fn get() -> Int }\n\
+         fn w(b) { if b { get() } else { 2 } }\n\
+         fn mkl(n, b) { let x = w(b)  Cons(n + x, Nil) }\n\
+         fn garbage(n) { if n == 0 { Cons(7777, Nil) } else { let j = Cons(n, Cons(n, Nil))  garbage(n - 1) } }\n\
+         fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n\
+         fn pair(a, z) { head(a) + head(z) - 7777 }\n\
+         fn lp(i, acc, b) { if i == 0 { acc } else { lp(i - 1, acc + pair(mkl(i, b), garbage(100)), b) } }\n\
+         pub fn main() -> Int { handle { lp(2000, 0, False) } with { S.get() -> resume(1)  return(r) -> r } }\n",
+    ),
+    (
+        // D-3: a string literal operand of a resumption, live while a later
+        // operand allocates.
+        "string-literal-in-a-resumption",
+        "type L { Nil, Cons(Int, L) }\n\
+         effect S { fn get() -> Int }\n\
+         fn w(b) { if b { get() } else { 2 } }\n\
+         fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n\
+         fn garbage(n) { if n == 0 { Cons(7777, Nil) } else { let j = Cons(n, Cons(n, Nil))  garbage(n - 1) } }\n\
+         fn pr(n, s, l) { let z = io.println(s)  n + head(l) }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { pr(w(False), \"hello\", garbage(12000)) } with { S.get() -> resume(1)  return(r) -> r }\n\
+         }\n",
+    ),
+    (
+        // A heap binding SHADOWED inside an effectful region, live while pure
+        // code allocates -- before and after the resumption (found by the
+        // review of the shadowing fix; the direct-emitter half is pinned by
+        // `a_shadowed_heap_binding_stays_rooted_and_in_scope`).
+        "shadowed-binding-in-an-effectful-region",
+        "type L { Nil, Cons(Int, L) }\n\
+         fn churn(n, acc) { if n == 0 { acc } else { let g = Cons(n, Cons(n, Cons(n, Nil)))  churn(n - 1, acc + 1) } }\n\
+         fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n\
+         effect S { fn get() -> Int }\n\
+         fn w(b) { if b { get() } else { 2 } }\n\
+         fn u(x) {\n\
+         \x20 let s = Cons(42, Nil)\n\
+         \x20 let r = { let s = Cons(7, Nil)  let z0 = churn(30000, 0)  let q = w(False)  let z = churn(30000, 0) + z0 - 30000  head(s) + z + q }\n\
+         \x20 r + head(s) + x\n\
+         }\n\
+         pub fn main() -> Int { handle { u(1) } with { S.get() -> resume(3)  return(r) -> r } }\n",
+    ),
+    (
+        // D-3: a string literal LEFT of the site is re-lowered by the
+        // resumption, and must be rooted while a later operand allocates.
+        "string-literal-left-of-a-site",
+        "type L { Nil, Cons(Int, L) }\n\
+         effect S { fn get() -> Int }\n\
+         fn w(b) { if b { get() } else { 2 } }\n\
+         fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n\
+         fn garbage(n) { if n == 0 { Cons(7777, Nil) } else { let j = Cons(n, Cons(n, Nil))  garbage(n - 1) } }\n\
+         fn pr(s, n, l) { let z = io.println(s)  n + head(l) }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { pr(\"hello\", w(False), garbage(12000)) } with { S.get() -> resume(1)  return(r) -> r }\n\
+         }\n",
+    ),
+    (
+        // D-3: the same, in forward CPS code on a path that takes no site.
+        "string-literal-before-an-untaken-site",
+        "type L { Nil, Cons(Int, L) }\n\
+         effect S { fn get() -> Int }\n\
+         fn w(b) { if b { get() } else { 2 } }\n\
+         fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n\
+         fn garbage(n) { if n == 0 { Cons(7777, Nil) } else { let j = Cons(n, Cons(n, Nil))  garbage(n - 1) } }\n\
+         fn pr(s, l, n) { let z = io.println(s)  n + head(l) }\n\
+         fn go(c) { pr(\"hello\", garbage(12000), if c { w(False) } else { 1 }) }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { go(False) } with { S.get() -> resume(1)  return(r) -> r }\n\
+         }\n",
+    ),
+];
+
+#[test]
+fn heap_values_live_across_cps_operands_survive_collections() {
+    let dir = temp_dir("cps-rooting-7b3");
+    let mut failures = Vec::new();
+    for (tag, src) in CPS_ROOTING {
+        let core = lower_src(src);
+        let exe = match try_compile_and_link(&core, &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let out = Command::new(&exe)
+            .env("ELY_GC_STATS", "1")
+            .output()
+            .expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        if !out.status.success() {
+            failures.push(format!("{tag}: {:?} stderr={stderr:?}", out.status));
+            continue;
+        }
+        if !stderr
+            .lines()
+            .any(|l| l.starts_with("elya-gc:") && !l.contains("collections=0"))
+        {
+            failures.push(format!("{tag}: no collection ran: {stderr:?}"));
+        }
+        let (text, value) = split_text_and_value(&stdout, tag);
+        let (want_text, want_value) = (eval_main_text(src), eval_main_int(src));
+        if text != want_text || value != want_value {
+            failures.push(format!(
+                "{tag}: native text={text:?} value={value} evaluator text={want_text:?} value={want_value}"
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A heap binding SHADOWED by an inner binding of the same name stays live and
+/// must stay rooted while the inner scope allocates (found 2026-10-03 while
+/// reading the emitter for 5b-8 7b-3; pre-existing since the collector landed).
+const SHADOW_PRELUDE: &str = "type L { Nil, Cons(Int, L) }\n\
+     fn churn(n, acc) { if n == 0 { acc } else { let g = Cons(n, Cons(n, Cons(n, Nil)))  churn(n - 1, acc + 1) } }\n\
+     fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n";
+
+const SHADOWING: &[(&str, &str)] = &[
+    (
+        "let-in-value-position",
+        "pub fn main() -> Int {\n\
+         \x20 let s = Cons(42, Nil)\n\
+         \x20 let r = { let s = Cons(7, Nil)  let z = churn(30000, 0)  head(s) + z }\n\
+         \x20 r + head(s)\n\
+         }\n",
+    ),
+    (
+        "let-in-tail-position",
+        "fn f(s) { let r = { let s = Cons(7, Nil)  let z = churn(30000, 0)  head(s) + z }  r + head(s) }\n\
+         pub fn main() -> Int { f(Cons(42, Nil)) }\n",
+    ),
+    (
+        // The arm used to REMOVE the outer binding after the arm instead of
+        // restoring it ("unbound var" at compile time).
+        "match-arm-binder",
+        "pub fn main() -> Int {\n\
+         \x20 let s = Cons(42, Nil)\n\
+         \x20 let r = match Cons(7, Cons(8, Nil)) { Nil -> 0  Cons(h, s) -> head(s) + churn(30000, 0) }\n\
+         \x20 r + head(s)\n\
+         }\n",
+    ),
+];
+
+#[test]
+fn a_shadowed_heap_binding_stays_rooted_and_in_scope() {
+    let dir = temp_dir("shadowing");
+    let mut failures = Vec::new();
+    for (tag, prog) in SHADOWING {
+        let src = format!("{SHADOW_PRELUDE}{prog}");
+        let core = lower_src(&src);
+        let exe = match try_compile_and_link(&core, &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let (stdout, stats) = run_with_gc_stats(&exe, tag);
+        if stats.collections < 1 {
+            failures.push(format!("{tag}: no collection ran"));
+        }
+        let want = eval_main_int(&src);
+        if stdout != want {
+            failures.push(format!("{tag}: native={stdout} evaluator={want}"));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+// ---- 5b-8 Task 8: handler dispatch, the continuation, resume (D10-D18) ----
+
+/// (tag, program, expected). Expected values were worked out by hand before
+/// the dispatch existed; the differential test holds them to the evaluator.
+/// `deep-reinstall` (A6) is calibrated: 6 if the handler is re-found on every
+/// perform, 2 if it is found once and lost. `frame-capture` is the 7b test
+/// D15 moved here. `perform-reached-at-run-time` was D18's trap until now.
+///
+/// Task 12 control 1a (resume no longer re-installs the continuation's
+/// handler) did NOT move `deep-reinstall`: it still printed 6. With one live
+/// handler under D17, every resume in it runs while that handler is still
+/// current, so in this design A6 cannot witness re-installation and the
+/// plan's "prints 2" has no native counterpart. The witness is a resume that
+/// runs AFTER its handle returned. Exactly those failed, all with exit 1:
+/// `state-passing-lambda-resumes-later` here (its stderr, the one captured:
+/// "the handler has no clause for this operation"), A9, and the
+/// lambda-held-continuation test. Nothing else in the binary failed.
+const HANDLER_8: &[(&str, &str, &str)] = &[
+    (
+        "deep-reinstall",
+        "effect State { fn get() -> Int }\n\
+         fn loop_body(n) { if n == 0 { 0 } else { get() + loop_body(n - 1) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { loop_body(3) } with {\n\
+         \x20   State.get() -> resume(2)\n\
+         \x20   return(x) -> x\n\
+         \x20 }\n\
+         }\n",
+        "6",
+    ),
+    (
+        "frame-capture",
+        "effect State { fn get() -> Int }\n\
+         fn body() -> Int { get() + 1 }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { body() } with {\n\
+         \x20   State.get() -> resume(41)\n\
+         \x20   return(x) -> x\n\
+         \x20 }\n\
+         }\n",
+        "42",
+    ),
+    (
+        "two-ops-one-handler",
+        "effect Ask { fn a() -> Int  fn b() -> Int }\n\
+         fn body() -> Int { a() + b() }\n\
+         pub fn main() -> Int { handle { body() } with { Ask.a() -> resume(10)  Ask.b() -> resume(20)  return(r) -> r } }\n",
+        "30",
+    ),
+    (
+        "op-with-an-argument",
+        "effect Log { fn log(n: Int) -> Int }\n\
+         fn body() -> Int { log(5) + log(6) }\n\
+         pub fn main() -> Int { handle { body() } with { Log.log(n) -> resume(n * 2)  return(r) -> r } }\n",
+        "22",
+    ),
+    (
+        "non-tail-resume-sees-the-return-clause",
+        "effect S { fn get() -> Int }\n\
+         fn body() -> Int { get() + 1 }\n\
+         pub fn main() -> Int { handle { body() } with { S.get() -> resume(1) + 100  return(r) -> r * 2 } }\n",
+        "104",
+    ),
+    (
+        "clause-that-does-not-resume",
+        "effect S { fn get() -> Int }\n\
+         fn body() -> Int { get() + 1 }\n\
+         pub fn main() -> Int { handle { body() } with { S.get() -> 99  return(r) -> r * 2 } }\n",
+        "99",
+    ),
+    (
+        "state-passing-lambda-resumes-later",
+        "effect St { fn get() -> Int }\n\
+         fn prog(n) { if n == 0 { 0 } else { get() + prog(n - 1) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let f = handle { prog(10) } with {\n\
+         \x20   St.get() -> fn(s) { (resume(s))(s + 1) }\n\
+         \x20   return(x) -> fn(s) { x }\n\
+         \x20 }\n\
+         \x20 f(1)\n\
+         }\n",
+        "55",
+    ),
+    (
+        "a3-polymorphic-effect-at-int",
+        // A polymorphic effect performed at Int inside a handler (spec 11
+        // A3, plan Task 8 Step 11a). No `set`: `resume(Unit)` would meet
+        // codegen's existing refusal of a Unit literal, not dispatch.
+        "effect State(s) { fn get() -> s }\n\
+         fn w() -> Int { let x = get()  x * 10 }\n\
+         pub fn main() -> Int { handle { w() } with { State.get() -> resume(4)  return(r) -> r } }\n",
+        "40",
+    ),
+    (
+        "sequential-handles-perform",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 let x = handle { get() } with { S.get() -> resume(1)  return(v) -> v }\n\
+         \x20 let y = handle { get() + 40 } with { S.get() -> resume(2)  return(v) -> v }\n\
+         \x20 x + y\n\
+         }\n",
+        "43",
+    ),
+    (
+        // A pure function called from a handled body runs its OWN handle;
+        // when it returns, the outer handler must be current again for the
+        // body's next perform.
+        "dynamically-nested-handle",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         fn g() -> Int { handle { t() + 1 } with { T.t() -> resume(100)  return(r) -> r } }\n\
+         fn body() -> Int { let a = g()  a + get() }\n\
+         pub fn main() -> Int { handle { body() } with { S.get() -> resume(5)  return(r) -> r } }\n",
+        "106",
+    ),
+    (
+        "perform-reached-at-run-time",
+        "effect S { fn get() -> Int }\n\
+         fn w(b) { if b { get() } else { 2 } }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { w(True) } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r\n\
+         \x20 }\n\
+         }\n",
+        "1",
+    ),
+];
+
+#[test]
+fn the_task8_handler_corpus_compiles_runs_and_prints_the_expected_answer() {
+    let dir = temp_dir("handler-8");
+    let mut failures = Vec::new();
+    for (tag, src, expected) in HANDLER_8 {
+        let core = lower_src(src);
+        let exe = match try_compile_and_link(&core, &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || got != *expected {
+            failures.push(format!(
+                "{tag}: {:?} stdout={got:?} want={expected} stderr={:?}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_task8_handler_corpus() {
+    let dir = temp_dir("differential-handler-8");
+    let mut failures = Vec::new();
+    for (tag, src, _) in HANDLER_8 {
+        let core = lower_src(src);
+        let exe = match try_compile_and_link(&core, &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let want = eval_main_int(src);
+        if !out.status.success() || got != want {
+            failures.push(format!(
+                "{tag}: {:?} native={got:?} evaluator={want}",
+                out.status
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        failures.is_empty(),
+        "native diverges from the evaluator: {failures:#?}"
+    );
+}
+
+#[test]
+fn a_function_named_like_an_op_is_not_what_a_perform_calls() {
+    // D11, differential: the evaluator PERFORMS the op; native must too.
+    let src = "effect E { fn ping() -> Int }\n\
+         fn ping() -> Int { 5 }\n\
+         fn user() -> Int { ping() }\n\
+         pub fn main() -> Int {\n\
+         \x20 let v = handle { user() } with {\n\
+         \x20   E.ping() -> resume(1)\n\
+         \x20   return(x) -> x\n\
+         \x20 }\n\
+         \x20 let z = if v == 1 { io.println(\"evaluator PERFORMED the op\") } else { io.println(\"evaluator CALLED fn ping\") }\n\
+         \x20 0\n\
+         }\n";
+    let dir = temp_dir("collide-8");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "collide");
+    let (text, value) = native_text_value(&exe, "collide");
+    assert_eq!(text, eval_main_text(src));
+    assert_eq!(text, "evaluator PERFORMED the op\n");
+    assert_eq!(value, eval_main_int(src));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Task 12 control 2a (site frames tagged past the table, so `gc_mark`'s
+/// `tag >= gc_n_ctors` skip fires: the frame is kept, nothing in it traced)
+/// fails this test SILENTLY -- it printed 6287, not 2550, and exited 0 --
+/// which is why the assertion is on the value. Control 2b (rows kept, only
+/// the `next` bit cleared) PASSES it: the short chain here needs the frame's
+/// saved heap value, not what lies behind it. That is the test that shows the
+/// two tracing controls test two different things.
+#[test]
+fn a_continuation_held_by_a_lambda_survives_a_collection() {
+    // D12: the handle returns a lambda that holds the continuation; a
+    // collection runs before the lambda resumes it. The frames (each saving
+    // a heap `Cons`) are reachable only through the lambda's capture.
+    let src = "type L { Nil, Cons(Int, L) }\n\
+         fn churn(n, acc) { if n == 0 { acc } else { let g = Cons(n, Cons(n, Cons(n, Nil)))  churn(n - 1, acc + 1) } }\n\
+         fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n\
+         effect St { fn get() -> Int }\n\
+         fn prog(n) { if n == 0 { 0 } else { let c = Cons(n, Nil)  get() + prog(n - 1) + head(c) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let f = handle { prog(50) } with {\n\
+         \x20   St.get() -> fn(s) { (resume(s))(s + 1) }\n\
+         \x20   return(x) -> fn(s) { x }\n\
+         \x20 }\n\
+         \x20 let z = churn(30000, 0)\n\
+         \x20 f(1) + z - 30000\n\
+         }\n";
+    let dir = temp_dir("cont-gc-8");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "cont-gc");
+    let (stdout, stats) = run_with_gc_stats(&exe, "cont-gc");
+    assert!(stats.collections >= 1, "no collection ran: {stats:?}");
+    assert_eq!(
+        stdout,
+        eval_main_int(src),
+        "native diverges from the evaluator"
+    );
+    assert_eq!(stdout, "2550");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_second_resume_traps_natively_and_errors_in_the_evaluator() {
+    // D13: one-shot. Both sides must FAIL: the evaluator with E0425, native
+    // with its named trap -- never a re-run that computes an answer.
+    let src = "effect S { fn get() -> Int }\n\
+         fn body() -> Int { get() }\n\
+         pub fn main() -> Int { handle { body() } with { S.get() -> resume(1) + resume(2)  return(r) -> r } }\n";
+    let session = Session::new();
+    let (m, pd) = parse_module(&session, src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let eval = elya::eval::run_module_value(&m);
+    assert!(
+        matches!(&eval, Err(e) if format!("{e:?}").contains("E0425")),
+        "the evaluator must refuse the second resume with E0425"
+    );
+    let dir = temp_dir("double-resume-8");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "double");
+    let out = Command::new(&exe).output().expect("run produced binary");
+    assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("elya: resume: a one-shot continuation was resumed twice"),
+        "stderr should name the trap, got: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).is_empty(),
+        "no answer may be printed"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_handler_frame_keeps_its_saved_heap_values_across_a_collection() {
+    // `s` is saved in the HANDLER frame (word 4, mask bit 3) and read by the
+    // return clause. `mk` returns before the continuation is resumed, so
+    // after that `s` is reachable ONLY through the lambda -> continuation
+    // object -> frame chain -> handler frame; a collection runs in between.
+    // (A first version kept `s` in scope at the handle site, where the site's
+    // own roots kept it alive, so control T5 could not fail it -- measured.)
+    let src = "type L { Nil, Cons(Int, L) }\n\
+         fn churn(n, acc) { if n == 0 { acc } else { let g = Cons(n, Cons(n, Cons(n, Nil)))  churn(n - 1, acc + 1) } }\n\
+         fn head(l) { match l { Nil -> 0  Cons(h, _) -> h } }\n\
+         effect S { fn get() -> Int }\n\
+         fn body() -> Int { get() + 1 }\n\
+         fn mk() {\n\
+         \x20 let s = Cons(42, Nil)\n\
+         \x20 handle { body() } with {\n\
+         \x20   S.get() -> fn(y) { (resume(10))(y) }\n\
+         \x20   return(r) -> fn(y) { r + head(s) + y }\n\
+         \x20 }\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 let f = mk()\n\
+         \x20 let z = churn(30000, 0)\n\
+         \x20 f(5) + z - 30000\n\
+         }\n";
+    let dir = temp_dir("handler-frame-gc-8");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "hfgc");
+    let (stdout, stats) = run_with_gc_stats(&exe, "hfgc");
+    assert!(stats.collections >= 1, "no collection ran: {stats:?}");
+    assert_eq!(
+        stdout,
+        eval_main_int(src),
+        "native diverges from the evaluator"
+    );
+    assert_eq!(stdout, "58");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_deep_non_tail_effectful_recursion_finds_its_handler_in_constant_time() {
+    // 400,000 performs, each from a frame chain 400,000 deep at its deepest.
+    // Walking the chain to the handler on every perform is quadratic: it did
+    // not finish in 30 s at this N (measured before the fix; 80k took 15 s).
+    // With the handler found in O(1) it takes well under a second. The 20 s
+    // deadline makes a regression fail by NAME instead of hanging the suite.
+    let src = "effect S { fn get() -> Int }\n\
+         fn loop(n) { if n == 0 { 0 } else { get() + loop(n - 1) } }\n\
+         pub fn main() -> Int { handle { loop(400000) } with { S.get() -> resume(1)  return(r) -> r } }\n";
+    let dir = temp_dir("handler-lookup-8");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "deeploop");
+    let mut child = Command::new(&exe)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("wait") {
+            break st;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().ok();
+            panic!("400k performs did not finish in 20 s: the handler lookup is not O(1)");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let mut out = String::new();
+    use std::io::Read;
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut out)
+        .expect("read");
+    assert!(status.success(), "{status:?}");
+    assert_eq!(out.trim(), "400000");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_growing_live_set_is_collected_a_logarithmic_number_of_times() {
+    // A fixed 64K-word threshold re-marks a growing live set every 64K words,
+    // so total marking is quadratic (measured before the fix: 46 collections
+    // building this 1M list; 183 for the 1M-deep effectful loop, 6.8 s).
+    // Collecting when allocation since the last collection reaches
+    // max(64K, live) doubles the heap between collections: O(log n) of them.
+    let src = "type L { Nil, Cons(Int, L) }\n\
+         fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(1, acc)) } }\n\
+         pub fn main() -> Int { let keep = build(1000000, Nil)  match keep { Nil -> 0  Cons(h, t) -> h } }\n";
+    let dir = temp_dir("gc-doubling");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "build1m");
+    let (stdout, stats) = run_with_gc_stats(&exe, "build1m");
+    assert_eq!(stdout, "1");
+    assert!(stats.collections >= 1, "{stats:?}");
+    assert!(
+        stats.collections <= 10,
+        "a live set growing to 3M words must not be re-marked every 64K words: {stats:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A1 (plan Task 9). Three shapes, each chosen for one property dispatch can
+/// get wrong: a NON-TAIL resume (the value flows back through `+` in the
+/// clause body), TWO ops under one handler (the `(effect, op)` match must read
+/// the op name), and TWO sequential handles (the handler record must be
+/// scoped to its body). No `<>`, no `with multi`, every main Int-valued.
+/// Values were predicted in writing before the first run.
+///
+/// Task 12 control 1b (dispatch always loads clause-table entry 0): `two-ops`
+/// printed 20, not 14 -- both performs took `Two.a` and resumed with 10, the
+/// number Task 9 predicted for exactly this defect -- while `ask-nontail`, one
+/// op and so blind to it, still printed 3. (Both corpus loops stop at their
+/// first failing row, so `two-handles` was not reached under the control.)
+/// The same control also printed 20 for Task 8's `two-ops-one-handler`
+/// (want 30) and stopped `dynamically-nested-handle` with exit 1 ("no
+/// clause"): any program with a second op is exposed by it.
+const HANDLER_CORPUS: &[(&str, &str, &str)] = &[
+    (
+        "ask-nontail",
+        "effect Ask { fn ask() -> Int }\n\
+         fn one() { ask() }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { one() } with {\n\
+         \x20   Ask.ask() -> 1 + resume(2)\n\
+         \x20   return(x) -> x\n\
+         \x20 }\n\
+         }\n",
+        "3",
+    ),
+    (
+        "two-ops",
+        "effect Two { fn a() -> Int  fn b() -> Int }\n\
+         fn both() { a() + b() }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { both() } with {\n\
+         \x20   Two.a() -> resume(10)\n\
+         \x20   Two.b() -> resume(4)\n\
+         \x20   return(x) -> x\n\
+         \x20 }\n\
+         }\n",
+        "14",
+    ),
+    (
+        "two-handles",
+        "effect Ask { fn ask() -> Int }\n\
+         fn one() { ask() }\n\
+         pub fn main() -> Int {\n\
+         \x20 let x = handle { one() } with { Ask.ask() -> resume(1)  return(v) -> v }\n\
+         \x20 let y = handle { one() } with { Ask.ask() -> resume(20)  return(v) -> v }\n\
+         \x20 x + y\n\
+         }\n",
+        "21",
+    ),
+];
+
+#[test]
+fn the_handler_corpus_compiles_and_runs() {
+    let dir = temp_dir("handler-corpus");
+    for (tag, src, expected) in HANDLER_CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        assert_runs(&exe, expected);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_handler_corpus() {
+    let dir = temp_dir("differential-handler");
+    for (tag, src, _) in HANDLER_CORPUS {
+        let core = lower_src(src);
+        let exe = compile_and_link(&core, &dir, tag);
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        assert!(
+            out.status.success(),
+            "{tag}: binary exited {:?}",
+            out.status
+        );
+        let native = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            native,
+            eval_main_int(src),
+            "{tag}: native output diverges from the evaluator"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A1's second half: the exact bytes. The `io.println` sits INSIDE the clause
+/// body, so the text also witnesses that the body ran once per perform -- two
+/// lines, in order. Both halves are compared with the evaluator, and the text
+/// is also pinned, so an empty-vs-empty comparison cannot pass vacuously.
+#[test]
+fn a_printing_clause_body_matches_the_evaluator_byte_for_byte() {
+    let src = "effect Ask { fn ask() -> Int }\n\
+               fn twice() { ask() + ask() }\n\
+               pub fn main() -> Int {\n\
+               \x20 handle { twice() } with {\n\
+               \x20   Ask.ask() -> { io.println(\"asked\")  resume(1) }\n\
+               \x20   return(x) -> x\n\
+               \x20 }\n\
+               }\n";
+    let dir = temp_dir("handler-printing");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "handler-printing");
+    let (text, value) = native_text_value(&exe, "handler-printing");
+    assert_eq!(
+        text,
+        eval_main_text(src),
+        "native println text diverges from the evaluator"
+    );
+    assert_eq!(
+        value,
+        eval_main_int(src),
+        "native main value diverges from the evaluator"
+    );
+    assert_eq!(
+        text, "asked\nasked\n",
+        "the clause body must run once per perform, in order"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A4, the heap half of Invariant N8-1 (plan Task 10). Four N over an 8x
+/// spread. `live` is the LEVEL -- visible words still live at the end of the
+/// LAST collection -- where `freed` and `words_since_gc` are flows.
+///
+/// NO CONSTANT IS PINNED. The claim is that the level does not grow with N.
+/// `collections > 0` and `live > 0` are guards that `live` was computed at
+/// all, NOT invariant guards (spec 7.3, ground 2).
+#[test]
+fn a_tail_resuming_handler_settles_its_live_set() {
+    let dir = temp_dir("handler-settles");
+    let mut levels = Vec::new();
+    for n in [25_000, 50_000, 100_000, 200_000] {
+        let src = format!(
+            "effect Tick {{ fn tick() -> Int }}\n\
+             fn spin(n) {{ if n == 0 {{ 0 }} else {{ let _ = tick()  spin(n - 1) }} }}\n\
+             pub fn main() -> Int {{\n\
+             \x20 handle {{ spin({n}) }} with {{\n\
+             \x20   Tick.tick() -> resume(1)\n\
+             \x20   return(x) -> x\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        let tag = format!("settles-{n}");
+        let core = lower_src(&src);
+        let exe = compile_and_link(&core, &dir, &tag);
+        let (stdout, stats) = run_with_gc_stats(&exe, &tag);
+        assert_eq!(stdout, "0", "{tag}: the loop must run to completion");
+        assert!(
+            stats.collections > 0,
+            "{tag}: no collection happened, so `live` measures nothing"
+        );
+        assert!(
+            stats.live > 0,
+            "{tag}: live=0 means the level was never computed"
+        );
+        levels.push((n, stats.live));
+    }
+    println!("A4 levels: {levels:?}");
+    let (_, first) = levels[0];
+    for (n, live) in &levels {
+        assert_eq!(
+            *live, first,
+            "live set must not grow with N (a growing level is a frame leak): {levels:?}, diverged at N={n}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A5. The same handler with the recursive call under `+` instead of in
+/// tail position: each level holds a pending frame, so the captured chain
+/// grows with N and the level must move. STRICT inequality -- an instrument
+/// that a deliberately-growing control cannot move is measuring nothing.
+///
+/// Task 12 controls 2a and 2b both kill this control at N = 10,000 with
+/// SIGSEGV. (The captured chain is the live set it measures; the crash is
+/// consistent with that chain being freed while still in use, though a
+/// signal alone does not prove it.)
+#[test]
+fn a_growing_control_moves_the_live_set() {
+    let dir = temp_dir("handler-grows");
+    let mut levels = Vec::new();
+    // 10k/80k, not the plan's 5k/40k (8x kept; approved 2026-10-04): at 5k the
+    // control allocates 60,004 words, under the 64K first-collection floor,
+    // so it never collects and `live` measures nothing (measured).
+    for n in [10_000, 80_000] {
+        let src = format!(
+            "effect Tick {{ fn tick() -> Int }}\n\
+             fn spin(n) {{ if n == 0 {{ 0 }} else {{ tick() + spin(n - 1) }} }}\n\
+             pub fn main() -> Int {{\n\
+             \x20 handle {{ spin({n}) }} with {{\n\
+             \x20   Tick.tick() -> resume(1)\n\
+             \x20   return(x) -> x\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        let tag = format!("grows-{n}");
+        let core = lower_src(&src);
+        let exe = compile_and_link(&core, &dir, &tag);
+        let (stdout, stats) = run_with_gc_stats(&exe, &tag);
+        assert_eq!(
+            stdout,
+            n.to_string(),
+            "{tag}: each of the N performs resumes with 1"
+        );
+        assert!(
+            stats.collections > 0,
+            "{tag}: no collection happened, so `live` measures nothing"
+        );
+        levels.push((n, stats.live));
+    }
+    println!("A5 levels: {levels:?}");
+    assert!(
+        levels[1].1 > levels[0].1,
+        "a growing control must move the live set, or A4's settling proves nothing: {levels:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The MAX_PARAMS edge, on purpose (PARKED: unverified on win64, where more
+/// than 5 tailcc params aborted). `f` and `g` are CPS with 4 source params +
+/// the continuation = 5; `f -> g` is a musttail CPS call at that width; the
+/// `op3` clause takes 3 op args + the continuation + the handler frame = 5.
+/// Predicted 20 before the first run: get -> 10, g(11, 2, 3, 4), op3 -> 16, + 4.
+#[test]
+fn effectful_functions_at_the_parameter_cap_run_natively() {
+    let src = "effect E { fn get() -> Int  fn op3(a: Int, b: Int, c: Int) -> Int }\n\
+               fn g(a, b, c, d) { op3(a, b, c) + d }\n\
+               fn f(a, b, c, d) { let x = get()  g(a + x, b, c, d) }\n\
+               pub fn main() -> Int {\n\
+               \x20 handle { f(1, 2, 3, 4) } with {\n\
+               \x20   E.get() -> resume(10)\n\
+               \x20   E.op3(a, b, c) -> resume(a + b + c)\n\
+               \x20   return(x) -> x\n\
+               \x20 }\n\
+               }\n";
+    let dir = temp_dir("param-cap");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "param-cap");
+    assert_runs(&exe, "20");
+    assert_eq!(eval_main_int(src), "20");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_unit_literal_compiles_natively() {
+    // `Unit` is the i64 word 0 (`repr_ty`); codegen refused the literal itself
+    // until A9's source needed `resume(Unit)` (plan Task 11).
+    let src = "fn f() { Unit }\n\
+               pub fn main() -> Int { let u = f()  7 }\n";
+    let dir = temp_dir("unit-literal");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "unit-literal");
+    assert_runs(&exe, "7");
+    assert_eq!(eval_main_int(src), "7");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_unit_main_prints_its_text_then_its_word() {
+    // A Unit-valued main compiles: the shim prints main's word, which for Unit
+    // is 0, after the program's text (plan Task 11: A9's main is
+    // `io.println(...)`). The text is compared with the evaluator's output.
+    let src = "pub fn main() { io.println(\"hi\") }\n";
+    let dir = temp_dir("unit-main");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "unit-main");
+    let (text, value) = native_text_value(&exe, "unit-main");
+    let session = Session::new();
+    let (m, pd) = parse_module(&session, src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let (interp, _) = elya::eval::run_module_value(&m).expect("evaluator runs it");
+    assert_eq!(
+        text,
+        interp.output(),
+        "native text diverges from the evaluator"
+    );
+    assert_eq!(text, "hi\n");
+    assert_eq!(value, "0", "Unit's word");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A9, the machine-stack half of Invariant N8-1 (plan Task 11) -- the other
+/// half from Task 10's heap measurement; neither subsumes the other.
+///
+/// The source is copied verbatim from `tests/state_effect.rs`
+/// (`state_tail_loop`) at N = 1,000,000. Its PEAK assertions are an evaluator
+/// instrument and are deliberately not ported.
+///
+/// DEVIATION FROM A9, REPORTED NOT PATCHED: A9 says `assert_runs` "printing
+/// exactly `x`", but main returns Unit and the shim prints main's word, so
+/// stdout is "x\n0\n". The splitter separates them and the TEXT half is
+/// asserted, which also pins the newline `assert_runs`'s `.trim()` would
+/// drop. The value half is a shim artifact and is not pinned.
+///
+/// N MUST NOT BE LOWERED: at small N this completes even on an implementation
+/// that grows the stack linearly (Task 12's fifth control shows exactly that).
+///
+/// Task 12, observed. Control 3b (the tail-position call loses `musttail`)
+/// kills this test with SIGSEGV, named by `diagnose_crash` (and with it
+/// every other million-deep tail test and three GC loops, 8 tests in all).
+/// Control 3a lowers N to 1_000 and the test PASSES -- and still passes with
+/// 3b applied too, so at that N the test cannot tell a flat stack from a
+/// growing one: the tautology, demonstrated rather than asserted. Control 1a
+/// (no handler re-installation at resume) fails it with exit 1: its resumes
+/// run after the handle returned. Control 1b (always clause 0) fails it with
+/// exit 1, where a SIGSEGV was predicted; its stderr was not captured.
+#[test]
+fn a_state_passing_tail_loop_is_bounded_natively_at_a_million() {
+    let src = "effect State { fn get() -> String  fn set(v: String) -> Unit }\n\
+               fn loop(n) { if n == 0 { get() } else { let _ = set(\"x\")  loop(n - 1) } }\n\
+               pub fn main() {\n\
+               \x20 let program = handle { loop(1000000) } with {\n\
+               \x20   State.get() -> fn(s) { (resume(s))(s) }\n\
+               \x20   State.set(v) -> fn(s) { (resume(Unit))(v) }\n\
+               \x20   return(x) -> fn(s) { x }\n\
+               \x20 }\n\
+               \x20 io.println(program(\"init\"))\n\
+               }\n";
+    let dir = temp_dir("state-tail-million");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "state-tail-million");
+    let out = Command::new(&exe).output().expect("run produced binary");
+    diagnose_crash(&out.status, "state-tail-million");
+    assert!(out.status.success(), "binary exited {:?}", out.status);
+    let (text, _unit_word) =
+        split_text_and_value(&String::from_utf8_lossy(&out.stdout), "state-tail-million");
+    assert_eq!(
+        text, "x\n",
+        "the state-passing tail loop must run to completion at N = 1_000_000 and print exactly one line"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

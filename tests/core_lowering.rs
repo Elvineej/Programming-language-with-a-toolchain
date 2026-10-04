@@ -5,8 +5,9 @@
 //! (synthesized Let nodes). The snapshot IS the proof of lowering-preserves-types.
 
 use std::collections::{BTreeMap, HashSet};
+use std::rc::Rc;
 
-use elya::core::{lower_module, pretty_typed, CoreExpr, CoreKind, CoreModule};
+use elya::core::{lower_module, pretty_typed, CoreExpr, CoreHandle, CoreKind, CoreModule};
 use elya::parse::parse_module;
 use elya::span::Span;
 use elya::types::{infer_typed_table, Ty, TyCon, TyPrinter};
@@ -69,6 +70,21 @@ fn nodes(core: &CoreModule) -> Vec<&CoreExpr> {
                 walk(scrut, out);
                 for arm in arms.iter() {
                     walk(&arm.body, out);
+                }
+            }
+            CoreKind::Handle(h) => {
+                walk(&h.body, out);
+                for c in h.clauses.iter() {
+                    walk(&c.body, out);
+                }
+                if let Some(r) = &h.ret {
+                    walk(&r.body, out);
+                }
+            }
+            CoreKind::Resume(v) => walk(v, out),
+            CoreKind::Perform(p) => {
+                for a in p.args.iter() {
+                    walk(a, out);
                 }
             }
         }
@@ -448,4 +464,339 @@ fn an_effect_not_named_io_still_lowers() {
     let (m, _pd) = parse_module(&Session::new(), src);
     let (_diags, table) = infer_typed_table(&Session::new(), &m);
     assert!(lower_module(&m, &table).is_ok());
+}
+
+/// `Ty::Error` at any depth: a function's params, result, or effect-label
+/// arguments, a tuple's elements, or a constructor's arguments.
+fn has_error(t: &Ty) -> bool {
+    match t {
+        Ty::Error => true,
+        Ty::Var(_) | Ty::Base(_) => false,
+        Ty::Fn(ps, row, r) => {
+            ps.iter().any(has_error)
+                || row.labels.values().any(|l| l.args.iter().any(has_error))
+                || has_error(r)
+        }
+        Ty::Tuple(ts) | Ty::Con(_, ts) => ts.iter().any(has_error),
+    }
+}
+
+#[test]
+fn a_block_in_expression_position_lowers_to_nested_lets() {
+    // §3.1(b): `handle { ... }` parses its body through `block_expr()`, so Task 5
+    // needs blocks lowerable in expression position. A `let` initializer is the
+    // smallest program that reaches the same arm today.
+    //
+    // Two assertions deviate from the 5b-8 plan's text, on purpose: (a) is
+    // widened from literal nodes to every node, at any depth; (c) exempts the
+    // synthesized `Let` nodes from span membership (they carry their
+    // statement's span, which the typed table need not hold — the same
+    // exemption `both_origin_checks` makes) and verifies each by derivation
+    // instead.
+    let src = "pub fn main() -> Int {\n\
+               \x20 let x = { let a = 1  a + 2 }\n\
+               \x20 x\n\
+               }\n";
+    let (core, table) = lower_src(src);
+
+    // (a) No node carries `Ty::Error`, anywhere in its type.
+    for n in nodes(&core) {
+        assert!(
+            !has_error(&n.ty),
+            "node at {:?} carries Ty::Error: {:?}",
+            n.span,
+            n.ty
+        );
+    }
+
+    // (b) The inner block became a `Let` — not a new node kind.
+    let lets = nodes(&core)
+        .iter()
+        .filter(|n| matches!(n.kind, CoreKind::Let(ref name, _, _) if name == "a"))
+        .count();
+    assert_eq!(
+        lets, 1,
+        "the block's `let a` should survive as a CoreKind::Let"
+    );
+
+    // (c) The frozen table gained nothing. Every direct node's span is a span
+    //     the inference table already knows; every synthesized `Let` is
+    //     exempt from that and is checked by derivation (its type is its
+    //     body's) instead — so the exemption is verified, not a free pass.
+    let mut derived = 0;
+    for n in nodes(&core) {
+        match &n.kind {
+            CoreKind::Let(_, _, body) => {
+                assert_eq!(
+                    n.ty, body.ty,
+                    "synthesized Let at {:?}: its type must be its body's (derivation check)",
+                    n.span
+                );
+                derived += 1;
+            }
+            _ => assert!(
+                table.contains_key(&n.span),
+                "node at {:?} has a span absent from the typed table",
+                n.span
+            ),
+        }
+    }
+    // `let x` (main's body) and `let a` (the block): the derivation check must
+    // have seen both, or the exemption covered nothing and proved nothing.
+    assert_eq!(derived, 2, "expected exactly two synthesized Lets");
+}
+
+/// The first `Handle` in `nodes`' pre-order. Panics if lowering produced none.
+fn first_handle(core: &CoreModule) -> Rc<CoreHandle> {
+    nodes(core)
+        .into_iter()
+        .find_map(|n| match &n.kind {
+            CoreKind::Handle(h) => Some(h.clone()),
+            _ => None,
+        })
+        .expect("the handle should have lowered to a CoreKind::Handle")
+}
+
+/// One handled op, qualified: `Log.log(m) -> resume(m)` with a `return` clause.
+/// Also the bare-resume program for the A-normalization test below.
+const LOG_HANDLE: &str = "effect Log { fn log(msg: String) -> String }\n\
+                          pub fn main() {\n\
+                          \x20 let r = handle {\n\
+                          \x20   log(\"hi\")\n\
+                          \x20 } with {\n\
+                          \x20   Log.log(m) -> resume(m)\n\
+                          \x20   return(x) -> x\n\
+                          \x20 }\n\
+                          \x20 io.println(r)\n\
+                          }\n";
+
+#[test]
+fn a_handle_lowers_to_core_handle() {
+    let (core, table) = lower_src(LOG_HANDLE);
+    let h = first_handle(&core);
+
+    assert_eq!(h.clauses.len(), 1);
+    assert_eq!(h.clauses[0].effect, "Log");
+    assert_eq!(h.clauses[0].op, "log");
+    assert_eq!(h.clauses[0].params.len(), 1);
+    assert_eq!(h.clauses[0].params[0].name, "m");
+    // The clause parameter's type is READ from the frozen table at the
+    // parameter's own span, as a lambda parameter's is — never guessed.
+    assert_eq!(h.clauses[0].params[0].ty, Ty::Base(TyCon::Str));
+
+    // `Log` is not `multi`-declared, so the stamp is clear (§5.3 / D4).
+    assert!(!h.is_multi_declared, "a one-shot effect is not multi");
+
+    // `return(x) -> x` is present, and its body is a plain Var — not a lambda.
+    let r = h.ret.as_ref().expect("return clause");
+    assert_eq!(r.binder, "x");
+    assert!(matches!(r.body.kind, CoreKind::Var(ref v) if v == "x"));
+
+    // The clause body is `resume(m)` — a Resume node, not an App of a `resume` Var.
+    assert!(matches!(h.clauses[0].body.kind, CoreKind::Resume(_)));
+
+    // The handler subtree is held to both origin proofs like every other node,
+    // and the printer renders it without leaking an internal token.
+    both_origin_checks(&core, &table);
+    let rendered = pretty_typed(&core, &mut TyPrinter::new());
+    assert!(rendered.contains("(handle "), "{rendered}");
+    assert!(rendered.contains("(resume "), "{rendered}");
+    for bad in ["%r", "%e", "%s", "%t", "%v", "%row"] {
+        assert!(
+            !rendered.contains(bad),
+            "leaked internal token {bad} in:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn an_applied_resume_is_a_normalized_but_a_bare_one_is_not() {
+    // `resume(v)(s)` becomes `let $k = resume(v) in $k(s)`, so Task 7b sees the
+    // resume in a named position. `$k` is SYNTHESIZED, not recorded (D7): the
+    // Let carries the resume's span, and the `$k` Var's type is cloned from the
+    // resume node rather than looked up.
+    //
+    // The plan's program had no `return` clause and is a type error (E0400): R
+    // is then the body's `Int`, and `resume(s)(s)` applies an Int. A `return`
+    // clause makes R a function, and main applies the result.
+    let src = "effect St { fn get() -> Int }\n\
+               pub fn main() -> Int {\n\
+               \x20 let f = handle { get() } with {\n\
+               \x20   St.get() -> fn(s) { resume(s)(s) }\n\
+               \x20   return(x) -> fn(s) { x }\n\
+               \x20 }\n\
+               \x20 f(0)\n\
+               }\n";
+    let (core, table) = lower_src(src);
+
+    let lets: Vec<_> = nodes(&core)
+        .into_iter()
+        .filter_map(|n| match &n.kind {
+            CoreKind::Let(name, v, _) if name == "$k" => Some((n, v.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lets.len(), 1, "exactly one $k binding");
+    assert!(
+        matches!(lets[0].1.kind, CoreKind::Resume(_)),
+        "$k binds the resume"
+    );
+    assert_eq!(lets[0].0.span, lets[0].1.span);
+    assert!(table.contains_key(&lets[0].0.span));
+
+    // Synthesized is not exempt: the `$k` Let passes the derivation check and
+    // the `$k` Var the lookup cross-check, like every other node.
+    both_origin_checks(&core, &table);
+
+    // The other half of this test's name: a BARE `resume(m)` is left alone.
+    let (bare, _) = lower_src(LOG_HANDLE);
+    assert!(
+        !nodes(&bare)
+            .iter()
+            .any(|n| matches!(n.kind, CoreKind::Let(ref name, _, _) if name == "$k")),
+        "a bare resume must not be A-normalized"
+    );
+}
+
+/// Spec §5.2-§5.3 and plan D4: `is_multi_declared` comes from the EFFECT'S
+/// DECLARATION, op-keyed through `multi_declared_ops` — not from the handler's
+/// own `multi` flag. Lowers `effect multi Flip` handled by `with_kw` and returns
+/// the stamp. One `#[test]` per keyword, so each case fails on its own.
+fn flip_handled_with_is_stamped_multi(with_kw: &str) -> bool {
+    let src = format!(
+        "effect multi Flip {{ fn flip() -> Bool }}\n\
+         fn g() -> Int {{ if flip() {{ 1 }} else {{ 0 }} }}\n\
+         pub fn main() -> Int {{\n\
+         \x20 handle {{ g() }} {with_kw} {{\n\
+         \x20   Flip.flip() -> resume(True)\n\
+         \x20   return(x) -> x\n\
+         \x20 }}\n\
+         }}\n"
+    );
+    let (core, _table) = lower_src(&src);
+    first_handle(&core).is_multi_declared
+}
+
+#[test]
+fn a_plain_with_over_a_multi_declared_effect_is_stamped_multi() {
+    // §5.2's deliberate over-refusal: the handler is plain, the DECLARATION is
+    // `multi`, and the declaration decides. This is the case that tells
+    // declaration-keying apart from `Handler::multi`-keying.
+    assert!(
+        flip_handled_with_is_stamped_multi("with"),
+        "plain `with` over a `multi`-declared effect must be stamped multi"
+    );
+}
+
+#[test]
+fn a_with_multi_over_a_multi_declared_effect_is_stamped_multi() {
+    // Both keyings agree here (the handler flag and the declaration are both
+    // multi), so this case pins the stamp itself, not which source it is read
+    // from.
+    assert!(
+        flip_handled_with_is_stamped_multi("with multi"),
+        "`with multi` over a `multi`-declared effect must be stamped multi"
+    );
+}
+
+#[test]
+fn an_unqualified_handler_clause_is_refused_at_lowering() {
+    // `ask() -> ..` (no `Ask.`) type-checks, but the evaluator — the reference
+    // semantics — never dispatches to it: `handler_handles` (src/eval.rs)
+    // matches `effect == Some(..)` only, and the run ends in E0300 "unhandled
+    // effect reached the machine". There is no behaviour to reproduce, so
+    // lowering refuses it by name rather than invent one.
+    let unqualified = "effect Ask { fn ask() -> Int }\n\
+                       fn one() { ask() }\n\
+                       pub fn main() -> Int {\n\
+                       \x20 handle { one() } with {\n\
+                       \x20   ask() -> resume(2)\n\
+                       \x20   return(x) -> x\n\
+                       \x20 }\n\
+                       }\n";
+    let (m, pd) = parse_module(&Session::new(), unqualified);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let (diags, table) = infer_typed_table(&Session::new(), &m);
+    assert!(diags.is_empty(), "the front end accepts it: {diags:?}");
+    assert_eq!(
+        lower_module(&m, &table).unwrap_err(),
+        elya::core::LowerError::Unsupported("unqualified handler clause"),
+    );
+
+    // Control: the same program with the clause qualified lowers, so the
+    // refusal is keyed on the missing effect name, not on handlers.
+    lower_src(&unqualified.replace("ask() -> resume", "Ask.ask() -> resume"));
+}
+
+#[test]
+fn a_perform_lowers_to_a_perform_node() {
+    // D11: a call whose callee names an operation is a PERFORM, and Core says
+    // so -- effect and op by name, the arguments lowered -- instead of
+    // passing it off as an application of a `Var`.
+    let (core, table) = lower_src(LOG_HANDLE);
+    let (node, p) = nodes(&core)
+        .into_iter()
+        .find_map(|n| match &n.kind {
+            CoreKind::Perform(p) => Some((n, p.clone())),
+            _ => None,
+        })
+        .expect("the perform should have lowered to a CoreKind::Perform");
+    assert_eq!(p.effect, "Log");
+    assert_eq!(p.op, "log");
+    assert_eq!(p.args.len(), 1);
+    assert_eq!(
+        node.ty,
+        Ty::Base(TyCon::Str),
+        "a perform's type is the op's result"
+    );
+    both_origin_checks(&core, &table);
+}
+
+#[test]
+fn an_op_wins_over_a_same_named_fn_as_inference_and_the_evaluator_resolve_it() {
+    // D11. Inference (`infer_call`: ops before the environment) and the
+    // evaluator (`CalleeSlot::Operation`) both resolve an op name before any
+    // variable; measured, this program's evaluator run PERFORMS the op. So
+    // `user`'s `ping()` must lower to a Perform -- never to a call to `fn ping`.
+    let src = "effect E { fn ping() -> Int }\n\
+               fn ping() -> Int { 5 }\n\
+               fn user() -> Int { ping() }\n\
+               pub fn main() -> Int {\n\
+               \x20 handle { user() } with {\n\
+               \x20   E.ping() -> resume(1)\n\
+               \x20   return(x) -> x\n\
+               \x20 }\n\
+               }\n";
+    let (core, _table) = lower_src(src);
+    let user = core.fns.iter().find(|f| f.name == "user").expect("user");
+    assert!(
+        matches!(&user.body.kind, CoreKind::Perform(p) if p.effect == "E" && p.op == "ping"),
+        "`ping()` must be the op's perform, not a call to `fn ping`: {:?}",
+        user.body.kind
+    );
+}
+
+#[test]
+fn a_perform_carries_the_effect_instantiation() {
+    // D11 + Shape C: the perform keeps the op's type as inference instantiated
+    // it, so the effect's argument (`State(Int)`) is still on the node -- the
+    // names `State`/`set` alone would lose it. Step 11a (a polymorphic effect
+    // performed at a concrete type) reads it.
+    let (core, _t) = lower_src(
+        "effect State(s) { fn get() -> s  fn set(v: s) -> Unit }\n\
+         fn worker() { set(1) }\n",
+    );
+    let worker = core
+        .fns
+        .iter()
+        .find(|f| f.name == "worker")
+        .expect("worker");
+    let CoreKind::Perform(p) = &worker.body.kind else {
+        panic!("worker's body should be a Perform: {:?}", worker.body.kind);
+    };
+    assert_eq!(
+        TyPrinter::new().render(&p.op_ty),
+        "fn(Int) / {State(Int)} -> Unit",
+        "the perform must carry the op's instantiated type"
+    );
 }
