@@ -49,7 +49,8 @@ for the first time:
    neighbour* rather than looked up, and it will not be the last).
 2. **A calling convention for handler clauses** — clauses are not functions in the
    existing sense; they receive an operation's arguments *and* a continuation, and
-   they may return to a trampoline rather than to their caller (§8.3).
+   they may return to a trampoline rather than to their caller (§8.3). *(2026-10-03:
+   no runtime trampoline — every transfer is a `musttail` jump; §13 D14.)*
 3. **The first heterogeneous pointer-bearing heap object** — every heap shape so
    far has been homogeneous in what it points at. A frame cell points at a next
    frame *and* at saved values of unrelated types (§6.1).
@@ -151,7 +152,9 @@ is the one that costs something.
 `Rc<Spanned<Expr>>` (`src/ast.rs:96, 102`) — **not** `Rc<Spanned<Block>>`, which
 is what `Expr::Lambda` carries. ✓ VERIFIED at `src/parse.rs:753` (return clause)
 and `src/parse.rs:840` (op clause): both are parsed by `self.expr(0)`. So a clause
-body is lowered by `lower_expr`, and **no fifth Core node is needed for it.** The
+body is lowered by `lower_expr`, and **no fifth Core node is needed for it.** *(2026-10-03:
+performs DO get a node of their own, `CoreKind::Perform` — a third new Core node, §13
+D11. Clause bodies still need none.)* The
 corpus's actual handler shape —
 
 ```
@@ -276,7 +279,9 @@ implementation — jump back into the captured frames — drops the handler and 
 the *second* perform in a loop escape. The fidelity test in §7 is a loop
 precisely so that it performs more than once.
 
-Point 5 is where the native back end **diverges deliberately**: see §5.
+Point 5 is where the native back end **diverges deliberately**: see §5. *(2026-10-03:
+for a one-shot effect, native enforces point 5 with a consumed flag that traps with a
+named error, never by re-executing — §13 D13.)*
 
 ---
 
@@ -398,6 +403,11 @@ continuation, or null at the base. **A continuation frame is a closure.** That i
 not an analogy used to explain the design — it is the design, and it is why the
 design is cheap.
 
+*(2026-10-03, §13 D10: the cell above has no room for the values a suspended
+computation still needs. A frame is shaped per continuation site,
+`[tag][code_ptr][next][saved…]` — a closure in exactly the lambda sense — and the
+three-word shape above is its no-saved-values case.)*
+
 ### 6.2 Why 3(a) and not a variable-length block
 
 A continuation is variable-length, pointer-bearing, and **heterogeneous** — the
@@ -418,8 +428,17 @@ byte-identical for a **third** consecutive slice.
 
 ### 6.3 What this costs
 
-**Exactly one new descriptor row:** arity 2, mask `0b11` (both `code_ptr` and
-`next` are pointers). ✓ VERIFIED that tag allocation is linear and computed
+**Exactly one new descriptor row:** arity 2, mask `0b10`. Bit `f` of a row's mask
+governs word `1 + f` (`gc_mark`), so for `[tag][code_ptr][next]` bit 0 is `code_ptr`
+and bit 1 is `next`. Only `next` is a heap pointer, so only bit 1 is set: `code_ptr`
+is a text-segment address stored as an integer word — exactly as a closure's word 1
+is — and is never traced. *(Corrected in place 2026-10-02. This sentence first read
+"mask `0b11` (both `code_ptr` and `next` are pointers)": true of the machine words,
+wrong for the mask, which marks HEAP pointers. Tracing the code pointer makes
+`gc_gray_push` write a mark bit 16 bytes before a text-segment address; measured with
+the lambda rows' bit 0 forced on, a closure program that collects dies with signal
+11. See plan D5; implemented in b370191 and pinned by
+`the_frame_row_follows_the_string_row_with_mask_0b10`.)* ✓ VERIFIED that tag allocation is linear and computed
 (`crates/codegen/src/lib.rs:1253-1255`):
 
 ```rust
@@ -433,6 +452,9 @@ extended with it: the per-lambda guard at `:1391` and the row-count guard
 `string_tag != desc.len() / 2` at `:1412`. Those guards are structural invariants
 — no Elya program can make them disagree — so per the standing rule they are
 discharged by the check that enforces them and owe no execution test.
+*(As built, 2026-10-04: b370191 left both existing guards unchanged and added a
+separate frame guard of the same shape, `frame_tag != desc.len() / 2`; D10 then
+gave every site its own row, whose tag IS the row index when pushed (§14).)*
 
 ### 6.4 The cost this design does carry
 
@@ -493,6 +515,8 @@ required, not incidental.
 
 **Consequence for the design, not just for the tests:** the transfer must return
 to a trampoline rather than nest, and §8.3's dispatch is where that is discharged.
+*(2026-10-03, §13 D14: "must not nest" stands; it is met by `musttail` transfers, not
+by a trampoline loop.)*
 General resume position (§0) forces the issue anyway — a clause that applies
 `resume`'s result, as the corpus's does, cannot be a nested call — but the
 instrument must be able to catch it if the implementation drifts back.
@@ -642,6 +666,10 @@ frames, per §4 point 4.
 
 The strict `(effect, op)` match of §4 point 2 is reproduced as-is. Nothing here
 needs a row at runtime; the match is on two names.
+
+*(2026-10-03: the perform site is a `CoreKind::Perform` carrying both names, resolved
+ops-first as inference and the evaluator resolve it — §13 D11; transfers are `musttail`
+jumps — §13 D14.)*
 
 ---
 
@@ -793,12 +821,12 @@ checks that enforce them.
 |---|---|---|
 | A1 | A `State`-effect program with a **non-tail** `resume` compiles natively, and its output equals the evaluator's — both the value and the exact bytes written. | differential execution |
 | A2 | `with multi` is refused at codegen by a message naming `multi`, before any clause body is lowered. | execution (reachable refusal) |
-| A3 | A polymorphic effect is refused. **✗ UNCERTAIN** whether this reaches a distinct refusal or falls into the existing `Ty::Var` refusal; must be determined in planning. If reachable, it owes its own execution test. | execution (pending) |
+| A3 | ~~A polymorphic effect is refused.~~ **✓ VERIFIED by execution (2026-10-02): a polymorphic effect has no refusal of its own, at any stage.** Its declaration passes the front end, lowers, and compiles and runs natively (`a3_a_polymorphic_effect_declaration_compiles_and_runs_natively`). An op performed at one concrete type reaches codegen as a monomorphic op does — the identical refusal, until this slice's handlers land. Only a type parameter left unconstrained survives, as `Ty::Var`, and it falls into the existing `Ty::Var` refusal, `unrepresentable type` (`a3_an_unconstrained_polymorphic_effect_meets_the_ty_var_refusal`). So it is the existing refusal, not a distinct one. Plan D2 stands; Task 3's prediction of a refusal was wrong. *(2026-10-03, Task 8 Step 11a: the handled half, measured. `effect State(s) { fn get() -> s }` performed at `Int` inside a handler compiles, runs and prints 40, matching the evaluator -- the `a3-polymorphic-effect-at-int` case of the Task 8 handler corpus. Prediction held.)* | execution (measured) |
 | A4 | On a **handler** program, the live set settles across four N over an 8× spread, **no constant pinned**. `collections > 0` and `live > 0` are retained as guards that `live` was computed at all — **not** as Invariant N8-1 guards, which they cannot be (§7.3, ground 2). | execution |
 | A5 | A growing control moves the heap instrument (strict inequality), written without `<>` (§9.1). | execution |
 | A6 | A deep handler resumed inside a loop performs more than once and finds the same handler each time (§4 point 4). | differential execution |
 | A7 | `gc_mark` is byte-identical to its form at the slice base, measured by byte count, not eyeballed — third consecutive slice. If it is not, the deviation is **reported, not patched**. | measurement |
-| A8 | The tag/row guards at `crates/codegen/src/lib.rs:1391` and `:1412` are extended to cover the frame tag. | structural (discharged by the check) |
+| A8 | One descriptor row per continuation site, each guarded by "tag == row index"; Task 6's `[2, 0b10]` row is the no-saved-values case (§13 D10). *(Was: "The tag/row guards at `crates/codegen/src/lib.rs:1391` and `:1412` are extended to cover the frame tag.")* | structural (discharged by the check) |
 | A9 | **The other half of Invariant N8-1 — the machine stack.** `state_tail_loop`'s source (§9.1, the one row that transfers) compiles natively as written and runs to completion at **N = 1 000 000** through `assert_runs`, printing exactly `x`. Non-vacuous by the calibration in §7.3, not by a control test. **The N must not be lowered.** | execution (differential bytes) |
 
 **A4 and A9 are not interchangeable and neither subsumes the other** — A4 watches
@@ -806,7 +834,8 @@ the heap frame list, A9 watches the machine stack, and §7.1's coupling hazard i
 precisely that each is blind where the other sees (§7.2).
 
 **A3 is the one criterion this spec cannot fully specify**, and it is marked rather
-than guessed.
+than guessed. *(2026-10-02: no longer — A3 was measured and its row above now states
+the result.)*
 
 ---
 
@@ -837,3 +866,87 @@ than guessed.
 - **Open for decision before planning:** §9.2 (whether `IO` can be user-declared)
   and §9.4 (extract the `multi_declared_ops` helper, or accept a third local
   rebuild).
+
+---
+
+## 13. Amendments at the Task 7b checkpoint (2026-10-03)
+
+Taken by the reviewer on evidence measured at the plan's Task 7b checkpoint (at
+`adbd854`). The full rationale and evidence are the plan's D10–D15, with the same
+numbers; each section amended above carries a dated pointer here.
+
+- **D10 (§0 item 3, §6.1, §6.3, §11 A8).** Frames are shaped per continuation site,
+  `[tag][code_ptr][next][saved…]`, each site with one descriptor row guarded "tag == row
+  index". Bit 0 is clear, bit 1 is set, and bit `j + 2` is set iff saved value `j` is a heap
+  value. The row Task 6 laid down, `[2, 0b10]`, is the no-saved-values case. `gc_mark` is
+  still untouched (A7): rows are generic, and lambdas already have one row per site.
+- **D11 (§3.1, §8.3).** `CoreKind::Perform` carries the effect, the op and the arguments,
+  resolved ops-first exactly as inference and the evaluator resolve a call. Measured: with a
+  function and an op both named `ping`, the front end accepts the program and the evaluator
+  performs the op; codegen's local-then-function order would have called the function. It is
+  a third new Core node, against §3.1's "no fifth Core node".
+- **D12 (§2.1, §3.2).** A lambda that calls `resume` captures the clause's continuation
+  implicitly, as a synthetic binder the ordinary free-variable rule carries inward. It is a
+  heap pointer to the frame chain, so its mask bit MUST be set.
+- **D13 (§4 point 5, §5).** Natively, one-shot is enforced by a consumed flag that traps
+  with a named runtime error, never by re-executing; the differential test expects both
+  sides to fail (E0425, and the trap).
+- **D14 (§0 item 2, §7.2, §8.3).** No runtime trampoline: every transfer is a `musttail`
+  jump, and the only nesting calls into effectful code are the handle and resume sites. A CPS
+  function therefore has at most 4 source parameters. A9's N = 1 000 000 is unchanged.
+- **D15.** Plan-only: the plan's 7b test moves to Task 8, its predicted failure corrected
+  to the measured one.
+- **D16 (§8.1, §8.2).** The CPS key is "the row NAMES a user-declared effect"; an open tail
+  alone is direct. An effect-polymorphic function used at a user effect is refused by name (N7),
+  and a call whose callee type disagrees with the callee's convention is refused. Measured
+  motive: `apply(fn(x) { x * 10 })` compiles and prints 11 at `831b023`, and would crash under
+  "open means CPS".
+- **D17 (§8.3).** A `handle` compiles only in a region that does not need CPS and not inside
+  another handle; otherwise it is refused by name.
+- **D18.** Until Task 8, a `Perform` compiles to the named trap `elya_perform_unimplemented`.
+- **Task 8, as built (2026-10-03).** Dispatch follows from D14 and D17. A perform's continuation is
+  the frame chain as it stands; under D17 that chain always ends at the handler frame, so the
+  handler is already beneath the captured frames (§4 point 4) with no copying. A handler frame is
+  `[tag][code = return clause][next = null][clause table][saved..]` (the table is a static array
+  of clause code addresses indexed by a module-wide `(effect, op)` number; its word is never
+  traced, so saved value j is mask bit j + 3). A clause receives the op's arguments, a one-shot
+  continuation object `[tag][k][consumed]` (one descriptor row, mask `0b01`; *since e2c112a
+`[tag][k][consumed][handler]`, mask `0b101` -- §14*) and the handler
+  frame; an op with more than three parameters is refused by name (MAX_PARAMS). `resume` is a
+  native nesting call; in a clause's tail position it is a `musttail` jump. `with multi` is
+  refused on the handle node before anything else (A2).
+
+---
+
+## 14. Close-out (2026-10-04)
+
+Every §11 criterion, the commit that discharged it, and the test that holds it.
+All gated on Linux (`scripts/check.sh`, 59 suites, 593 passed at `6bede80`).
+**Not yet gated on Windows** -- see PARKED.md; `main` does not take this branch
+until `scripts/check.ps1` exits 0.
+
+| # | Status | Held by |
+|---|---|---|
+| A1 | ✓ `334a292` | `HANDLER_CORPUS` (value, both corpus tests) and `a_printing_clause_body_matches_the_evaluator_byte_for_byte` (exact bytes, pinned `"asked\nasked\n"`). |
+| A2 | ✓ `9ac2074` | `a_multi_shot_handler_is_refused_by_its_own_name`, `the_multi_refusal_fires_before_any_clause_body_is_lowered`, `a_multi_shot_handler_written_in_source_reaches_the_codegen_refusal` (`lib.rs` unit tests). |
+| A3 | ✓ measured | §11's row; both halves measured (`d50f3b1`, Task 8 Step 11a). |
+| A4 | ✓ `2db4b9d` | `a_tail_resuming_handler_settles_its_live_set`: four equal levels over 25k-200k, no constant pinned. |
+| A5 | ✓ `2db4b9d` | `a_growing_control_moves_the_live_set`, at **10k/80k**, not the plan's 5k/40k (approved 2026-10-04: at 5k nothing is collected, so `live` measured nothing). 8x kept. |
+| A6 | ✓ `9ac2074` -- **with a finding** | `deep-reinstall` prints 6. Task 12 control 1a showed it does **not** witness re-installation in this design: with one live handler (D17) every resume in it runs while that handler is current, so it still printed 6 with re-installation removed. The witnesses are the resumes that run after their handle returned (`state-passing-lambda-resumes-later`, A9, the lambda-held-continuation test) -- exactly those failed. |
+| A7 | ✓ | `gc_mark` 637 bytes at every re-measure through `6bede80`. Third consecutive slice. |
+| A8 | ✓ `b370191`, `b24b96d` | One row per site, tag == row index at push; `[2, 0b10]` is the no-saved-values row (D10). |
+| A9 | ✓ `636f98c` -- **with a deviation** | `a_state_passing_tail_loop_is_bounded_natively_at_a_million`, source verbatim, N = 1 000 000. Codegen was widened (Unit literal, Unit `main`) rather than the source adapted. `assert_runs` "printing exactly `x`" is impossible as written (stdout is `"x\n0\n"`, the shim prints main's word); the TEXT half is asserted. On Linux an overflow is SIGSEGV, named by `diagnose_crash`. |
+| §9.3 step 7 | ✓ `6bede80` | Six controls, each failing differently, reverted; recorded as doc comments on the proofs. 3a + 3b demonstrates §12's tautology: at N = 1 000 with `musttail` removed, A9 still passes. |
+| §9.2 / §9.4 | ✓ | Task 2 (D1) / Task 1. |
+
+**Beyond the plan, found and fixed on the way** (each with its own red test):
+shadowed heap bindings unrooted (`c89c5ad`, pre-existing); O(depth) handler lookup
+replaced by `elya_current_handler` (`e2c112a`); a fixed 64K-word collection threshold
+made deep live sets quadratic, now `max(64K, live)` (`d04e457`). None touches `gc_mark`.
+
+**§12 obligations, at close.** T7's out-of-repo ledger line (naming N8 as its arrival
+point) is outside this repository and is the maintainer's to update. Invariant N8-1
+holds and is guarded by A4 and A9 as §12 requires. The §5.2 over-refusal and the
+carried items are unchanged. New carried items are in PARKED.md, chiefly: D17's refusals
+make the tail-resume install in `clause_tail` redundant today, and lifting them makes it
+load-bearing.
