@@ -91,6 +91,14 @@ static Block *gc_block_of(void *payload) { return (Block *)((int64_t *)payload -
 void elya_gc_init(const int64_t *descriptors, int64_t n_ctors) {
     gc_descriptors = (int64_t *)descriptors;
     gc_n_ctors = n_ctors;
+#ifdef _WIN32
+    /* The shim calls this first, so stdout is byte-exact for the WHOLE run --
+     * including main's value line, which a program that never prints would
+     * otherwise write in text mode as "\r\n" (found by the Windows gate on the
+     * non-printing CPS-rooting corpus, 2026-10-04). elya_println keeps its own
+     * call; it is now redundant but harmless. */
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
 }
 
 void elya_gc_push(void *root) {
