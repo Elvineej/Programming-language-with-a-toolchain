@@ -85,7 +85,10 @@ pub fn main() {
 - `elya check` → `ok`, exit 0
 - `elya run` → `evaluator PERFORMED the op`, exit 0
 
-## Slice close-out doc fixes
+## RESOLVED (5b-8 close-out, 2026-10-04): slice close-out doc fixes
+
+Spec §6.3 now carries an as-built note (guards unchanged, a separate frame guard added). Original:
+
 
 - Spec §6.3 says both existing guards "must be extended" to cover the frame
   tag; b370191 left both unchanged and added a separate frame guard of the same
@@ -156,6 +159,9 @@ did not finish in 10 minutes. The 7b-3 deep-frames test uses n = 4000 because of
   native frame (D14's nesting call). Plain non-tail recursion at 1M segfaults the same way, so it
   is the existing backend limit; A9/Task 11 must state it and the Linux overflow diagnosis (the
   Task 11 note) must name it.
+  *Update (Task 11, 636f98c):* `diagnose_crash` names SIGSEGV as the likely overflow, but only
+  A9 uses it; the other deep tests still report a bare exit status on Linux. The 1M
+  non-tail-resume limit itself is unchanged.
 - Refusals that Task 8 did not lift were renamed from "(Task 8)" to "(not yet compiled
   natively)": effectful lambdas, effectful closure calls, effectful calls inside a `match`.
 
@@ -178,3 +184,16 @@ no handle inside a handle or inside an effectful function). When those refusals 
 clause must run with the global set to the handler OUTSIDE its handle -- a perform must switch
 it before jumping to the clause -- and the tail-resume install in `clause_tail` (redundant today)
 becomes load-bearing. Revisit both together with D17.
+
+Measured by Task 12 control 1a (6bede80): with re-installation removed from BOTH resume paths,
+only programs that resume after their handle returned failed (4 tests); A6 still printed 6.
+So no test today isolates the `clause_tail` install, and A6 is not a re-installation witness
+in this design. Lifting D17 needs a test with two live handlers where the wrong one is
+observable, red first.
+
+## Corpus loops stop at their first failing row (Task 12, 2026-10-04)
+
+`the_handler_corpus_compiles_and_runs` and its differential twin assert inside the loop, so
+under a control the rows after the first failure are never run (control 1b never reached
+`two-handles`). The Task 8 corpus collects failures and reports them all. Make the Task 9 pair
+collect too, so a control's full footprint is visible; test-only, no expected value changes.
