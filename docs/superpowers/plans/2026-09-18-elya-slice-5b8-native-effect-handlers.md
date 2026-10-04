@@ -87,6 +87,14 @@ Bit `f` governs word `1 + f`. For `[tag][code_ptr][next]`: bit 0 is `code_ptr`, 
 
 With `0b11`, `gc_mark` pushes a **text-segment address** into the gray set, then reads the first eight bytes of machine code as `obj[0]` and traces onward if that garbage lands in `[0, gc_n_ctors)`. Correct value: **arity 2, mask `0b10`.** Per A7's standing rule, spec deviations are **reported, not patched** — Task 6 implements `0b10` and its commit message records the deviation.
 
+> *(2026-10-02.)* Spec §6.3 has since been corrected in place, by explicit decision, so
+> "§6.3 specifies" above records what it said. One refinement to the failure path, from
+> reading `runtime.c`: before anything reads machine code as `obj[0]`, `gc_gray_push`
+> **writes** the mark bit at `gc_block_of(p)` — 16 bytes before the code address, in the
+> read-only text segment. Measured with the lambda rows' bit 0 forced on:
+> `a_captured_closure_is_traced_mask_covers_ty_fn`'s binary died with signal 11. The
+> exact faulting instruction was not traced. The conclusion, `0b10`, is unchanged.
+
 ### D6 — Two refusal boundaries with two different test homes (easy to blur, structurally real)
 
 | Refusal | Error type | Lives in | Tested in |
@@ -128,6 +136,173 @@ So: the source transfers, the output assertion transfers, and **only the peak as
 Two further facts from the same read, both load-bearing:
 - The sibling control `non_tail_state_loop_grows_with_length` (`:93+`) puts the recursive call under `<>`. Its **program does not transfer** — native codegen refuses `<>` on strings by name. That is the real "string concatenation barrier," and it applies to the *control*, not the main corpus program.
 - `K_MAX_STATE` and `N = 1_000_000` **already appear here** (`:77`). A9's N is not invented for this slice; it is the existing corpus's large-N value. One more reason not to lower it.
+
+---
+
+## Decisions taken at the Task 7b checkpoint (2026-10-03; settled — do not re-litigate)
+
+Task 7b's Step 3 checkpoint (Steps 1–2 measured at `adbd854`) found that 7b could not be
+built as written: its own test needs Task 8's machinery, and the spec's frame shape cannot
+hold a suspended computation. The reviewer took six decisions on the evidence below. They
+amend the spec (its §13) and re-split Task 7b into 7b-1, 7b-2 and 7b-3.
+
+### D10 — A frame is shaped per continuation site, `[tag][code_ptr][next][saved…]`, with one guarded descriptor row per site
+
+**Why.** A frame must hold what the suspended computation still needs, and
+`[tag][code_ptr][next]` has no slot for it: `x + get()` must keep `x` across the perform,
+and A6's `get() + loop_body(n - 1)` must keep `get()`'s value while `loop_body` runs. Spec
+§0 item 3 already says a frame "points at a next frame *and* at saved values of unrelated
+types"; §6.1's fixed shape and §6.3's "exactly one new descriptor row" contradicted it.
+
+**What.** Each continuation site gets a frame shaped like a closure,
+`[tag][code_ptr][next][saved_0..]` — a fixed arity *per site*, known at compile time — and
+one descriptor row, appended after the existing rows and guarded "tag == row index" exactly
+as the lambda, string and frame tags already are. Mask: bit 0 clear (`code_ptr` is a
+text-segment address), bit 1 set (`next` is a heap frame), bit `j + 2` set iff saved value
+`j` is a heap value (`is_heap_ty`) — the lambda rows' convention shifted by one. A site with
+no saved values uses the `[2, 0b10]` row Task 6 laid down.
+
+**Evidence.** `gc_mark` reads arity and mask generically per tag (`runtime.c`), and lambdas
+already get one synthesized row per site (`descriptor_rows`). Per-site frame rows therefore
+add rows, not a `gc_mark` case: A7 still holds (637 bytes by Task 1's command at
+`adbd854`). The variable-length block §6.2 rejects has a per-OBJECT length; a per-SITE fixed
+arity is exactly what a lambda already is.
+
+**A8 becomes:** one descriptor row per continuation site, each guarded; Task 6's `[2, 0b10]`
+row is the no-saved-values case.
+
+### D11 — `CoreKind::Perform`, resolved ops-first to match inference and the evaluator
+
+**Why.** Core had no perform node: `get()` lowered to `App(Var("get"), ..)`, and codegen
+resolves a callee as a local, then a top-level function. Inference (`infer_call` checks
+`self.ops` before `env.lookup`) and the evaluator (`eval.rs`, `CalleeSlot::Operation` from
+`op_table`) both resolve `io.println`, then constructors, then **op names**, before any
+variable. Measured at `adbd854` with `effect E { fn ping() -> Int }` and
+`fn ping() -> Int { 5 }` both declared: `elya check` → `ok`; `elya run` → "evaluator
+PERFORMED the op". Once handlers compile, codegen's order would call `fn ping` instead — a
+silent miscompile.
+
+**What.** Lowering emits a `Perform` node carrying the effect name, the op name and the
+lowered arguments, at the same point in the same order as inference and the evaluator: after
+`io.println` and constructors, before the applied-`resume` rewrite and the generic callee.
+The op → effect index is built from `Decl::Effect` with the same last-declaration-wins rule
+both existing tables use, through one helper (`ast::op_effects`) — the third construction of
+that index, after `Infer.ops` and the evaluator's `op_table`, so it is extracted rather than
+rebuilt locally (§9.4's rule). Redirecting the evaluator's `op_table` to the helper touches
+the reference semantics and is parked, not done here. Codegen refuses `Perform` by name until
+Task 8.
+
+**Recorded against the plan:** this is a **third** new Core node, after `Handle` and
+`Resume`, against Task 5's "No fifth node kind" and spec §3.1's "no fifth Core node is
+needed".
+
+### D12 — Closure conversion captures the continuation implicitly; its mask bit MUST be set
+
+**Why.** `resume` can run after its `handle` has returned. A9's own program is
+`State.get() -> fn(s) { (resume(s))(s) }`, and `program("init")` calls that lambda after
+the handle produced it. The lambda needs the clause's continuation, but Task 5's `fv_walk`
+gives `Resume(v)` only `v`'s free variables, so nothing captures it.
+
+**What.** A `resume` makes the clause's continuation free, as a synthetic binder (in the
+house style of D7's `$k`) that the clause binds. A lambda containing a `resume` — at any
+depth — therefore captures it by the ordinary free-variable rule, and an enclosing lambda
+captures it to pass inward. The continuation is a heap pointer to the frame chain, so its bit
+in the lambda's descriptor row MUST be set: a clear bit leaves the chain untraced, and a
+collection between the handle returning and the lambda calling `resume` frees frames still
+in use.
+
+**Required tests:** 7b-2 — the implicit capture's bit is set in the lambda's row, and a
+negative control that clears it fails the test. Task 8 — the GC-stress test (see Task 8).
+
+### D13 — One-shot is enforced natively by a consumed flag that traps with a named error
+
+**Why.** The evaluator enforces one-shot dynamically (`ResumeData.consumed: Cell<bool>`,
+E0425; spec §4 point 5). Native frames are immutable heap cells, so without a check a second
+`resume` silently re-runs the captured frames — a native answer where the evaluator stops
+with an error.
+
+**What.** The continuation object carries a consumed word, which is not a heap pointer, so its
+mask bit is clear. `resume` checks and sets it. A second `resume` calls a runtime trap in the
+style of `elya_match_fail` — a named message on stderr and a non-zero exit — and never
+re-executes. The differential test expects BOTH sides to fail: the evaluator with E0425, native
+with the named trap.
+
+### D14 — `musttail` transfers instead of a runtime trampoline; the N = 1 000 000 obligation is unchanged
+
+**Why.** Measured at the checkpoint: `runtime.c` contains no function-pointer call, so no
+extern calls back into emitted code; and every Elya function and call site is `tailcc`,
+which C cannot call, so a trampoline loop in `runtime.c` (the plan's shape A) would need a
+C-callable thunk for every resumable code pointer. Every Elya call already supports
+`musttail`, and four 1 000 000-deep tests already prove it keeps the machine stack flat.
+
+**What.** Shape B. Every transfer — perform → clause, and one frame's code → the next — is a
+`musttail` jump. The only nesting calls into effectful code are the handle site and the
+resume site, and each returns when the computation it started reaches its handler. That is
+§7.2's requirement (the perform → clause transfer must not nest), met without a trampoline
+loop. A9 at N = 1 000 000 is unchanged and remains the machine-stack criterion.
+
+**Consequence.** The continuation is an extra parameter, so a CPS function may have at most
+4 source parameters (`MAX_PARAMS` = 5, the measured win64 limit, minus one), refused by name
+in 7b-3 the way `MAX_LAMBDA_PARAMS` is. It is untested on win64 (PARKED.md).
+
+### D15 — The plan's 7b test moves to Task 8, with its predicted failure corrected
+
+**Why.** `a_non_tail_resume_compiles_and_runs` needs performs, handler installation,
+dispatch and resume — Task 8's machinery — so it cannot pass in 7b. Its predicted
+pre-implementation failure, "a `CodegenError::Unsupported` naming the handle node", was
+wrong. Measured at `adbd854`, `elya build` refuses that program with
+`callee is not a top-level function`, because `body()` is emitted before `main`. After 7b-1
+the perform is a `Perform` node and the first refusal becomes codegen's `Perform` refusal, so
+Task 8's red step re-measures instead of assuming.
+
+---
+
+## Decisions taken at the Task 7b-3 checkpoint (2026-10-03; settled — do not re-litigate)
+
+Reading the emitter before writing 7b-3 found three forks. The reviewer took A1, B1 and C1.
+
+### D16 — The calling convention follows the user effects a type NAMES; an effect-polymorphic function used at a user effect is refused (N7)
+
+**Why.** 7a's `needs_cps` answered `true` for an open row tail, "conservatively". Measured at
+`831b023`: `fn apply(f) { f(1) + 1 }` with `pub fn main() -> Int { apply(fn(x) { x * 10 }) }`
+compiles natively today and prints `11`. Compiled once, `apply` would call `f` with the CPS
+convention while the pure lambda passed to it is compiled direct: a wrong-convention call, so a
+program that works today would crash. Over-CPS is not "safe" across a convention boundary.
+
+**What.** `needs_cps` is true iff the row names a user-declared effect; an open tail alone is
+direct (`an_open_row_tail_selects_cps_conservatively` flips to `false` — an approved
+expected-value change). A top-level function is CPS iff its body region (lambda and handle
+subtrees excluded) contains a `Perform` or a call whose callee type `needs_cps`. Two refusals keep
+that sound: (1) a reference to a top-level function whose generic signature (its params' and
+body's types) contains an open row, at an instantiated type that names a user effect, is refused
+as "effect-polymorphic function used at a user effect" — N7's territory, like `Ty::Var`
+(`apply(fn(x) { x * get() })` type-checks and the evaluator runs it; native refuses it by name);
+(2) any call whose callee type disagrees with the callee's own convention is refused, as a guard
+on the emitter itself. Effectful lambdas and indirect effectful calls are refused by name in 7b-3
+and are Task 8's.
+
+### D17 — A `handle` compiles only where nothing outside it can be captured
+
+**Why.** Under D14 a handle is a nesting native call. A perform of an OUTER effect inside it
+would need to capture the code after the `handle`, which is on the machine stack, not in the
+frame chain (the 7b-2 review's concern (b), confirmed by reading).
+
+**What.** A `handle` is accepted only in a region that does not need CPS (its function is not
+CPS; effectful lambdas are refused anyway) and not lexically inside another handle. Everything
+else is refused by name. The handler corpus (sequential handles in `main`), A6 and A9 are inside
+this cut. Lifting it means making a non-tail `handle` a continuation site — a later slice.
+
+### D18 — Until Task 8, a `Perform` compiles to a named runtime trap
+
+**Why.** Effect annotations are exact (measured: `/ {S}` on a body that never performs is
+E0423), so every effectful body contains a `Perform` somewhere, and 7b-3's first execution test
+("a handle whose body does not perform at run time") could not even build while codegen refused
+`Perform` at compile time.
+
+**What.** A `Perform` emits a call to `elya_perform_unimplemented`, which prints a named message
+and exits non-zero: never a wrong answer, only a loud stop. The compile-time refusal test
+`a_perform_is_refused_by_name_until_dispatch_exists`, which Task 8 was to delete, is replaced by
+an execution test of the trap — an approved expected-value change. Task 8 replaces the trap.
 
 ---
 
@@ -1184,7 +1359,7 @@ against the code**, and the code is right. The descriptor convention is stated a
 A code pointer is deliberately **not traced**. So a frame `[tag][code_ptr][next]` is
 `arity = 1 + 1 = 2`, `mask = 1 << (0 + 1) = 0b10`. Use `0b10`. Do not "fix" the code to
 match the spec; record the spec deviation in the commit message and it will be carried to
-close-out.
+close-out. *(Done in b370191; spec §6.3 itself was corrected in place on 2026-10-02.)*
 
 **Why this is one row and not zero.** Two true statements that sound contradictory:
 
@@ -1250,7 +1425,7 @@ variant on `CodegenError` — the payload string is new but the variant is the e
 - [ ] **Step 3: Build and run the codegen suite**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen
 ```
 
 Expected: PASS, with the same test count as before this task. A `frame_tag` that is
@@ -1262,7 +1437,7 @@ continuing.
 - [ ] **Step 4: Prove the new guard is live, then revert**
 
 Temporarily change Step 1's line to `let frame_tag = string_tag + 2;` and re-run
-`cargo test -p codegen`. Expected: failures naming
+`cargo test -p elya-codegen`. Expected: failures naming
 `frame tag disagrees with its descriptor row index`.
 
 Then restore `string_tag + 1` and re-run to confirm green. **Do not commit the broken
@@ -1444,7 +1619,7 @@ mod cps;
 Run:
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --lib cps
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --lib cps
 ```
 
 Expected: **compile error**, `cannot find function 'needs_cps' in this scope`. The tests
@@ -1498,7 +1673,7 @@ fn row_needs_cps(row: &EffectRow) -> bool {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --lib cps
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --lib cps
 ```
 
 Expected: PASS, 6 tests (or 5 if you dropped the `Open` case per Step 1).
@@ -1542,6 +1717,43 @@ git commit -F /tmp/msg-t7a.txt
 
 ### Task 7b: The effectful calling convention — measure the seam, then build it
 
+> **Re-split at the checkpoint (2026-10-03; D10–D15).** Steps 1–3 below were run and
+> reported at `adbd854`. Steps 4–10 are SUPERSEDED: Step 4's test moved to Task 8 (D15), and
+> Step 6's single frame constructor is replaced by per-site frames (D10). The work is three
+> separately gated commits, each stopped after and reported:
+>
+> - **7b-1 — `CoreKind::Perform` (D11).** Lowering stamps performs ops-first, through
+>   `ast::op_effects`; the exhaustive Core matches learn the node; codegen refuses it by name
+>   until Task 8. **Required test:** the fn/op name-collision program
+>   (`effect E { fn ping() -> Int }` + `fn ping() -> Int { 5 }`) lowers to a `Perform`, not to
+>   a call to `fn ping`.
+> - **7b-2 — continuation-site analysis (D10, D12), LLVM-free like `closure.rs`.** The
+>   continuation sites of CPS functions, their saved values, per-site tags and guarded
+>   descriptor rows (Task 6's `[2, 0b10]` is the no-saved-values case), and the implicit
+>   continuation capture. `frame_tag` comes from `descriptor_rows`, never recomputed.
+>   **Required test:** the implicit capture's bit is SET in the lambda's descriptor row; a
+>   negative control that clears it makes the test fail.
+> - **7b-3 — emission (D10, D14).** The CPS calling convention for `needs_cps` functions,
+>   with the ≤ 4-source-parameter refusal; per-site frame allocation; the handle entry, the
+>   return clause and the handler frame. First execution test: a handle whose effectful body
+>   does not perform at run time. **Acceptance:** `grep -rn "allow(dead_code)" crates/ src/`
+>   returns 0 matches, recorded in the report.
+>
+> - **7b-3 obligations from the 7b-2 independent review (2026-10-03, unconfirmed concerns,
+>   recorded so emission cannot skip them):** (a) a saved value can carry an unresolved
+>   `Ty::Var` (`fn f(x, y) { if get() == 1 { x } else { y } }` saves `x`, `y` at `Var`),
+>   and `is_heap_ty(Var)` is false, so its mask bit is clear -- emission must refuse a site
+>   whose saved type is a `Ty::Var` by name (as `repr_ty` refuses it), never emit it untraced;
+>   lambda captures share the exposure. (b) A site inside a handled body saves only that body's
+>   remainder; whatever follows the `handle` (`let a = handle {..}  a + x`) relies on the
+>   handle being a native nested call (D14). 7b-3/Task 8 must keep it one even when a clause
+>   stores the continuation and the handle returns early, and Task 8 adds an execution test of
+>   exactly that shape.
+>
+> Standing rules for all three: predictions first; red before the fix; every negative control
+> built, run, recorded and reverted with a hash check; before a control runs, the test it
+> targets has one assertion path per case it must discriminate; exact gate counts.
+
 **Files:**
 - Modify: `crates/codegen/src/cps.rs`, `crates/codegen/src/lib.rs`
 - Possibly modify: `crates/codegen/src/runtime.c` — **only outside `gc_mark`** (A7)
@@ -1550,6 +1762,9 @@ git commit -F /tmp/msg-t7a.txt
 **Interfaces:**
 - Consumes: `cps::needs_cps` (Task 7a); `frame_tag` (Task 6); `CoreKind::Handle` /
   `CoreKind::Resume` and the `CoreHandle`/`CoreClause`/`CoreReturn` structs (Task 5).
+- **`frame_tag` (added 2026-10-02):** frame_tag is computed inside descriptor_rows (Task 6
+  deviation 4). 7b must get it from there. Don't recompute it, and don't add a second
+  source of truth.
 - Produces: the frame-cell constructor and the effectful-call convention that Task 8's
   dispatch, splice and trampoline are written against. Its exact signatures are **fixed
   by Step 2's measurement** and must be written into the checkpoint report before any
@@ -1665,7 +1880,7 @@ Do not add a second `assert_runs`. If the program does not type-check as written
 - [ ] **Step 5: Run it and confirm the failure is the one you expect**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_non_tail_resume -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_non_tail_resume -- --nocapture
 ```
 
 Expected before any emission work: a `CodegenError::Unsupported` naming the handle node,
@@ -1689,7 +1904,7 @@ allocation, because `elya_alloc` can collect and the environment must be rooted 
 - [ ] **Step 7: Run the test to verify it passes**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_non_tail_resume -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_non_tail_resume -- --nocapture
 ```
 
 Expected: PASS, stdout `42`.
@@ -1739,6 +1954,20 @@ Explicit paths; never `-A`.
 ---
 
 ### Task 8: Handler dispatch, the splice, the trampoline, and the `with multi` refusal (A2)
+
+> **Added at the 7b checkpoint (2026-10-03; D11–D15).** There is no runtime trampoline: the
+> transfers are `musttail` jumps (D14), so "the trampoline" in this task's title and steps
+> means that. Required tests, in addition to the steps below:
+>
+> - **The moved 7b test** (D15), `a_non_tail_resume_compiles_and_runs`: program and
+>   expected `42` unchanged. Its red step re-measures the refusal instead of assuming it.
+> - **Name collision, differential** (D11): the `effect E { fn ping() -> Int }` +
+>   `fn ping() -> Int { 5 }` program. Native must match the evaluator's
+>   "evaluator PERFORMED the op".
+> - **GC stress** (D12): a collection runs between the handle returning and a lambda calling
+>   `resume`; the result matches the evaluator.
+> - **Double resume** (D13): native traps with the named error; the evaluator gives E0425.
+>   Both sides must fail.
 
 **Files:**
 - Modify: `crates/codegen/src/lib.rs`
@@ -1910,7 +2139,7 @@ it in one command.
 - [ ] **Step 3: Run all three tests and verify they fail**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --lib multi -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --lib multi -- --nocapture
 ```
 
 Note `--lib`, not `--test native_codegen`: these are unit tests now.
@@ -1945,7 +2174,7 @@ dispatch. It is removed inside this same task, before the task's commit.
 - [ ] **Step 5: Run the tests to verify they pass**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --lib multi -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --lib multi -- --nocapture
 ```
 
 Expected: PASS, all three.
@@ -2015,7 +2244,7 @@ is calibrated to distinguish it from success.
 - [ ] **Step 8: Run it and verify it fails on the temporary floor**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture
 ```
 
 Expected: FAIL with `Unsupported("handle")` — Step 4's floor.
@@ -2041,7 +2270,7 @@ nothing here needs a row at runtime. Do not reach for `EffectRow` in emitted cod
 - [ ] **Step 10: Run the dispatch test to verify it passes**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture
 ```
 
 Expected: PASS, status 6.
@@ -2049,13 +2278,27 @@ Expected: PASS, status 6.
 - [ ] **Step 11: Confirm the refusal tests still pass**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --lib multi -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --lib multi -- --nocapture
 ```
 
 Expected: PASS, all three. Step 9 removed the temporary floor but must not have removed
 the `multi` branch above it. If `the_multi_refusal_fires_before_any_clause_body_is_lowered`
 now reports `unbound`, the refusal has drifted below the clause lowering — fix the order,
 do not relax the assertion.
+
+- [ ] **Step 11a: Re-run the A3 handled-perform probe** *(added 2026-10-02; numbered 11a so
+  no later step, and none of Task 12's or the Self-Review's references to Task 8's steps,
+  is renumbered)*
+
+Re-run the A3 handled-perform probe (polymorphic effect, op performed at a concrete type
+inside a handler). Prediction: compiles and runs, matching the evaluator. Record the measured
+result in spec §11 A3.
+
+Why it is here: d50f3b1 measured A3 through codegen for everything that could reach it before
+dispatch existed, and left exactly this half open — Core refused `Handle` until Task 5, and
+codegen has no handler until this task's Step 9. Write the probe program and the prediction
+down before running it; if the program does not type-check, fix the program, never the
+prediction.
 
 - [ ] **Step 12: Re-measure A7**
 
@@ -2240,7 +2483,7 @@ fn the_handler_corpus_compiles_and_runs() {
 - [ ] **Step 4: Run it, and read a failure as a prediction miss before reading it as a bug**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen the_handler_corpus -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen the_handler_corpus -- --nocapture
 ```
 
 Expected: PASS.
@@ -2250,7 +2493,7 @@ first — Step 5's differential is the arbiter, and it compares against the eval
 is this project's reference semantics:
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen native_output_matches_the_evaluator_across_the_handler -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen native_output_matches_the_evaluator_across_the_handler -- --nocapture
 ```
 
 If the evaluator agrees with the prediction and native does not, the defect is in Task 8.
@@ -2286,7 +2529,7 @@ fn native_output_matches_the_evaluator_across_the_handler_corpus() {
 - [ ] **Step 6: Run it**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen native_output_matches_the_evaluator_across_the_handler -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen native_output_matches_the_evaluator_across_the_handler -- --nocapture
 ```
 
 Expected: PASS.
@@ -2339,7 +2582,7 @@ un-refused. If this reports `Unsupported`, Task 4's sweep missed a site; fix it 
 - [ ] **Step 8: Run it**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_printing_clause_body -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_printing_clause_body -- --nocapture
 ```
 
 Expected: PASS, text `asked\nasked\n`, value `2`.
@@ -2452,7 +2695,7 @@ fn a_tail_resuming_handler_settles_its_live_set() {
 - [ ] **Step 2: Run it. Four equal levels, or stop.**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_tail_resuming_handler_settles -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_tail_resuming_handler_settles -- --nocapture
 ```
 
 Expected: PASS, four equal levels.
@@ -2528,7 +2771,7 @@ rather than short-circuiting.
 - [ ] **Step 4: Run it**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_growing_control_moves -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_growing_control_moves -- --nocapture
 ```
 
 Expected: PASS, `levels[1].1 > levels[0].1`.
@@ -2592,6 +2835,18 @@ a state-passing tail loop at small N completes on any implementation, including 
 grows the stack linearly. Task 12's fifth control demonstrates precisely that. If the test
 overflows at 1 000 000, the finding is *a tail-call regression*, which is what
 `diagnose_stack_overflow` exists to name — not a reason to pick a smaller number.
+
+**Platform note — Linux (added 2026-10-02; nothing above is changed).** On Linux a stack
+overflow shows up as **signal 11 (SIGSEGV)**, not as Windows' `STATUS_STACK_OVERFLOW`.
+Measured in the cloud container (Ubuntu 24.04, clang 18.1.3, 8 MiB stack): a C program
+that recurses without bound dies with `Segmentation fault`, shell status `139`, and Rust's
+`ExitStatus` reports `code() == None`, `signal() == Some(11)`. `diagnose_stack_overflow`
+matches only `code() == Some(0xC00000FD)`, so on Linux it stays silent, and a tail-call
+regression surfaces as the generic `binary exited …` assertion — unnamed. **The helper must
+recognise SIGSEGV by name (e.g. `std::os::unix::process::ExitStatusExt::signal()`) before A9
+means anything on Linux.** One caveat for whoever writes that: SIGSEGV is not unique to stack
+overflow the way `0xC00000FD` is — a collector or codegen fault raises the same signal — so
+the Linux diagnosis names a *likely* cause, not a certain one.
 
 **A measured deviation from A9's wording, reported rather than patched.** A9 says the
 program runs "through `assert_runs`, printing exactly `x`". Against the code, it cannot:
@@ -2673,7 +2928,7 @@ returns `Unit`, and the annotation would be wrong. This row is copied, not autho
 - [ ] **Step 3: Run it**
 
 ```
-$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_state_passing_tail_loop -- --nocapture
+$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_state_passing_tail_loop -- --nocapture
 ```
 
 Expected: PASS, text `x\n`.
@@ -2749,7 +3004,7 @@ In Task 8's Step 9 point 4, change `k_cap ++ [handler] ++ k_now` to
 
 - Predicate tripped: deep re-installation, §4 point 4 — the handler must sit *beneath* the
   captured frames so it is found again on the next perform.
-- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture`
+- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture`
 - Required symptom: the A6 test prints **2**, not 6 — the handler was found once and then
   lost. Task 8's Step 7 prose predicts this exact number, which is what makes it a
   calibration rather than a guess.
@@ -2760,7 +3015,7 @@ In Task 8's Step 9 point 4, change `k_cap ++ [handler] ++ k_now` to
 Make dispatch always select clause 0 rather than matching the op name.
 
 - Predicate tripped: the two-name match in Task 8's Step 9 point 3.
-- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen the_handler_corpus -- --nocapture`
+- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen the_handler_corpus -- --nocapture`
 - Required symptom: the `two-ops` row prints **20**, not 14 — both performs resumed with
   `10`. Task 9's Step 1 predicts this number for this failure.
 - **Distinctness check:** this must *not* also break `ask-nontail`, which has one clause and
@@ -2775,7 +3030,7 @@ Remove the frame's row from the descriptor table (Task 6).
 - Predicate tripped: `gc_mark`'s `tag >= gc_n_ctors` skip, `crates/codegen/src/runtime.c:141`
   — a tag with no row is skipped, so the frame is never traced. This is the same predicate
   the closure-capture control at `:1073` trips.
-- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture`
+- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_deep_handler_is_reinstalled -- --nocapture`
 - Required symptom: a **wrong value**, not a crash. `:1080`'s comment is explicit about the
   shape of this failure — "This fails SILENTLY on the un-fixed build — it prints a wrong
   `Int`, it does not crash — which is why the assertion is on the VALUE." Expect the same
@@ -2790,7 +3045,7 @@ pointer, taking the mask from `0b10` to `0b00`.
 - Predicate tripped: the descriptor table's pointer-mask test. Per the measured convention,
   bit 0 is clear (the code pointer) and bit j+1 is set iff capture j is heap; the frame's
   one capture is `next`, so bit 1 is the tail of the captured chain.
-- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_growing_control_moves -- --nocapture`
+- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_growing_control_moves -- --nocapture`
 - Required symptom: **different from 2a.** 2a loses the whole frame; 2b keeps the frame and
   loses everything behind it, so it needs a *long* chain to show — which is why it is run
   against Task 10's growing control rather than against the A6 test. Expect a wrong value
@@ -2809,7 +3064,7 @@ Temporarily change Task 11's `loop(1000000)` to `loop(1000)`.
 
 - Predicate tripped: none — that is the finding. §12 says lowering N "silently converts A9
   into a tautology," and this demonstrates it rather than asserting it.
-- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p codegen --test native_codegen a_state_passing_tail_loop -- --nocapture`
+- Run: `$env:CARGO_INCREMENTAL="0"; cargo test -p elya-codegen --test native_codegen a_state_passing_tail_loop -- --nocapture`
 - Required symptom: **PASS**. A state-passing tail loop at N = 1 000 completes on an
   implementation that grows the stack linearly, so at that N the test distinguishes
   nothing. This is the concrete reason the N is fixed and not a tuning knob.
@@ -2921,7 +3176,7 @@ be the right answer — reached after seeing why equality failed, not before.
 
 Two known spec-vs-code deviations are carried as *reported findings* rather than patched:
 §6.3's frame mask (`0b11` in the spec, `0b10` against the measured descriptor convention,
-recorded in Task 6) and A9's `assert_runs` prescription (impossible against `lib.rs:202`,
+recorded in Task 6 — and, since 2026-10-02, corrected in the spec itself) and A9's `assert_runs` prescription (impossible against `lib.rs:202`,
 `:1349`, `:1461`; recorded in Task 11).
 
 **3. Type and name consistency.** Checked across tasks:

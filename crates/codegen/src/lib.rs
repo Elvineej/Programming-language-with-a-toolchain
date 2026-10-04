@@ -18,8 +18,10 @@
 //! is a front-end question, not a back-end one.
 
 mod closure;
+mod cps;
+mod cps_emit;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use inkwell::builder::Builder;
@@ -237,7 +239,10 @@ fn fn_type_of<'ctx>(
 /// inside the fold — which is why this message stayed "non-Int value" when the
 /// fold widened.
 fn require_int(ty: &Ty) -> Result<(), CodegenError> {
-    if matches!(ty, Ty::Base(TyCon::Int)) {
+    // 5b-8 Task 11: a `Unit` main is also an i64 word (0), so the shim's
+    // `%lld` prints it as-is; A9's main ends in `io.println(..)`. A `Bool`
+    // main stays refused (an i1 is not the shim's word).
+    if matches!(ty, Ty::Base(TyCon::Int) | Ty::Base(TyCon::Unit)) {
         Ok(())
     } else {
         Err(CodegenError::Unsupported("non-Int value"))
@@ -260,6 +265,7 @@ fn declare_all<'ctx>(
     ctx: &'ctx Context,
     module: &Module<'ctx>,
     core: &CoreModule,
+    cps_fns: &HashSet<String>,
 ) -> Result<HashMap<String, FunctionValue<'ctx>>, CodegenError> {
     let mut decls: HashMap<String, FunctionValue<'ctx>> = HashMap::new();
     for f in &core.fns {
@@ -274,7 +280,17 @@ fn declare_all<'ctx>(
         for p in f.params.iter() {
             params.push(repr_ty(ctx, &p.ty)?.into());
         }
-        let fn_ty = fn_type_of(repr_ty(ctx, &f.body.ty)?, &params)?;
+        // D14/D16: an effectful function takes its continuation as a trailing
+        // pointer and answers with the handle's answer as a word: it never
+        // returns its own value, it passes it to the continuation. Its body
+        // type is still checked representable, as every function's is.
+        let ret = repr_ty(ctx, &f.body.ty)?;
+        let fn_ty = if cps_fns.contains(&f.name) {
+            params.push(ctx.ptr_type(AddressSpace::default()).into());
+            ctx.i64_type().fn_type(&params, false)
+        } else {
+            fn_type_of(ret, &params)?
+        };
         let func = module.add_function(&mangle(&f.name), fn_ty, None);
         // NOTE the plural: `set_call_conventions` is the FunctionValue method.
         // The call-site method is `set_call_convention`, singular. Both are
@@ -449,6 +465,48 @@ fn word_to_value<'ctx>(
     }
 }
 
+/// The prefix of the hidden keys `bind_local` parks shadowed values under. No
+/// source identifier can begin with `$`, so `Var` lookup never sees one.
+const SHADOW: &str = "$shadow:";
+
+/// What `unbind_local` needs to undo a `bind_local`.
+struct Shadowed(Option<String>);
+
+/// Bind `x` to `v`. If that shadows an existing binding, the outer value is
+/// NOT moved into a Rust local (where `gc_root_env` cannot see it -- a live
+/// heap value left unrooted while the inner scope allocates): it stays in
+/// `env` under a hidden key, so every allocation inside the inner scope roots
+/// it, and `unbind_local` restores it exactly. Bindings nest LIFO, so the
+/// count of hidden keys present is a unique, deterministic suffix.
+fn bind_local<'ctx>(
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    x: &str,
+    v: BasicValueEnum<'ctx>,
+) -> Shadowed {
+    match env.insert(x.to_string(), v) {
+        None => Shadowed(None),
+        Some(prev) => {
+            let n = env.keys().filter(|k| k.starts_with(SHADOW)).count();
+            let key = format!("{SHADOW}{n:06}:{x}");
+            env.insert(key.clone(), prev);
+            Shadowed(Some(key))
+        }
+    }
+}
+
+fn unbind_local<'ctx>(env: &mut HashMap<String, BasicValueEnum<'ctx>>, x: &str, s: Shadowed) {
+    match s.0 {
+        None => {
+            env.remove(x);
+        }
+        Some(key) => {
+            if let Some(prev) = env.remove(&key) {
+                env.insert(x.to_string(), prev);
+            }
+        }
+    }
+}
+
 /// Root every heap binding currently in scope, returning how many went on.
 ///
 /// The keys are SORTED first. `HashMap` iteration order varies between
@@ -518,6 +576,13 @@ fn build_elya_call<'ctx>(
     let target = *lc.decls.get(name).ok_or(CodegenError::Unsupported(
         "callee is not a top-level function",
     ))?;
+    // D16: an effectful callee takes a continuation; only the CPS emitter can
+    // supply one. Reaching here with one is an emitter bug, refused by name.
+    if lc.cps_fns.contains(name) {
+        return Err(CodegenError::Unsupported(
+            "effectful call outside an effectful region",
+        ));
+    }
     build_direct_call(ctx, func, b, lc, target, args, env, tail)
 }
 
@@ -594,6 +659,11 @@ fn build_closure_call<'ctx>(
     let Ty::Fn(param_tys, _, ret_ty) = &callee.ty else {
         return Err(CodegenError::Unsupported("computed callee"));
     };
+    if cps::needs_cps(&callee.ty) {
+        return Err(CodegenError::Unsupported(
+            "effectful closure call (not yet compiled natively)",
+        ));
+    }
     if param_tys.len() != args.len() {
         return Err(CodegenError::Unsupported("closure call arity mismatch"));
     }
@@ -681,17 +751,10 @@ fn lower_tail<'ctx>(
         CoreKind::Let(x, rhs, body) => {
             // The bound value is NOT in tail position; only the body is.
             let v = lower_expr(ctx, func, b, lc, rhs, env)?;
-            let prev = env.insert(x.clone(), v);
+            // A shadowed outer binding stays rooted (`bind_local`).
+            let shadowed = bind_local(env, x, v);
             let out = lower_tail(ctx, func, b, lc, body, env);
-            // Restore any shadowed binding, exactly as `lower_expr` does.
-            match prev {
-                Some(p) => {
-                    env.insert(x.clone(), p);
-                }
-                None => {
-                    env.remove(x);
-                }
-            }
+            unbind_local(env, x, shadowed);
             out
         }
         CoreKind::App(callee, args) => {
@@ -716,6 +779,42 @@ fn lower_tail<'ctx>(
             Ok(())
         }
     }
+}
+
+/// The binary `Prim` operators on two already-lowered operands. Extracted from
+/// `lower_expr` (5b-8 7b-3) so the CPS emitter, which meets operands whose
+/// values were computed before a continuation site, applies exactly the same
+/// operators -- one table, not two that could drift.
+fn prim_values<'ctx>(
+    b: &Builder<'ctx>,
+    op: BinOp,
+    l: IntValue<'ctx>,
+    r: IntValue<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    // Deliberately NO nsw/nuw flags: defined two's-complement wrapping
+    // (§3.4). Overflow reconciliation with the evaluator is tracked in
+    // spec §11 — not silently decided here.
+    //
+    // Comparisons are SIGNED: Elya's Int is i64 two's-complement, so
+    // `(0 - 1) < 1` must be true. `and`/`or` are strict and bit-wise on
+    // i1 because BOTH evaluators are strict (spec §4.1) — a
+    // short-circuit diamond here would make native less-undefined than
+    // `elya run`, which is the mirror image of the Div trade.
+    let built = match op {
+        BinOp::Add => b.build_int_add(l, r, "add"),
+        BinOp::Sub => b.build_int_sub(l, r, "sub"),
+        BinOp::Mul => b.build_int_mul(l, r, "mul"),
+        BinOp::Lt => b.build_int_compare(IntPredicate::SLT, l, r, "lt"),
+        BinOp::Le => b.build_int_compare(IntPredicate::SLE, l, r, "le"),
+        BinOp::Gt => b.build_int_compare(IntPredicate::SGT, l, r, "gt"),
+        BinOp::Ge => b.build_int_compare(IntPredicate::SGE, l, r, "ge"),
+        BinOp::Eq => b.build_int_compare(IntPredicate::EQ, l, r, "eq"),
+        BinOp::Ne => b.build_int_compare(IntPredicate::NE, l, r, "ne"),
+        BinOp::And => b.build_and(l, r, "and"),
+        BinOp::Or => b.build_or(l, r, "or"),
+        other => return Err(CodegenError::Unsupported(op_label(other))),
+    };
+    built.map(|v| v.into()).map_err(internal)
 }
 
 /// §3.3 expression lowering: a recursive fold returning a `BasicValueEnum`,
@@ -806,24 +905,20 @@ fn lower_expr<'ctx>(
                 .map_err(internal)?;
             Ok(ctx.i64_type().const_int(0, false).into())
         }
-        CoreKind::Lit(_) => Err(CodegenError::Unsupported("non-Int literal")),
+        // 5b-8 Task 11: `Unit` is the immediate i64 word 0 (`repr_ty`), never
+        // dereferenced, traced or rooted. A9's source needs `resume(Unit)`.
+        CoreKind::Lit(CoreLit::Unit) => Ok(ctx.i64_type().const_int(0, false).into()),
         CoreKind::Var(x) => match env.get(x) {
             Some(v) => Ok(*v),
             None => Err(CodegenError::Unsupported("unbound var")),
         },
         CoreKind::Let(x, rhs, body) => {
             let v = lower_expr(ctx, func, b, lc, rhs, env)?;
-            let prev = env.insert(x.clone(), v);
+            // Restore any shadowed binding -- `let x = 1; let x = x + 1` stays
+            // correct -- and keep it ROOTED meanwhile (`bind_local`).
+            let shadowed = bind_local(env, x, v);
             let out = lower_expr(ctx, func, b, lc, body, env);
-            // Restore any shadowed binding — `let x = 1; let x = x + 1` stays correct.
-            match prev {
-                Some(p) => {
-                    env.insert(x.clone(), p);
-                }
-                None => {
-                    env.remove(x);
-                }
-            }
+            unbind_local(env, x, shadowed);
             out
         }
         CoreKind::Prim(op, args) => {
@@ -849,30 +944,7 @@ fn lower_expr<'ctx>(
             }
             let l = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
             let r = lower_expr(ctx, func, b, lc, &args[1], env)?.into_int_value();
-            // Deliberately NO nsw/nuw flags: defined two's-complement wrapping
-            // (§3.4). Overflow reconciliation with the evaluator is tracked in
-            // spec §11 — not silently decided here.
-            //
-            // Comparisons are SIGNED: Elya's Int is i64 two's-complement, so
-            // `(0 - 1) < 1` must be true. `and`/`or` are strict and bit-wise on
-            // i1 because BOTH evaluators are strict (spec §4.1) — a
-            // short-circuit diamond here would make native less-undefined than
-            // `elya run`, which is the mirror image of the Div trade.
-            let built = match op {
-                BinOp::Add => b.build_int_add(l, r, "add"),
-                BinOp::Sub => b.build_int_sub(l, r, "sub"),
-                BinOp::Mul => b.build_int_mul(l, r, "mul"),
-                BinOp::Lt => b.build_int_compare(IntPredicate::SLT, l, r, "lt"),
-                BinOp::Le => b.build_int_compare(IntPredicate::SLE, l, r, "le"),
-                BinOp::Gt => b.build_int_compare(IntPredicate::SGT, l, r, "gt"),
-                BinOp::Ge => b.build_int_compare(IntPredicate::SGE, l, r, "ge"),
-                BinOp::Eq => b.build_int_compare(IntPredicate::EQ, l, r, "eq"),
-                BinOp::Ne => b.build_int_compare(IntPredicate::NE, l, r, "ne"),
-                BinOp::And => b.build_and(l, r, "and"),
-                BinOp::Or => b.build_or(l, r, "or"),
-                other => return Err(CodegenError::Unsupported(op_label(*other))),
-            };
-            built.map(|v| v.into()).map_err(internal)
+            prim_values(b, *op, l, r)
         }
         CoreKind::App(callee, args) => {
             // Ordinary (non-tail) position: `tailcc` convention, NO tail-call
@@ -1111,13 +1183,19 @@ fn lower_expr<'ctx>(
                                 }
                             }
                         }
+                        // Bound with `bind_local` and undone in reverse: an arm
+                        // binder that shadows an outer name used to REMOVE the
+                        // outer binding after the arm (and leave it unrooted
+                        // during it).
+                        let mut shadowed = Vec::with_capacity(bindings.len());
                         for (n, v) in &bindings {
-                            env.insert(n.clone(), *v);
+                            shadowed.push((n.clone(), bind_local(env, n, *v)));
                         }
-                        let v = lower_expr(ctx, func, b, lc, &arm.body, env)?;
-                        for (n, _) in &bindings {
-                            env.remove(n);
+                        let v = lower_expr(ctx, func, b, lc, &arm.body, env);
+                        for (n, sh) in shadowed.into_iter().rev() {
+                            unbind_local(env, &n, sh);
                         }
+                        let v = v?;
                         let exit = b
                             .get_insert_block()
                             .ok_or_else(|| internal("builder left no block"))?;
@@ -1140,16 +1218,9 @@ fn lower_expr<'ctx>(
                         b.position_at_end(fallthrough);
                         b.build_unconditional_branch(body_bb).map_err(internal)?;
                         b.position_at_end(body_bb);
-                        let prev = env.insert(name.clone(), s.into());
+                        let shadowed = bind_local(env, name, s.into());
                         let v = lower_expr(ctx, func, b, lc, &arm.body, env);
-                        match prev {
-                            Some(p) => {
-                                env.insert(name.clone(), p);
-                            }
-                            None => {
-                                env.remove(name);
-                            }
-                        }
+                        unbind_local(env, name, shadowed);
                         let v = v?;
                         let exit = b
                             .get_insert_block()
@@ -1182,7 +1253,181 @@ fn lower_expr<'ctx>(
             }
             Ok(phi.as_basic_value())
         }
+        // 5b-8: Core carries handlers from Task 5; native dispatch arrives in Task
+        // 8. Until then a handler that reaches the back end is refused by name,
+        // never mis-lowered.
+        // D17: a handle is a nesting native call from a region that needs no
+        // CPS (the prepass refused every other position).
+        CoreKind::Handle(_) => cps_emit::emit_handle_site(ctx, func, b, lc, e, env),
+        // Task 8: a resume inside a clause body (or a lambda in one) is a
+        // native nesting call of the continuation (D14).
+        CoreKind::Resume(arg) => cps_emit::emit_resume_call(ctx, func, b, lc, e, arg, env),
+        // Only CPS regions perform; reaching one here is an emitter bug.
+        CoreKind::Perform(_) => Err(CodegenError::Unsupported(
+            "perform outside an effectful region",
+        )),
     }
+}
+
+/// The collector's descriptor table: one `[arity, ptr_mask]` row per tag, in tag
+/// order -- the real constructors, then one synthetic row per lambda site, then
+/// the string row. Pure: it reads Core and the lambda table and emits nothing,
+/// so a unit test can read the very rows `build_module` hands the runtime.
+/// The descriptor table and the tags read off it. `frame_tag` and `site_tags`
+/// are the single source of truth for 7b-3's emitter (plan: "frame_tag comes
+/// from descriptor_rows, never recomputed").
+pub(crate) struct Descriptors {
+    pub(crate) rows: Vec<u64>,
+    pub(crate) frame_tag: usize,
+    /// Continuation site key (`ContSite::key`) -> the tag its frames carry.
+    pub(crate) site_tags: std::collections::BTreeMap<usize, usize>,
+    /// Handle key (`HandlerSite::key`) -> the tag its handler frame carries.
+    pub(crate) handler_tags: std::collections::BTreeMap<usize, usize>,
+    /// D13: the continuation object's tag.
+    pub(crate) cont_tag: usize,
+}
+
+fn descriptor_rows(
+    core: &CoreModule,
+    lambdas: &[closure::LambdaSite],
+    sites: &[cps::ContSite],
+    handlers: &[cps::HandlerSite],
+    n_real_ctors: usize,
+    string_tag: usize,
+) -> Result<Descriptors, CodegenError> {
+    // 5b-5 §4: one `[arity, ptr_mask]` pair per constructor, in the SAME global
+    // tag order `build_ctor_table` assigns — the tag stored in an object's word
+    // 0 indexes straight into this table. Bit `i` of the mask is set iff field
+    // `i` is a heap pointer, which is what lets the mark phase trace precisely
+    // instead of guessing: an `Int` field is never mistaken for a pointer.
+    let mut desc: Vec<u64> = core
+        .types
+        .iter()
+        .flat_map(|t| t.ctors.iter())
+        .flat_map(|c| {
+            let arity = c.fields.len() as u64;
+            let mut mask = 0u64;
+            for (i, f) in c.fields.iter().enumerate() {
+                if is_heap_ty(f) {
+                    mask |= 1 << i;
+                }
+            }
+            [arity, mask].into_iter()
+        })
+        .collect();
+    // One SYNTHETIC constructor row per lambda site, continuing the tag
+    // numbering. This is what keeps `gc_mark` byte-identical: a closure is just
+    // an object whose descriptor happens to have been synthesized rather than
+    // declared, so the one function whose failure mode is silent gains no second
+    // dispatch path.
+    for (i, site) in lambdas.iter().enumerate() {
+        // Assigned in `collect_lambdas`'s pre-order; checked here rather than
+        // assumed, because a drift between the tag stored in word 0 and the row
+        // index would mis-trace silently. A hard error, not a `debug_assert` —
+        // release builds must not skip it.
+        if site.tag != n_real_ctors + i {
+            return Err(CodegenError::Unsupported(
+                "lambda tag disagrees with its descriptor row index",
+            ));
+        }
+        // arity = 1 (the code pointer) + the captures.
+        desc.push(1 + site.captures.len() as u64);
+        // Bit 0 is CLEAR: word 1 is a code pointer into the text segment, not a
+        // heap object. Bit j+1 is set iff capture j is a heap value.
+        let mut mask: u64 = 0;
+        for (j, (_, ty)) in site.captures.iter().enumerate() {
+            if is_heap_ty(ty) {
+                mask |= 1 << (j + 1);
+            }
+        }
+        desc.push(mask);
+    }
+    // N6 (§1.2): ONE string row — arity 0, mask 0. Nothing after the tag is a
+    // heap reference, so the mark phase traces nothing for a string. The tag is
+    // this row's index; the guard below makes "tag agrees with its row index" a
+    // compile-time property, exactly as the lambda guard above does.
+    if string_tag != desc.len() / 2 {
+        return Err(CodegenError::Unsupported(
+            "string tag disagrees with its descriptor row index",
+        ));
+    }
+    desc.push(0); // arity = 0: no traced-candidate words follow the tag
+    desc.push(0); // mask = 0
+                  // N8 §6.1 / §6.3 / A8: ONE row for a captured-continuation frame cell,
+                  // `[tag][code_ptr][next]`. Its tag continues the same linear numbering as the
+                  // lambda tags and the string tag, and the row is appended AFTER the string
+                  // row, so the string guard above still sees the table length it expects. Same
+                  // guard shape as the string tag's: "the tag agrees with its row index" is a
+                  // compile-time property rather than a comment.
+    let frame_tag = string_tag + 1;
+    if frame_tag != desc.len() / 2 {
+        return Err(CodegenError::Unsupported(
+            "frame tag disagrees with its descriptor row index",
+        ));
+    }
+    desc.push(2); // arity = 2: the code pointer and `next` follow the tag
+    desc.push(0b10); // bit 0 clear (code pointer, not traced); bit 1 set (`next` is heap)
+                     // 5b-8 D10: one row per continuation site that saves anything,
+                     // `[tag][code_ptr][next][saved_0..]`, appended after the frame row; a site
+                     // that saves nothing shares the frame row above. The tag IS the row index
+                     // at the moment the row is pushed, and `site_tags` is the only place an
+                     // emitter reads it from -- so there is no second assignment for a guard to
+                     // compare against (unlike the lambda tags, assigned in `collect_lambdas`).
+                     // A handler frame (7b-3, D17) is the same shape -- `[tag][code_ptr =
+                     // the return clause][next = null][saved..]` -- so it takes a row by the
+                     // same rule, appended after the site rows.
+    let frame_row = |saved: &[(cps::Saved, Ty)], desc: &mut Vec<u64>| -> usize {
+        if saved.is_empty() {
+            return frame_tag;
+        }
+        let tag = desc.len() / 2;
+        desc.push(2 + saved.len() as u64);
+        // Bit 0 clear (code pointer), bit 1 set (`next`), bit j+2 set iff saved
+        // value j is a heap value -- the lambda rows' convention shifted by one.
+        let mut mask: u64 = 0b10;
+        for (j, (_, ty)) in saved.iter().enumerate() {
+            if is_heap_ty(ty) {
+                mask |= 1 << (j + 2);
+            }
+        }
+        desc.push(mask);
+        tag
+    };
+    let mut site_tags = std::collections::BTreeMap::new();
+    for site in sites {
+        site_tags.insert(site.key, frame_row(&site.saved, &mut desc));
+    }
+    // Task 8: a handler frame is `[tag][code_ptr = the return clause][next =
+    // null][table][saved..]`. Word 3 is the address of the handle's static
+    // clause table (text/rodata, not heap), so it is never traced: bit 2
+    // clear, and saved value j is bit j+3. Always its own row -- its arity is
+    // never the frame row's.
+    let mut handler_tags = std::collections::BTreeMap::new();
+    for h in handlers {
+        handler_tags.insert(h.key, desc.len() / 2);
+        desc.push(3 + h.saved.len() as u64);
+        let mut mask: u64 = 0b10;
+        for (j, (_, ty)) in h.saved.iter().enumerate() {
+            if is_heap_ty(ty) {
+                mask |= 1 << (j + 3);
+            }
+        }
+        desc.push(mask);
+    }
+    // D13: ONE row for the continuation object a clause receives,
+    // `[tag][k][consumed][handler]`: `k` is the captured frame chain (traced,
+    // bit 0); `consumed` is the one-shot flag (a plain word, bit 1 clear);
+    // `handler` is the handler frame a resume re-installs (traced, bit 2).
+    let cont_tag = desc.len() / 2;
+    desc.push(3);
+    desc.push(0b101);
+    Ok(Descriptors {
+        rows: desc,
+        frame_tag,
+        site_tags,
+        handler_tags,
+        cont_tag,
+    })
 }
 
 /// The shared lowering context: declarations, constructor and string tags, and
@@ -1211,6 +1456,32 @@ struct LowerCtx<'a, 'ctx> {
     /// program can still reach a name for.
     gc_push: FunctionValue<'ctx>,
     gc_pop: FunctionValue<'ctx>,
+    /// 5b-8 7b-3 (D16): the top-level functions compiled with the CPS
+    /// convention -- `(params.., ptr k) -> i64`.
+    cps_fns: &'a HashSet<String>,
+    /// Every Core node by address, so the CPS emitter can walk a site's
+    /// recorded path back up to its region root.
+    nodes: &'a HashMap<usize, &'a CoreExpr>,
+    /// Continuation sites (D10) and their index by node address.
+    sites: &'a [cps::ContSite],
+    site_index: &'a HashMap<usize, usize>,
+    /// Handles (D17) and their index by node address.
+    handlers: &'a [cps::HandlerSite],
+    handler_index: &'a HashMap<usize, usize>,
+    /// The descriptor table's tags: per site, per handler.
+    desc: &'a Descriptors,
+    /// Site key -> its resumption function `(i64 value, ptr frame) -> i64`.
+    resume_fns: &'a HashMap<usize, FunctionValue<'ctx>>,
+    /// Handle key -> (body `(ptr frame) -> i64`, return `(i64, ptr frame) -> i64`).
+    handler_fns: &'a HashMap<usize, cps_emit::HandlerFns<'ctx>>,
+    /// Task 8: every `(effect, op)` the module performs or handles -> its index
+    /// in each handle's clause table.
+    op_ids: &'a HashMap<(String, String), usize>,
+    /// Task 8 runtime: the address of `elya_current_handler`, and
+    /// `elya_resume_twice`, `elya_unhandled_effect` (both `ccc`).
+    current_handler: inkwell::values::PointerValue<'ctx>,
+    resume_twice: FunctionValue<'ctx>,
+    unhandled: FunctionValue<'ctx>,
 }
 
 /// Fold `core.types` into a flat constructor table: name -> (tag, field types).
@@ -1270,6 +1541,23 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         .map(|(i, s)| (s.key, i))
         .collect();
 
+    // 5b-8 7b-3: which functions are effectful (D16), and the refusals that
+    // keep the convention and D17's handle cut sound -- all before anything
+    // is emitted, like the arity caps above.
+    let cps_fns = cps_emit::cps_functions(core);
+    cps_emit::prepass(core, &cps_fns)?;
+    let sites = cps::collect_sites(core);
+    let handlers = cps::collect_handlers(core);
+    let site_index: HashMap<usize, usize> =
+        sites.iter().enumerate().map(|(i, s)| (s.key, i)).collect();
+    let handler_index: HashMap<usize, usize> = handlers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (h.key, i))
+        .collect();
+    let nodes = cps_emit::index_nodes(core);
+    let descriptors = descriptor_rows(core, &lambdas, &sites, &handlers, n_real_ctors, string_tag)?;
+
     let main = find_main(core)?;
     // §5.5: `main` ALONE. The scope narrows from "every function" (which was
     // trivially just `main` in N1) to "`main`", because `@elya_main`'s signature
@@ -1286,7 +1574,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
 
     // §4.2: declare Elya functions and runtime externals, then emit every body.
     // Runtime externals are `ccc` at the C-ABI boundary; Elya functions stay `tailcc`.
-    let decls = declare_all(ctx, &module, core)?;
+    let decls = declare_all(ctx, &module, core, &cps_fns)?;
     let ctors = build_ctor_table(core);
 
     let alloc_ty = ptrt.fn_type(&[i64t.into()], false);
@@ -1313,6 +1601,18 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let gc_report = module.add_function("elya_gc_report", gc_report_ty, None); // ccc
 
     let lifted = declare_lifted(ctx, &module, &lambdas)?;
+    let trap_ty = ctx.void_type().fn_type(&[], false);
+    let resume_twice = module.add_function("elya_resume_twice", trap_ty, None); // ccc
+    let unhandled = module.add_function("elya_unhandled_effect", trap_ty, None); // ccc
+
+    // `elya_current_handler`: a declaration (no initializer); the definition
+    // lives in runtime.c.
+    let current_handler = module
+        .add_global(ptrt, Some(AddressSpace::default()), "elya_current_handler")
+        .as_pointer_value();
+    let op_ids = cps_emit::op_ids(core);
+    let (resume_fns, handler_fns) =
+        cps_emit::declare(ctx, &module, &nodes, &sites, &handlers, &op_ids)?;
 
     let lc = LowerCtx {
         module: &module,
@@ -1328,11 +1628,29 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         fail,
         gc_push,
         gc_pop,
+        cps_fns: &cps_fns,
+        nodes: &nodes,
+        sites: &sites,
+        site_index: &site_index,
+        handlers: &handlers,
+        handler_index: &handler_index,
+        desc: &descriptors,
+        resume_fns: &resume_fns,
+        handler_fns: &handler_fns,
+        op_ids: &op_ids,
+        current_handler,
+        resume_twice,
+        unhandled,
     };
     let b = ctx.create_builder();
     for f in &core.fns {
-        emit_body(ctx, &b, &lc, f)?;
+        if cps_fns.contains(&f.name) {
+            cps_emit::emit_cps_fn(ctx, &b, &lc, f)?;
+        } else {
+            emit_body(ctx, &b, &lc, f)?;
+        }
     }
+    cps_emit::emit_sites_and_handlers(ctx, &b, &lc)?;
     for site in lc.lambdas {
         emit_lifted(ctx, &b, &lc, site)?;
     }
@@ -1358,64 +1676,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     fmt.set_constant(true);
     fmt.set_unnamed_addr(true);
 
-    // 5b-5 §4: one `[arity, ptr_mask]` pair per constructor, in the SAME global
-    // tag order `build_ctor_table` assigns — the tag stored in an object's word
-    // 0 indexes straight into this table. Bit `i` of the mask is set iff field
-    // `i` is a heap pointer, which is what lets the mark phase trace precisely
-    // instead of guessing: an `Int` field is never mistaken for a pointer.
-    let mut desc: Vec<u64> = core
-        .types
-        .iter()
-        .flat_map(|t| t.ctors.iter())
-        .flat_map(|c| {
-            let arity = c.fields.len() as u64;
-            let mut mask = 0u64;
-            for (i, f) in c.fields.iter().enumerate() {
-                if is_heap_ty(f) {
-                    mask |= 1 << i;
-                }
-            }
-            [arity, mask].into_iter()
-        })
-        .collect();
-    // One SYNTHETIC constructor row per lambda site, continuing the tag
-    // numbering. This is what keeps `gc_mark` byte-identical: a closure is just
-    // an object whose descriptor happens to have been synthesized rather than
-    // declared, so the one function whose failure mode is silent gains no second
-    // dispatch path.
-    for (i, site) in lambdas.iter().enumerate() {
-        // Assigned in `collect_lambdas`'s pre-order; checked here rather than
-        // assumed, because a drift between the tag stored in word 0 and the row
-        // index would mis-trace silently. A hard error, not a `debug_assert` —
-        // release builds must not skip it.
-        if site.tag != n_real_ctors + i {
-            return Err(CodegenError::Unsupported(
-                "lambda tag disagrees with its descriptor row index",
-            ));
-        }
-        // arity = 1 (the code pointer) + the captures.
-        desc.push(1 + site.captures.len() as u64);
-        // Bit 0 is CLEAR: word 1 is a code pointer into the text segment, not a
-        // heap object. Bit j+1 is set iff capture j is a heap value.
-        let mut mask: u64 = 0;
-        for (j, (_, ty)) in site.captures.iter().enumerate() {
-            if is_heap_ty(ty) {
-                mask |= 1 << (j + 1);
-            }
-        }
-        desc.push(mask);
-    }
-    // N6 (§1.2): ONE string row — arity 0, mask 0. Nothing after the tag is a
-    // heap reference, so the mark phase traces nothing for a string. The tag is
-    // this row's index; the guard below makes "tag agrees with its row index" a
-    // compile-time property, exactly as the lambda guard above does.
-    if string_tag != desc.len() / 2 {
-        return Err(CodegenError::Unsupported(
-            "string tag disagrees with its descriptor row index",
-        ));
-    }
-    desc.push(0); // arity = 0: no traced-candidate words follow the tag
-    desc.push(0); // mask = 0
+    let desc = descriptors.rows.clone();
     let n_ctors = (desc.len() / 2) as u64;
     let desc_const = i64t.const_array(
         &desc
@@ -1513,13 +1774,17 @@ pub fn link(obj: &Path, exe: &Path) -> Result<(), CodegenError> {
     // N4 (spec §2.1): the runtime is a C file clang compiles and links alongside
     // the object, so the two `ccc` externals resolve.
     let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime.c");
-    let out = std::process::Command::new("clang")
-        .arg(obj)
-        .arg(&runtime)
-        .arg("-o")
-        .arg(exe)
-        .output()
-        .map_err(CodegenError::Io)?;
+    let mut cmd = std::process::Command::new("clang");
+    cmd.arg(obj).arg(&runtime).arg("-o").arg(exe);
+    // `compile_module` emits with `RelocMode::Default`, which on Linux is
+    // non-PIC: a string literal is addressed by an absolute `R_X86_64_32`
+    // relocation. Distribution clangs (Ubuntu's among them) link PIE by default
+    // and reject that relocation, so link non-PIE here. Linux only, and the
+    // emitted code is unchanged: making the object PIC instead would change
+    // codegen on every platform (PARKED.md).
+    #[cfg(target_os = "linux")]
+    cmd.arg("-no-pie");
+    let out = cmd.output().map_err(CodegenError::Io)?;
     if !out.status.success() {
         return Err(CodegenError::Link {
             code: out.status.code(),
@@ -1946,6 +2211,236 @@ mod tests {
         );
     }
 
+    // ---- 5b-8 7b-3 refusals (D16, D17, and what Task 8 owns) ----------------
+
+    const S_W: &str = "effect S { fn get() -> Int }\n\
+                       fn w(b) { if b { get() } else { 2 } }\n";
+
+    fn refused(prog: &str) -> CodegenError {
+        emit_ir(&core_of(&format!("{S_W}{prog}"))).unwrap_err()
+    }
+
+    // ---- 5b-8 Task 8 refusals (A2, and the clause arity cap) ---------------
+
+    fn handle_expr(clauses: Vec<elya::core::CoreClause>, multi: bool) -> CoreExpr {
+        CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Int),
+            kind: CoreKind::Handle(Rc::new(elya::core::CoreHandle {
+                body: Rc::new(int_lit(0)),
+                clauses: clauses.into(),
+                ret: None,
+                is_multi_declared: multi,
+            })),
+        }
+    }
+
+    #[test]
+    fn a_multi_shot_handler_is_refused_by_its_own_name() {
+        let err = emit_ir(&main_fn(handle_expr(Vec::new(), true))).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multi"),
+            "the message must name the feature: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_multi_refusal_fires_before_any_clause_body_is_lowered() {
+        // `Var("unbound")` in the clause body would refuse with its OWN
+        // message; seeing "multi" proves the handle-node refusal fired first
+        // (spec 5.4).
+        let poisonous = CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Int),
+            kind: CoreKind::Var("unbound".to_string()),
+        };
+        let clause = elya::core::CoreClause {
+            effect: "Flip".to_string(),
+            op: "flip".to_string(),
+            params: Rc::from([]),
+            body: Rc::new(poisonous),
+        };
+        let err = emit_ir(&main_fn(handle_expr(vec![clause], true))).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("multi"), "{msg}");
+        assert!(
+            !msg.contains("unbound"),
+            "the clause body was lowered before the refusal fired: {msg}"
+        );
+    }
+
+    /// Source -> Core, with the front end allowed to WARN: `with multi` is
+    /// deliberately not an error (E0426 stays a warning), so it type-checks
+    /// and lowers; the refusal is codegen's alone.
+    fn lower_warned_source(src: &str) -> CoreModule {
+        let session = elya::Session::new();
+        let (m, pd) = elya::parse::parse_module(&session, src);
+        assert!(pd.is_empty(), "parse: {pd:?}");
+        let (diags, table) = elya::types::infer_typed_table(&session, &m);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.severity == elya::diag::Severity::Error),
+            "type errors: {diags:?}"
+        );
+        elya::core::lower_module(&m, &table).expect("must lower to Core")
+    }
+
+    #[test]
+    fn a_multi_shot_handler_written_in_source_reaches_the_codegen_refusal() {
+        let src = "effect multi Flip { fn flip() -> Bool }\n\
+                   fn g() -> Int { if flip() { 1 } else { 0 } }\n\
+                   pub fn main() -> Int {\n\
+                   \x20 handle g() with multi { Flip.flip() -> resume(True) }\n\
+                   }\n";
+        let err = emit_ir(&lower_warned_source(src)).unwrap_err();
+        assert!(err.to_string().contains("multi"), "{err:?}");
+    }
+
+    #[test]
+    fn an_effect_operation_with_four_parameters_is_refused() {
+        // The clause takes the op's arguments, the continuation and the
+        // handler frame: 4 + 2 is past MAX_PARAMS, the measured win64 limit.
+        let err = emit_ir(&core_of(
+            "effect E { fn op(a: Int, b: Int, c: Int, d: Int) -> Int }\n\
+             fn body() -> Int { op(1, 2, 3, 4) }\n\
+             pub fn main() -> Int {\n\
+             \x20 handle { body() } with { E.op(a, b, c, d) -> resume(a + d)  return(r) -> r }\n\
+             }\n",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("effect operation takes more than three parameters")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_effect_polymorphic_function_used_at_a_user_effect_is_refused() {
+        // D16: `apply` is compiled once, direct; this instantiation would call
+        // an effectful lambda with the direct convention. N7's territory.
+        let err = refused(
+            "fn apply(f) { f(1) + 1 }\n\
+             pub fn main() -> Int {\n\
+             \x20 handle { apply(fn(x) { x * get() }) } with {\n\
+             \x20   S.get() -> resume(10)\n    return(r) -> r\n  }\n}\n",
+        );
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("effect-polymorphic function used at a user effect")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_handle_nested_inside_another_handle_is_refused() {
+        // D17: the inner handle is a nesting call the outer capture cannot see past.
+        let err = refused(
+            "pub fn main() -> Int {\n\
+             \x20 handle {\n\
+             \x20   handle { w(False) } with { S.get() -> resume(1)  return(r) -> r }\n\
+             \x20 } with { S.get() -> resume(2)  return(r) -> r }\n}\n",
+        );
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("handle nested inside another handle")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_handle_inside_an_effectful_function_is_refused() {
+        // D17: `g` performs S outside its handle, so it is CPS, and a perform
+        // inside its handle could need the code after it.
+        let err = refused(
+            "effect T { fn t() -> Int }\n\
+             fn g() -> Int {\n\
+             \x20 let a = handle { w(False) } with { S.get() -> resume(1)  return(r) -> r }\n\
+             \x20 a + t()\n}\n\
+             pub fn main() -> Int {\n\
+             \x20 handle { g() } with { T.t() -> resume(1)  return(r) -> r }\n}\n",
+        );
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("handle inside an effectful function")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_effectful_lambda_is_refused_by_name() {
+        let err = refused(
+            "pub fn main() -> Int {\n\
+             \x20 handle { let f = fn(x) { x + get() }  f(1) } with {\n\
+             \x20   S.get() -> resume(1)\n    return(r) -> r\n  }\n}\n",
+        );
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("effectful lambda (not yet compiled natively)")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_effectful_function_with_five_parameters_is_refused() {
+        // D14: the continuation is a sixth LLVM parameter, past MAX_PARAMS.
+        let err = refused(
+            "fn five(a, b, c, d, e) { a + b + c + d + e + get() }\n\
+             pub fn main() -> Int {\n\
+             \x20 handle { five(1, 2, 3, 4, 5) } with {\n\
+             \x20   S.get() -> resume(1)\n    return(r) -> r\n  }\n}\n",
+        );
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("effectful function takes more than four parameters")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a3_an_unconstrained_polymorphic_effect_meets_the_ty_var_refusal() {
+        // A3 (spec §11), measured. A polymorphic effect has no refusal of its
+        // own: when `reader` leaves the effect's parameter unconstrained, the
+        // parameter survives into `reader`'s type as a `Ty::Var`, and that is
+        // refused by the SAME `repr_ty` rule as `id` above (5b-8 plan D2).
+        // Constrain it (`get() + 1`) and the measured refusal moves to the
+        // monomorphic program's, so the `Ty::Var` is the cause, not the effect.
+        let core = core_of(
+            "effect State(s) { fn get() -> s  fn set(v: s) -> Unit }\n\
+             fn reader() { get() }\n\
+             pub fn main() -> Int { 0 }\n",
+        );
+        let reader = core
+            .fns
+            .iter()
+            .find(|f| f.name == "reader")
+            .expect("reader");
+        assert!(
+            matches!(reader.body.ty, Ty::Var(_)),
+            "the unconstrained parameter should reach Core as a Ty::Var: {:?}",
+            reader.body.ty
+        );
+        let err = emit_ir(&core).unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported("unrepresentable type")),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn rejects_a_computed_callee_specifically() {
         // §5.3, witnessed by a program a user could actually write. The Pratt
@@ -2170,5 +2665,62 @@ mod tests {
                 "repr_ty and is_heap_ty disagree on {ty:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_frame_row_follows_the_string_row_with_mask_0b10() {
+        // N8 §6.1 / §6.3, A8, and plan D5. A captured-continuation frame cell is
+        // `[tag][code_ptr][next]`: arity 2, mask 0b10. Bit 0 is CLEAR because word
+        // 1 is a code pointer into the text segment (the lambda rows' own
+        // convention); bit 1 is SET because `next` is a heap frame. The spec's
+        // §6.3 says 0b11 -- the silent-corruption error D5 records -- and this
+        // pins the correction. The frame row is the table's last, right after the
+        // string row, so the frame tag is `string_tag + 1`.
+        //
+        // A real program carrying every earlier kind of row (a constructor with a
+        // heap field, and a lambda), so the frame row is placed after all of them.
+        let core = core_of(
+            "type L { Nil, Cons(Int, L) }\n\
+             fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }\n\
+             pub fn main() -> Int {\n\
+             \x20 let f = fn(x) { x + 1 }\n\
+             \x20 f(len(Cons(1, Nil)))\n\
+             }\n",
+        );
+        let n_real_ctors: usize = core.types.iter().map(|t| t.ctors.len()).sum();
+        let lambdas = closure::collect_lambdas(&core, n_real_ctors);
+        assert_eq!(lambdas.len(), 1, "the program must carry one lambda row");
+        let string_tag = n_real_ctors + lambdas.len();
+        let d = descriptor_rows(&core, &lambdas, &[], &[], n_real_ctors, string_tag).expect("rows");
+        let rows = d.rows;
+        let frame_tag = string_tag + 1;
+        // Task 8 (D13, approved expected-value change): with no sites and no
+        // handles, the frame row is followed by exactly ONE more row -- the
+        // continuation object's `[3, 0b101]` -- where it used to be the last.
+        assert_eq!(
+            rows.len() / 2,
+            frame_tag + 2,
+            "frame row, then only the continuation-object row: {rows:?}"
+        );
+        assert_eq!(
+            d.frame_tag, frame_tag,
+            "descriptor_rows reports the frame tag"
+        );
+        assert_eq!(d.cont_tag, frame_tag + 1);
+        assert_eq!(
+            &rows[2 * d.cont_tag..],
+            &[3, 0b101],
+            "continuation object: k and handler traced, consumed flag not"
+        );
+        assert_eq!(
+            &rows[2 * string_tag..2 * string_tag + 2],
+            &[0, 0],
+            "the string row is unchanged"
+        );
+        assert_eq!(
+            &rows[2 * frame_tag..2 * frame_tag + 2],
+            &[2, 0b10],
+            "frame row: arity 2, mask 0b10 (D5) -- not the spec's 0b11"
+        );
     }
 }
