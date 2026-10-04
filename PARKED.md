@@ -104,7 +104,11 @@ Spec §6.3 now carries an as-built note (guards unchanged, a separate frame guar
   shape. (A8's own row was rewritten by plan D10 on 2026-10-03; §6.3's sentence
   still says "extended".)
 
-## Op → effect index: one helper, one copy left
+## RESOLVED (parked-cleanup-1, 2026-10-04): op → effect index: one helper, one copy left
+
+The evaluator's `op_table` is now `ast::op_effects`; 5c-1's E0202 makes op names unique, so
+`Infer.ops` (kept: it carries signatures) agrees with it by rule. Original:
+
 
 Plan D11 adds `ast::op_effects` for lowering: the third construction of the op →
 effect index, after `Infer.ops` (richer: it carries signatures, like
@@ -200,7 +204,11 @@ So no test today isolates the `clause_tail` install, and A6 is not a re-installa
 in this design. Lifting D17 needs a test with two live handlers where the wrong one is
 observable, red first.
 
-## Corpus loops stop at their first failing row (Task 12, 2026-10-04)
+## RESOLVED (parked-cleanup-1, 2026-10-04): corpus loops stop at their first failing row (Task 12)
+
+Both Task 9 corpus loops now collect failures (control: two wrong expectations, both
+reported). Original:
+
 
 `the_handler_corpus_compiles_and_runs` and its differential twin assert inside the loop, so
 under a control the rows after the first failure are never run (control 1b never reached

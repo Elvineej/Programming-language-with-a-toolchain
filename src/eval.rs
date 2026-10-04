@@ -472,19 +472,14 @@ pub mod cek {
     use std::rc::Rc;
 
     /// Operation name -> its declaring effect. A call to one of these names is a
-    /// *perform*. Built from `effect` declarations, threaded like `fns`.
-    type Ops<'a> = HashMap<&'a str, String>;
+    /// *perform*. Threaded like `fns`. Since slice 5c-1 it is the shared
+    /// `ast::op_effects` index -- the one Core lowering reads -- rather than a
+    /// local rebuild: op names are unique per module (E0202), so the evaluator,
+    /// lowering and inference cannot disagree about an op's effect.
+    type Ops<'a> = HashMap<String, String>;
 
     fn op_table<'a>(module: &'a Module) -> Ops<'a> {
-        let mut m = HashMap::new();
-        for d in &module.decls {
-            if let Decl::Effect(e) = &d.node {
-                for op in &e.ops {
-                    m.insert(op.node.name.as_str(), e.name.clone());
-                }
-            }
-        }
-        m
+        crate::ast::op_effects(module)
     }
 
     /// A first-class captured continuation: the frames above the handler at the
