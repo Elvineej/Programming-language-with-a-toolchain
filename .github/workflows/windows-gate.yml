@@ -17,22 +17,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Every step logs to a file and, on failure, surfaces its tail as an
+      # annotation, so the failure is readable through the checks API alone.
       - name: Fetch LLVM 18.1.8
         shell: bash
         run: |
-          curl -fsSL -o llvm.tar.xz https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz
-          mkdir -p /c/llvm18
-          # The archive holds symlinks that Git Bash's tar cannot create on
-          # Windows; the files the build needs are regular files, checked below.
-          tar -xJf llvm.tar.xz -C /c/llvm18 --strip-components=1 || echo "tar reported errors (symlinks); verifying"
-          /c/llvm18/bin/llvm-config.exe --version
-          /c/llvm18/bin/clang.exe --version
+          set -o pipefail
+          report() { echo "::error title=$1::$(tail -n 40 "$2" | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"; }
+          {
+            curl -fsSL -o llvm.tar.xz https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz &&
+            mkdir -p /c/llvm18 &&
+            { tar -xJf llvm.tar.xz -C /c/llvm18 --strip-components=1 || echo "tar reported errors (symlinks); verifying"; } &&
+            /c/llvm18/bin/llvm-config.exe --version &&
+            /c/llvm18/bin/clang.exe --version
+          } > llvm.log 2>&1 || { report llvm llvm.log; exit 1; }
+          cat llvm.log
           echo 'LLVM_SYS_180_PREFIX=C:\llvm18' >> "$GITHUB_ENV"
           echo 'C:\llvm18\bin' >> "$GITHUB_PATH"
 
       - name: Gate (scripts/check.ps1)
-        shell: powershell
+        shell: bash
         run: |
-          clang --version
-          powershell -NoProfile -File scripts/check.ps1
-          exit $LASTEXITCODE
+          report() { echo "::error title=$1::$(tail -n 40 "$2" | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"; }
+          powershell -NoProfile -File scripts/check.ps1 > gate.log 2>&1
+          rc=$?
+          cat gate.log
+          grep -E "^test result" gate.log | awk '{p+=$4;f+=$6} END{print "::notice title=tests::passed="p" failed="f}'
+          if [ $rc -ne 0 ]; then report "check.ps1 exit $rc" gate.log; exit $rc; fi
