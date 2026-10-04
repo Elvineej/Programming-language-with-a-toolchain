@@ -39,6 +39,7 @@ jobs:
         shell: bash
         run: |
           report() { echo "::error title=$1::$(tail -n 40 "$2" | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"; }
+          set +e
           powershell -NoProfile -File scripts/check.ps1 > gate.log 2>&1
           rc=$?
           cat gate.log
