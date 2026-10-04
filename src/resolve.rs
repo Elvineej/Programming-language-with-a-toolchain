@@ -20,6 +20,8 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
     // `op_table`, `ast::op_effects`) is keyed by op name, so a second
     // declaration is E0202 rather than a silent overwrite.
     let mut op_effect: HashMap<String, String> = HashMap::new();
+    let mut op_arity: HashMap<String, usize> = HashMap::new();
+    let mut dup_ops: HashSet<String> = HashSet::new();
     let mut effect_names: HashSet<String> = HashSet::new();
     let mut dup_diags: Vec<Diagnostic> = Vec::new();
     for d in &module.decls {
@@ -32,6 +34,7 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
                 for op in &e.ops {
                     let name = &op.node.name;
                     if let Some(first) = op_effect.get(name) {
+                        dup_ops.insert(name.clone());
                         dup_diags.push(
                             Diagnostic::error(
                                 "E0202",
@@ -47,6 +50,7 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
                         );
                     } else {
                         op_effect.insert(name.clone(), e.name.clone());
+                        op_arity.insert(name.clone(), op.node.param_tys.len());
                     }
                     op_names.insert(name.clone());
                 }
@@ -63,6 +67,8 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
         ops: &op_names,
         ctors: &ctor_names,
         op_effect: &op_effect,
+        op_arity: &op_arity,
+        dup_ops: &dup_ops,
         effects: &effect_names,
         in_handler: 0,
         diags: dup_diags,
@@ -90,6 +96,11 @@ struct Cx<'a> {
     /// Op name -> its declaring effect (unique by E0202), and the declared
     /// effect names: what a handler clause must resolve against (E0203).
     op_effect: &'a HashMap<String, String>,
+    /// Op name -> its parameter count; a clause must bind exactly that many.
+    op_arity: &'a HashMap<String, usize>,
+    /// Op names already reported E0202: a clause on one is not checked again
+    /// (its owner is ambiguous, so any E0203 there would be noise or false).
+    dup_ops: &'a HashSet<String>,
     effects: &'a HashSet<String>,
     /// Nesting depth of handler clauses currently being checked. `resume` is
     /// only legal where this is nonzero (E0210 otherwise).
@@ -103,6 +114,9 @@ impl Cx<'_> {
     /// from slice 5c-1). An unqualified clause then means the op's effect.
     fn check_clause_names_an_op(&mut self, clause: &OpClause, span: Span) {
         let op = &clause.op;
+        if self.dup_ops.contains(op) {
+            return;
+        }
         let msg = match (self.op_effect.get(op), &clause.effect) {
             (None, Some(q)) if !self.effects.contains(q) => {
                 format!("`{q}` is not a declared effect")
@@ -114,11 +128,28 @@ impl Cx<'_> {
             (Some(owner), Some(q)) if owner != q => {
                 format!("`{op}` is an operation of `{owner}`, not `{q}`")
             }
-            _ => return,
+            // Pre-existing hole closed here (review of 5c-1): a clause binding
+            // the wrong number of arguments checked clean, then failed at run
+            // time ("unbound variable") or crashed natively.
+            _ => match self.op_arity.get(op) {
+                Some(&n) if n != clause.params.len() => {
+                    let plural = if n == 1 { "" } else { "s" };
+                    format!(
+                        "`{op}` takes {n} argument{plural}, but this clause binds {}",
+                        clause.params.len()
+                    )
+                }
+                _ => return,
+            },
         };
-        let mut d = Diagnostic::error("E0203", "this clause names no declared operation")
+        let mut d = Diagnostic::error("E0203", "this clause does not match a declared operation")
             .with_label(span, msg);
-        if let Some(owner) = self.op_effect.get(op) {
+        // The qualifier fix-it only where the qualifier is what is wrong.
+        let qualifier_wrong = clause
+            .effect
+            .as_ref()
+            .is_some_and(|q| self.op_effect.get(op) != Some(q));
+        if let (Some(owner), true) = (self.op_effect.get(op), qualifier_wrong) {
             d = d.with_help(format!("write `{owner}.{op}(…)`, or just `{op}(…)`"));
         }
         self.diags.push(d);
