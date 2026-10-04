@@ -35,6 +35,17 @@ jobs:
           echo 'LLVM_SYS_180_PREFIX=C:\llvm18' >> "$GITHUB_ENV"
           echo 'C:\llvm18\bin' >> "$GITHUB_PATH"
 
+      # The release archive's llvm-config names libxml2s.lib (LLVM's
+      # WindowsManifest support) but does not ship it. Supply it: static
+      # libxml2, core features only (no iconv/zlib/lzma), dynamic CRT to match
+      # Rust's /MD.
+      - name: Provide libxml2s.lib
+        shell: bash
+        run: |
+          report() { echo "::error title=$1::$(tail -n 40 "$2" | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"; }
+          "$VCPKG_INSTALLATION_ROOT/vcpkg.exe" install "libxml2[core]:x64-windows-static-md" > xml.log 2>&1 || { report libxml2 xml.log; exit 1; }
+          cp "$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md/lib/libxml2.lib" /c/llvm18/lib/libxml2s.lib || { ls "$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md/lib" > xml.log 2>&1; report "libxml2 lib name" xml.log; exit 1; }
+
       - name: Gate (scripts/check.ps1)
         shell: bash
         run: |
