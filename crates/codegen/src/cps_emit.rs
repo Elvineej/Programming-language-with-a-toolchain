@@ -351,6 +351,7 @@ pub(crate) fn declare<'ctx>(
         };
         let mut clauses = Vec::with_capacity(hd.clauses.len());
         let mut entries = vec![i64t.const_int(0, false); op_ids.len()];
+        let mut filled = std::collections::HashSet::new();
         for (j, c) in hd.clauses.iter().enumerate() {
             let mut sig: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
             for p in c.params.iter() {
@@ -367,7 +368,11 @@ pub(crate) fn declare<'ctx>(
             let id = *op_ids
                 .get(&(c.effect.clone(), c.op.clone()))
                 .ok_or_else(|| internal("a clause's op has no id"))?;
-            entries[id] = f.as_global_value().as_pointer_value().const_to_int(i64t);
+            // The FIRST clause for an op wins, as in the evaluator (`find`); a
+            // later duplicate is still emitted but never dispatched to.
+            if filled.insert(id) {
+                entries[id] = f.as_global_value().as_pointer_value().const_to_int(i64t);
+            }
             clauses.push(f);
         }
         let arr = i64t.const_array(&entries);
