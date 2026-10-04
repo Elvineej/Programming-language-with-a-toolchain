@@ -1831,6 +1831,36 @@ const HANDLER_8: &[(&str, &str, &str)] = &[
         "6",
     ),
     (
+        // Slice 5c-1: an UNQUALIFIED clause means its op's effect; the native
+        // back end gets it from Core, which always names the effect.
+        "unqualified-clause",
+        "effect Ask { fn ask() -> Int }\n\
+         fn one() { ask() }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { one() } with {\n\
+         \x20   ask() -> resume(2)\n\
+         \x20   return(x) -> x\n\
+         \x20 }\n\
+         }\n",
+        "2",
+    ),
+    (
+        // Two clauses for one op: the evaluator (reference) takes the FIRST
+        // (`find`). Native took the LAST -- each clause overwrote its op's slot
+        // in the clause table -- and printed 5 (measured 2026-10-04, 5c-1 m8).
+        "duplicate-clause-first-wins",
+        "effect Ask { fn ask() -> Int }\n\
+         fn one() { ask() }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { one() } with {\n\
+         \x20   Ask.ask() -> resume(2)\n\
+         \x20   Ask.ask() -> resume(5)\n\
+         \x20   return(x) -> x\n\
+         \x20 }\n\
+         }\n",
+        "2",
+    ),
+    (
         "frame-capture",
         "effect State { fn get() -> Int }\n\
          fn body() -> Int { get() + 1 }\n\
@@ -2240,38 +2270,67 @@ const HANDLER_CORPUS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Both corpus loops COLLECT failures and report them together (PARKED,
+/// Task 12): asserting inside the loop hid every row after the first failure,
+/// so a control's footprint was never fully visible (control 1b never reached
+/// `two-handles`). Same rows, same expected values, same comparisons.
 #[test]
 fn the_handler_corpus_compiles_and_runs() {
     let dir = temp_dir("handler-corpus");
+    let mut failures = Vec::new();
     for (tag, src, expected) in HANDLER_CORPUS {
         let core = lower_src(src);
-        let exe = compile_and_link(&core, &dir, tag);
-        assert_runs(&exe, expected);
+        let exe = match try_compile_and_link(&core, &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || got != *expected {
+            failures.push(format!(
+                "{tag}: {:?} stdout={got:?} want={expected} stderr={:?}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
     }
     std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 #[test]
 fn native_output_matches_the_evaluator_across_the_handler_corpus() {
     let dir = temp_dir("differential-handler");
+    let mut failures = Vec::new();
     for (tag, src, _) in HANDLER_CORPUS {
         let core = lower_src(src);
-        let exe = compile_and_link(&core, &dir, tag);
+        let exe = match try_compile_and_link(&core, &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
         let out = Command::new(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
-        assert!(
-            out.status.success(),
-            "{tag}: binary exited {:?}",
-            out.status
-        );
         let native = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        assert_eq!(
-            native,
-            eval_main_int(src),
-            "{tag}: native output diverges from the evaluator"
-        );
+        let want = eval_main_int(src);
+        if !out.status.success() || native != want {
+            failures.push(format!(
+                "{tag}: {:?} native={native:?} evaluator={want}",
+                out.status
+            ));
+        }
     }
     std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        failures.is_empty(),
+        "native diverges from the evaluator: {failures:#?}"
+    );
 }
 
 /// A1's second half: the exact bytes. The `io.println` sits INSIDE the clause
