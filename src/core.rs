@@ -500,11 +500,10 @@ fn lower_expr(
         // that lookup returns is then unused.
         Expr::Block(b) => return lower_block(b, table, cx),
         Expr::Handle { body, handler } => {
-            // An unqualified clause (`op(..) -> ..`) type-checks, but the evaluator
-            // — the reference semantics — never dispatches to one:
-            // `handler_handles` (src/eval.rs) matches `effect == Some(..)` only, and
-            // the run ends in E0300. There is no behaviour to reproduce, so it is
-            // refused by name, before anything in the handle is lowered.
+            // An unqualified clause (`op(..) -> ..`) means its op's effect (slice
+            // 5c-1): op names are unique per module (E0202), and the evaluator
+            // dispatches it exactly so. A clause naming no declared op is E0203 in
+            // the front end, so the refusal below is defensive, not reachable.
             let effects = handler
                 .clauses
                 .iter()
@@ -512,7 +511,10 @@ fn lower_expr(
                     c.node
                         .effect
                         .clone()
-                        .ok_or(LowerError::Unsupported("unqualified handler clause"))
+                        .or_else(|| cx.op_effects.get(&c.node.op).cloned())
+                        .ok_or(LowerError::Unsupported(
+                            "handler clause names no declared operation",
+                        ))
                 })
                 .collect::<Result<Vec<String>, LowerError>>()?;
             let b = lower_expr(&body.node, body.span, table, cx)?;

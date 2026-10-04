@@ -5,7 +5,7 @@ use crate::ast::*;
 use crate::diag::Diagnostic;
 use crate::span::{Span, Spanned};
 use crate::Session;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub fn builtins() -> &'static [&'static str] {
     &["io.println"]
@@ -15,14 +15,44 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
     let mut fn_names: HashSet<String> = HashSet::new();
     let mut op_names: HashSet<String> = HashSet::new();
     let mut ctor_names: HashSet<String> = HashSet::new();
+    // Slice 5c-1: op name -> its ONE declaring effect. A perform cannot be
+    // qualified, and every op index downstream (`Infer.ops`, the evaluator's
+    // `op_table`, `ast::op_effects`) is keyed by op name, so a second
+    // declaration is E0202 rather than a silent overwrite.
+    let mut op_effect: HashMap<String, String> = HashMap::new();
+    let mut op_arity: HashMap<String, usize> = HashMap::new();
+    let mut dup_ops: HashSet<String> = HashSet::new();
+    let mut effect_names: HashSet<String> = HashSet::new();
+    let mut dup_diags: Vec<Diagnostic> = Vec::new();
     for d in &module.decls {
         match &d.node {
             Decl::Fn(f) => {
                 fn_names.insert(f.name.clone());
             }
             Decl::Effect(e) => {
+                effect_names.insert(e.name.clone());
                 for op in &e.ops {
-                    op_names.insert(op.node.name.clone());
+                    let name = &op.node.name;
+                    if let Some(first) = op_effect.get(name) {
+                        dup_ops.insert(name.clone());
+                        dup_diags.push(
+                            Diagnostic::error(
+                                "E0202",
+                                format!("operation `{name}` is declared more than once"),
+                            )
+                            .with_label(
+                                op.span,
+                                format!("`{name}` is already declared by effect `{first}`"),
+                            )
+                            .with_help(
+                                "operation names are unique across a module: a perform names only the operation, so it must say which effect it performs",
+                            ),
+                        );
+                    } else {
+                        op_effect.insert(name.clone(), e.name.clone());
+                        op_arity.insert(name.clone(), op.node.param_tys.len());
+                    }
+                    op_names.insert(name.clone());
                 }
             }
             Decl::Type(t) => {
@@ -36,8 +66,12 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
         fns: &fn_names,
         ops: &op_names,
         ctors: &ctor_names,
+        op_effect: &op_effect,
+        op_arity: &op_arity,
+        dup_ops: &dup_ops,
+        effects: &effect_names,
         in_handler: 0,
-        diags: Vec::new(),
+        diags: dup_diags,
     };
     for d in &module.decls {
         match &d.node {
@@ -59,6 +93,15 @@ struct Cx<'a> {
     fns: &'a HashSet<String>,
     ops: &'a HashSet<String>,
     ctors: &'a HashSet<String>,
+    /// Op name -> its declaring effect (unique by E0202), and the declared
+    /// effect names: what a handler clause must resolve against (E0203).
+    op_effect: &'a HashMap<String, String>,
+    /// Op name -> its parameter count; a clause must bind exactly that many.
+    op_arity: &'a HashMap<String, usize>,
+    /// Op names already reported E0202: a clause on one is not checked again
+    /// (its owner is ambiguous, so any E0203 there would be noise or false).
+    dup_ops: &'a HashSet<String>,
+    effects: &'a HashSet<String>,
     /// Nesting depth of handler clauses currently being checked. `resume` is
     /// only legal where this is nonzero (E0210 otherwise).
     in_handler: usize,
@@ -66,6 +109,52 @@ struct Cx<'a> {
 }
 
 impl Cx<'_> {
+    /// E0203: a clause must name a declared operation, and its qualifier, if
+    /// written, must be that operation's effect (slice 3 spec §7.2, enforced
+    /// from slice 5c-1). An unqualified clause then means the op's effect.
+    fn check_clause_names_an_op(&mut self, clause: &OpClause, span: Span) {
+        let op = &clause.op;
+        if self.dup_ops.contains(op) {
+            return;
+        }
+        let msg = match (self.op_effect.get(op), &clause.effect) {
+            (None, Some(q)) if !self.effects.contains(q) => {
+                format!("`{q}` is not a declared effect")
+            }
+            (None, _) => format!("no effect declares an operation `{op}`"),
+            (Some(_), Some(q)) if !self.effects.contains(q) => {
+                format!("`{q}` is not a declared effect")
+            }
+            (Some(owner), Some(q)) if owner != q => {
+                format!("`{op}` is an operation of `{owner}`, not `{q}`")
+            }
+            // Pre-existing hole closed here (review of 5c-1): a clause binding
+            // the wrong number of arguments checked clean, then failed at run
+            // time ("unbound variable") or crashed natively.
+            _ => match self.op_arity.get(op) {
+                Some(&n) if n != clause.params.len() => {
+                    let plural = if n == 1 { "" } else { "s" };
+                    format!(
+                        "`{op}` takes {n} argument{plural}, but this clause binds {}",
+                        clause.params.len()
+                    )
+                }
+                _ => return,
+            },
+        };
+        let mut d = Diagnostic::error("E0203", "this clause does not match a declared operation")
+            .with_label(span, msg);
+        // The qualifier fix-it only where the qualifier is what is wrong.
+        let qualifier_wrong = clause
+            .effect
+            .as_ref()
+            .is_some_and(|q| self.op_effect.get(op) != Some(q));
+        if let (Some(owner), true) = (self.op_effect.get(op), qualifier_wrong) {
+            d = d.with_help(format!("write `{owner}.{op}(…)`, or just `{op}(…)`"));
+        }
+        self.diags.push(d);
+    }
+
     fn resolves_var(&self, name: &str, scope: &[HashSet<String>]) -> bool {
         scope.iter().rev().any(|s| s.contains(name))
             || self.fns.contains(name)
@@ -160,6 +249,7 @@ impl Cx<'_> {
                 self.in_handler += 1;
                 for c in &handler.clauses {
                     let clause = &c.node;
+                    self.check_clause_names_an_op(clause, c.span);
                     scope.push(HashSet::new());
                     for p in &clause.params {
                         scope.last_mut().unwrap().insert(p.node.name.clone());

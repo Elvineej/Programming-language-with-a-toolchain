@@ -472,19 +472,14 @@ pub mod cek {
     use std::rc::Rc;
 
     /// Operation name -> its declaring effect. A call to one of these names is a
-    /// *perform*. Built from `effect` declarations, threaded like `fns`.
-    type Ops<'a> = HashMap<&'a str, String>;
+    /// *perform*. Threaded like `fns`. Since slice 5c-1 it is the shared
+    /// `ast::op_effects` index -- the one Core lowering reads -- rather than a
+    /// local rebuild: op names are unique per module (E0202), so the evaluator,
+    /// lowering and inference cannot disagree about an op's effect.
+    type Ops<'a> = HashMap<String, String>;
 
     fn op_table<'a>(module: &'a Module) -> Ops<'a> {
-        let mut m = HashMap::new();
-        for d in &module.decls {
-            if let Decl::Effect(e) = &d.node {
-                for op in &e.ops {
-                    m.insert(op.node.name.as_str(), e.name.clone());
-                }
-            }
-        }
-        m
+        crate::ast::op_effects(module)
     }
 
     /// A first-class captured continuation: the frames above the handler at the
@@ -1067,13 +1062,20 @@ pub mod cek {
         }
     }
 
+    /// Does this clause handle a perform of `(effect, op)`? Its op must match,
+    /// and its qualifier, if written, must be `effect`. An UNQUALIFIED clause
+    /// means its op's effect (slice 5c-1): op names are unique per module (E0202)
+    /// and a qualifier must name the op's own effect (E0203), so the op name
+    /// alone decides -- no table is threaded here.
+    fn clause_matches(c: &OpClause, effect: &str, op: &str) -> bool {
+        c.op == op && c.effect.as_deref().map_or(true, |e| e == effect)
+    }
+
     fn handler_handles(handler: &Handler, effect: &str, op: &str) -> bool {
-        // Strict (effect, op) matching (plan 5c): unambiguous even if two effects
-        // share an operation name.
         handler
             .clauses
             .iter()
-            .any(|c| c.node.effect.as_deref() == Some(effect) && c.node.op == op)
+            .any(|c| clause_matches(&c.node, effect, op))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1090,7 +1092,7 @@ pub mod cek {
         let clause = handler
             .clauses
             .iter()
-            .find(|c| c.node.effect.as_deref() == Some(effect) && c.node.op == op)
+            .find(|c| clause_matches(&c.node, effect, op))
             .ok_or_else(|| rt(span, format!("internal: handler has no clause for `{op}`")))?;
         let rd = Rc::new(ResumeData {
             captured: cap,
