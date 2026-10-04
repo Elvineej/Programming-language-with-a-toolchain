@@ -3,6 +3,7 @@
 - Consider RelocMode::PIC + PIE linking on all platforms. Needs a Windows gate run before landing.
 - Before fast-forwarding main to the 5b-8 branch: run scripts/check.ps1 on Windows and get exit 0. Commits from 65b08e4 onward have only been gated on Linux.
   - The ≤4 source-param cap for CPS functions (5 + continuation) is untested on win64, where >5 tailcc params caused a fatal abort. Verify it there.
+  - *2026-10-04: met in CI, not on the maintainer's machine.* `.github/workflows/windows-gate.yml` runs the unmodified check.ps1 on windows-latest (MSVC) with LLVM from the official 18.1.8 archive (+ libxml2s.lib from vcpkg, which the archive names but omits) -- not the local vcpkg LLVM. First run: 592/593; the failure was a real bug (stdout in text mode for programs that never print, "\r\n"), fixed in d8ede9c; then 593/593, exit 0. The cap is now exercised by `effectful_functions_at_the_parameter_cap_run_natively`. A local check.ps1 run is still worth doing once, since the vcpkg LLVM is what the maintainer builds with.
 
 ## Unqualified handler clauses (front-end/evaluator disagreement)
 

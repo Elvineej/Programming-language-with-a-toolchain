@@ -2407,6 +2407,31 @@ fn a_growing_control_moves_the_live_set() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The MAX_PARAMS edge, on purpose (PARKED: unverified on win64, where more
+/// than 5 tailcc params aborted). `f` and `g` are CPS with 4 source params +
+/// the continuation = 5; `f -> g` is a musttail CPS call at that width; the
+/// `op3` clause takes 3 op args + the continuation + the handler frame = 5.
+/// Predicted 20 before the first run: get -> 10, g(11, 2, 3, 4), op3 -> 16, + 4.
+#[test]
+fn effectful_functions_at_the_parameter_cap_run_natively() {
+    let src = "effect E { fn get() -> Int  fn op3(a: Int, b: Int, c: Int) -> Int }\n\
+               fn g(a, b, c, d) { op3(a, b, c) + d }\n\
+               fn f(a, b, c, d) { let x = get()  g(a + x, b, c, d) }\n\
+               pub fn main() -> Int {\n\
+               \x20 handle { f(1, 2, 3, 4) } with {\n\
+               \x20   E.get() -> resume(10)\n\
+               \x20   E.op3(a, b, c) -> resume(a + b + c)\n\
+               \x20   return(x) -> x\n\
+               \x20 }\n\
+               }\n";
+    let dir = temp_dir("param-cap");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "param-cap");
+    assert_runs(&exe, "20");
+    assert_eq!(eval_main_int(src), "20");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn a_unit_literal_compiles_natively() {
     // `Unit` is the i64 word 0 (`repr_ty`); codegen refused the literal itself
