@@ -1,0 +1,38 @@
+# The Windows gate PARKED.md requires before `main` takes a branch: the
+# unmodified scripts/check.ps1 on x86_64-pc-windows-msvc. LLVM 18 comes from
+# the official 18.1.8 release archive (static libs + llvm-config), not vcpkg,
+# so this proves the code and the win64 calling-convention limits, not a
+# particular local LLVM install.
+name: windows-gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['claude/**']
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch LLVM 18.1.8
+        shell: bash
+        run: |
+          curl -fsSL -o llvm.tar.xz https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz
+          mkdir -p /c/llvm18
+          # The archive holds symlinks that Git Bash's tar cannot create on
+          # Windows; the files the build needs are regular files, checked below.
+          tar -xJf llvm.tar.xz -C /c/llvm18 --strip-components=1 || echo "tar reported errors (symlinks); verifying"
+          /c/llvm18/bin/llvm-config.exe --version
+          /c/llvm18/bin/clang.exe --version
+          echo 'LLVM_SYS_180_PREFIX=C:\llvm18' >> "$GITHUB_ENV"
+          echo 'C:\llvm18\bin' >> "$GITHUB_PATH"
+
+      - name: Gate (scripts/check.ps1)
+        shell: powershell
+        run: |
+          clang --version
+          powershell -NoProfile -File scripts/check.ps1
+          exit $LASTEXITCODE
