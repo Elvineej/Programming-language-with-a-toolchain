@@ -1594,6 +1594,11 @@ fn native_output_matches_the_evaluator_across_the_7b3_handle_corpus() {
     );
 }
 
+/// Task 12 controls 2a and 2b both fail this test, the same way (exit 1), as
+/// they do the 400,000-deep constant-time-handler test (SIGSEGV): a deep chain
+/// under collection is exposed by losing either the frames' rows or their
+/// `next` bit. The pair is told apart by
+/// `a_continuation_held_by_a_lambda_survives_a_collection`.
 #[test]
 fn frames_holding_heap_values_survive_collections_and_match_the_evaluator() {
     // D10's rows under load: 4000 non-tail effectful calls deep, each frame
@@ -1802,6 +1807,16 @@ fn a_shadowed_heap_binding_stays_rooted_and_in_scope() {
 /// `deep-reinstall` (A6) is calibrated: 6 if the handler is re-found on every
 /// perform, 2 if it is found once and lost. `frame-capture` is the 7b test
 /// D15 moved here. `perform-reached-at-run-time` was D18's trap until now.
+///
+/// Task 12 control 1a (resume no longer re-installs the continuation's
+/// handler) did NOT move `deep-reinstall`: it still printed 6. With one live
+/// handler under D17, every resume in it runs while that handler is still
+/// current, so in this design A6 cannot witness re-installation and the
+/// plan's "prints 2" has no native counterpart. The witness is a resume that
+/// runs AFTER its handle returned. Exactly those failed, all with exit 1:
+/// `state-passing-lambda-resumes-later` here (its stderr, the one captured:
+/// "the handler has no clause for this operation"), A9, and the
+/// lambda-held-continuation test. Nothing else in the binary failed.
 const HANDLER_8: &[(&str, &str, &str)] = &[
     (
         "deep-reinstall",
@@ -1997,6 +2012,13 @@ fn a_function_named_like_an_op_is_not_what_a_perform_calls() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Task 12 control 2a (site frames tagged past the table, so `gc_mark`'s
+/// `tag >= gc_n_ctors` skip fires: the frame is kept, nothing in it traced)
+/// fails this test SILENTLY -- it printed 6287, not 2550, and exited 0 --
+/// which is why the assertion is on the value. Control 2b (rows kept, only
+/// the `next` bit cleared) PASSES it: the short chain here needs the frame's
+/// saved heap value, not what lies behind it. That is the test that shows the
+/// two tracing controls test two different things.
 #[test]
 fn a_continuation_held_by_a_lambda_survives_a_collection() {
     // D12: the handle returns a lambda that holds the continuation; a
@@ -2170,6 +2192,15 @@ fn a_growing_live_set_is_collected_a_logarithmic_number_of_times() {
 /// the op name), and TWO sequential handles (the handler record must be
 /// scoped to its body). No `<>`, no `with multi`, every main Int-valued.
 /// Values were predicted in writing before the first run.
+///
+/// Task 12 control 1b (dispatch always loads clause-table entry 0): `two-ops`
+/// printed 20, not 14 -- both performs took `Two.a` and resumed with 10, the
+/// number Task 9 predicted for exactly this defect -- while `ask-nontail`, one
+/// op and so blind to it, still printed 3. (Both corpus loops stop at their
+/// first failing row, so `two-handles` was not reached under the control.)
+/// The same control also printed 20 for Task 8's `two-ops-one-handler`
+/// (want 30) and stopped `dynamically-nested-handle` with exit 1 ("no
+/// clause"): any program with a second op is exposed by it.
 const HANDLER_CORPUS: &[(&str, &str, &str)] = &[
     (
         "ask-nontail",
@@ -2330,6 +2361,11 @@ fn a_tail_resuming_handler_settles_its_live_set() {
 /// tail position: each level holds a pending frame, so the captured chain
 /// grows with N and the level must move. STRICT inequality -- an instrument
 /// that a deliberately-growing control cannot move is measuring nothing.
+///
+/// Task 12 controls 2a and 2b both kill this control at N = 10,000 with
+/// SIGSEGV. (The captured chain is the live set it measures; the crash is
+/// consistent with that chain being freed while still in use, though a
+/// signal alone does not prove it.)
 #[test]
 fn a_growing_control_moves_the_live_set() {
     let dir = temp_dir("handler-grows");
@@ -2424,6 +2460,16 @@ fn a_unit_main_prints_its_text_then_its_word() {
 ///
 /// N MUST NOT BE LOWERED: at small N this completes even on an implementation
 /// that grows the stack linearly (Task 12's fifth control shows exactly that).
+///
+/// Task 12, observed. Control 3b (the tail-position call loses `musttail`)
+/// kills this test with SIGSEGV, named by `diagnose_crash` (and with it
+/// every other million-deep tail test and three GC loops, 8 tests in all).
+/// Control 3a lowers N to 1_000 and the test PASSES -- and still passes with
+/// 3b applied too, so at that N the test cannot tell a flat stack from a
+/// growing one: the tautology, demonstrated rather than asserted. Control 1a
+/// (no handler re-installation at resume) fails it with exit 1: its resumes
+/// run after the handle returned. Control 1b (always clause 0) fails it with
+/// exit 1, where a SIGSEGV was predicted; its stderr was not captured.
 #[test]
 fn a_state_passing_tail_loop_is_bounded_natively_at_a_million() {
     let src = "effect State { fn get() -> String  fn set(v: String) -> Unit }\n\
