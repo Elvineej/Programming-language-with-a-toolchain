@@ -1845,6 +1845,22 @@ const HANDLER_8: &[(&str, &str, &str)] = &[
         "2",
     ),
     (
+        // Two clauses for one op: the evaluator (reference) takes the FIRST
+        // (`find`). Native took the LAST -- each clause overwrote its op's slot
+        // in the clause table -- and printed 5 (measured 2026-10-04, 5c-1 m8).
+        "duplicate-clause-first-wins",
+        "effect Ask { fn ask() -> Int }\n\
+         fn one() { ask() }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { one() } with {\n\
+         \x20   Ask.ask() -> resume(2)\n\
+         \x20   Ask.ask() -> resume(5)\n\
+         \x20   return(x) -> x\n\
+         \x20 }\n\
+         }\n",
+        "2",
+    ),
+    (
         "frame-capture",
         "effect State { fn get() -> Int }\n\
          fn body() -> Int { get() + 1 }\n\

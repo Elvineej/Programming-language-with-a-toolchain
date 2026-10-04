@@ -5,7 +5,15 @@
   - The ≤4 source-param cap for CPS functions (5 + continuation) is untested on win64, where >5 tailcc params caused a fatal abort. Verify it there.
   - *2026-10-04: met in CI, not on the maintainer's machine.* `.github/workflows/windows-gate.yml` runs the unmodified check.ps1 on windows-latest (MSVC) with LLVM from the official 18.1.8 archive (+ libxml2s.lib from vcpkg, which the archive names but omits) -- not the local vcpkg LLVM. First run: 592/593; the failure was a real bug (stdout in text mode for programs that never print, "\r\n"), fixed in d8ede9c; then 593/593, exit 0. The cap is now exercised by `effectful_functions_at_the_parameter_cap_run_natively`. A local check.ps1 run is still worth doing once, since the vcpkg LLVM is what the maintainer builds with.
 
-## Unqualified handler clauses (front-end/evaluator disagreement)
+## RESOLVED (slice 5c-1, 2026-10-04): unqualified handler clauses (front-end/evaluator disagreement)
+
+Op names are now unique per module (E0202), a clause must name a declared op of the effect
+it names (E0203), and a bare clause means its op's effect in the evaluator and in Core
+lowering (native inherits it). The direction below changed on measurement: a perform cannot
+be qualified and every op index is last-declaration-wins, so "reject a shared op name only
+inside a handler" would have left performs of it silently mis-resolved. See the 5c-1 spec.
+Original report:
+
 
 The front end accepts a clause written `op(...) -> …` with no effect name
 (`OpClause.effect == None`), and inference resolves its effect through the
@@ -198,3 +206,12 @@ observable, red first.
 under a control the rows after the first failure are never run (control 1b never reached
 `two-handles`). The Task 8 corpus collects failures and reports them all. Make the Task 9 pair
 collect too, so a control's full footprint is visible; test-only, no expected value changes.
+
+## Two clauses for one op in a handler (found 2026-10-04, slice 5c-1 measurement m8)
+
+`handle { .. } with { Ask.ask() -> resume(2)  Ask.ask() -> resume(5) }` checks and runs; the
+evaluator takes the first clause (`find`). Natively it printed **5**: each clause overwrote
+its op's slot in the clause table, so the LAST won -- an accepted program answering
+differently under `run` and `build`. Fixed in 5c-1 to match the reference (first wins),
+pinned by the `duplicate-clause-first-wins` native corpus row (red first, 5 vs 2).
+Still open: whether a duplicate clause should be an error (likely E0204) instead.
