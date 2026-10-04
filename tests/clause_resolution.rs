@@ -4,6 +4,18 @@
 //! the spec's measured table (§0); each test notes what the build before this
 //! slice did with it.
 
+//!
+//! Negative controls (plan Task 5), each reverted, each failing differently:
+//! - C1, E0202 switched off: m7 falls back to its old E0400; m2 is caught a
+//!   second time as E0203 ("`ping` is an operation of `B`, not `A`"), not the
+//!   old E0420 -- the overwrite makes the clause check its backstop.
+//! - C2, E0203's wrong-qualifier case off: only m3 fails, back to E0420.
+//! - C3, the evaluator's strict `Some(effect)` match restored: both value tests
+//!   fail, and natively only the differential (the evaluator side errors).
+//! - C4, lowering's op_effects fallback removed: the core test fails, and both
+//!   native corpus tests fail on the `unqualified-clause` row with the refusal;
+//!   every front-end test still passes.
+
 use elya::eval::{run_module_value, Value};
 use elya::parse::parse_module;
 use elya::types::infer_schemes;
@@ -96,6 +108,7 @@ fn a_clause_naming_the_wrong_effect_is_e0203() {
         r.contains("`ask` is an operation of `Ask`, not `Other`"),
         "{r}"
     );
+    assert!(r.contains("write `Ask.ask(…)`, or just `ask(…)`"), "{r}");
 }
 
 #[test]
@@ -166,4 +179,43 @@ fn an_unqualified_handler_over_two_effects_is_still_e0423() {
         "{:?}",
         codes(src)
     );
+}
+
+// ---- Review follow-ups ----
+
+#[test]
+fn a_duplicate_op_does_not_cascade_into_a_false_e0203() {
+    // Review: with `ping` declared by A and B, the clause `B.ping` was ALSO
+    // reported as E0203 "`ping` is an operation of `A`, not `B`" -- false, B
+    // declares it. The E0202 is the whole story.
+    let src = "effect A { fn ping() -> Int }\n\
+               effect B { fn ping() -> Int }\n\
+               fn one() { ping() }\n\
+               pub fn main() -> Int {\n\
+               \x20 handle { one() } with {\n\
+               \x20   B.ping() -> resume(1)\n\
+               \x20   return(x) -> x\n\
+               \x20 }\n\
+               }\n";
+    assert_eq!(codes(src), ["E0202"]);
+}
+
+#[test]
+fn a_clause_binding_the_wrong_number_of_arguments_is_e0203() {
+    // Review (pre-existing, reachable through either spelling): `ask` takes no
+    // arguments, the clause binds one. Before: `check` ok, the evaluator failed
+    // with "unbound variable `x`", and the native binary segfaulted.
+    for clause in ["ask(x) -> resume(x)", "Ask.ask(x) -> resume(x)"] {
+        let src = ask_program("effect Ask { fn ask() -> Int }\n", clause);
+        assert_eq!(codes(&src), ["E0203"], "{clause}");
+        let r = rendered_error(&src);
+        assert!(
+            r.contains("`ask` takes 0 arguments, but this clause binds 1"),
+            "{clause}: {r}"
+        );
+        assert!(
+            !r.contains("write `Ask.ask"),
+            "{clause}: no qualifier fix-it: {r}"
+        );
+    }
 }

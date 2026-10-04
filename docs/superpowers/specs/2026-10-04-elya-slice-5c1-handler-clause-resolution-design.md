@@ -63,10 +63,23 @@ qualified form; the bare form is a parser extension the maintainer chose to keep
 4. Resolve errors stop the front end before inference (`lib.rs` `front_end`), so E0202
    and E0203 arrive alone, without the misleading E0420s in the table above.
 
+5. **Amendments during the build (2026-10-04)**, each red first:
+   - *Native first-wins.* m8 was found to DIVERGE: the evaluator takes the first of two
+     clauses for one op (`find`), native took the last (each clause overwrote its op's
+     clause-table slot) and printed 5 for 2. Native now keeps the first. This is the back
+     end matching the reference, not a language rule; §1.3's "native needs no change"
+     held for unqualified clauses only.
+   - *E0203 also covers clause arity* (independent review). A clause binding a different
+     number of parameters than its op declares checked clean, then failed at run time
+     ("unbound variable") or segfaulted natively -- pre-existing, but the bare form now
+     reaches it too. Message: "`ask` takes 0 arguments, but this clause binds 1".
+   - *No E0203 after E0202* for the same op name (review): its owner is ambiguous, and the
+     cascade said, falsely, that `B.ping` was not B's.
+
 ## 2. Non-goals
 
-- m8 (two clauses for one op): parked, not fixed — a separate rule (which clause wins,
-  or an error) with no consumer here.
+- m8 (two clauses for one op): whether it should be an ERROR stays parked. Native now
+  matches the evaluator's first-wins (§1.5).
 - A qualified perform syntax (`A.ping()`), and op names shared between effects: excluded
   by the decision.
 - The fn-vs-op name collision (PARKED, its own entry): unchanged.
