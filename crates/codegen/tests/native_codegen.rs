@@ -2161,6 +2161,26 @@ fn run_differential_corpus(corpus: &[(&str, &str, &str)], dir_name: &str) {
 }
 
 #[test]
+fn a_tail_call_inside_a_match_arm_is_eliminated_at_a_million() {
+    // Found by Windows CI on 5b-9a (STATUS_STACK_OVERFLOW in a 30,000-deep
+    // `lenacc`, whose recursive call sits in a match arm): the direct emitter's
+    // `lower_tail` handled `If`, `Let` and `App` but not `Match`, so a call in
+    // an arm was an ordinary call. Linux's 8 MiB stack hid it at 30,000; at
+    // 1,000,000 it overflows on Linux too. Pre-existing since 5b-4.
+    let src = "type B { T, F }\n\
+               fn lp(n, acc) { match if n == 0 { T } else { F } { T -> acc  F -> lp(n - 1, acc + 1) } }\n\
+               pub fn main() -> Int { lp(1000000, 0) }\n";
+    let dir = temp_dir("tail-in-match-arm");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "tail-in-match");
+    let out = Command::new(&exe).output().expect("run produced binary");
+    diagnose_crash(&out.status, "tail-in-match");
+    assert!(out.status.success(), "binary exited {:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1000000");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_match_arm_after_a_catch_all_compiles_natively() {
     // Found by the 5b-9a review, pre-existing in the DIRECT emitter: an arm
     // after a catch-all is only a warning (E0431), but the emitter kept going
