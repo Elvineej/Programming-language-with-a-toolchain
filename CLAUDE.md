@@ -10,6 +10,7 @@ Rules:
 
 ## Handoff
 
-`HANDOFF.md` is the project's state and plan for whichever agent works next. It is a
+`HANDOFF.md` is the project's state and plan for whichever agent works next. **Only Claude
+edits it**; other agents and tools read it and leave changes to Claude. It is a
 rolling window of five steps: when a step is finished, move it to "Done" (with its PR or
 commit), renumber, and write a new step 5, updating the State section in the same commit.

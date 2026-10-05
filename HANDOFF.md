@@ -51,7 +51,10 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 11. **The agent cannot mark PRs ready or merge them** (blocked by the permission system,
     including via the browser). Open PRs ready for review and let the maintainer click
     Merge.
-12. **Keep this file a rolling window of five** (the maintainer's standing rule). When a
+12. **Only Claude writes this file** (the maintainer's rule, 2026-10-05). Other agents and
+    tools (Cline, other models) read it but never edit it; they report progress and Claude
+    records it here.
+13. **Keep this file a rolling window of five** (the maintainer's standing rule). When a
     step is finished, move it to "Done" with its PR or commit, renumber the rest, and
     write a NEW step 5, so the next agent always sees five steps ahead. Update the State
     section in the same commit.
