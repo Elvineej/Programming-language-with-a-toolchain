@@ -149,10 +149,11 @@ impl Cx<'_> {
     /// E0203: a clause must name a declared operation, and its qualifier, if
     /// written, must be that operation's effect (slice 3 spec §7.2, enforced
     /// from slice 5c-1). An unqualified clause then means the op's effect.
-    fn check_clause_names_an_op(&mut self, clause: &OpClause, span: Span) {
+    /// Returns whether it reported (so E0204 does not judge the same clause).
+    fn check_clause_names_an_op(&mut self, clause: &OpClause, span: Span) -> bool {
         let op = &clause.op;
         if self.dup_ops.contains(op) {
-            return;
+            return false;
         }
         let msg = match (self.op_effect.get(op), &clause.effect) {
             (None, Some(q)) if !self.effects.contains(q) => {
@@ -176,7 +177,7 @@ impl Cx<'_> {
                         clause.params.len()
                     )
                 }
-                _ => return,
+                _ => return false,
             },
         };
         let mut d = Diagnostic::error("E0203", "this clause does not match a declared operation")
@@ -190,6 +191,7 @@ impl Cx<'_> {
             d = d.with_help(format!("write `{owner}.{op}(…)`, or just `{op}(…)`"));
         }
         self.diags.push(d);
+        true
     }
 
     fn resolves_var(&self, name: &str, scope: &[HashSet<String>]) -> bool {
@@ -294,11 +296,13 @@ impl Cx<'_> {
                 let mut handled: HashSet<&str> = HashSet::new();
                 for c in &handler.clauses {
                     let clause = &c.node;
-                    self.check_clause_names_an_op(clause, c.span);
+                    let malformed = self.check_clause_names_an_op(clause, c.span);
                     // E0204 (5c-2): one clause per op. Op names are unique, so the
-                    // op name decides whatever the spelling. Ops already reported
-                    // (E0202) or unknown (E0203) are not judged again.
-                    let known = self.op_effect.contains_key(&clause.op)
+                    // op name decides whatever the spelling. A clause already
+                    // reported (E0202 op, or E0203) is not judged again, and does
+                    // not count as the op's clause.
+                    let known = !malformed
+                        && self.op_effect.contains_key(&clause.op)
                         && !self.dup_ops.contains(&clause.op);
                     if known && !handled.insert(clause.op.as_str()) {
                         self.diags.push(

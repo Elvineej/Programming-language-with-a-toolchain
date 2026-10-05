@@ -45,8 +45,13 @@ the block and performs after it.
    - Evaluator: `CalleeSlot::Operation` only when the runtime `Env` (locals only; top-level
      functions are a separate table) does not bind the name.
    - Core lowering: a call is a `Perform` only when its span is not in the resolver's set.
-   Three layers, one rule; the set is computed by the same walk that already decides
+   - *Amended (independent review):* the affine checker is a FOURTH layer. It treated any
+     call named like a `multi` op as a multi-shot perform, so a local named `flip` drew a
+     false E0429. It now reads the same resolver set.
+   Four layers, one rule; the set is computed by the same walk that already decides
    E0200, so it cannot disagree with what `check` accepted.
+4. *Amended (review):* a clause already reported E0203 is not judged by E0204 and does not
+   count as its op's clause.
 
 ## 2. Non-goals
 

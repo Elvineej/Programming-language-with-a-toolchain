@@ -2,6 +2,19 @@
 //! function named like an op is E0205; a LOCAL binding shadows an op,
 //! lexically, in inference, the evaluator and Core lowering alike. Programs
 //! n1-n5 are the spec's measured table (§0); each test notes the build before.
+//!
+//! Negative controls (plan Task 3), each reverted, each failing differently:
+//! - K1, E0204 off: the two duplicate-clause tests read `[]`.
+//! - K2, E0205 off: the fn-named-like-an-op test reads `[]`.
+//! - K3, inference op-first again: NO value test fails (the evaluator calls
+//!   the local whatever inference decided); natively n5 is refused as an
+//!   "effectful closure call", and the type test reads `fn() / {E} -> Int`.
+//!   Predicted E0400 or a value failure: a miss, and the reason the type
+//!   test exists.
+//! - K4, evaluator op-first again: values 1, 1, 2 (the old answers); natively
+//!   only the differential side fails.
+//! - K5, lowering ignores the resolver's set: the core test sees 1 Perform,
+//!   native n3 prints "PERFORMED", native n5 prints 2.
 
 use elya::eval::{run_module_value, Value};
 use elya::parse::parse_module;
@@ -124,4 +137,102 @@ fn shadowing_ends_with_its_scope() {
         "user()",
     );
     assert_eq!(value(&src), Value::Int(6));
+}
+
+#[test]
+fn a_shadowed_call_does_not_perform_in_its_inferred_type() {
+    // Control K3 found that inference's choice is invisible to every value
+    // test -- the evaluator calls the local whatever inference decided -- and
+    // shows only in the TYPE: op-first inference typed `user` as performing
+    // `E` while it never does. So the type itself is pinned.
+    let src = under_ping_handler(
+        "fn user() -> Int {\n  let ping = fn() { 5 }\n  ping()\n}\n",
+        "user()",
+    );
+    let (m, pd) = parse_module(&Session::new(), &src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let (schemes, diags) = infer_schemes(&Session::new(), &m);
+    assert!(diags.is_empty(), "{diags:?}");
+    let user = schemes
+        .iter()
+        .find(|(n, _)| n == "user")
+        .map(|(_, s)| s.as_str());
+    assert_eq!(user, Some("fn() -> Int"));
+}
+
+// ---- Review follow-ups ----
+
+#[test]
+fn a_local_named_like_a_multi_op_is_not_a_multi_shot_perform_to_affine() {
+    // Review: the affine checker (a fourth layer) still took any call named
+    // like a `multi` op as a perform, so this program -- whose `flip()` is the
+    // LOCAL -- was a false E0429 "used after a multi-shot perform". Renaming
+    // the local checked clean.
+    let src = "effect multi Flip { fn flip() -> Bool }\n\
+               linear type Tok { Tok }\n\
+               fn use1(t) { match t { Tok -> \"ok\" } }\n\
+               pub fn main() { let t = Tok  let flip = fn() { True }  let _ = flip()  io.println(use1(t)) }\n";
+    assert!(
+        check_source("t.elya", src).is_ok(),
+        "{:?}",
+        check_source("t.elya", src)
+    );
+}
+
+#[test]
+fn a_clause_already_reported_e0203_draws_no_e0204() {
+    // Review: a malformed clause (wrong arity) is not a second clause for the
+    // op -- reporting E0204 too told the CORRECT clause it "can never run".
+    let src = "effect Ask { fn ask() -> Int }\n\
+               fn one() { ask() }\n\
+               pub fn main() -> Int {\n\
+               \x20 handle { one() } with {\n\
+               \x20   Ask.ask(a) -> resume(a)\n\
+               \x20   Ask.ask() -> resume(2)\n\
+               \x20   return(x) -> x\n\
+               \x20 }\n\
+               }\n";
+    assert_eq!(codes(src), ["E0203"]);
+}
+
+#[test]
+fn every_kind_of_local_binder_shadows_an_op() {
+    // Review coverage: clause parameter, return binder, match binder, a lambda
+    // capturing a shadowing local, and a self-reference in the `let` value
+    // (evaluated before the binding, so it is still the op: 1 + 10 = 11).
+    let cases: [(&str, &str, i64); 4] = [
+        (
+            "fn user() -> Int { let ping = fn() { 5 }  let g = fn() { ping() }  g() }\n",
+            "user()",
+            5,
+        ),
+        (
+            "fn user() -> Int { let ping = { let p = ping()  fn() { p + 10 } }  ping() }\n",
+            "user()",
+            11,
+        ),
+        (
+            "type Box { B(Int) }\nfn user() -> Int { match B(7) { B(ping) -> ping } }\n",
+            "user()",
+            7,
+        ),
+        (
+            "fn user() -> Int { let ping = fn() { 5 }  if True { ping() } else { 0 } }\n",
+            "user()",
+            5,
+        ),
+    ];
+    for (decls, body, want) in cases {
+        let src = under_ping_handler(decls, body);
+        assert_eq!(value(&src), Value::Int(want), "{decls}");
+    }
+    // Return binder: `return(ping) -> ping()` calls the binder (a closure).
+    let src = "effect E { fn ping() -> Int }\n\
+               pub fn main() -> Int {\n\
+               \x20 handle { fn() { 5 } } with {\n\
+               \x20   E.ping() -> resume(1)\n\
+               \x20   return(ping) -> ping()\n\
+               \x20 }\n\
+               }\n";
+    assert_eq!(value(src), Value::Int(5));
 }

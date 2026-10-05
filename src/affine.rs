@@ -16,6 +16,9 @@ use std::collections::{HashMap, HashSet};
 struct Ctx<'a> {
     affine_sites: &'a HashSet<Span>,
     multi_ops: &'a HashSet<String>,
+    /// Slice 5c-2: callee spans where a LOCAL shadows an op -- calls, not
+    /// performs (the resolver's set, the one Core lowering reads).
+    shadowed: &'a HashSet<Span>,
     live: HashMap<String, (u32, bool)>,
     out: Vec<Diagnostic>,
 }
@@ -24,12 +27,14 @@ pub fn check(module: &Module, affine_sites: &HashSet<Span>) -> Vec<Diagnostic> {
     // Operation names belonging to a `multi`-declared effect (Slice 5b-8 §9.4).
     // This is the sole call site of `multi_declared_ops` in this slice.
     let multi_ops: HashSet<String> = multi_declared_ops(module);
+    let shadowed = crate::resolve::locally_shadowed_op_calls(module);
     let mut out = Vec::new();
     for d in &module.decls {
         if let Decl::Fn(f) = &d.node {
             let mut ctx = Ctx {
                 affine_sites,
                 multi_ops: &multi_ops,
+                shadowed: &shadowed,
                 live: HashMap::new(),
                 out: Vec::new(),
             };
@@ -105,7 +110,7 @@ impl<'a> Ctx<'a> {
                 // use is then E0429. (Keys on `multi`-ness, not on any perform —
                 // a one-shot op is absent from `multi_ops`, so nothing is marked.)
                 if let Expr::Var(op) = &callee.node {
-                    if self.multi_ops.contains(op) {
+                    if self.multi_ops.contains(op) && !self.shadowed.contains(&callee.span) {
                         for v in self.live.values_mut() {
                             v.1 = true;
                         }
