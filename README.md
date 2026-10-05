@@ -138,9 +138,10 @@ analysis goes inter-procedural — see the Slice 4d-2 design spec.
 ## License
 
 Elya is **source-available, not open source**. It is licensed under the
-[PolyForm Noncommercial License 1.0.0](LICENSE.md): you may read, use, modify and share it
-for any **noncommercial** purpose, such as personal projects, study, research, teaching, or
-use by charities and public institutions. **Commercial use requires a separate license**
-from the author; get in touch via [GitHub](https://github.com/Elvineej).
+[PolyForm Strict License 1.0.0](LICENSE.md): you may **read it and use it** for any
+**noncommercial** purpose (personal projects, study, research, teaching, charities and
+public institutions). You may **not** modify it, make new works based on it, or distribute
+it, whether original or modified, and commercial use is not permitted, without the author's
+written permission. To ask, get in touch via [GitHub](https://github.com/Elvineej).
 
 Copyright (c) 2026 Elvin Elakkattu.
