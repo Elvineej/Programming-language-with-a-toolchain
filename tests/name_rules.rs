@@ -236,3 +236,66 @@ fn every_kind_of_local_binder_shadows_an_op() {
                }\n";
     assert_eq!(value(src), Value::Int(5));
 }
+
+// ---- Slice 5c-3: an operation may only be called (E0206) ----
+
+#[test]
+fn an_op_bound_as_a_value_is_e0206() {
+    // o1. Before: checked clean, then E0300 "unbound variable `ping`".
+    let src = under_ping_handler("fn user() -> Int { let f = ping  f() }\n", "user()");
+    assert_eq!(codes(&src), ["E0206"]);
+    let r = rendered_error(&src);
+    assert!(r.contains("operation `ping` used as a value"), "{r}");
+    assert!(r.contains("fn() { ping() }"), "{r}");
+}
+
+#[test]
+fn an_op_passed_as_an_argument_is_e0206() {
+    // o2. Before: checked clean, then E0300.
+    let src = under_ping_handler(
+        "fn apply(g) { g() }\nfn user() -> Int { apply(ping) }\n",
+        "user()",
+    );
+    assert_eq!(codes(&src), ["E0206"]);
+}
+
+#[test]
+fn a_local_named_like_an_op_is_still_a_value() {
+    // o3: the local shadows the op (5c-2), so `ping` here is the closure.
+    let src = under_ping_handler(
+        "fn user() -> Int { let ping = fn() { 5 }  let f = ping  f() }\n",
+        "user()",
+    );
+    assert_eq!(value(&src), Value::Int(5));
+}
+
+#[test]
+fn e0206_reaches_nested_positions_and_spares_a_parenthesised_callee() {
+    // Review coverage: a bare op inside a lambda body is E0206; `(ping)()` is
+    // still a callee (the parser keeps no paren node) and still performs.
+    let nested = under_ping_handler("fn user() -> Int { let g = fn() { ping }  1 }\n", "user()");
+    assert_eq!(codes(&nested), ["E0206"]);
+    let paren = under_ping_handler("fn user() -> Int { (ping)() }\n", "user()");
+    assert_eq!(value(&paren), Value::Int(1));
+}
+
+#[test]
+fn e0206_help_passes_the_ops_arguments_through() {
+    // Review: the help printed `fn() { log() }` for an op taking an argument.
+    let src = "effect L { fn log(m: Int) -> Unit }\n\
+               fn user() { let f = log  f(1) }\n";
+    assert_eq!(codes(src), ["E0206"]);
+    let r = rendered_error(src);
+    assert!(r.contains("fn(a) { log(a) }"), "{r}");
+}
+
+#[test]
+fn a_function_named_like_an_op_is_e0205_only_not_also_e0206() {
+    // Review: `fn ping` beside op `ping`, then `let f = ping`, drew E0205 AND
+    // E0206; renaming the function clears both, so the second is noise.
+    let src = under_ping_handler(
+        "fn ping() -> Int { 5 }\nfn user() -> Int { let f = ping  f() }\n",
+        "user()",
+    );
+    assert_eq!(codes(&src), ["E0205"]);
+}

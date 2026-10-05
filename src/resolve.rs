@@ -194,6 +194,17 @@ impl Cx<'_> {
         true
     }
 
+    /// E0200: the name must resolve to a local, function, operation or
+    /// constructor.
+    fn check_name(&mut self, name: &str, span: Span, scope: &[HashSet<String>]) {
+        if !self.resolves_var(name, scope) {
+            self.diags.push(
+                Diagnostic::error("E0200", format!("unresolved name `{name}`"))
+                    .with_label(span, "not found in this scope"),
+            );
+        }
+    }
+
     fn resolves_var(&self, name: &str, scope: &[HashSet<String>]) -> bool {
         scope.iter().rev().any(|s| s.contains(name))
             || self.fns.contains(name)
@@ -244,10 +255,31 @@ impl Cx<'_> {
         match e {
             Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Unit => {}
             Expr::Var(name) => {
-                if !self.resolves_var(name, scope) {
+                self.check_name(name, span, scope);
+                // E0206 (slice 5c-3): an operation may only be called. Named
+                // anywhere else -- and not shadowed by a local -- it checked
+                // clean and failed at run time ("unbound variable"). The callee
+                // of a call never reaches here (see `Expr::Call`).
+                let local = scope.iter().any(|s| s.contains(name));
+                // A name that is also a top-level fn is already E0205; renaming
+                // the fn clears both, so E0206 there would be noise.
+                if self.ops.contains(name) && !local && !self.fns.contains(name) {
+                    // The wrapper passes the op's own arguments through.
+                    let n = self.op_arity.get(name).copied().unwrap_or(0);
+                    let ps: Vec<String> = (0..n)
+                        .map(|i| {
+                            char::from_u32('a' as u32 + i as u32)
+                                .map(String::from)
+                                .unwrap_or_else(|| format!("a{i}"))
+                        })
+                        .collect();
+                    let ps = ps.join(", ");
                     self.diags.push(
-                        Diagnostic::error("E0200", format!("unresolved name `{name}`"))
-                            .with_label(span, "not found in this scope"),
+                        Diagnostic::error("E0206", format!("operation `{name}` used as a value"))
+                            .with_label(span, "an operation can only be called")
+                            .with_help(format!(
+                                "to pass it on, wrap it in a function: `fn({ps}) {{ {name}({ps}) }}`"
+                            )),
                     );
                 }
             }
@@ -268,7 +300,12 @@ impl Cx<'_> {
                         self.shadowed_calls.insert(callee.span);
                     }
                 }
-                self.check_expr(&callee.node, callee.span, scope);
+                // A callee that is a bare name only has to resolve; it is the one
+                // place an operation name may appear (E0206 is for the others).
+                match &callee.node {
+                    Expr::Var(name) => self.check_name(name, callee.span, scope),
+                    other => self.check_expr(other, callee.span, scope),
+                }
                 for a in args.iter() {
                     self.check_expr(&a.node, a.span, scope);
                 }
