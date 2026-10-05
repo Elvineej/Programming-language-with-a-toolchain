@@ -15,3 +15,9 @@ fn hello() {
 fn arith() {
     insta::assert_snapshot!("02_arith", run_example("02_arith.elya"));
 }
+
+#[test]
+fn cek() {
+    // A CEK machine written in Elya, running a lambda calculus (2026-10-05).
+    insta::assert_snapshot!("03_cek", run_example("03_cek.elya"));
+}

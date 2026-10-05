@@ -21,7 +21,17 @@ fn cek_matches_tree_on_examples() {
         let p = entry.unwrap().path();
         if p.extension().and_then(|e| e.to_str()) == Some("elya") {
             let src = std::fs::read_to_string(&p).unwrap();
-            let (cek, tree) = both(&src);
+            // The tree-walker recurses on the HOST stack for every call (no
+            // tail calls; that is why it is the oracle only for shallow
+            // programs). `examples/03_cek.elya` -- a CEK machine written in
+            // Elya -- needs more than a test thread's default 2 MiB for that,
+            // so the comparison runs on a 64 MiB thread. No assertion changes.
+            let (cek, tree) = std::thread::Builder::new()
+                .stack_size(64 << 20)
+                .spawn(move || both(&src))
+                .expect("spawn the comparison thread")
+                .join()
+                .expect("the comparison thread panicked");
             assert_eq!(cek, tree, "CEK vs tree divergence on {p:?}");
         }
     }
