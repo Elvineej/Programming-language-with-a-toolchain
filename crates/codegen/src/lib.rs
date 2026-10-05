@@ -320,7 +320,14 @@ fn declare_lifted<'ctx>(
         for p in site.params.iter() {
             params.push(repr_ty(ctx, &p.ty)?.into());
         }
-        let fn_ty = fn_type_of(repr_ty(ctx, &site.ret)?, &params)?;
+        // 5b-9b: an effectful lambda takes its continuation last and answers
+        // with a word, exactly as an effectful top-level function does.
+        let fn_ty = if site.effectful {
+            params.push(ptrt.into());
+            ctx.i64_type().fn_type(&params, false)
+        } else {
+            fn_type_of(repr_ty(ctx, &site.ret)?, &params)?
+        };
         let f = module.add_function(&mangle(&site.symbol), fn_ty, None);
         f.set_call_conventions(TAILCC);
         out.insert(site.symbol.clone(), f);
@@ -339,6 +346,9 @@ fn emit_lifted<'ctx>(
     lc: &LowerCtx<'_, 'ctx>,
     site: &LambdaSite,
 ) -> Result<(), CodegenError> {
+    if site.effectful {
+        return cps_emit::emit_cps_lifted(ctx, b, lc, site);
+    }
     let func = *lc
         .lifted
         .get(&site.symbol)
@@ -1494,7 +1504,9 @@ struct LowerCtx<'a, 'ctx> {
     /// Core node address -> index into `lambdas`.
     lambda_index: &'a HashMap<usize, usize>,
     /// `LambdaSite::symbol` -> the declared lifted function.
-    lifted: &'a HashMap<String, FunctionValue<'ctx>>,
+    pub(crate) lifted: &'a HashMap<String, FunctionValue<'ctx>>,
+    /// 5b-9b: each lambda's region (its scope), for effectful lifted bodies.
+    pub(crate) lambda_regions: &'a HashMap<usize, cps::LambdaRegion>,
     alloc: FunctionValue<'ctx>,
     str_lit: FunctionValue<'ctx>,
     println: FunctionValue<'ctx>,
@@ -1598,6 +1610,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     cps_emit::prepass(core, &cps_fns)?;
     let sites = cps::collect_sites(core);
     let handlers = cps::collect_handlers(core);
+    let lambda_regions = cps::collect_lambda_regions(core);
     let site_index: HashMap<usize, usize> =
         sites.iter().enumerate().map(|(i, s)| (s.key, i)).collect();
     let handler_index: HashMap<usize, usize> = handlers
@@ -1671,6 +1684,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         lambdas: &lambdas,
         lambda_index: &lambda_index,
         lifted: &lifted,
+        lambda_regions: &lambda_regions,
         alloc,
         str_lit,
         println,
@@ -2428,16 +2442,53 @@ mod tests {
     }
 
     #[test]
-    fn an_effectful_lambda_is_refused_by_name() {
+    fn a_let_bound_effect_polymorphic_lambda_used_at_a_user_effect_is_refused() {
+        // 5b-9b review (a REGRESSION caught before commit): `app` is generic in
+        // its effect row, so its lifted body uses the DIRECT convention, but the
+        // call `app(..)` is instantiated at {S} -- and was compiled as a CPS jump
+        // into the direct function: native SIGSEGV where the evaluator printed
+        // 8. D16 refused this for top-level functions only; a local binding
+        // now gets the same refusal, by the same name.
+        for body in [
+            "let app = fn(g) { g() + 1 }  app(fn() { get() })",
+            "let app = fn(g) { g() + 1 }  let h = fn() { get() }  app(h) * 2",
+        ] {
+            let err = refused(&format!(
+                "pub fn main() -> Int {{\n\
+                 \x20 handle {{ {body} }} with {{\n\
+                 \x20   S.get() -> resume(7)\n    return(r) -> r\n  }}\n}}\n"
+            ));
+            assert!(
+                matches!(
+                    err,
+                    CodegenError::Unsupported("effect-polymorphic function used at a user effect")
+                ),
+                "{body}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_effectful_lambda_compiles_and_four_parameters_are_refused_by_name() {
+        // 5b-9b (replaces `an_effectful_lambda_is_refused_by_name`, which pinned
+        // the refusal this slice lifts): the same program now compiles, and the
+        // one remaining refusal is the parameter cap -- the closure, the source
+        // parameters and the continuation must fit MAX_PARAMS.
+        emit_ir(&core_of(&format!(
+            "{S_W}pub fn main() -> Int {{\n\
+             \x20 handle {{ let f = fn(x) {{ x + get() }}  f(1) }} with {{\n\
+             \x20   S.get() -> resume(1)\n    return(r) -> r\n  }}\n}}\n"
+        )))
+        .expect("an effectful lambda compiles");
         let err = refused(
             "pub fn main() -> Int {\n\
-             \x20 handle { let f = fn(x) { x + get() }  f(1) } with {\n\
+             \x20 handle { let f = fn(a, b, c, d) { a + b + c + d + get() }  f(1, 2, 3, 4) } with {\n\
              \x20   S.get() -> resume(1)\n    return(r) -> r\n  }\n}\n",
         );
         assert!(
             matches!(
                 err,
-                CodegenError::Unsupported("effectful lambda (not yet compiled natively)")
+                CodegenError::Unsupported("effectful lambda takes more than three parameters")
             ),
             "{err:?}"
         );

@@ -3,6 +3,8 @@
 //! Deliberately LLVM-free: this is a pure question about a `Ty`, so it needs no
 //! `Context` and its tests are unit tests.
 
+use std::collections::HashMap;
+
 use elya::core::{CoreExpr, CoreKind, CoreModule};
 use elya::types::{EffectRow, RowTail, Ty};
 
@@ -120,15 +122,38 @@ pub fn collect_handlers(core: &CoreModule) -> Vec<HandlerSite> {
     collect(core).handlers
 }
 
+/// One lambda's region (slice 5b-9b): the scope at the lambda, BEFORE its
+/// parameters. A lambda body continues its enclosing scope's binding indices,
+/// so an effectful lifted body must place each capture at the index of the
+/// innermost binding of that name here -- the index every site inside the
+/// body saved it under -- and bind its parameters from `scope.len()` on.
+pub struct LambdaRegion {
+    pub scope: Vec<String>,
+}
+
+impl LambdaRegion {
+    /// The binding index of `name` as seen from inside the lambda.
+    pub fn binding_of(&self, name: &str) -> Option<usize> {
+        self.scope.iter().rposition(|n| n == name)
+    }
+}
+
+/// Every lambda's region, by the lambda node's address (`LambdaSite::key`).
+pub fn collect_lambda_regions(core: &CoreModule) -> HashMap<usize, LambdaRegion> {
+    collect(core).lambdas
+}
+
 struct Out {
     sites: Vec<ContSite>,
     handlers: Vec<HandlerSite>,
+    lambdas: HashMap<usize, LambdaRegion>,
 }
 
 fn collect(core: &CoreModule) -> Out {
     let mut out = Out {
         sites: Vec::new(),
         handlers: Vec::new(),
+        lambdas: HashMap::new(),
     };
     for f in &core.fns {
         let mut scope: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
@@ -329,6 +354,12 @@ fn walk<'a>(
         CoreKind::Resume(v) => visit(v, 0, scope, path, out),
         // New regions: each starts with an empty path and the scope it sees.
         CoreKind::Lambda(params, body) => {
+            out.lambdas.insert(
+                e as *const CoreExpr as usize,
+                LambdaRegion {
+                    scope: scope.clone(),
+                },
+            );
             let depth = scope.len();
             for p in params.iter() {
                 scope.push(p.name.clone());
