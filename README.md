@@ -134,3 +134,13 @@ create-and-consume within a single function body. Two deliberate
 over-/under-approximations (a callee that duplicates an affine parameter; whole-
 body branch-insensitivity) are tracked obligations to be tightened when the
 analysis goes inter-procedural — see the Slice 4d-2 design spec.
+
+## License
+
+Elya is **source-available, not open source**. It is licensed under the
+[PolyForm Noncommercial License 1.0.0](LICENSE.md): you may read, use, modify and share it
+for any **noncommercial** purpose, such as personal projects, study, research, teaching, or
+use by charities and public institutions. **Commercial use requires a separate license**
+from the author; get in touch via [GitHub](https://github.com/Elvineej).
+
+Copyright (c) 2026 Elvin Elakkattu.
