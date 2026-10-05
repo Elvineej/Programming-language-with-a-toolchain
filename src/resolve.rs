@@ -12,6 +12,20 @@ pub fn builtins() -> &'static [&'static str] {
 }
 
 pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
+    walk(module).0
+}
+
+/// Slice 5c-2: the spans of call-site CALLEES that name an operation but are
+/// bound by a LOCAL (let, parameter, lambda or clause parameter, match binder)
+/// in scope -- calls of the local, not performs. Computed by the same scope
+/// walk that decides E0200, so Core lowering cannot disagree with `check`.
+/// (Inference and the evaluator consult their own environments, which under
+/// E0205 can only hold such a name as a local.)
+pub fn locally_shadowed_op_calls(module: &Module) -> HashSet<Span> {
+    walk(module).1
+}
+
+fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
     let mut fn_names: HashSet<String> = HashSet::new();
     let mut op_names: HashSet<String> = HashSet::new();
     let mut ctor_names: HashSet<String> = HashSet::new();
@@ -62,6 +76,26 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
             }
         }
     }
+    // E0205 (slice 5c-2): a top-level function named like an operation could
+    // never be called -- a call of that name performs -- so it is an error.
+    // Checked after every declaration is seen; effects may follow functions.
+    for d in &module.decls {
+        if let Decl::Fn(f) = &d.node {
+            if let Some(effect) = op_effect.get(&f.name) {
+                dup_diags.push(
+                    Diagnostic::error(
+                        "E0205",
+                        format!(
+                            "function `{}` has the name of an operation of `{effect}`",
+                            f.name
+                        ),
+                    )
+                    .with_label(d.span, "a call of this name performs the operation instead")
+                    .with_help("rename the function; a local binding may shadow an operation, a top-level function may not"),
+                );
+            }
+        }
+    }
     let mut cx = Cx {
         fns: &fn_names,
         ops: &op_names,
@@ -72,6 +106,7 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
         effects: &effect_names,
         in_handler: 0,
         diags: dup_diags,
+        shadowed_calls: HashSet::new(),
     };
     for d in &module.decls {
         match &d.node {
@@ -86,7 +121,7 @@ pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
             Decl::Type(_) => {}   // type declarations are signatures only
         }
     }
-    cx.diags
+    (cx.diags, cx.shadowed_calls)
 }
 
 struct Cx<'a> {
@@ -106,16 +141,19 @@ struct Cx<'a> {
     /// only legal where this is nonzero (E0210 otherwise).
     in_handler: usize,
     diags: Vec<Diagnostic>,
+    /// See `locally_shadowed_op_calls`.
+    shadowed_calls: HashSet<Span>,
 }
 
 impl Cx<'_> {
     /// E0203: a clause must name a declared operation, and its qualifier, if
     /// written, must be that operation's effect (slice 3 spec §7.2, enforced
     /// from slice 5c-1). An unqualified clause then means the op's effect.
-    fn check_clause_names_an_op(&mut self, clause: &OpClause, span: Span) {
+    /// Returns whether it reported (so E0204 does not judge the same clause).
+    fn check_clause_names_an_op(&mut self, clause: &OpClause, span: Span) -> bool {
         let op = &clause.op;
         if self.dup_ops.contains(op) {
-            return;
+            return false;
         }
         let msg = match (self.op_effect.get(op), &clause.effect) {
             (None, Some(q)) if !self.effects.contains(q) => {
@@ -139,7 +177,7 @@ impl Cx<'_> {
                         clause.params.len()
                     )
                 }
-                _ => return,
+                _ => return false,
             },
         };
         let mut d = Diagnostic::error("E0203", "this clause does not match a declared operation")
@@ -153,6 +191,18 @@ impl Cx<'_> {
             d = d.with_help(format!("write `{owner}.{op}(…)`, or just `{op}(…)`"));
         }
         self.diags.push(d);
+        true
+    }
+
+    /// E0200: the name must resolve to a local, function, operation or
+    /// constructor.
+    fn check_name(&mut self, name: &str, span: Span, scope: &[HashSet<String>]) {
+        if !self.resolves_var(name, scope) {
+            self.diags.push(
+                Diagnostic::error("E0200", format!("unresolved name `{name}`"))
+                    .with_label(span, "not found in this scope"),
+            );
+        }
     }
 
     fn resolves_var(&self, name: &str, scope: &[HashSet<String>]) -> bool {
@@ -205,10 +255,31 @@ impl Cx<'_> {
         match e {
             Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Unit => {}
             Expr::Var(name) => {
-                if !self.resolves_var(name, scope) {
+                self.check_name(name, span, scope);
+                // E0206 (slice 5c-3): an operation may only be called. Named
+                // anywhere else -- and not shadowed by a local -- it checked
+                // clean and failed at run time ("unbound variable"). The callee
+                // of a call never reaches here (see `Expr::Call`).
+                let local = scope.iter().any(|s| s.contains(name));
+                // A name that is also a top-level fn is already E0205; renaming
+                // the fn clears both, so E0206 there would be noise.
+                if self.ops.contains(name) && !local && !self.fns.contains(name) {
+                    // The wrapper passes the op's own arguments through.
+                    let n = self.op_arity.get(name).copied().unwrap_or(0);
+                    let ps: Vec<String> = (0..n)
+                        .map(|i| {
+                            char::from_u32('a' as u32 + i as u32)
+                                .map(String::from)
+                                .unwrap_or_else(|| format!("a{i}"))
+                        })
+                        .collect();
+                    let ps = ps.join(", ");
                     self.diags.push(
-                        Diagnostic::error("E0200", format!("unresolved name `{name}`"))
-                            .with_label(span, "not found in this scope"),
+                        Diagnostic::error("E0206", format!("operation `{name}` used as a value"))
+                            .with_label(span, "an operation can only be called")
+                            .with_help(format!(
+                                "to pass it on, wrap it in a function: `fn({ps}) {{ {name}({ps}) }}`"
+                            )),
                     );
                 }
             }
@@ -222,7 +293,19 @@ impl Cx<'_> {
                 }
             }
             Expr::Call { callee, args } => {
-                self.check_expr(&callee.node, callee.span, scope);
+                // Locals before ops (5c-2): an op name bound by a local in scope
+                // is a call of the local.
+                if let Expr::Var(name) = &callee.node {
+                    if self.ops.contains(name) && scope.iter().any(|s| s.contains(name)) {
+                        self.shadowed_calls.insert(callee.span);
+                    }
+                }
+                // A callee that is a bare name only has to resolve; it is the one
+                // place an operation name may appear (E0206 is for the others).
+                match &callee.node {
+                    Expr::Var(name) => self.check_name(name, callee.span, scope),
+                    other => self.check_expr(other, callee.span, scope),
+                }
                 for a in args.iter() {
                     self.check_expr(&a.node, a.span, scope);
                 }
@@ -247,9 +330,32 @@ impl Cx<'_> {
                 // bare `resume` here is still an error (in_handler unchanged).
                 self.check_expr(&body.node, body.span, scope);
                 self.in_handler += 1;
+                let mut handled: HashSet<&str> = HashSet::new();
                 for c in &handler.clauses {
                     let clause = &c.node;
-                    self.check_clause_names_an_op(clause, c.span);
+                    let malformed = self.check_clause_names_an_op(clause, c.span);
+                    // E0204 (5c-2): one clause per op. Op names are unique, so the
+                    // op name decides whatever the spelling. A clause already
+                    // reported (E0202 op, or E0203) is not judged again, and does
+                    // not count as the op's clause.
+                    let known = !malformed
+                        && self.op_effect.contains_key(&clause.op)
+                        && !self.dup_ops.contains(&clause.op);
+                    if known && !handled.insert(clause.op.as_str()) {
+                        self.diags.push(
+                            Diagnostic::error(
+                                "E0204",
+                                "a handler has more than one clause for an operation",
+                            )
+                            .with_label(
+                                c.span,
+                                format!(
+                                    "`{}` already has a clause in this handler; this one can never run",
+                                    clause.op
+                                ),
+                            ),
+                        );
+                    }
                     scope.push(HashSet::new());
                     for p in &clause.params {
                         scope.last_mut().unwrap().insert(p.node.name.clone());

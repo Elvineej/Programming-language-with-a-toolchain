@@ -46,7 +46,12 @@ unqualified syntax, have inference record the resolved effect, and make the
 evaluator and lowering both read it. An op name shared by two handled effects
 gets rejected as ambiguous by the checker.
 
-## Front end: should a fn sharing a name with an effect op be an error?
+## RESOLVED (slice 5c-2, 2026-10-05): front end: should a fn sharing a name with an effect op be an error?
+
+Yes: E0205. And a LOCAL now shadows an op lexically, in inference, the evaluator and Core
+lowering (the resolver's scope walk supplies lowering's call sites). See the 5c-2 spec.
+Original:
+
 
 Measured: accepted today, evaluator performs the op. Both inference
 (`infer_call` checks the op registry before the environment) and the evaluator
@@ -215,7 +220,11 @@ under a control the rows after the first failure are never run (control 1b never
 `two-handles`). The Task 8 corpus collects failures and reports them all. Make the Task 9 pair
 collect too, so a control's full footprint is visible; test-only, no expected value changes.
 
-## Two clauses for one op in a handler (found 2026-10-04, slice 5c-1 measurement m8)
+## RESOLVED (slice 5c-2, 2026-10-05): two clauses for one op in a handler
+
+An error: E0204. Native first-wins (5c-1) stays as a defensive rule, now unreachable from
+source. Original:
+
 
 `handle { .. } with { Ask.ask() -> resume(2)  Ask.ask() -> resume(5) }` checks and runs; the
 evaluator takes the first clause (`find`). Natively it printed **5**: each clause overwrote
@@ -223,3 +232,14 @@ its op's slot in the clause table, so the LAST won -- an accepted program answer
 differently under `run` and `build`. Fixed in 5c-1 to match the reference (first wins),
 pinned by the `duplicate-clause-first-wins` native corpus row (red first, 5 vs 2).
 Still open: whether a duplicate clause should be an error (likely E0204) instead.
+
+## RESOLVED (slice 5c-3, 2026-10-05): an op used as a value checks clean, then fails at run time
+
+An error now: E0206 (an operation may only be called), with a wrapper fix-it. First-class
+ops were declined. Original:
+
+
+`let f = ping  f()` (op `ping`, no local of that name) passes `elya check` -- inference types
+the bare `ping` as `Ty::Error` silently -- and `elya run` ends in E0300 "unbound variable
+`ping`". Pre-existing; 5c-2's non-goal. Decide: reject a bare op reference (an error), or
+make an op a first-class value (an eta-expanded perform).
