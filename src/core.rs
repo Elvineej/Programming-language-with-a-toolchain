@@ -230,9 +230,12 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
         // One construction, two call sites (Slice 5b-8 §9.4, D4): this one and
         // `affine.rs`'s.
         multi_ops: multi_declared_ops(module),
-        // D11: the op -> effect index, built by the rule `Infer.ops` and the
-        // evaluator's `op_table` both use (last declaration wins).
+        // D11: the op -> effect index, the one the evaluator also uses (op
+        // names are unique since 5c-1, E0202).
         op_effects: op_effects(module),
+        // 5c-2: call sites where a local shadows an op -- from the resolver's
+        // scope walk, the one `check` already ran.
+        shadowed_op_calls: crate::resolve::locally_shadowed_op_calls(module),
     };
 
     let mut fns = Vec::new();
@@ -271,6 +274,9 @@ struct LowerCx {
     /// `op_effects(module)` — op name -> declaring effect, read by the `Perform`
     /// stamp (D11).
     op_effects: HashMap<String, String>,
+    /// Callee spans of calls whose name is a LOCAL shadowing an op (5c-2):
+    /// lowered as applications, never as performs.
+    shadowed_op_calls: std::collections::HashSet<Span>,
 }
 
 /// Elaborate a (monomorphic) ADT field type annotation to a `Ty`. Param-free by
@@ -377,13 +383,16 @@ fn lower_expr(
                     });
                 }
             }
-            // D11: a call whose callee names an operation is a PERFORM. Resolved
-            // exactly where inference (`infer_call`) and the evaluator
-            // (`CalleeSlot::Operation`) resolve it: after `io.println` and
-            // constructors, BEFORE any variable. So a function sharing the op's
-            // name is not what this calls -- both reference layers perform.
+            // D11: a call whose callee names an operation is a PERFORM -- unless a
+            // LOCAL of that name is in scope (5c-2), which inference and the
+            // evaluator resolve first too. No top-level function can share an
+            // op's name (E0205).
             if let Expr::Var(name) = &callee.node {
-                if let Some(effect) = cx.op_effects.get(name) {
+                let effect = cx
+                    .op_effects
+                    .get(name)
+                    .filter(|_| !cx.shadowed_op_calls.contains(&callee.span));
+                if let Some(effect) = effect {
                     let op_ty = table
                         .get(&callee.span)
                         .cloned()

@@ -802,6 +802,10 @@ pub mod cek {
                     Expr::Var(name) if is_ctor_name(name) => {
                         CalleeSlot::Ctor { name: name.clone() }
                     }
+                    // Locals before ops (slice 5c-2): `env` holds only local
+                    // bindings (top-level functions are `fns`), so a bound name
+                    // shadows an operation of the same name.
+                    Expr::Var(name) if env.get(name).is_some() => CalleeSlot::Pending,
                     Expr::Var(name) => match ops.get(name.as_str()) {
                         Some(effect) => CalleeSlot::Operation {
                             effect: effect.clone(),

@@ -368,8 +368,9 @@ pub(crate) fn declare<'ctx>(
             let id = *op_ids
                 .get(&(c.effect.clone(), c.op.clone()))
                 .ok_or_else(|| internal("a clause's op has no id"))?;
-            // The FIRST clause for an op wins, as in the evaluator (`find`); a
-            // later duplicate is still emitted but never dispatched to.
+            // The FIRST clause for an op wins, as in the evaluator (`find`). Since
+            // slice 5c-2 a second clause for one op is E0204, so no source program
+            // reaches this; it stays so the two layers agree by construction.
             if filled.insert(id) {
                 entries[id] = f.as_global_value().as_pointer_value().const_to_int(i64t);
             }
