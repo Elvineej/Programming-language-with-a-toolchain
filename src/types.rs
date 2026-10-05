@@ -1143,9 +1143,17 @@ impl Infer {
             }
         }
         // An operation call is a *perform*: it adds its effect to the ambient
-        // and yields the operation's declared result type.
+        // and yields the operation's declared result type. Locals first (slice
+        // 5c-2): a name bound in the environment is a call of that binding. Under
+        // E0205 no top-level function shares an op's name, so the environment
+        // can hold one only as a local, which shadows the op lexically.
         if let Expr::Var(name) = &callee.node {
-            if let Some(op) = self.ops.get(name).cloned() {
+            let op = if env.lookup(name).is_none() {
+                self.ops.get(name).cloned()
+            } else {
+                None
+            };
+            if let Some(op) = op {
                 // Instantiate the effect's type params fresh (Slice 4c-2); the
                 // fresh args ride in the row, so a second perform of the same
                 // effect reconciles against them via `unify_row`.

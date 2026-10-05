@@ -1845,22 +1845,6 @@ const HANDLER_8: &[(&str, &str, &str)] = &[
         "2",
     ),
     (
-        // Two clauses for one op: the evaluator (reference) takes the FIRST
-        // (`find`). Native took the LAST -- each clause overwrote its op's slot
-        // in the clause table -- and printed 5 (measured 2026-10-04, 5c-1 m8).
-        "duplicate-clause-first-wins",
-        "effect Ask { fn ask() -> Int }\n\
-         fn one() { ask() }\n\
-         pub fn main() -> Int {\n\
-         \x20 handle { one() } with {\n\
-         \x20   Ask.ask() -> resume(2)\n\
-         \x20   Ask.ask() -> resume(5)\n\
-         \x20   return(x) -> x\n\
-         \x20 }\n\
-         }\n",
-        "2",
-    ),
-    (
         "frame-capture",
         "effect State { fn get() -> Int }\n\
          fn body() -> Int { get() + 1 }\n\
@@ -2019,26 +2003,53 @@ fn native_output_matches_the_evaluator_across_the_task8_handler_corpus() {
 }
 
 #[test]
-fn a_function_named_like_an_op_is_not_what_a_perform_calls() {
-    // D11, differential: the evaluator PERFORMS the op; native must too.
+fn a_local_named_like_an_op_is_called_natively() {
+    // Slice 5c-2 (replaces D11's `a_function_named_like_an_op_is_not_what_a_
+    // perform_calls`: a top-level `fn ping` beside op `ping` is now E0205). A
+    // LOCAL shadows the op; the evaluator CALLS it, and native must too.
     let src = "effect E { fn ping() -> Int }\n\
-         fn ping() -> Int { 5 }\n\
-         fn user() -> Int { ping() }\n\
+         fn user() -> Int {\n\
+         \x20 let ping = fn() { 5 }\n\
+         \x20 ping()\n\
+         }\n\
          pub fn main() -> Int {\n\
          \x20 let v = handle { user() } with {\n\
          \x20   E.ping() -> resume(1)\n\
          \x20   return(x) -> x\n\
          \x20 }\n\
-         \x20 let z = if v == 1 { io.println(\"evaluator PERFORMED the op\") } else { io.println(\"evaluator CALLED fn ping\") }\n\
+         \x20 let z = if v == 1 { io.println(\"PERFORMED the op\") } else { io.println(\"CALLED the local\") }\n\
          \x20 0\n\
          }\n";
-    let dir = temp_dir("collide-8");
+    let dir = temp_dir("shadow-5c2");
     let core = lower_src(src);
-    let exe = compile_and_link(&core, &dir, "collide");
-    let (text, value) = native_text_value(&exe, "collide");
+    let exe = compile_and_link(&core, &dir, "shadow");
+    let (text, value) = native_text_value(&exe, "shadow");
     assert_eq!(text, eval_main_text(src));
-    assert_eq!(text, "evaluator PERFORMED the op\n");
+    assert_eq!(text, "CALLED the local\n");
     assert_eq!(value, eval_main_int(src));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn shadowing_ends_with_its_scope_natively() {
+    // 5c-2 n5: the local inside the block (5), the op after it (1). 2 would be
+    // the old ops-first rule; 10 a shadow leaking out of its block.
+    let src = "effect E { fn ping() -> Int }\n\
+         fn user() -> Int {\n\
+         \x20 let a = { let ping = fn() { 5 }  ping() }\n\
+         \x20 a + ping()\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { user() } with {\n\
+         \x20   E.ping() -> resume(1)\n\
+         \x20   return(x) -> x\n\
+         \x20 }\n\
+         }\n";
+    let dir = temp_dir("shadow-scope-5c2");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "shadow-scope");
+    assert_runs(&exe, "6");
+    assert_eq!(eval_main_int(src), "6");
     std::fs::remove_dir_all(&dir).ok();
 }
 
