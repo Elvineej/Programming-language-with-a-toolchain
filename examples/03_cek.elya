@@ -1,0 +1,113 @@
+// A CEK machine, written in Elya.
+//
+// It runs a small lambda calculus: integers, `+`, a zero test, functions and
+// application. Variables are de Bruijn indices -- `Var(0)` is the nearest
+// enclosing `Lam`, `Var(1)` the one outside it -- so the machine needs no
+// strings and no maps, only Elya's own ADTs.
+//
+// C is the term (control), E the environment, K the continuation. The machine
+// is two functions that tail-call each other: `ev` takes a term apart, `co`
+// hands a finished value to the continuation. Every step is a tail call, so
+// the host stack stays flat and the object program's depth lives in K, on the
+// heap.
+
+type Term {
+  Lit(Int),
+  Var(Int),
+  Lam(Term),
+  App(Term, Term),
+  Add(Term, Term),
+  If0(Term, Term, Term)
+}
+
+type Val { Num(Int), Clo(Term, Env) }
+
+type Env { Empty, Bind(Val, Env) }
+
+type Kont {
+  Halt,
+  EvalArg(Term, Env, Kont),
+  Apply(Val, Kont),
+  EvalRight(Term, Env, Kont),
+  AddLeft(Int, Kont),
+  Branch(Term, Term, Env, Kont)
+}
+
+fn lookup(e, i) {
+  match e {
+    Empty -> Num(0 - 999)
+    Bind(v, rest) -> if i == 0 { v } else { lookup(rest, i - 1) }
+  }
+}
+
+fn num(v) {
+  match v {
+    Num(n) -> n
+    Clo(_, _) -> 0 - 1
+  }
+}
+
+// Control: take the term apart.
+fn ev(t, e, k) {
+  match t {
+    Lit(n) -> co(Num(n), k)
+    Var(i) -> co(lookup(e, i), k)
+    Lam(body) -> co(Clo(body, e), k)
+    App(f, a) -> ev(f, e, EvalArg(a, e, k))
+    Add(l, r) -> ev(l, e, EvalRight(r, e, k))
+    If0(c, th, el) -> ev(c, e, Branch(th, el, e, k))
+  }
+}
+
+// Continue: give the value `v` to the continuation `k`.
+fn co(v, k) {
+  match k {
+    Halt -> v
+    EvalArg(a, e, k2) -> ev(a, e, Apply(v, k2))
+    Apply(f, k2) -> apply(f, v, k2)
+    EvalRight(r, e, k2) -> ev(r, e, AddLeft(num(v), k2))
+    AddLeft(n, k2) -> co(Num(n + num(v)), k2)
+    Branch(th, el, e, k2) -> if num(v) == 0 { ev(th, e, k2) } else { ev(el, e, k2) }
+  }
+}
+
+fn apply(f, v, k) {
+  match f {
+    Clo(body, e) -> ev(body, Bind(v, e), k)
+    Num(_) -> co(Num(0 - 1), k)
+  }
+}
+
+fn run(t) -> Int { num(ev(t, Empty, Halt)) }
+
+// ---- programs ----
+
+// (\x. x + 1) 41
+fn add_one() { App(Lam(Add(Var(0), Lit(1))), Lit(41)) }
+
+// twice = \f. \x. f (f x);  twice (\x. x + 3) 10
+fn twice_add3() {
+  let twice = Lam(Lam(App(Var(1), App(Var(1), Var(0)))))
+  App(App(twice, Lam(Add(Var(0), Lit(3)))), Lit(10))
+}
+
+// The call-by-value fixed point: Z = \f. (\x. f (\v. x x v)) (\x. f (\v. x x v))
+fn z() {
+  let half = Lam(App(Var(1), Lam(App(App(Var(1), Var(1)), Var(0)))))
+  Lam(App(half, half))
+}
+
+// sum = Z (\self. \n. if n == 0 then 0 else n + self (n - 1));  sum n
+fn sum_to(n) {
+  let body = Lam(Lam(If0(Var(0), Lit(0), Add(Var(0), App(Var(1), Add(Var(0), Lit(0 - 1)))))))
+  App(App(z(), body), Lit(n))
+}
+
+pub fn main() / {IO} {
+  let a = run(add_one())
+  let b = run(twice_add3())
+  let c = run(sum_to(10))
+  if a == 42 { io.println("add_one: 42") } else { io.println("add_one: WRONG") }
+  if b == 16 { io.println("twice_add3: 16") } else { io.println("twice_add3: WRONG") }
+  if c == 55 { io.println("sum_to(10): 55") } else { io.println("sum_to(10): WRONG") }
+}

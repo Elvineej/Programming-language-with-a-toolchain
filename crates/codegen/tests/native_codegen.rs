@@ -2161,6 +2161,26 @@ fn run_differential_corpus(corpus: &[(&str, &str, &str)], dir_name: &str) {
 }
 
 #[test]
+fn the_elya_cek_machine_runs_natively() {
+    // `examples/03_cek.elya`: a CEK machine written in Elya, compiled natively
+    // and checked against the evaluator. N = 1,000 (500,500). Deeper fails on
+    // the native stack today: the machine's loop is tail calls inside match
+    // arms, which the direct emitter does not yet compile as tail calls
+    // (measured 2026-10-05: N = 10,000 segfaults; the evaluator runs it).
+    let src = include_str!("../../../examples/03_cek.elya");
+    let src = format!(
+        "{}pub fn main() -> Int {{ run(sum_to(1000)) }}\n",
+        &src[..src.find("pub fn main").expect("example has a main")]
+    );
+    let dir = temp_dir("elya-cek");
+    let core = lower_src(&src);
+    let exe = compile_and_link(&core, &dir, "elya-cek");
+    assert_runs(&exe, "500500");
+    assert_eq!(eval_main_int(&src), "500500");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_match_arm_after_a_catch_all_compiles_natively() {
     // Found by the 5b-9a review, pre-existing in the DIRECT emitter: an arm
     // after a catch-all is only a warning (E0431), but the emitter kept going
