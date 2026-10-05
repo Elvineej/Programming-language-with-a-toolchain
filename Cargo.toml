@@ -5,7 +5,7 @@ members = ["crates/codegen", "crates/cli"]
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.75"
-license = "PolyForm-Noncommercial-1.0.0"
+license = "PolyForm-Strict-1.0.0"
 
 # The front end. Deliberately LLVM-free: `elya-codegen` depends on this crate,
 # never the reverse, so nothing here can ever pull in `llvm_sys` (Slice 5b-1
