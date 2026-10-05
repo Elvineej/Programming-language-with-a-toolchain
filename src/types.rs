@@ -2042,7 +2042,34 @@ fn collect_refs_expr(e: &Expr, acc: &mut Vec<String>) {
             collect_refs(&else_block.node, acc);
         }
         Expr::Block(b) => collect_refs(b, acc),
-        _ => {}
+        // Exhaustive, with no catch-all (fixed 2026-10-05): a call hidden in a
+        // match arm, a lambda or a handler used to be no edge at all, so a
+        // caller could be generalised before its callee was typed -- `forall a`
+        // results, and ill-typed programs that checked clean. Over-approximation
+        // (a local sharing a function's name) only merges SCCs, which is safe.
+        Expr::Match { scrutinee, arms } => {
+            collect_refs_expr(&scrutinee.node, acc);
+            for arm in arms.iter() {
+                collect_refs_expr(&arm.node.body.node, acc);
+            }
+        }
+        Expr::Lambda { body, .. } => collect_refs(&body.node, acc),
+        Expr::Handle { body, handler } => {
+            collect_refs_expr(&body.node, acc);
+            for c in &handler.clauses {
+                collect_refs_expr(&c.node.body.node, acc);
+            }
+            if let Some(r) = &handler.ret {
+                collect_refs_expr(&r.body.node, acc);
+            }
+        }
+        Expr::Resume { arg } => collect_refs_expr(&arg.node, acc),
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Unit
+        | Expr::Qualified { .. } => {}
     }
 }
 
