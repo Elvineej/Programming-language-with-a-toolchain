@@ -763,27 +763,35 @@ fn a_perform_lowers_to_a_perform_node() {
 }
 
 #[test]
-fn an_op_wins_over_a_same_named_fn_as_inference_and_the_evaluator_resolve_it() {
-    // D11. Inference (`infer_call`: ops before the environment) and the
-    // evaluator (`CalleeSlot::Operation`) both resolve an op name before any
-    // variable; measured, this program's evaluator run PERFORMS the op. So
-    // `user`'s `ping()` must lower to a Perform -- never to a call to `fn ping`.
+fn a_local_named_like_an_op_lowers_to_a_call_not_a_perform() {
+    // Slice 5c-2 (replaces D11's `an_op_wins_over_a_same_named_fn_...`, whose
+    // program -- a top-level `fn ping` beside op `ping` -- is now E0205). A LOCAL
+    // shadows the op lexically, as inference and the evaluator resolve it, so
+    // `ping()` here is an application of the local, and the module has no
+    // Perform at all.
     let src = "effect E { fn ping() -> Int }\n\
-               fn ping() -> Int { 5 }\n\
-               fn user() -> Int { ping() }\n\
+               fn user() -> Int {\n\
+               \x20 let ping = fn() { 5 }\n\
+               \x20 ping()\n\
+               }\n\
                pub fn main() -> Int {\n\
                \x20 handle { user() } with {\n\
                \x20   E.ping() -> resume(1)\n\
                \x20   return(x) -> x\n\
                \x20 }\n\
                }\n";
-    let (core, _table) = lower_src(src);
-    let user = core.fns.iter().find(|f| f.name == "user").expect("user");
-    assert!(
-        matches!(&user.body.kind, CoreKind::Perform(p) if p.effect == "E" && p.op == "ping"),
-        "`ping()` must be the op's perform, not a call to `fn ping`: {:?}",
-        user.body.kind
-    );
+    let performs = |src: &str| {
+        let (core, _) = lower_src(src);
+        nodes(&core)
+            .into_iter()
+            .filter(|e| matches!(&e.kind, CoreKind::Perform(_)))
+            .count()
+    };
+    assert_eq!(performs(src), 0, "the shadowed `ping()` must not perform");
+    // Control: outside the local's scope the same call performs.
+    let unshadowed = src.replace("  let ping = fn() { 5 }\n  ping()", "  ping()");
+    assert_ne!(unshadowed, src, "control rewrite must apply");
+    assert_eq!(performs(&unshadowed), 1);
 }
 
 #[test]
