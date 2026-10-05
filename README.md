@@ -106,6 +106,33 @@ Elya is a typed language on a CEK machine, built up through these slices:
   most once (`E0428`), and an affine value may not be captured into a
   multiply-resuming continuation (`E0429`) — the double-free that a tracing
   collector cannot catch.
+- **Name rules for effects** — operation names are unique per module (`E0202`); a
+  handler clause must name a declared operation of the effect it names, with the
+  right arity (`E0203`), at most once per handler (`E0204`); a top-level function
+  may not share an operation's name (`E0205`); an operation may only be called,
+  never used as a value (`E0206`); and a local binding shadows an operation of the
+  same name, lexically. A bare clause (`ask() -> …`) means its operation's effect.
+
+### Native compiler
+
+`elya build` compiles through a typed Core IR to native code with LLVM 18:
+
+- integers, booleans and control flow; functions with **guaranteed tail calls**
+  (`tailcc` + `musttail`, run 1,000,000 deep);
+- ADTs and pattern matching (a failed match traps); closures, including indirect
+  tail calls; strings and `io.println`;
+- Elya's **own precise mark-sweep garbage collector**: non-moving, with a shadow
+  stack, compiler-generated descriptor tables and free lists;
+- **one-shot effect handlers** (selective CPS): `handle`/`resume` anywhere in a
+  clause, deep re-installation, O(1) handler lookup, one-shot enforced by a named
+  trap, and a state-passing handler loop bounded at N = 1,000,000.
+
+Every native program is checked against the reference evaluator, for both the
+value and the exact bytes printed. CI runs the full gate on Windows too.
+
+Not yet native (refused by name): multi-shot handlers (`with multi`), effectful
+lambdas and closure calls, a `handle` nested in another handler or in effectful
+code, and polymorphic code that stays polymorphic (`Ty::Var`).
 
 ### Affine resources
 
