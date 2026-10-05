@@ -233,7 +233,11 @@ differently under `run` and `build`. Fixed in 5c-1 to match the reference (first
 pinned by the `duplicate-clause-first-wins` native corpus row (red first, 5 vs 2).
 Still open: whether a duplicate clause should be an error (likely E0204) instead.
 
-## An op used as a value checks clean, then fails at run time (found 2026-10-05, 5c-2 review)
+## RESOLVED (slice 5c-3, 2026-10-05): an op used as a value checks clean, then fails at run time
+
+An error now: E0206 (an operation may only be called), with a wrapper fix-it. First-class
+ops were declined. Original:
+
 
 `let f = ping  f()` (op `ping`, no local of that name) passes `elya check` -- inference types
 the bare `ping` as `Ty::Error` silently -- and `elya run` ends in E0300 "unbound variable
