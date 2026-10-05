@@ -1,0 +1,7 @@
+---
+source: tests/examples.rs
+expression: "run_example(\"03_cek.elya\")"
+---
+add_one: 42
+twice_add3: 16
+sum_to(10): 55
