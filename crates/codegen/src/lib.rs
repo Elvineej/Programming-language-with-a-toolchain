@@ -1231,6 +1231,13 @@ fn lower_expr<'ctx>(
                     }
                     CorePat::Lit(_) => return Err(CodegenError::Unsupported("literal pattern")),
                 }
+                // Arms after a catch-all can never match (an E0431 warning, not
+                // an error); emitting them branched out of an already-terminated
+                // block and LLVM rejected the module (5b-9a review). The CPS twin,
+                // `match_dispatch`, stops here too.
+                if terminal {
+                    break;
+                }
             }
             // The default block — reached only if the last arm was a constructor
             // and no tag matched — traps via elya_match_fail, never UB.

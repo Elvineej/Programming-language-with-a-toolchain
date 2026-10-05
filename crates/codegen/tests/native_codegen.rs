@@ -1623,6 +1623,29 @@ fn frames_holding_heap_values_survive_collections_and_match_the_evaluator() {
 /// pressure and is compared to the evaluator, text and value.
 const CPS_ROOTING: &[(&str, &str)] = &[
     (
+        // 5b-9a: pattern binders live across a site inside a match arm, with
+        // garbage churned every level so collections run mid-recursion. `t` is
+        // a heap binder the frame must save AND trace. 8,030,000 predicted.
+        "match-binders-survive-collection",
+        "type L { Nil, Cons(Int, L) }\n\
+         effect Ask { fn ask() -> Int }\n\
+         fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }\n\
+         fn sum(l) { match l { Nil -> 0  Cons(h, t) -> { let g = Cons(h, Cons(h, Cons(h, Nil)))  h + ask() + sum(t) } } }\n\
+         pub fn main() -> Int { handle { sum(build(4000, Nil)) } with { Ask.ask() -> resume(7)  return(r) -> r } }\n",
+    ),
+    (
+        // 5b-9a review: a VARIABLE-pattern heap binder (`o`, the whole
+        // scrutinee) live across a site while a 30,000-cell list is built and
+        // collected: 7 + 30000 + 50 = 30057.
+        "match-var-binder-survives-collection",
+        "type L { Nil, Cons(Int, L) }\n\
+         effect Ask { fn ask() -> Int }\n\
+         fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }\n\
+         fn lenacc(l, a) { match l { Nil -> a  Cons(_, t) -> lenacc(t, a + 1) } }\n\
+         fn user() -> Int { match build(50, Nil) { o -> ask() + lenacc(build(30000, Nil), 0) + lenacc(o, 0) } }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(r) -> r } }\n",
+    ),
+    (
         // D-1: the value a site returned, held by the resumption while a
         // later operand (`garbage(100)`) allocates.
         "hole-value-across-a-later-operand",
@@ -1942,6 +1965,226 @@ const HANDLER_8: &[(&str, &str, &str)] = &[
         "1",
     ),
 ];
+
+/// Slice 5b-9a: effectful code inside a `match`, natively. Every row was
+/// refused "effectful call inside a match (not yet compiled natively)" before;
+/// expected values were predicted before the first run.
+///
+/// Negative controls, each reverted, each failing differently:
+/// - binding order reversed: COMPILE error "saved binding is not available"
+///   on the binder rows. Predicted a wrong value, 1018 (`x * 100` is computed
+///   before the site; only `y` would reload from `x`'s slot -- a full swap
+///   would be 2018). The frame save cross-checks names against binding
+///   indices, which is stronger;
+/// - the resumption skips dispatch on a scrutinee site: the compiler panics
+///   (a pointer reaches integer arithmetic);
+/// - pattern binders bypass `St`: "saved binding is not available" again, on
+///   the binder row and the GC row (`CPS_ROOTING`).
+const MATCH_EFFECTS: &[(&str, &str, &str)] = &[
+    (
+        // a tail match whose arm performs.
+        "match-tail-effect-arm",
+        "effect Ask { fn ask() -> Int }\n\
+         type T { A, B }\n\
+         fn user(t) -> Int { match t { A -> ask()  B -> 0 } }\n\
+         pub fn main() -> Int { handle { user(A) } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "7",
+    ),
+    (
+        // the arm's site is non-tail: the resumption carries the arm's value up through the match (slot >= 1).
+        "match-value-effect-arm",
+        "effect Ask { fn ask() -> Int }\n\
+         type T { A, B }\n\
+         fn user(t) -> Int { let v = match t { A -> ask()  B -> 0 }  v + 1 }\n\
+         pub fn main() -> Int { handle { user(A) } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "8",
+    ),
+    (
+        // the pattern binders `x` and `y` are live across the site, so its frame saves them; asymmetric so a swapped binding order shows (1028 vs 2018).
+        "match-binders-across-site",
+        "effect Ask { fn ask() -> Int }\n\
+         type T { A, B }\n\
+         type P { P(Int, Int) }\n\
+         fn user() -> Int { let r = match P(10, 20) { P(x, y) -> x * 100 + ask() + y }  r + 1 }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "1028",
+    ),
+    (
+        // the site is the SCRUTINEE (slot 0): the resumption dispatches on the returned value.
+        "match-effectful-scrutinee",
+        "effect Ask { fn ask() -> Int }\n\
+         type T { A, B }\n\
+         fn choose() -> T { if ask() == 7 { B } else { A } }\n\
+         fn user() -> Int { let r = match choose() { A -> 1  B -> 2 }  r * 10 }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "20",
+    ),
+    (
+        // slot 0 again, with the match in tail position.
+        "match-tail-effectful-scrutinee",
+        "effect Ask { fn ask() -> Int }\n\
+         type T { A, B }\n\
+         fn choose() -> T { if ask() == 7 { B } else { A } }\n\
+         fn user() -> Int { match choose() { A -> 1  B -> ask() } }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "7",
+    ),
+    (
+        // variable and wildcard arms (5 + 8).
+        "match-var-and-wild-arms",
+        "effect Ask { fn ask() -> Int }\n\
+         type T { A, B }\n\
+         fn user(t) -> Int {\n\
+         \x20 let a = match t { A -> ask()  other -> 5 }\n\
+         \x20 let b = match t { A -> 0  _ -> ask() + 1 }\n\
+         \x20 a + b\n\
+         }\n\
+         pub fn main() -> Int { handle { user(B) } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "13",
+    ),
+    (
+        // review: a scrutinee site whose arms use an OUTER local (saved_at's slot-0 branch): 10 + 5.
+        "match-scrutinee-site-outer-local",
+        "effect Ask { fn ask() -> Int }\n\
+         type T { A, B }\n\
+         fn choose() -> T { if ask() == 7 { B } else { A } }\n\
+         fn user() -> Int { let k = 5  let r = match choose() { A -> k  B -> k * 2 }  r + k }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "15",
+    ),
+    (
+        // review: a scrutinee site, then binders live across a site in the arm: 700 + 7 + 3 + 1.
+        "match-scrutinee-site-then-arm-binders",
+        "effect Ask { fn ask() -> Int }\n\
+         type T { A, B }\n\
+         type P { P(Int, Int) }\n\
+         fn mkp() -> P { P(ask(), 3) }\n\
+         fn user() -> Int { let r = match mkp() { P(x, y) -> x * 100 + ask() + y }  r + 1 }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "711",
+    ),
+    (
+        // review: an arm binder shadowing an outer name used after the match: (1 + 7) + 100.
+        "match-binder-shadows-outer",
+        "effect Ask { fn ask() -> Int }\n\
+         type T { A, B }\n\
+         type W { W(Int) }\n\
+         fn user() -> Int { let x = 100  let r = match W(1) { W(x) -> x + ask() }  r + x }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "108",
+    ),
+    (
+        // review: a Bool-valued effectful match (an i1 phi).
+        "match-bool-valued",
+        "effect Ask { fn ask() -> Int }\n\
+         type T { A, B }\n\
+         fn user(t) -> Int { let b = match t { A -> ask() == 7  B -> False }  if b { 1 } else { 0 } }\n\
+         pub fn main() -> Int { handle { user(A) } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "1",
+    ),
+    (
+        // review: every arm ends in a site, so the join block is unreachable: (7 + 1) * 2.
+        "match-all-arms-sites",
+        "effect Ask { fn ask() -> Int }\n\
+         type T { A, B }\n\
+         fn user(t) -> Int { let v = match t { A -> ask()  B -> ask() + 1 }  v * 2 }\n\
+         pub fn main() -> Int { handle { user(B) } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "16",
+    ),
+    (
+        // review: an arm after a catch-all (an E0431 warning, not an error) is never emitted.
+        "match-arm-after-catch-all",
+        "effect Ask { fn ask() -> Int }\n\
+         type T { A, B }\n\
+         fn user(t) -> Int { match t { A -> ask()  _ -> 5  B -> 9 } }\n\
+         pub fn main() -> Int { handle { user(B) } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "5",
+    ),
+];
+
+/// Runs a `(tag, src, expected)` corpus natively, collecting every failure.
+fn run_value_corpus(corpus: &[(&str, &str, &str)], dir_name: &str) {
+    let dir = temp_dir(dir_name);
+    let mut failures = Vec::new();
+    for (tag, src, expected) in corpus {
+        let core = lower_src(src);
+        let exe = match try_compile_and_link(&core, &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || got != *expected {
+            failures.push(format!(
+                "{tag}: {:?} stdout={got:?} want={expected}",
+                out.status
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Runs a corpus natively and compares each value with the evaluator's.
+fn run_differential_corpus(corpus: &[(&str, &str, &str)], dir_name: &str) {
+    let dir = temp_dir(dir_name);
+    let mut failures = Vec::new();
+    for (tag, src, _) in corpus {
+        let core = lower_src(src);
+        let exe = match try_compile_and_link(&core, &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let want = eval_main_int(src);
+        if !out.status.success() || got != want {
+            failures.push(format!(
+                "{tag}: {:?} native={got:?} evaluator={want}",
+                out.status
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        failures.is_empty(),
+        "native diverges from the evaluator: {failures:#?}"
+    );
+}
+
+#[test]
+fn a_match_arm_after_a_catch_all_compiles_natively() {
+    // Found by the 5b-9a review, pre-existing in the DIRECT emitter: an arm
+    // after a catch-all is only a warning (E0431), but the emitter kept going
+    // past the terminal arm and LLVM rejected the module ("does not have
+    // terminator"). The evaluator takes the catch-all: 5.
+    let src = "type T { A, B }\n\
+               pub fn main() -> Int { let t = B  match t { A -> 1  _ -> 5  B -> 9 } }\n";
+    let dir = temp_dir("arm-after-catch-all");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "after-catch-all");
+    assert_runs(&exe, "5");
+    assert_eq!(eval_main_int(src), "5");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn effectful_match_corpus_runs_natively() {
+    run_value_corpus(MATCH_EFFECTS, "match-effects");
+}
+
+#[test]
+fn effectful_match_corpus_matches_the_evaluator() {
+    run_differential_corpus(MATCH_EFFECTS, "differential-match-effects");
+}
 
 #[test]
 fn the_task8_handler_corpus_compiles_runs_and_prints_the_expected_answer() {

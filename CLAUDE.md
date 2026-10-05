@@ -7,3 +7,9 @@ Rules:
 - If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+
+## Handoff
+
+`HANDOFF.md` is the project's state and plan for whichever agent works next. It is a
+rolling window of five steps: when a step is finished, move it to "Done" (with its PR or
+commit), renumber, and write a new step 5, updating the State section in the same commit.

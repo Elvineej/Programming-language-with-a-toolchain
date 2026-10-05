@@ -182,6 +182,8 @@ did not finish in 10 minutes. The 7b-3 deep-frames test uses n = 4000 because of
   non-tail-resume limit itself is unchanged.
 - Refusals that Task 8 did not lift were renamed from "(Task 8)" to "(not yet compiled
   natively)": effectful lambdas, effectful closure calls, effectful calls inside a `match`.
+  *Update (slice 5b-9a, 2026-10-05):* effectful code inside a `match` now compiles natively
+  (`MATCH_EFFECTS` corpus + a GC row). Effectful lambdas and closure calls remain (5b-9b).
 
 ## RESOLVED (commit after e2c112a): a fixed 64K-word threshold made deep live structures quadratic (found 2026-10-03)
 
