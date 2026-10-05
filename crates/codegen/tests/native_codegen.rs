@@ -2160,13 +2160,71 @@ fn run_differential_corpus(corpus: &[(&str, &str, &str)], dir_name: &str) {
     );
 }
 
+/// HANDOFF step 1 (2026-10-05): a call in a `match` arm in tail position was
+/// an ORDINARY call -- the direct emitter's `lower_tail` handled `If`, `Let`
+/// and `App`, not `Match` -- so a loop through a match grew the stack.
+/// Pre-existing since 5b-4; Linux's 8 MiB hid it until a 30,000-deep row
+/// overflowed Windows' 1 MiB (5b-9a). At a million it overflows Linux too.
+fn run_deep(tag: &str, src: &str, want: &str) {
+    let dir = temp_dir(tag);
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, tag);
+    let out = Command::new(&exe).output().expect("run produced binary");
+    diagnose_crash(&out.status, tag);
+    assert!(
+        out.status.success(),
+        "{tag}: binary exited {:?}",
+        out.status
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want, "{tag}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_tail_call_in_a_match_arm_is_eliminated_at_a_million() {
+    run_deep(
+        "tail-in-match",
+        "type B { T, F }\n\
+         fn flag(n) { if n == 0 { T } else { F } }\n\
+         fn lp(n, acc) { match flag(n) { T -> acc  F -> lp(n - 1, acc + 1) } }\n\
+         pub fn main() -> Int { lp(1000000, 0) }\n",
+        "1000000",
+    );
+}
+
+#[test]
+fn a_tail_call_through_a_pattern_binder_walks_a_million_cells() {
+    // The binder `t` feeds the tail call: the arm's field load must not keep
+    // anything alive past the `musttail`.
+    run_deep(
+        "tail-in-match-binder",
+        "type L { Nil, Cons(Int, L) }\n\
+         fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }\n\
+         fn len(l, a) { match l { Nil -> a  Cons(_, t) -> len(t, a + 1) } }\n\
+         pub fn main() -> Int { len(build(1000000, Nil), 0) }\n",
+        "1000000",
+    );
+}
+
+#[test]
+fn the_elya_cek_machine_runs_natively_a_hundred_thousand_deep() {
+    // The Elya CEK machine's loop is `ev`/`co` tail calls in match arms. Before
+    // the fix, N = 10,000 segfaulted. 100,000 * 100,001 / 2 = 5,000,050,000
+    // (computed, not run through the evaluator: too slow at this depth).
+    let src = include_str!("../../../examples/03_cek.elya");
+    let src = format!(
+        "{}pub fn main() -> Int {{ run(sum_to(100000)) }}\n",
+        &src[..src.find("pub fn main").expect("example has a main")]
+    );
+    run_deep("elya-cek-deep", &src, "5000050000");
+}
+
 #[test]
 fn the_elya_cek_machine_runs_natively() {
     // `examples/03_cek.elya`: a CEK machine written in Elya, compiled natively
-    // and checked against the evaluator. N = 1,000 (500,500). Deeper fails on
-    // the native stack today: the machine's loop is tail calls inside match
-    // arms, which the direct emitter does not yet compile as tail calls
-    // (measured 2026-10-05: N = 10,000 segfaults; the evaluator runs it).
+    // and checked against the evaluator. N = 1,000 (500,500): the evaluator
+    // side keeps N modest. The deep native run is
+    // `the_elya_cek_machine_runs_natively_a_hundred_thousand_deep`.
     let src = include_str!("../../../examples/03_cek.elya");
     let src = format!(
         "{}pub fn main() -> Int {{ run(sum_to(1000)) }}\n",
