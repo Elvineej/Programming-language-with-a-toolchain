@@ -36,7 +36,7 @@ use inkwell::values::{IntValue, LLVMTailCallKind};
 use inkwell::AddressSpace;
 
 use elya::ast::BinOp;
-use elya::core::{CoreExpr, CoreKind, CoreModule};
+use elya::core::{CoreExpr, CoreKind, CoreModule, CorePat};
 use elya::types::{Ty, TyCon};
 
 use crate::cps::{self, contains_effect, is_tail_slot, needs_cps, ContSite, HandlerSite, Saved};
@@ -1061,9 +1061,12 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                 };
                 self.branch_value(st, cv, t, f)
             }
-            CoreKind::Match(..) => Err(CodegenError::Unsupported(
-                "effectful call inside a match (not yet compiled natively)",
-            )),
+            CoreKind::Match(s, arms) => {
+                let Some(sv) = self.expr(st, s)? else {
+                    return Ok(None);
+                };
+                self.match_dispatch(st, sv, s, arms, false)
+            }
             CoreKind::Resume(_) => {
                 Err(CodegenError::Unsupported("resume outside a handler clause"))
             }
@@ -1113,6 +1116,160 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
         let phi = match ty {
             inkwell::types::BasicTypeEnum::IntType(t) => self.b.build_phi(t, "cphi"),
             inkwell::types::BasicTypeEnum::PointerType(t) => self.b.build_phi(t, "cphi"),
+            _ => return Err(CodegenError::Unsupported("unrepresentable type")),
+        }
+        .map_err(internal)?;
+        for (v, bb) in &incoming {
+            phi.add_incoming(&[(v, *bb)]);
+        }
+        Ok(Some(phi.as_basic_value()))
+    }
+
+    /// Slice 5b-9a: a `match` in a CPS region, on an already-evaluated
+    /// scrutinee `sv` -- the effect-aware twin of the direct emitter's match
+    /// (`lower_expr`'s `CoreKind::Match`): the same tag tests, field loads and
+    /// trap on no match. Pattern variables are bound through `St`, in
+    /// `pat_binders` order, so a site inside an arm finds them at the binding
+    /// indices the analysis recorded, saves them, and roots them. `tail` emits
+    /// each arm in tail position (returns `None`); otherwise the arms join in a
+    /// phi, like `branch_value`, and an arm that ends in a site joins nothing.
+    fn match_dispatch(
+        &self,
+        st: &mut St<'ctx>,
+        sv: BasicValueEnum<'ctx>,
+        scrutinee: &CoreExpr,
+        arms: &[elya::core::CoreArm],
+        tail: bool,
+    ) -> R<Option<BasicValueEnum<'ctx>>> {
+        if !matches!(scrutinee.ty, Ty::Con(..)) {
+            return Err(CodegenError::Unsupported("match scrutinee is not an ADT"));
+        }
+        let i64t = self.i64t();
+        let s = sv.into_pointer_value();
+        let tag = self
+            .b
+            .build_load(i64t, s, "ctag")
+            .map_err(internal)?
+            .into_int_value();
+        let join_bb = self.ctx.append_basic_block(self.func, "cmjoin");
+        let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+        let mut fallthrough = self
+            .b
+            .get_insert_block()
+            .ok_or(CodegenError::Unsupported("builder left no block"))?;
+        let mut terminal = false;
+        let snap = st.pending;
+        for arm in arms.iter() {
+            let body_bb = self.ctx.append_basic_block(self.func, "cmarm");
+            // The arm's binders, in `pat_binders` order, with their values.
+            let mut bindings: Vec<(String, BasicValueEnum<'ctx>)> = Vec::new();
+            match &arm.pat {
+                CorePat::Ctor(name, pat_args) => {
+                    let (tag_idx, field_tys) = self
+                        .lc
+                        .ctors
+                        .get(name)
+                        .cloned()
+                        .ok_or(CodegenError::Unsupported("parametric ADT"))?;
+                    self.b.position_at_end(fallthrough);
+                    let cmp = self
+                        .b
+                        .build_int_compare(
+                            inkwell::IntPredicate::EQ,
+                            tag,
+                            i64t.const_int(tag_idx as u64, false),
+                            "cmc",
+                        )
+                        .map_err(internal)?;
+                    let next = self.ctx.append_basic_block(self.func, "cmnext");
+                    self.b
+                        .build_conditional_branch(cmp, body_bb, next)
+                        .map_err(internal)?;
+                    fallthrough = next;
+                    self.b.position_at_end(body_bb);
+                    for (pi, p) in pat_args.iter().enumerate() {
+                        match p {
+                            CorePat::Var(v) => {
+                                let w = self.load_word(s, pi + 1)?;
+                                let fv = word_to_value(
+                                    self.b,
+                                    w,
+                                    &field_tys[pi],
+                                    self.ctx.bool_type(),
+                                    self.ptrt(),
+                                )?;
+                                bindings.push((v.clone(), fv));
+                            }
+                            CorePat::Wild => {}
+                            CorePat::Ctor(..) => {
+                                return Err(CodegenError::Unsupported("nested constructor pattern"))
+                            }
+                            CorePat::Lit(_) => {
+                                return Err(CodegenError::Unsupported("literal pattern"))
+                            }
+                        }
+                    }
+                }
+                CorePat::Wild | CorePat::Var(_) => {
+                    self.b.position_at_end(fallthrough);
+                    self.b
+                        .build_unconditional_branch(body_bb)
+                        .map_err(internal)?;
+                    self.b.position_at_end(body_bb);
+                    if let CorePat::Var(name) = &arm.pat {
+                        bindings.push((name.clone(), sv));
+                    }
+                    terminal = true;
+                }
+                CorePat::Lit(_) => return Err(CodegenError::Unsupported("literal pattern")),
+            }
+            st.pending = snap;
+            let mut undo = Vec::with_capacity(bindings.len());
+            for (n, v) in &bindings {
+                undo.push((n.clone(), st.bind(n, *v)));
+            }
+            let out = if tail {
+                self.tail(st, &arm.body).map(|_| None)
+            } else {
+                self.expr(st, &arm.body)
+            };
+            for (n, saved) in undo.into_iter().rev() {
+                st.unbind(&n, saved);
+            }
+            if let Some(v) = out? {
+                let exit = self
+                    .b
+                    .get_insert_block()
+                    .ok_or(CodegenError::Unsupported("builder left no block"))?;
+                self.b
+                    .build_unconditional_branch(join_bb)
+                    .map_err(internal)?;
+                incoming.push((v, exit));
+            }
+            if terminal {
+                break;
+            }
+        }
+        st.pending = snap;
+        if !terminal {
+            // No arm matched: the same named trap as the direct emitter.
+            self.b.position_at_end(fallthrough);
+            self.b
+                .build_call(self.lc.fail, &[], "cmfail")
+                .map_err(internal)?;
+            self.b.build_unreachable().map_err(internal)?;
+        }
+        if incoming.is_empty() {
+            join_bb
+                .remove_from_function()
+                .map_err(|_| internal("could not remove an unreachable join"))?;
+            return Ok(None);
+        }
+        self.b.position_at_end(join_bb);
+        let ty = incoming[0].0.get_type();
+        let phi = match ty {
+            inkwell::types::BasicTypeEnum::IntType(t) => self.b.build_phi(t, "cmphi"),
+            inkwell::types::BasicTypeEnum::PointerType(t) => self.b.build_phi(t, "cmphi"),
             _ => return Err(CodegenError::Unsupported("unrepresentable type")),
         }
         .map_err(internal)?;
@@ -1183,9 +1340,12 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                 };
                 self.branch_tail(st, cv, t, f)
             }
-            CoreKind::Match(..) if contains_effect(e) => Err(CodegenError::Unsupported(
-                "effectful call inside a match (not yet compiled natively)",
-            )),
+            CoreKind::Match(s, arms) if contains_effect(e) => {
+                let Some(sv) = self.expr(st, s)? else {
+                    return Ok(());
+                };
+                self.match_dispatch(st, sv, s, arms, true).map(|_| ())
+            }
             CoreKind::Resume(_) => {
                 Err(CodegenError::Unsupported("resume outside a handler clause"))
             }
@@ -1777,10 +1937,20 @@ fn emit_resume_fn<'ctx>(
                     }
                 }
             }
-            CoreKind::Match(..) => {
-                return Err(CodegenError::Unsupported(
-                    "effectful call inside a match (not yet compiled natively)",
-                ))
+            // 5b-9a. Slot 0 is the scrutinee: dispatch on the value the site
+            // returned. An arm slot needs nothing -- the arm's value is the
+            // match's value -- exactly as an `If` branch.
+            CoreKind::Match(s, arms) => {
+                if step.slot == 0 {
+                    if tail_i {
+                        cx.match_dispatch(&mut st, cur, s, arms, true)?;
+                        return Ok(());
+                    }
+                    match cx.match_dispatch(&mut st, cur, s, arms, false)? {
+                        Some(v) => cur = v,
+                        None => return Ok(()),
+                    }
+                }
             }
             CoreKind::Resume(_) => {
                 return Err(CodegenError::Unsupported("resume outside a handler clause"))
