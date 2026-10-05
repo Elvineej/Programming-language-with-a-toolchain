@@ -58,6 +58,9 @@ pub struct LambdaSite {
     pub captures: Vec<(String, Ty)>,
     pub params: Rc<[CoreParam]>,
     pub body: Rc<CoreExpr>,
+    /// Slice 5b-9b: the lambda's row names a user effect, so its lifted body
+    /// uses the CPS convention -- `(closure, params.., continuation) -> i64`.
+    pub effectful: bool,
     /// The lifted function's return type — the body's own type, never a second
     /// source of truth (the same rule `CoreFn` states at `core.rs:87`).
     pub ret: Ty,
@@ -241,6 +244,7 @@ fn collect_in(
                 params: Rc::clone(params),
                 body: Rc::clone(body),
                 ret: body.ty.clone(),
+                effectful: crate::cps::needs_cps(&e.ty),
             });
             collect_in(body, enclosing, n, module_level, first_tag, out);
         }
