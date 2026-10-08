@@ -199,7 +199,14 @@ collections at 400k (0.7 s), 183 at 1M (6.8 s, live 4M words). Fix in the alloca
 last collection exceeds max(64K, live)). Needs its own step: it changes when collections
 happen, which several GC tests calibrate against.
 
-## `elya_current_handler` depends on today's handle refusals (review of the lookup fix, 2026-10-03)
+## RESOLVED (slice 5b-10, 2026-10-08): `elya_current_handler` depends on today's handle refusals (review of the lookup fix, 2026-10-03)
+
+D17 is lifted. Every clause and return clause runs with its frame's new `parent` word
+current; a perform walks `parent`s to the frame with a clause; a resume re-installs its
+frame (`parent`, and `next` for a CPS handle) at the resume. The tail-resume install in
+`clause_tail` is now load-bearing and isolated: control K5 fails five `NESTED_HANDLES`
+rows. Original:
+
 
 The global equals "the handler at the end of k's chain" because clauses never perform (D17:
 no handle inside a handle or inside an effectful function). When those refusals are lifted, a
@@ -247,3 +254,48 @@ ops were declined. Original:
 the bare `ping` as `Ty::Error` silently -- and `elya run` ends in E0300 "unbound variable
 `ping`". Pre-existing; 5c-2's non-goal. Decide: reject a bare op reference (an error), or
 make an op a first-class value (an eta-expanded perform).
+
+## Front end: `resume` is typed effect-free -- an escaped resume can perform an unhandled effect (found by slice 5b-10, 2026-10-08)
+
+**Soundness.** `check` accepts this, and the evaluator stops with "internal: unhandled
+effect `t` reached the machine":
+
+```
+effect S { fn get() -> Int }
+effect T { fn t() -> Int }
+pub fn main() -> Int {
+  let f = handle {
+    handle { get() + t() } with { S.get() -> fn(s) { (resume(s))(s) }  return(x) -> fn(s) { x } }
+  } with { T.t() -> resume(10)  return(r) -> r }
+  f(5)
+}
+```
+
+The lambda `fn(s) { (resume(s))(s) }` is typed `fn(Int) -> Int` with an EMPTY row
+(measured on its Core node), but calling it runs the rest of the handled body, which
+performs T -- here after T's handler has returned. Under deep handlers `resume` should
+carry the handle's outer row (the effects the resumed computation may still perform).
+Natively the same shape is refused by name ("resume of an effectful handler in direct
+code", pinned by `an_escaped_resume_of_a_leaking_handle_is_refused_by_name`); once the
+row is carried, that program (m10 in the 5b-10 spec) should compile.
+
+## Front end: recursion through a handle body is rejected (found by slice 5b-10, 2026-10-08)
+
+`fn nest(n: Int) / {T} -> Int { if n == 0 { t() } else { handle { nest(n - 1) + get() }
+with { S.get() -> resume(1)  return(r) -> r } } }` is E0423 ("the rows differ by exactly:
+{S}") and E0420; unannotated, or split into `nest`/`wrap`, it is E0420. The evaluator runs
+it (1000). The handle discharges S, so S should not reach `nest`'s row; recursion inside
+the SCC seems to unify the row before the handle subtracts S. It also blocks the native
+test of deep dynamic handler nesting (the perform walk over many `parent`s).
+
+## Front end: a handle with clauses for only some of its effect's ops checks clean (found by the 5b-10 review, 2026-10-08)
+
+The front end types such a handle as discharging the whole effect, so `fn f() -> Int {
+handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 } }` is typed
+pure; called from `main` with no other handler, `check` is clean and the evaluator stops
+with "internal: unhandled effect `put` reached the machine". With an outer handler for
+`put` the evaluator forwards it there (1226). Natively such a handle now LEAKS the effect
+(`cps::effect_facts` counts an effect handled only when every op the module performs has
+a clause), so it compiles as a CPS handle where its region is effectful and is refused by
+name where the types call it pure. Language question for the maintainer: require a clause
+for every op (an error), or keep forwarding and put the unhandled ops in the handle's row.
