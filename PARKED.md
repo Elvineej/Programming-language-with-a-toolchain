@@ -313,15 +313,41 @@ for every op (an error), or keep forwarding and put the unhandled ops in the han
 
 ## Front end: further soundness gaps found by the resume-row review (2026-10-08)
 
-- **Effects silently dropped on a closed row.** `add_effect`/`add_row` return a
+- **RESOLVED (branch `claude/row-conflicts`, 2026-10-08): effects silently dropped on a
+  closed row** -- now E0423 "this effect reaches a row that was already closed"
+  (`tests/row_soundness.rs`). The cost: programs that checked clean ONLY by dropping the
+  effect are rejected, including ones the evaluator runs under a handler (the recursive
+  `go` below, 64). Accepting them soundly needs row subsumption (see the next entry).
+  Original: `add_effect`/`add_row` return a
   `RowConflict` when the ambient is already closed, and the perform and call paths discard
   it (`let _ = ...`). `fn go(n) { let f = fn(s) { s + (if n == 0 { 0 } else { go(n - 1) })
   }  f(1) + lg(n) }` is typed `fn(Int) -> Int`: the lambda calls the enclosing recursive
   `go`, its closing step closes `go`'s row early, and the later `lg` is dropped; `main`
   calls it unhandled, `check` is clean, the evaluator stops on unhandled `lg`. Moving `lg`
   before the lambda gives E0420. Surfacing the conflict as a diagnostic is the first step.
-- **`let` annotations are ignored:** `let s: String = 1` checks clean.
+- **Type annotations are ignored -- all of them.** The parser's `skip_type_annotation`
+  ("Slice 1 has no type checker") discards parameter, return and `let` types:
+  `let s: String = 1` and `fn f(x: Int) -> String { x }` check clean. Only effect rows
+  (`/ {..}`) are checked. Checking them is a language decision (the annotation syntax for
+  function types and type variables, and their scoping): ask the maintainer.
 - **An open-row function value called inside a handle body** gets the handled effect forced
   into its row and is rejected (the evaluator prints 12) -- likely the same root as
   "recursion through a handle body".
+
+## Language question: effect rows unify by equality -- sub-effecting? (row-soundness sweep, 2026-10-08)
+
+Rows of function values, `if` branches and clause values unify by EQUALITY (spec 3.6: no
+sub-effecting), and a call pours the callee's row into the caller by unifying tails. So a
+pure lambda joined to an effectful one closes a row early, and since the sweep the later
+effect is a named E0423 rather than silently dropped. Programs the evaluator runs that
+are now rejected for this reason: the recursive `go` under a handler
+(`tests/row_soundness.rs`), m10 of the 5b-10 spec (clause values `{T}` vs pure), a
+handler's `return(x) -> fn(s) { x }` beside an effectful clause value, `if c { fn(s) { s }
+} else { fn(s) { s + go(n - 1) } }`. A tried fix (leave a lambda's tail open when it is free
+in the environment) accepted some and rejected others base accepted soundly -- a handled
+effect leaking into a recursive function's row, and a forwarding lambda forcing its
+function's own effect onto the forwarded parameter (`w(k) { let f = fn(s) { k(s) }  f(1)
++ lg(1) }`) -- so it was reverted. Options: (a) keep equality (sound, strict); (b)
+sub-effecting at function-value joins (a pure function usable where `{T}` is expected);
+(c) full row-constraint inference. Ask the maintainer before any of (b)/(c).
 
