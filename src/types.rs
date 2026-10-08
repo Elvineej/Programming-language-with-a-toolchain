@@ -150,9 +150,11 @@ pub struct Infer {
     /// Operation name -> its elaborated signature. Populated from `effect`
     /// declarations before inference; a call to one of these is a *perform*.
     ops: HashMap<String, OpInfo>,
-    /// Stack of `(B, R)` for the handler clause currently being typed: `resume`
-    /// takes the operation's result type `B` and yields the handle's result `R`.
-    resume_stack: Vec<(Ty, Ty)>,
+    /// Stack of `(B, R, ε)` for the handler clause currently being typed:
+    /// `resume` takes the operation's result type `B`, yields the handle's
+    /// result `R`, and performs `ε` -- the handled body's effects minus the
+    /// handled one, which the resumed computation may still perform.
+    resume_stack: Vec<(Ty, Ty, EffectRow, Option<String>)>,
     /// Constructor name -> arity. An n-ary constructor used unapplied or
     /// partially applied is `E0433` (unapplied constructors need 4b's closures).
     ctor_arity: HashMap<String, usize>,
@@ -945,11 +947,33 @@ impl Infer {
             Expr::Resume { arg } => {
                 let arg_ty = self.infer_expr(arg, env, amb);
                 match self.resume_stack.last().cloned() {
-                    Some((b, r)) => {
-                        // resume : (B) -> R — takes the operation's result, yields
-                        // the handle's result. Its latent effect is the clause's
-                        // ambient, already threaded, so nothing new is added here.
+                    Some((b, r, eff, handled)) => {
+                        // resume : (B) / ε -> R — takes the operation's result,
+                        // yields the handle's result, and runs the rest of the
+                        // handled body, which may still perform ε. Directly in
+                        // the clause ε is already in the ambient (the handle
+                        // discharges into it); inside a LAMBDA in the clause it
+                        // is not, and leaving it out typed such a lambda pure
+                        // (found by slice 5b-10: an escaped resume performed an
+                        // effect nothing handled, on a program `check` passed).
+                        //
+                        // LABELS only, never the tail: `add_row` unifies tails,
+                        // which made this site's ambient EQUAL to the body's tail
+                        // and merged rows related only by inclusion (the review of
+                        // the first version: a direct resume tied the enclosing
+                        // function's row to a lambda that then closed it, and a
+                        // later effect was dropped -- a new hole). The body's
+                        // labels are re-read here, so ones it gained since the
+                        // clauses began are included; an effect the body only
+                        // RELAYS through an open row is not (PARKED).
                         self.unify(&arg_ty, &b, span);
+                        let now = self.resolve_row(&eff);
+                        for (label, l) in now.labels.iter() {
+                            if handled.as_deref() == Some(label.as_str()) {
+                                continue;
+                            }
+                            let _ = self.add_effect(amb, label, l.args.clone(), l.span);
+                        }
                         r
                     }
                     // resume outside a handler is E0210 at resolve time.
@@ -1257,6 +1281,14 @@ impl Infer {
 
         // R — the handle's result type, shared by every clause and `return`.
         let result = self.fresh();
+        // ε — what a `resume` in a clause may still perform: the body's effects
+        // minus the handled one (the resumed handler handles that one again).
+        // Its tail is the body's row variable, so effects the body's row gains
+        // later reach every resume too.
+        let mut resume_eff = self.resolve_row(&EffectRow::open(amb_in));
+        if let Some(e) = &effect {
+            resume_eff.labels.remove(e);
+        }
         for c in &handler.clauses {
             let clause = &c.node;
             let (params, b) = match self.ops.get(&clause.op).cloned() {
@@ -1300,7 +1332,8 @@ impl Infer {
             }
             // The clause body runs at the handler's *outer* ambient; `resume`
             // there takes B and yields R.
-            self.resume_stack.push((b, result.clone()));
+            self.resume_stack
+                .push((b, result.clone(), resume_eff.clone(), effect.clone()));
             let clause_ty = self.infer_expr(&clause.body, env, amb);
             self.unify(&clause_ty, &result, clause.body.span);
             self.resume_stack.pop();

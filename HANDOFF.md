@@ -3,19 +3,25 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-08)
+## State at handoff (updated 2026-10-08, late)
 
 - `main` has slices 5b-8, 5c-1..3, 5b-9a, the CEK example, the PolyForm Strict license and
-  this file. **Open PR #15** lands the tail-in-match fix and slice 5b-9b on `main` (Windows
-  CI green on its tip). Slice 5b-10 (this file's newest Done entry) is on branch
-  `claude/slice-5b10-nested-handles`, stacked on #15's branch: merge #15 first, then
-  retarget 5b-10's PR to `main`.
+  this file. Open PRs, stacked, merge **in order**, retargeting each to `main` after the
+  one below it merges:
+  - **#15** tail-in-match fix + slice 5b-9b (base `main`);
+  - **#16** slice 5b-10, nested handles (base #15's branch);
+  - the resume-row soundness fix, branch `claude/resume-row` (base #16's branch).
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
   university address; every branch was force-pushed. Do not push old local branches.
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the 5b-10 tip: 677 passed, 67 suites. `gc_mark` 637 bytes.
+- Linux gate at the resume-row tip: 695 passed, 69 suites. `gc_mark` 637 bytes.
+- **Asked the maintainer (2026-10-08), no answer yet:** which problems of today's languages
+  Elya should prioritise (effect-typed code, async without function colouring, per-
+  dependency capabilities against supply-chain attacks, deterministic replay, handler-based
+  testing, null-free ADTs, affine resources, provenance debugging). Record the answer in
+  the roadmap and reorder these steps by it.
 
 ## How work is done here (non-negotiable)
 
@@ -97,20 +103,24 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   effect-free (a soundness hole), partial handles check clean, recursion through a handle
   body is rejected by inference.
 
+- **`resume` carries its handle's row** (2026-10-08, branch `claude/resume-row`): spec
+  `docs/superpowers/specs/2026-10-08-elya-resume-row-design.md`. Closes the soundness hole
+  5b-10 found; the first version opened a new one (tail unification), caught by the
+  independent review and fixed test-first. m10's T-carrying variant now compiles natively.
+
 ## The next five steps
 
-### 1. Front end: `resume` carries its handle's row (soundness; found by 5b-10)
+### 1. Front end: the soundness sweep the resume-row review found (urgent)
 
-PARKED, "`resume` is typed effect-free". A program that checks clean stops in the evaluator
-with "unhandled effect `t` reached the machine": a lambda that resumes is typed pure, but
-calling it runs the rest of the handled body. Under deep handlers `resume(v)` should carry
-the handle's OUTER row (what the resumed computation may still perform). Measure first (the
-PARKED program, m10 from the 5b-10 spec, every corpus that resumes inside a lambda), red
-tests in `tests/` (a type error where today `check` is clean), then the fix in
-`src/types.rs`. Expect m10 to compile natively afterwards and
-`an_escaped_resume_of_a_leaking_handle_is_refused_by_name` to flip (an approved
-expected-value change: say so in the commit). Any existing program the fix rejects is a
-language decision: stop and ask the maintainer.
+PARKED, "further soundness gaps" and the open half of "`resume` is typed effect-free":
+- `add_effect`/`add_row` conflicts are DISCARDED on the perform and call paths, so an
+  effect added to a row closed early vanishes (`go`/`lg` example: `check` clean, the
+  evaluator stops on an unhandled `lg`). Surface the conflict as a diagnostic first and
+  measure what else it reports across every corpus.
+- resume's row lacks the return clause's effects and re-entered clauses' effects.
+- `let` annotations are ignored (`let s: String = 1` checks clean).
+Each: measured table, red test, fix, controls. A fix that rejects a program the corpora
+accept is a language decision: stop and ask.
 
 ### 2. Evaluator: non-tail recursion under a handler is quadratic
 
