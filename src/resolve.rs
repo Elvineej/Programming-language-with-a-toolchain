@@ -194,6 +194,66 @@ impl Cx<'_> {
         true
     }
 
+    /// E0207 (the maintainer's decision, 2026-10-08): a handler must give a
+    /// clause for EVERY operation of the effect it handles. A partial handler
+    /// checked clean and was typed as discharging the whole effect, while at
+    /// run time the uncovered operations went to an outer handler -- or to no
+    /// handler at all ("unhandled effect reached the machine"). An op some
+    /// clause already names (even a malformed clause, E0203) is not reported
+    /// again here.
+    fn check_handler_covers_its_effect(&mut self, handler: &crate::ast::Handler, span: Span) {
+        let named: HashSet<&str> = handler.clauses.iter().map(|c| c.node.op.as_str()).collect();
+        let mut effects: Vec<&String> = handler
+            .clauses
+            .iter()
+            .filter_map(|c| self.op_effect.get(&c.node.op))
+            .collect();
+        effects.sort();
+        effects.dedup();
+        for eff in effects {
+            let mut missing: Vec<&String> = self
+                .op_effect
+                .iter()
+                .filter(|(op, e)| {
+                    *e == eff && !named.contains(op.as_str()) && !self.dup_ops.contains(*op)
+                })
+                .map(|(op, _)| op)
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            missing.sort();
+            let list = missing
+                .iter()
+                .map(|op| format!("`{op}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let stubs = missing
+                .iter()
+                .map(|op| {
+                    let n = self.op_arity.get(*op).copied().unwrap_or(0);
+                    let ps: Vec<String> = (0..n)
+                        .map(|i| {
+                            char::from_u32('a' as u32 + i as u32)
+                                .map(String::from)
+                                .unwrap_or_else(|| format!("a{i}"))
+                        })
+                        .collect();
+                    format!("{eff}.{op}({}) -> …", ps.join(", "))
+                })
+                .collect::<Vec<_>>()
+                .join("  ");
+            self.diags.push(
+                Diagnostic::error(
+                    "E0207",
+                    format!("this handler does not cover every operation of `{eff}`"),
+                )
+                .with_label(span, format!("no clause for {list}"))
+                .with_help(format!("a handler handles the whole effect: add {stubs}")),
+            );
+        }
+    }
+
     /// E0200: the name must resolve to a local, function, operation or
     /// constructor.
     fn check_name(&mut self, name: &str, span: Span, scope: &[HashSet<String>]) {
@@ -364,6 +424,7 @@ impl Cx<'_> {
                     scope.pop();
                 }
                 self.in_handler -= 1;
+                self.check_handler_covers_its_effect(handler, span);
                 if let Some(ret) = &handler.ret {
                     // The return clause runs after the computation completes;
                     // `resume` is not in scope there.

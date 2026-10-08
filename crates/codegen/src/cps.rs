@@ -1011,4 +1011,32 @@ mod tests {
             sites.iter().map(names).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn a_partial_handle_leaks_the_ops_it_does_not_cover() {
+        // Defence in depth: since E0207 (resolve) a partial handler never
+        // passes the front end, but `Fx` must not call one direct if a Core
+        // module ever carries it -- the 5b-10 review measured that as a silent
+        // wrong value (2220 for 1220). Types alone accept it, so `core_of`
+        // (which runs no resolve pass) can build it.
+        let core = core_of(
+            "effect S { fn get() -> Int  fn put(x: Int) -> Int }\n\
+             pub fn main() -> Int {\n  handle {\n    \
+             handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 }\n  \
+             } with { S.get() -> resume(100)  S.put(x) -> resume(x * 2) + 1000  return(r) -> r * 2 }\n}\n",
+        );
+        let fx = effect_facts(&core);
+        let nodes = crate::cps_emit::index_nodes(&core);
+        let handles: Vec<usize> = nodes
+            .iter()
+            .filter(|(_, e)| matches!(e.kind, CoreKind::Handle(_)))
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(handles.len(), 2);
+        assert_eq!(
+            fx.leaking.len(),
+            1,
+            "the inner (partial) handle leaks S, the outer covers it"
+        );
+    }
 }

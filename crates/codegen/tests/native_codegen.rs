@@ -3288,52 +3288,6 @@ const NESTED_HANDLES: &[(&str, &str, &str)] = &[
         "321",
     ),
     (
-        // 5b-10 review: the inner handle has a clause for `get` only, so `put`
-        // goes to the outer handle, whose non-tail resume must get the OUTER
-        // handle's answer: ((1 + 10) * 10 + 1000) * 2. The front end types the
-        // inner handle as discharging S; compiled direct, it printed 2220.
-        "partial-handle-forwards-to-the-outer",
-        "effect S { fn get() -> Int  fn put(x: Int) -> Int }\n\
-         pub fn main() -> Int {\n\
-         \x20 handle {\n\
-         \x20   handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 }\n\
-         \x20 } with { S.get() -> resume(100)  S.put(x) -> resume(x * 2) + 1000  return(r) -> r * 2 }\n\
-         }\n",
-        "1220",
-    ),
-    (
-        // 5b-10 review: the same, with the outer `put` clause aborting:
-        // (5 + 1000) + 1. Compiled direct, it printed 2011.
-        "partial-handle-outer-clause-aborts",
-        "effect S { fn get() -> Int  fn put(x: Int) -> Int }\n\
-         pub fn main() -> Int {\n\
-         \x20 let v = handle {\n\
-         \x20   handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 }\n\
-         \x20 } with { S.get() -> resume(100)  S.put(x) -> x + 1000  return(r) -> r * 2 }\n\
-         \x20 v + 1\n\
-         }\n",
-        "1006",
-    ),
-    (
-        // 5b-10 review: the aborting shape inside an effectful function, under
-        // a T handler: ((5 + 1000 + 10) + 1) * 3 + 7. Compiled direct, it
-        // printed 18400.
-        "partial-handle-abort-in-an-effectful-fn",
-        "effect S { fn get() -> Int  fn put(x: Int) -> Int }\n\
-         effect T { fn t() -> Int }\n\
-         fn f() -> Int {\n\
-         \x20 let v = handle {\n\
-         \x20   let a = handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 }\n\
-         \x20   a + t()\n\
-         \x20 } with { S.get() -> resume(100)  S.put(x) -> x + 1000 + t()  return(r) -> r * 2 }\n\
-         \x20 v + 1\n\
-         }\n\
-         pub fn main() -> Int {\n\
-         \x20 handle { f() * 3 } with { T.t() -> resume(10)  return(r) -> r + 7 }\n\
-         }\n",
-        "3055",
-    ),
-    (
         // The resume-row review: `g` resumes directly in one branch of its
         // clause and builds a resuming lambda in the other, then performs L.
         // The first version of the resume-row fix typed `g` pure (its row
@@ -3350,31 +3304,6 @@ const NESTED_HANDLES: &[(&str, &str, &str)] = &[
         "8",
     ),
 ];
-
-/// 5b-10 review: a handle with a clause for only SOME of its effect's ops is
-/// typed by the front end as discharging the effect, so `f` is typed pure; at
-/// run time `put` still reaches main's handler, so natively `f` is effectful
-/// (its handle leaks S). The disagreement is refused by name, never
-/// mis-compiled (before the fix the walk compiled it and printed 2226 where
-/// the evaluator printed 1226).
-#[test]
-fn a_partial_handle_in_a_function_typed_pure_is_refused_by_name() {
-    let src = "effect S { fn get() -> Int  fn put(x: Int) -> Int }\n\
-               fn f() -> Int {\n\
-               \x20 handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 }\n\
-               }\n\
-               pub fn main() -> Int {\n\
-               \x20 handle { f() + 3 } with { S.get() -> resume(100)  S.put(x) -> resume(x * 2) + 1000  return(r) -> r * 2 }\n\
-               }\n";
-    assert_eq!(eval_main_int(src), "1226");
-    let dir = temp_dir("partial-handle-typed-pure");
-    let err = try_compile_and_link(&lower_src(src), &dir, "partial-handle-typed-pure").unwrap_err();
-    assert!(
-        err.contains("calling convention disagrees with the callee"),
-        "{err}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
 
 #[test]
 fn the_nested_handle_corpus_compiles_and_runs() {

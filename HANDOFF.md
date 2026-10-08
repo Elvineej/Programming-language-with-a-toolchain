@@ -11,25 +11,27 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   - **#15** tail-in-match fix + slice 5b-9b (base `main`);
   - **#16** slice 5b-10, nested handles (base #15's branch);
   - **#17** the resume-row soundness fix (base #16's branch);
-  - the dropped-effect fix, branch `claude/row-conflicts` (base #17's branch).
+  - **#18** the dropped-effect fix (base #17's branch);
+  - partial handlers are E0207, branch `claude/partial-handlers` (base #18's branch).
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
   university address; every branch was force-pushed. Do not push old local branches.
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the row-conflicts tip: 709 passed, 71 suites. `gc_mark` 637 bytes.
-- **Asked the maintainer (2026-10-08), no answer yet:** which problems of today's languages
-  Elya should prioritise (effect-typed code, async without function colouring, per-
-  dependency capabilities against supply-chain attacks, deterministic replay, handler-based
-  testing, null-free ADTs, affine resources, provenance debugging). Record the answer in
-  the roadmap and reorder these steps by it.
+- Linux gate at the partial-handlers tip: 721 passed, 73 suites. `gc_mark` 637 bytes.
+- **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
+  colouring, per-dependency capabilities, exact replay and handler-based testing) and the
+  language decisions taken. The maintainer delegated all choices (rule 2).
 
 ## How work is done here (non-negotiable)
 
 1. **Measure first.** Run the real program through `elya check | run | build` and write
    the table into the spec before designing (see any 5c spec, §0).
-2. **Language decisions belong to the maintainer.** Ask, offering options with a
-   recommendation, then record the answer in the spec. Never decide the language silently.
+2. **Language decisions: delegated to Claude (the maintainer, 2026-10-09: "From now on u
+   handle all including the choices", aiming for a language with real advantages --
+   high-tech and experimental, but WORKING; unconventional implementations are fine).**
+   Decide, write the options and the reason into the spec, and say so in the PR. Never
+   decide silently, and never trade away soundness or the gate for novelty.
 3. **Spec, then plan (with numeric predictions), then red tests, then code.** Every new
    test must fail first with the predicted value.
 4. **Negative controls:** break each rule on purpose, observe a *distinct* failure,
@@ -114,19 +116,26 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   half (an environment rule for lambda tails) was reverted after the review found two
   regressions -- sub-effecting is now a parked language question.
 
+- **Partial handlers are an error, `E0207`** (2026-10-09, branch `claude/partial-handlers`,
+  the maintainer's choice): `tests/handler_coverage.rs`. `effect_syntax`'s A3 program
+  gained the `State.set` clause it lacked; the three partial-handler native rows went (the
+  programs no longer pass the front end).
+
 ## The next five steps
 
-### 1. Front end: the rest of the soundness sweep, and three questions to ask
+### 1. Sub-effecting for function values (decided; spec first)
 
-- resume's row lacks the return clause's effects and re-entered clauses' effects (PARKED,
-  "`resume` is typed effect-free", the open half): a program checks clean and the
-  evaluator stops on an unhandled `t`. Needs the clause rows before the clauses are typed.
-  Measure, red test, fix, controls.
-- Ask the maintainer, offering options with a recommendation (PARKED has each): partial
-  handlers (error, or forward the rest and put it in the row); type annotations, which
-  the parser discards entirely (check them, and with what syntax for function types);
-  sub-effecting for effect rows (equality, function-value joins, or full constraints).
-A fix that rejects a program the corpora accept is a language decision: stop and ask.
+`docs/ROADMAP.md` and PARKED, "effect rows unify by equality". Where two function values
+meet (`if` branches, clause values, a call's argument against a parameter, a `let` and its
+uses) a function with a SMALLER row must be accepted where a bigger one is expected. Spec
+first: the measured table (m10 of the 5b-10 spec, the recursive `go` in
+`tests/row_soundness.rs`, the reverted environment rule's two regressions, the relay
+over-rejections `twice`/`mk` from the review), then a design -- e.g. instantiate a pure
+closed row as fresh-open at each join, or an "at most" row constraint -- with predictions,
+then red tests. The native side must keep D16 sound: a function's CONVENTION is fixed by
+its definition's row, so a direct function used where an effectful one is expected needs
+an adapter (wrap it as CPS) or a refusal by name. Then the rest of the sweep: resume's row
+lacks return-clause and re-entered-clause effects.
 
 ### 2. Evaluator: non-tail recursion under a handler is quadratic
 
@@ -136,14 +145,14 @@ continuation?), predict the complexity, fix, and pin it with a timing-free test 
 counts steps or allocations. The evaluator is the reference semantics, so the
 differential corpora must stay green unchanged.
 
-### 3. N7: runtime polymorphism (spec first, stop for decisions)
+### 3. N7: runtime polymorphism (spec first; decisions recorded in it, rule 2)
 
 - Lifts the `Ty::Var` "unrepresentable type" refusal (5c-2's n4 hits it) and D16's
   conservative refusal of effect-polymorphic functions at user effects (5b-9a's s4).
 - The roadmap direction is specialisation in core code plus dictionary passing above it,
   with `@specialize`/`@share` and an enforced code-size budget.
-- Write the measured table and the open questions, then ask the maintainer before
-  planning. This is a large arc; plan it as several slices.
+- Write the measured table and the open questions, decide them in the spec (rule 2),
+  then plan. This is a large arc; plan it as several slices.
 
 ### 4. Native multi-shot handlers (`with multi`)
 
@@ -153,24 +162,25 @@ a resume also MUTATES its handler frame (`next`, `parent`): a second resume need
 chain, handler frames included, COPIED first, and the one-shot word replaced by a
 copy-on-resume rule. Measure first (the evaluator's multi-shot corpus, e.g.
 `multi_shot_collects_both_branches`, through `build`), then a spec with the copy cost
-stated and gated against A4's live-set instrument. Ask the maintainer whether multi-shot is
-worth native support before N7.
+stated and gated against A4's live-set instrument. Multi-shot is what a native
+probabilistic or backtracking handler needs (ROADMAP), so it is worth doing natively.
 
-### 5. Native strings: `<>` and an Int-to-String builtin
+### 5. Check type annotations (decided; spec first)
 
-`<>` (string concatenation) runs in the evaluator but is refused natively by name (5b-8
-§9.1), and there is no way to turn an `Int` into a `String` at all -- which is why the
-Elya CEK example prints fixed strings instead of its results. Measure first (every
-corpus and example that uses `<>`, through `build`). The runtime needs a concatenation
-that allocates a fresh string block (one descriptor row already exists for strings) and
-an integer formatter. The builtin's NAME and module (`int.to_string`? `show`?) is a
-language decision: ask the maintainer, offering options. Then let the CEK example print
-its answers.
+The parser's `skip_type_annotation` discards every parameter, return and `let` type
+(`let s: String = 1` checks clean). Parse them into `TypeAnn` (the effect-op elaborator
+already turns `TypeAnn` into `Ty`), add syntax for function types (`fn(Int) / {S} -> Int`)
+and type variables, unify each annotation with the inferred type, and report mismatches
+with the annotation's span. Measure first: every annotation in the corpora, examples and
+`tests/ui` -- a corpus program with a wrong annotation is a bug in the corpus, fixed and
+called out. Native strings (`<>`, Int-to-String) move to "Also open"; the CEK example is
+their first user.
 
-Also open, unscheduled: two front-end findings from 5b-10 (PARKED): recursion through a
-handle body is rejected by inference, and a handle with clauses for only some of its
-effect's ops checks clean (a language question: error, or forward and put the rest in the
-row). A perform walks the handler chain, so a program whose handler stack really grows
+Also open, unscheduled: native strings (`<>` refused natively, no Int-to-String; the
+builtin's name is Claude's call now -- `int.to_string` is the natural one); the roadmap's
+priority problems after these five (async as an effect with a scheduler handler first,
+then record/replay handlers, then capabilities once modules exist); recursion through a
+handle body is rejected by inference (PARKED). A perform walks the handler chain, so a program whose handler stack really grows
 (a resume inside a fresh handle every iteration) pays O(depth) per perform; the evaluator
 is no faster there. Also: the Elya CEK machine's next versions (a parser for its terms, a step
 counter as an Elya effect); PIC/PIE linking (needs a Windows run), and a named diagnosis for
