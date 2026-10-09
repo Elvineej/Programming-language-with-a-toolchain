@@ -49,12 +49,17 @@ pub struct FnDecl {
     /// `Some(vec![])` = explicit pure `/ {}`, `Some([Log@span, …])` = declared
     /// exactly those effects. Spans point diagnostics at the declared effect.
     pub effect_row: Option<Vec<Spanned<String>>>,
+    /// The declared return type, `-> T` (checked since 2026-10-09; it used to
+    /// be parsed and discarded).
+    pub ret_ann: Option<Spanned<TypeAnn>>,
     pub body: Rc<Spanned<Block>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Param {
     pub name: String,
+    /// `name: T` -- checked since 2026-10-09 (it used to be discarded).
+    pub ann: Option<Spanned<TypeAnn>>,
 }
 
 /// A surface type annotation. Slice 3a: base names (`Int`, `String`, `Unit`, …)
@@ -64,6 +69,10 @@ pub struct Param {
 pub struct TypeAnn {
     pub name: String,
     pub args: Vec<Spanned<TypeAnn>>,
+    /// A function type `fn(A, B) / {E} -> R` (2026-10-09) has `name == "fn"`,
+    /// `args == [A, B, R]` (the result last) and its row here: `None` when the
+    /// annotation names no row (any effects), `Some(vec![])` for `/ {}`.
+    pub row: Option<Vec<Spanned<String>>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -118,7 +127,12 @@ pub struct Block {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
-    Let { name: String, value: Spanned<Expr> },
+    Let {
+        name: String,
+        /// `let name: T = value` -- checked since 2026-10-09.
+        ann: Option<Spanned<TypeAnn>>,
+        value: Spanned<Expr>,
+    },
     Expr(Spanned<Expr>),
 }
 
@@ -327,7 +341,7 @@ fn pretty_block(b: &Block, s: &mut String) {
     for st in b.stmts.iter() {
         s.push(' ');
         match &st.node {
-            Stmt::Let { name, value } => {
+            Stmt::Let { name, value, .. } => {
                 s.push_str(&format!("(let {} ", name));
                 pretty_expr(&value.node, s);
                 s.push(')');
@@ -539,6 +553,7 @@ mod tests {
                     fields: vec![sp(TypeAnn {
                         name: "a".into(),
                         args: vec![],
+                        row: None,
                     })],
                 }),
             ],
@@ -571,8 +586,12 @@ mod tests {
                 sp(Decl::Fn(FnDecl {
                     is_pub: false,
                     name: "f".into(),
-                    params: vec![sp(Param { name: "o".into() })],
+                    params: vec![sp(Param {
+                        name: "o".into(),
+                        ann: None,
+                    })],
                     effect_row: None,
+                    ret_ann: None,
                     body: Rc::new(sp(Block {
                         stmts: vec![].into(),
                         tail: Some(Rc::new(sp(m))),
@@ -600,6 +619,7 @@ mod tests {
                 name: "f".into(),
                 params: vec![],
                 effect_row: None,
+                ret_ann: None,
                 body: Rc::new(sp(Block {
                     stmts: vec![].into(),
                     tail: Some(Rc::new(sp(e))),
@@ -618,14 +638,19 @@ mod tests {
             is_multi: false,
             ops: vec![sp(OpSig {
                 name: "log".into(),
-                params: vec![sp(Param { name: "msg".into() })],
+                params: vec![sp(Param {
+                    name: "msg".into(),
+                    ann: None,
+                })],
                 param_tys: vec![sp(TypeAnn {
                     name: "String".into(),
                     args: vec![],
+                    row: None,
                 })],
                 ret: sp(TypeAnn {
                     name: "Unit".into(),
                     args: vec![],
+                    row: None,
                 }),
             })],
         });
@@ -635,7 +660,10 @@ mod tests {
             clauses: vec![sp(OpClause {
                 effect: Some("Log".into()),
                 op: "log".into(),
-                params: vec![sp(Param { name: "m".into() })],
+                params: vec![sp(Param {
+                    name: "m".into(),
+                    ann: None,
+                })],
                 body: Rc::new(sp(Expr::Resume {
                     arg: Rc::new(sp(Expr::Var("m".into()))),
                 })),
@@ -658,6 +686,7 @@ mod tests {
                     name: "f".into(),
                     params: vec![],
                     effect_row: None,
+                    ret_ann: None,
                     body: Rc::new(sp(Block {
                         stmts: vec![].into(),
                         tail: Some(Rc::new(sp(handle))),

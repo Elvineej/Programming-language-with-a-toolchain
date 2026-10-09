@@ -49,7 +49,7 @@ impl<'a> Ctx<'a> {
     fn walk_block(&mut self, b: &Block) {
         for st in b.stmts.iter() {
             match &st.node {
-                Stmt::Let { name, value } => {
+                Stmt::Let { name, value, .. } => {
                     self.walk_expr(value);
                     // A newly-bound affine value (its RHS span is the site).
                     if self.affine_sites.contains(&value.span) {

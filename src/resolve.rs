@@ -302,7 +302,7 @@ impl Cx<'_> {
         scope.push(HashSet::new());
         for st in b.stmts.iter() {
             match &st.node {
-                Stmt::Let { name, value } => {
+                Stmt::Let { name, value, .. } => {
                     self.check_expr(&value.node, value.span, scope);
                     scope.last_mut().unwrap().insert(name.clone());
                 }

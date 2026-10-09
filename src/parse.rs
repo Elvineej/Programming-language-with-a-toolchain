@@ -473,10 +473,12 @@ impl<'a> Parser<'a> {
                 match self.peek()?.clone() {
                     TokenKind::Lower(pn) => {
                         self.bump();
-                        if self.eat(&TokenKind::Colon) {
-                            self.skip_type_annotation();
-                        }
-                        params.push(spanned(Param { name: pn }, pspan));
+                        let ann = if self.eat(&TokenKind::Colon) {
+                            Some(self.type_ann()?)
+                        } else {
+                            None
+                        };
+                        params.push(spanned(Param { name: pn, ann }, pspan));
                     }
                     _ => {
                         self.error(pspan, "expected parameter name");
@@ -647,7 +649,13 @@ impl<'a> Parser<'a> {
                     return None;
                 }
                 let ty = self.type_ann()?;
-                params.push(spanned(Param { name: pname }, pspan));
+                params.push(spanned(
+                    Param {
+                        name: pname,
+                        ann: None,
+                    },
+                    pspan,
+                ));
                 param_tys.push(ty);
                 if !self.eat(&TokenKind::Comma) {
                     break;
@@ -677,6 +685,69 @@ impl<'a> Parser<'a> {
 
     fn type_ann(&mut self) -> Option<Spanned<TypeAnn>> {
         let span = self.peek_span();
+        // A function type (2026-10-09): `fn(A, B) / {E} -> R`; the row is
+        // optional (none written: any effects).
+        if self.eat(&TokenKind::KwFn) {
+            if !self.eat(&TokenKind::LParen) {
+                self.error(self.peek_span(), "expected `(` in a function type");
+                return None;
+            }
+            let mut args = Vec::new();
+            if self.peek() != Some(&TokenKind::RParen) {
+                loop {
+                    args.push(self.type_ann()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            if !self.eat(&TokenKind::RParen) {
+                self.error(self.peek_span(), "expected `)` in a function type");
+                return None;
+            }
+            let row = if self.eat(&TokenKind::Slash) {
+                Some(self.effect_row())
+            } else {
+                None
+            };
+            if !self.eat(&TokenKind::Arrow) {
+                self.error(self.peek_span(), "expected `->` in a function type");
+                return None;
+            }
+            let ret = self.type_ann()?;
+            let end = ret.span;
+            args.push(ret);
+            return Some(spanned(
+                TypeAnn {
+                    name: "fn".to_string(),
+                    args,
+                    row,
+                },
+                span.merge(end),
+            ));
+        }
+        // `(T)` is T (the old annotation skipper accepted it; 2026-10-09).
+        if self.eat(&TokenKind::LParen) {
+            if self.eat(&TokenKind::RParen) {
+                return Some(spanned(
+                    TypeAnn {
+                        name: "Unit".to_string(),
+                        args: Vec::new(),
+                        row: None,
+                    },
+                    span,
+                ));
+            }
+            let inner = self.type_ann()?;
+            if !self.eat(&TokenKind::RParen) {
+                self.error(
+                    self.peek_span(),
+                    "expected `)` -- tuple types are not supported in annotations",
+                );
+                return None;
+            }
+            return Some(inner);
+        }
         let name = match self.peek()?.clone() {
             TokenKind::Upper(n) => {
                 self.bump();
@@ -707,7 +778,14 @@ impl<'a> Parser<'a> {
             }
             self.eat(&TokenKind::RParen);
         }
-        Some(spanned(TypeAnn { name, args }, span))
+        Some(spanned(
+            TypeAnn {
+                name,
+                args,
+                row: None,
+            },
+            span,
+        ))
     }
 
     fn handle_expr(&mut self) -> Option<Spanned<Expr>> {
@@ -817,7 +895,7 @@ impl<'a> Parser<'a> {
                 match self.peek()?.clone() {
                     TokenKind::Lower(n) => {
                         self.bump();
-                        params.push(spanned(Param { name: n }, pspan));
+                        params.push(spanned(Param { name: n, ann: None }, pspan));
                     }
                     _ => {
                         self.error(pspan, "expected parameter name");
@@ -901,10 +979,12 @@ impl<'a> Parser<'a> {
                 match self.peek()?.clone() {
                     TokenKind::Lower(pn) => {
                         self.bump();
-                        if self.eat(&TokenKind::Colon) {
-                            self.skip_type_annotation();
-                        }
-                        params.push(spanned(Param { name: pn }, pspan));
+                        let ann = if self.eat(&TokenKind::Colon) {
+                            Some(self.type_ann()?)
+                        } else {
+                            None
+                        };
+                        params.push(spanned(Param { name: pn, ann }, pspan));
                     }
                     _ => {
                         self.error(pspan, "expected parameter name");
@@ -927,10 +1007,12 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        // optional return type: `-> Type`
-        if self.eat(&TokenKind::Arrow) {
-            self.skip_type_annotation();
-        }
+        // optional return type: `-> Type` (checked since 2026-10-09)
+        let ret_ann = if self.eat(&TokenKind::Arrow) {
+            Some(self.type_ann()?)
+        } else {
+            None
+        };
         let body = self.block()?;
         let end = body.span;
         Some(spanned(
@@ -939,6 +1021,7 @@ impl<'a> Parser<'a> {
                 name,
                 params,
                 effect_row,
+                ret_ann,
                 body: Rc::new(body),
             }),
             start.merge(end),
@@ -976,23 +1059,6 @@ impl<'a> Parser<'a> {
         }
         self.eat(&TokenKind::RBrace);
         names
-    }
-
-    /// Slice 1 has no type checker: consume a type annotation and discard it.
-    fn skip_type_annotation(&mut self) {
-        match self.peek().cloned() {
-            Some(TokenKind::Upper(_)) | Some(TokenKind::Lower(_)) | Some(TokenKind::Unit) => {
-                self.bump();
-                if self.eat(&TokenKind::LParen) {
-                    self.skip_balanced_parens();
-                }
-            }
-            Some(TokenKind::LParen) => {
-                self.bump();
-                self.skip_balanced_parens();
-            }
-            _ => { /* nothing to skip */ }
-        }
     }
 
     fn skip_balanced_parens(&mut self) {
@@ -1056,16 +1122,18 @@ impl<'a> Parser<'a> {
                 return None;
             }
         };
-        if self.eat(&TokenKind::Colon) {
-            self.skip_type_annotation();
-        }
+        let ann = if self.eat(&TokenKind::Colon) {
+            Some(self.type_ann()?)
+        } else {
+            None
+        };
         if !self.eat(&TokenKind::Eq) {
             self.error(self.peek_span(), "expected `=` in let binding");
             return None;
         }
         let value = self.expr(0)?;
         let span = start.merge(value.span);
-        Some(spanned(Stmt::Let { name, value }, span))
+        Some(spanned(Stmt::Let { name, ann, value }, span))
     }
 
     fn if_expr(&mut self) -> Option<Spanned<Expr>> {

@@ -357,3 +357,16 @@ function's own effect onto the forwarded parameter (`w(k) { let f = fn(s) { k(s)
 sub-effecting at function-value joins (a pure function usable where `{T}` is expected);
 (c) full row-constraint inference. Ask the maintainer before any of (b)/(c).
 
+## Annotations: what is not checked yet (the annotations review, 2026-10-09)
+
+- Effect ARGUMENTS in a written row are discarded by `effect_row()`: `k: fn(Int) /
+  {State(Bool)} -> Int` is accepted while the state is Int (not unsound: the argument is
+  inferred consistently), and `/ {State(Int), State(Bool)}` merges silently. Same for
+  top-level `/ {..}` rows, as always.
+- A parameter or lambda-parameter mismatch is reported at the uses, not at the annotation
+  (the annotation is unified with a fresh variable before the body is inferred).
+- Type variables are flexible, not rigid: `fn f(x: Int) -> a` is accepted. Rigid
+  variables behind an explicit `forall` would need skolems.
+- Function-typed ADT fields and effect-operation parameters are a named error ("not
+  supported yet"): they need a row story for type declarations.
+
