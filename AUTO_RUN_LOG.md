@@ -15,5 +15,9 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 - **Done: async step 1** (1a59091): function types in declarations + `examples/04_async.elya`
   (scheduler as a handler; same bytes natively). Gate 816 / 79 suites. Review: no
   regression; re-found the parked resume-row soundness gap (now HANDOFF step 1).
-- Next: HANDOFF step 1 (resume carries relayed and return-clause effects).
-- Windows-gate debt (check.ps1 not run): 786df15, 1a59091.
+- **Done: resume-row completion** (b56566f): resume carries relayed, return-clause and
+  re-entered-clause effects; `wrap(f)` accepted. Gate 836 / 79. Review: 2 holes in the
+  first version fixed; 1 over-rejection pinned as known limitation (rows unify by
+  equality -- see PARKED; a decision candidate for later: inclusion constraints).
+- Next: HANDOFF step 1 (native multi-shot handlers).
+- Windows-gate debt (check.ps1 not run): 786df15, 1a59091, b56566f.
