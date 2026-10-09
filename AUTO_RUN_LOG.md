@@ -12,5 +12,8 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   Spec `docs/superpowers/specs/2026-10-09-elya-n7a-convention-specialization-design.md`.
   Gate 796 passed / 77 suites (baseline 783). Fixed two pre-existing native miscompiles.
   Independent review: 1 regression + 2 pre-existing issues, all pinned red and fixed.
-- Next: HANDOFF step 1 (async as an effect: a scheduler handler).
-- Windows-gate debt (check.ps1 not run): 786df15.
+- **Done: async step 1** (1a59091): function types in declarations + `examples/04_async.elya`
+  (scheduler as a handler; same bytes natively). Gate 816 / 79 suites. Review: no
+  regression; re-found the parked resume-row soundness gap (now HANDOFF step 1).
+- Next: HANDOFF step 1 (resume carries relayed and return-clause effects).
+- Windows-gate debt (check.ps1 not run): 786df15, 1a59091.
