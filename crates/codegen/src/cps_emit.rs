@@ -173,9 +173,13 @@ fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>)
         // }`). Its code has the direct convention, so a CPS call of it would
         // jump into it with the wrong signature -- measured: 2 where the
         // evaluator printed 13. Refused by name until an adapter wraps it.
+        // N7 part 1: compared at EVERY covariant layer -- an upcast in a
+        // function's result (measured: 2 where the evaluator printed 3306) has
+        // agreeing outer conventions. `specialize` eta-expands every upcast of
+        // a tracked binder, so this fires only if that pass missed one.
         CoreKind::Var(name) => {
             if let Some((_, Some(bound))) = locals.iter().rev().find(|(n, _)| n == name) {
-                if needs_cps(&e.ty) && !needs_cps(bound) {
+                if !crate::specialize::conv_eq(bound, &e.ty) {
                     return Err(CodegenError::Unsupported(
                         "direct function used where an effectful one is expected",
                     ));
@@ -189,6 +193,19 @@ fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>)
                     if needs_cps(&callee.ty) && !needs_cps(bound) {
                         return Err(CodegenError::Unsupported(
                             "effect-polymorphic function used at a user effect",
+                        ));
+                    }
+                    // N7 part 1 review: a disagreement in a deeper layer (the
+                    // result of an alias of a generic local; natively it hung
+                    // where the evaluator printed 8). `specialize` coerces the
+                    // results it can; this refuses what it could not.
+                    if !crate::specialize::conv_eq(bound, &callee.ty) {
+                        return Err(CodegenError::Unsupported(
+                            if crate::specialize::user_subst(bound, &callee.ty).is_empty() {
+                                "direct function used where an effectful one is expected"
+                            } else {
+                                "effect-polymorphic function used at a user effect"
+                            },
                         ));
                     }
                 }
@@ -373,9 +390,10 @@ fn check(
 
 /// D16's two refusals at a reference to a top-level function.
 fn check_reference(target: &elya::core::CoreFn, at: &Ty, cps_fns: &HashSet<String>) -> R<()> {
-    let generic_is_polymorphic = target.params.iter().any(|p| cps::ty_has_open_row(&p.ty))
-        || cps::ty_has_open_row(&target.body.ty);
-    if generic_is_polymorphic && cps::ty_names_user_effect(at) {
+    // D16, stated precisely since N7 part 1: one of the target's open row
+    // variables is instantiated at a user effect here. `specialize` sends every
+    // such reference to a clone, so this fires only if that pass missed one.
+    if crate::specialize::instantiates_user_effect(target, at) {
         return Err(CodegenError::Unsupported(
             "effect-polymorphic function used at a user effect",
         ));

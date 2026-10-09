@@ -126,14 +126,17 @@ Elya is a typed language on a CEK machine, built up through these slices:
   stack, compiler-generated descriptor tables and free lists;
 - **one-shot effect handlers** (selective CPS): `handle`/`resume` anywhere in a
   clause, deep re-installation, O(1) handler lookup, one-shot enforced by a named
-  trap, and a state-passing handler loop bounded at N = 1,000,000.
+  trap, and a state-passing handler loop bounded at N = 1,000,000; effectful
+  lambdas and closure calls, and handles nested in handlers or effectful code;
+- **effect-polymorphic functions**: a function generic in its effect row is
+  specialized per calling convention at the rows it is used with, and a pure
+  closure used where an effectful one is expected gets an adapter.
 
 Every native program is checked against the reference evaluator, for both the
 value and the exact bytes printed. CI runs the full gate on Windows too.
 
-Not yet native (refused by name): multi-shot handlers (`with multi`), effectful
-lambdas and closure calls, a `handle` nested in another handler or in effectful
-code, and polymorphic code that stays polymorphic (`Ty::Var`).
+Not yet native (refused by name): multi-shot handlers (`with multi`), and code
+polymorphic in a type variable (`Ty::Var`).
 
 ### Affine resources
 

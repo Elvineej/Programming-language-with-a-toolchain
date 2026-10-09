@@ -3489,10 +3489,12 @@ fn native_output_matches_the_evaluator_across_the_sub_effecting_corpus() {
 /// Sub-effecting lets a DIRECT closure (`f`, generic and pure) be used where an
 /// effectful function is expected (the `if` joins it with a T-performing
 /// lambda). Its code has the direct convention, so the CPS call of `g` jumped
-/// into it with the wrong signature: measured 2 where the evaluator printed 13.
-/// Refused by name until an adapter wraps such a closure.
+/// into it with the wrong signature: measured 2 where the evaluator printed 13,
+/// then refused by name. N7 part 1 (replaces
+/// `a_direct_closure_used_where_an_effectful_one_is_expected_is_refused_by_name`):
+/// the use is eta-expanded into an adapter lambda with the CPS convention.
 #[test]
-fn a_direct_closure_used_where_an_effectful_one_is_expected_is_refused_by_name() {
+fn a_direct_closure_used_where_an_effectful_one_is_expected_runs_through_an_adapter() {
     let src = "effect T { fn t() -> Int }\n\
                fn h(c) {\n\
                \x20 let f = fn(x) { x + 1 }\n\
@@ -3501,22 +3503,16 @@ fn a_direct_closure_used_where_an_effectful_one_is_expected_is_refused_by_name()
                }\n\
                pub fn main() -> Int { handle { h(True) + h(False) } with { T.t() -> resume(10)  return(r) -> r } }\n";
     assert_eq!(eval_main_int(src), "13");
-    let dir = temp_dir("direct-closure-upcast");
-    let err = try_compile_and_link(&lower_src(src), &dir, "direct-closure-upcast").unwrap_err();
-    assert!(
-        err.contains("direct function used where an effectful one is expected"),
-        "{err}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
+    assert_native_matches(src, "13", "direct-closure-upcast");
 }
 
 /// The sub-effecting review's F3: the same upcast reached through a handler's
 /// RETURN binder (`x`, the direct closure `mk()` returns, joined with an
-/// effectful lambda) was not refused -- the return binder's type was not
-/// tracked -- and the CPS call jumped into direct code: 2 where the
-/// evaluator printed 102.
+/// effectful lambda): 2 where the evaluator printed 102, then refused by name.
+/// N7 part 1 (replaces `a_direct_closure_upcast_through_a_return_binder_is_refused_by_name`):
+/// the return binder is tracked, so its upcast gets the adapter too.
 #[test]
-fn a_direct_closure_upcast_through_a_return_binder_is_refused_by_name() {
+fn a_direct_closure_upcast_through_a_return_binder_runs_through_an_adapter() {
     let src = "effect T { fn t() -> Int }\n\
                fn mk() { fn(x) { x + 1 } }\n\
                fn h(c) {\n\
@@ -3525,11 +3521,397 @@ fn a_direct_closure_upcast_through_a_return_binder_is_refused_by_name() {
                }\n\
                pub fn main() -> Int { handle { h(True) + 100 } with { T.t() -> resume(10)  return(r) -> r } }\n";
     assert_eq!(eval_main_int(src), "102");
-    let dir = temp_dir("direct-closure-upcast-ret");
-    let err = try_compile_and_link(&lower_src(src), &dir, "direct-closure-upcast-ret").unwrap_err();
+    assert_native_matches(src, "102", "direct-closure-upcast-ret");
+}
+
+/// N7 part 1, measured on `main` at 5799ba9: the upcast one level down, in the
+/// RESULT of a function value. The outer conventions agree (both direct), so
+/// the outermost-only refusal let it through, and the inner direct closure was
+/// called with the CPS convention: native printed 2 where the evaluator
+/// printed 3306. The adapter now coerces every covariant layer.
+#[test]
+fn a_direct_closure_returned_where_an_effectful_one_is_expected_runs() {
+    let src = "effect T { fn t() -> Int }\n\
+               fn h(c) {\n\
+               \x20 let f = fn() { fn(x) { x + 1 } }\n\
+               \x20 let g = if c { f } else { fn() { fn(x) { t() + x } } }\n\
+               \x20 let k = g()\n\
+               \x20 k(1) * 3\n\
+               }\n\
+               pub fn main() -> Int { handle { h(True) + h(False) * 100 } with { T.t() -> resume(10)  return(r) -> r } }\n";
+    assert_eq!(eval_main_int(src), "3306");
+    assert_native_matches(src, "3306", "direct-closure-result-upcast");
+}
+
+fn assert_native_matches(src: &str, want: &str, tag: &str) {
+    let dir = temp_dir(tag);
+    let exe = try_compile_and_link(&lower_src(src), &dir, tag).unwrap_or_else(|e| panic!("{e}"));
+    let out = Command::new(&exe).output().expect("run produced binary");
+    diagnose_stack_overflow(&out.status, tag);
+    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(out.status.success(), "{tag}: {:?}", out.status);
+    assert_eq!(got, want, "{tag}");
+}
+
+/// N7 part 1 (spec `2026-10-09-elya-n7a-convention-specialization-design.md`):
+/// row-polymorphic functions used at user effects (each was refused by name,
+/// "effect-polymorphic function used at a user effect") and direct closures
+/// upcast to effectful types (refused, "direct function used where an
+/// effectful one is expected"). Values are the evaluator's.
+const CONVENTIONS: &[(&str, &str, &str)] = &[
+    (
+        // `w`'s own `lg` and `k`'s row: `r` is instantiated at nothing new, so
+        // no clone is needed; the old guard refused it anyway.
+        "pure-callback-into-a-relay",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn w(k) { k(0) + lg(1) }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { w(fn(x) { x + 5 }) } with { L.lg(x) -> resume(x * 10)  return(r) -> r }\n\
+         }\n",
+        "15",
+    ),
+    (
+        "apply-at-pure-and-at-a-user-effect",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn apply(f) { f(1) + 1 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = apply(fn(x) { x * 7 })\n\
+         \x20 let b = handle { apply(fn(x) { lg(x) }) } with { L.lg(x) -> resume(x + 40)  return(r) -> r }\n\
+         \x20 a * 100 + b\n\
+         }\n",
+        "842",
+    ),
+    (
+        "recursive-map-at-two-rows",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn mapl(f, n) { if n == 0 { 0 } else { f(n) + mapl(f, n - 1) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let pure = mapl(fn(x) { x }, 10)\n\
+         \x20 let eff = handle { mapl(fn(x) { lg(x) }, 10) } with { L.lg(x) -> resume(x * 2)  return(r) -> r }\n\
+         \x20 pure * 1000 + eff\n\
+         }\n",
+        "55110",
+    ),
+    (
+        "let-bound-generic-lambda",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { let app = fn(g) { g() + 1 }  let h = fn() { get() }  app(h) * 2 + app(fn() { 3 }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "20",
+    ),
+    (
+        "annotated-twice",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn twice(f: fn(Int) -> Int, x: Int) -> Int { f(f(x)) }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = twice(fn(x) { x * 3 }, 2)\n\
+         \x20 let b = handle { twice(fn(x) { lg(x) + 1 }, 3) } with { L.lg(x) -> resume(x * 10)  return(r) -> r }\n\
+         \x20 a * 1000 + b\n\
+         }\n",
+        "18311",
+    ),
+    (
+        "mutual-recursion-over-a-callback",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn ev(f: fn(Int) -> Int, n: Int) -> Int { if n == 0 { 0 } else { f(n) + od(f, n - 1) } }\n\
+         fn od(f: fn(Int) -> Int, n: Int) -> Int { if n == 0 { 0 } else { ev(f, n - 1) - f(n) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = ev(fn(x) { x }, 10)\n\
+         \x20 let b = handle { ev(fn(x) { lg(x) }, 10) } with { L.lg(x) -> resume(x * 3)  return(r) -> r }\n\
+         \x20 a * 1000 + b\n\
+         }\n",
+        "5015",
+    ),
+    (
+        "a-generic-function-calls-a-generic-function",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn apply(f: fn(Int) -> Int) -> Int { f(1) }\n\
+         fn apply2(f: fn(Int) -> Int) -> Int { apply(f) + apply(f) * 10 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = apply2(fn(x) { x + 1 })\n\
+         \x20 let b = handle { apply2(fn(x) { lg(x) + 2 }) } with { L.lg(x) -> resume(x * 5)  return(r) -> r }\n\
+         \x20 a * 1000 + b\n\
+         }\n",
+        "22077",
+    ),
+    (
+        "three-instantiations-three-clones",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         effect M { fn mm(x: Int) -> Int }\n\
+         fn apply(f: fn(Int) -> Int) -> Int { f(2) + 1 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = handle { apply(fn(x) { lg(x) }) } with { L.lg(x) -> resume(x * 5)  return(r) -> r }\n\
+         \x20 let b = handle { apply(fn(x) { mm(x) }) } with { M.mm(x) -> resume(x * 7)  return(r) -> r }\n\
+         \x20 let c = handle { handle { apply(fn(x) { mm(x) + lg(x) }) } with { M.mm(x) -> resume(x * 7)  return(r) -> r } } with { L.lg(x) -> resume(x * 100)  return(r) -> r }\n\
+         \x20 a * 10000 + b * 100 + c\n\
+         }\n",
+        "111715",
+    ),
+    (
+        "a-generic-call-inside-an-effectful-lambda",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn apply(f: fn(Int) -> Int) -> Int { f(3) * 2 }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { let k = fn(y) { apply(fn(x) { lg(x) + y }) }  k(1) + k(2) } with { L.lg(x) -> resume(x * 10)  return(r) -> r }\n\
+         }\n",
+        "126",
+    ),
+    (
+        // `guard` handles E around `f()`; at `{E, L}` the clone's handle
+        // LEAKS L, so it is a CPS handle -- the leak analysis sees the label.
+        "a-clone-whose-handle-leaks-the-instantiated-effect",
+        "effect E { fn e() -> Int }\n\
+         effect L { fn lg(x: Int) -> Int }\n\
+         fn guard(f) { handle { f() } with { E.e() -> resume(5)  return(r) -> r + 1 } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = guard(fn() { e() * 2 })\n\
+         \x20 let b = handle { guard(fn() { e() + lg(4) }) } with { L.lg(x) -> resume(x * 10)  return(r) -> r }\n\
+         \x20 a * 1000 + b\n\
+         }\n",
+        "11046",
+    ),
+    (
+        "non-tail-recursion-through-a-clone",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn go(f: fn(Int) -> Int, n: Int) -> Int { if n == 0 { 0 } else { go(f, n - 1) + f(n) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { go(fn(x) { lg(x) }, 2000) } with { L.lg(x) -> resume(x)  return(r) -> r }\n\
+         }\n",
+        "2001000",
+    ),
+    (
+        "upcast-of-a-let-bound-direct-closure",
+        "effect T { fn t() -> Int }\n\
+         fn pick(c) {\n\
+         \x20 let f = fn(x) { x + 1 }\n\
+         \x20 let g = if c { f } else { fn(x) { t() + x } }\n\
+         \x20 g(10)\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { pick(True) + pick(False) } with { T.t() -> resume(2)  return(r) -> r }\n\
+         }\n",
+        "23",
+    ),
+    (
+        "upcast-through-a-return-binder",
+        "effect T { fn t() -> Int }\n\
+         fn mk() { fn(x) { x + 1 } }\n\
+         fn h(c) {\n\
+         \x20 let g = handle { mk() } with { T.t() -> resume(0)  return(x) -> if c { x } else { fn(s) { t() + s } } }\n\
+         \x20 g(1)\n\
+         }\n\
+         pub fn main() -> Int { handle { h(True) + 100 + h(False) * 1000 } with { T.t() -> resume(10)  return(r) -> r } }\n",
+        "11102",
+    ),
+    (
+        "a-direct-closure-passed-for-an-effectful-parameter",
+        "effect T { fn t() -> Int }\n\
+         fn h(f: fn(Int) / {T} -> Int) -> Int { f(1) + f(2) * 10 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let p = fn(x) { x + 4 }\n\
+         \x20 handle { h(p) + h(fn(x) { t() * x }) * 100 } with { T.t() -> resume(3)  return(r) -> r }\n\
+         }\n",
+        "6365",
+    ),
+    (
+        "upcast-of-a-capturing-closure-saved-across-a-site",
+        "effect T { fn t() -> Int }\n\
+         fn h(c, n) {\n\
+         \x20 let f = fn(x) { x + n }\n\
+         \x20 let g = if c { f } else { fn(x) { t() + x } }\n\
+         \x20 let a = g(10)\n\
+         \x20 a + g(20) * 100\n\
+         }\n\
+         pub fn main() -> Int { handle { h(True, 1) + h(False, 2) * 100000 } with { T.t() -> resume(7)  return(r) -> r } }\n",
+        "271702111",
+    ),
+    (
+        "upcast-in-a-result-layer",
+        "effect T { fn t() -> Int }\n\
+         fn h(c) {\n\
+         \x20 let f = fn() { fn(x) { x + 1 } }\n\
+         \x20 let g = if c { f } else { fn() { fn(x) { t() + x } } }\n\
+         \x20 let k = g()\n\
+         \x20 k(1) * 3\n\
+         }\n\
+         pub fn main() -> Int { handle { h(True) + h(False) * 100 } with { T.t() -> resume(10)  return(r) -> r } }\n",
+        "3306",
+    ),
+];
+
+#[test]
+fn the_conventions_corpus_compiles_and_runs() {
+    run_value_corpus(CONVENTIONS, "conventions");
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_conventions_corpus() {
+    run_differential_corpus(CONVENTIONS, "conventions-diff");
+}
+
+/// The independent review of N7 part 1. Local clones were bound INSIDE the
+/// scope of the binder they copy, so a free occurrence of the same name in the
+/// lambda (an outer `let`, parameter, clause parameter, return binder or
+/// top-level function) captured the generic lambda itself: compiler panics,
+/// a segfault, "match failed", and 1007 for 12. And an upcast in a callee's
+/// RESULT (`if c { f() } else { .. }`, pre-existing): 11 for 1511.
+const CONVENTIONS_REVIEW: &[(&str, &str, &str)] = &[
+    (
+        "clone-captures-an-outer-int-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 let x = 10\n\
+         \x20 let x = fn(g) { g() + x }\n\
+         \x20 handle { x(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "17",
+    ),
+    (
+        "clone-captures-an-outer-adt-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         type Opt { None, Some(Int) }\n\
+         pub fn main() -> Int {\n\
+         \x20 let x = Some(5)\n\
+         \x20 let x = fn(g) { g() + match x { Some(n) -> n  _ -> 1000 } }\n\
+         \x20 handle { x(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "12",
+    ),
+    (
+        "clone-captures-an-outer-closure-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 let x = fn(y) { y * 3 }\n\
+         \x20 let x = fn(g) { g() + x(4) }\n\
+         \x20 handle { x(fn() { get() }) + x(fn() { 1 }) * 100 } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "1319",
+    ),
+    (
+        "clone-captures-a-top-level-function-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         fn scale(n: Int) -> Int { n * 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let scale = fn(g) { g() + scale(2) }\n\
+         \x20 handle { scale(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "2007",
+    ),
+    (
+        "clone-captures-a-return-binder-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { 5 } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(v) -> {\n\
+         \x20     let v = fn(g) { g() + v }\n\
+         \x20     handle { v(fn() { get() }) } with { S.get() -> resume(70)  return(r) -> r }\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+        "75",
+    ),
+    (
+        "clone-captures-a-clause-parameter-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         effect K { fn kk(x: Int) -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { kk(5) } with {\n\
+         \x20   K.kk(x) -> {\n\
+         \x20     let x = fn(g) { g() + x }\n\
+         \x20     resume(handle { x(fn() { get() }) } with { S.get() -> resume(70)  return(r) -> r })\n\
+         \x20   }\n\
+         \x20   return(r) -> r\n\
+         \x20 }\n\
+         }\n",
+        "75",
+    ),
+    (
+        "clone-captures-a-parameter-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         fn h(app) {\n\
+         \x20 let app = fn(g) { g() + app }\n\
+         \x20 handle { app(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n\
+         pub fn main() -> Int { h(3) }\n",
+        "10",
+    ),
+    (
+        "clone-of-a-clone-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 let k = 5\n\
+         \x20 let k = fn(g) { g() + k }\n\
+         \x20 let k = fn(g) { k(g) * 10 }\n\
+         \x20 handle { k(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "120",
+    ),
+    (
+        "result-upcast-at-a-callee",
+        "effect T { fn t() -> Int }\n\
+         fn h(c) {\n\
+         \x20 let f = fn() { fn(x) { x + 1 } }\n\
+         \x20 let k = if c { f() } else { fn(x) { t() + x } }\n\
+         \x20 k(10)\n\
+         }\n\
+         pub fn main() -> Int { handle { h(True) + h(False) * 100 } with { T.t() -> resume(5)  return(r) -> r } }\n",
+        "1511",
+    ),
+    (
+        "result-upcast-at-a-two-parameter-callee",
+        "effect T { fn t() -> Int }\n\
+         fn h(c) {\n\
+         \x20 let f = fn(a, b) { fn(x) { x + a + b } }\n\
+         \x20 let k = if c { f(1, 2) } else { fn(x) { t() + x } }\n\
+         \x20 k(10) + k(20)\n\
+         }\n\
+         pub fn main() -> Int { handle { h(True) + h(False) * 1000 } with { T.t() -> resume(5)  return(r) -> r } }\n",
+        "40036",
+    ),
+    (
+        "result-upcast-with-an-annotated-parameter",
+        "effect S { fn get() -> Int }\n\
+         fn run(c) {\n\
+         \x20 let mk = fn(n) { fn(g: fn() / {} -> Int) { g() + n } }\n\
+         \x20 let k = if c { mk(1) } else { fn(g: fn() / {} -> Int) { get() + g() } }\n\
+         \x20 k(fn() { 5 })\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { run(True) + run(False) * 100 } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "1206",
+    ),
+];
+
+#[test]
+fn the_conventions_review_corpus_matches_the_evaluator() {
+    run_value_corpus(CONVENTIONS_REVIEW, "conventions-review");
+    run_differential_corpus(CONVENTIONS_REVIEW, "conventions-review-diff");
+}
+
+/// The review's finding 3 (pre-existing): an ALIAS of a generic local
+/// (`let mk2 = mk`) gets no clone, and the result of `mk2(1)` was a direct
+/// closure called with the CPS convention -- natively it hung where the
+/// evaluator printed 8. The deep callee guard refuses it by name: the
+/// result layer is an instantiation of `mk`'s open row at {S}.
+#[test]
+fn an_alias_of_a_generic_local_used_at_a_user_effect_is_refused_by_name() {
+    let src = "effect S { fn get() -> Int }\n\
+               pub fn main() -> Int {\n\
+               \x20 let mk = fn(n) { fn(g) { g() + n } }\n\
+               \x20 let mk2 = mk\n\
+               \x20 let k = mk2(1)\n\
+               \x20 handle { k(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+               }\n";
+    assert_eq!(eval_main_int(src), "8");
+    let dir = temp_dir("generic-alias");
+    let err = try_compile_and_link(&lower_src(src), &dir, "generic-alias").unwrap_err();
+    std::fs::remove_dir_all(&dir).ok();
     assert!(
-        err.contains("direct function used where an effectful one is expected"),
+        err.contains("effect-polymorphic function used at a user effect"),
         "{err}"
     );
-    std::fs::remove_dir_all(&dir).ok();
 }

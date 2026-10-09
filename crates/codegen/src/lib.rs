@@ -20,6 +20,7 @@
 mod closure;
 mod cps;
 mod cps_emit;
+mod specialize;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1585,6 +1586,12 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         }
     }
 
+    // N7 part 1: monomorphize rows where a reference needs another convention,
+    // and eta-expand upcasts, so every phase below sees types that say the
+    // right convention. Pure Core-to-Core; nothing is emitted yet.
+    let specialized = specialize::run(core)?;
+    let core = &specialized;
+
     // The closure tags continue the constructor numbering, so `first_tag` is the
     // number of REAL descriptor rows — computed the same way the descriptor table
     // below counts them, from `core.types`.
@@ -2392,22 +2399,17 @@ mod tests {
     }
 
     #[test]
-    fn an_effect_polymorphic_function_used_at_a_user_effect_is_refused() {
-        // D16: `apply` is compiled once, direct; this instantiation would call
-        // an effectful lambda with the direct convention. N7's territory.
-        let err = refused(
-            "fn apply(f) { f(1) + 1 }\n\
-             pub fn main() -> Int {\n\
-             \x20 handle { apply(fn(x) { x * get() }) } with {\n\
-             \x20   S.get() -> resume(10)\n    return(r) -> r\n  }\n}\n",
-        );
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("effect-polymorphic function used at a user effect")
-            ),
-            "{err:?}"
-        );
+    fn an_effect_polymorphic_function_used_at_a_user_effect_compiles() {
+        // N7 part 1 (replaces `..._is_refused`, D16's pin): `apply` is
+        // compiled direct for its pure uses, and this instantiation at {S}
+        // goes to a clone whose rows say S, so it compiles CPS.
+        emit_ir(&core_of(&format!(
+            "{S_W}fn apply(f) {{ f(1) + 1 }}\n\
+             pub fn main() -> Int {{\n\
+             \x20 handle {{ apply(fn(x) {{ x * get() }}) }} with {{\n\
+             \x20   S.get() -> resume(10)\n    return(r) -> r\n  }}\n}}\n"
+        )))
+        .expect("a clone of `apply` at {S} compiles");
     }
 
     #[test]
@@ -2441,29 +2443,22 @@ mod tests {
     }
 
     #[test]
-    fn a_let_bound_effect_polymorphic_lambda_used_at_a_user_effect_is_refused() {
-        // 5b-9b review (a REGRESSION caught before commit): `app` is generic in
-        // its effect row, so its lifted body uses the DIRECT convention, but the
-        // call `app(..)` is instantiated at {S} -- and was compiled as a CPS jump
-        // into the direct function: native SIGSEGV where the evaluator printed
-        // 8. D16 refused this for top-level functions only; a local binding
-        // now gets the same refusal, by the same name.
+    fn a_let_bound_effect_polymorphic_lambda_used_at_a_user_effect_compiles() {
+        // N7 part 1 (replaces `..._is_refused`, the 5b-9b review's pin: a
+        // SIGSEGV where the evaluator printed 8, then refused by name): the
+        // use at {S} goes to a local clone `let app.spec.k = ..` bound next
+        // to `app`, whose type says S. Execution: `CONVENTIONS` in
+        // tests/native_codegen.rs.
         for body in [
             "let app = fn(g) { g() + 1 }  app(fn() { get() })",
             "let app = fn(g) { g() + 1 }  let h = fn() { get() }  app(h) * 2",
         ] {
-            let err = refused(&format!(
-                "pub fn main() -> Int {{\n\
+            emit_ir(&core_of(&format!(
+                "{S_W}pub fn main() -> Int {{\n\
                  \x20 handle {{ {body} }} with {{\n\
                  \x20   S.get() -> resume(7)\n    return(r) -> r\n  }}\n}}\n"
-            ));
-            assert!(
-                matches!(
-                    err,
-                    CodegenError::Unsupported("effect-polymorphic function used at a user effect")
-                ),
-                "{body}: {err:?}"
-            );
+            )))
+            .unwrap_or_else(|e| panic!("{body}: {e:?}"));
         }
     }
 

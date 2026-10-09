@@ -3,20 +3,18 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-09)
+## State at handoff (updated 2026-10-09, auto-run)
 
-- `main` has everything through #15 (5b-9b). The stacked PRs #16-#19 were merged into
-  each other's branches, not into `main`, so `main` still lacks 5b-10, the three
-  soundness fixes, E0207 and sub-effecting. **One PR lands all of it:** branch
-  `claude/sub-effecting` -> `main`. From now on: one PR at a time, always based on `main`.
+- `main` has everything through #21 (sub-effecting and checked annotations).
+- Scheduled auto-runs work on branch `auto/elya` (one draft PR to `main`) and log in
+  `AUTO_RUN_LOG.md`; the maintainer reviews on GitHub.
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
-  university address; every branch was force-pushed. Do not push old local branches.
+  former e-mail address; every branch was force-pushed. Do not push old local branches.
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Branch `claude/annotations` (checked type annotations) is stacked on #20's branch; its
-  PR targets `main` and shows only its own commit once #20 merges.
-- Linux gate at the annotations tip: 783 passed, 77 suites. `gc_mark` 637 bytes.
+- Linux gate at the N7-part-1 tip of `auto/elya`: 796 passed, 77 suites. The runtime is
+  untouched (`gc_mark` unchanged).
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
   language decisions taken. The maintainer delegated all choices (rule 2).
@@ -135,23 +133,18 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   review found a native GC unsoundness through a generalized annotation variable (3395 for
   42), fixed first.
 
+- **N7 part 1: convention specialization and the upcast adapter (native)** (2026-10-09,
+  branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-09-elya-n7a-convention-specialization-design.md`. A
+  Core-to-Core pass (`crates/codegen/src/specialize.rs`): references that instantiate a
+  row variable at a user effect go to clones with substituted rows (top-level and
+  `let`-bound lambdas); upcasts are eta-expanded into adapter lambdas, at every covariant
+  layer. Fixed on the way: a pre-existing native miscompile of an upcast in a result
+  (2 for 3306) and of one at a callee's result (11 for 1511, found by the review).
+
 ## The next five steps
 
-### 1. N7 part 1: convention specialization and the closure adapter (native)
-
-What sub-effecting newly accepts mostly stops at two native refusals: "effect-polymorphic
-function used at a user effect" (D16) and "direct function used where an effectful one is
-expected". Both are about CONVENTION, not representation. A row-polymorphic function
-needs at most two compiled versions (direct, and CPS when its row variable is instantiated
-at a user effect), so compile the CPS clone on demand: inside it, an open row variable of
-the function's own type counts as effectful. A direct closure used at an effectful type
-gets an adapter closure, `adapt(clos, args.., k) = k(code(clos.inner, args..))`, with one
-descriptor row. Measure first (`w(k) { k(0) + lg(1) }`, `twice`, the review's a1/q1/s1h,
-`tests/sub_effecting.rs`, through `build`), keep `gc_mark` byte-identical; the type-variable
-half of N7 (`Ty::Var`, "unrepresentable type"; specialisation plus dictionary passing,
-`@specialize`/`@share`, a code-size budget) is part 2.
-
-### 2. Async as an effect: a scheduler handler (ROADMAP priority 1)
+### 1. Async as an effect: a scheduler handler (ROADMAP priority 1)
 
 An `Async` effect (`fork`, `yield`) and a round-robin scheduler written as an ordinary
 Elya handler that keeps a queue of suspended continuations. Show that the same `map` works
@@ -160,7 +153,7 @@ queue of continuations needs escaped resumes, which work natively; `fork` may ne
 multi-shot or a second continuation: measure). Ship `examples/04_async.elya`, with tests
 and a README section.
 
-### 3. Native multi-shot handlers (`with multi`)
+### 2. Native multi-shot handlers (`with multi`)
 
 Refused natively by name since 5b-8 (A2); the evaluator runs them. A multi-shot resume
 re-runs a captured continuation, but native frames are consumed in place -- and since 5b-10
@@ -171,7 +164,7 @@ copy-on-resume rule. Measure first (the evaluator's multi-shot corpus, e.g.
 stated and gated against A4's live-set instrument. Multi-shot is what a native
 probabilistic or backtracking handler needs (ROADMAP), so it is worth doing natively.
 
-### 4. Evaluator: non-tail recursion under a handler is quadratic
+### 3. Evaluator: non-tail recursion under a handler is quadratic
 
 PARKED: about 4× time per doubling (n=4000 takes 1.7 s; n=100 000 did not finish in 10
 minutes). This caps every differential test's N. Profile (frame capture copies the
@@ -179,7 +172,7 @@ continuation?), predict the complexity, fix, and pin it with a timing-free test 
 counts steps or allocations. The evaluator is the reference semantics, so the
 differential corpora must stay green unchanged.
 
-### 5. Exact replay and handler-based testing (ROADMAP priority 3)
+### 4. Exact replay and handler-based testing (ROADMAP priority 3)
 
 A `Record` handler that wraps a computation and logs every effect's answer (op name,
 arguments, the value it resumed with), and a `Replay` handler that feeds a log back and
@@ -189,6 +182,17 @@ effect set first (needs a list of answers: an ADT log is enough; strings wait fo
 handlers instead of mocking. Evaluator and native. Ship `examples/05_replay.elya` with
 tests and a README section; the CLI flag (`elya run --record/--replay`) comes after real
 I/O effects exist.
+
+### 5. Front end: a lambda forwarding an enclosing parameter keeps its row open; then N7 part 2
+
+`fn wrap(f) { fn(x) { f(x) + 1 } }` used at `{L}` (and `compose(f, g)` with one pure
+argument) is E0423: a lambda forwarding an enclosing function's parameter forces that
+parameter pure (PARKED by sub-effecting, "deferred to N7"). Natively nothing blocks the
+open version any more (N7 part 1 specializes it). Measure the probe programs of the N7a
+spec (q1, q9, q10, p16) first. Then N7 part 2: type variables (`twice(f, x)` with `x: 'a`
+is "unrepresentable type"): monomorphize types like rows, with the code-size budget, or
+dictionary passing -- decide in its spec. Also: aliases of generic locals (`let mk2 = mk`)
+are refused by name.
 
 Also open, unscheduled: native strings (`<>` refused natively, no Int-to-String; the
 builtin's name is Claude's call now -- `int.to_string` is the natural one); the roadmap's
