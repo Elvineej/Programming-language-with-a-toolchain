@@ -13,7 +13,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the N7-part-1 tip of `auto/elya`: 796 passed, 77 suites. The runtime is
+- Linux gate at the async-step-1 tip of `auto/elya`: 816 passed, 79 suites. The runtime is
   untouched (`gc_mark` unchanged).
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
@@ -142,16 +142,27 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   layer. Fixed on the way: a pre-existing native miscompile of an upcast in a result
   (2 for 3306) and of one at a callee's result (11 for 1511, found by the review).
 
+- **Async step 1: function types in declarations, and a scheduler written as a handler**
+  (2026-10-09, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-09-elya-async-step1-design.md`. `fn(A) / {E} -> R` in
+  constructor fields and operations (an unwritten declaration row is empty);
+  `examples/04_async.elya` (fork, yield, a round-robin queue, one `each` for sync and
+  async), the same bytes natively. Pattern binders are tracked by the native adapter.
+
 ## The next five steps
 
-### 1. Async as an effect: a scheduler handler (ROADMAP priority 1)
+### 1. Soundness: `resume` must carry relayed effects and the return clause's
 
-An `Async` effect (`fork`, `yield`) and a round-robin scheduler written as an ordinary
-Elya handler that keeps a queue of suspended continuations. Show that the same `map` works
-for sync and async code (no function colouring). The evaluator first, then natively (a
-queue of continuations needs escaped resumes, which work natively; `fork` may need
-multi-shot or a second continuation: measure). Ship `examples/04_async.elya`, with tests
-and a README section.
+Found again by the async-step-1 review (PARKED since the resume-row fix): at a `resume`
+only the LABELS of the handled body's remaining row are added, never its tail, so effects
+the body relays through a row variable (an unannotated `task(body)` calling `body()`) are
+lost; the return clause's effects are lost too. A stored `fn() { resume(Unit) }` is then
+typed pure: `check` is clean, the evaluator stops on an unhandled effect, natively it is
+refused by name or reaches the runtime "no clause" guard. Probes: the review's
+min1-min4 and pre3 (in the async-step-1 spec, §4). Fix in inference (`infer_handle`,
+`Expr::Resume`): the resume's row is the handled body's remaining row INCLUDING its tail
+(an inclusion, the sub-effecting machinery) plus the return clause's row; pin
+`check`-level tests that the unannotated scheduler either checks and runs or is rejected.
 
 ### 2. Native multi-shot handlers (`with multi`)
 

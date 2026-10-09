@@ -149,7 +149,7 @@ pub(crate) fn prepass(core: &CoreModule, cps_fns: &HashSet<String>) -> R<()> {
             .iter()
             .map(|p| (p.name.clone(), Some(p.ty.clone())))
             .collect();
-        check_local_conventions(&f.body, &mut locals)?;
+        check_local_conventions(&f.body, &mut locals, &core.types)?;
     }
     Ok(())
 }
@@ -161,11 +161,16 @@ pub(crate) fn prepass(core: &CoreModule, cps_fns: &HashSet<String>) -> R<()> {
 /// convention) and the use instantiates it at a user effect -- the call would
 /// jump into a direct function with the CPS signature (measured: SIGSEGV where
 /// the evaluator printed 8). Refused by the same name as the top-level case.
-/// Binders whose type is not tracked (pattern and return binders, `$cont`)
-/// carry `None` and are never refused here.
-fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>) -> R<()> {
-    let go =
-        |c: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>| check_local_conventions(c, locals);
+/// Binders whose type is not tracked (`$cont`, and pattern binders of a
+/// parametric type's fields) carry `None` and are never refused here.
+fn check_local_conventions(
+    e: &CoreExpr,
+    locals: &mut Vec<(String, Option<Ty>)>,
+    types: &[elya::core::CoreType],
+) -> R<()> {
+    let go = |c: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>| {
+        check_local_conventions(c, locals, types)
+    };
     match &e.kind {
         CoreKind::Lit(_) => Ok(()),
         // Sub-effecting (2026-10-08): a direct closure may now be USED where an
@@ -235,10 +240,12 @@ fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>)
         CoreKind::Match(s, arms) => {
             go(s, locals)?;
             for arm in arms.iter() {
-                let mut names = Vec::new();
-                crate::closure::pat_binders(&arm.pat, &mut names);
+                // Pattern binders are tracked since function types may be
+                // written in declarations (a closure in a field).
+                let mut binders = Vec::new();
+                crate::specialize::pat_binder_types(&arm.pat, &s.ty, types, &mut binders);
                 let depth = locals.len();
-                locals.extend(names.into_iter().map(|n| (n, None)));
+                locals.extend(binders);
                 let r = go(&arm.body, locals);
                 locals.truncate(depth);
                 r?;

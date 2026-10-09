@@ -138,6 +138,28 @@ value and the exact bytes printed. CI runs the full gate on Windows too.
 Not yet native (refused by name): multi-shot handlers (`with multi`), and code
 polymorphic in a type variable (`Ty::Var`).
 
+### Async without function colouring
+
+Suspension is an effect, so a scheduler is just a handler. In
+[`examples/04_async.elya`](examples/04_async.elya) tasks call `yld()` and `fork(f)`;
+the handler `task` turns a computation into a value that holds the rest of it (its
+`resume`, stored in a constructor field), and `run` is a round-robin queue written in
+plain Elya. The same `each` loops in ordinary code and, inside the tasks, over a body
+that yields at every step: there is no async copy of it and no `await`. It runs in the
+evaluator and natively, printing the same interleaving:
+
+```
+main: start
+  ping
+main
+    pong
+  ping
+...
+```
+
+Function types can be written in `type` and `effect` declarations for this
+(`Paused(fn() / {Log} -> Task)`); a declaration's rows are exactly what is written.
+
 ### Affine resources
 
 A type declared `linear` makes its values **affine** — usable at most once:

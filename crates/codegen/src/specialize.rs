@@ -26,8 +26,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use elya::core::{
-    CoreClause, CoreExpr, CoreFn, CoreHandle, CoreKind, CoreModule, CoreParam, CorePerform,
-    CoreReturn,
+    CoreClause, CoreExpr, CoreFn, CoreHandle, CoreKind, CoreModule, CoreParam, CorePat,
+    CorePerform, CoreReturn, CoreType,
 };
 use elya::types::{EffectLabel, EffectRow, RowTail, RowVar, Ty};
 
@@ -599,11 +599,50 @@ fn coercible(from: &Ty, to: &Ty) -> bool {
     }
 }
 
-struct Adapter {
-    counter: usize,
+/// The binders of a pattern matched against a value of type `scrut`, in
+/// `closure::pat_binders` order, each with its type where it is known: a
+/// variable pattern has the scrutinee's type; a constructor's sub-patterns
+/// have its declared field types. A parametric type's fields mention its
+/// parameters, so they are not tracked (`None`); natively such constructors
+/// are refused anyway. Since function types may be written in declarations
+/// (async step 1), a pattern binder can hold a closure, so it must be tracked
+/// for the upcast adapter and its guard like any other binder.
+pub(crate) fn pat_binder_types(
+    p: &CorePat,
+    scrut: &Ty,
+    types: &[CoreType],
+    out: &mut Vec<(String, Option<Ty>)>,
+) {
+    match p {
+        CorePat::Wild | CorePat::Lit(_) => {}
+        CorePat::Var(x) => out.push((x.clone(), Some(scrut.clone()))),
+        CorePat::Ctor(name, subs) => {
+            let fields = types
+                .iter()
+                .filter(|t| matches!(scrut, Ty::Con(n, args) if *n == t.name && args.is_empty()))
+                .flat_map(|t| t.ctors.iter())
+                .find(|c| c.name == *name)
+                .map(|c| c.fields.clone());
+            for (i, sp) in subs.iter().enumerate() {
+                match fields.as_ref().and_then(|f| f.get(i)) {
+                    Some(ft) => pat_binder_types(sp, ft, types, out),
+                    None => {
+                        let mut names = Vec::new();
+                        crate::closure::pat_binders(sp, &mut names);
+                        out.extend(names.into_iter().map(|n| (n, None)));
+                    }
+                }
+            }
+        }
+    }
 }
 
-impl Adapter {
+struct Adapter<'t> {
+    counter: usize,
+    types: &'t [CoreType],
+}
+
+impl Adapter<'_> {
     fn fresh(&mut self, what: &str) -> String {
         self.counter += 1;
         format!("$adapt.{what}.{}", self.counter)
@@ -753,10 +792,10 @@ impl Adapter {
                 let s = Rc::new(self.walk(s, locals)?);
                 let mut out = Vec::with_capacity(arms.len());
                 for a in arms.iter() {
-                    let mut names = Vec::new();
-                    crate::closure::pat_binders(&a.pat, &mut names);
+                    let mut binders = Vec::new();
+                    pat_binder_types(&a.pat, &s.ty, self.types, &mut binders);
                     let depth = locals.len();
-                    locals.extend(names.into_iter().map(|n| (n, None)));
+                    locals.extend(binders);
                     let body = self.walk(&a.body, locals);
                     locals.truncate(depth);
                     out.push(elya::core::CoreArm {
@@ -835,7 +874,10 @@ impl Adapter {
 
 /// Step 2: eta-expand every upcast use of a tracked binder.
 pub(crate) fn adapt_upcasts(core: &CoreModule) -> R<CoreModule> {
-    let mut ad = Adapter { counter: 0 };
+    let mut ad = Adapter {
+        counter: 0,
+        types: &core.types,
+    };
     let mut fns = Vec::with_capacity(core.fns.len());
     for f in &core.fns {
         let mut locals: Vec<(String, Option<Ty>)> = f

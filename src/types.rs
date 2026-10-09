@@ -1890,25 +1890,70 @@ impl Infer {
 /// Elaborate an ADT field/argument type annotation under a type-parameter
 /// environment: a bare param name → its type variable; a base name → its
 /// `Base`; an `Upper(args)` → a `Ty::Con` (arity-checked against `known`).
+///
+/// A function type `fn(A) / {E} -> R` (2026-10-09, async step 1): a
+/// declaration has no row variables, so its rows are exactly what is written
+/// -- no `/ {..}` is the empty row (pure), not "any effects" as in a
+/// function's own annotations. A row may name `IO` and any declared effect
+/// without type parameters (`effects` maps every declared effect to its
+/// arity); an effect's arguments cannot be written in a row yet.
 fn elaborate_adt_ty(
     inf: &mut Infer,
     ann: &Spanned<TypeAnn>,
     param_env: &HashMap<String, Ty>,
     known: &HashMap<String, usize>,
+    effects: &HashMap<String, usize>,
 ) -> Ty {
     let t = &ann.node;
-    if t.name == "fn" {
-        inf.diags.push(
-            Diagnostic::error(
-                "E0432",
-                "a function type in a type or effect declaration is not supported yet",
-            )
-            .with_label(
-                ann.span,
-                "function-typed fields and operation parameters come later",
-            ),
+    if t.name == "fn" && !t.args.is_empty() {
+        let n = t.args.len();
+        let params: Vec<Ty> = t.args[..n - 1]
+            .iter()
+            .map(|a| elaborate_adt_ty(inf, a, param_env, known, effects))
+            .collect();
+        let ret = elaborate_adt_ty(inf, &t.args[n - 1], param_env, known, effects);
+        let mut labels = BTreeMap::new();
+        for l in t.row.iter().flatten() {
+            match effects.get(&l.node) {
+                _ if l.node == "IO" => {}
+                Some(0) => {}
+                Some(_) => {
+                    inf.diags.push(
+                        Diagnostic::error(
+                            "E0432",
+                            format!(
+                                "effect `{}` takes type arguments, which a declaration row cannot write yet",
+                                l.node
+                            ),
+                        )
+                        .with_label(l.span, "a parameterized effect"),
+                    );
+                    continue;
+                }
+                None => {
+                    inf.diags.push(
+                        Diagnostic::error("E0432", format!("unknown effect `{}`", l.node))
+                            .with_label(l.span, "no such effect"),
+                    );
+                    continue;
+                }
+            }
+            labels.insert(
+                l.node.clone(),
+                EffectLabel {
+                    args: Vec::new(),
+                    span: l.span,
+                },
+            );
+        }
+        return Ty::Fn(
+            params,
+            EffectRow {
+                labels,
+                tail: RowTail::Closed,
+            },
+            Box::new(ret),
         );
-        return Ty::Error;
     }
     if t.args.is_empty() {
         if let Some(ty) = param_env.get(&t.name) {
@@ -1937,7 +1982,7 @@ fn elaborate_adt_ty(
                 }
                 let mut args = Vec::new();
                 for a in &t.args {
-                    args.push(elaborate_adt_ty(inf, a, param_env, known));
+                    args.push(elaborate_adt_ty(inf, a, param_env, known, effects));
                 }
                 Ty::Con(other.to_string(), args)
             }
@@ -2175,6 +2220,15 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
         }
     }
     inf.known_types = known_types.clone();
+    // Every declared effect and its arity, before any declaration is
+    // elaborated: a function type in a field or an operation may name an
+    // effect declared later, or the effect being declared.
+    let mut effect_arity: HashMap<String, usize> = HashMap::new();
+    for d in &module.decls {
+        if let Decl::Effect(e) = &d.node {
+            effect_arity.insert(e.name.clone(), e.params.len());
+        }
+    }
     for d in &module.decls {
         if let Decl::Type(t) = &d.node {
             let param_vars: Vec<Ty> = t.params.iter().map(|_| inf.fresh()).collect();
@@ -2197,7 +2251,13 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                 inf.ctor_arity.insert(vd.name.clone(), vd.fields.len());
                 let mut field_tys = Vec::new();
                 for f in &vd.fields {
-                    field_tys.push(elaborate_adt_ty(&mut inf, f, &param_env, &known_types));
+                    field_tys.push(elaborate_adt_ty(
+                        &mut inf,
+                        f,
+                        &param_env,
+                        &known_types,
+                        &effect_arity,
+                    ));
                 }
                 let ty = if field_tys.is_empty() {
                     result.clone()
@@ -2246,9 +2306,10 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                 let params: Vec<Ty> = sig
                     .param_tys
                     .iter()
-                    .map(|t| elaborate_adt_ty(&mut inf, t, &param_env, &known_types))
+                    .map(|t| elaborate_adt_ty(&mut inf, t, &param_env, &known_types, &effect_arity))
                     .collect();
-                let ret = elaborate_adt_ty(&mut inf, &sig.ret, &param_env, &known_types);
+                let ret =
+                    elaborate_adt_ty(&mut inf, &sig.ret, &param_env, &known_types, &effect_arity);
                 inf.ops.insert(
                     sig.name.clone(),
                     OpInfo {

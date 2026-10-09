@@ -14,6 +14,11 @@ fn both(src: &str) -> (String, String) {
     (cek, tree)
 }
 
+/// Examples that perform user effects, which the tree-walker oracle does not
+/// evaluate (it predates Slice 3c). Each is compared with the native backend
+/// in `crates/codegen/tests/native_codegen.rs` instead.
+const EFFECTFUL_EXAMPLES: &[&str] = &["04_async.elya"];
+
 #[test]
 fn cek_matches_tree_on_examples() {
     let dir = format!("{}/examples", env!("CARGO_MANIFEST_DIR"));
@@ -21,6 +26,24 @@ fn cek_matches_tree_on_examples() {
         let p = entry.unwrap().path();
         if p.extension().and_then(|e| e.to_str()) == Some("elya") {
             let src = std::fs::read_to_string(&p).unwrap();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if EFFECTFUL_EXAMPLES.contains(&name) {
+                // The tree-walker has no effects; it must REFUSE the program
+                // (so this list cannot hide a regression), and the program is
+                // checked against the native backend instead
+                // (`the_async_example_runs_natively`).
+                let (m, d) = parse_module(&Session::new(), &src);
+                assert!(d.is_empty(), "parse: {d:?}");
+                let err = elya::eval::run_module_tree(&m)
+                    .err()
+                    .unwrap_or_else(|| panic!("{name}: the tree-walker ran an effectful example"));
+                assert!(
+                    err.diag.message.contains("effects are not evaluated"),
+                    "{name}: {:?}",
+                    err.diag
+                );
+                continue;
+            }
             // The tree-walker recurses on the HOST stack for every call (no
             // tail calls; that is why it is the oracle only for shallow
             // programs). `examples/03_cek.elya` -- a CEK machine written in

@@ -3915,3 +3915,148 @@ fn an_alias_of_a_generic_local_used_at_a_user_effect_is_refused_by_name() {
         "{err}"
     );
 }
+
+/// Async step 1 (spec `2026-10-09-elya-async-step1-design.md`): function
+/// types in declarations. A closure in a constructor field or an operation
+/// argument, generator-style tasks built by a handler that stores `resume` in a
+/// field, and a round-robin scheduler. `an-upcast-of-a-pattern-binder` was a
+/// miscompile while pattern binders were untracked (4 for 304).
+const FN_FIELDS: &[(&str, &str, &str)] = &[
+    (
+        "a-closure-in-a-field",
+        "type B { B(fn(Int) -> Int) }\n\
+         pub fn main() -> Int { let f = fn(x) { x + 1 }  match B(f) { B(g) -> g(41) } }\n",
+        "42",
+    ),
+    (
+        "a-written-row-in-a-field",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         type B { B(fn(Int) / {L} -> Int) }\n\
+         fn call(b) { match b { B(g) -> g(5) } }\n\
+         pub fn main() -> Int { handle { call(B(fn(x) { lg(x) + 1 })) + call(B(fn(x) { x })) } with { L.lg(x) -> resume(x * 100)  return(r) -> r } }\n",
+        "506",
+    ),
+    (
+        "a-direct-closure-into-an-effectful-field",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         type B { B(fn(Int) / {L} -> Int) }\n\
+         fn call(b) { match b { B(g) -> g(5) } }\n\
+         pub fn main() -> Int { let p = fn(x) { x + 7 }  handle { call(B(p)) } with { L.lg(x) -> resume(x * 100)  return(r) -> r } }\n",
+        "12",
+    ),
+    (
+        "an-upcast-of-a-pattern-binder",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         type P { P(fn(Int) -> Int) }\n\
+         fn h(c, b) { match b { P(g) -> { let k = if c { g } else { fn(x) { lg(x) } }  k(3) } } }\n\
+         pub fn main() -> Int { handle { h(True, P(fn(x) { x + 1 })) + h(False, P(fn(x) { x })) } with { L.lg(x) -> resume(x * 100)  return(r) -> r } }\n",
+        "304",
+    ),
+    (
+        "an-operation-takes-a-function",
+        "effect Ap { fn ap(f: fn(Int) -> Int, x: Int) -> Int }\n\
+         pub fn main() -> Int { handle { ap(fn(x) { x * 2 }, 20) + 2 } with { Ap.ap(f, x) -> resume(f(x))  return(r) -> r } }\n",
+        "42",
+    ),
+    (
+        "a-generator-task",
+        "effect Yield { fn yld() -> Unit }\n\
+         type Task { Done(Int), Paused(fn() -> Task) }\n\
+         fn count(n: Int, acc: Int) -> Int { if n == 0 { acc } else { let _ = yld()  count(n - 1, acc + n) } }\n\
+         fn spawn(n: Int) -> Task { handle { count(n, 0) } with { Yield.yld() -> Paused(fn() { resume(Unit) })  return(x) -> Done(x) } }\n\
+         fn finish(t: Task) -> Int { match t { Done(x) -> x  Paused(k) -> finish(k()) } }\n\
+         fn run2(a: Task, b: Task) -> Int { match a { Done(x) -> x * 1000 + finish(b)  Paused(k) -> run2(b, k()) } }\n\
+         pub fn main() -> Int { run2(spawn(3), spawn(5)) }\n",
+        "6015",
+    ),
+    (
+        "two-tasks-interleave-their-log",
+        "effect Yield { fn yld() -> Unit }\n\
+         effect Log { fn emit(d: Int) -> Unit }\n\
+         type Task { Done(Int), Paused(fn() / {Log} -> Task) }\n\
+         fn work(id: Int, n: Int) -> Int { if n == 0 { id } else { let _ = emit(id)  let _ = yld()  work(id, n - 1) } }\n\
+         fn spawn(id: Int, n: Int) -> Task { handle { work(id, n) } with { Yield.yld() -> Paused(fn() { resume(Unit) })  return(x) -> Done(x) } }\n\
+         fn finish(t: Task) -> Int { match t { Done(x) -> x  Paused(k) -> finish(k()) } }\n\
+         fn run2(a: Task, b: Task) -> Int { match a { Done(x) -> x + finish(b)  Paused(k) -> run2(b, k()) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let f = handle { run2(spawn(1, 3), spawn(2, 2)) } with {\n\
+         \x20   Log.emit(d) -> fn(acc) { (resume(Unit))(acc * 10 + d) }\n\
+         \x20   return(x) -> fn(acc) { acc * 10 + x }\n\
+         \x20 }\n\
+         \x20 f(0)\n\
+         }\n",
+        "121213",
+    ),
+    (
+        "fork-and-yield",
+        "effect Async {\n\
+         \x20 fn fork(f: fn() / {Async, Log} -> Unit) -> Unit\n\
+         \x20 fn yld() -> Unit\n\
+         }\n\
+         effect Log { fn emit(d: Int) -> Unit }\n\
+         \n\
+         type Task { Done, Paused(fn() / {Log} -> Task), Forked(fn() / {Async, Log} -> Unit, fn() / {Log} -> Task) }\n\
+         type Queue { Empty, Push(Task, Queue) }\n\
+         \n\
+         fn task(body: fn() / {Async, Log} -> Unit) -> Task {\n\
+         \x20 handle { body() } with {\n\
+         \x20   Async.yld() -> Paused(fn() { resume(Unit) })\n\
+         \x20   Async.fork(f) -> Forked(f, fn() { resume(Unit) })\n\
+         \x20   return(u) -> Done\n\
+         \x20 }\n\
+         }\n\
+         \n\
+         fn append(q: Queue, t: Task) -> Queue { match q { Empty -> Push(t, Empty)  Push(h, r) -> Push(h, append(r, t)) } }\n\
+         \n\
+         fn run(q: Queue) -> Int {\n\
+         \x20 match q {\n\
+         \x20   Empty -> 0\n\
+         \x20   Push(t, rest) -> match t {\n\
+         \x20     Done -> 1 + run(rest)\n\
+         \x20     Paused(k) -> run(append(rest, k()))\n\
+         \x20     Forked(child, parent) -> run(append(append(rest, parent()), task(child)))\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n\
+         \n\
+         fn each(f: fn(Int) -> Unit, n: Int) -> Unit { if n == 0 { Unit } else { let _ = f(n)  each(f, n - 1) } }\n\
+         \n\
+         fn worker(id: Int) -> Unit { each(fn(i) { let _ = emit(id)  yld() }, 3) }\n\
+         \n\
+         pub fn main() -> Int {\n\
+         \x20 let pure_sum = each(fn(i) { Unit }, 5)\n\
+         \x20 let f = handle {\n\
+         \x20   run(Push(task(fn() { let _ = fork(fn() { worker(2) })  worker(1) }), Empty))\n\
+         \x20 } with {\n\
+         \x20   Log.emit(d) -> fn(acc) { (resume(Unit))(acc * 10 + d) }\n\
+         \x20   return(x) -> fn(acc) { acc * 10 + x }\n\
+         \x20 }\n\
+         \x20 f(0)\n\
+         }\n",
+        "1212122",
+    ),
+];
+
+#[test]
+fn the_fn_fields_corpus_matches_the_evaluator() {
+    run_value_corpus(FN_FIELDS, "fn-fields");
+    run_differential_corpus(FN_FIELDS, "fn-fields-diff");
+}
+
+#[test]
+fn the_async_example_runs_natively() {
+    // `examples/04_async.elya`: a scheduler written as an Elya handler, the
+    // same bytes printed natively as by the evaluator, and the same count.
+    let src = include_str!("../../../examples/04_async.elya");
+    let dir = temp_dir("async-example");
+    let exe = compile_and_link(&lower_src(src), &dir, "async");
+    let (text, value) = native_text_value(&exe, "async");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(text, eval_main_text(src));
+    assert!(
+        text.starts_with("main: start\n  ping\nmain\n    pong\n"),
+        "{text}"
+    );
+    assert_eq!(value, "3");
+    assert_eq!(value, eval_main_int(src));
+}

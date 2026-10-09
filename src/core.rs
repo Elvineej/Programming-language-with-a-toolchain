@@ -284,6 +284,37 @@ struct LowerCx {
 /// reference and maps to `Ty::Con` with its args elaborated. No type parameters
 /// reach here, so there is no substitution.
 fn ann_to_ty(a: &TypeAnn) -> Ty {
+    // A function type in a declaration (2026-10-09, async step 1): its row is
+    // exactly what is written, closed -- the same elaboration inference gives
+    // the field (`types::elaborate_adt_ty`), so the back end reads the
+    // field's real type (a pattern binder holding a closure is tracked by it).
+    if a.name == "fn" && !a.args.is_empty() {
+        let n = a.args.len();
+        let params = a.args[..n - 1].iter().map(|x| ann_to_ty(&x.node)).collect();
+        let ret = ann_to_ty(&a.args[n - 1].node);
+        let labels = a
+            .row
+            .iter()
+            .flatten()
+            .map(|l| {
+                (
+                    l.node.clone(),
+                    crate::types::EffectLabel {
+                        args: Vec::new(),
+                        span: l.span,
+                    },
+                )
+            })
+            .collect();
+        return Ty::Fn(
+            params,
+            crate::types::EffectRow {
+                labels,
+                tail: crate::types::RowTail::Closed,
+            },
+            Box::new(ret),
+        );
+    }
     match a.name.as_str() {
         "Int" => Ty::int(),
         "Float" => Ty::float(),

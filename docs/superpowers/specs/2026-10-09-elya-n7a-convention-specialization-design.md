@@ -107,7 +107,8 @@ at an upcast; if they ever differ in convention, the pass refuses by name
 (`"upcast in a parameter position"`) instead of guessing. Values reach native code
 through tracked binders only (`let`, parameters, lambda and clause parameters, return
 binders): ADT fields cannot be function-typed (annotations spec) and parametric
-constructors are refused natively.
+constructors are refused natively. (Async step 1 made fields function-typed; pattern
+binders are tracked with their field types since then.)
 
 ### The guard
 
