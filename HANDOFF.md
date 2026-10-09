@@ -10,13 +10,14 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   one below it merges:
   - **#15** tail-in-match fix + slice 5b-9b (base `main`);
   - **#16** slice 5b-10, nested handles (base #15's branch);
-  - the resume-row soundness fix, branch `claude/resume-row` (base #16's branch).
+  - **#17** the resume-row soundness fix (base #16's branch);
+  - the dropped-effect fix, branch `claude/row-conflicts` (base #17's branch).
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
   university address; every branch was force-pushed. Do not push old local branches.
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the resume-row tip: 695 passed, 69 suites. `gc_mark` 637 bytes.
+- Linux gate at the row-conflicts tip: 709 passed, 71 suites. `gc_mark` 637 bytes.
 - **Asked the maintainer (2026-10-08), no answer yet:** which problems of today's languages
   Elya should prioritise (effect-typed code, async without function colouring, per-
   dependency capabilities against supply-chain attacks, deterministic replay, handler-based
@@ -108,19 +109,24 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   5b-10 found; the first version opened a new one (tail unification), caught by the
   independent review and fixed test-first. m10's T-carrying variant now compiles natively.
 
+- **Effects dropped on a closed row** (2026-10-08, branch `claude/row-conflicts`): spec
+  `docs/superpowers/specs/2026-10-08-elya-row-conflicts-design.md`. Now E0423; a second
+  half (an environment rule for lambda tails) was reverted after the review found two
+  regressions -- sub-effecting is now a parked language question.
+
 ## The next five steps
 
-### 1. Front end: the soundness sweep the resume-row review found (urgent)
+### 1. Front end: the rest of the soundness sweep, and three questions to ask
 
-PARKED, "further soundness gaps" and the open half of "`resume` is typed effect-free":
-- `add_effect`/`add_row` conflicts are DISCARDED on the perform and call paths, so an
-  effect added to a row closed early vanishes (`go`/`lg` example: `check` clean, the
-  evaluator stops on an unhandled `lg`). Surface the conflict as a diagnostic first and
-  measure what else it reports across every corpus.
-- resume's row lacks the return clause's effects and re-entered clauses' effects.
-- `let` annotations are ignored (`let s: String = 1` checks clean).
-Each: measured table, red test, fix, controls. A fix that rejects a program the corpora
-accept is a language decision: stop and ask.
+- resume's row lacks the return clause's effects and re-entered clauses' effects (PARKED,
+  "`resume` is typed effect-free", the open half): a program checks clean and the
+  evaluator stops on an unhandled `t`. Needs the clause rows before the clauses are typed.
+  Measure, red test, fix, controls.
+- Ask the maintainer, offering options with a recommendation (PARKED has each): partial
+  handlers (error, or forward the rest and put it in the row); type annotations, which
+  the parser discards entirely (check them, and with what syntax for function types);
+  sub-effecting for effect rows (equality, function-value joins, or full constraints).
+A fix that rejects a program the corpora accept is a language decision: stop and ask.
 
 ### 2. Evaluator: non-tail recursion under a handler is quadratic
 

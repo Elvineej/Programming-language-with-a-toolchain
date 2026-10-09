@@ -559,6 +559,23 @@ impl Infer {
         Ok(())
     }
 
+    /// A row conflict on the way INTO an ambient -- a perform, a call or a
+    /// handle's residual meeting a row that was already closed -- used to be
+    /// discarded, so the effect vanished from the type (found by the
+    /// resume-row review). Report it instead.
+    fn surface_conflict(&mut self, r: Result<(), RowConflict>) {
+        if let Err(c) = r {
+            let mut differ = c.only1.clone();
+            differ.extend(c.only2.iter().cloned());
+            let span = differ.first().map(|(_, s)| *s).unwrap_or(Span::EMPTY);
+            self.emit_row_mismatch(
+                &differ,
+                span,
+                "this effect reaches a row that was already closed",
+            );
+        }
+    }
+
     /// Emit `E0423` naming the exact set of labels two rows differ by. Rows are
     /// rendered as named labels (never a `%r` token) — the effect-diagnostic
     /// discipline. Shared by the unifier and the exact-match pass (Task 6).
@@ -972,7 +989,10 @@ impl Infer {
                             if handled.as_deref() == Some(label.as_str()) {
                                 continue;
                             }
-                            let _ = self.add_effect(amb, label, l.args.clone(), l.span);
+                            {
+                                let r = self.add_effect(amb, label, l.args.clone(), l.span);
+                                self.surface_conflict(r);
+                            }
                         }
                         r
                     }
@@ -1121,7 +1141,10 @@ impl Infer {
                 let want = Ty::Fn(vec![Ty::str()], EffectRow::pure(), Box::new(Ty::unit()));
                 let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::unit()));
                 self.unify(&want, &got, span);
-                let _ = self.add_effect(amb, "IO", Vec::new(), span); // io.println performs {IO}
+                {
+                    let r = self.add_effect(amb, "IO", Vec::new(), span);
+                    self.surface_conflict(r);
+                } // io.println performs {IO}
                 let mut io_labels = BTreeMap::new();
                 io_labels.insert(
                     "IO".to_string(),
@@ -1209,7 +1232,10 @@ impl Infer {
                 let want = Ty::Fn(op_params, EffectRow::pure(), Box::new(op_ret.clone()));
                 let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(op_ret.clone()));
                 self.unify(&want, &got, span);
-                let _ = self.add_effect(amb, &op.effect, eff_args, span);
+                {
+                    let r = self.add_effect(amb, &op.effect, eff_args, span);
+                    self.surface_conflict(r);
+                }
                 return op_ret;
             }
         }
@@ -1222,7 +1248,10 @@ impl Infer {
         let expected = Ty::Fn(arg_ts, EffectRow::open(call_row), Box::new(result.clone()));
         self.unify(&f, &expected, span);
         let eff = self.resolve_row(&EffectRow::open(call_row));
-        let _ = self.add_row(amb, &eff, span);
+        {
+            let r = self.add_row(amb, &eff, span);
+            self.surface_conflict(r);
+        }
         result
     }
 
@@ -1275,7 +1304,10 @@ impl Infer {
         // `e` may perform E plus a polymorphic remainder.
         let amb_in = self.fresh_row();
         if let Some(e) = &effect {
-            let _ = self.add_effect(amb_in, e, eff_args.clone(), span);
+            {
+                let r = self.add_effect(amb_in, e, eff_args.clone(), span);
+                self.surface_conflict(r);
+            }
         }
         let body_ty = self.infer_expr(body, env, amb_in);
 
@@ -1391,7 +1423,10 @@ impl Infer {
         if let Some(e) = &effect {
             residual.labels.remove(e);
         }
-        let _ = self.add_row(amb, &residual, span);
+        {
+            let r = self.add_row(amb, &residual, span);
+            self.surface_conflict(r);
+        }
         result
     }
 
@@ -2491,6 +2526,24 @@ mod tests {
             );
         }
         EffectRow { labels: m, tail }
+    }
+
+    #[test]
+    fn an_effect_reaching_a_closed_row_is_reported_not_dropped() {
+        // The row-soundness sweep: every perform/call/discharge site used to
+        // discard this conflict, and the effect vanished from the type. The
+        // helper on its own; `tests/row_soundness.rs` has the programs.
+        let mut inf = Infer::new();
+        let amb = inf.fresh_row();
+        inf.bind_row(amb, &EffectRow::pure(), Span::EMPTY);
+        let r = inf.add_effect(amb, "Log", Vec::new(), Span::EMPTY);
+        assert!(r.is_err(), "a closed row cannot absorb Log");
+        inf.surface_conflict(r);
+        assert!(
+            inf.diags.iter().any(|d| d.code == "E0423"),
+            "the conflict must be a diagnostic: {:?}",
+            inf.diags
+        );
     }
 
     #[test]
