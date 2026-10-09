@@ -188,6 +188,12 @@ pub struct Infer {
     /// only through `infer_with_types`. Keyed by span (Shape A; the span-audit
     /// gate proves the key is unique).
     node_types: HashMap<Span, Ty>,
+    /// Declared type names -> arity, for elaborating annotations (2026-10-09).
+    known_types: HashMap<String, usize>,
+    /// The current top-level function's annotation type variables: a lowercase
+    /// name in any annotation of one function (its signature, its `let`s and
+    /// lambdas) is one shared unification variable.
+    ann_vars: HashMap<String, Ty>,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -206,7 +212,128 @@ impl Infer {
             linear_types: HashSet::new(),
             affine_sites: HashSet::new(),
             node_types: HashMap::new(),
+            known_types: HashMap::new(),
+            ann_vars: HashMap::new(),
             diags: Vec::new(),
+        }
+    }
+
+    /// A type annotation as a type (2026-10-09; annotations used to be parsed
+    /// and discarded). Base and declared names as in an ADT field; a lowercase
+    /// name is the function's shared variable of that name -- FLEXIBLE: it
+    /// says "the same type here and there", not "for every type" (no rigid
+    /// skolems); `fn(A) / {E} -> R` is a function type whose row, when none is
+    /// written, is open (any effects), and when written is exactly those.
+    fn elaborate_ann(&mut self, ann: &Spanned<TypeAnn>, covariant: bool) -> Ty {
+        let t = &ann.node;
+        if t.name == "fn" && !t.args.is_empty() {
+            let n = t.args.len();
+            let params: Vec<Ty> = t.args[..n - 1]
+                .iter()
+                .map(|a| self.elaborate_ann(a, !covariant))
+                .collect();
+            let ret = self.elaborate_ann(&t.args[n - 1], covariant);
+            let row = match &t.row {
+                // An unwritten row says nothing about effects. Where the value
+                // is PRODUCED (a covariant position: a result, a `let`) it is
+                // an upcast tail, exactly what an unannotated lambda gets --
+                // a meaningful variable there stopped sub-effecting (the
+                // review's F2). Where it is CONSUMED (a parameter) it is a
+                // real variable the body's calls relay.
+                None if covariant => EffectRow::open(self.fresh_phantom_row()),
+                None => EffectRow::open(self.fresh_row()),
+                Some(labels) => {
+                    let mut m = BTreeMap::new();
+                    for l in labels {
+                        if !self.effect_multi.contains_key(&l.node) && l.node != "IO" {
+                            self.diags.push(
+                                Diagnostic::error("E0432", format!("unknown effect `{}`", l.node))
+                                    .with_label(l.span, "no such effect"),
+                            );
+                            continue;
+                        }
+                        let arity = self
+                            .ops
+                            .values()
+                            .find(|o| o.effect == l.node)
+                            .map(|o| o.effect_params.len())
+                            .unwrap_or(0);
+                        let args = (0..arity).map(|_| self.fresh()).collect();
+                        m.insert(l.node.clone(), EffectLabel { args, span: l.span });
+                    }
+                    EffectRow {
+                        labels: m,
+                        tail: RowTail::Closed,
+                    }
+                }
+            };
+            return Ty::Fn(params, row, Box::new(ret));
+        }
+        if t.args.is_empty() && t.name.starts_with(|c: char| c.is_ascii_lowercase()) {
+            if let Some(v) = self.ann_vars.get(&t.name) {
+                return v.clone();
+            }
+            let v = self.fresh();
+            self.ann_vars.insert(t.name.clone(), v.clone());
+            return v;
+        }
+        if matches!(
+            t.name.as_str(),
+            "Int" | "Float" | "Bool" | "String" | "Unit"
+        ) && !t.args.is_empty()
+        {
+            self.diags.push(
+                Diagnostic::error("E0400", format!("`{}` takes no type arguments", t.name))
+                    .with_label(ann.span, "remove the arguments"),
+            );
+            return Ty::Error;
+        }
+        match t.name.as_str() {
+            "Int" => Ty::int(),
+            "Float" => Ty::float(),
+            "Bool" => Ty::bool(),
+            "String" => Ty::str(),
+            "Unit" => Ty::unit(),
+            other => match self.known_types.get(other).copied() {
+                Some(arity) => {
+                    if t.args.len() != arity {
+                        self.diags.push(
+                            Diagnostic::error(
+                                "E0400",
+                                format!(
+                                    "type `{other}` expects {arity} argument(s), found {}",
+                                    t.args.len()
+                                ),
+                            )
+                            .with_label(ann.span, "wrong number of type arguments"),
+                        );
+                        return Ty::Error;
+                    }
+                    // Type arguments are invariant: no upcast tails inside.
+                    let args = t
+                        .args
+                        .iter()
+                        .map(|a| self.elaborate_ann(a, false))
+                        .collect();
+                    Ty::Con(other.to_string(), args)
+                }
+                None => {
+                    self.diags.push(
+                        Diagnostic::error("E0432", format!("unknown type `{other}`"))
+                            .with_label(ann.span, "no such type"),
+                    );
+                    Ty::Error
+                }
+            },
+        }
+    }
+
+    /// Check an annotation against the type inference gave the annotated
+    /// thing; a mismatch is reported at the annotation.
+    fn check_ann(&mut self, ann: &Option<Spanned<TypeAnn>>, ty: &Ty, covariant: bool) {
+        if let Some(a) = ann {
+            let want = self.elaborate_ann(a, covariant);
+            self.unify(&want, ty, a.span);
         }
     }
 
@@ -961,8 +1088,9 @@ impl Infer {
         env.push();
         for st in b.stmts.iter() {
             match &st.node {
-                Stmt::Let { name, value } => {
+                Stmt::Let { name, ann, value } => {
                     let t = self.infer_expr(value, env, amb);
+                    self.check_ann(ann, &t, true);
                     // Record an affine binding site (Slice 4d-2): a `let` whose
                     // value has a `linear`-declared type. Keyed by the value span,
                     // which the affine pass reads to recognise the binding.
@@ -1151,6 +1279,7 @@ impl Infer {
                     // The back end then READS a lambda parameter's type instead of
                     // reconstructing it from call-site context.
                     self.node_types.insert(p.span, pv.clone());
+                    self.check_ann(&p.node.ann, &pv, false);
                     param_tys.push(pv);
                 }
                 // The lambda has its OWN latent effect row: infer the body under a
@@ -1627,6 +1756,14 @@ impl Infer {
         free_vars(self, &resolved, &mut in_ty);
         let mut in_env = Vec::new();
         env_free_vars(self, env, &mut in_env);
+        // The function's annotation variables are part of the environment: a
+        // lowercase name is ONE type for the whole function, so an inner `let`
+        // must not quantify it (the annotations review's F1: a later binding
+        // of it rewrote the generalized nodes, and natively a captured ADT was
+        // treated as an untraced Int).
+        for t in self.ann_vars.values().cloned().collect::<Vec<_>>() {
+            free_vars(self, &t, &mut in_env);
+        }
         let vars: Vec<u32> = in_ty.into_iter().filter(|v| !in_env.contains(v)).collect();
 
         let mut row_in_ty = Vec::new();
@@ -1760,6 +1897,19 @@ fn elaborate_adt_ty(
     known: &HashMap<String, usize>,
 ) -> Ty {
     let t = &ann.node;
+    if t.name == "fn" {
+        inf.diags.push(
+            Diagnostic::error(
+                "E0432",
+                "a function type in a type or effect declaration is not supported yet",
+            )
+            .with_label(
+                ann.span,
+                "function-typed fields and operation parameters come later",
+            ),
+        );
+        return Ty::Error;
+    }
     if t.args.is_empty() {
         if let Some(ty) = param_env.get(&t.name) {
             return ty.clone();
@@ -2024,6 +2174,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             known_types.insert(t.name.clone(), t.params.len());
         }
     }
+    inf.known_types = known_types.clone();
     for d in &module.decls {
         if let Decl::Type(t) = &d.node {
             let param_vars: Vec<Ty> = t.params.iter().map(|_| inf.fresh()).collect();
@@ -2145,6 +2296,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
         // 1. fresh monotype per member (with a fresh open ambient row), in scope
         //    for the whole group.
         let mut member_ty: HashMap<usize, (Vec<Ty>, RowVar, Ty)> = HashMap::new();
+        let mut ann_vars_of: HashMap<usize, HashMap<String, Ty>> = HashMap::new();
         for &i in group {
             let f = fns[i];
             let params: Vec<Ty> = f.params.iter().map(|_| inf.fresh()).collect();
@@ -2162,12 +2314,23 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                     ),
                 },
             );
+            // Annotations (2026-10-09): each parameter's and the result's,
+            // against the member's monotype, before any body is inferred --
+            // so a call earlier in the group already sees them. The function's
+            // annotation variables live on into its body (step 2).
+            inf.ann_vars = HashMap::new();
+            for (p, pty) in f.params.iter().zip(&params) {
+                inf.check_ann(&p.node.ann, pty, false);
+            }
+            inf.check_ann(&f.ret_ann, &result, true);
+            ann_vars_of.insert(i, std::mem::take(&mut inf.ann_vars));
             member_ty.insert(i, (params, amb_f, result));
         }
         // 2. infer each body under its params + ambient (monomorphic in-group).
         for &i in group {
             let f = fns[i];
             let (params, amb_f, result) = member_ty[&i].clone();
+            inf.ann_vars = ann_vars_of.remove(&i).unwrap_or_default();
             env.push();
             for (p, pty) in f.params.iter().zip(&params) {
                 // Slice 5b-3 §3.2: record the parameter's type at its OWN span,
@@ -2190,7 +2353,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             inf.param_tys = params.clone();
             let body_ty = inf.infer_block(&f.body.node, &mut env, amb_f);
             inf.param_tys.clear();
-            inf.unify(&body_ty, &result, f.body.span);
+            inf.unify(&result, &body_ty, f.body.span);
             env.pop();
         }
         // 2.4. Sub-effecting: every pending inclusion reaches its ambient

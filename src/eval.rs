@@ -292,7 +292,7 @@ pub mod tree {
         let mut local = env.clone();
         for st in b.stmts.iter() {
             match &st.node {
-                Stmt::Let { name, value } => {
+                Stmt::Let { name, value, .. } => {
                     let v = eval_expr(interp, value, &local, fns)?;
                     local = local.extend(&[(name.clone(), v)]);
                 }
@@ -627,7 +627,7 @@ pub mod cek {
             };
         }
         match &stmts[cursor].node {
-            Stmt::Let { name, value } => State::Eval(
+            Stmt::Let { name, value, .. } => State::Eval(
                 Rc::new(value.clone()),
                 env.clone(),
                 push(

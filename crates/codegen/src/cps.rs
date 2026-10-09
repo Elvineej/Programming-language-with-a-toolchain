@@ -895,7 +895,7 @@ mod tests {
 
     #[test]
     fn a_heap_saved_value_is_listed_with_its_type() {
-        let (_c, sites) = sites_of("fn g() -> Str { let s = \"a\"  let n = get()  s }\n");
+        let (_c, sites) = sites_of("fn g() -> String { let s = \"a\"  let n = get()  s }\n");
         assert_eq!(sites.len(), 1);
         assert_eq!(names(&sites[0]), vec!["s"]);
     }
@@ -904,7 +904,7 @@ mod tests {
     fn a_site_row_sets_bit_j_plus_2_for_a_heap_saved_value() {
         // D10: [tag][code_ptr][next][saved_0..] -- bit 0 clear (code), bit 1
         // set (next), bit j+2 set iff saved j is heap.
-        let (core, sites) = sites_of("fn g() -> Str { let s = \"a\"  let n = get()  s }\n");
+        let (core, sites) = sites_of("fn g() -> String { let s = \"a\"  let n = get()  s }\n");
         let d = rows_of(&core, &sites);
         let tag = d.site_tags[&sites[0].key];
         assert_eq!(row_at(&d, tag), [3, 0b110]);

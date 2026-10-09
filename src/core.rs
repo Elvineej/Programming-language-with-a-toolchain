@@ -312,7 +312,7 @@ fn lower_block(
     let mut acc = lower_expr(&tail.node, tail.span, table, cx)?;
     for stmt in block.stmts.iter().rev() {
         let (name, value) = match &stmt.node {
-            Stmt::Let { name, value } => (
+            Stmt::Let { name, value, .. } => (
                 name.clone(),
                 lower_expr(&value.node, value.span, table, cx)?,
             ),
