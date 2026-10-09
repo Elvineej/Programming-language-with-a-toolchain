@@ -3,19 +3,19 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-05, 16:00)
+## State at handoff (updated 2026-10-08)
 
-- `main` has slices 5b-8, 5c-1..3, 5b-9a (effectful `match`, native), the PolyForm Strict
-  license and this file. **`main` fails ONE test on Windows** (see step 1); Linux is green.
+- `main` has slices 5b-8, 5c-1..3, 5b-9a, the CEK example, the PolyForm Strict license and
+  this file. **Open PR #15** lands the tail-in-match fix and slice 5b-9b on `main` (Windows
+  CI green on its tip). Slice 5b-10 (this file's newest Done entry) is on branch
+  `claude/slice-5b10-nested-handles`, stacked on #15's branch: merge #15 first, then
+  retarget 5b-10's PR to `main`.
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
   university address; every branch was force-pushed. Do not push old local branches.
 - The repo is private until the maintainer flips it public (only they can).
-- Open PRs: **#12** lands the Elya CEK machine and the Claude-only rule on `main` (#11
-  merged into #10's branch, not `main`); the tail-in-match fix is stacked on #12.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Diagnostics added in 5c: E0202 duplicate op name, E0203 clause names no declared op
-  (or has the wrong arity), E0204, E0205, E0206.
+- Linux gate at the 5b-10 tip: 677 passed, 67 suites. `gc_mark` 637 bytes.
 
 ## How work is done here (non-negotiable)
 
@@ -88,18 +88,29 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   enclosing scope's binding indices; effectful closure calls as site calls or tail jumps.
   Spec `docs/superpowers/specs/2026-10-05-elya-slice-5b9b-effectful-lambdas-design.md`.
 
+- **Slice 5b-10: nested handles and handles inside effectful code, natively (D17 lifted)**
+  (2026-10-08, branch `claude/slice-5b10-nested-handles`): spec
+  `docs/superpowers/specs/2026-10-08-elya-slice-5b10-nested-handles-design.md`. A handle
+  that leaks an effect is a CPS handle (a continuation site; its clauses and return clause
+  CPS regions); handler frames gained a `parent` word; performs walk parents; resumes
+  re-install their frame at the resume. Found on the way (parked): `resume` is typed
+  effect-free (a soundness hole), partial handles check clean, recursion through a handle
+  body is rejected by inference.
+
 ## The next five steps
 
-### 1. Slice 5b-10: lift D17 (nested handles, handles inside effectful code)
+### 1. Front end: `resume` carries its handle's row (soundness; found by 5b-10)
 
-PARKED, "`elya_current_handler` depends on today's handle refusals":
-
-- A perform must switch the global to the handler *outside* the clause's handle before
-  jumping to the clause.
-- The tail-resume install in `clause_tail` becomes load-bearing.
-- First write a red test with **two live handlers where the wrong one is observable**.
-  Today no test isolates the install (Task 12 control 1a), and A6 is not a witness in
-  this design.
+PARKED, "`resume` is typed effect-free". A program that checks clean stops in the evaluator
+with "unhandled effect `t` reached the machine": a lambda that resumes is typed pure, but
+calling it runs the rest of the handled body. Under deep handlers `resume(v)` should carry
+the handle's OUTER row (what the resumed computation may still perform). Measure first (the
+PARKED program, m10 from the 5b-10 spec, every corpus that resumes inside a lambda), red
+tests in `tests/` (a type error where today `check` is clean), then the fix in
+`src/types.rs`. Expect m10 to compile natively afterwards and
+`an_escaped_resume_of_a_leaking_handle_is_refused_by_name` to flip (an approved
+expected-value change: say so in the commit). Any existing program the fix rejects is a
+language decision: stop and ask the maintainer.
 
 ### 2. Evaluator: non-tail recursion under a handler is quadratic
 
@@ -121,12 +132,13 @@ differential corpora must stay green unchanged.
 ### 4. Native multi-shot handlers (`with multi`)
 
 Refused natively by name since 5b-8 (A2); the evaluator runs them. A multi-shot resume
-re-runs a captured continuation, but native frames are consumed in place: a second resume
-needs the frame chain COPIED (or made immutable) first, and the one-shot `consumed` flag
-replaced by a copy-on-resume rule. Measure first (the evaluator's multi-shot corpus, e.g.
-`multi_shot_collects_both_branches`, through `build`), then a spec with the frame-copy
-cost stated and gated against A4's live-set instrument. Depends on step 2 (handler
-re-installation). Ask the maintainer whether multi-shot is worth native support before N7.
+re-runs a captured continuation, but native frames are consumed in place -- and since 5b-10
+a resume also MUTATES its handler frame (`next`, `parent`): a second resume needs the frame
+chain, handler frames included, COPIED first, and the one-shot word replaced by a
+copy-on-resume rule. Measure first (the evaluator's multi-shot corpus, e.g.
+`multi_shot_collects_both_branches`, through `build`), then a spec with the copy cost
+stated and gated against A4's live-set instrument. Ask the maintainer whether multi-shot is
+worth native support before N7.
 
 ### 5. Native strings: `<>` and an Int-to-String builtin
 
@@ -139,6 +151,11 @@ an integer formatter. The builtin's NAME and module (`int.to_string`? `show`?) i
 language decision: ask the maintainer, offering options. Then let the CEK example print
 its answers.
 
-Also open, unscheduled: the Elya CEK machine's next versions (a parser for its terms, a step
+Also open, unscheduled: two front-end findings from 5b-10 (PARKED): recursion through a
+handle body is rejected by inference, and a handle with clauses for only some of its
+effect's ops checks clean (a language question: error, or forward and put the rest in the
+row). A perform walks the handler chain, so a program whose handler stack really grows
+(a resume inside a fresh handle every iteration) pays O(depth) per perform; the evaluator
+is no faster there. Also: the Elya CEK machine's next versions (a parser for its terms, a step
 counter as an Elya effect); PIC/PIE linking (needs a Windows run), and a named diagnosis for
 a native stack overflow in tests other than A9.

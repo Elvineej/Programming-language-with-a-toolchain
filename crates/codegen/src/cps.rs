@@ -3,7 +3,7 @@
 //! Deliberately LLVM-free: this is a pure question about a `Ty`, so it needs no
 //! `Context` and its tests are unit tests.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use elya::core::{CoreExpr, CoreKind, CoreModule};
 use elya::types::{EffectRow, RowTail, Ty};
@@ -94,14 +94,15 @@ pub struct ContSite {
 ///
 /// A site is a `Perform`, or an `App` whose callee's type `needs_cps`, that is
 /// NOT in tail position of its region: a tail call passes the current
-/// continuation straight on (D14), so it needs no frame. A handle and a resume
-/// are nesting calls (D14), so they are not sites, and each of their bodies
-/// is a region of its own.
+/// continuation straight on (D14), so it needs no frame. A direct handle and a
+/// direct resume are nesting calls (D14), so they are not sites; a CPS handle
+/// and a CPS resume are (5b-10, `Fx`). Each of a handle's bodies is a region
+/// of its own.
 pub fn collect_sites(core: &CoreModule) -> Vec<ContSite> {
     collect(core).sites
 }
 
-/// One `handle` node (7b-3, D17): what its handler frame must carry.
+/// One `handle` node (7b-3): what its handler frame must carry.
 pub struct HandlerSite {
     /// The `Handle` node's address.
     pub key: usize,
@@ -144,6 +145,7 @@ pub fn collect_lambda_regions(core: &CoreModule) -> HashMap<usize, LambdaRegion>
 }
 
 struct Out {
+    fx: Fx,
     sites: Vec<ContSite>,
     handlers: Vec<HandlerSite>,
     lambdas: HashMap<usize, LambdaRegion>,
@@ -151,6 +153,7 @@ struct Out {
 
 fn collect(core: &CoreModule) -> Out {
     let mut out = Out {
+        fx: effect_facts(core),
         sites: Vec::new(),
         handlers: Vec::new(),
         lambdas: HashMap::new(),
@@ -190,27 +193,268 @@ fn handler_saved(h: &elya::core::CoreHandle, scope: &[String]) -> Vec<(Saved, Ty
         .collect()
 }
 
+/// Slice 5b-10: which `handle`s LEAK a user effect -- their clauses, return
+/// clause or body perform something the handle does not handle -- and which
+/// `resume`s belong to such a handle, by node address. A leaking handle is a
+/// CPS handle (a continuation site of its region, its clauses and return
+/// clause CPS regions); every other handle is a direct nesting call, as in
+/// 5b-8. Which handle a resume belongs to is lexical: the innermost enclosing
+/// clause binds `$cont`.
+#[derive(Default, Debug)]
+pub struct Fx {
+    pub leaking: HashSet<usize>,
+    pub cps_resumes: HashSet<usize>,
+}
+
+/// Computes `Fx` structurally, to a fixpoint: a region's user effects are what
+/// it performs and what the rows of its callees name; a handle subtracts the
+/// effect its clauses name (E0423: one per handle) -- if they cover every op of
+/// it the module performs -- from its body's and adds its
+/// clauses' and return clause's; a resume contributes its own handle's leaks.
+/// The convention checks (D16) refuse, by name, any disagreement with the types.
+pub fn effect_facts(core: &CoreModule) -> Fx {
+    let mut owner: HashMap<usize, usize> = HashMap::new();
+    for f in &core.fns {
+        resume_owners(&f.body, None, &mut owner);
+    }
+    // Every op the module performs, by effect: a handle HANDLES an effect only
+    // if it has a clause for each of them. The front end accepts a handle with
+    // clauses for some of an effect's ops and types it as discharging all of
+    // it, while at run time the other ops go to an outer handler -- so such a
+    // handle LEAKS that effect (found by the 5b-10 review: compiled direct,
+    // the outer clause's continuation ended at the inner frame -- 2220 where
+    // the evaluator printed 1220).
+    let mut performed: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for f in &core.fns {
+        performed_ops(&f.body, &mut performed);
+    }
+    let mut leaks: HashMap<usize, BTreeSet<String>> = HashMap::new();
+    loop {
+        let mut changed = false;
+        for f in &core.fns {
+            region_effects(&f.body, &owner, &performed, &mut leaks, &mut changed);
+        }
+        if !changed {
+            break;
+        }
+    }
+    let leaking: HashSet<usize> = leaks
+        .iter()
+        .filter(|(_, l)| !l.is_empty())
+        .map(|(k, _)| *k)
+        .collect();
+    let cps_resumes = owner
+        .iter()
+        .filter(|(_, h)| leaking.contains(h))
+        .map(|(r, _)| *r)
+        .collect();
+    Fx {
+        leaking,
+        cps_resumes,
+    }
+}
+
+fn key(e: &CoreExpr) -> usize {
+    e as *const CoreExpr as usize
+}
+
+/// Every `(effect, op)` performed anywhere in `e`, lambda bodies and handle
+/// regions included.
+fn performed_ops(e: &CoreExpr, out: &mut HashMap<String, BTreeSet<String>>) {
+    if let CoreKind::Perform(p) = &e.kind {
+        out.entry(p.effect.clone())
+            .or_default()
+            .insert(p.op.clone());
+    }
+    let mut go = |c: &CoreExpr| performed_ops(c, out);
+    match &e.kind {
+        CoreKind::Lit(_) | CoreKind::Var(_) => {}
+        CoreKind::App(f, args) => {
+            go(f);
+            args.iter().for_each(go);
+        }
+        CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
+            a.iter().for_each(go)
+        }
+        CoreKind::Perform(p) => p.args.iter().for_each(go),
+        CoreKind::Lambda(_, body) | CoreKind::Resume(body) => go(body),
+        CoreKind::Let(_, v, b) => {
+            go(v);
+            go(b);
+        }
+        CoreKind::If(c, t, f) => {
+            go(c);
+            go(t);
+            go(f);
+        }
+        CoreKind::Match(s, arms) => {
+            go(s);
+            arms.iter().for_each(|a| go(&a.body));
+        }
+        CoreKind::Handle(h) => {
+            go(&h.body);
+            h.clauses.iter().for_each(|c| go(&c.body));
+            if let Some(r) = &h.ret {
+                go(&r.body);
+            }
+        }
+    }
+}
+
+/// Each `resume` node -> the `handle` whose clause encloses it.
+fn resume_owners(e: &CoreExpr, clause_of: Option<usize>, out: &mut HashMap<usize, usize>) {
+    if let (CoreKind::Resume(_), Some(h)) = (&e.kind, clause_of) {
+        out.insert(key(e), h);
+    }
+    let mut go = |c: &CoreExpr| resume_owners(c, clause_of, out);
+    match &e.kind {
+        CoreKind::Lit(_) | CoreKind::Var(_) => {}
+        CoreKind::App(f, args) => {
+            go(f);
+            args.iter().for_each(go);
+        }
+        CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
+            a.iter().for_each(go)
+        }
+        CoreKind::Perform(p) => p.args.iter().for_each(go),
+        CoreKind::Lambda(_, body) => go(body),
+        CoreKind::Resume(v) => go(v),
+        CoreKind::Let(_, v, b) => {
+            go(v);
+            go(b);
+        }
+        CoreKind::If(c, t, f) => {
+            go(c);
+            go(t);
+            go(f);
+        }
+        CoreKind::Match(s, arms) => {
+            go(s);
+            arms.iter().for_each(|a| go(&a.body));
+        }
+        CoreKind::Handle(h) => {
+            go(&h.body);
+            if let Some(r) = &h.ret {
+                go(&r.body);
+            }
+        }
+    }
+    if let CoreKind::Handle(h) = &e.kind {
+        for c in h.clauses.iter() {
+            resume_owners(&c.body, Some(key(e)), out);
+        }
+    }
+}
+
+/// The user effects `e`'s own region may perform (lambda bodies are regions of
+/// their own: visited for their handles, contributing nothing here). Records
+/// every handle's leaks in `leaks`, setting `changed` when one grows.
+fn region_effects(
+    e: &CoreExpr,
+    owner: &HashMap<usize, usize>,
+    performed: &HashMap<String, BTreeSet<String>>,
+    leaks: &mut HashMap<usize, BTreeSet<String>>,
+    changed: &mut bool,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    {
+        let mut go = |c: &CoreExpr, out: &mut BTreeSet<String>| {
+            out.extend(region_effects(c, owner, performed, leaks, changed));
+        };
+        match &e.kind {
+            CoreKind::Lit(_) | CoreKind::Var(_) => {}
+            CoreKind::App(f, args) => {
+                if let Ty::Fn(_, row, _) = &f.ty {
+                    out.extend(row.labels.keys().filter(|l| *l != BUILTIN_EFFECT).cloned());
+                }
+                go(f, &mut out);
+                args.iter().for_each(|a| go(a, &mut out));
+            }
+            CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
+                a.iter().for_each(|x| go(x, &mut out))
+            }
+            CoreKind::Perform(p) => {
+                if p.effect != BUILTIN_EFFECT {
+                    out.insert(p.effect.clone());
+                }
+                p.args.iter().for_each(|a| go(a, &mut out));
+            }
+            CoreKind::Lambda(_, body) => {
+                let _ = region_effects(body, owner, performed, leaks, changed);
+            }
+            CoreKind::Resume(v) => {
+                go(v, &mut out);
+                if let Some(h) = owner.get(&key(e)) {
+                    if let Some(l) = leaks.get(h) {
+                        out.extend(l.iter().cloned());
+                    }
+                }
+            }
+            CoreKind::Let(_, v, b) => {
+                go(v, &mut out);
+                go(b, &mut out);
+            }
+            CoreKind::If(c, t, f) => {
+                go(c, &mut out);
+                go(t, &mut out);
+                go(f, &mut out);
+            }
+            CoreKind::Match(s, arms) => {
+                go(s, &mut out);
+                arms.iter().for_each(|a| go(&a.body, &mut out));
+            }
+            CoreKind::Handle(_) => {}
+        }
+    }
+    if let CoreKind::Handle(h) = &e.kind {
+        let covers = |eff: &String| {
+            performed.get(eff).map_or(true, |ops| {
+                ops.iter()
+                    .all(|op| h.clauses.iter().any(|c| &c.effect == eff && &c.op == op))
+            })
+        };
+        let handled: BTreeSet<&String> = h
+            .clauses
+            .iter()
+            .map(|c| &c.effect)
+            .filter(|eff| covers(eff))
+            .collect();
+        let body = region_effects(&h.body, owner, performed, leaks, changed);
+        out.extend(body.into_iter().filter(|l| !handled.contains(l)));
+        for c in h.clauses.iter() {
+            out.extend(region_effects(&c.body, owner, performed, leaks, changed));
+        }
+        if let Some(r) = &h.ret {
+            out.extend(region_effects(&r.body, owner, performed, leaks, changed));
+        }
+        let entry = leaks.entry(key(e)).or_default();
+        for l in &out {
+            if entry.insert(l.clone()) {
+                *changed = true;
+            }
+        }
+    }
+    out
+}
+
 /// True iff `e` needs the CPS machinery in its OWN region: it contains a
-/// `Perform`, or a call whose callee type `needs_cps`, outside any lambda body
-/// and outside any `handle` (both are regions of their own). D16: a top-level
-/// function is CPS iff its body answers true.
-pub fn contains_effect(e: &CoreExpr) -> bool {
-    if is_call_site(e) {
+/// `Perform`, a call whose callee type `needs_cps`, a LEAKING `handle` or a
+/// resume of one (5b-10), outside any lambda body and outside any handle's
+/// own regions. D16: a top-level function is CPS iff its body answers true.
+pub fn contains_effect(e: &CoreExpr, fx: &Fx) -> bool {
+    if is_call_site(e, fx) {
         return true;
     }
+    let go = |c: &CoreExpr| contains_effect(c, fx);
     match &e.kind {
         CoreKind::Lit(_) | CoreKind::Var(_) | CoreKind::Lambda(..) | CoreKind::Handle(_) => false,
-        CoreKind::App(f, args) => contains_effect(f) || args.iter().any(contains_effect),
-        CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
-            a.iter().any(contains_effect)
-        }
-        CoreKind::Perform(p) => p.args.iter().any(contains_effect),
-        CoreKind::Let(_, v, b) => contains_effect(v) || contains_effect(b),
-        CoreKind::If(c, t, f) => contains_effect(c) || contains_effect(t) || contains_effect(f),
-        CoreKind::Match(s, arms) => {
-            contains_effect(s) || arms.iter().any(|a| contains_effect(&a.body))
-        }
-        CoreKind::Resume(v) => contains_effect(v),
+        CoreKind::App(f, args) => go(f) || args.iter().any(go),
+        CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => a.iter().any(go),
+        CoreKind::Perform(p) => p.args.iter().any(go),
+        CoreKind::Let(_, v, b) => go(v) || go(b),
+        CoreKind::If(c, t, f) => go(c) || go(t) || go(f),
+        CoreKind::Match(s, arms) => go(s) || arms.iter().any(|a| go(&a.body)),
+        CoreKind::Resume(v) => go(v),
     }
 }
 
@@ -260,10 +504,14 @@ struct Step<'a> {
     depth: usize,
 }
 
-fn is_call_site(e: &CoreExpr) -> bool {
+fn is_call_site(e: &CoreExpr, fx: &Fx) -> bool {
     match &e.kind {
         CoreKind::Perform(_) => true,
         CoreKind::App(f, _) => needs_cps(&f.ty),
+        // 5b-10: a CPS handle and a CPS resume suspend their region: the rest
+        // of it is the handle's (or the resume's) continuation.
+        CoreKind::Handle(_) => fx.leaking.contains(&key(e)),
+        CoreKind::Resume(_) => fx.cps_resumes.contains(&key(e)),
         _ => false,
     }
 }
@@ -284,7 +532,7 @@ fn walk<'a>(
     path: &mut Vec<Step<'a>>,
     out: &mut Out,
 ) {
-    if is_call_site(e) && !in_tail(path) {
+    if is_call_site(e, &out.fx) && !in_tail(path) {
         out.sites.push(ContSite {
             key: e as *const CoreExpr as usize,
             owner: owner.to_string(),

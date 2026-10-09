@@ -278,9 +278,13 @@ void elya_match_fail(void) {
  * site sets it around its body and restores it after; a resume installs the
  * continuation's own handler around the resumed computation. A perform reads
  * it in O(1) -- walking the frame chain to its end on every perform made deep
- * non-tail effectful recursion quadratic (measured: 80k deep, 15 s). Not a GC
- * root: whenever it is read, the handler frame is reachable from the live
- * continuation, whose chain ends at it. Single-threaded, like the runtime. */
+ * non-tail effectful recursion quadratic (measured: 80k deep, 15 s). Since
+ * slice 5b-10 the innermost handler: a perform walks handler frames' traced
+ * `parent` words from here, and a clause or return clause runs with its
+ * frame's `parent` current, paired with that frame's `next` (or the native
+ * return of a direct handle) as its continuation. Not a GC root: whenever it
+ * is read, it is reachable from the live continuation through `next` and
+ * `parent`. Single-threaded, like the runtime. */
 void *elya_current_handler = 0;
 
 /* 5b-8 D13: one-shot is enforced natively. A second resume stops here -- a
