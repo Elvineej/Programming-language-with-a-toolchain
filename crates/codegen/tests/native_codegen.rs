@@ -3288,6 +3288,62 @@ const NESTED_HANDLES: &[(&str, &str, &str)] = &[
         "321",
     ),
     (
+        // the inner handle (S) forwards `put` (P) to the outer, whose NON-TAIL resume must get the outer handle's answer: ((1 + 10) * 10 + 1000) * 2. (The 5b-10 review's partial-handler row, rewritten with two effects once E0207 made partial handlers an error.)
+        "forwarded-op-non-tail-resume",
+        "effect S { fn get() -> Int }\n\
+         effect P { fn put(x: Int) -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle {\n\
+         \x20   handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 }\n\
+         \x20 } with { P.put(x) -> resume(x * 2) + 1000  return(r) -> r * 2 }\n\
+         }\n",
+        "1220",
+    ),
+    (
+        // the same, the outer clause aborting: (5 + 1000) + 1.
+        "forwarded-op-outer-clause-aborts",
+        "effect S { fn get() -> Int }\n\
+         effect P { fn put(x: Int) -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 let v = handle {\n\
+         \x20   handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 }\n\
+         \x20 } with { P.put(x) -> x + 1000  return(r) -> r * 2 }\n\
+         \x20 v + 1\n\
+         }\n",
+        "1006",
+    ),
+    (
+        // the aborting shape inside an effectful function, under a T handler: ((5 + 1000 + 10) + 1) * 3 + 7.
+        "forwarded-op-abort-in-an-effectful-fn",
+        "effect S { fn get() -> Int }\n\
+         effect P { fn put(x: Int) -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         fn f() -> Int {\n\
+         \x20 let v = handle {\n\
+         \x20   let a = handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 }\n\
+         \x20   a + t()\n\
+         \x20 } with { P.put(x) -> x + 1000 + t()  return(r) -> r * 2 }\n\
+         \x20 v + 1\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { f() * 3 } with { T.t() -> resume(10)  return(r) -> r + 7 }\n\
+         }\n",
+        "3055",
+    ),
+    (
+        // `f`'s handle forwards P out of `f` (typed `{P}` now): ((1 + 10) * 10 + 1000 + 3) * 2.
+        "forwarded-op-through-a-function",
+        "effect S { fn get() -> Int }\n\
+         effect P { fn put(x: Int) -> Int }\n\
+         fn f() -> Int {\n\
+         \x20 handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 }\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { f() + 3 } with { P.put(x) -> resume(x * 2) + 1000  return(r) -> r * 2 }\n\
+         }\n",
+        "1226",
+    ),
+    (
         // The resume-row review: `g` resumes directly in one branch of its
         // clause and builds a resuming lambda in the other, then performs L.
         // The first version of the resume-row fix typed `g` pure (its row

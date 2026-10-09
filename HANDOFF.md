@@ -18,7 +18,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the partial-handlers tip: 721 passed, 73 suites. `gc_mark` 637 bytes.
+- Linux gate at the partial-handlers tip: 729 passed, 73 suites. `gc_mark` 637 bytes.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
   language decisions taken. The maintainer delegated all choices (rule 2).
