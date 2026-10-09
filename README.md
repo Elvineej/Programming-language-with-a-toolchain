@@ -108,7 +108,8 @@ Elya is a typed language on a CEK machine, built up through these slices:
   collector cannot catch.
 - **Name rules for effects** — operation names are unique per module (`E0202`); a
   handler clause must name a declared operation of the effect it names, with the
-  right arity (`E0203`), at most once per handler (`E0204`); a top-level function
+  right arity (`E0203`), at most once per handler (`E0204`), and a handler covers
+  every operation of its effect (`E0207`); a top-level function
   may not share an operation's name (`E0205`); an operation may only be called,
   never used as a value (`E0206`); and a local binding shadows an operation of the
   same name, lexically. A bare clause (`ask() -> …`) means its operation's effect.

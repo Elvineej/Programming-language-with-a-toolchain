@@ -299,7 +299,13 @@ it (1000). The handle discharges S, so S should not reach `nest`'s row; recursio
 the SCC seems to unify the row before the handle subtracts S. It also blocks the native
 test of deep dynamic handler nesting (the perform walk over many `parent`s).
 
-## Front end: a handle with clauses for only some of its effect's ops checks clean (found by the 5b-10 review, 2026-10-08)
+## RESOLVED (branch `claude/partial-handlers`, 2026-10-09): a handle with clauses for only some of its effect's ops checks clean (found by the 5b-10 review, 2026-10-08)
+
+The maintainer chose the error: `E0207`, "this handler does not cover every operation of
+`S`", with the clauses to add (`tests/handler_coverage.rs`). `cps::Fx` keeps treating a
+partial handle as leaking, as defence in depth (unit test
+`a_partial_handle_leaks_the_ops_it_does_not_cover`). Original:
+
 
 The front end types such a handle as discharging the whole effect, so `fn f() -> Int {
 handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 } }` is typed
