@@ -3425,3 +3425,111 @@ fn a_leaking_handle_in_a_tail_loop_is_bounded_natively_at_a_million() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3000002");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- Sub-effecting for function values (2026-10-08, the maintainer's decision) ----
+
+/// Programs the front end newly accepts through sub-effecting, natively: value
+/// and evaluator differential. Rejected by `check` before (E0423).
+const SUB_EFFECTING: &[(&str, &str, &str)] = &[
+    (
+        // an `if` joins a pure lambda and one that recurses into an effectful
+        // `go`; the joined node type names L, so BOTH lambdas compile with the
+        // CPS convention.
+        "pure-and-effectful-lambdas-joined",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn go(n) {\n\
+         \x20 let a = lg(n)\n\
+         \x20 let f = if n == 0 { fn(s) { s } } else { fn(s) { s + go(n - 1) } }\n\
+         \x20 f(1) + a\n\
+         }\n\
+         pub fn main() -> Int { handle { go(2) } with { L.lg(x) -> resume(x)  return(r) -> r } }\n",
+        "6",
+    ),
+    (
+        // the resuming clause value performs T, the return clause's does not;
+        // they join in the handle's result: ((1 * 2) + 10) * 2.
+        "clause-values-with-different-rows",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle {\n\
+         \x20   let f = handle { get() + t() } with { S.get() -> fn(k) { (resume(k(1)))(k) }  return(x) -> fn(k) { k(x) } }\n\
+         \x20   f(fn(z) { z * 2 })\n\
+         \x20 } with { T.t() -> resume(10)  return(r) -> r }\n\
+         }\n",
+        "24",
+    ),
+    (
+        // m10 of the 5b-10 spec, which the resume-row fix had made E0423.
+        "pure-return-value-beside-a-resuming-one",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         fn g() -> Int {\n\
+         \x20 let f = handle { get() + t() } with {\n\
+         \x20   S.get() -> fn(s) { (resume(s))(s) }\n\
+         \x20   return(x) -> fn(s) { x }\n\
+         \x20 }\n\
+         \x20 f(5)\n\
+         }\n\
+         pub fn main() -> Int { handle { g() } with { T.t() -> resume(10)  return(r) -> r } }\n",
+        "15",
+    ),
+];
+
+#[test]
+fn the_sub_effecting_corpus_compiles_and_runs() {
+    run_value_corpus(SUB_EFFECTING, "sub-effecting");
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_sub_effecting_corpus() {
+    run_differential_corpus(SUB_EFFECTING, "sub-effecting-diff");
+}
+
+/// Sub-effecting lets a DIRECT closure (`f`, generic and pure) be used where an
+/// effectful function is expected (the `if` joins it with a T-performing
+/// lambda). Its code has the direct convention, so the CPS call of `g` jumped
+/// into it with the wrong signature: measured 2 where the evaluator printed 13.
+/// Refused by name until an adapter wraps such a closure.
+#[test]
+fn a_direct_closure_used_where_an_effectful_one_is_expected_is_refused_by_name() {
+    let src = "effect T { fn t() -> Int }\n\
+               fn h(c) {\n\
+               \x20 let f = fn(x) { x + 1 }\n\
+               \x20 let g = if c { f } else { fn(x) { t() + x } }\n\
+               \x20 g(1)\n\
+               }\n\
+               pub fn main() -> Int { handle { h(True) + h(False) } with { T.t() -> resume(10)  return(r) -> r } }\n";
+    assert_eq!(eval_main_int(src), "13");
+    let dir = temp_dir("direct-closure-upcast");
+    let err = try_compile_and_link(&lower_src(src), &dir, "direct-closure-upcast").unwrap_err();
+    assert!(
+        err.contains("direct function used where an effectful one is expected"),
+        "{err}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The sub-effecting review's F3: the same upcast reached through a handler's
+/// RETURN binder (`x`, the direct closure `mk()` returns, joined with an
+/// effectful lambda) was not refused -- the return binder's type was not
+/// tracked -- and the CPS call jumped into direct code: 2 where the
+/// evaluator printed 102.
+#[test]
+fn a_direct_closure_upcast_through_a_return_binder_is_refused_by_name() {
+    let src = "effect T { fn t() -> Int }\n\
+               fn mk() { fn(x) { x + 1 } }\n\
+               fn h(c) {\n\
+               \x20 let g = handle { mk() } with { T.t() -> resume(0)  return(x) -> if c { x } else { fn(s) { t() + s } } }\n\
+               \x20 g(1)\n\
+               }\n\
+               pub fn main() -> Int { handle { h(True) + 100 } with { T.t() -> resume(10)  return(r) -> r } }\n";
+    assert_eq!(eval_main_int(src), "102");
+    let dir = temp_dir("direct-closure-upcast-ret");
+    let err = try_compile_and_link(&lower_src(src), &dir, "direct-closure-upcast-ret").unwrap_err();
+    assert!(
+        err.contains("direct function used where an effectful one is expected"),
+        "{err}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

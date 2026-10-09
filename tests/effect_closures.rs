@@ -111,14 +111,15 @@ fn relay_plus_own_effect_runs_when_callback_also_performs() {
 }
 
 #[test]
-fn relay_plus_own_effect_rejects_pure_callback_known_limitation() {
-    // KNOWN LIMITATION (pre-existing 3b, documented not fixed): because the
+fn relay_plus_own_effect_accepts_a_pure_callback() {
+    // Was `relay_plus_own_effect_rejects_pure_callback_known_limitation`: the
     // shared ambient leaks `Log` onto the callback's row (see
     // `relay_plus_own_effect_row_is_the_known_limitation` in effect_types.rs),
-    // `both` wrongly requires its callback to ALSO perform `Log`. A pure
-    // callback is therefore rejected with E0423, even though it is valid (`both`
-    // performs `Log` regardless of `f`). This pins the current wrong-but-sound
-    // behavior; the deferred call-site row fix will make this program compile.
+    // so `both` requires a callback whose row ADMITS `Log` -- and a pure
+    // callback was E0423. Sub-effecting (2026-10-08, the maintainer's decision)
+    // lets a pure function stand where `{Log | ..}` is expected: the program
+    // the old comment said the deferred fix would make compile now compiles
+    // (approved expected-value change).
     let src = "effect Log { fn log(msg: String) -> Unit }\n\
                fn both(f, x) { let _ = log(x)  f(x) }\n\
                pub fn main() {\n\
@@ -131,9 +132,5 @@ fn relay_plus_own_effect_rejects_pure_callback_known_limitation() {
                  }\n\
                  io.println(r)\n\
                }\n";
-    let err = check_err(src);
-    assert!(
-        err.contains("E0423"),
-        "known limitation: pure callback rejected by row leak: {err}"
-    );
+    assert_eq!(run(src), "ok\n");
 }

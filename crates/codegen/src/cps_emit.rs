@@ -167,7 +167,22 @@ fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>)
     let go =
         |c: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>| check_local_conventions(c, locals);
     match &e.kind {
-        CoreKind::Lit(_) | CoreKind::Var(_) => Ok(()),
+        CoreKind::Lit(_) => Ok(()),
+        // Sub-effecting (2026-10-08): a direct closure may now be USED where an
+        // effectful function is expected (`if c { f } else { fn(x) { t() + x }
+        // }`). Its code has the direct convention, so a CPS call of it would
+        // jump into it with the wrong signature -- measured: 2 where the
+        // evaluator printed 13. Refused by name until an adapter wraps it.
+        CoreKind::Var(name) => {
+            if let Some((_, Some(bound))) = locals.iter().rev().find(|(n, _)| n == name) {
+                if needs_cps(&e.ty) && !needs_cps(bound) {
+                    return Err(CodegenError::Unsupported(
+                        "direct function used where an effectful one is expected",
+                    ));
+                }
+            }
+            Ok(())
+        }
         CoreKind::App(callee, args) => {
             if let CoreKind::Var(name) = &callee.kind {
                 if let Some((_, Some(bound))) = locals.iter().rev().find(|(n, _)| n == name) {
@@ -177,8 +192,10 @@ fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>)
                         ));
                     }
                 }
+                // The callee was judged just above; it is not a value use.
+            } else {
+                go(callee, locals)?;
             }
-            go(callee, locals)?;
             args.iter().try_for_each(|a| go(a, locals))
         }
         CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
@@ -233,7 +250,10 @@ fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>)
                 r?;
             }
             if let Some(r) = &h.ret {
-                locals.push((r.binder.clone(), None));
+                // The return binder is the handled body's value: tracked, so
+                // a direct closure it holds is not upcast unrefused (the
+                // sub-effecting review's F3: 2 where the evaluator printed 102).
+                locals.push((r.binder.clone(), Some(h.body.ty.clone())));
                 let out = go(&r.body, locals);
                 locals.pop();
                 out?;

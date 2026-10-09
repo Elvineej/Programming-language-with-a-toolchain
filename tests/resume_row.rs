@@ -47,12 +47,13 @@ fn an_escaped_resume_that_performs_an_unhandled_effect_is_e0420() {
 }
 
 #[test]
-fn a_resuming_lambda_now_carries_the_bodys_remaining_effects() {
-    // m10 of the 5b-10 spec, called where T IS handled. With the fix the
-    // resuming lambda is `fn(Int) / {T} -> Int`, and the return clause's
-    // `fn(s) { x }` is a closed pure row: the two clause values no longer unify
-    // (no sub-effecting, spec 3.6). Recorded as this fix's one strictness cost:
-    // before it, this checked clean only because the lambda's row was wrong.
+fn a_resuming_lambda_beside_a_pure_return_value_checks_by_sub_effecting() {
+    // m10 of the 5b-10 spec, called where T IS handled. The resuming lambda is
+    // `fn(Int) / {T} -> Int` and the return clause's `fn(s) { x }` is pure.
+    // Without sub-effecting the two clause values did not unify (E0423, this
+    // fix's strictness cost when it shipped); with it (2026-10-08) the pure
+    // one stands where `{T}` is expected, and the program runs (15).
+    // Approved expected-value change.
     let src = "effect S { fn get() -> Int }\n\
                effect T { fn t() -> Int }\n\
                fn g() -> Int {\n\
@@ -62,9 +63,11 @@ fn a_resuming_lambda_now_carries_the_bodys_remaining_effects() {
                  }\n\
                  f(5)\n\
                }\n\
-               pub fn main() -> Int { handle { g() } with { T.t() -> resume(10)  return(r) -> r } }\n";
-    let err = check_err(src);
-    assert!(err.contains("E0423"), "expected E0423: {err}");
+               pub fn main() {\n\
+                 let r = handle { g() } with { T.t() -> resume(10)  return(r) -> r }\n\
+                 io.println(if r == 15 { \"15\" } else { \"wrong\" })\n\
+               }\n";
+    checks_and_prints(src, "15\n");
 }
 
 #[test]

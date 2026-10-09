@@ -3,22 +3,18 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-08, late)
+## State at handoff (updated 2026-10-09)
 
-- `main` has slices 5b-8, 5c-1..3, 5b-9a, the CEK example, the PolyForm Strict license and
-  this file. Open PRs, stacked, merge **in order**, retargeting each to `main` after the
-  one below it merges:
-  - **#15** tail-in-match fix + slice 5b-9b (base `main`);
-  - **#16** slice 5b-10, nested handles (base #15's branch);
-  - **#17** the resume-row soundness fix (base #16's branch);
-  - **#18** the dropped-effect fix (base #17's branch);
-  - partial handlers are E0207, branch `claude/partial-handlers` (base #18's branch).
+- `main` has everything through #15 (5b-9b). The stacked PRs #16-#19 were merged into
+  each other's branches, not into `main`, so `main` still lacks 5b-10, the three
+  soundness fixes, E0207 and sub-effecting. **One PR lands all of it:** branch
+  `claude/sub-effecting` -> `main`. From now on: one PR at a time, always based on `main`.
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
   university address; every branch was force-pushed. Do not push old local branches.
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the partial-handlers tip: 729 passed, 73 suites. `gc_mark` 637 bytes.
+- Linux gate at the sub-effecting tip: 751 passed, 75 suites. `gc_mark` 637 bytes.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
   language decisions taken. The maintainer delegated all choices (rule 2).
@@ -121,38 +117,48 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   gained the `State.set` clause it lacked; the three partial-handler native rows went (the
   programs no longer pass the front end).
 
+- **Sub-effecting for function values** (2026-10-09, branch `claude/sub-effecting`, the
+  maintainer's decision; design Claude's): spec
+  `docs/superpowers/specs/2026-10-09-elya-sub-effecting-design.md`. Phantom tails (Koka's
+  open/close), inclusions at calls instead of unification, flushed before rows close. On
+  ~840 probe programs nothing changed from accepted to rejected, and every newly accepted
+  one runs in the evaluator. Natively a direct closure used at an effectful type is
+  refused by name (it miscompiled: 2 for 13).
+
 ## The next five steps
 
-### 1. Sub-effecting for function values (decided; spec first)
+### 1. Check type annotations (decided; spec first)
 
-`docs/ROADMAP.md` and PARKED, "effect rows unify by equality". Where two function values
-meet (`if` branches, clause values, a call's argument against a parameter, a `let` and its
-uses) a function with a SMALLER row must be accepted where a bigger one is expected. Spec
-first: the measured table (m10 of the 5b-10 spec, the recursive `go` in
-`tests/row_soundness.rs`, the reverted environment rule's two regressions, the relay
-over-rejections `twice`/`mk` from the review), then a design -- e.g. instantiate a pure
-closed row as fresh-open at each join, or an "at most" row constraint -- with predictions,
-then red tests. The native side must keep D16 sound: a function's CONVENTION is fixed by
-its definition's row, so a direct function used where an effectful one is expected needs
-an adapter (wrap it as CPS) or a refusal by name. Then the rest of the sweep: resume's row
-lacks return-clause and re-entered-clause effects.
+The parser's `skip_type_annotation` discards every parameter, return and `let` type
+(`let s: String = 1` checks clean). Parse them into `TypeAnn` (the effect-op elaborator
+already turns `TypeAnn` into `Ty`), add syntax for function types (`fn(Int) / {S} -> Int`)
+and type variables, unify each annotation with the inferred type, and report mismatches
+with the annotation's span. Measure first: every annotation in the corpora, examples and
+`tests/ui`. A corpus program with a wrong annotation is a bug in the corpus; fix it and
+call it out.
 
-### 2. Evaluator: non-tail recursion under a handler is quadratic
+### 2. N7 part 1: convention specialization and the closure adapter (native)
 
-PARKED: about 4× time per doubling (n=4000 takes 1.7 s; n=100 000 did not finish in 10
-minutes). This caps every differential test's N. Profile (frame capture copies the
-continuation?), predict the complexity, fix, and pin it with a timing-free test that
-counts steps or allocations. The evaluator is the reference semantics, so the
-differential corpora must stay green unchanged.
+What sub-effecting newly accepts mostly stops at two native refusals: "effect-polymorphic
+function used at a user effect" (D16) and "direct function used where an effectful one is
+expected". Both are about CONVENTION, not representation. A row-polymorphic function
+needs at most two compiled versions (direct, and CPS when its row variable is instantiated
+at a user effect), so compile the CPS clone on demand: inside it, an open row variable of
+the function's own type counts as effectful. A direct closure used at an effectful type
+gets an adapter closure, `adapt(clos, args.., k) = k(code(clos.inner, args..))`, with one
+descriptor row. Measure first (`w(k) { k(0) + lg(1) }`, `twice`, the review's a1/q1/s1h,
+`tests/sub_effecting.rs`, through `build`), keep `gc_mark` byte-identical; the type-variable
+half of N7 (`Ty::Var`, "unrepresentable type"; specialisation plus dictionary passing,
+`@specialize`/`@share`, a code-size budget) is part 2.
 
-### 3. N7: runtime polymorphism (spec first; decisions recorded in it, rule 2)
+### 3. Async as an effect: a scheduler handler (ROADMAP priority 1)
 
-- Lifts the `Ty::Var` "unrepresentable type" refusal (5c-2's n4 hits it) and D16's
-  conservative refusal of effect-polymorphic functions at user effects (5b-9a's s4).
-- The roadmap direction is specialisation in core code plus dictionary passing above it,
-  with `@specialize`/`@share` and an enforced code-size budget.
-- Write the measured table and the open questions, decide them in the spec (rule 2),
-  then plan. This is a large arc; plan it as several slices.
+An `Async` effect (`fork`, `yield`) and a round-robin scheduler written as an ordinary
+Elya handler that keeps a queue of suspended continuations. Show that the same `map` works
+for sync and async code (no function colouring). The evaluator first, then natively (a
+queue of continuations needs escaped resumes, which work natively; `fork` may need
+multi-shot or a second continuation: measure). Ship `examples/04_async.elya`, with tests
+and a README section.
 
 ### 4. Native multi-shot handlers (`with multi`)
 
@@ -165,21 +171,19 @@ copy-on-resume rule. Measure first (the evaluator's multi-shot corpus, e.g.
 stated and gated against A4's live-set instrument. Multi-shot is what a native
 probabilistic or backtracking handler needs (ROADMAP), so it is worth doing natively.
 
-### 5. Check type annotations (decided; spec first)
+### 5. Evaluator: non-tail recursion under a handler is quadratic
 
-The parser's `skip_type_annotation` discards every parameter, return and `let` type
-(`let s: String = 1` checks clean). Parse them into `TypeAnn` (the effect-op elaborator
-already turns `TypeAnn` into `Ty`), add syntax for function types (`fn(Int) / {S} -> Int`)
-and type variables, unify each annotation with the inferred type, and report mismatches
-with the annotation's span. Measure first: every annotation in the corpora, examples and
-`tests/ui` -- a corpus program with a wrong annotation is a bug in the corpus, fixed and
-called out. Native strings (`<>`, Int-to-String) move to "Also open"; the CEK example is
-their first user.
+PARKED: about 4× time per doubling (n=4000 takes 1.7 s; n=100 000 did not finish in 10
+minutes). This caps every differential test's N. Profile (frame capture copies the
+continuation?), predict the complexity, fix, and pin it with a timing-free test that
+counts steps or allocations. The evaluator is the reference semantics, so the
+differential corpora must stay green unchanged.
 
 Also open, unscheduled: native strings (`<>` refused natively, no Int-to-String; the
 builtin's name is Claude's call now -- `int.to_string` is the natural one); the roadmap's
-priority problems after these five (async as an effect with a scheduler handler first,
-then record/replay handlers, then capabilities once modules exist); recursion through a
+other priorities (record/replay handlers, then capabilities once modules exist); the rest
+of the soundness sweep (resume's row lacks return-clause and re-entered-clause effects;
+recursion through a lambda the function handles around, PARKED); recursion through a
 handle body is rejected by inference (PARKED). A perform walks the handler chain, so a program whose handler stack really grows
 (a resume inside a fresh handle every iteration) pays O(depth) per perform; the evaluator
 is no faster there. Also: the Elya CEK machine's next versions (a parser for its terms, a step

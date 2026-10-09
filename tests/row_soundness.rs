@@ -61,13 +61,16 @@ fn an_effect_after_a_lambda_that_calls_its_recursive_function_is_not_dropped() {
 
 #[test]
 fn an_effect_after_an_if_that_joins_a_pure_lambda_is_not_dropped() {
-    // The review's witness with no recursion: the `if` joins `k`'s row to the
-    // pure lambda's closed one, and `lg(1)` then reached a closed row.
-    closed_row_conflict(&check_err(
+    // The review's witness with no recursion: the `if` joined `k`'s row to the
+    // pure lambda's closed one, and `lg(1)` then reached a closed row (E0423).
+    // Since sub-effecting the pure lambda's row is open, so nothing closes
+    // early and L simply reaches `main` unhandled: E0420. Not dropped either way.
+    let err = check_err(
         "effect L { fn lg(x: Int) -> Int }\n\
          fn w(k) { let a = k(0)  let z = if a == 0 { k } else { fn(x) { x } }  a + z(1) + lg(1) }\n\
          pub fn main() -> Int { w(fn(x) { x }) }\n",
-    ));
+    );
+    assert!(err.contains("E0420") && err.contains('L'), "{err}");
 }
 
 #[test]
