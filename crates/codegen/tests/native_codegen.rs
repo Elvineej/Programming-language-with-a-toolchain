@@ -3739,6 +3739,20 @@ const CONVENTIONS: &[(&str, &str, &str)] = &[
          pub fn main() -> Int { handle { h(True) + h(False) * 100 } with { T.t() -> resume(10)  return(r) -> r } }\n",
         "3306",
     ),
+    (
+        // 2026-10-09: a lambda relaying an ENCLOSING parameter keeps its row
+        // open (it forced `f` pure, E0423); `wrap` is then effect-polymorphic
+        // in its result and gets a clone at {L}.
+        "a-returned-lambda-relays-an-enclosing-parameter",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn wrap(f: fn(Int) -> Int) { fn(x: Int) { f(x) + 1 } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = wrap(fn(x) { x * 2 })\n\
+         \x20 let b = handle { let w = wrap(fn(x) { lg(x) })  w(3) + w(4) } with { L.lg(x) -> resume(x * 10)  return(r) -> r }\n\
+         \x20 a(5) * 1000 + b\n\
+         }\n",
+        "11072",
+    ),
 ];
 
 #[test]

@@ -13,7 +13,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the async-step-1 tip of `auto/elya`: 816 passed, 79 suites. The runtime is
+- Linux gate at the tip of `auto/elya`: 836 passed, 79 suites. The runtime is
   untouched (`gc_mark` unchanged).
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
@@ -149,22 +149,15 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   `examples/04_async.elya` (fork, yield, a round-robin queue, one `each` for sync and
   async), the same bytes natively. Pattern binders are tracked by the native adapter.
 
+- **`resume` carries relayed, return-clause and re-entered-clause effects** (2026-10-09,
+  branch `auto/elya`): spec `docs/superpowers/specs/2026-10-09-elya-resume-row-complete-design.md`.
+  Closes the last parked resume-row gaps (15 probe programs checked clean and then hit an
+  unhandled effect); a lambda relaying an ENCLOSING parameter keeps its row open, so
+  `wrap(f)`/`compose` are accepted (natively with annotations, via N7 part 1).
+
 ## The next five steps
 
-### 1. Soundness: `resume` must carry relayed effects and the return clause's
-
-Found again by the async-step-1 review (PARKED since the resume-row fix): at a `resume`
-only the LABELS of the handled body's remaining row are added, never its tail, so effects
-the body relays through a row variable (an unannotated `task(body)` calling `body()`) are
-lost; the return clause's effects are lost too. A stored `fn() { resume(Unit) }` is then
-typed pure: `check` is clean, the evaluator stops on an unhandled effect, natively it is
-refused by name or reaches the runtime "no clause" guard. Probes: the review's
-min1-min4 and pre3 (in the async-step-1 spec, §4). Fix in inference (`infer_handle`,
-`Expr::Resume`): the resume's row is the handled body's remaining row INCLUDING its tail
-(an inclusion, the sub-effecting machinery) plus the return clause's row; pin
-`check`-level tests that the unannotated scheduler either checks and runs or is rejected.
-
-### 2. Native multi-shot handlers (`with multi`)
+### 1. Native multi-shot handlers (`with multi`)
 
 Refused natively by name since 5b-8 (A2); the evaluator runs them. A multi-shot resume
 re-runs a captured continuation, but native frames are consumed in place -- and since 5b-10
@@ -175,7 +168,7 @@ copy-on-resume rule. Measure first (the evaluator's multi-shot corpus, e.g.
 stated and gated against A4's live-set instrument. Multi-shot is what a native
 probabilistic or backtracking handler needs (ROADMAP), so it is worth doing natively.
 
-### 3. Evaluator: non-tail recursion under a handler is quadratic
+### 2. Evaluator: non-tail recursion under a handler is quadratic
 
 PARKED: about 4× time per doubling (n=4000 takes 1.7 s; n=100 000 did not finish in 10
 minutes). This caps every differential test's N. Profile (frame capture copies the
@@ -183,7 +176,7 @@ continuation?), predict the complexity, fix, and pin it with a timing-free test 
 counts steps or allocations. The evaluator is the reference semantics, so the
 differential corpora must stay green unchanged.
 
-### 4. Exact replay and handler-based testing (ROADMAP priority 3)
+### 3. Exact replay and handler-based testing (ROADMAP priority 3)
 
 A `Record` handler that wraps a computation and logs every effect's answer (op name,
 arguments, the value it resumed with), and a `Replay` handler that feeds a log back and
@@ -194,16 +187,21 @@ handlers instead of mocking. Evaluator and native. Ship `examples/05_replay.elya
 tests and a README section; the CLI flag (`elya run --record/--replay`) comes after real
 I/O effects exist.
 
-### 5. Front end: a lambda forwarding an enclosing parameter keeps its row open; then N7 part 2
+### 4. N7 part 2: type variables natively
 
-`fn wrap(f) { fn(x) { f(x) + 1 } }` used at `{L}` (and `compose(f, g)` with one pure
-argument) is E0423: a lambda forwarding an enclosing function's parameter forces that
-parameter pure (PARKED by sub-effecting, "deferred to N7"). Natively nothing blocks the
-open version any more (N7 part 1 specializes it). Measure the probe programs of the N7a
-spec (q1, q9, q10, p16) first. Then N7 part 2: type variables (`twice(f, x)` with `x: 'a`
-is "unrepresentable type"): monomorphize types like rows, with the code-size budget, or
-dictionary passing -- decide in its spec. Also: aliases of generic locals (`let mk2 = mk`)
-are refused by name.
+`twice(f, x)` with `x: 'a`, and every unannotated `wrap`/`compose` (now accepted by the
+front end), are "unrepresentable type" natively. Monomorphize type variables like rows
+(N7 part 1's `specialize.rs` already matches signatures against uses), with the code-size
+budget, or pass dictionaries -- decide in the spec. Parametric ADTs (`type Q(a)`) are the
+same question for constructors. Also: aliases of generic locals (`let mk2 = mk`) are
+refused by name.
+
+### 5. Async step 2: structured concurrency and a poll loop
+
+ROADMAP 1b/1c on top of `examples/04_async.elya`: a scope handler that joins its children
+(a `spawn` returning a handle, `await` as an effect), then real I/O readiness through a
+runtime poll loop the scheduler consults. Recursion through a handle body (PARKED) blocks
+the natural recursive `task`: measure whether it is the next front-end fix.
 
 Also open, unscheduled: native strings (`<>` refused natively, no Int-to-String; the
 builtin's name is Claude's call now -- `int.to_string` is the natural one); the roadmap's

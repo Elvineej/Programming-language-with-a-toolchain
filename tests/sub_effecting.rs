@@ -208,3 +208,21 @@ fn a_parameter_reached_through_a_group_members_result_keeps_its_row() {
         "6\n",
     );
 }
+
+#[test]
+fn a_lambda_forwarding_an_enclosing_parameter_keeps_its_row_open() {
+    // PARKED by this slice ("deferred to N7"): the returned lambda relays
+    // `f`'s row, and closing it at the lambda forced `f` pure (E0423 at the
+    // `{L}` use). Since 2026-10-09 a relay of an ENCLOSING parameter keeps the
+    // lambda's tail open, as a relay of its own parameter always did.
+    checks_and_prints(
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn wrap(f) { fn(x) { f(x) + 1 } }\n\
+         pub fn main() {\n\
+           let a = wrap(fn(x) { x * 2 })\n\
+           let b = handle { let w = wrap(fn(x) { lg(x) })  w(3) + w(4) } with { L.lg(x) -> resume(x * 10)  return(r) -> r }\n\
+           io.println(if a(5) * 1000 + b == 11072 { \"11072\" } else { \"wrong\" })\n\
+         }\n",
+        "11072\n",
+    );
+}

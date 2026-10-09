@@ -144,6 +144,31 @@ struct OpInfo {
     ret: Ty,
 }
 
+/// What a `resume` inside a clause needs (resume-row fix, 2026-10-08, and
+/// its relay and return-clause half, 2026-10-09).
+#[derive(Clone)]
+struct ResumeCx {
+    /// The operation's result type: `resume`'s argument.
+    arg: Ty,
+    /// The handle's result type: `resume`'s result.
+    result: Ty,
+    /// The handled body's ambient. A resume runs the rest of the body, so its
+    /// row includes the body's effects except the handled one.
+    body_amb: RowVar,
+    /// The return clause's ambient: the rest of the body ends in the return
+    /// clause, so a resume performs its effects too.
+    ret_amb: RowVar,
+    /// The handled effect, which the resumed handler handles again.
+    handled: Option<String>,
+    /// The lambda depth at the clause: a resume at a greater depth is inside a
+    /// lambda, which may run after the clause has returned (it ESCAPES).
+    lambda_depth: usize,
+    /// The handle's "every clause" row: an escaped resume's ambient takes it as
+    /// its tail, and `infer_handle` fills it with every clause's effects once
+    /// all clauses are typed (the resumed body may re-enter any clause).
+    clauses_row: RowVar,
+}
+
 pub struct Infer {
     subst: Vec<Option<Ty>>,
     row_subst: Vec<Option<EffectRow>>,
@@ -171,7 +196,13 @@ pub struct Infer {
     /// `resume` takes the operation's result type `B`, yields the handle's
     /// result `R`, and performs `ε` -- the handled body's effects minus the
     /// handled one, which the resumed computation may still perform.
-    resume_stack: Vec<(Ty, Ty, EffectRow, Option<String>)>,
+    resume_stack: Vec<ResumeCx>,
+    /// The `clauses_row` of every handle whose clauses are being typed. Such a
+    /// row is filled only when its handle is done, so until then it is neither
+    /// closed (`close_unrelayed_residual`) nor generalized (`generalize`).
+    pending_clause_rows: Vec<RowVar>,
+    /// How many lambdas enclose the expression being typed.
+    lambda_depth: usize,
     /// Constructor name -> arity. An n-ary constructor used unapplied or
     /// partially applied is `E0433` (unapplied constructors need 4b's closures).
     ctor_arity: HashMap<String, usize>,
@@ -204,6 +235,8 @@ impl Infer {
             row_subst: Vec::new(),
             ops: HashMap::new(),
             resume_stack: Vec::new(),
+            pending_clause_rows: Vec::new(),
+            lambda_depth: 0,
             phantom: HashSet::new(),
             pending_incl: Vec::new(),
             param_tys: Vec::new(),
@@ -1201,37 +1234,59 @@ impl Infer {
             Expr::Resume { arg } => {
                 let arg_ty = self.infer_expr(arg, env, amb);
                 match self.resume_stack.last().cloned() {
-                    Some((b, r, eff, handled)) => {
+                    Some(cx) => {
                         // resume : (B) / ε -> R — takes the operation's result,
                         // yields the handle's result, and runs the rest of the
-                        // handled body, which may still perform ε. Directly in
-                        // the clause ε is already in the ambient (the handle
-                        // discharges into it); inside a LAMBDA in the clause it
-                        // is not, and leaving it out typed such a lambda pure
-                        // (found by slice 5b-10: an escaped resume performed an
-                        // effect nothing handled, on a program `check` passed).
+                        // handled body AND then the return clause, which may
+                        // still perform ε. Directly in the clause ε is already in
+                        // the ambient; inside a LAMBDA in the clause it is not,
+                        // and leaving it out typed such a lambda pure (found by
+                        // slice 5b-10, and again by the async-step-1 review for
+                        // relayed and return-clause effects).
                         //
-                        // LABELS only, never the tail: `add_row` unifies tails,
-                        // which made this site's ambient EQUAL to the body's tail
-                        // and merged rows related only by inclusion (the review of
-                        // the first version: a direct resume tied the enclosing
-                        // function's row to a lambda that then closed it, and a
-                        // later effect was dropped -- a new hole). The body's
-                        // labels are re-read here, so ones it gained since the
-                        // clauses began are included; an effect the body only
-                        // RELAYS through an open row is not (PARKED).
-                        self.unify(&arg_ty, &b, span);
-                        let now = self.resolve_row(&eff);
-                        for (label, l) in now.labels.iter() {
-                            if handled.as_deref() == Some(label.as_str()) {
-                                continue;
-                            }
-                            {
+                        // LABELS, never the bare tail: unifying with the body's
+                        // tail made this site's ambient EQUAL to it and merged
+                        // rows related only by inclusion (the first resume-row
+                        // review). Both rows are complete here: the body was
+                        // inferred and its inclusions flushed, the return clause
+                        // was inferred first and its residual closed. A tail
+                        // that is a RELAY -- a row variable of a parameter in
+                        // scope, which a caller instantiates -- IS unified,
+                        // exactly as a call through that parameter would be.
+                        self.unify(&arg_ty, &cx.arg, span);
+                        if self.lambda_depth > cx.lambda_depth {
+                            // Escaped: the rest of the body may re-enter any
+                            // clause, whose effects are not all known yet.
+                            let all = EffectRow::open(cx.clauses_row);
+                            let r = self.add_row(amb, &all, span);
+                            self.surface_conflict(r);
+                        }
+                        let mut in_params = Vec::new();
+                        for p in self.param_tys.clone() {
+                            free_row_vars(self, &p, &mut in_params);
+                        }
+                        for (src, except) in [(cx.body_amb, cx.handled.clone()), (cx.ret_amb, None)]
+                        {
+                            let now = self.resolve_row(&EffectRow::open(src));
+                            for (label, l) in now.labels.iter() {
+                                if except.as_deref() == Some(label.as_str()) {
+                                    continue;
+                                }
                                 let r = self.add_effect(amb, label, l.args.clone(), l.span);
                                 self.surface_conflict(r);
                             }
+                            if let RowTail::Open(w) = now.tail {
+                                if in_params.contains(&w) {
+                                    let relay = EffectRow {
+                                        labels: BTreeMap::new(),
+                                        tail: RowTail::Open(w),
+                                    };
+                                    let r = self.add_row(amb, &relay, span);
+                                    self.surface_conflict(r);
+                                }
+                            }
                         }
-                        r
+                        cx.result
                     }
                     // resume outside a handler is E0210 at resolve time.
                     None => Ty::Error,
@@ -1289,7 +1344,9 @@ impl Infer {
                 let lam_amb = self.fresh_row();
                 let mark = self.param_tys.len();
                 self.param_tys.extend(param_tys.iter().cloned());
+                self.lambda_depth += 1;
                 let body_ty = self.infer_block(&body.node, env, lam_amb);
+                self.lambda_depth -= 1;
                 self.param_tys.truncate(mark);
                 env.pop();
                 // Fork A (4b-2 §2): close the lambda's residual tail unless it is
@@ -1298,8 +1355,15 @@ impl Infer {
                 // a relay lambda keeps its open, row-polymorphic tail.
                 // Pending sub-effecting inclusions reach this ambient before it
                 // closes (a label arriving later is a surfaced conflict).
+                // A relay of an ENCLOSING function's (or lambda's) parameter
+                // keeps the tail open too (2026-10-09): `fn wrap(f) { fn(x) {
+                // f(x) } }` relays `f`'s row, and closing it forced `f` pure
+                // (PARKED by sub-effecting until native code could compile the
+                // effect-polymorphic result -- N7 part 1).
                 self.flush_inclusions();
-                self.close_unrelayed_residual(lam_amb, &param_tys);
+                let mut scope_params = self.param_tys.clone();
+                scope_params.extend(param_tys.iter().cloned());
+                self.close_unrelayed_residual(lam_amb, &scope_params);
                 // Sub-effecting (the maintainer's decision, 2026-10-08): the
                 // VALUE's row is open even when the body's is closed -- a
                 // function that performs ε may stand where ε ∪ ρ is expected.
@@ -1598,14 +1662,43 @@ impl Infer {
 
         // R — the handle's result type, shared by every clause and `return`.
         let result = self.fresh();
-        // ε — what a `resume` in a clause may still perform: the body's effects
-        // minus the handled one (the resumed handler handles that one again).
-        // Its tail is the body's row variable, so effects the body's row gains
-        // later reach every resume too.
-        let mut resume_eff = self.resolve_row(&EffectRow::open(amb_in));
-        if let Some(e) = &effect {
-            resume_eff.labels.remove(e);
+        // The return clause FIRST (2026-10-09): a resume runs the rest of the
+        // body and then this clause, so a lambda that resumes must carry its
+        // effects -- and a lambda's row closes when the lambda is done, which
+        // for a lambda in a clause is before a later return clause would be
+        // inferred. Its own ambient is a region like a lambda body: inclusions
+        // flushed, its residual closed unless relayed through a parameter,
+        // then poured into the handle's ambient.
+        let ret_amb = self.fresh_row();
+        match &handler.ret {
+            Some(ret) => {
+                env.push();
+                env.insert(
+                    &ret.binder,
+                    Scheme {
+                        vars: Vec::new(),
+                        row_vars: Vec::new(),
+                        ty: body_ty.clone(),
+                    },
+                );
+                let ret_ty = self.infer_expr(&ret.body, env, ret_amb);
+                self.unify(&ret_ty, &result, ret.body.span);
+                env.pop();
+            }
+            // No return clause ⇒ identity: R = type of `e`.
+            None => self.unify(&result, &body_ty, span),
         }
+        self.flush_inclusions();
+        let scope_params = self.param_tys.clone();
+        self.close_unrelayed_residual(ret_amb, &scope_params);
+        {
+            let ret_row = self.resolve_row(&EffectRow::open(ret_amb));
+            let r = self.add_row(amb, &ret_row, span);
+            self.surface_conflict(r);
+        }
+        let mut clause_ambs: Vec<RowVar> = Vec::new();
+        let clauses_row = self.fresh_row();
+        self.pending_clause_rows.push(clauses_row);
         for c in &handler.clauses {
             let clause = &c.node;
             let (params, b) = match self.ops.get(&clause.op).cloned() {
@@ -1649,35 +1742,58 @@ impl Infer {
             }
             // The clause body runs at the handler's *outer* ambient; `resume`
             // there takes B and yields R.
-            self.resume_stack
-                .push((b, result.clone(), resume_eff.clone(), effect.clone()));
+            // Each clause is a region of its own (2026-10-09), so its effects
+            // are known apart: an escaped resume may re-enter it.
+            let clause_amb = self.fresh_row();
+            clause_ambs.push(clause_amb);
+            self.resume_stack.push(ResumeCx {
+                arg: b,
+                result: result.clone(),
+                body_amb: amb_in,
+                ret_amb,
+                handled: effect.clone(),
+                lambda_depth: self.lambda_depth,
+                clauses_row,
+            });
             let mark = self.param_tys.len();
             self.param_tys.extend(params.iter().cloned());
-            let clause_ty = self.infer_expr(&clause.body, env, amb);
+            let clause_ty = self.infer_expr(&clause.body, env, clause_amb);
+            self.flush_inclusions();
+            let scope_params = self.param_tys.clone();
+            self.close_unrelayed_residual(clause_amb, &scope_params);
             self.param_tys.truncate(mark);
+            {
+                let row = self.resolve_row(&EffectRow::open(clause_amb));
+                let r = self.add_row(amb, &row, clause.body.span);
+                self.surface_conflict(r);
+            }
             self.unify(&clause_ty, &result, clause.body.span);
             self.resume_stack.pop();
             env.pop();
         }
-        match &handler.ret {
-            Some(ret) => {
-                env.push();
-                env.insert(
-                    &ret.binder,
-                    Scheme {
-                        vars: Vec::new(),
-                        row_vars: Vec::new(),
-                        ty: body_ty.clone(),
-                    },
-                );
-                let ret_ty = self.infer_expr(&ret.body, env, amb);
-                self.unify(&ret_ty, &result, ret.body.span);
-                env.pop();
+        // Escaped resumes: a lambda that resumes runs the rest of the body,
+        // which may re-enter any clause -- so the handle's clauses row takes
+        // every clause's effects (but the handled one, which the resumed
+        // handler handles), and only then closes. A clauses row that has
+        // become the enclosing ambient's own tail (the lambda was called in a
+        // clause) is left to that ambient.
+        self.pending_clause_rows.pop();
+        for &ca in &clause_ambs {
+            let row = self.resolve_row(&EffectRow::open(ca));
+            for (label, l) in row.labels.iter() {
+                if effect.as_deref() == Some(label.as_str()) {
+                    continue;
+                }
+                let r = self.add_effect(clauses_row, label, l.args.clone(), l.span);
+                self.surface_conflict(r);
             }
-            // No return clause ⇒ identity: R = type of `e`.
-            None => self.unify(&result, &body_ty, span),
         }
-
+        self.flush_inclusions();
+        let own_tail = self.resolve_row(&EffectRow::open(amb)).tail;
+        if self.resolve_row(&EffectRow::open(clauses_row)).tail != own_tail {
+            let scope_params = self.param_tys.clone();
+            self.close_unrelayed_residual(clauses_row, &scope_params);
+        }
         // Cleanup lint (E0426): a `with multi` handler may re-run its captured
         // continuation, repeating any observably-duplicable effect the body
         // performs. Best-effort (spec §8.6) — a full guarantee awaits linear types.
@@ -1770,6 +1886,13 @@ impl Infer {
         free_row_vars(self, &resolved, &mut row_in_ty);
         let mut row_in_env = Vec::new();
         env_free_row_vars(self, env, &mut row_in_env);
+        // A handle's clauses row still being filled is not quantified: its
+        // labels arrive when the handle is done (the resume-row review's F1).
+        for c in self.pending_clause_rows.clone() {
+            if let RowTail::Open(v) = self.resolve_row(&EffectRow::open(c)).tail {
+                row_in_env.push(v);
+            }
+        }
         let row_vars: Vec<RowVar> = row_in_ty
             .into_iter()
             .filter(|v| !row_in_env.contains(v))
@@ -1793,6 +1916,12 @@ impl Infer {
     fn close_unrelayed_residual(&mut self, amb: RowVar, params: &[Ty]) {
         let resolved = self.resolve_row(&EffectRow::open(amb));
         if let RowTail::Open(rho) = resolved.tail {
+            // A handle's clauses row still being filled stays open.
+            for c in self.pending_clause_rows.clone() {
+                if self.resolve_row(&EffectRow::open(c)).tail == RowTail::Open(rho) {
+                    return;
+                }
+            }
             let mut in_params = Vec::new();
             for p in params {
                 free_row_vars(self, p, &mut in_params);
