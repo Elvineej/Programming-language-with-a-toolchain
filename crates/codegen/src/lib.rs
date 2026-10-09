@@ -320,7 +320,14 @@ fn declare_lifted<'ctx>(
         for p in site.params.iter() {
             params.push(repr_ty(ctx, &p.ty)?.into());
         }
-        let fn_ty = fn_type_of(repr_ty(ctx, &site.ret)?, &params)?;
+        // 5b-9b: an effectful lambda takes its continuation last and answers
+        // with a word, exactly as an effectful top-level function does.
+        let fn_ty = if site.effectful {
+            params.push(ptrt.into());
+            ctx.i64_type().fn_type(&params, false)
+        } else {
+            fn_type_of(repr_ty(ctx, &site.ret)?, &params)?
+        };
         let f = module.add_function(&mangle(&site.symbol), fn_ty, None);
         f.set_call_conventions(TAILCC);
         out.insert(site.symbol.clone(), f);
@@ -339,6 +346,9 @@ fn emit_lifted<'ctx>(
     lc: &LowerCtx<'_, 'ctx>,
     site: &LambdaSite,
 ) -> Result<(), CodegenError> {
+    if site.effectful {
+        return cps_emit::emit_cps_lifted(ctx, b, lc, site);
+    }
     let func = *lc
         .lifted
         .get(&site.symbol)
@@ -757,6 +767,11 @@ fn lower_tail<'ctx>(
             unbind_local(env, x, shadowed);
             out
         }
+        // A call in a match arm is in tail position too (HANDOFF step 1).
+        CoreKind::Match(scrutinee, arms) => {
+            lower_match(ctx, func, b, lc, scrutinee, arms, None, env)?;
+            Ok(())
+        }
         CoreKind::App(callee, args) => {
             let site = build_elya_call(ctx, func, b, lc, callee, args, env, true)?;
             // The guarantee, in one line. `musttail` is VERIFIER-ENFORCED: if
@@ -779,6 +794,191 @@ fn lower_tail<'ctx>(
             Ok(())
         }
     }
+}
+
+/// A `match`, by tag tests, field loads and a named trap on no match (N6 §8.4).
+/// `phi_ty: Some(t)` lowers it as a VALUE: the arms join in a phi of type `t`.
+/// `None` lowers it in TAIL position (HANDOFF step 1, 2026-10-05): each arm
+/// ends itself through `lower_tail` -- a `musttail` call or a `ret` -- with no
+/// join block, exactly as a tail `if`, and the result is `None`. Before, a
+/// match in tail position was lowered as a value and a call in an arm was an
+/// ordinary call, so a loop through a match grew the machine stack.
+#[allow(clippy::too_many_arguments)]
+fn lower_match<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    scrutinee: &CoreExpr,
+    arms: &[elya::core::CoreArm],
+    phi_ty: Option<BasicTypeEnum<'ctx>>,
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
+    // N6 §8.4: a scrutinee must be an ADT (a pointer with a real tag word). A
+    // non-Con scrutinee panics `.into_pointer_value()` today; a Str scrutinee
+    // would load its tag and fall through to elya_match_fail. Refuse by name.
+    if !matches!(scrutinee.ty, Ty::Con(..)) {
+        return Err(CodegenError::Unsupported("match scrutinee is not an ADT"));
+    }
+    let i64t = ctx.i64_type();
+    let ptrt = ctx.ptr_type(AddressSpace::default());
+    let s = lower_expr(ctx, func, b, lc, scrutinee, env)?.into_pointer_value();
+    let tag = b
+        .build_load(i64t, s, "tag")
+        .map_err(internal)?
+        .into_int_value();
+    // Value mode joins the arms in a phi; tail mode has NO join block --
+    // each arm ends itself (a `musttail` call or a `ret`), as a tail `if`.
+    let join_bb = phi_ty.map(|_| ctx.append_basic_block(func, "mjoin"));
+    let mut incoming: Vec<(BasicValueEnum<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> =
+        Vec::new();
+    let mut fallthrough = b
+        .get_insert_block()
+        .ok_or_else(|| internal("builder left no block"))?;
+    let mut terminal = false;
+    for arm in arms.iter() {
+        let body_bb = ctx.append_basic_block(func, "marm");
+        match &arm.pat {
+            CorePat::Ctor(name, pat_args) => {
+                let (tag_idx, field_tys) = lc
+                    .ctors
+                    .get(name)
+                    .cloned()
+                    .ok_or(CodegenError::Unsupported("parametric ADT"))?;
+                b.position_at_end(fallthrough);
+                let cmp = b
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        tag,
+                        i64t.const_int(tag_idx as u64, false),
+                        "mc",
+                    )
+                    .map_err(internal)?;
+                let next = ctx.append_basic_block(func, "mnext");
+                b.build_conditional_branch(cmp, body_bb, next)
+                    .map_err(internal)?;
+                fallthrough = next;
+                b.position_at_end(body_bb);
+                let mut bindings: Vec<(String, BasicValueEnum<'ctx>)> = Vec::new();
+                for (pi, p) in pat_args.iter().enumerate() {
+                    let fp = unsafe {
+                        b.build_gep(i64t, s, &[i64t.const_int((pi + 1) as u64, false)], "fp")
+                    }
+                    .map_err(internal)?;
+                    let loaded = b
+                        .build_load(i64t, fp, "fld")
+                        .map_err(internal)?
+                        .into_int_value();
+                    let field_val =
+                        word_to_value(b, loaded, &field_tys[pi], ctx.bool_type(), ptrt)?;
+                    match p {
+                        CorePat::Var(v) => bindings.push((v.clone(), field_val)),
+                        CorePat::Wild => {}
+                        CorePat::Ctor(..) => {
+                            return Err(CodegenError::Unsupported("nested constructor pattern"))
+                        }
+                        CorePat::Lit(_) => {
+                            return Err(CodegenError::Unsupported("literal pattern"))
+                        }
+                    }
+                }
+                // Bound with `bind_local` and undone in reverse: an arm
+                // binder that shadows an outer name used to REMOVE the
+                // outer binding after the arm (and leave it unrooted
+                // during it).
+                let mut shadowed = Vec::with_capacity(bindings.len());
+                for (n, v) in &bindings {
+                    shadowed.push((n.clone(), bind_local(env, n, *v)));
+                }
+                let v = arm_body(ctx, func, b, lc, &arm.body, env, join_bb);
+                for (n, sh) in shadowed.into_iter().rev() {
+                    unbind_local(env, &n, sh);
+                }
+                if let Some(v) = v? {
+                    incoming.push(v);
+                }
+            }
+            CorePat::Wild => {
+                b.position_at_end(fallthrough);
+                b.build_unconditional_branch(body_bb).map_err(internal)?;
+                b.position_at_end(body_bb);
+                if let Some(v) = arm_body(ctx, func, b, lc, &arm.body, env, join_bb)? {
+                    incoming.push(v);
+                }
+                terminal = true;
+            }
+            CorePat::Var(name) => {
+                b.position_at_end(fallthrough);
+                b.build_unconditional_branch(body_bb).map_err(internal)?;
+                b.position_at_end(body_bb);
+                let shadowed = bind_local(env, name, s.into());
+                let v = arm_body(ctx, func, b, lc, &arm.body, env, join_bb);
+                unbind_local(env, name, shadowed);
+                if let Some(v) = v? {
+                    incoming.push(v);
+                }
+                terminal = true;
+            }
+            CorePat::Lit(_) => return Err(CodegenError::Unsupported("literal pattern")),
+        }
+        // Arms after a catch-all can never match (an E0431 warning, not
+        // an error); emitting them branched out of an already-terminated
+        // block and LLVM rejected the module (5b-9a review). The CPS twin,
+        // `match_dispatch`, stops here too.
+        if terminal {
+            break;
+        }
+    }
+    // The default block — reached only if the last arm was a constructor
+    // and no tag matched — traps via elya_match_fail, never UB.
+    if !terminal {
+        b.position_at_end(fallthrough);
+        b.build_call(lc.fail, &[], "fail").map_err(internal)?;
+        // `elya_match_fail` exits (calls exit(1)); this terminator is never
+        // reached — a placeholder, NOT the trap.
+        b.build_unreachable().map_err(internal)?;
+    }
+    let (Some(join_bb), Some(node_ty)) = (join_bb, phi_ty) else {
+        return Ok(None);
+    };
+    b.position_at_end(join_bb);
+    let phi = match node_ty {
+        BasicTypeEnum::IntType(t) => b.build_phi(t, "mph"),
+        BasicTypeEnum::PointerType(t) => b.build_phi(t, "mph"),
+        _ => return Err(CodegenError::Unsupported("unrepresentable type")),
+    }
+    .map_err(internal)?;
+    for (v, bbb) in incoming.iter() {
+        phi.add_incoming(&[(v, *bbb)]);
+    }
+    Ok(Some(phi.as_basic_value()))
+}
+
+/// The phi's incoming pair: a value and the block it arrives from.
+type Incoming<'ctx> = (BasicValueEnum<'ctx>, inkwell::basic_block::BasicBlock<'ctx>);
+
+/// One arm's body. Value mode (`join: Some`): lowered as a value and branched
+/// to the join, returning the phi's incoming pair. Tail mode (`join: None`):
+/// lowered by `lower_tail`, which terminates the block itself.
+fn arm_body<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    body: &CoreExpr,
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    join: Option<inkwell::basic_block::BasicBlock<'ctx>>,
+) -> Result<Option<Incoming<'ctx>>, CodegenError> {
+    let Some(join) = join else {
+        lower_tail(ctx, func, b, lc, body, env)?;
+        return Ok(None);
+    };
+    let v = lower_expr(ctx, func, b, lc, body, env)?;
+    let exit = b
+        .get_insert_block()
+        .ok_or_else(|| internal("builder left no block"))?;
+    b.build_unconditional_branch(join).map_err(internal)?;
+    Ok(Some((v, exit)))
 }
 
 /// The binary `Prim` operators on two already-lowered operands. Extracted from
@@ -1110,155 +1310,8 @@ fn lower_expr<'ctx>(
             Ok(p.into())
         }
         CoreKind::Match(scrutinee, arms) => {
-            // N6 §8.4: a scrutinee must be an ADT (a pointer with a real tag word). A
-            // non-Con scrutinee panics `.into_pointer_value()` today; a Str scrutinee
-            // would load its tag and fall through to elya_match_fail. Refuse by name.
-            if !matches!(scrutinee.ty, Ty::Con(..)) {
-                return Err(CodegenError::Unsupported("match scrutinee is not an ADT"));
-            }
-            let i64t = ctx.i64_type();
-            let ptrt = ctx.ptr_type(AddressSpace::default());
-            let s = lower_expr(ctx, func, b, lc, scrutinee, env)?.into_pointer_value();
-            let tag = b
-                .build_load(i64t, s, "tag")
-                .map_err(internal)?
-                .into_int_value();
-            let join_bb = ctx.append_basic_block(func, "mjoin");
-            let mut incoming: Vec<(BasicValueEnum<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> =
-                Vec::new();
-            let mut fallthrough = b
-                .get_insert_block()
-                .ok_or_else(|| internal("builder left no block"))?;
-            let mut terminal = false;
-            for arm in arms.iter() {
-                let body_bb = ctx.append_basic_block(func, "marm");
-                match &arm.pat {
-                    CorePat::Ctor(name, pat_args) => {
-                        let (tag_idx, field_tys) = lc
-                            .ctors
-                            .get(name)
-                            .cloned()
-                            .ok_or(CodegenError::Unsupported("parametric ADT"))?;
-                        b.position_at_end(fallthrough);
-                        let cmp = b
-                            .build_int_compare(
-                                IntPredicate::EQ,
-                                tag,
-                                i64t.const_int(tag_idx as u64, false),
-                                "mc",
-                            )
-                            .map_err(internal)?;
-                        let next = ctx.append_basic_block(func, "mnext");
-                        b.build_conditional_branch(cmp, body_bb, next)
-                            .map_err(internal)?;
-                        fallthrough = next;
-                        b.position_at_end(body_bb);
-                        let mut bindings: Vec<(String, BasicValueEnum<'ctx>)> = Vec::new();
-                        for (pi, p) in pat_args.iter().enumerate() {
-                            let fp = unsafe {
-                                b.build_gep(
-                                    i64t,
-                                    s,
-                                    &[i64t.const_int((pi + 1) as u64, false)],
-                                    "fp",
-                                )
-                            }
-                            .map_err(internal)?;
-                            let loaded = b
-                                .build_load(i64t, fp, "fld")
-                                .map_err(internal)?
-                                .into_int_value();
-                            let field_val =
-                                word_to_value(b, loaded, &field_tys[pi], ctx.bool_type(), ptrt)?;
-                            match p {
-                                CorePat::Var(v) => bindings.push((v.clone(), field_val)),
-                                CorePat::Wild => {}
-                                CorePat::Ctor(..) => {
-                                    return Err(CodegenError::Unsupported(
-                                        "nested constructor pattern",
-                                    ))
-                                }
-                                CorePat::Lit(_) => {
-                                    return Err(CodegenError::Unsupported("literal pattern"))
-                                }
-                            }
-                        }
-                        // Bound with `bind_local` and undone in reverse: an arm
-                        // binder that shadows an outer name used to REMOVE the
-                        // outer binding after the arm (and leave it unrooted
-                        // during it).
-                        let mut shadowed = Vec::with_capacity(bindings.len());
-                        for (n, v) in &bindings {
-                            shadowed.push((n.clone(), bind_local(env, n, *v)));
-                        }
-                        let v = lower_expr(ctx, func, b, lc, &arm.body, env);
-                        for (n, sh) in shadowed.into_iter().rev() {
-                            unbind_local(env, &n, sh);
-                        }
-                        let v = v?;
-                        let exit = b
-                            .get_insert_block()
-                            .ok_or_else(|| internal("builder left no block"))?;
-                        b.build_unconditional_branch(join_bb).map_err(internal)?;
-                        incoming.push((v, exit));
-                    }
-                    CorePat::Wild => {
-                        b.position_at_end(fallthrough);
-                        b.build_unconditional_branch(body_bb).map_err(internal)?;
-                        b.position_at_end(body_bb);
-                        let v = lower_expr(ctx, func, b, lc, &arm.body, env)?;
-                        let exit = b
-                            .get_insert_block()
-                            .ok_or_else(|| internal("builder left no block"))?;
-                        b.build_unconditional_branch(join_bb).map_err(internal)?;
-                        incoming.push((v, exit));
-                        terminal = true;
-                    }
-                    CorePat::Var(name) => {
-                        b.position_at_end(fallthrough);
-                        b.build_unconditional_branch(body_bb).map_err(internal)?;
-                        b.position_at_end(body_bb);
-                        let shadowed = bind_local(env, name, s.into());
-                        let v = lower_expr(ctx, func, b, lc, &arm.body, env);
-                        unbind_local(env, name, shadowed);
-                        let v = v?;
-                        let exit = b
-                            .get_insert_block()
-                            .ok_or_else(|| internal("builder left no block"))?;
-                        b.build_unconditional_branch(join_bb).map_err(internal)?;
-                        incoming.push((v, exit));
-                        terminal = true;
-                    }
-                    CorePat::Lit(_) => return Err(CodegenError::Unsupported("literal pattern")),
-                }
-                // Arms after a catch-all can never match (an E0431 warning, not
-                // an error); emitting them branched out of an already-terminated
-                // block and LLVM rejected the module (5b-9a review). The CPS twin,
-                // `match_dispatch`, stops here too.
-                if terminal {
-                    break;
-                }
-            }
-            // The default block — reached only if the last arm was a constructor
-            // and no tag matched — traps via elya_match_fail, never UB.
-            if !terminal {
-                b.position_at_end(fallthrough);
-                b.build_call(lc.fail, &[], "fail").map_err(internal)?;
-                // `elya_match_fail` exits (calls exit(1)); this terminator is never
-                // reached — a placeholder, NOT the trap.
-                b.build_unreachable().map_err(internal)?;
-            }
-            b.position_at_end(join_bb);
-            let phi = match node_ty {
-                BasicTypeEnum::IntType(t) => b.build_phi(t, "mph"),
-                BasicTypeEnum::PointerType(t) => b.build_phi(t, "mph"),
-                _ => return Err(CodegenError::Unsupported("unrepresentable type")),
-            }
-            .map_err(internal)?;
-            for (v, bbb) in incoming.iter() {
-                phi.add_incoming(&[(v, *bbb)]);
-            }
-            Ok(phi.as_basic_value())
+            lower_match(ctx, func, b, lc, scrutinee, arms, Some(node_ty), env)?
+                .ok_or_else(|| internal("a value match produced no value"))
         }
         // 5b-8: Core carries handlers from Task 5; native dispatch arrives in Task
         // 8. Until then a handler that reaches the back end is refused by name,
@@ -1451,7 +1504,9 @@ struct LowerCtx<'a, 'ctx> {
     /// Core node address -> index into `lambdas`.
     lambda_index: &'a HashMap<usize, usize>,
     /// `LambdaSite::symbol` -> the declared lifted function.
-    lifted: &'a HashMap<String, FunctionValue<'ctx>>,
+    pub(crate) lifted: &'a HashMap<String, FunctionValue<'ctx>>,
+    /// 5b-9b: each lambda's region (its scope), for effectful lifted bodies.
+    pub(crate) lambda_regions: &'a HashMap<usize, cps::LambdaRegion>,
     alloc: FunctionValue<'ctx>,
     str_lit: FunctionValue<'ctx>,
     println: FunctionValue<'ctx>,
@@ -1555,6 +1610,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     cps_emit::prepass(core, &cps_fns)?;
     let sites = cps::collect_sites(core);
     let handlers = cps::collect_handlers(core);
+    let lambda_regions = cps::collect_lambda_regions(core);
     let site_index: HashMap<usize, usize> =
         sites.iter().enumerate().map(|(i, s)| (s.key, i)).collect();
     let handler_index: HashMap<usize, usize> = handlers
@@ -1628,6 +1684,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         lambdas: &lambdas,
         lambda_index: &lambda_index,
         lifted: &lifted,
+        lambda_regions: &lambda_regions,
         alloc,
         str_lit,
         println,
@@ -2385,16 +2442,53 @@ mod tests {
     }
 
     #[test]
-    fn an_effectful_lambda_is_refused_by_name() {
+    fn a_let_bound_effect_polymorphic_lambda_used_at_a_user_effect_is_refused() {
+        // 5b-9b review (a REGRESSION caught before commit): `app` is generic in
+        // its effect row, so its lifted body uses the DIRECT convention, but the
+        // call `app(..)` is instantiated at {S} -- and was compiled as a CPS jump
+        // into the direct function: native SIGSEGV where the evaluator printed
+        // 8. D16 refused this for top-level functions only; a local binding
+        // now gets the same refusal, by the same name.
+        for body in [
+            "let app = fn(g) { g() + 1 }  app(fn() { get() })",
+            "let app = fn(g) { g() + 1 }  let h = fn() { get() }  app(h) * 2",
+        ] {
+            let err = refused(&format!(
+                "pub fn main() -> Int {{\n\
+                 \x20 handle {{ {body} }} with {{\n\
+                 \x20   S.get() -> resume(7)\n    return(r) -> r\n  }}\n}}\n"
+            ));
+            assert!(
+                matches!(
+                    err,
+                    CodegenError::Unsupported("effect-polymorphic function used at a user effect")
+                ),
+                "{body}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_effectful_lambda_compiles_and_four_parameters_are_refused_by_name() {
+        // 5b-9b (replaces `an_effectful_lambda_is_refused_by_name`, which pinned
+        // the refusal this slice lifts): the same program now compiles, and the
+        // one remaining refusal is the parameter cap -- the closure, the source
+        // parameters and the continuation must fit MAX_PARAMS.
+        emit_ir(&core_of(&format!(
+            "{S_W}pub fn main() -> Int {{\n\
+             \x20 handle {{ let f = fn(x) {{ x + get() }}  f(1) }} with {{\n\
+             \x20   S.get() -> resume(1)\n    return(r) -> r\n  }}\n}}\n"
+        )))
+        .expect("an effectful lambda compiles");
         let err = refused(
             "pub fn main() -> Int {\n\
-             \x20 handle { let f = fn(x) { x + get() }  f(1) } with {\n\
+             \x20 handle { let f = fn(a, b, c, d) { a + b + c + d + get() }  f(1, 2, 3, 4) } with {\n\
              \x20   S.get() -> resume(1)\n    return(r) -> r\n  }\n}\n",
         );
         assert!(
             matches!(
                 err,
-                CodegenError::Unsupported("effectful lambda (not yet compiled natively)")
+                CodegenError::Unsupported("effectful lambda takes more than three parameters")
             ),
             "{err:?}"
         );

@@ -1623,6 +1623,31 @@ fn frames_holding_heap_values_survive_collections_and_match_the_evaluator() {
 /// pressure and is compared to the evaluator, text and value.
 const CPS_ROOTING: &[(&str, &str)] = &[
     (
+        // 5b-9b review: collections run INSIDE the lambda body, between a site
+        // and later uses of the capture `l` and the local `m`. 45015 + 40000 +
+        // 45016 = 130031.
+        "lambda-body-collects-between-sites",
+        "effect Ask { fn ask() -> Int }\n\
+         type L { Nil, Cons(Int, L) }\n\
+         fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }\n\
+         fn len(l, a) { match l { Nil -> a  Cons(_, t) -> len(t, a + 1) } }\n\
+         fn user() -> Int { let l = build(10000, Nil)  let f = fn(x) { let a = ask()  let junk = len(build(30000, Nil), 0)  let m = build(5000, Nil)  let b = ask()  x + a + b + len(l, 0) + len(m, 0) + junk }  f(1) + len(build(40000, Nil), 0) + f(2) }\n\
+         fn prog() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n\
+         pub fn main() -> Int { prog() }\n",
+    ),
+    (
+        // 5b-9b: an effectful closure captures a heap list; it must survive a
+        // 30,000-cell build between the two calls. (1 + 7 + 20000) + 30000 +
+        // (2 + 7 + 20000) = 70017.
+        "lambda-captures-survive-collection",
+        "type L { Nil, Cons(Int, L) }\n\
+         effect Ask { fn ask() -> Int }\n\
+         fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }\n\
+         fn lenacc(l, a) { match l { Nil -> a  Cons(_, t) -> lenacc(t, a + 1) } }\n\
+         fn user() -> Int { let l = build(20000, Nil)  let f = fn(x) { x + ask() + lenacc(l, 0) }  f(1) + lenacc(build(30000, Nil), 0) + f(2) }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(r) -> r } }\n",
+    ),
+    (
         // 5b-9a: pattern binders live across a site inside a match arm, with
         // garbage churned every level so collections run mid-recursion. `t` is
         // a heap binder the frame must save AND trace. 8,030,000 predicted.
@@ -2160,13 +2185,71 @@ fn run_differential_corpus(corpus: &[(&str, &str, &str)], dir_name: &str) {
     );
 }
 
+/// HANDOFF step 1 (2026-10-05): a call in a `match` arm in tail position was
+/// an ORDINARY call -- the direct emitter's `lower_tail` handled `If`, `Let`
+/// and `App`, not `Match` -- so a loop through a match grew the stack.
+/// Pre-existing since 5b-4; Linux's 8 MiB hid it until a 30,000-deep row
+/// overflowed Windows' 1 MiB (5b-9a). At a million it overflows Linux too.
+fn run_deep(tag: &str, src: &str, want: &str) {
+    let dir = temp_dir(tag);
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, tag);
+    let out = Command::new(&exe).output().expect("run produced binary");
+    diagnose_crash(&out.status, tag);
+    assert!(
+        out.status.success(),
+        "{tag}: binary exited {:?}",
+        out.status
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want, "{tag}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_tail_call_in_a_match_arm_is_eliminated_at_a_million() {
+    run_deep(
+        "tail-in-match",
+        "type B { T, F }\n\
+         fn flag(n) { if n == 0 { T } else { F } }\n\
+         fn lp(n, acc) { match flag(n) { T -> acc  F -> lp(n - 1, acc + 1) } }\n\
+         pub fn main() -> Int { lp(1000000, 0) }\n",
+        "1000000",
+    );
+}
+
+#[test]
+fn a_tail_call_through_a_pattern_binder_walks_a_million_cells() {
+    // The binder `t` feeds the tail call: the arm's field load must not keep
+    // anything alive past the `musttail`.
+    run_deep(
+        "tail-in-match-binder",
+        "type L { Nil, Cons(Int, L) }\n\
+         fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }\n\
+         fn len(l, a) { match l { Nil -> a  Cons(_, t) -> len(t, a + 1) } }\n\
+         pub fn main() -> Int { len(build(1000000, Nil), 0) }\n",
+        "1000000",
+    );
+}
+
+#[test]
+fn the_elya_cek_machine_runs_natively_a_hundred_thousand_deep() {
+    // The Elya CEK machine's loop is `ev`/`co` tail calls in match arms. Before
+    // the fix, N = 10,000 segfaulted. 100,000 * 100,001 / 2 = 5,000,050,000
+    // (computed, not run through the evaluator: too slow at this depth).
+    let src = include_str!("../../../examples/03_cek.elya");
+    let src = format!(
+        "{}pub fn main() -> Int {{ run(sum_to(100000)) }}\n",
+        &src[..src.find("pub fn main").expect("example has a main")]
+    );
+    run_deep("elya-cek-deep", &src, "5000050000");
+}
+
 #[test]
 fn the_elya_cek_machine_runs_natively() {
     // `examples/03_cek.elya`: a CEK machine written in Elya, compiled natively
-    // and checked against the evaluator. N = 1,000 (500,500). Deeper fails on
-    // the native stack today: the machine's loop is tail calls inside match
-    // arms, which the direct emitter does not yet compile as tail calls
-    // (measured 2026-10-05: N = 10,000 segfaults; the evaluator runs it).
+    // and checked against the evaluator. N = 1,000 (500,500): the evaluator
+    // side keeps N modest. The deep native run is
+    // `the_elya_cek_machine_runs_natively_a_hundred_thousand_deep`.
     let src = include_str!("../../../examples/03_cek.elya");
     let src = format!(
         "{}pub fn main() -> Int {{ run(sum_to(1000)) }}\n",
@@ -2194,6 +2277,156 @@ fn a_match_arm_after_a_catch_all_compiles_natively() {
     assert_runs(&exe, "5");
     assert_eq!(eval_main_int(src), "5");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Slice 5b-9b: effectful lambdas and closure calls, natively. Every row was
+/// refused "effectful lambda (not yet compiled natively)" before; values
+/// predicted before the first run.
+const EFFECTFUL_LAMBDAS: &[(&str, &str, &str)] = &[
+    (
+        // a lambda that performs, called once (s1).
+        "lambda-direct-call",
+        "effect Ask { fn ask() -> Int }\n\
+         fn user() -> Int { let f = fn() { ask() }  f() }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "7",
+    ),
+    (
+        // two calls of one closure: 8 + 9 (s2).
+        "lambda-two-calls",
+        "effect Ask { fn ask() -> Int }\n\
+         fn user() -> Int { let f = fn(x) { x + ask() }  f(1) + f(2) }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "17",
+    ),
+    (
+        // a pure function builds the effectful closure (s5).
+        "lambda-returned-by-pure-fn",
+        "effect Ask { fn ask() -> Int }\n\
+         fn mk(n) { fn() { n + ask() } }\n\
+         fn user() -> Int { let g = mk(3)  g() }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "10",
+    ),
+    (
+        // a fresh closure every iteration (s6).
+        "lambda-in-a-loop",
+        "effect Ask { fn ask() -> Int }\n\
+         fn lp(n, acc) { if n == 0 { acc } else { let f = fn() { ask() }  lp(n - 1, acc + f()) } }\n\
+         pub fn main() -> Int { handle { lp(1000, 0) } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "7000",
+    ),
+    (
+        // the capture `k` is used AFTER the site inside the lambda: (1 + 7 + 5) * 2.
+        "lambda-capture-across-site",
+        "effect Ask { fn ask() -> Int }\n\
+         fn user() -> Int { let k = 5  let f = fn(x) { x + ask() + k }  f(1) * 2 }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "26",
+    ),
+    (
+        // the effectful closure call is in tail position: the continuation is passed on.
+        "lambda-tail-call",
+        "effect Ask { fn ask() -> Int }\n\
+         fn user() -> Int { let f = fn(x) { x + ask() }  f(10) }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "17",
+    ),
+    (
+        // the parameter cap: closure + 3 + continuation = 5.
+        "lambda-three-params",
+        "effect Ask { fn ask() -> Int }\n\
+         fn user() -> Int { let f = fn(a, b, c) { a * 100 + b * 10 + c + ask() }  f(1, 2, 3) }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "130",
+    ),
+    (
+        // a pure lambda returns an effectful one.
+        "lambda-made-by-a-pure-lambda",
+        "effect Ask { fn ask() -> Int }\n\
+         fn user() -> Int { let f = fn(x) { fn() { x + ask() } }  let g = f(4)  g() }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "11",
+    ),
+    (
+        // the second call runs inside the first call's resumption.
+        "lambda-called-in-resume-path",
+        "effect Ask { fn ask() -> Int }\n\
+         fn user() -> Int { let f = fn() { ask() }  let v = f() + f()  v }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "14",
+    ),
+    (
+        // control K1 found the other rows blind to WHERE captures are bound: here
+        // the only capture `k` is binding 2 of [a, b, k] but slot 0 of the
+        // closure. (1 + 7 + 5) + 2 = 15.
+        "lambda-capture-index-differs-from-slot",
+        "effect Ask { fn ask() -> Int }\n\
+         fn user(a, b) -> Int { let k = 5  let f = fn(x) { x + ask() + k }  f(a) + b }\n\
+         pub fn main() -> Int { handle { user(1, 2) } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "15",
+    ),
+    (
+        // control K4 found no row reaching the resumption path's closure call:
+        // here the site `ask()` is the closure call's ARGUMENT. f(7) = 14.
+        "lambda-call-on-a-resumption-path",
+        "effect Ask { fn ask() -> Int }\n\
+         fn user() -> Int { let f = fn(x) { x + ask() }  let v = f(ask())  v }\n\
+         pub fn main() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "14",
+    ),
+    (
+        // from the independent review: an inner lambda's parameter `k` shadows the outer `k` the outer lambda captures: g(100) = 1107, + 5 + 7, f(1000) + 5.
+        "lambda-param-shadows-a-capture",
+        "effect Ask { fn ask() -> Int }\n\
+         fn user(k) -> Int { let f = fn(x) { let g = fn(k) { k + x + ask() }  g(100) + k + ask() }  f(1000) + k }\n\
+         fn prog() -> Int { handle { user(5) } with { Ask.ask() -> resume(7)  return(x) -> x } }\n\
+         pub fn main() -> Int { prog() }\n",
+        "1124",
+    ),
+    (
+        // from the review: an effectful lambda inside an effectful lambda, capturing a, c and d from three depths.
+        "lambda-nested-captures-at-several-depths",
+        "effect Ask { fn ask() -> Int }\n\
+         fn user(a, b) -> Int { let c = 3  let f = fn(x) { let d = x * 2  let g = fn(y) { y + d + c + ask() + a }  g(1) + ask() + b + g(2) }  f(10) + c }\n\
+         fn prog() -> Int { handle { user(100, 1000) } with { Ask.ask() -> resume(7)  return(x) -> x } }\n\
+         pub fn main() -> Int { prog() }\n",
+        "1273",
+    ),
+    (
+        // from the review: a lambda built in a handler's return clause and called under another handler: 101 + 1000 + 7 + 1.
+        "lambda-built-in-a-return-clause",
+        "effect Ask { fn ask() -> Int }\n\
+         fn inner(base) { handle { base + 1 } with { return(x) -> fn(y) { x + y + ask() } } }\n\
+         fn user() -> Int { let g = inner(100)  g(1000) + 1 }\n\
+         fn prog() -> Int { handle { user() } with { Ask.ask() -> resume(7)  return(x) -> x } }\n\
+         pub fn main() -> Int { prog() }\n",
+        "1109",
+    ),
+];
+
+#[test]
+fn an_effectful_closure_in_tail_position_loops_a_million_times() {
+    // 5b-9b: `lp` tail-calls the effectful closure `f`, which tail-calls `lp`
+    // back -- both jumps must be `musttail` with the continuation passed on, or
+    // the native stack grows. 1,000,000 * 7.
+    run_deep(
+        "lambda-tail-loop",
+        "effect Ask { fn ask() -> Int }\n\
+         fn lp(n, acc) { if n == 0 { acc } else { let f = fn(m, a) { lp(m, a + ask()) }  f(n - 1, acc) } }\n\
+         pub fn main() -> Int { handle { lp(1000000, 0) } with { Ask.ask() -> resume(7)  return(x) -> x } }\n",
+        "7000000",
+    );
+}
+
+#[test]
+fn effectful_lambda_corpus_runs_natively() {
+    run_value_corpus(EFFECTFUL_LAMBDAS, "effectful-lambdas");
+}
+
+#[test]
+fn effectful_lambda_corpus_matches_the_evaluator() {
+    run_differential_corpus(EFFECTFUL_LAMBDAS, "differential-effectful-lambdas");
 }
 
 #[test]

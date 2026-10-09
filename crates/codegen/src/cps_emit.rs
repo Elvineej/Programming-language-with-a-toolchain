@@ -135,8 +135,103 @@ pub(crate) fn prepass(core: &CoreModule, cps_fns: &HashSet<String>) -> R<()> {
         let mut scope: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
         let region_cps = cps_fns.contains(&f.name);
         check(&f.body, &mut scope, false, region_cps, &fns, cps_fns)?;
+        let mut locals: Vec<(String, Option<Ty>)> = f
+            .params
+            .iter()
+            .map(|p| (p.name.clone(), Some(p.ty.clone())))
+            .collect();
+        check_local_conventions(&f.body, &mut locals)?;
     }
     Ok(())
+}
+
+/// D16 for LOCAL bindings (5b-9b review). A closure's convention is fixed by
+/// the lambda's own type at its definition (`LambdaSite::effectful`); a call
+/// site chooses by the callee's type at the USE. They disagree when a binding is
+/// generic in its effect row (`let app = fn(g) { g() + 1 }`: open row, direct
+/// convention) and the use instantiates it at a user effect -- the call would
+/// jump into a direct function with the CPS signature (measured: SIGSEGV where
+/// the evaluator printed 8). Refused by the same name as the top-level case.
+/// Binders whose type is not tracked (pattern and return binders, `$cont`)
+/// carry `None` and are never refused here.
+fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>) -> R<()> {
+    let go =
+        |c: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>| check_local_conventions(c, locals);
+    match &e.kind {
+        CoreKind::Lit(_) | CoreKind::Var(_) => Ok(()),
+        CoreKind::App(callee, args) => {
+            if let CoreKind::Var(name) = &callee.kind {
+                if let Some((_, Some(bound))) = locals.iter().rev().find(|(n, _)| n == name) {
+                    if needs_cps(&callee.ty) && !needs_cps(bound) {
+                        return Err(CodegenError::Unsupported(
+                            "effect-polymorphic function used at a user effect",
+                        ));
+                    }
+                }
+            }
+            go(callee, locals)?;
+            args.iter().try_for_each(|a| go(a, locals))
+        }
+        CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
+            a.iter().try_for_each(|x| go(x, locals))
+        }
+        CoreKind::Perform(p) => p.args.iter().try_for_each(|a| go(a, locals)),
+        CoreKind::Resume(v) => go(v, locals),
+        CoreKind::Let(x, v, body) => {
+            go(v, locals)?;
+            locals.push((x.clone(), Some(v.ty.clone())));
+            let r = go(body, locals);
+            locals.pop();
+            r
+        }
+        CoreKind::If(c, t, f) => {
+            go(c, locals)?;
+            go(t, locals)?;
+            go(f, locals)
+        }
+        CoreKind::Match(s, arms) => {
+            go(s, locals)?;
+            for arm in arms.iter() {
+                let mut names = Vec::new();
+                crate::closure::pat_binders(&arm.pat, &mut names);
+                let depth = locals.len();
+                locals.extend(names.into_iter().map(|n| (n, None)));
+                let r = go(&arm.body, locals);
+                locals.truncate(depth);
+                r?;
+            }
+            Ok(())
+        }
+        CoreKind::Lambda(params, body) => {
+            let depth = locals.len();
+            locals.extend(params.iter().map(|p| (p.name.clone(), Some(p.ty.clone()))));
+            let r = go(body, locals);
+            locals.truncate(depth);
+            r
+        }
+        CoreKind::Handle(h) => {
+            go(&h.body, locals)?;
+            for c in h.clauses.iter() {
+                let depth = locals.len();
+                locals.extend(
+                    c.params
+                        .iter()
+                        .map(|p| (p.name.clone(), Some(p.ty.clone()))),
+                );
+                locals.push((crate::closure::CONT.to_string(), None));
+                let r = go(&c.body, locals);
+                locals.truncate(depth);
+                r?;
+            }
+            if let Some(r) = &h.ret {
+                locals.push((r.binder.clone(), None));
+                let out = go(&r.body, locals);
+                locals.pop();
+                out?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn check(
@@ -199,14 +294,18 @@ fn check(
             Ok(())
         }
         CoreKind::Lambda(params, body) => {
-            if needs_cps(&e.ty) {
+            // 5b-9b: an effectful lambda compiles with the CPS convention: the
+            // closure, its parameters and the continuation (MAX_PARAMS).
+            let effectful = needs_cps(&e.ty);
+            if effectful && params.len() + 2 > MAX_PARAMS {
                 return Err(CodegenError::Unsupported(
-                    "effectful lambda (not yet compiled natively)",
+                    "effectful lambda takes more than three parameters",
                 ));
             }
             let depth = scope.len();
             scope.extend(params.iter().map(|p| p.name.clone()));
-            let r = check(body, scope, in_handle, false, fns, cps_fns);
+            // Its body is a CPS region, so D17's handle refusals apply in it.
+            let r = check(body, scope, in_handle, effectful, fns, cps_fns);
             scope.truncate(depth);
             r
         }
@@ -827,6 +926,62 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             .ok_or(CodegenError::Unsupported("call returned no value"))
     }
 
+    /// 5b-9b: the indirect CPS call of an effectful closure, `code(clos,
+    /// args.., k)`, as a `musttail` jump. `k` is a fresh site frame (non-tail)
+    /// or the region's own continuation (tail).
+    fn closure_cps_jump(
+        &self,
+        st: &mut St<'ctx>,
+        callee: &CoreExpr,
+        clos: PointerValue<'ctx>,
+        args: &[BasicValueEnum<'ctx>],
+        k: PointerValue<'ctx>,
+    ) -> R<()> {
+        let Ty::Fn(param_tys, _, _) = &callee.ty else {
+            return Err(CodegenError::Unsupported("computed callee"));
+        };
+        if param_tys.len() != args.len() {
+            return Err(CodegenError::Unsupported("closure call arity mismatch"));
+        }
+        let mut sig: Vec<BasicMetadataTypeEnum<'ctx>> = vec![self.ptrt().into()];
+        for t in param_tys {
+            sig.push(repr_ty(self.ctx, t)?.into());
+        }
+        sig.push(self.ptrt().into());
+        let fn_ty = self.i64t().fn_type(&sig, false);
+        let code = self.load_word(clos, 1)?;
+        let fp = self
+            .b
+            .build_int_to_ptr(code, self.ptrt(), "ci2f")
+            .map_err(internal)?;
+        self.pop_pending(st)?;
+        let mut vals: Vec<BasicMetadataValueEnum<'ctx>> = vec![clos.into()];
+        vals.extend(args.iter().map(|v| BasicMetadataValueEnum::from(*v)));
+        vals.push(k.into());
+        let call = self
+            .b
+            .build_indirect_call(fn_ty, fp, &vals, "cc")
+            .map_err(internal)?;
+        self.tail_jump(call)
+    }
+
+    /// A non-tail effectful closure call: a continuation site, like
+    /// `site_call`. The closure is rooted with the arguments while the frame
+    /// is allocated.
+    fn closure_site_call(
+        &self,
+        st: &mut St<'ctx>,
+        node: &CoreExpr,
+        callee: &CoreExpr,
+        clos: BasicValueEnum<'ctx>,
+        args: &[BasicValueEnum<'ctx>],
+    ) -> R<()> {
+        let mut live = vec![clos];
+        live.extend_from_slice(args);
+        let p = self.site_frame(st, node, &live)?;
+        self.closure_cps_jump(st, callee, clos.into_pointer_value(), args, p)
+    }
+
     fn closure_call(
         &self,
         st: &St<'ctx>,
@@ -1004,6 +1159,10 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                     return Ok(None);
                 };
                 if let Some(clos) = local {
+                    if needs_cps(&callee.ty) {
+                        self.closure_site_call(st, e, callee, clos, &vals)?;
+                        return Ok(None);
+                    }
                     let v = self.closure_call(st, callee, clos, &vals)?;
                     self.settle(st, before)?;
                     return Ok(Some(v));
@@ -1307,6 +1466,23 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
         match &e.kind {
             CoreKind::App(callee, args) => {
                 if let CoreKind::Var(name) = &callee.kind {
+                    // 5b-9b: an effectful closure in tail position takes the
+                    // region's own continuation.
+                    if let Some(clos) = st.env.get(name).copied() {
+                        if needs_cps(&callee.ty) {
+                            let Some(vals) = self.operands(st, args)? else {
+                                return Ok(());
+                            };
+                            let k = st.kont;
+                            return self.closure_cps_jump(
+                                st,
+                                callee,
+                                clos.into_pointer_value(),
+                                &vals,
+                                k,
+                            );
+                        }
+                    }
                     if !st.env.contains_key(name) && self.lc.cps_fns.contains(name) {
                         let target = *self.lc.decls.get(name).ok_or(CodegenError::Unsupported(
                             "callee is not a top-level function",
@@ -1388,6 +1564,57 @@ pub(crate) fn emit_cps_fn<'ctx>(
         st.bind(&p.name, v);
     }
     Cx { ctx, func, b, lc }.tail(&mut st, &f.body)
+}
+
+/// Slice 5b-9b: an effectful lambda's lifted body, `(clos, params.., k) ->
+/// i64`. The body is a CPS region that CONTINUES its enclosing scope's binding
+/// indices (`cps::LambdaRegion`): each capture is loaded from the closure and
+/// placed at the index of the innermost binding of its name there -- the index
+/// every site inside the body saved it under -- and the parameters are bound
+/// from the region's depth on, exactly as the analysis numbered them.
+pub(crate) fn emit_cps_lifted<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    site: &crate::closure::LambdaSite,
+) -> R<()> {
+    let func = *lc
+        .lifted
+        .get(&site.symbol)
+        .ok_or(CodegenError::Unsupported("lambda body was never declared"))?;
+    let region = lc
+        .lambda_regions
+        .get(&site.key)
+        .ok_or_else(|| internal("an effectful lambda has no region"))?;
+    let entry = ctx.append_basic_block(func, "entry");
+    b.position_at_end(entry);
+    let cx = Cx { ctx, func, b, lc };
+    let clos = func
+        .get_nth_param(0)
+        .ok_or_else(|| internal("lifted body has no environment parameter"))?
+        .into_pointer_value();
+    let kont = func
+        .get_nth_param((site.params.len() + 1) as u32)
+        .ok_or_else(|| internal("effectful lambda has no continuation parameter"))?
+        .into_pointer_value();
+    let mut st = St::new(kont);
+    for (i, (name, ty)) in site.captures.iter().enumerate() {
+        let w = cx.load_word(clos, i + 2)?;
+        let v = word_to_value(b, w, ty, ctx.bool_type(), cx.ptrt())?;
+        let at = region
+            .binding_of(name)
+            .ok_or_else(|| internal("a capture is not in the lambda's scope"))?;
+        st.binds.insert(at, (name.clone(), v));
+    }
+    st.depth = region.scope.len();
+    st.rebuild_env();
+    for (i, p) in site.params.iter().enumerate() {
+        let v = func
+            .get_nth_param((i + 1) as u32)
+            .ok_or_else(|| internal("declared lambda arity disagrees with Core"))?;
+        st.bind(&p.name, v);
+    }
+    cx.tail(&mut st, &site.body)
 }
 
 /// A `handle`, from a region that needs no CPS (D17): allocate the handler
@@ -1870,6 +2097,21 @@ fn emit_resume_fn<'ctx>(
                     return Ok(());
                 };
                 if let Some(clos) = local {
+                    if needs_cps(&callee.ty) {
+                        // 5b-9b: an effectful closure call in a resumption.
+                        return if tail_i {
+                            let k = st.kont;
+                            cx.closure_cps_jump(
+                                &mut st,
+                                callee,
+                                clos.into_pointer_value(),
+                                &vals,
+                                k,
+                            )
+                        } else {
+                            cx.closure_site_call(&mut st, a, callee, clos, &vals)
+                        };
+                    }
                     cur = cx.closure_call(&st, callee, clos, &vals)?;
                 } else {
                     let target = *lc.decls.get(name).ok_or(CodegenError::Unsupported(

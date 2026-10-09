@@ -10,10 +10,10 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
   university address; every branch was force-pushed. Do not push old local branches.
 - The repo is private until the maintainer flips it public (only they can).
-- Open PRs: **#8** README status; **#10** the call-graph soundness fix; and the Elya CEK
-  machine (`claude/elya-cek-2`), stacked on #10 -- retarget it to `main` after #10 merges.
-- Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits that appeared in the
-  working tree from another writer (not this session), unverified; the maintainer decides.
+- Open PRs: **#12** lands the Elya CEK machine and the Claude-only rule on `main` (#11
+  merged into #10's branch, not `main`); the tail-in-match fix is stacked on #12.
+- Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
+  this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
 - Diagnostics added in 5c: E0202 duplicate op name, E0203 clause names no declared op
   (or has the wrong arity), E0204, E0205, E0206.
 
@@ -77,37 +77,20 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   natively (to N = 1,000; deeper waits on step 1). `crosscheck` now runs examples on a
   64 MiB thread (the tree-walker oracle recurses on the host stack).
 
+- **Tail calls inside a `match` arm** (2026-10-05, branch `claude/tail-in-match`): the
+  direct emitter's `lower_tail` had no `Match` case, so a call in an arm was an ordinary
+  call (pre-existing since 5b-4; red on Windows `main`). `lower_match` now has a value
+  mode and a tail mode. A million-deep loop and list walk, and the Elya CEK machine at
+  N = 100,000, run natively. Supersedes the parked `claude/outside-edit-tail-in-match`.
+
+- **Slice 5b-9b: effectful lambdas and closure calls, natively** (2026-10-05, branch
+  `claude/slice-5b9b-effectful-lambdas`): CPS-convention lifted bodies that continue their
+  enclosing scope's binding indices; effectful closure calls as site calls or tail jumps.
+  Spec `docs/superpowers/specs/2026-10-05-elya-slice-5b9b-effectful-lambdas-design.md`.
+
 ## The next five steps
 
-### 1. Tail calls inside a `match` arm (urgent: `main` is red on Windows)
-
-The direct emitter's `lower_tail` handles `If`, `Let` and `App` but not `Match`, so a call in
-a match arm is an ordinary call, not `musttail`. Pre-existing since 5b-4; Linux's 8 MiB
-stack hid it until 5b-9a's review added a 30,000-deep row (`match-var-binder-survives-
-collection`), which overflows Windows' 1 MiB stack -- that row fails on `main` on Windows
-now. It also caps the Elya CEK machine natively (N = 10,000 segfaults on Linux).
-
-- A candidate fix is parked on `claude/outside-edit-tail-in-match` (from another writer,
-  unverified); ask the maintainer whether to adopt it or write it fresh, test-first.
-- Red test first: a 1,000,000-deep loop through a match arm (overflows on Linux too), and
-  the Elya CEK machine natively at N = 100,000.
-
-### 2. Slice 5b-9b: native effectful lambdas and closure calls
-
-Natively refused today, by name: "effectful lambda" and "effectful closure call", both
-"(not yet compiled natively)" (PARKED, Task 8 follow-ups). Measured shapes (5b-9a spec §0):
-s1, s2, s5, s6. s4, an effect-polymorphic function used at a user effect, is N7's.
-
-- This is the biggest check/run/build split left. 5c-3's own fix-it (`fn() { ping() }`)
-  runs but does not build.
-- Approach: give lambdas the CPS convention when their row names a user effect (the
-  selective-CPS key, D16), with closure calls through `$cont`. `match_dispatch` (5b-9a)
-  is the model for an effect-aware twin of a direct construct.
-- Keep `gc_mark` byte-identical (637 bytes, measured with the `awk` command in PARKED/A7).
-- Watch MAX_PARAMS (5) on win64: a CPS lambda takes its env and `$cont` too.
-- Measure each refused shape first and record which stay refused.
-
-### 3. Slice 5b-10: lift D17 (nested handles, handles inside effectful code)
+### 1. Slice 5b-10: lift D17 (nested handles, handles inside effectful code)
 
 PARKED, "`elya_current_handler` depends on today's handle refusals":
 
@@ -118,7 +101,7 @@ PARKED, "`elya_current_handler` depends on today's handle refusals":
   Today no test isolates the install (Task 12 control 1a), and A6 is not a witness in
   this design.
 
-### 4. Evaluator: non-tail recursion under a handler is quadratic
+### 2. Evaluator: non-tail recursion under a handler is quadratic
 
 PARKED: about 4× time per doubling (n=4000 takes 1.7 s; n=100 000 did not finish in 10
 minutes). This caps every differential test's N. Profile (frame capture copies the
@@ -126,7 +109,7 @@ continuation?), predict the complexity, fix, and pin it with a timing-free test 
 counts steps or allocations. The evaluator is the reference semantics, so the
 differential corpora must stay green unchanged.
 
-### 5. N7: runtime polymorphism (spec first, stop for decisions)
+### 3. N7: runtime polymorphism (spec first, stop for decisions)
 
 - Lifts the `Ty::Var` "unrepresentable type" refusal (5c-2's n4 hits it) and D16's
   conservative refusal of effect-polymorphic functions at user effects (5b-9a's s4).
@@ -135,8 +118,27 @@ differential corpora must stay green unchanged.
 - Write the measured table and the open questions, then ask the maintainer before
   planning. This is a large arc; plan it as several slices.
 
-Also open, unscheduled: native multi-shot handlers (`with multi`, refused natively since
-5b-8 A2: a second resume needs the frame chain copied, and the maintainer's call on
-priority vs N7); the Elya CEK machine's next versions (a parser for its terms, a step
+### 4. Native multi-shot handlers (`with multi`)
+
+Refused natively by name since 5b-8 (A2); the evaluator runs them. A multi-shot resume
+re-runs a captured continuation, but native frames are consumed in place: a second resume
+needs the frame chain COPIED (or made immutable) first, and the one-shot `consumed` flag
+replaced by a copy-on-resume rule. Measure first (the evaluator's multi-shot corpus, e.g.
+`multi_shot_collects_both_branches`, through `build`), then a spec with the frame-copy
+cost stated and gated against A4's live-set instrument. Depends on step 2 (handler
+re-installation). Ask the maintainer whether multi-shot is worth native support before N7.
+
+### 5. Native strings: `<>` and an Int-to-String builtin
+
+`<>` (string concatenation) runs in the evaluator but is refused natively by name (5b-8
+§9.1), and there is no way to turn an `Int` into a `String` at all -- which is why the
+Elya CEK example prints fixed strings instead of its results. Measure first (every
+corpus and example that uses `<>`, through `build`). The runtime needs a concatenation
+that allocates a fresh string block (one descriptor row already exists for strings) and
+an integer formatter. The builtin's NAME and module (`int.to_string`? `show`?) is a
+language decision: ask the maintainer, offering options. Then let the CEK example print
+its answers.
+
+Also open, unscheduled: the Elya CEK machine's next versions (a parser for its terms, a step
 counter as an Elya effect); PIC/PIE linking (needs a Windows run), and a named diagnosis for
 a native stack overflow in tests other than A9.
