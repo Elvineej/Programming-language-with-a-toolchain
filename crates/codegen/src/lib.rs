@@ -1313,11 +1313,9 @@ fn lower_expr<'ctx>(
             lower_match(ctx, func, b, lc, scrutinee, arms, Some(node_ty), env)?
                 .ok_or_else(|| internal("a value match produced no value"))
         }
-        // 5b-8: Core carries handlers from Task 5; native dispatch arrives in Task
-        // 8. Until then a handler that reaches the back end is refused by name,
-        // never mis-lowered.
-        // D17: a handle is a nesting native call from a region that needs no
-        // CPS (the prepass refused every other position).
+        // A DIRECT handle (one that leaks no effect) is a nesting native call,
+        // wherever it sits (5b-10). A CPS handle is a site of its CPS region and
+        // never reaches here from a clean front end; it is refused by name.
         CoreKind::Handle(_) => cps_emit::emit_handle_site(ctx, func, b, lc, e, env),
         // Task 8: a resume inside a clause body (or a lambda in one) is a
         // native nesting call of the continuation (D14).
@@ -1433,9 +1431,8 @@ fn descriptor_rows(
                      // at the moment the row is pushed, and `site_tags` is the only place an
                      // emitter reads it from -- so there is no second assignment for a guard to
                      // compare against (unlike the lambda tags, assigned in `collect_lambdas`).
-                     // A handler frame (7b-3, D17) is the same shape -- `[tag][code_ptr =
-                     // the return clause][next = null][saved..]` -- so it takes a row by the
-                     // same rule, appended after the site rows.
+                     // A handler frame takes its own row, appended after the site rows
+                     // (below).
     let frame_row = |saved: &[(cps::Saved, Ty)], desc: &mut Vec<u64>| -> usize {
         if saved.is_empty() {
             return frame_tag;
@@ -1457,27 +1454,33 @@ fn descriptor_rows(
     for site in sites {
         site_tags.insert(site.key, frame_row(&site.saved, &mut desc));
     }
-    // Task 8: a handler frame is `[tag][code_ptr = the return clause][next =
-    // null][table][saved..]`. Word 3 is the address of the handle's static
-    // clause table (text/rodata, not heap), so it is never traced: bit 2
-    // clear, and saved value j is bit j+3. Always its own row -- its arity is
-    // never the frame row's.
+    // Task 8: a handler frame is `[tag][code_ptr = the return clause][next]
+    // [table][parent][saved..]`. `next` is null for a direct handle and the
+    // handle's continuation for a CPS one (5b-10; traced, bit 1). Word 3 is the
+    // address of the handle's static clause table (text/rodata, not heap), so
+    // it is never traced: bit 2 clear. `parent` (5b-10) is the handler a
+    // perform this one does not answer goes to (traced, bit 3), and saved
+    // value j is bit j+4. Always its own row -- its arity is never the frame
+    // row's.
     let mut handler_tags = std::collections::BTreeMap::new();
     for h in handlers {
         handler_tags.insert(h.key, desc.len() / 2);
-        desc.push(3 + h.saved.len() as u64);
-        let mut mask: u64 = 0b10;
+        desc.push(4 + h.saved.len() as u64);
+        let mut mask: u64 = 0b1010;
         for (j, (_, ty)) in h.saved.iter().enumerate() {
             if is_heap_ty(ty) {
-                mask |= 1 << (j + 3);
+                mask |= 1 << (j + 4);
             }
         }
         desc.push(mask);
     }
     // D13: ONE row for the continuation object a clause receives,
-    // `[tag][k][consumed][handler]`: `k` is the captured frame chain (traced,
-    // bit 0); `consumed` is the one-shot flag (a plain word, bit 1 clear);
-    // `handler` is the handler frame a resume re-installs (traced, bit 2).
+    // `[tag][k][h][innermost]`: `k` is the captured frame chain (traced, bit
+    // 0); `h` is the frame that answers the perform, and 0 once the
+    // continuation is consumed -- the one-shot flag (5b-10; not traced: `h` is
+    // a frame on `k`'s chain, so `k` keeps it alive, bit 1 clear); `innermost`
+    // is the handler that was current at the perform, which a resume makes
+    // current again (traced, bit 2).
     let cont_tag = desc.len() / 2;
     desc.push(3);
     desc.push(0b101);
@@ -1527,7 +1530,9 @@ struct LowerCtx<'a, 'ctx> {
     /// Continuation sites (D10) and their index by node address.
     sites: &'a [cps::ContSite],
     site_index: &'a HashMap<usize, usize>,
-    /// Handles (D17) and their index by node address.
+    /// 5b-10: the CPS handles and CPS resumes.
+    pub(crate) fx: &'a cps::Fx,
+    /// Handles and their index by node address.
     handlers: &'a [cps::HandlerSite],
     handler_index: &'a HashMap<usize, usize>,
     /// The descriptor table's tags: per site, per handler.
@@ -1604,9 +1609,11 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         .collect();
 
     // 5b-8 7b-3: which functions are effectful (D16), and the refusals that
-    // keep the convention and D17's handle cut sound -- all before anything
-    // is emitted, like the arity caps above.
-    let cps_fns = cps_emit::cps_functions(core);
+    // keep the convention sound -- all before anything is emitted, like the
+    // arity caps above. 5b-10: which handles leak an effect (CPS handles) and
+    // which resumes are theirs.
+    let fx = cps::effect_facts(core);
+    let cps_fns = cps_emit::cps_functions(core, &fx);
     cps_emit::prepass(core, &cps_fns)?;
     let sites = cps::collect_sites(core);
     let handlers = cps::collect_handlers(core);
@@ -1693,6 +1700,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         gc_push,
         gc_pop,
         cps_fns: &cps_fns,
+        fx: &fx,
         nodes: &nodes,
         sites: &sites,
         site_index: &site_index,
@@ -2403,42 +2411,33 @@ mod tests {
     }
 
     #[test]
-    fn a_handle_nested_inside_another_handle_is_refused() {
-        // D17: the inner handle is a nesting call the outer capture cannot see past.
-        let err = refused(
-            "pub fn main() -> Int {\n\
-             \x20 handle {\n\
-             \x20   handle { w(False) } with { S.get() -> resume(1)  return(r) -> r }\n\
-             \x20 } with { S.get() -> resume(2)  return(r) -> r }\n}\n",
-        );
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("handle nested inside another handle")
-            ),
-            "{err:?}"
-        );
+    fn a_handle_nested_inside_another_handle_compiles() {
+        // Slice 5b-10 (replaces `a_handle_nested_inside_another_handle_is_refused`,
+        // which pinned D17's refusal): the same program now compiles. The inner
+        // handle discharges everything, so it is a direct nesting call.
+        emit_ir(&core_of(&format!(
+            "{S_W}pub fn main() -> Int {{\n\
+             \x20 handle {{\n\
+             \x20   handle {{ w(False) }} with {{ S.get() -> resume(1)  return(r) -> r }}\n\
+             \x20 }} with {{ S.get() -> resume(2)  return(r) -> r }}\n}}\n"
+        )))
+        .expect("a nested handle compiles");
     }
 
     #[test]
-    fn a_handle_inside_an_effectful_function_is_refused() {
-        // D17: `g` performs S outside its handle, so it is CPS, and a perform
-        // inside its handle could need the code after it.
-        let err = refused(
-            "effect T { fn t() -> Int }\n\
-             fn g() -> Int {\n\
-             \x20 let a = handle { w(False) } with { S.get() -> resume(1)  return(r) -> r }\n\
-             \x20 a + t()\n}\n\
-             pub fn main() -> Int {\n\
-             \x20 handle { g() } with { T.t() -> resume(1)  return(r) -> r }\n}\n",
-        );
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("handle inside an effectful function")
-            ),
-            "{err:?}"
-        );
+    fn a_handle_inside_an_effectful_function_compiles() {
+        // Slice 5b-10 (replaces `a_handle_inside_an_effectful_function_is_refused`):
+        // `g` performs T outside its handle, so it is CPS, and the handle inside
+        // it now compiles there.
+        emit_ir(&core_of(&format!(
+            "{S_W}effect T {{ fn t() -> Int }}\n\
+             fn g() -> Int {{\n\
+             \x20 let a = handle {{ w(False) }} with {{ S.get() -> resume(1)  return(r) -> r }}\n\
+             \x20 a + t()\n}}\n\
+             pub fn main() -> Int {{\n\
+             \x20 handle {{ g() }} with {{ T.t() -> resume(1)  return(r) -> r }}\n}}\n"
+        )))
+        .expect("a handle inside an effectful function compiles");
     }
 
     #[test]

@@ -67,9 +67,14 @@ fn nonvalue_bound_relay_row_stays_monomorphic() {
                  if a == \"pure\" { io.println(r) } else { io.println(\"no\") }\n\
                }\n";
     let err = check_err(src);
+    // Since sub-effecting (2026-10-08) the pure thunk fits the shared row, so
+    // the conflict surfaces one step later: the monomorphic row, shared by
+    // both uses, carries Log into `main` (E0420). Either way the guard holds:
+    // the row was NOT generalized. Approved expected-value change (E0423 ->
+    // E0423 or E0420).
     assert!(
-        err.contains("E0423"),
-        "must be a ROW mismatch (the row is not generalized): {err}"
+        err.contains("E0423") || err.contains("E0420"),
+        "must be a ROW error (the row is not generalized): {err}"
     );
     assert!(
         !err.contains("E0400"),

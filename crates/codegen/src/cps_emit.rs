@@ -13,12 +13,17 @@
 //!   that frame as its continuation. The frame's code is the site's RESUMPTION
 //!   function, which reloads what was saved and runs the rest of the region from
 //!   the hole upward.
-//! - A `handle` (only where D17 allows one) allocates a handler frame
-//!   `[tag][code_ptr = return clause][next = null][saved..]` and calls the body's
-//!   function as an ordinary nested call; the body eventually hands its value to
-//!   the handler frame, whose code runs the return clause and RETURNS -- through
-//!   the chain of `musttail`s -- to the handle site.
-//! - A `Perform` is a named trap until Task 8 (D18).
+//! - A DIRECT `handle` (one that leaks no effect) allocates a handler frame
+//!   `[tag][code_ptr = return clause][next = null][table][parent][saved..]` and
+//!   calls the body's function as an ordinary nested call; the body eventually
+//!   hands its value to the handler frame, whose code runs the return clause and
+//!   RETURNS -- through the chain of `musttail`s -- to the handle site.
+//! - A CPS `handle` (one that leaks, slice 5b-10) is a continuation site: its
+//!   frame's `next` is the handle's continuation, the body is entered with a
+//!   `musttail`, and its clauses and return clause are CPS regions whose
+//!   continuation is that `next`.
+//! - A `Perform` walks from the current handler through `parent`s to the frame
+//!   with a clause for its op, and jumps to the clause (Task 8, 5b-10).
 //!
 //! GC discipline is the existing one: every allocation and every non-tail call
 //! is bracketed by shadow-stack pushes of what is live, and nothing is pushed
@@ -47,6 +52,10 @@ use crate::{
 };
 use crate::{unbind_local, Shadowed};
 
+fn key_of(e: &CoreExpr) -> usize {
+    e as *const CoreExpr as usize
+}
+
 /// The region's continuation, kept in the name environment under a name no
 /// source identifier can spell, so the existing env-rooting discipline roots it
 /// at every allocation the direct emitter performs inside a CPS region.
@@ -58,10 +67,10 @@ type R<T> = Result<T, CodegenError>;
 
 /// D16: the effectful top-level functions -- those whose own region performs
 /// or makes an effectful call.
-pub(crate) fn cps_functions(core: &CoreModule) -> HashSet<String> {
+pub(crate) fn cps_functions(core: &CoreModule, fx: &cps::Fx) -> HashSet<String> {
     core.fns
         .iter()
-        .filter(|f| contains_effect(&f.body))
+        .filter(|f| contains_effect(&f.body, fx))
         .map(|f| f.name.clone())
         .collect()
 }
@@ -111,8 +120,9 @@ pub(crate) fn index_nodes(core: &CoreModule) -> HashMap<usize, &CoreExpr> {
     out
 }
 
-/// The refusals that keep D16's convention and D17's handle cut sound, run
-/// before anything is emitted (like the arity caps in `build_module`).
+/// The refusals that keep D16's convention sound and the arity caps, run
+/// before anything is emitted (like the arity caps in `build_module`). D17's
+/// handle refusals are gone since slice 5b-10.
 pub(crate) fn prepass(core: &CoreModule, cps_fns: &HashSet<String>) -> R<()> {
     let fns: HashMap<&str, &elya::core::CoreFn> =
         core.fns.iter().map(|f| (f.name.as_str(), f)).collect();
@@ -133,8 +143,7 @@ pub(crate) fn prepass(core: &CoreModule, cps_fns: &HashSet<String>) -> R<()> {
     }
     for f in &core.fns {
         let mut scope: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
-        let region_cps = cps_fns.contains(&f.name);
-        check(&f.body, &mut scope, false, region_cps, &fns, cps_fns)?;
+        check(&f.body, &mut scope, &fns, cps_fns)?;
         let mut locals: Vec<(String, Option<Ty>)> = f
             .params
             .iter()
@@ -158,7 +167,22 @@ fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>)
     let go =
         |c: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>| check_local_conventions(c, locals);
     match &e.kind {
-        CoreKind::Lit(_) | CoreKind::Var(_) => Ok(()),
+        CoreKind::Lit(_) => Ok(()),
+        // Sub-effecting (2026-10-08): a direct closure may now be USED where an
+        // effectful function is expected (`if c { f } else { fn(x) { t() + x }
+        // }`). Its code has the direct convention, so a CPS call of it would
+        // jump into it with the wrong signature -- measured: 2 where the
+        // evaluator printed 13. Refused by name until an adapter wraps it.
+        CoreKind::Var(name) => {
+            if let Some((_, Some(bound))) = locals.iter().rev().find(|(n, _)| n == name) {
+                if needs_cps(&e.ty) && !needs_cps(bound) {
+                    return Err(CodegenError::Unsupported(
+                        "direct function used where an effectful one is expected",
+                    ));
+                }
+            }
+            Ok(())
+        }
         CoreKind::App(callee, args) => {
             if let CoreKind::Var(name) = &callee.kind {
                 if let Some((_, Some(bound))) = locals.iter().rev().find(|(n, _)| n == name) {
@@ -168,8 +192,10 @@ fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>)
                         ));
                     }
                 }
+                // The callee was judged just above; it is not a value use.
+            } else {
+                go(callee, locals)?;
             }
-            go(callee, locals)?;
             args.iter().try_for_each(|a| go(a, locals))
         }
         CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
@@ -224,7 +250,10 @@ fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>)
                 r?;
             }
             if let Some(r) = &h.ret {
-                locals.push((r.binder.clone(), None));
+                // The return binder is the handled body's value: tracked, so
+                // a direct closure it holds is not upcast unrefused (the
+                // sub-effecting review's F3: 2 where the evaluator printed 102).
+                locals.push((r.binder.clone(), Some(h.body.ty.clone())));
                 let out = go(&r.body, locals);
                 locals.pop();
                 out?;
@@ -237,14 +266,10 @@ fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>)
 fn check(
     e: &CoreExpr,
     scope: &mut Vec<String>,
-    in_handle: bool,
-    region_cps: bool,
     fns: &HashMap<&str, &elya::core::CoreFn>,
     cps_fns: &HashSet<String>,
 ) -> R<()> {
-    let go = |c: &CoreExpr, scope: &mut Vec<String>| {
-        check(c, scope, in_handle, region_cps, fns, cps_fns)
-    };
+    let go = |c: &CoreExpr, scope: &mut Vec<String>| check(c, scope, fns, cps_fns);
     match &e.kind {
         CoreKind::Lit(_) | CoreKind::Var(_) => Ok(()),
         CoreKind::App(callee, args) => {
@@ -304,8 +329,7 @@ fn check(
             }
             let depth = scope.len();
             scope.extend(params.iter().map(|p| p.name.clone()));
-            // Its body is a CPS region, so D17's handle refusals apply in it.
-            let r = check(body, scope, in_handle, effectful, fns, cps_fns);
+            let r = go(body, scope);
             scope.truncate(depth);
             r
         }
@@ -318,11 +342,6 @@ fn check(
                     "multi-shot handler (`with multi`)",
                 ));
             }
-            if in_handle {
-                return Err(CodegenError::Unsupported(
-                    "handle nested inside another handle",
-                ));
-            }
             // A clause takes the op's arguments, the continuation and the
             // handler frame (Task 8): MAX_PARAMS is the measured win64 limit.
             if h.clauses.iter().any(|c| c.params.len() + 2 > MAX_PARAMS) {
@@ -330,23 +349,20 @@ fn check(
                     "effect operation takes more than three parameters",
                 ));
             }
-            if region_cps {
-                return Err(CodegenError::Unsupported(
-                    "handle inside an effectful function",
-                ));
-            }
-            check(&h.body, scope, true, true, fns, cps_fns)?;
+            // Slice 5b-10: D17's two refusals (a handle inside another handle,
+            // a handle inside an effectful region) are lifted.
+            go(&h.body, scope)?;
             for c in h.clauses.iter() {
                 let depth = scope.len();
                 scope.extend(c.params.iter().map(|p| p.name.clone()));
                 scope.push(crate::closure::CONT.to_string());
-                let r = check(&c.body, scope, true, false, fns, cps_fns);
+                let r = go(&c.body, scope);
                 scope.truncate(depth);
                 r?;
             }
             if let Some(r) = &h.ret {
                 scope.push(r.binder.clone());
-                let out = check(&r.body, scope, true, false, fns, cps_fns);
+                let out = go(&r.body, scope);
                 scope.pop();
                 out?;
             }
@@ -429,9 +445,13 @@ pub(crate) fn declare<'ctx>(
     let body_ty = i64t.fn_type(&[ptrt.into()], false);
     let mut resume = HashMap::new();
     for (i, s) in sites.iter().enumerate() {
+        // 5b-10: a CPS handle and a CPS resume are sites too.
         if !matches!(
             nodes.get(&s.key).map(|n| &n.kind),
-            Some(CoreKind::App(..)) | Some(CoreKind::Perform(_))
+            Some(CoreKind::App(..))
+                | Some(CoreKind::Perform(_))
+                | Some(CoreKind::Handle(_))
+                | Some(CoreKind::Resume(_))
         ) {
             continue;
         }
@@ -785,11 +805,14 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
     }
 
     /// Task 8: a perform. Its continuation is the current one (tail position)
-    /// or a fresh site frame linked to it. With D17 the chain always ends at
-    /// the handler frame, so the handler is already BENEATH the captured frames
-    /// (spec 4 point 4) -- deep re-installation with no copying. Wrap the chain
-    /// in a one-shot continuation object (D13), find the handler at the chain's
-    /// end, and jump to its clause for this `(effect, op)`.
+    /// or a fresh site frame linked to it; the chain runs through every handler
+    /// frame between here and the handler that answers, ending beyond it (spec
+    /// 4 point 4: the handler is BENEATH the captured frames -- deep
+    /// re-installation with no copying). Slice 5b-10: the handler is found by
+    /// walking from the current one through `parent`s to the first frame whose
+    /// table has this `(effect, op)`. The one-shot continuation object (D13) is
+    /// `[tag][k][h][innermost]`: `h` the answering frame (0 once consumed; on
+    /// `k`'s chain, so not traced), `innermost` the handler current here.
     fn perform(
         &self,
         st: &mut St<'ctx>,
@@ -814,23 +837,34 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
         self.store_word(cont, 0, i64t.const_int(self.lc.desc.cont_tag as u64, false))?;
         let kw = self.b.build_ptr_to_int(k, i64t, "kw").map_err(internal)?;
         self.store_word(cont, 1, kw)?;
-        self.store_word(cont, 2, i64t.const_int(0, false))?;
-        // O(1): the handler this computation performs to (set by the handle
-        // site, re-installed by every resume). Read AFTER the allocation; the
-        // global does not move, and nothing here can collect.
-        let h = self
+        // The handlers are read AFTER the allocation; frames do not move, and
+        // nothing below can collect.
+        let h0 = self
             .b
             .build_load(self.ptrt(), self.lc.current_handler, "h")
             .map_err(internal)?
             .into_pointer_value();
-        let hw = self.b.build_ptr_to_int(h, i64t, "hw").map_err(internal)?;
-        self.store_word(cont, 3, hw)?;
-        // No handler at all: unreachable under D17 (main is never CPS and
-        // effectful closure calls are refused), but a perform with nothing to
-        // perform to must stop by NAME, not dereference null.
-        let none = self.b.build_is_null(h, "noh").map_err(internal)?;
+        let id = *self
+            .lc
+            .op_ids
+            .get(&(pf.effect.clone(), pf.op.clone()))
+            .ok_or_else(|| internal("a performed op has no id"))?;
+        let from = self
+            .b
+            .get_insert_block()
+            .ok_or(CodegenError::Unsupported("builder left no block"))?;
+        let walk = self.ctx.append_basic_block(self.func, "find_handler");
         let nobody = self.ctx.append_basic_block(self.func, "no_handler");
         let found = self.ctx.append_basic_block(self.func, "handler");
+        let up = self.ctx.append_basic_block(self.func, "outer_handler");
+        let ok = self.ctx.append_basic_block(self.func, "dispatch");
+        self.b.build_unconditional_branch(walk).map_err(internal)?;
+        self.b.position_at_end(walk);
+        let phi = self.b.build_phi(self.ptrt(), "hw").map_err(internal)?;
+        let h = phi.as_basic_value().into_pointer_value();
+        // No handler at all: unreachable from a clean front end, but a perform
+        // with nothing to perform to must stop by NAME, not dereference null.
+        let none = self.b.build_is_null(h, "noh").map_err(internal)?;
         self.b
             .build_conditional_branch(none, nobody, found)
             .map_err(internal)?;
@@ -838,18 +872,14 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
         self.b
             .build_call(self.lc.unhandled, &[], "nh")
             .map_err(internal)?;
+        // `elya_unhandled_effect` exits; a placeholder terminator, NOT the trap.
         self.b.build_unreachable().map_err(internal)?;
         self.b.position_at_end(found);
-        let table = self.load_word(h, 3)?;
+        let table = self.load_word(h, HF_TABLE)?;
         let table = self
             .b
             .build_int_to_ptr(table, self.ptrt(), "tab")
             .map_err(internal)?;
-        let id = *self
-            .lc
-            .op_ids
-            .get(&(pf.effect.clone(), pf.op.clone()))
-            .ok_or_else(|| internal("a performed op has no id"))?;
         let entry = self.load_word(table, id)?;
         let missing = self
             .b
@@ -860,18 +890,22 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                 "nc",
             )
             .map_err(internal)?;
-        let bad = self.ctx.append_basic_block(self.func, "unhandled");
-        let ok = self.ctx.append_basic_block(self.func, "dispatch");
         self.b
-            .build_conditional_branch(missing, bad, ok)
+            .build_conditional_branch(missing, up, ok)
             .map_err(internal)?;
-        self.b.position_at_end(bad);
-        self.b
-            .build_call(self.lc.unhandled, &[], "uh")
+        self.b.position_at_end(up);
+        let parent = self.load_word(h, HF_PARENT)?;
+        let parent = self
+            .b
+            .build_int_to_ptr(parent, self.ptrt(), "ph")
             .map_err(internal)?;
-        // `elya_unhandled_effect` exits; a placeholder terminator, NOT the trap.
-        self.b.build_unreachable().map_err(internal)?;
+        self.b.build_unconditional_branch(walk).map_err(internal)?;
+        phi.add_incoming(&[(&h0, from), (&parent, up)]);
         self.b.position_at_end(ok);
+        let hw = self.b.build_ptr_to_int(h, i64t, "hw").map_err(internal)?;
+        self.store_word(cont, 2, hw)?;
+        let iw = self.b.build_ptr_to_int(h0, i64t, "iw").map_err(internal)?;
+        self.store_word(cont, 3, iw)?;
         self.pop_pending(st)?;
         let mut sig: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
         for a in pf.args.iter() {
@@ -893,6 +927,142 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             .build_indirect_call(clause_ty, fp, &vals, "pc")
             .map_err(internal)?;
         self.tail_jump(call)
+    }
+
+    /// Slice 5b-10: a CPS handle (one that leaks an effect) in a CPS region.
+    /// Its frame's `next` is the handle's continuation -- a fresh site frame,
+    /// or the region's own in tail position -- and its `parent` the handler
+    /// current here. The frame becomes current, and the body is entered with a
+    /// `musttail` jump; its answer reaches `next` through the return clause.
+    fn handle_cps(&self, st: &mut St<'ctx>, e: &CoreExpr, tail: bool) -> R<()> {
+        let key = e as *const CoreExpr as usize;
+        let h = &self.lc.handlers[*self.lc.handler_index.get(&key).ok_or(
+            CodegenError::Unsupported("handle missing from the pre-pass"),
+        )?];
+        let tag = *self
+            .lc
+            .desc
+            .handler_tags
+            .get(&key)
+            .ok_or(CodegenError::Unsupported("handle has no descriptor row"))?;
+        let fns = self
+            .lc
+            .handler_fns
+            .get(&key)
+            .ok_or(CodegenError::Unsupported("handle has no functions"))?;
+        let (body_fn, ret_fn, table) = (fns.body, fns.ret, fns.table);
+        let k = if tail {
+            st.kont
+        } else {
+            self.site_frame(st, e, &[])?
+        };
+        let mut saved = Vec::with_capacity(h.saved.len());
+        for (sv, ty) in h.saved.iter() {
+            let Saved::Var { name, binding } = sv else {
+                return Err(internal("a handler frame saves bindings only"));
+            };
+            if matches!(ty, Ty::Var(_)) {
+                return Err(CodegenError::Unsupported(
+                    "saved value of unresolved type (N7)",
+                ));
+            }
+            let v = match st.binds.get(binding) {
+                Some((n, v)) if n == name => *v,
+                _ => return Err(CodegenError::Unsupported("handler binding is not in scope")),
+            };
+            saved.push((v, ty));
+        }
+        let i64t = self.i64t();
+        let roots = self.root_live(st, &[k.into()])?;
+        let p = self.alloc(HANDLER_SAVED + saved.len())?;
+        self.store_word(p, 0, i64t.const_int(tag as u64, false))?;
+        self.store_word(p, 1, self.fn_word(ret_fn)?)?;
+        let next = self.b.build_ptr_to_int(k, i64t, "nx").map_err(internal)?;
+        self.store_word(p, HF_NEXT, next)?;
+        let tw = self
+            .b
+            .build_ptr_to_int(table, i64t, "tw")
+            .map_err(internal)?;
+        self.store_word(p, HF_TABLE, tw)?;
+        let outer = self
+            .b
+            .build_load(self.ptrt(), self.lc.current_handler, "oh")
+            .map_err(internal)?
+            .into_pointer_value();
+        let ow = self
+            .b
+            .build_ptr_to_int(outer, i64t, "ow")
+            .map_err(internal)?;
+        self.store_word(p, HF_PARENT, ow)?;
+        for (j, (v, ty)) in saved.iter().enumerate() {
+            let w = value_to_word(self.b, *v, ty, i64t)?;
+            self.store_word(p, HANDLER_SAVED + j, w)?;
+        }
+        gc_unroot(self.b, self.lc, roots)?;
+        self.b
+            .build_store(self.lc.current_handler, p)
+            .map_err(internal)?;
+        self.pop_pending(st)?;
+        let call = self
+            .b
+            .build_call(body_fn, &[p.into()], "hb")
+            .map_err(internal)?;
+        self.tail_jump(call)
+    }
+
+    /// Slice 5b-10: `resume(v)` of a CPS handle's continuation, as a `musttail`
+    /// jump. The answering frame is re-installed AT the resume: its `next` is
+    /// this resume's continuation `k_after` (so the handled computation's
+    /// answer, and any later clause's, flows back here -- deep handlers) and
+    /// its `parent` the handler current here (so what the resumed computation
+    /// does not handle goes to the handlers around the resume).
+    fn resume_cps(
+        &self,
+        st: &mut St<'ctx>,
+        v: BasicValueEnum<'ctx>,
+        arg_ty: &Ty,
+        k_after: PointerValue<'ctx>,
+    ) -> R<()> {
+        let cont = st
+            .env
+            .get(crate::closure::CONT)
+            .copied()
+            .ok_or(CodegenError::Unsupported("resume outside a handler clause"))?
+            .into_pointer_value();
+        let (k, code, h, inner) = take_continuation(self, cont)?;
+        let i64t = self.i64t();
+        let aw = self
+            .b
+            .build_ptr_to_int(k_after, i64t, "ka")
+            .map_err(internal)?;
+        self.store_word(h, HF_NEXT, aw)?;
+        self.reparent(h)?;
+        self.b
+            .build_store(self.lc.current_handler, inner)
+            .map_err(internal)?;
+        let word = value_to_word(self.b, v, arg_ty, i64t)?;
+        self.pop_pending(st)?;
+        let code_ty = i64t.fn_type(&[i64t.into(), self.ptrt().into()], false);
+        let site = self
+            .b
+            .build_indirect_call(code_ty, code, &[word.into(), k.into()], "rj")
+            .map_err(internal)?;
+        self.tail_jump(site)
+    }
+
+    /// `h.parent = ` the current handler: a resumed handler sits inside the
+    /// handlers around its resume (5b-10).
+    fn reparent(&self, h: PointerValue<'ctx>) -> R<()> {
+        let cur = self
+            .b
+            .build_load(self.ptrt(), self.lc.current_handler, "rp")
+            .map_err(internal)?
+            .into_pointer_value();
+        let cw = self
+            .b
+            .build_ptr_to_int(cur, self.i64t(), "rpw")
+            .map_err(internal)?;
+        self.store_word(h, HF_PARENT, cw)
     }
 
     /// A tail call of an effectful function: pass the current continuation on.
@@ -1131,7 +1301,7 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
     /// Value position in a CPS region. `None`: control left this function at a
     /// continuation site (or a trap); the rest runs in a resumption function.
     fn expr(&self, st: &mut St<'ctx>, e: &CoreExpr) -> R<Option<BasicValueEnum<'ctx>>> {
-        if !contains_effect(e) {
+        if !contains_effect(e, self.lc.fx) {
             return Ok(Some(lower_expr(
                 self.ctx,
                 self.func,
@@ -1226,8 +1396,39 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                 };
                 self.match_dispatch(st, sv, s, arms, false)
             }
-            CoreKind::Resume(_) => {
-                Err(CodegenError::Unsupported("resume outside a handler clause"))
+            // 5b-10: a CPS resume is a site: the rest of the region is its
+            // continuation, and the answering handler's new `next`.
+            CoreKind::Resume(arg) if self.lc.fx.cps_resumes.contains(&key_of(e)) => {
+                let Some(v) = self.operand(st, arg)? else {
+                    return Ok(None);
+                };
+                let k = self.site_frame(st, e, &[v])?;
+                self.resume_cps(st, v, &arg.ty, k)?;
+                Ok(None)
+            }
+            // A direct resume whose argument suspends (a CPS lambda inside a
+            // direct handle's clause): evaluate it, then nest as usual.
+            CoreKind::Resume(arg) => {
+                let Some(v) = self.operand(st, arg)? else {
+                    return Ok(None);
+                };
+                let out = resume_nested(
+                    self.ctx,
+                    self.func,
+                    self.b,
+                    self.lc,
+                    e,
+                    v,
+                    &arg.ty,
+                    &mut st.env,
+                )?;
+                self.settle(st, before)?;
+                Ok(Some(out))
+            }
+            // 5b-10: a CPS handle in value position is a site.
+            CoreKind::Handle(_) => {
+                self.handle_cps(st, e, false)?;
+                Ok(None)
             }
             _ => Err(internal("an effect-free node reached the CPS fold")),
         }
@@ -1516,14 +1717,21 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                 };
                 self.branch_tail(st, cv, t, f)
             }
-            CoreKind::Match(s, arms) if contains_effect(e) => {
+            CoreKind::Match(s, arms) if contains_effect(e, self.lc.fx) => {
                 let Some(sv) = self.expr(st, s)? else {
                     return Ok(());
                 };
                 self.match_dispatch(st, sv, s, arms, true).map(|_| ())
             }
-            CoreKind::Resume(_) => {
-                Err(CodegenError::Unsupported("resume outside a handler clause"))
+            CoreKind::Resume(arg) if self.lc.fx.cps_resumes.contains(&key_of(e)) => {
+                let Some(v) = self.operand(st, arg)? else {
+                    return Ok(());
+                };
+                let k = st.kont;
+                self.resume_cps(st, v, &arg.ty, k)
+            }
+            CoreKind::Handle(_) if self.lc.fx.leaking.contains(&key_of(e)) => {
+                self.handle_cps(st, e, true)
             }
             _ => self.tail_value(st, e),
         }
@@ -1617,9 +1825,11 @@ pub(crate) fn emit_cps_lifted<'ctx>(
     cx.tail(&mut st, &site.body)
 }
 
-/// A `handle`, from a region that needs no CPS (D17): allocate the handler
+/// A DIRECT `handle` (one that leaks no effect, so nothing inside it performs
+/// past it -- 5b-10; before that, D17's only handle): allocate the handler
 /// frame, then call the body's function as an ordinary nested call. Its answer
-/// comes back through the return clause as a word.
+/// comes back through the return clause as a word. Since 5b-10 it may sit
+/// anywhere: inside another handle, a clause, or an effectful region.
 pub(crate) fn emit_handle_site<'ctx>(
     ctx: &'ctx Context,
     func: FunctionValue<'ctx>,
@@ -1629,6 +1839,9 @@ pub(crate) fn emit_handle_site<'ctx>(
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
 ) -> R<BasicValueEnum<'ctx>> {
     let key = e as *const CoreExpr as usize;
+    if lc.fx.leaking.contains(&key) {
+        return Err(CodegenError::Unsupported("effectful handle in direct code"));
+    }
     let h = &lc.handlers[*lc.handler_index.get(&key).ok_or(CodegenError::Unsupported(
         "handle missing from the pre-pass",
     ))?];
@@ -1645,16 +1858,26 @@ pub(crate) fn emit_handle_site<'ctx>(
     let cx = Cx { ctx, func, b, lc };
     let i64t = ctx.i64_type();
     let roots = gc_root_env(b, lc, env)?;
-    let p = cx.alloc(4 + h.saved.len())?;
+    let p = cx.alloc(HANDLER_SAVED + h.saved.len())?;
     cx.store_word(p, 0, i64t.const_int(tag as u64, false))?;
     cx.store_word(p, 1, cx.fn_word(ret_fn)?)?;
-    cx.store_word(p, 2, i64t.const_int(0, false))?;
+    cx.store_word(p, HF_NEXT, i64t.const_int(0, false))?;
     // Task 8: word 3 is the static clause table (not heap; its mask bit is
     // clear), so a perform can find this handle's clause for its op.
     let tw = b
         .build_ptr_to_int(fns.table, i64t, "tw")
         .map_err(internal)?;
-    cx.store_word(p, 3, tw)?;
+    cx.store_word(p, HF_TABLE, tw)?;
+    // 5b-10: word 4 is the handler current here, where a perform this
+    // handle does not answer goes next.
+    let ptrt = ctx.ptr_type(AddressSpace::default());
+    let outer = b
+        .build_load(ptrt, lc.current_handler, "oh")
+        .map_err(internal)?;
+    let ow = b
+        .build_ptr_to_int(outer.into_pointer_value(), i64t, "ow")
+        .map_err(internal)?;
+    cx.store_word(p, HF_PARENT, ow)?;
     for (j, (sv, ty)) in h.saved.iter().enumerate() {
         let Saved::Var { name, .. } = sv else {
             return Err(internal("a handler frame saves bindings only"));
@@ -1673,10 +1896,6 @@ pub(crate) fn emit_handle_site<'ctx>(
     gc_unroot(b, lc, roots)?;
     // This handle's frame is the current handler for its body; the previous
     // one is restored when the body's answer comes back.
-    let ptrt = ctx.ptr_type(AddressSpace::default());
-    let outer = b
-        .build_load(ptrt, lc.current_handler, "oh")
-        .map_err(internal)?;
     b.build_store(lc.current_handler, p).map_err(internal)?;
     let roots = gc_root_env(b, lc, env)?;
     let call = b.build_call(body_fn, &[p.into()], "hb").map_err(internal)?;
@@ -1699,8 +1918,14 @@ pub(crate) fn emit_handle_site<'ctx>(
 
 /// Where a site frame's saved values start: after `[tag][code][next]`.
 const SITE_SAVED: usize = 3;
-/// Where a handler frame's saved values start: after `[tag][code][next][table]`.
-const HANDLER_SAVED: usize = 4;
+/// A handler frame is `[tag][code][next][table][parent][saved..]` (5b-10 added
+/// `parent`): `next` is null for a direct handle and the handle's continuation
+/// for a CPS one; `parent` is where a perform this handle does not answer goes.
+const HF_NEXT: usize = 2;
+const HF_TABLE: usize = 3;
+const HF_PARENT: usize = 4;
+/// Where a handler frame's saved values start.
+const HANDLER_SAVED: usize = 5;
 
 /// Load a frame's saved values (words `first..`) into `st`.
 fn load_saved<'ctx>(
@@ -1786,6 +2011,24 @@ pub(crate) fn emit_sites_and_handlers<'ctx>(
             b,
             lc,
         };
+        if lc.fx.leaking.contains(&h.key) {
+            // 5b-10: a CPS handle's return clause is a CPS region. It runs
+            // OUTSIDE the handle (its parent current) and hands the handle's
+            // answer to the frame's `next`.
+            let mut st = enter_outside(&cx, hf, h)?;
+            let bound = word_to_value(b, v, &hd.body.ty, ctx.bool_type(), cx.ptrt())?;
+            match &hd.ret {
+                None => cx.cps_return(&mut st, bound, &hd.body.ty)?,
+                Some(r) => {
+                    let _ = st.bind(&r.binder, bound);
+                    cx.tail(&mut st, &r.body)?;
+                }
+            }
+            continue;
+        }
+        // A return clause runs OUTSIDE its handle (5b-10 review: a direct
+        // one ran with its own frame current).
+        set_current_to_parent(&cx, hf)?;
         let Some(r) = &hd.ret else {
             // No return clause: the identity, and the body's type is the
             // handle's, so the word passes straight through.
@@ -1804,6 +2047,38 @@ pub(crate) fn emit_sites_and_handlers<'ctx>(
         emit_clauses(ctx, b, lc, h)?;
     }
     Ok(())
+}
+
+/// Make the handler frame's `parent` current: a clause and a return clause run
+/// outside their handle (5b-10, the PARKED requirement).
+fn set_current_to_parent<'ctx>(cx: &Cx<'_, '_, 'ctx>, hf: PointerValue<'ctx>) -> R<()> {
+    let pw = cx.load_word(hf, HF_PARENT)?;
+    let parent =
+        cx.b.build_int_to_ptr(pw, cx.ptrt(), "par")
+            .map_err(internal)?;
+    cx.b.build_store(cx.lc.current_handler, parent)
+        .map_err(internal)?;
+    Ok(())
+}
+
+/// Enter a CPS handle's clause or return clause: its parent current, the
+/// frame's `next` as the region's continuation, and the frame's saved bindings
+/// at the binding indices the analysis gave them (below the handle's depth).
+fn enter_outside<'ctx>(
+    cx: &Cx<'_, '_, 'ctx>,
+    hf: PointerValue<'ctx>,
+    h: &HandlerSite,
+) -> R<St<'ctx>> {
+    set_current_to_parent(cx, hf)?;
+    let nw = cx.load_word(hf, HF_NEXT)?;
+    let kont =
+        cx.b.build_int_to_ptr(nw, cx.ptrt(), "hk")
+            .map_err(internal)?;
+    let mut st = St::new(kont);
+    load_saved(cx, &mut st, hf, &h.saved, HANDLER_SAVED)?;
+    st.depth = h.depth;
+    st.rebuild_env();
+    Ok(st)
 }
 
 /// The handler frame's saved bindings as a name environment, in binding
@@ -1835,9 +2110,10 @@ fn handler_env<'ctx>(
 }
 
 /// Task 8: one function per clause, `(op args.., ptr cont, ptr frame) -> i64`.
-/// A clause body is direct code (D17: nothing outside the handle can be
-/// captured, so it performs nothing unhandled); its answer is the handle's
-/// answer, returned as a word. `cont` is bound as the clause's continuation
+/// A DIRECT handle's clause body is direct code (it performs nothing: the
+/// handle leaks nothing); its answer is the handle's answer, returned as a
+/// word. A CPS handle's clause is a CPS region (5b-10). Either runs with the
+/// frame's `parent` current. `cont` is bound as the clause's continuation
 /// (`closure::CONT`), which `resume` -- and any lambda that captured it --
 /// reads.
 fn emit_clauses<'ctx>(
@@ -1853,6 +2129,7 @@ fn emit_clauses<'ctx>(
     let CoreKind::Handle(hd) = &node.kind else {
         return Err(internal("a handler key names a non-handle node"));
     };
+    let cps = lc.fx.leaking.contains(&h.key);
     for (c, &func) in hd.clauses.iter().zip(fns.clauses.iter()) {
         let entry = ctx.append_basic_block(func, "entry");
         b.position_at_end(entry);
@@ -1865,6 +2142,24 @@ fn emit_clauses<'ctx>(
             .get_nth_param(n + 1)
             .ok_or_else(|| internal("clause has no frame parameter"))?
             .into_pointer_value();
+        if cps {
+            // 5b-10: a CPS handle's clause is a CPS region whose continuation
+            // is the frame's `next` as of this perform -- the handle's own, or
+            // the remainder of an earlier clause that resumed.
+            let mut st = enter_outside(&cx, hf, h)?;
+            for (i, p) in c.params.iter().enumerate() {
+                let v = func
+                    .get_nth_param(i as u32)
+                    .ok_or_else(|| internal("declared clause arity disagrees with Core"))?;
+                let _ = st.bind(&p.name, v);
+            }
+            let _ = st.bind(crate::closure::CONT, cont);
+            cx.tail(&mut st, &c.body)?;
+            continue;
+        }
+        // A clause runs OUTSIDE its handle (5b-10): the frame's parent is
+        // current while it runs.
+        set_current_to_parent(&cx, hf)?;
         let mut env = handler_env(&cx, hf, h)?;
         for (i, p) in c.params.iter().enumerate() {
             let v = func
@@ -1907,7 +2202,8 @@ fn clause_tail<'ctx>(
             clause_tail(cx, f, answer, env)
         }
         CoreKind::Resume(arg) => {
-            let (word, k, code, handler) = resume_prologue(cx, e, arg, env)?;
+            let v = lower_expr(cx.ctx, cx.func, cx.b, cx.lc, arg, env)?;
+            let (word, k, code, handler) = resume_prologue(cx, v, &arg.ty, env)?;
             // The resumed computation performs to ITS handler.
             cx.b.build_store(cx.lc.current_handler, handler)
                 .map_err(internal)?;
@@ -1928,32 +2224,24 @@ fn clause_tail<'ctx>(
     }
 }
 
-/// The shared half of `resume(arg)`: lower the argument, enforce one-shot
-/// (D13: a second resume calls the named trap, never re-runs), mark the
-/// continuation consumed, and load its chain and code.
-fn resume_prologue<'ctx>(
+/// Every resume's first half: enforce one-shot (D13: a second resume calls the
+/// named trap, never re-runs), mark the continuation consumed (word 2, the
+/// answering frame, becomes 0) and load its chain `k`, `k`'s code, the
+/// answering frame `h` and the handler that was current at the perform.
+fn take_continuation<'ctx>(
     cx: &Cx<'_, '_, 'ctx>,
-    e: &CoreExpr,
-    arg: &CoreExpr,
-    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    cont: PointerValue<'ctx>,
 ) -> R<(
-    IntValue<'ctx>,
+    PointerValue<'ctx>,
     PointerValue<'ctx>,
     PointerValue<'ctx>,
     PointerValue<'ctx>,
 )> {
-    let _ = e;
-    let v = lower_expr(cx.ctx, cx.func, cx.b, cx.lc, arg, env)?;
-    let cont = env
-        .get(crate::closure::CONT)
-        .copied()
-        .ok_or(CodegenError::Unsupported("resume outside a handler clause"))?
-        .into_pointer_value();
-    let used = cx.load_word(cont, 2)?;
+    let hw = cx.load_word(cont, 2)?;
     let twice =
         cx.b.build_int_compare(
-            inkwell::IntPredicate::NE,
-            used,
+            inkwell::IntPredicate::EQ,
+            hw,
             cx.i64t().const_int(0, false),
             "used",
         )
@@ -1968,7 +2256,10 @@ fn resume_prologue<'ctx>(
     // `elya_resume_twice` exits; a placeholder terminator, NOT the trap.
     cx.b.build_unreachable().map_err(internal)?;
     cx.b.position_at_end(ok);
-    cx.store_word(cont, 2, cx.i64t().const_int(1, false))?;
+    cx.store_word(cont, 2, cx.i64t().const_int(0, false))?;
+    let h =
+        cx.b.build_int_to_ptr(hw, cx.ptrt(), "rhf")
+            .map_err(internal)?;
     let k = cx.load_word(cont, 1)?;
     let k =
         cx.b.build_int_to_ptr(k, cx.ptrt(), "rk")
@@ -1977,12 +2268,36 @@ fn resume_prologue<'ctx>(
     let code =
         cx.b.build_int_to_ptr(code, cx.ptrt(), "rc")
             .map_err(internal)?;
-    let hw = cx.load_word(cont, 3)?;
-    let handler =
-        cx.b.build_int_to_ptr(hw, cx.ptrt(), "rh")
+    let iw = cx.load_word(cont, 3)?;
+    let inner =
+        cx.b.build_int_to_ptr(iw, cx.ptrt(), "rh")
             .map_err(internal)?;
-    let word = value_to_word(cx.b, v, &arg.ty, cx.i64t())?;
-    Ok((word, k, code, handler))
+    Ok((k, code, h, inner))
+}
+
+/// The shared half of a DIRECT `resume(v)` (a handle that leaks nothing):
+/// take the continuation and re-parent its frame at this resume (5b-10). Its
+/// `next` stays null: a direct handle's answer returns natively.
+fn resume_prologue<'ctx>(
+    cx: &Cx<'_, '_, 'ctx>,
+    v: BasicValueEnum<'ctx>,
+    arg_ty: &Ty,
+    env: &HashMap<String, BasicValueEnum<'ctx>>,
+) -> R<(
+    IntValue<'ctx>,
+    PointerValue<'ctx>,
+    PointerValue<'ctx>,
+    PointerValue<'ctx>,
+)> {
+    let cont = env
+        .get(crate::closure::CONT)
+        .copied()
+        .ok_or(CodegenError::Unsupported("resume outside a handler clause"))?
+        .into_pointer_value();
+    let (k, code, h, inner) = take_continuation(cx, cont)?;
+    cx.reparent(h)?;
+    let word = value_to_word(cx.b, v, arg_ty, cx.i64t())?;
+    Ok((word, k, code, inner))
 }
 
 /// Task 8: `resume(arg)` in value position -- a native NESTING call of the
@@ -1998,8 +2313,29 @@ pub(crate) fn emit_resume_call<'ctx>(
     arg: &CoreExpr,
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
 ) -> R<BasicValueEnum<'ctx>> {
+    if lc.fx.cps_resumes.contains(&(e as *const CoreExpr as usize)) {
+        return Err(CodegenError::Unsupported(
+            "resume of an effectful handler in direct code",
+        ));
+    }
+    let v = lower_expr(ctx, func, b, lc, arg, env)?;
+    resume_nested(ctx, func, b, lc, e, v, &arg.ty, env)
+}
+
+/// A direct resume as a native nesting call, on an already-evaluated argument.
+#[allow(clippy::too_many_arguments)]
+fn resume_nested<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    e: &CoreExpr,
+    v: BasicValueEnum<'ctx>,
+    arg_ty: &Ty,
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+) -> R<BasicValueEnum<'ctx>> {
     let cx = Cx { ctx, func, b, lc };
-    let (word, k, code, handler) = resume_prologue(&cx, e, arg, env)?;
+    let (word, k, code, handler) = resume_prologue(&cx, v, arg_ty, env)?;
     let i64t = ctx.i64_type();
     let code_ty = i64t.fn_type(&[i64t.into(), cx.ptrt().into()], false);
     // The resumed computation performs to ITS handler; the caller's comes
@@ -2194,8 +2530,17 @@ fn emit_resume_fn<'ctx>(
                     }
                 }
             }
-            CoreKind::Resume(_) => {
-                return Err(CodegenError::Unsupported("resume outside a handler clause"))
+            // 5b-10: the hole is the resume's argument.
+            CoreKind::Resume(arg) => {
+                if lc.fx.cps_resumes.contains(&step.key) {
+                    let k = if tail_i {
+                        st.kont
+                    } else {
+                        cx.site_frame(&mut st, a, &[cur])?
+                    };
+                    return cx.resume_cps(&mut st, cur, &arg.ty, k);
+                }
+                cur = resume_nested(ctx, func, b, lc, a, cur, &arg.ty, &mut st.env)?;
             }
             _ => {
                 return Err(internal(

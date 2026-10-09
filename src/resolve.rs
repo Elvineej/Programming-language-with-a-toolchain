@@ -35,6 +35,9 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
     // declaration is E0202 rather than a silent overwrite.
     let mut op_effect: HashMap<String, String> = HashMap::new();
     let mut op_arity: HashMap<String, usize> = HashMap::new();
+    // E0207: each effect's operations, in declaration order, with their
+    // declared parameter names (for the clauses the help suggests).
+    let mut effect_ops: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
     let mut dup_ops: HashSet<String> = HashSet::new();
     let mut effect_names: HashSet<String> = HashSet::new();
     let mut dup_diags: Vec<Diagnostic> = Vec::new();
@@ -65,6 +68,10 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
                     } else {
                         op_effect.insert(name.clone(), e.name.clone());
                         op_arity.insert(name.clone(), op.node.param_tys.len());
+                        effect_ops.entry(e.name.clone()).or_default().push((
+                            name.clone(),
+                            op.node.params.iter().map(|p| p.node.name.clone()).collect(),
+                        ));
                     }
                     op_names.insert(name.clone());
                 }
@@ -102,6 +109,7 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
         ctors: &ctor_names,
         op_effect: &op_effect,
         op_arity: &op_arity,
+        effect_ops: &effect_ops,
         dup_ops: &dup_ops,
         effects: &effect_names,
         in_handler: 0,
@@ -133,6 +141,8 @@ struct Cx<'a> {
     op_effect: &'a HashMap<String, String>,
     /// Op name -> its parameter count; a clause must bind exactly that many.
     op_arity: &'a HashMap<String, usize>,
+    /// Effect -> its operations in declaration order, with parameter names.
+    effect_ops: &'a HashMap<String, Vec<(String, Vec<String>)>>,
     /// Op names already reported E0202: a clause on one is not checked again
     /// (its owner is ambiguous, so any E0203 there would be noise or false).
     dup_ops: &'a HashSet<String>,
@@ -192,6 +202,60 @@ impl Cx<'_> {
         }
         self.diags.push(d);
         true
+    }
+
+    /// E0207 (the maintainer's decision, 2026-10-08): a handler must give a
+    /// clause for EVERY operation of the effect it handles. A partial handler
+    /// checked clean and was typed as discharging the whole effect, while at
+    /// run time the uncovered operations went to an outer handler -- or to no
+    /// handler at all ("unhandled effect reached the machine"). An op some
+    /// clause already names (even a malformed clause, E0203) is not reported
+    /// again here.
+    fn check_handler_covers_its_effect(&mut self, handler: &crate::ast::Handler, span: Span) {
+        let named: HashSet<&str> = handler.clauses.iter().map(|c| c.node.op.as_str()).collect();
+        // The effect the clauses handle. A clause on a duplicated op (E0202)
+        // has no owner to credit; clauses spanning two effects are E0423 (the
+        // type checker's single-effect rule), and "add the missing clauses"
+        // would only lead there -- so no E0207 for those (the review).
+        let mut effects: Vec<&String> = handler
+            .clauses
+            .iter()
+            .filter(|c| !self.dup_ops.contains(&c.node.op))
+            .filter_map(|c| self.op_effect.get(&c.node.op))
+            .collect();
+        effects.sort();
+        effects.dedup();
+        let [eff] = effects.as_slice() else {
+            return;
+        };
+        let Some(ops) = self.effect_ops.get(*eff) else {
+            return;
+        };
+        let missing: Vec<&(String, Vec<String>)> = ops
+            .iter()
+            .filter(|(op, _)| !named.contains(op.as_str()) && !self.dup_ops.contains(op))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let list = missing
+            .iter()
+            .map(|(op, _)| format!("`{op}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let stubs = missing
+            .iter()
+            .map(|(op, ps)| format!("`{eff}.{op}({}) -> …`", ps.join(", ")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.diags.push(
+            Diagnostic::error(
+                "E0207",
+                format!("this handler does not cover every operation of `{eff}`"),
+            )
+            .with_label(span, format!("no clause for {list}"))
+            .with_help(format!("a handler handles its whole effect: add {stubs}")),
+        );
     }
 
     /// E0200: the name must resolve to a local, function, operation or
@@ -266,11 +330,12 @@ impl Cx<'_> {
                 if self.ops.contains(name) && !local && !self.fns.contains(name) {
                     // The wrapper passes the op's own arguments through.
                     let n = self.op_arity.get(name).copied().unwrap_or(0);
+                    // a, b, … z, then a26, a27, … (from_u32 never fails here,
+                    // so the old fallback produced `{`, `|`, `}` past z).
                     let ps: Vec<String> = (0..n)
-                        .map(|i| {
-                            char::from_u32('a' as u32 + i as u32)
-                                .map(String::from)
-                                .unwrap_or_else(|| format!("a{i}"))
+                        .map(|i| match char::from_u32('a' as u32 + i as u32) {
+                            Some(c) if i < 26 => c.to_string(),
+                            _ => format!("a{i}"),
                         })
                         .collect();
                     let ps = ps.join(", ");
@@ -364,6 +429,7 @@ impl Cx<'_> {
                     scope.pop();
                 }
                 self.in_handler -= 1;
+                self.check_handler_covers_its_effect(handler, span);
                 if let Some(ret) = &handler.ret {
                     // The return clause runs after the computation completes;
                     // `resume` is not in scope there.

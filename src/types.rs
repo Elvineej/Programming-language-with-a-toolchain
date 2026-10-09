@@ -147,12 +147,31 @@ struct OpInfo {
 pub struct Infer {
     subst: Vec<Option<Ty>>,
     row_subst: Vec<Option<EffectRow>>,
+    /// Sub-effecting (2026-10-08): the row variables that only say "this
+    /// function VALUE may be used where more effects are allowed" -- the fresh
+    /// tails `open_covariant` and lambda literals add. A call closes such a
+    /// tail (the callee performs at most its labels); unified with a
+    /// meaningful row variable, a tail stops being phantom; one still unbound
+    /// when its SCC group is done is closed.
+    phantom: HashSet<RowVar>,
+    /// Sub-effecting: `(callee tail, ambient)` -- a call whose callee row ends
+    /// in a phantom tail performs at most what that tail becomes, so the
+    /// ambient must INCLUDE it. Recorded instead of unified (unifying made the
+    /// callee's row equal to the caller's), and flushed -- labels only -- before
+    /// a lambda's ambient closes and when the group is done.
+    pending_incl: Vec<(RowVar, RowVar, Span)>,
+    /// The parameter types in scope (function, lambda and clause parameters):
+    /// a callee tail shared with one is a RELAY and is unified, never treated
+    /// as an upcast -- generalization needs the shared variable.
+    param_tys: Vec<Ty>,
     /// Operation name -> its elaborated signature. Populated from `effect`
     /// declarations before inference; a call to one of these is a *perform*.
     ops: HashMap<String, OpInfo>,
-    /// Stack of `(B, R)` for the handler clause currently being typed: `resume`
-    /// takes the operation's result type `B` and yields the handle's result `R`.
-    resume_stack: Vec<(Ty, Ty)>,
+    /// Stack of `(B, R, ε)` for the handler clause currently being typed:
+    /// `resume` takes the operation's result type `B`, yields the handle's
+    /// result `R`, and performs `ε` -- the handled body's effects minus the
+    /// handled one, which the resumed computation may still perform.
+    resume_stack: Vec<(Ty, Ty, EffectRow, Option<String>)>,
     /// Constructor name -> arity. An n-ary constructor used unapplied or
     /// partially applied is `E0433` (unapplied constructors need 4b's closures).
     ctor_arity: HashMap<String, usize>,
@@ -179,6 +198,9 @@ impl Infer {
             row_subst: Vec::new(),
             ops: HashMap::new(),
             resume_stack: Vec::new(),
+            phantom: HashSet::new(),
+            pending_incl: Vec::new(),
+            param_tys: Vec::new(),
             ctor_arity: HashMap::new(),
             effect_multi: HashMap::new(),
             linear_types: HashSet::new(),
@@ -424,6 +446,10 @@ impl Infer {
         match tail {
             RowTail::Open(v) => {
                 let fresh = self.fresh_row();
+                // What remains of a phantom tail is still phantom.
+                if self.phantom.contains(v) {
+                    self.phantom.insert(fresh);
+                }
                 let labels: BTreeMap<String, EffectLabel> = extra.iter().cloned().collect();
                 self.bind_row(
                     *v,
@@ -474,7 +500,63 @@ impl Infer {
             });
             return;
         }
+        // A meaningful variable bound to `{.. | w}` hands its meaning to `w`.
+        if !self.phantom.contains(&v) {
+            if let RowTail::Open(w) = resolved.tail {
+                self.phantom.remove(&w);
+            }
+        }
         self.row_subst[v as usize] = Some(resolved);
+    }
+
+    /// Add each pending callee tail's CURRENT labels to its ambient, to a
+    /// fixpoint (a label can travel through several inclusions). A label that
+    /// meets an ambient already closed is a surfaced conflict, never dropped.
+    fn flush_inclusions(&mut self) {
+        loop {
+            let mut changed = false;
+            for (src, dst, span) in self.pending_incl.clone() {
+                let have = self.resolve_row(&EffectRow::open(dst));
+                let want = self.resolve_row(&EffectRow::open(src));
+                // A recorded tail that has since become MEANINGFUL (it aliased
+                // a real row variable, e.g. a parameter's) is a relay after
+                // all: the ambient must take whatever that row takes later,
+                // which labels alone cannot say (the sub-effecting review's
+                // F1: `f` was typed pure though it calls its parameter `k`).
+                if let RowTail::Open(w) = want.tail {
+                    if !self.phantom.contains(&w) && have.tail != RowTail::Open(w) {
+                        let r = self.unify_row(&EffectRow::open(dst), &EffectRow::open(w), span);
+                        if r.is_ok() {
+                            changed = true;
+                        }
+                        self.surface_conflict(r);
+                    }
+                }
+                for (label, l) in want.labels.iter() {
+                    if have.labels.contains_key(label) {
+                        continue;
+                    }
+                    let r = self.add_effect(dst, label, l.args.clone(), span);
+                    // Only a label that got in can carry further; a conflict
+                    // is reported once and the pair dropped (no retry loop).
+                    if r.is_ok() {
+                        changed = true;
+                    } else {
+                        self.pending_incl.retain(|p| *p != (src, dst, span));
+                    }
+                    self.surface_conflict(r);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn fresh_phantom_row(&mut self) -> RowVar {
+        let v = self.fresh_row();
+        self.phantom.insert(v);
+        v
     }
 
     /// Force `op ∈ amb`: unify the ambient with `{op@span} | Open(fresh)`, which
@@ -555,6 +637,41 @@ impl Infer {
             self.unify_row(&EffectRow::open(amb), &EffectRow::open(rho), span)?;
         }
         Ok(())
+    }
+
+    /// Sub-effecting (2026-10-08): open every CLOSED row in a covariant
+    /// position of `t` -- a function's own row, and rows in its result -- to a
+    /// fresh tail. Parameter rows are contravariant and stay as they are
+    /// (opening one would let an effectful argument into a pure parameter).
+    fn open_covariant(&mut self, t: &Ty) -> Ty {
+        match self.resolve(t) {
+            Ty::Fn(ps, row, r) => {
+                let mut row = self.resolve_row(&row);
+                if row.tail == RowTail::Closed {
+                    row.tail = RowTail::Open(self.fresh_phantom_row());
+                }
+                let r = self.open_covariant(&r);
+                Ty::Fn(ps, row, Box::new(r))
+            }
+            other => other,
+        }
+    }
+
+    /// A row conflict on the way INTO an ambient -- a perform, a call or a
+    /// handle's residual meeting a row that was already closed -- used to be
+    /// discarded, so the effect vanished from the type (found by the
+    /// resume-row review). Report it instead.
+    fn surface_conflict(&mut self, r: Result<(), RowConflict>) {
+        if let Err(c) = r {
+            let mut differ = c.only1.clone();
+            differ.extend(c.only2.iter().cloned());
+            let span = differ.first().map(|(_, s)| *s).unwrap_or(Span::EMPTY);
+            self.emit_row_mismatch(
+                &differ,
+                span,
+                "this effect reaches a row that was already closed",
+            );
+        }
     }
 
     /// Emit `E0423` naming the exact set of labels two rows differ by. Rows are
@@ -806,8 +923,15 @@ impl Infer {
             return s.ty.clone();
         }
         let mapping: HashMap<u32, Ty> = s.vars.iter().map(|v| (*v, self.fresh())).collect();
-        let row_mapping: HashMap<RowVar, RowVar> =
-            s.row_vars.iter().map(|v| (*v, self.fresh_row())).collect();
+        let mut row_mapping: HashMap<RowVar, RowVar> = HashMap::new();
+        for v in &s.row_vars {
+            let fresh = if self.phantom.contains(v) {
+                self.fresh_phantom_row()
+            } else {
+                self.fresh_row()
+            };
+            row_mapping.insert(*v, fresh);
+        }
         subst_vars(&s.ty, &mapping, &row_mapping)
     }
 
@@ -899,7 +1023,11 @@ impl Infer {
                 match env.lookup(name) {
                     Some(s) => {
                         let s = s.clone();
-                        self.instantiate(&s)
+                        let t = self.instantiate(&s);
+                        // Sub-effecting at a VALUE use (a call's callee is typed
+                        // in `infer_call`, unopened): a closed row in a covariant
+                        // position opens to a fresh tail.
+                        self.open_covariant(&t)
                     }
                     None => Ty::Error, // unresolved names are E0200 from resolution
                 }
@@ -945,11 +1073,36 @@ impl Infer {
             Expr::Resume { arg } => {
                 let arg_ty = self.infer_expr(arg, env, amb);
                 match self.resume_stack.last().cloned() {
-                    Some((b, r)) => {
-                        // resume : (B) -> R — takes the operation's result, yields
-                        // the handle's result. Its latent effect is the clause's
-                        // ambient, already threaded, so nothing new is added here.
+                    Some((b, r, eff, handled)) => {
+                        // resume : (B) / ε -> R — takes the operation's result,
+                        // yields the handle's result, and runs the rest of the
+                        // handled body, which may still perform ε. Directly in
+                        // the clause ε is already in the ambient (the handle
+                        // discharges into it); inside a LAMBDA in the clause it
+                        // is not, and leaving it out typed such a lambda pure
+                        // (found by slice 5b-10: an escaped resume performed an
+                        // effect nothing handled, on a program `check` passed).
+                        //
+                        // LABELS only, never the tail: `add_row` unifies tails,
+                        // which made this site's ambient EQUAL to the body's tail
+                        // and merged rows related only by inclusion (the review of
+                        // the first version: a direct resume tied the enclosing
+                        // function's row to a lambda that then closed it, and a
+                        // later effect was dropped -- a new hole). The body's
+                        // labels are re-read here, so ones it gained since the
+                        // clauses began are included; an effect the body only
+                        // RELAYS through an open row is not (PARKED).
                         self.unify(&arg_ty, &b, span);
+                        let now = self.resolve_row(&eff);
+                        for (label, l) in now.labels.iter() {
+                            if handled.as_deref() == Some(label.as_str()) {
+                                continue;
+                            }
+                            {
+                                let r = self.add_effect(amb, label, l.args.clone(), l.span);
+                                self.surface_conflict(r);
+                            }
+                        }
                         r
                     }
                     // resume outside a handler is E0210 at resolve time.
@@ -1005,14 +1158,28 @@ impl Infer {
                 // is NOT added to the enclosing `amb`; only *calling* it pours the
                 // row in (infer_call). This mirrors top-level fn typing (spec §2.1).
                 let lam_amb = self.fresh_row();
+                let mark = self.param_tys.len();
+                self.param_tys.extend(param_tys.iter().cloned());
                 let body_ty = self.infer_block(&body.node, env, lam_amb);
+                self.param_tys.truncate(mark);
                 env.pop();
                 // Fork A (4b-2 §2): close the lambda's residual tail unless it is
                 // relayed through a parameter — the same discipline top-level fns
                 // use. A concrete-effect lambda gets a minimal closed row (`{Log}`);
                 // a relay lambda keeps its open, row-polymorphic tail.
+                // Pending sub-effecting inclusions reach this ambient before it
+                // closes (a label arriving later is a surfaced conflict).
+                self.flush_inclusions();
                 self.close_unrelayed_residual(lam_amb, &param_tys);
-                let row = self.resolve_row(&EffectRow::open(lam_amb));
+                // Sub-effecting (the maintainer's decision, 2026-10-08): the
+                // VALUE's row is open even when the body's is closed -- a
+                // function that performs ε may stand where ε ∪ ρ is expected.
+                // The body's own ambient stays closed (nothing leaks in); only
+                // the type gains a fresh tail, the row-polymorphic upcast.
+                let mut row = self.resolve_row(&EffectRow::open(lam_amb));
+                if row.tail == RowTail::Closed {
+                    row.tail = RowTail::Open(self.fresh_phantom_row());
+                }
                 Ty::Fn(param_tys, row, Box::new(body_ty))
             }
         }
@@ -1097,7 +1264,10 @@ impl Infer {
                 let want = Ty::Fn(vec![Ty::str()], EffectRow::pure(), Box::new(Ty::unit()));
                 let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::unit()));
                 self.unify(&want, &got, span);
-                let _ = self.add_effect(amb, "IO", Vec::new(), span); // io.println performs {IO}
+                {
+                    let r = self.add_effect(amb, "IO", Vec::new(), span);
+                    self.surface_conflict(r);
+                } // io.println performs {IO}
                 let mut io_labels = BTreeMap::new();
                 io_labels.insert(
                     "IO".to_string(),
@@ -1185,20 +1355,59 @@ impl Infer {
                 let want = Ty::Fn(op_params, EffectRow::pure(), Box::new(op_ret.clone()));
                 let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(op_ret.clone()));
                 self.unify(&want, &got, span);
-                let _ = self.add_effect(amb, &op.effect, eff_args, span);
+                {
+                    let r = self.add_effect(amb, &op.effect, eff_args, span);
+                    self.surface_conflict(r);
+                }
                 return op_ret;
             }
         }
         // Ordinary function call: unify the arrow's param/result types, then pour
         // the callee's latent effect row into the ambient (`amb ⊇ ε_f`).
-        let f = self.infer_expr(callee, env, amb);
+        let f = match &callee.node {
+            // A callee is not a value use: no sub-effecting opening (the call
+            // pours exactly the callee's row into the ambient).
+            Expr::Var(name) => match env.lookup(name) {
+                Some(s) => {
+                    let s = s.clone();
+                    let t = self.instantiate(&s);
+                    self.node_types.insert(callee.span, t.clone());
+                    t
+                }
+                None => Ty::Error,
+            },
+            _ => self.infer_expr(callee, env, amb),
+        };
         let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
         let result = self.fresh();
-        let call_row = self.fresh_row();
+        // Phantom until the callee gives it meaning: unified with a meaningful
+        // row (a relay, an in-progress row) it stops being phantom
+        // (`bind_row`); unified only with the callee's upcast tail, it stays
+        // phantom and is closed below.
+        let call_row = self.fresh_phantom_row();
         let expected = Ty::Fn(arg_ts, EffectRow::open(call_row), Box::new(result.clone()));
         self.unify(&f, &expected, span);
-        let eff = self.resolve_row(&EffectRow::open(call_row));
-        let _ = self.add_row(amb, &eff, span);
+        let mut eff = self.resolve_row(&EffectRow::open(call_row));
+        // Sub-effecting: a PHANTOM callee tail (an upcast, see `phantom`) that
+        // nothing in the environment shares is not unified with the ambient --
+        // that would make this use's row EQUAL to the caller's and merge rows
+        // related only by inclusion. The ambient must include whatever the tail
+        // becomes: recorded in `pending_incl`, flushed later. A meaningful tail
+        // (a RELAY through a parameter, an in-progress row) is unified as before.
+        if let RowTail::Open(v) = eff.tail {
+            let mut in_params = Vec::new();
+            for p in self.param_tys.clone() {
+                free_row_vars(self, &p, &mut in_params);
+            }
+            if self.phantom.contains(&v) && !in_params.contains(&v) {
+                self.pending_incl.push((v, amb, span));
+                eff.tail = RowTail::Closed;
+            }
+        }
+        {
+            let r = self.add_row(amb, &eff, span);
+            self.surface_conflict(r);
+        }
         result
     }
 
@@ -1251,12 +1460,23 @@ impl Infer {
         // `e` may perform E plus a polymorphic remainder.
         let amb_in = self.fresh_row();
         if let Some(e) = &effect {
-            let _ = self.add_effect(amb_in, e, eff_args.clone(), span);
+            {
+                let r = self.add_effect(amb_in, e, eff_args.clone(), span);
+                self.surface_conflict(r);
+            }
         }
         let body_ty = self.infer_expr(body, env, amb_in);
 
         // R — the handle's result type, shared by every clause and `return`.
         let result = self.fresh();
+        // ε — what a `resume` in a clause may still perform: the body's effects
+        // minus the handled one (the resumed handler handles that one again).
+        // Its tail is the body's row variable, so effects the body's row gains
+        // later reach every resume too.
+        let mut resume_eff = self.resolve_row(&EffectRow::open(amb_in));
+        if let Some(e) = &effect {
+            resume_eff.labels.remove(e);
+        }
         for c in &handler.clauses {
             let clause = &c.node;
             let (params, b) = match self.ops.get(&clause.op).cloned() {
@@ -1300,8 +1520,12 @@ impl Infer {
             }
             // The clause body runs at the handler's *outer* ambient; `resume`
             // there takes B and yields R.
-            self.resume_stack.push((b, result.clone()));
+            self.resume_stack
+                .push((b, result.clone(), resume_eff.clone(), effect.clone()));
+            let mark = self.param_tys.len();
+            self.param_tys.extend(params.iter().cloned());
             let clause_ty = self.infer_expr(&clause.body, env, amb);
+            self.param_tys.truncate(mark);
             self.unify(&clause_ty, &result, clause.body.span);
             self.resume_stack.pop();
             env.pop();
@@ -1358,7 +1582,10 @@ impl Infer {
         if let Some(e) = &effect {
             residual.labels.remove(e);
         }
-        let _ = self.add_row(amb, &residual, span);
+        {
+            let r = self.add_row(amb, &residual, span);
+            self.surface_conflict(r);
+        }
         result
     }
 
@@ -1960,10 +2187,32 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                     },
                 );
             }
+            inf.param_tys = params.clone();
             let body_ty = inf.infer_block(&f.body.node, &mut env, amb_f);
+            inf.param_tys.clear();
             inf.unify(&body_ty, &result, f.body.span);
             env.pop();
         }
+        // 2.4. Sub-effecting: every pending inclusion reaches its ambient
+        //      before anything closes. A recorded tail that is now free in a
+        //      member's PARAMETER types is a relay: it stops being phantom (the
+        //      review's F2 -- closing it at 2.7 forced every `k` pure).
+        {
+            let mut in_params = Vec::new();
+            for &i in group {
+                for p in &member_ty[&i].0 {
+                    free_row_vars(&inf, p, &mut in_params);
+                }
+            }
+            for (src, _, _) in inf.pending_incl.clone() {
+                if let RowTail::Open(w) = inf.resolve_row(&EffectRow::open(src)).tail {
+                    if in_params.contains(&w) {
+                        inf.phantom.remove(&w);
+                    }
+                }
+            }
+        }
+        inf.flush_inclusions();
         // 2.5. close each member's residual ambient (once all in-group effects
         //      are accumulated), unless it is relayed through a parameter.
         for &i in group {
@@ -1981,6 +2230,17 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                 inf.check_main_discharge(amb_f);
             }
         }
+        // 2.7. Sub-effecting: the group is solved; an upcast tail nothing bound
+        //      is closed (Koka's close-at-generalization; value uses re-open).
+        inf.flush_inclusions();
+        inf.pending_incl.clear();
+        let pending: Vec<RowVar> = inf.phantom.iter().copied().collect();
+        for v in pending {
+            if inf.row_subst[v as usize].is_none() {
+                inf.bind_row(v, &EffectRow::pure(), Span::EMPTY);
+            }
+        }
+        inf.phantom.clear();
         // 3. generalize each member and re-insert its polytype for later groups.
         for &i in group {
             let f = fns[i];
@@ -2458,6 +2718,24 @@ mod tests {
             );
         }
         EffectRow { labels: m, tail }
+    }
+
+    #[test]
+    fn an_effect_reaching_a_closed_row_is_reported_not_dropped() {
+        // The row-soundness sweep: every perform/call/discharge site used to
+        // discard this conflict, and the effect vanished from the type. The
+        // helper on its own; `tests/row_soundness.rs` has the programs.
+        let mut inf = Infer::new();
+        let amb = inf.fresh_row();
+        inf.bind_row(amb, &EffectRow::pure(), Span::EMPTY);
+        let r = inf.add_effect(amb, "Log", Vec::new(), Span::EMPTY);
+        assert!(r.is_err(), "a closed row cannot absorb Log");
+        inf.surface_conflict(r);
+        assert!(
+            inf.diags.iter().any(|d| d.code == "E0423"),
+            "the conflict must be a diagnostic: {:?}",
+            inf.diags
+        );
     }
 
     #[test]

@@ -199,7 +199,14 @@ collections at 400k (0.7 s), 183 at 1M (6.8 s, live 4M words). Fix in the alloca
 last collection exceeds max(64K, live)). Needs its own step: it changes when collections
 happen, which several GC tests calibrate against.
 
-## `elya_current_handler` depends on today's handle refusals (review of the lookup fix, 2026-10-03)
+## RESOLVED (slice 5b-10, 2026-10-08): `elya_current_handler` depends on today's handle refusals (review of the lookup fix, 2026-10-03)
+
+D17 is lifted. Every clause and return clause runs with its frame's new `parent` word
+current; a perform walks `parent`s to the frame with a clause; a resume re-installs its
+frame (`parent`, and `next` for a CPS handle) at the resume. The tail-resume install in
+`clause_tail` is now load-bearing and isolated: control K5 fails five `NESTED_HANDLES`
+rows. Original:
+
 
 The global equals "the handler at the end of k's chain" because clauses never perform (D17:
 no handle inside a handle or inside an effectful function). When those refusals are lifted, a
@@ -247,3 +254,106 @@ ops were declined. Original:
 the bare `ping` as `Ty::Error` silently -- and `elya run` ends in E0300 "unbound variable
 `ping`". Pre-existing; 5c-2's non-goal. Decide: reject a bare op reference (an error), or
 make an op a first-class value (an eta-expanded perform).
+
+## PARTLY RESOLVED (branch `claude/resume-row`, 2026-10-08): `resume` is typed effect-free -- an escaped resume can perform an unhandled effect (found by slice 5b-10)
+
+`resume` now adds the handled body's labels (minus the handled effect) to the ambient at
+the resume site (`tests/resume_row.rs`); the program below is E0420 and m10's
+T-carrying variant compiles natively. Still open, same family (found by the review,
+`check` clean, evaluator "unhandled effect `t`"): the RETURN clause's effects and those of
+clauses the resumed body re-enters are not in resume's row --
+`return(x) -> { let y = t()  fn(s) { x + y } }`, and a clause `{ let y = t()  fn(s) {
+(resume(s + y))(s) } }` over `get() + get()`; nor are effects the body only relays through
+an open row. Including them needs the clause rows before the clauses are typed (a second
+pass, or a row variable shared without merging). Original:
+
+
+**Soundness.** `check` accepts this, and the evaluator stops with "internal: unhandled
+effect `t` reached the machine":
+
+```
+effect S { fn get() -> Int }
+effect T { fn t() -> Int }
+pub fn main() -> Int {
+  let f = handle {
+    handle { get() + t() } with { S.get() -> fn(s) { (resume(s))(s) }  return(x) -> fn(s) { x } }
+  } with { T.t() -> resume(10)  return(r) -> r }
+  f(5)
+}
+```
+
+The lambda `fn(s) { (resume(s))(s) }` is typed `fn(Int) -> Int` with an EMPTY row
+(measured on its Core node), but calling it runs the rest of the handled body, which
+performs T -- here after T's handler has returned. Under deep handlers `resume` should
+carry the handle's outer row (the effects the resumed computation may still perform).
+Natively the same shape is refused by name ("resume of an effectful handler in direct
+code", pinned by `an_escaped_resume_of_a_leaking_handle_is_refused_by_name`); once the
+row is carried, that program (m10 in the 5b-10 spec) should compile.
+
+## Front end: recursion through a handle body is rejected (found by slice 5b-10, 2026-10-08)
+
+`fn nest(n: Int) / {T} -> Int { if n == 0 { t() } else { handle { nest(n - 1) + get() }
+with { S.get() -> resume(1)  return(r) -> r } } }` is E0423 ("the rows differ by exactly:
+{S}") and E0420; unannotated, or split into `nest`/`wrap`, it is E0420. The evaluator runs
+it (1000). The handle discharges S, so S should not reach `nest`'s row; recursion inside
+the SCC seems to unify the row before the handle subtracts S. It also blocks the native
+test of deep dynamic handler nesting (the perform walk over many `parent`s).
+
+## RESOLVED (branch `claude/partial-handlers`, 2026-10-09): a handle with clauses for only some of its effect's ops checks clean (found by the 5b-10 review, 2026-10-08)
+
+The maintainer chose the error: `E0207`, "this handler does not cover every operation of
+`S`", with the clauses to add (`tests/handler_coverage.rs`). `cps::Fx` keeps treating a
+partial handle as leaking, as defence in depth (unit test
+`a_partial_handle_leaks_the_ops_it_does_not_cover`). Original:
+
+
+The front end types such a handle as discharging the whole effect, so `fn f() -> Int {
+handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 } }` is typed
+pure; called from `main` with no other handler, `check` is clean and the evaluator stops
+with "internal: unhandled effect `put` reached the machine". With an outer handler for
+`put` the evaluator forwards it there (1226). Natively such a handle now LEAKS the effect
+(`cps::effect_facts` counts an effect handled only when every op the module performs has
+a clause), so it compiles as a CPS handle where its region is effectful and is refused by
+name where the types call it pure. Language question for the maintainer: require a clause
+for every op (an error), or keep forwarding and put the unhandled ops in the handle's row.
+
+## Front end: further soundness gaps found by the resume-row review (2026-10-08)
+
+- **RESOLVED (branch `claude/row-conflicts`, 2026-10-08): effects silently dropped on a
+  closed row** -- now E0423 "this effect reaches a row that was already closed"
+  (`tests/row_soundness.rs`). The cost: programs that checked clean ONLY by dropping the
+  effect are rejected, including ones the evaluator runs under a handler (the recursive
+  `go` below, 64). Accepting them soundly needs row subsumption (see the next entry).
+  Original: `add_effect`/`add_row` return a
+  `RowConflict` when the ambient is already closed, and the perform and call paths discard
+  it (`let _ = ...`). `fn go(n) { let f = fn(s) { s + (if n == 0 { 0 } else { go(n - 1) })
+  }  f(1) + lg(n) }` is typed `fn(Int) -> Int`: the lambda calls the enclosing recursive
+  `go`, its closing step closes `go`'s row early, and the later `lg` is dropped; `main`
+  calls it unhandled, `check` is clean, the evaluator stops on unhandled `lg`. Moving `lg`
+  before the lambda gives E0420. Surfacing the conflict as a diagnostic is the first step.
+- **Type annotations are ignored -- all of them.** The parser's `skip_type_annotation`
+  ("Slice 1 has no type checker") discards parameter, return and `let` types:
+  `let s: String = 1` and `fn f(x: Int) -> String { x }` check clean. Only effect rows
+  (`/ {..}`) are checked. Checking them is a language decision (the annotation syntax for
+  function types and type variables, and their scoping): ask the maintainer.
+- **An open-row function value called inside a handle body** gets the handled effect forced
+  into its row and is rejected (the evaluator prints 12) -- likely the same root as
+  "recursion through a handle body".
+
+## Language question: effect rows unify by equality -- sub-effecting? (row-soundness sweep, 2026-10-08)
+
+Rows of function values, `if` branches and clause values unify by EQUALITY (spec 3.6: no
+sub-effecting), and a call pours the callee's row into the caller by unifying tails. So a
+pure lambda joined to an effectful one closes a row early, and since the sweep the later
+effect is a named E0423 rather than silently dropped. Programs the evaluator runs that
+are now rejected for this reason: the recursive `go` under a handler
+(`tests/row_soundness.rs`), m10 of the 5b-10 spec (clause values `{T}` vs pure), a
+handler's `return(x) -> fn(s) { x }` beside an effectful clause value, `if c { fn(s) { s }
+} else { fn(s) { s + go(n - 1) } }`. A tried fix (leave a lambda's tail open when it is free
+in the environment) accepted some and rejected others base accepted soundly -- a handled
+effect leaking into a recursive function's row, and a forwarding lambda forcing its
+function's own effect onto the forwarded parameter (`w(k) { let f = fn(s) { k(s) }  f(1)
++ lg(1) }`) -- so it was reverted. Options: (a) keep equality (sound, strict); (b)
+sub-effecting at function-value joins (a pure function usable where `{T}` is expected);
+(c) full row-constraint inference. Ask the maintainer before any of (b)/(c).
+

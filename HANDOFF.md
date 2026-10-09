@@ -3,26 +3,31 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-05, 16:00)
+## State at handoff (updated 2026-10-09)
 
-- `main` has slices 5b-8, 5c-1..3, 5b-9a (effectful `match`, native), the PolyForm Strict
-  license and this file. **`main` fails ONE test on Windows** (see step 1); Linux is green.
+- `main` has everything through #15 (5b-9b). The stacked PRs #16-#19 were merged into
+  each other's branches, not into `main`, so `main` still lacks 5b-10, the three
+  soundness fixes, E0207 and sub-effecting. **One PR lands all of it:** branch
+  `claude/sub-effecting` -> `main`. From now on: one PR at a time, always based on `main`.
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
   university address; every branch was force-pushed. Do not push old local branches.
 - The repo is private until the maintainer flips it public (only they can).
-- Open PRs: **#12** lands the Elya CEK machine and the Claude-only rule on `main` (#11
-  merged into #10's branch, not `main`); the tail-in-match fix is stacked on #12.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Diagnostics added in 5c: E0202 duplicate op name, E0203 clause names no declared op
-  (or has the wrong arity), E0204, E0205, E0206.
+- Linux gate at the sub-effecting tip: 751 passed, 75 suites. `gc_mark` 637 bytes.
+- **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
+  colouring, per-dependency capabilities, exact replay and handler-based testing) and the
+  language decisions taken. The maintainer delegated all choices (rule 2).
 
 ## How work is done here (non-negotiable)
 
 1. **Measure first.** Run the real program through `elya check | run | build` and write
    the table into the spec before designing (see any 5c spec, §0).
-2. **Language decisions belong to the maintainer.** Ask, offering options with a
-   recommendation, then record the answer in the spec. Never decide the language silently.
+2. **Language decisions: delegated to Claude (the maintainer, 2026-10-09: "From now on u
+   handle all including the choices", aiming for a language with real advantages --
+   high-tech and experimental, but WORKING; unconventional implementations are fine).**
+   Decide, write the options and the reason into the spec, and say so in the PR. Never
+   decide silently, and never trade away soundness or the gate for novelty.
 3. **Spec, then plan (with numeric predictions), then red tests, then code.** Every new
    test must fail first with the predicted value.
 4. **Negative controls:** break each rule on purpose, observe a *distinct* failure,
@@ -88,20 +93,85 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   enclosing scope's binding indices; effectful closure calls as site calls or tail jumps.
   Spec `docs/superpowers/specs/2026-10-05-elya-slice-5b9b-effectful-lambdas-design.md`.
 
+- **Slice 5b-10: nested handles and handles inside effectful code, natively (D17 lifted)**
+  (2026-10-08, branch `claude/slice-5b10-nested-handles`): spec
+  `docs/superpowers/specs/2026-10-08-elya-slice-5b10-nested-handles-design.md`. A handle
+  that leaks an effect is a CPS handle (a continuation site; its clauses and return clause
+  CPS regions); handler frames gained a `parent` word; performs walk parents; resumes
+  re-install their frame at the resume. Found on the way (parked): `resume` is typed
+  effect-free (a soundness hole), partial handles check clean, recursion through a handle
+  body is rejected by inference.
+
+- **`resume` carries its handle's row** (2026-10-08, branch `claude/resume-row`): spec
+  `docs/superpowers/specs/2026-10-08-elya-resume-row-design.md`. Closes the soundness hole
+  5b-10 found; the first version opened a new one (tail unification), caught by the
+  independent review and fixed test-first. m10's T-carrying variant now compiles natively.
+
+- **Effects dropped on a closed row** (2026-10-08, branch `claude/row-conflicts`): spec
+  `docs/superpowers/specs/2026-10-08-elya-row-conflicts-design.md`. Now E0423; a second
+  half (an environment rule for lambda tails) was reverted after the review found two
+  regressions -- sub-effecting is now a parked language question.
+
+- **Partial handlers are an error, `E0207`** (2026-10-09, branch `claude/partial-handlers`,
+  the maintainer's choice): `tests/handler_coverage.rs`. `effect_syntax`'s A3 program
+  gained the `State.set` clause it lacked; the three partial-handler native rows went (the
+  programs no longer pass the front end).
+
+- **Sub-effecting for function values** (2026-10-09, branch `claude/sub-effecting`, the
+  maintainer's decision; design Claude's): spec
+  `docs/superpowers/specs/2026-10-09-elya-sub-effecting-design.md`. Phantom tails (Koka's
+  open/close), inclusions at calls instead of unification, flushed before rows close. On
+  ~840 probe programs nothing changed from accepted to rejected, and every newly accepted
+  one runs in the evaluator. Natively a direct closure used at an effectful type is
+  refused by name (it miscompiled: 2 for 13).
+
 ## The next five steps
 
-### 1. Slice 5b-10: lift D17 (nested handles, handles inside effectful code)
+### 1. Check type annotations (decided; spec first)
 
-PARKED, "`elya_current_handler` depends on today's handle refusals":
+The parser's `skip_type_annotation` discards every parameter, return and `let` type
+(`let s: String = 1` checks clean). Parse them into `TypeAnn` (the effect-op elaborator
+already turns `TypeAnn` into `Ty`), add syntax for function types (`fn(Int) / {S} -> Int`)
+and type variables, unify each annotation with the inferred type, and report mismatches
+with the annotation's span. Measure first: every annotation in the corpora, examples and
+`tests/ui`. A corpus program with a wrong annotation is a bug in the corpus; fix it and
+call it out.
 
-- A perform must switch the global to the handler *outside* the clause's handle before
-  jumping to the clause.
-- The tail-resume install in `clause_tail` becomes load-bearing.
-- First write a red test with **two live handlers where the wrong one is observable**.
-  Today no test isolates the install (Task 12 control 1a), and A6 is not a witness in
-  this design.
+### 2. N7 part 1: convention specialization and the closure adapter (native)
 
-### 2. Evaluator: non-tail recursion under a handler is quadratic
+What sub-effecting newly accepts mostly stops at two native refusals: "effect-polymorphic
+function used at a user effect" (D16) and "direct function used where an effectful one is
+expected". Both are about CONVENTION, not representation. A row-polymorphic function
+needs at most two compiled versions (direct, and CPS when its row variable is instantiated
+at a user effect), so compile the CPS clone on demand: inside it, an open row variable of
+the function's own type counts as effectful. A direct closure used at an effectful type
+gets an adapter closure, `adapt(clos, args.., k) = k(code(clos.inner, args..))`, with one
+descriptor row. Measure first (`w(k) { k(0) + lg(1) }`, `twice`, the review's a1/q1/s1h,
+`tests/sub_effecting.rs`, through `build`), keep `gc_mark` byte-identical; the type-variable
+half of N7 (`Ty::Var`, "unrepresentable type"; specialisation plus dictionary passing,
+`@specialize`/`@share`, a code-size budget) is part 2.
+
+### 3. Async as an effect: a scheduler handler (ROADMAP priority 1)
+
+An `Async` effect (`fork`, `yield`) and a round-robin scheduler written as an ordinary
+Elya handler that keeps a queue of suspended continuations. Show that the same `map` works
+for sync and async code (no function colouring). The evaluator first, then natively (a
+queue of continuations needs escaped resumes, which work natively; `fork` may need
+multi-shot or a second continuation: measure). Ship `examples/04_async.elya`, with tests
+and a README section.
+
+### 4. Native multi-shot handlers (`with multi`)
+
+Refused natively by name since 5b-8 (A2); the evaluator runs them. A multi-shot resume
+re-runs a captured continuation, but native frames are consumed in place -- and since 5b-10
+a resume also MUTATES its handler frame (`next`, `parent`): a second resume needs the frame
+chain, handler frames included, COPIED first, and the one-shot word replaced by a
+copy-on-resume rule. Measure first (the evaluator's multi-shot corpus, e.g.
+`multi_shot_collects_both_branches`, through `build`), then a spec with the copy cost
+stated and gated against A4's live-set instrument. Multi-shot is what a native
+probabilistic or backtracking handler needs (ROADMAP), so it is worth doing natively.
+
+### 5. Evaluator: non-tail recursion under a handler is quadratic
 
 PARKED: about 4× time per doubling (n=4000 takes 1.7 s; n=100 000 did not finish in 10
 minutes). This caps every differential test's N. Profile (frame capture copies the
@@ -109,36 +179,13 @@ continuation?), predict the complexity, fix, and pin it with a timing-free test 
 counts steps or allocations. The evaluator is the reference semantics, so the
 differential corpora must stay green unchanged.
 
-### 3. N7: runtime polymorphism (spec first, stop for decisions)
-
-- Lifts the `Ty::Var` "unrepresentable type" refusal (5c-2's n4 hits it) and D16's
-  conservative refusal of effect-polymorphic functions at user effects (5b-9a's s4).
-- The roadmap direction is specialisation in core code plus dictionary passing above it,
-  with `@specialize`/`@share` and an enforced code-size budget.
-- Write the measured table and the open questions, then ask the maintainer before
-  planning. This is a large arc; plan it as several slices.
-
-### 4. Native multi-shot handlers (`with multi`)
-
-Refused natively by name since 5b-8 (A2); the evaluator runs them. A multi-shot resume
-re-runs a captured continuation, but native frames are consumed in place: a second resume
-needs the frame chain COPIED (or made immutable) first, and the one-shot `consumed` flag
-replaced by a copy-on-resume rule. Measure first (the evaluator's multi-shot corpus, e.g.
-`multi_shot_collects_both_branches`, through `build`), then a spec with the frame-copy
-cost stated and gated against A4's live-set instrument. Depends on step 2 (handler
-re-installation). Ask the maintainer whether multi-shot is worth native support before N7.
-
-### 5. Native strings: `<>` and an Int-to-String builtin
-
-`<>` (string concatenation) runs in the evaluator but is refused natively by name (5b-8
-§9.1), and there is no way to turn an `Int` into a `String` at all -- which is why the
-Elya CEK example prints fixed strings instead of its results. Measure first (every
-corpus and example that uses `<>`, through `build`). The runtime needs a concatenation
-that allocates a fresh string block (one descriptor row already exists for strings) and
-an integer formatter. The builtin's NAME and module (`int.to_string`? `show`?) is a
-language decision: ask the maintainer, offering options. Then let the CEK example print
-its answers.
-
-Also open, unscheduled: the Elya CEK machine's next versions (a parser for its terms, a step
+Also open, unscheduled: native strings (`<>` refused natively, no Int-to-String; the
+builtin's name is Claude's call now -- `int.to_string` is the natural one); the roadmap's
+other priorities (record/replay handlers, then capabilities once modules exist); the rest
+of the soundness sweep (resume's row lacks return-clause and re-entered-clause effects;
+recursion through a lambda the function handles around, PARKED); recursion through a
+handle body is rejected by inference (PARKED). A perform walks the handler chain, so a program whose handler stack really grows
+(a resume inside a fresh handle every iteration) pays O(depth) per perform; the evaluator
+is no faster there. Also: the Elya CEK machine's next versions (a parser for its terms, a step
 counter as an Elya effect); PIC/PIE linking (needs a Windows run), and a named diagnosis for
 a native stack overflow in tests other than A9.

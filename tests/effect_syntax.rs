@@ -176,7 +176,9 @@ fn a3_polymorphic_effects_are_refused_nowhere_in_the_front_end() {
     // (b) The load-bearing half: a declaration nothing uses proves little. This
     // one invokes a polymorphic op and handles it. Core lowering refuses every
     // handler until Task 5, so the question here is strictly the front end's --
-    // asserting on lowering would couple this test to that task.
+    // asserting on lowering would couple this test to that task. (E0207,
+    // 2026-10-08: a handler covers every op of its effect, so `set` has a
+    // clause too -- the program's subject, a polymorphic op, is unchanged.)
     let used = "effect State(s) {
                   fn get() -> s
                   fn set(v: s) -> Unit
@@ -184,6 +186,7 @@ fn a3_polymorphic_effects_are_refused_nowhere_in_the_front_end() {
                 fn prog() {
                   handle get() with {
                     State.get() -> resume(7)
+                    State.set(v) -> resume(Unit)
                     return(r) -> r
                   }
                 }

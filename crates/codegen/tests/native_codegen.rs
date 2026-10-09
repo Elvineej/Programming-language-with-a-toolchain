@@ -1744,6 +1744,27 @@ const CPS_ROOTING: &[(&str, &str)] = &[
          \x20 handle { go(False) } with { S.get() -> resume(1)  return(r) -> r }\n\
          }\n",
     ),
+    (
+        // 5b-10: a CPS handler frame saves the heap list `l`; a CPS clause holds
+        // `m` and `l` across a site (`t()`) and a 30,000-cell build, and the
+        // CPS return clause reads `l` again: 30007 + 20000 + 20000 + 7 + 30000 =
+        // 100014.
+        "cps-handler-frame-and-clause-survive-collection",
+        "type L { Nil, Cons(Int, L) }
+         effect S { fn get() -> Int }
+         effect T { fn t() -> Int }
+         fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }
+         fn lenacc(l, a) { match l { Nil -> a  Cons(_, t) -> lenacc(t, a + 1) } }
+         fn user() -> Int {
+           let l = build(20000, Nil)
+           handle { get() + lenacc(l, 0) } with {
+             S.get() -> { let m = build(10000, Nil)  let x = t()  let junk = lenacc(build(30000, Nil), 0)  resume(x + lenacc(m, 0) + lenacc(l, 0)) + junk }
+             return(r) -> r + lenacc(l, 0) + t()
+           }
+         }
+         pub fn main() -> Int { handle { user() } with { T.t() -> resume(7)  return(r) -> r } }
+",
+    ),
 ];
 
 #[test]
@@ -3084,6 +3105,431 @@ fn a_state_passing_tail_loop_is_bounded_natively_at_a_million() {
     assert_eq!(
         text, "x\n",
         "the state-passing tail loop must run to completion at N = 1_000_000 and print exactly one line"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- Slice 5b-10: nested handles and handles inside effectful code (D17 lifted) ----
+
+/// Slice 5b-10 (spec `2026-10-08-elya-slice-5b10-nested-handles-design.md`).
+/// Every row was refused by `elya build` before -- "handle nested inside another
+/// handle", "handle inside an effectful function", or "calling convention
+/// disagrees with the callee" (a handle that LEAKS an effect made its function
+/// effectful while `contains_effect` called it direct). Expected values are the
+/// evaluator's, measured before the first native run (spec §0).
+///
+/// Negative controls, each reverted (`cmp` against a saved copy), each failing
+/// differently (rows by their spec names; m12 is the million-step test, r1 the
+/// `CPS_ROOTING` row):
+/// - K1, the dispatch walk stops at the current handler: m2, m5, m13 and the
+///   three-level row exit 1 ("no clause for this operation"); m1 still passes
+///   -- its clause runs with the outer handler already current (K2's job);
+/// - K2, clauses run with their OWN handle current: m1, m6, m7, m8, m12, m13
+///   and r1 never terminate (a clause's perform reaches itself);
+/// - K3, a resume does not re-parent its handler: m5 alone, 101 for 8 -- the
+///   resumed body's `t()` escapes the clause's handler to main's;
+/// - K4, a CPS resume does not rebind `next`: m7 200 for 206, r1 70014 for
+///   100014 -- the remainder of the resuming clause is skipped;
+/// - K5, the tail-resume install in `clause_tail` removed: m2, m6, m7, the
+///   three-level row and r1 exit 1. 5b-8's A6 finding was that no test
+///   isolated this install; these rows do;
+/// - K6, a CPS return clause leaves its own handle current: m13 12 for 111,
+///   and m12 never terminates.
+const NESTED_HANDLES: &[(&str, &str, &str)] = &[
+    (
+        // m1: `inner`'s clause performs S, which its own handle also handles; the clause runs OUTSIDE it, so the outer handle answers 5: (5 * 10) + 1.
+        "clause-performs-to-the-outer-handler",
+        "effect S { fn get() -> Int }\n\
+         fn inner() -> Int {\n\
+         \x20 handle { get() + 1 } with {\n\
+         \x20   S.get() -> resume(get() * 10)\n\
+         \x20   return(r) -> r\n\
+         \x20 }\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { inner() } with {\n\
+         \x20   S.get() -> resume(5)\n\
+         \x20   return(r) -> r\n\
+         \x20 }\n\
+         }\n",
+        "51",
+    ),
+    (
+        // m2: the inner handle (T) is nested in the outer (S) body and its body performs S, one parent up: ((3 + 2) * 10) + 1.
+        "handle-in-a-handle-body",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle {\n\
+         \x20   handle { get() + t() } with { T.t() -> resume(2)  return(r) -> r * 10 }\n\
+         \x20 } with { S.get() -> resume(3)  return(r) -> r + 1 }\n\
+         }\n",
+        "51",
+    ),
+    (
+        // m3: a handle that discharges everything, inside an effectful function: a direct nesting call there.
+        "non-leaking-handle-in-an-effectful-fn",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         fn g() -> Int {\n\
+         \x20 let a = handle { get() } with { S.get() -> resume(1)  return(r) -> r }\n\
+         \x20 a + t()\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { g() } with { T.t() -> resume(40)  return(r) -> r }\n\
+         }\n",
+        "41",
+    ),
+    (
+        // m4: a handle inside a clause body: (7 * 2) + 1.
+        "handle-in-a-clause",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { get() + 1 } with {\n\
+         \x20   S.get() -> resume(handle { t() * 2 } with { T.t() -> resume(7)  return(r) -> r })\n\
+         \x20   return(r) -> r\n\
+         \x20 }\n\
+         }\n",
+        "15",
+    ),
+    (
+        // m5: the clause resumes INSIDE its own T handle, so the resumed body's `t()` is answered there (7), not by main's (100): 1 + 7.
+        "resume-inside-a-clause-handle",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         fn body() -> Int { get() + t() }\n\
+         fn mid() -> Int {\n\
+         \x20 handle { body() } with {\n\
+         \x20   S.get() -> handle { resume(1) } with { T.t() -> resume(7)  return(r) -> r }\n\
+         \x20   return(r) -> r\n\
+         \x20 }\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { mid() } with { T.t() -> resume(100)  return(r) -> r }\n\
+         }\n",
+        "8",
+    ),
+    (
+        // m6: both performs of S reach a clause that performs T: (10 + 1) * 2.
+        "leaking-clause-in-a-fn-with-a-parameter",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         fn twice(n) {\n\
+         \x20 handle { get() + get() } with {\n\
+         \x20   S.get() -> resume(t() + n)\n\
+         \x20   return(r) -> r\n\
+         \x20 }\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { twice(1) } with { T.t() -> resume(10)  return(r) -> r }\n\
+         }\n",
+        "22",
+    ),
+    (
+        // m7: the second clause's answer is the value of the FIRST clause's `resume` (next rebound at the resume): 3 + (3 + 200).
+        "non-tail-resume-then-a-second-perform",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         fn h() -> Int {\n\
+         \x20 handle { get() + get() } with {\n\
+         \x20   S.get() -> t() + resume(1)\n\
+         \x20   return(r) -> r * 100\n\
+         \x20 }\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { h() } with { T.t() -> resume(3)  return(r) -> r }\n\
+         }\n",
+        "206",
+    ),
+    (
+        // m8: a return clause that performs an outer effect: 1 + 30.
+        "return-clause-performs",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         fn h() -> Int {\n\
+         \x20 handle { get() } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(r) -> r + t()\n\
+         \x20 }\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { h() } with { T.t() -> resume(30)  return(r) -> r }\n\
+         }\n",
+        "31",
+    ),
+    (
+        // m13: once the inner handle has returned, `get()` goes to the outer S handler: (1 + 10) + 100.
+        "finished-leaking-handle-restores-the-outer",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         fn g() -> Int {\n\
+         \x20 let a = handle { get() + t() } with { S.get() -> resume(1)  return(r) -> r }\n\
+         \x20 a + get()\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { handle { g() } with { S.get() -> resume(100)  return(r) -> r } } with { T.t() -> resume(10)  return(r) -> r }\n\
+         }\n",
+        "111",
+    ),
+    (
+        // a() walks two parents, b() one: 1 + 2 * 10 + 3 * 100.
+        "three-level-dispatch",
+        "effect A { fn a() -> Int }\n\
+         effect B { fn b() -> Int }\n\
+         effect C { fn c() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle {\n\
+         \x20   handle {\n\
+         \x20     handle { a() + b() * 10 + c() * 100 } with { C.c() -> resume(3)  return(r) -> r }\n\
+         \x20   } with { B.b() -> resume(2)  return(r) -> r }\n\
+         \x20 } with { A.a() -> resume(1)  return(r) -> r }\n\
+         }\n",
+        "321",
+    ),
+    (
+        // the inner handle (S) forwards `put` (P) to the outer, whose NON-TAIL resume must get the outer handle's answer: ((1 + 10) * 10 + 1000) * 2. (The 5b-10 review's partial-handler row, rewritten with two effects once E0207 made partial handlers an error.)
+        "forwarded-op-non-tail-resume",
+        "effect S { fn get() -> Int }\n\
+         effect P { fn put(x: Int) -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle {\n\
+         \x20   handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 }\n\
+         \x20 } with { P.put(x) -> resume(x * 2) + 1000  return(r) -> r * 2 }\n\
+         }\n",
+        "1220",
+    ),
+    (
+        // the same, the outer clause aborting: (5 + 1000) + 1.
+        "forwarded-op-outer-clause-aborts",
+        "effect S { fn get() -> Int }\n\
+         effect P { fn put(x: Int) -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 let v = handle {\n\
+         \x20   handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 }\n\
+         \x20 } with { P.put(x) -> x + 1000  return(r) -> r * 2 }\n\
+         \x20 v + 1\n\
+         }\n",
+        "1006",
+    ),
+    (
+        // the aborting shape inside an effectful function, under a T handler: ((5 + 1000 + 10) + 1) * 3 + 7.
+        "forwarded-op-abort-in-an-effectful-fn",
+        "effect S { fn get() -> Int }\n\
+         effect P { fn put(x: Int) -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         fn f() -> Int {\n\
+         \x20 let v = handle {\n\
+         \x20   let a = handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 }\n\
+         \x20   a + t()\n\
+         \x20 } with { P.put(x) -> x + 1000 + t()  return(r) -> r * 2 }\n\
+         \x20 v + 1\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { f() * 3 } with { T.t() -> resume(10)  return(r) -> r + 7 }\n\
+         }\n",
+        "3055",
+    ),
+    (
+        // `f`'s handle forwards P out of `f` (typed `{P}` now): ((1 + 10) * 10 + 1000 + 3) * 2.
+        "forwarded-op-through-a-function",
+        "effect S { fn get() -> Int }\n\
+         effect P { fn put(x: Int) -> Int }\n\
+         fn f() -> Int {\n\
+         \x20 handle { get() + put(5) } with { S.get() -> resume(1)  return(r) -> r * 10 }\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { f() + 3 } with { P.put(x) -> resume(x * 2) + 1000  return(r) -> r * 2 }\n\
+         }\n",
+        "1226",
+    ),
+    (
+        // The resume-row review: `g` resumes directly in one branch of its
+        // clause and builds a resuming lambda in the other, then performs L.
+        // The first version of the resume-row fix typed `g` pure (its row
+        // merged with a lambda's that closed), and this build was refused
+        // "calling convention disagrees": 7 + 1.
+        "direct-resume-beside-a-resuming-lambda",
+        "effect S { fn get() -> Int }\n\
+         effect L { fn lg(x: Int) -> Int }\n\
+         fn g(c) {\n\
+         \x20 let f = handle { get() } with { S.get() -> if c { resume(0) } else { fn(s) { (resume(s))(s) } }  return(x) -> fn(s) { x } }\n\
+         \x20 f(7) + lg(1)\n\
+         }\n\
+         pub fn main() -> Int { handle { g(False) } with { L.lg(x) -> resume(x)  return(r) -> r } }\n",
+        "8",
+    ),
+];
+
+#[test]
+fn the_nested_handle_corpus_compiles_and_runs() {
+    run_value_corpus(NESTED_HANDLES, "nested-handles");
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_nested_handle_corpus() {
+    run_differential_corpus(NESTED_HANDLES, "nested-handles-diff");
+}
+
+/// HANDOFF "`resume` carries its handle's row" (replaces
+/// `an_escaped_resume_of_a_leaking_handle_is_refused_by_name`, which pinned the
+/// refusal 5b-10 shipped while the front end typed `resume` effect-free): a
+/// lambda that resumes a LEAKING handle's continuation is now typed with the
+/// handled body's remaining row (`{T}`), so it is an effectful lambda, its
+/// body a CPS region, and the CPS resume inside it compiles. The continuation
+/// is resumed after its handle returned: 5 + 10 + 0.
+#[test]
+fn an_escaped_resume_of_a_leaking_handle_runs_natively() {
+    let src = "effect S { fn get() -> Int }\n\
+               effect T { fn t() -> Int }\n\
+               fn g() -> Int {\n\
+               \x20 let f = handle { get() + t() } with {\n\
+               \x20   S.get() -> fn(s) { (resume(s))(s) }\n\
+               \x20   return(x) -> fn(s) { x + 0 * t() }\n\
+               \x20 }\n\
+               \x20 f(5)\n\
+               }\n\
+               pub fn main() -> Int {\n\
+               \x20 handle { g() } with { T.t() -> resume(10)  return(r) -> r }\n\
+               }\n";
+    assert_eq!(eval_main_int(src), "15");
+    let dir = temp_dir("escaped-leaking-resume");
+    let exe = compile_and_link(&lower_src(src), &dir, "escaped-leaking-resume");
+    assert_runs(&exe, "15");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Slice 5b-10: a handle that leaks T, entered on every iteration of a tail
+/// loop (a CPS handle as a continuation site, its frame linked to the loop's
+/// continuation). A million iterations keep the machine stack flat and the
+/// heap collectable: 3 * 1_000_000 + 2.
+#[test]
+fn a_leaking_handle_in_a_tail_loop_is_bounded_natively_at_a_million() {
+    let src = "effect S { fn get() -> Int }\n\
+               effect T { fn t() -> Int }\n\
+               fn go(n, acc) {\n\
+               \x20 if n == 0 { acc + t() } else {\n\
+               \x20   let x = handle { get() + t() } with { S.get() -> resume(1)  return(r) -> r }\n\
+               \x20   go(n - 1, acc + x)\n\
+               \x20 }\n\
+               }\n\
+               pub fn main() -> Int {\n\
+               \x20 handle { go(1000000, 0) } with { T.t() -> resume(2)  return(r) -> r }\n\
+               }\n";
+    let dir = temp_dir("leaking-handle-million");
+    let core = lower_src(src);
+    let exe = compile_and_link(&core, &dir, "leaking-handle-million");
+    let out = Command::new(&exe).output().expect("run produced binary");
+    diagnose_crash(&out.status, "leaking-handle-million");
+    assert!(out.status.success(), "binary exited {:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3000002");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- Sub-effecting for function values (2026-10-08, the maintainer's decision) ----
+
+/// Programs the front end newly accepts through sub-effecting, natively: value
+/// and evaluator differential. Rejected by `check` before (E0423).
+const SUB_EFFECTING: &[(&str, &str, &str)] = &[
+    (
+        // an `if` joins a pure lambda and one that recurses into an effectful
+        // `go`; the joined node type names L, so BOTH lambdas compile with the
+        // CPS convention.
+        "pure-and-effectful-lambdas-joined",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn go(n) {\n\
+         \x20 let a = lg(n)\n\
+         \x20 let f = if n == 0 { fn(s) { s } } else { fn(s) { s + go(n - 1) } }\n\
+         \x20 f(1) + a\n\
+         }\n\
+         pub fn main() -> Int { handle { go(2) } with { L.lg(x) -> resume(x)  return(r) -> r } }\n",
+        "6",
+    ),
+    (
+        // the resuming clause value performs T, the return clause's does not;
+        // they join in the handle's result: ((1 * 2) + 10) * 2.
+        "clause-values-with-different-rows",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle {\n\
+         \x20   let f = handle { get() + t() } with { S.get() -> fn(k) { (resume(k(1)))(k) }  return(x) -> fn(k) { k(x) } }\n\
+         \x20   f(fn(z) { z * 2 })\n\
+         \x20 } with { T.t() -> resume(10)  return(r) -> r }\n\
+         }\n",
+        "24",
+    ),
+    (
+        // m10 of the 5b-10 spec, which the resume-row fix had made E0423.
+        "pure-return-value-beside-a-resuming-one",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn t() -> Int }\n\
+         fn g() -> Int {\n\
+         \x20 let f = handle { get() + t() } with {\n\
+         \x20   S.get() -> fn(s) { (resume(s))(s) }\n\
+         \x20   return(x) -> fn(s) { x }\n\
+         \x20 }\n\
+         \x20 f(5)\n\
+         }\n\
+         pub fn main() -> Int { handle { g() } with { T.t() -> resume(10)  return(r) -> r } }\n",
+        "15",
+    ),
+];
+
+#[test]
+fn the_sub_effecting_corpus_compiles_and_runs() {
+    run_value_corpus(SUB_EFFECTING, "sub-effecting");
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_sub_effecting_corpus() {
+    run_differential_corpus(SUB_EFFECTING, "sub-effecting-diff");
+}
+
+/// Sub-effecting lets a DIRECT closure (`f`, generic and pure) be used where an
+/// effectful function is expected (the `if` joins it with a T-performing
+/// lambda). Its code has the direct convention, so the CPS call of `g` jumped
+/// into it with the wrong signature: measured 2 where the evaluator printed 13.
+/// Refused by name until an adapter wraps such a closure.
+#[test]
+fn a_direct_closure_used_where_an_effectful_one_is_expected_is_refused_by_name() {
+    let src = "effect T { fn t() -> Int }\n\
+               fn h(c) {\n\
+               \x20 let f = fn(x) { x + 1 }\n\
+               \x20 let g = if c { f } else { fn(x) { t() + x } }\n\
+               \x20 g(1)\n\
+               }\n\
+               pub fn main() -> Int { handle { h(True) + h(False) } with { T.t() -> resume(10)  return(r) -> r } }\n";
+    assert_eq!(eval_main_int(src), "13");
+    let dir = temp_dir("direct-closure-upcast");
+    let err = try_compile_and_link(&lower_src(src), &dir, "direct-closure-upcast").unwrap_err();
+    assert!(
+        err.contains("direct function used where an effectful one is expected"),
+        "{err}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The sub-effecting review's F3: the same upcast reached through a handler's
+/// RETURN binder (`x`, the direct closure `mk()` returns, joined with an
+/// effectful lambda) was not refused -- the return binder's type was not
+/// tracked -- and the CPS call jumped into direct code: 2 where the
+/// evaluator printed 102.
+#[test]
+fn a_direct_closure_upcast_through_a_return_binder_is_refused_by_name() {
+    let src = "effect T { fn t() -> Int }\n\
+               fn mk() { fn(x) { x + 1 } }\n\
+               fn h(c) {\n\
+               \x20 let g = handle { mk() } with { T.t() -> resume(0)  return(x) -> if c { x } else { fn(s) { t() + s } } }\n\
+               \x20 g(1)\n\
+               }\n\
+               pub fn main() -> Int { handle { h(True) + 100 } with { T.t() -> resume(10)  return(r) -> r } }\n";
+    assert_eq!(eval_main_int(src), "102");
+    let dir = temp_dir("direct-closure-upcast-ret");
+    let err = try_compile_and_link(&lower_src(src), &dir, "direct-closure-upcast-ret").unwrap_err();
+    assert!(
+        err.contains("direct function used where an effectful one is expected"),
+        "{err}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
