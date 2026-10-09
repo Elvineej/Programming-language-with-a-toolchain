@@ -255,7 +255,18 @@ the bare `ping` as `Ty::Error` silently -- and `elya run` ends in E0300 "unbound
 `ping`". Pre-existing; 5c-2's non-goal. Decide: reject a bare op reference (an error), or
 make an op a first-class value (an eta-expanded perform).
 
-## Front end: `resume` is typed effect-free -- an escaped resume can perform an unhandled effect (found by slice 5b-10, 2026-10-08)
+## PARTLY RESOLVED (branch `claude/resume-row`, 2026-10-08): `resume` is typed effect-free -- an escaped resume can perform an unhandled effect (found by slice 5b-10)
+
+`resume` now adds the handled body's labels (minus the handled effect) to the ambient at
+the resume site (`tests/resume_row.rs`); the program below is E0420 and m10's
+T-carrying variant compiles natively. Still open, same family (found by the review,
+`check` clean, evaluator "unhandled effect `t`"): the RETURN clause's effects and those of
+clauses the resumed body re-enters are not in resume's row --
+`return(x) -> { let y = t()  fn(s) { x + y } }`, and a clause `{ let y = t()  fn(s) {
+(resume(s + y))(s) } }` over `get() + get()`; nor are effects the body only relays through
+an open row. Including them needs the clause rows before the clauses are typed (a second
+pass, or a row variable shared without merging). Original:
+
 
 **Soundness.** `check` accepts this, and the evaluator stops with "internal: unhandled
 effect `t` reached the machine":
@@ -299,3 +310,18 @@ with "internal: unhandled effect `put` reached the machine". With an outer handl
 a clause), so it compiles as a CPS handle where its region is effectful and is refused by
 name where the types call it pure. Language question for the maintainer: require a clause
 for every op (an error), or keep forwarding and put the unhandled ops in the handle's row.
+
+## Front end: further soundness gaps found by the resume-row review (2026-10-08)
+
+- **Effects silently dropped on a closed row.** `add_effect`/`add_row` return a
+  `RowConflict` when the ambient is already closed, and the perform and call paths discard
+  it (`let _ = ...`). `fn go(n) { let f = fn(s) { s + (if n == 0 { 0 } else { go(n - 1) })
+  }  f(1) + lg(n) }` is typed `fn(Int) -> Int`: the lambda calls the enclosing recursive
+  `go`, its closing step closes `go`'s row early, and the later `lg` is dropped; `main`
+  calls it unhandled, `check` is clean, the evaluator stops on unhandled `lg`. Moving `lg`
+  before the lambda gives E0420. Surfacing the conflict as a diagnostic is the first step.
+- **`let` annotations are ignored:** `let s: String = 1` checks clean.
+- **An open-row function value called inside a handle body** gets the handled effect forced
+  into its row and is rejected (the evaluator prints 12) -- likely the same root as
+  "recursion through a handle body".
+

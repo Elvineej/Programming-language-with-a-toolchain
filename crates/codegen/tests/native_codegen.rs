@@ -3333,6 +3333,22 @@ const NESTED_HANDLES: &[(&str, &str, &str)] = &[
          }\n",
         "3055",
     ),
+    (
+        // The resume-row review: `g` resumes directly in one branch of its
+        // clause and builds a resuming lambda in the other, then performs L.
+        // The first version of the resume-row fix typed `g` pure (its row
+        // merged with a lambda's that closed), and this build was refused
+        // "calling convention disagrees": 7 + 1.
+        "direct-resume-beside-a-resuming-lambda",
+        "effect S { fn get() -> Int }\n\
+         effect L { fn lg(x: Int) -> Int }\n\
+         fn g(c) {\n\
+         \x20 let f = handle { get() } with { S.get() -> if c { resume(0) } else { fn(s) { (resume(s))(s) } }  return(x) -> fn(s) { x } }\n\
+         \x20 f(7) + lg(1)\n\
+         }\n\
+         pub fn main() -> Int { handle { g(False) } with { L.lg(x) -> resume(x)  return(r) -> r } }\n",
+        "8",
+    ),
 ];
 
 /// 5b-10 review: a handle with a clause for only SOME of its effect's ops is
@@ -3370,20 +3386,21 @@ fn native_output_matches_the_evaluator_across_the_nested_handle_corpus() {
     run_differential_corpus(NESTED_HANDLES, "nested-handles-diff");
 }
 
-/// Slice 5b-10 finding (PARKED, "`resume` is typed effect-free"): the front
-/// end gives `resume(..)` no effects, so a lambda that resumes a LEAKING
-/// handle's continuation is typed pure (`fn(Int) -> Int`), and its body is
-/// direct code -- where a CPS resume cannot run. Natively it is refused by
-/// name, never mis-compiled; the evaluator runs it (15). Once `resume` carries
-/// its handle's row the lambda is effectful and this program should compile.
+/// HANDOFF "`resume` carries its handle's row" (replaces
+/// `an_escaped_resume_of_a_leaking_handle_is_refused_by_name`, which pinned the
+/// refusal 5b-10 shipped while the front end typed `resume` effect-free): a
+/// lambda that resumes a LEAKING handle's continuation is now typed with the
+/// handled body's remaining row (`{T}`), so it is an effectful lambda, its
+/// body a CPS region, and the CPS resume inside it compiles. The continuation
+/// is resumed after its handle returned: 5 + 10 + 0.
 #[test]
-fn an_escaped_resume_of_a_leaking_handle_is_refused_by_name() {
+fn an_escaped_resume_of_a_leaking_handle_runs_natively() {
     let src = "effect S { fn get() -> Int }\n\
                effect T { fn t() -> Int }\n\
                fn g() -> Int {\n\
                \x20 let f = handle { get() + t() } with {\n\
                \x20   S.get() -> fn(s) { (resume(s))(s) }\n\
-               \x20   return(x) -> fn(s) { x }\n\
+               \x20   return(x) -> fn(s) { x + 0 * t() }\n\
                \x20 }\n\
                \x20 f(5)\n\
                }\n\
@@ -3392,11 +3409,8 @@ fn an_escaped_resume_of_a_leaking_handle_is_refused_by_name() {
                }\n";
     assert_eq!(eval_main_int(src), "15");
     let dir = temp_dir("escaped-leaking-resume");
-    let err = try_compile_and_link(&lower_src(src), &dir, "escaped-leaking-resume").unwrap_err();
-    assert!(
-        err.contains("resume of an effectful handler in direct code"),
-        "{err}"
-    );
+    let exe = compile_and_link(&lower_src(src), &dir, "escaped-leaking-resume");
+    assert_runs(&exe, "15");
     std::fs::remove_dir_all(&dir).ok();
 }
 
