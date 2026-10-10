@@ -17,7 +17,7 @@ fn both(src: &str) -> (String, String) {
 /// Examples that perform user effects, which the tree-walker oracle does not
 /// evaluate (it predates Slice 3c). Each is compared with the native backend
 /// in `crates/codegen/tests/native_codegen.rs` instead.
-const EFFECTFUL_EXAMPLES: &[&str] = &["04_async.elya"];
+const EFFECTFUL_EXAMPLES: &[&str] = &["04_async.elya", "05_replay.elya"];
 
 #[test]
 fn cek_matches_tree_on_examples() {
@@ -31,7 +31,7 @@ fn cek_matches_tree_on_examples() {
                 // The tree-walker has no effects; it must REFUSE the program
                 // (so this list cannot hide a regression), and the program is
                 // checked against the native backend instead
-                // (`the_async_example_runs_natively`).
+                // (`the_async_example_runs_natively`, `the_replay_example_runs_natively`).
                 let (m, d) = parse_module(&Session::new(), &src);
                 assert!(d.is_empty(), "parse: {d:?}");
                 let err = elya::eval::run_module_tree(&m)

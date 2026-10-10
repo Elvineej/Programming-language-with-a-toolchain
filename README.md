@@ -118,9 +118,12 @@ Elya is a typed language on a CEK machine, built up through these slices:
 
 `elya build` compiles through a typed Core IR to native code with LLVM 18:
 
-- integers, booleans and control flow; functions with **guaranteed tail calls**
-  (`tailcc` + `musttail`, run 1,000,000 deep);
-- ADTs and pattern matching (a failed match traps); closures, including indirect
+- integers, booleans and control flow; **integer arithmetic is exact or fails by
+  name** (overflow and a zero divisor stop the program, the same words as the
+  evaluator); functions with **guaranteed tail calls** (`tailcc` + `musttail`, run
+  1,000,000 deep);
+- ADTs and pattern matching, nested and literal patterns included (compiled to flat
+  matches; a failed match traps); closures, including indirect
   tail calls; strings and `io.println`;
 - Elya's **own precise mark-sweep garbage collector**: non-moving, with a shadow
   stack, compiler-generated descriptor tables and free lists;
@@ -160,6 +163,23 @@ main
 
 Function types can be written in `type` and `effect` declarations for this
 (`Paused(fn() / {Log} -> Task)`); a declaration's rows are exactly what is written.
+
+### Exact replay, and tests without mocks
+
+A program touches the outside world only through effects, so whoever handles them decides
+what the world says. In [`examples/05_replay.elya`](examples/05_replay.elya) a dice game
+asks a `World` effect for rolls and clock readings. `record` sits between the program and
+any world and logs every answer; `replay` feeds a log back with no world at all and stops
+by name -- `Diverged(WantRoll(8), ..)` -- the first time the program asks for something the
+recording does not hold; `fixed` is a test double. All four are ordinary handlers, the
+game is written once, and it runs the same in the evaluator and natively:
+
+```
+test: 5 quick sixes score 60
+recorded a live run
+replay: same score
+replay of the changed game: diverged at an 8-sided roll
+```
 
 ### Affine resources
 

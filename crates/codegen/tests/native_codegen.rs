@@ -4616,3 +4616,23 @@ fn a_failed_nested_arm_does_not_shadow_an_outer_name() {
     assert_eq!(eval_main_int(src), "509");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `examples/05_replay.elya` (2026-10-10): record, replay and a test double as
+/// ordinary handlers; the same bytes and value natively as in the evaluator.
+/// Needed `%` (checked arithmetic) and nested patterns (pattern compilation).
+#[test]
+fn the_replay_example_runs_natively() {
+    let src = include_str!("../../../examples/05_replay.elya");
+    let dir = temp_dir("replay-example");
+    let exe = compile_and_link(&lower_src(src), &dir, "replay");
+    let (text, value) = native_text_value(&exe, "replay");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(text, eval_main_text(src));
+    assert_eq!(
+        text,
+        "test: 5 quick sixes score 60\nrecorded a live run\nreplay: same score\n\
+         replay of the changed game: diverged at an 8-sided roll\n"
+    );
+    assert_eq!(value, "2106");
+    assert_eq!(value, eval_main_int(src));
+}

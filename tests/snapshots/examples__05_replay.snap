@@ -1,0 +1,8 @@
+---
+source: tests/examples.rs
+expression: "run_example(\"05_replay.elya\")"
+---
+test: 5 quick sixes score 60
+recorded a live run
+replay: same score
+replay of the changed game: diverged at an 8-sided roll

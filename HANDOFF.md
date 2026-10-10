@@ -13,7 +13,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 873 passed, 83 suites. The runtime gained
+- Linux gate at the tip of `auto/elya`: 886 passed, 85 suites. The runtime gained
   `elya_cont_copy` (multi-shot); `gc_mark` is unchanged.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
@@ -181,20 +181,14 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   (test, then destructure: linear size). The first version copied failure continuations
   and the review measured exponential code size; fixed test-first.
 
+- **Exact replay and handler-based testing** (2026-10-10, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-10-elya-replay-design.md`. `examples/05_replay.elya`:
+  `record`, `replay` (stops by name on the first divergence, rejects leftovers) and a test
+  double, as ordinary handlers over one program; the same bytes natively.
+
 ## The next five steps
 
-### 1. Exact replay and handler-based testing (ROADMAP priority 3)
-
-A `Record` handler that wraps a computation and logs every effect's answer (op name,
-arguments, the value it resumed with), and a `Replay` handler that feeds a log back and
-stops by name on the first divergence. Written in Elya as ordinary handlers over a demo
-effect set first (needs a list of answers: an ADT log is enough; strings wait for native
-`<>`), shown on a program whose result depends on its effects, then a test that swaps
-handlers instead of mocking. Evaluator and native. Ship `examples/05_replay.elya` with
-tests and a README section; the CLI flag (`elya run --record/--replay`) comes after real
-I/O effects exist.
-
-### 2. N7 part 2: type variables natively
+### 1. N7 part 2: type variables natively
 
 `twice(f, x)` with `x: 'a`, and every unannotated `wrap`/`compose` (now accepted by the
 front end), are "unrepresentable type" natively. Monomorphize type variables like rows
@@ -203,31 +197,42 @@ budget, or pass dictionaries -- decide in the spec. Parametric ADTs (`type Q(a)`
 same question for constructors. Also: aliases of generic locals (`let mk2 = mk`) are
 refused by name.
 
-### 3. Async step 2: structured concurrency and a poll loop
+### 2. Async step 2: structured concurrency and a poll loop
 
 ROADMAP 1b/1c on top of `examples/04_async.elya`: a scope handler that joins its children
 (a `spawn` returning a handle, `await` as an effect), then real I/O readiness through a
 runtime poll loop the scheduler consults. Recursion through a handle body (PARKED) blocks
 the natural recursive `task`: measure whether it is the next front-end fix.
 
-### 4. A backtracking example, and handler frames in deep chains
+### 3. A backtracking example, and handler frames in deep chains
 
 Multi-shot runs natively now; show it: `examples/05_search.elya` (or the next free
 number), an N-queens or subset-sum search written as an ordinary function over a
 `multi` `Choose` effect, with handlers that collect all answers, the first answer, and a
 count -- one search, three meanings, the same bytes natively. Then measure the one shape
 the multi-shot review could not build: a captured chain holding MANY handler frames
-(blocked by PARKED's "recursion through a handle body"); if step 3's front-end fix lands
+(blocked by PARKED's "recursion through a handle body"); if step 2's front-end fix lands
 first, add it to `MULTI_SHOT` and time the copy (it maps parents through a hash table, so
 it should stay linear).
 
-### 5. Native strings
+### 4. Native strings
 
 `<>` is refused natively and there is no Int-to-String, so every native example prints a
 number. Add the builtin (`int.to_string`, Claude's call) to the front end and evaluator,
 then strings natively: concatenation in the runtime (GC-managed byte arrays), the builtin,
 and `io.println` of a computed string. Measure first which examples and corpora this
-unlocks (the CEK machine's output, step 2's replay log), and pin it with differential tests.
+unlocks (the CEK machine's output, the replay log of `examples/05_replay.elya`), and pin
+it with differential tests.
+
+### 5. Effect-polymorphic handlers (a recorder for ANY effect)
+
+Replay (done, `examples/05_replay.elya`) records one fixed effect: a handler covers
+exactly one effect, every operation of it, so a generic `record` would need a handler
+over "every operation of some effect `e`" -- the ROADMAP's next replay step before the CLI
+flags. Measure what the type system needs (an operation-generic clause? an effect-row
+variable a handler can be abstracted over?), survey Koka/Effekt/Frank, decide in a spec,
+and prototype in the evaluator first. Strings natively (step 4) are a prerequisite of a
+serialized log.
 
 Also open, unscheduled: explicit wrapping arithmetic (`int.wrapping_mul` and friends, for
 hashes and generators) and unary minus natively (Core refuses "Unary"); a two-parameter

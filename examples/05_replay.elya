@@ -1,0 +1,187 @@
+// Exact replay and handler-based testing, written in Elya.
+//
+// A program touches the outside world only through effects, so whoever
+// handles them decides what the world says. Here the world is a pair of dice
+// and a clock. `live` answers them (a seeded generator stands in for real
+// randomness and time); `record` sits between the program and whichever
+// handler of `World` is outside it, and writes down every answer; `replay` feeds a recording back, and stops by name
+// the first time the program asks for something the recording does not hold.
+// `fixed` is a test double: no mocking framework, just another handler.
+//
+// None of the four knows anything about `game`. The program is written once.
+
+// One effect, two questions. (A handler covers exactly one effect, every
+// operation of it.)
+effect World {
+  fn roll(sides: Int) -> Int
+  fn now() -> Int
+}
+
+// --- the program under test -----------------------------------------------
+
+// A round: roll a die, and score it double if the clock says the round was
+// quick. Its result depends on every answer the world gives.
+fn round(sides: Int, last: Int) -> Int {
+  let r = roll(sides)
+  let t = now()
+  if t - last < 50 { 2 * r } else { r }
+}
+
+fn game(rounds: Int, sides: Int, last: Int) -> Int {
+  if rounds == 0 { 0 } else {
+    let s = round(sides, last)
+    s + game(rounds - 1, sides, now())
+  }
+}
+
+// The same game after a change that rolls an eight-sided die in its third
+// round: a replay of an old recording must notice.
+fn game_changed(rounds: Int, last: Int) -> Int {
+  if rounds == 0 { 0 } else {
+    let sides = if rounds == 3 { 8 } else { 6 }
+    let s = round(sides, last)
+    s + game_changed(rounds - 1, now())
+  }
+}
+
+// --- a recording ----------------------------------------------------------
+
+// One answer the world gave, with the question it answered.
+type Entry { Rolled(Int, Int), Told(Int) }
+type Log { End, Ent(Entry, Log) }
+
+type Recorded { Rec(Int, Log) }
+
+// Pass every question on to the world outside, and write the answer down.
+// The log is built as the resumed computation returns, so it is in order.
+fn record(body: fn() / {World} -> Int) / {World} -> Recorded {
+  handle { body() } with {
+    World.roll(sides) -> {
+      let v = roll(sides)
+      match resume(v) {
+        Rec(x, log) -> Rec(x, Ent(Rolled(sides, v), log))
+      }
+    }
+    World.now() -> {
+      let t = now()
+      match resume(t) {
+        Rec(x, log) -> Rec(x, Ent(Told(t), log))
+      }
+    }
+    return(x) -> Rec(x, End)
+  }
+}
+
+// --- replay ---------------------------------------------------------------
+
+// What the program asked for when the recording disagreed.
+type Want { WantRoll(Int), WantNow }
+
+type Outcome {
+  Replayed(Int),
+  // The program asked for `Want`; the rest of the recording is `Log`.
+  Diverged(Want, Log),
+  // The program finished with entries left over: the run was not the same.
+  Unconsumed(Int, Log)
+}
+
+// Answer every question from the recording. A handler's answer can be a
+// function: here, of the part of the log not yet used.
+fn replay(body: fn() / {World} -> Int, log: Log) -> Outcome {
+  let run = handle { body() } with {
+    World.roll(sides) -> fn(l: Log) {
+      match l {
+        Ent(Rolled(s, v), rest) -> if s == sides { resume(v)(rest) } else { Diverged(WantRoll(sides), l) }
+        Ent(Told(t), rest) -> Diverged(WantRoll(sides), l)
+        End -> Diverged(WantRoll(sides), l)
+      }
+    }
+    World.now() -> fn(l: Log) {
+      match l {
+        Ent(Told(t), rest) -> resume(t)(rest)
+        Ent(Rolled(s, v), rest) -> Diverged(WantNow, l)
+        End -> Diverged(WantNow, l)
+      }
+    }
+    return(x) -> fn(l: Log) {
+      match l {
+        End -> Replayed(x)
+        Ent(e, rest) -> Unconsumed(x, l)
+      }
+    }
+  }
+  run(log)
+}
+
+// --- worlds ---------------------------------------------------------------
+
+// The live world: a linear congruential generator for the dice, and a clock
+// that advances by an amount the generator picks.
+fn next(s: Int) -> Int { (s * 1103515245 + 12345) % 2147483648 }
+
+fn live(body: fn() / {World} -> Recorded, seed: Int) -> Recorded {
+  let run = handle { body() } with {
+    World.roll(sides) -> fn(s: Int) {
+      let s2 = next(s)
+      resume(s2 / 65536 % sides + 1)(s2)
+    }
+    World.now() -> fn(s: Int) {
+      let s2 = next(s)
+      resume(s2 / 65536 % 100)(s2)
+    }
+    return(x) -> fn(s: Int) { x }
+  }
+  run(seed)
+}
+
+// A test double: every die shows its highest face, and no time passes.
+fn fixed(body: fn() / {World} -> Int) -> Int {
+  handle { body() } with {
+    World.roll(sides) -> resume(sides)
+    World.now() -> resume(0)
+    return(x) -> x
+  }
+}
+
+fn length(l: Log) -> Int {
+  match l {
+    End -> 0
+    Ent(e, rest) -> 1 + length(rest)
+  }
+}
+
+pub fn main() -> Int {
+  // A test, by swapping the handler: 5 rounds of a six-sided die, all sixes,
+  // all quick, so every round scores 12.
+  let tested = fixed(fn() { game(5, 6, 0) })
+  let _ = if tested == 60 { io.println("test: 5 quick sixes score 60") } else { io.println("test: FAILED") }
+
+  // Record a live run.
+  let recorded = live(fn() { record(fn() { game(5, 6, 0) }) }, 2026)
+  match recorded {
+    Rec(score, log) -> {
+      let _ = io.println("recorded a live run")
+      // Replay it: the same answers, so the same score, with no world at all.
+      let again = replay(fn() { game(5, 6, 0) }, log)
+      let same = match again {
+        Replayed(x) -> if x == score { 1 } else { 0 }
+        Diverged(w, l) -> 0
+        Unconsumed(x, l) -> 0
+      }
+      let _ = if same == 1 { io.println("replay: same score") } else { io.println("replay: FAILED") }
+      // Replay it against the changed program: it stops at the third roll.
+      let changed = replay(fn() { game_changed(5, 0) }, log)
+      let stopped = match changed {
+        Replayed(x) -> 0
+        Diverged(w, l) -> match w {
+          WantRoll(sides) -> if sides == 8 { length(log) - length(l) } else { 0 }
+          WantNow -> 0
+        }
+        Unconsumed(x, l) -> 0
+      }
+      let _ = if stopped > 0 { io.println("replay of the changed game: diverged at an 8-sided roll") } else { io.println("replay of the changed game: FAILED") }
+      // The score, and where the changed game stopped (entries consumed).
+      score * 100 + stopped
+    }
+  }
+}

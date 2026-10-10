@@ -28,3 +28,10 @@ fn async_scheduler() {
     // handler, and one `each` for sync and async code (2026-10-09).
     insta::assert_snapshot!("04_async", run_example("04_async.elya"));
 }
+
+#[test]
+fn replay() {
+    // Exact replay and handler-based testing: record, replay and a test double,
+    // each an ordinary handler over the same program (2026-10-10).
+    insta::assert_snapshot!("05_replay", run_example("05_replay.elya"));
+}
