@@ -3,20 +3,18 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-09)
+## State at handoff (updated 2026-10-10, auto-run)
 
-- `main` has everything through #15 (5b-9b). The stacked PRs #16-#19 were merged into
-  each other's branches, not into `main`, so `main` still lacks 5b-10, the three
-  soundness fixes, E0207 and sub-effecting. **One PR lands all of it:** branch
-  `claude/sub-effecting` -> `main`. From now on: one PR at a time, always based on `main`.
+- `main` has everything through #21 (sub-effecting and checked annotations).
+- Scheduled auto-runs work on branch `auto/elya` (one draft PR to `main`) and log in
+  `AUTO_RUN_LOG.md`; the maintainer reviews on GitHub.
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
-  university address; every branch was force-pushed. Do not push old local branches.
+  former e-mail address; every branch was force-pushed. Do not push old local branches.
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Branch `claude/annotations` (checked type annotations) is stacked on #20's branch; its
-  PR targets `main` and shows only its own commit once #20 merges.
-- Linux gate at the annotations tip: 783 passed, 77 suites. `gc_mark` 637 bytes.
+- Linux gate at the tip of `auto/elya`: 886 passed, 85 suites. The runtime gained
+  `elya_cont_copy` (multi-shot); `gc_mark` is unchanged.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
   language decisions taken. The maintainer delegated all choices (rule 2).
@@ -135,63 +133,114 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   review found a native GC unsoundness through a generalized annotation variable (3395 for
   42), fixed first.
 
+- **N7 part 1: convention specialization and the upcast adapter (native)** (2026-10-09,
+  branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-09-elya-n7a-convention-specialization-design.md`. A
+  Core-to-Core pass (`crates/codegen/src/specialize.rs`): references that instantiate a
+  row variable at a user effect go to clones with substituted rows (top-level and
+  `let`-bound lambdas); upcasts are eta-expanded into adapter lambdas, at every covariant
+  layer. Fixed on the way: a pre-existing native miscompile of an upcast in a result
+  (2 for 3306) and of one at a callee's result (11 for 1511, found by the review).
+
+- **Async step 1: function types in declarations, and a scheduler written as a handler**
+  (2026-10-09, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-09-elya-async-step1-design.md`. `fn(A) / {E} -> R` in
+  constructor fields and operations (an unwritten declaration row is empty);
+  `examples/04_async.elya` (fork, yield, a round-robin queue, one `each` for sync and
+  async), the same bytes natively. Pattern binders are tracked by the native adapter.
+
+- **`resume` carries relayed, return-clause and re-entered-clause effects** (2026-10-09,
+  branch `auto/elya`): spec `docs/superpowers/specs/2026-10-09-elya-resume-row-complete-design.md`.
+  Closes the last parked resume-row gaps (15 probe programs checked clean and then hit an
+  unhandled effect); a lambda relaying an ENCLOSING parameter keeps its row open, so
+  `wrap(f)`/`compose` are accepted (natively with annotations, via N7 part 1).
+
+- **Native multi-shot handlers (`with multi`)** (2026-10-10, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-10-elya-native-multi-shot-design.md`. A resume of a
+  `with multi` handle re-enters a COPY of its captured frames (`elya_cont_copy` in the
+  runtime: next relinked, handler parents and `innermost` remapped); the original is never
+  run. Keyed on the handler's `with multi` (`CoreHandle::multi`), so a plain `with` over a
+  `multi` effect is one-shot natively, as in the evaluator. The live set stays bounded.
+
+- **The evaluator's continuation costs linearly at any depth** (2026-10-10, branch
+  `auto/elya`): spec `docs/superpowers/specs/2026-10-10-elya-eval-linear-continuations-design.md`.
+  Two causes, not the handler: a per-step depth walk, and perform/resume copying frames.
+  The continuation is now segmented at handlers (a meta-continuation): a perform walks
+  handler boundaries and shares the frames above them. `Interp::cost()` pins it
+  timing-free (`tests/eval_complexity.rs`); the PARKED shape runs at n = 100 000.
+
+- **`Int` arithmetic is exact or fails by name; `/` and `%` natively** (2026-10-10, branch
+  `auto/elya`, a prerequisite of the replay step): spec
+  `docs/superpowers/specs/2026-10-10-elya-checked-integer-arithmetic-design.md`. Overflow,
+  `MIN / -1` and a zero divisor stop both sides by the same name (the evaluator used to
+  panic, native wrapped); `MIN % -1` is 0. Closes 5b-1 §11's deferred overflow question.
+
+- **Nested and literal patterns natively** (2026-10-10, branch `auto/elya`, a prerequisite
+  of the replay step): spec `docs/superpowers/specs/2026-10-10-elya-native-pattern-compilation-design.md`.
+  A Core-to-Core pass (`crates/codegen/src/patterns.rs`) compiles them to flat matches
+  (test, then destructure: linear size). The first version copied failure continuations
+  and the review measured exponential code size; fixed test-first.
+
+- **Exact replay and handler-based testing** (2026-10-10, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-10-elya-replay-design.md`. `examples/05_replay.elya`:
+  `record`, `replay` (stops by name on the first divergence, rejects leftovers) and a test
+  double, as ordinary handlers over one program; the same bytes natively.
+
 ## The next five steps
 
-### 1. N7 part 1: convention specialization and the closure adapter (native)
+### 1. N7 part 2: type variables natively
 
-What sub-effecting newly accepts mostly stops at two native refusals: "effect-polymorphic
-function used at a user effect" (D16) and "direct function used where an effectful one is
-expected". Both are about CONVENTION, not representation. A row-polymorphic function
-needs at most two compiled versions (direct, and CPS when its row variable is instantiated
-at a user effect), so compile the CPS clone on demand: inside it, an open row variable of
-the function's own type counts as effectful. A direct closure used at an effectful type
-gets an adapter closure, `adapt(clos, args.., k) = k(code(clos.inner, args..))`, with one
-descriptor row. Measure first (`w(k) { k(0) + lg(1) }`, `twice`, the review's a1/q1/s1h,
-`tests/sub_effecting.rs`, through `build`), keep `gc_mark` byte-identical; the type-variable
-half of N7 (`Ty::Var`, "unrepresentable type"; specialisation plus dictionary passing,
-`@specialize`/`@share`, a code-size budget) is part 2.
+`twice(f, x)` with `x: 'a`, and every unannotated `wrap`/`compose` (now accepted by the
+front end), are "unrepresentable type" natively. Monomorphize type variables like rows
+(N7 part 1's `specialize.rs` already matches signatures against uses), with the code-size
+budget, or pass dictionaries -- decide in the spec. Parametric ADTs (`type Q(a)`) are the
+same question for constructors. Also: aliases of generic locals (`let mk2 = mk`) are
+refused by name.
 
-### 2. Async as an effect: a scheduler handler (ROADMAP priority 1)
+### 2. Async step 2: structured concurrency and a poll loop
 
-An `Async` effect (`fork`, `yield`) and a round-robin scheduler written as an ordinary
-Elya handler that keeps a queue of suspended continuations. Show that the same `map` works
-for sync and async code (no function colouring). The evaluator first, then natively (a
-queue of continuations needs escaped resumes, which work natively; `fork` may need
-multi-shot or a second continuation: measure). Ship `examples/04_async.elya`, with tests
-and a README section.
+ROADMAP 1b/1c on top of `examples/04_async.elya`: a scope handler that joins its children
+(a `spawn` returning a handle, `await` as an effect), then real I/O readiness through a
+runtime poll loop the scheduler consults. Recursion through a handle body (PARKED) blocks
+the natural recursive `task`: measure whether it is the next front-end fix.
 
-### 3. Native multi-shot handlers (`with multi`)
+### 3. A backtracking example, and handler frames in deep chains
 
-Refused natively by name since 5b-8 (A2); the evaluator runs them. A multi-shot resume
-re-runs a captured continuation, but native frames are consumed in place -- and since 5b-10
-a resume also MUTATES its handler frame (`next`, `parent`): a second resume needs the frame
-chain, handler frames included, COPIED first, and the one-shot word replaced by a
-copy-on-resume rule. Measure first (the evaluator's multi-shot corpus, e.g.
-`multi_shot_collects_both_branches`, through `build`), then a spec with the copy cost
-stated and gated against A4's live-set instrument. Multi-shot is what a native
-probabilistic or backtracking handler needs (ROADMAP), so it is worth doing natively.
+Multi-shot runs natively now; show it: `examples/05_search.elya` (or the next free
+number), an N-queens or subset-sum search written as an ordinary function over a
+`multi` `Choose` effect, with handlers that collect all answers, the first answer, and a
+count -- one search, three meanings, the same bytes natively. Then measure the one shape
+the multi-shot review could not build: a captured chain holding MANY handler frames
+(blocked by PARKED's "recursion through a handle body"); if step 2's front-end fix lands
+first, add it to `MULTI_SHOT` and time the copy (it maps parents through a hash table, so
+it should stay linear).
 
-### 4. Evaluator: non-tail recursion under a handler is quadratic
+### 4. Native strings
 
-PARKED: about 4× time per doubling (n=4000 takes 1.7 s; n=100 000 did not finish in 10
-minutes). This caps every differential test's N. Profile (frame capture copies the
-continuation?), predict the complexity, fix, and pin it with a timing-free test that
-counts steps or allocations. The evaluator is the reference semantics, so the
-differential corpora must stay green unchanged.
+`<>` is refused natively and there is no Int-to-String, so every native example prints a
+number. Add the builtin (`int.to_string`, Claude's call) to the front end and evaluator,
+then strings natively: concatenation in the runtime (GC-managed byte arrays), the builtin,
+and `io.println` of a computed string. Measure first which examples and corpora this
+unlocks (the CEK machine's output, the replay log of `examples/05_replay.elya`), and pin
+it with differential tests.
 
-### 5. Exact replay and handler-based testing (ROADMAP priority 3)
+### 5. Effect-polymorphic handlers (a recorder for ANY effect)
 
-A `Record` handler that wraps a computation and logs every effect's answer (op name,
-arguments, the value it resumed with), and a `Replay` handler that feeds a log back and
-stops by name on the first divergence. Written in Elya as ordinary handlers over a demo
-effect set first (needs a list of answers: an ADT log is enough; strings wait for native
-`<>`), shown on a program whose result depends on its effects, then a test that swaps
-handlers instead of mocking. Evaluator and native. Ship `examples/05_replay.elya` with
-tests and a README section; the CLI flag (`elya run --record/--replay`) comes after real
-I/O effects exist.
+Replay (done, `examples/05_replay.elya`) records one fixed effect: a handler covers
+exactly one effect, every operation of it, so a generic `record` would need a handler
+over "every operation of some effect `e`" -- the ROADMAP's next replay step before the CLI
+flags. Measure what the type system needs (an operation-generic clause? an effect-row
+variable a handler can be abstracted over?), survey Koka/Effekt/Frank, decide in a spec,
+and prototype in the evaluator first. Strings natively (step 4) are a prerequisite of a
+serialized log.
 
-Also open, unscheduled: native strings (`<>` refused natively, no Int-to-String; the
-builtin's name is Claude's call now -- `int.to_string` is the natural one); the roadmap's
+Also open, unscheduled: explicit wrapping arithmetic (`int.wrapping_mul` and friends, for
+hashes and generators) and unary minus natively (Core refuses "Unary"); a two-parameter
+lambda passed to a higher-order function is "unrepresentable" natively (N7 part 2?); the
+one-shot trap's words differ (evaluator "continuation resumed more than once", native
+"a one-shot continuation was resumed twice"); the parser continues a call across a
+newline (`f()` then a line starting `(` is `f()(...)`) -- a layout rule is a language
+decision; the roadmap's
 other priorities (record/replay handlers, then capabilities once modules exist); the rest
 of the soundness sweep (resume's row lacks return-clause and re-entered-clause effects;
 recursion through a lambda the function handles around, PARKED); recursion through a

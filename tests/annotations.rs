@@ -220,15 +220,16 @@ fn parenthesised_and_empty_types_parse() {
 }
 
 #[test]
-fn a_function_type_in_a_declaration_is_named_not_unknown() {
-    // F7: function types now parse everywhere; in a type or effect
-    // declaration they are not supported yet, and the error says so.
+fn a_function_type_in_a_declaration_checks() {
+    // F7 named function types in declarations "not supported yet"; async
+    // step 1 (2026-10-09) supports them (replaces
+    // `a_function_type_in_a_declaration_is_named_not_unknown`; the rules are
+    // in tests/fn_fields.rs).
     for src in [
         "type Box { B(fn(Int) -> Int) }\npub fn main() -> Int { 0 }\n",
         "effect E { fn ap(f: fn(Int) -> Int) -> Int }\npub fn main() -> Int { 0 }\n",
     ] {
-        let err = check_err(src);
-        assert!(err.contains("function type"), "{err}");
+        assert!(check_source("t.elya", src).is_ok(), "{src}");
     }
 }
 

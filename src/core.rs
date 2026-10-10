@@ -82,6 +82,11 @@ pub struct CoreHandle {
     /// `multi`-declared effect is stamped too (§5.2's deliberate over-refusal).
     /// §5.4 puts the REFUSAL in codegen, where an execution test can observe it.
     pub is_multi_declared: bool,
+    /// The handler's own `with multi` (native multi-shot, 2026-10-10, spec D1):
+    /// the bit native re-entry keys on. A resume of a `multi` handle re-enters
+    /// a COPY of its captured frames; every other resume is one-shot, as in the
+    /// evaluator (E0425), so a plain `with` over a `multi` effect is `false`.
+    pub multi: bool,
 }
 
 /// One `Effect.op(params) -> body` clause. `effect` is always the name the
@@ -284,6 +289,37 @@ struct LowerCx {
 /// reference and maps to `Ty::Con` with its args elaborated. No type parameters
 /// reach here, so there is no substitution.
 fn ann_to_ty(a: &TypeAnn) -> Ty {
+    // A function type in a declaration (2026-10-09, async step 1): its row is
+    // exactly what is written, closed -- the same elaboration inference gives
+    // the field (`types::elaborate_adt_ty`), so the back end reads the
+    // field's real type (a pattern binder holding a closure is tracked by it).
+    if a.name == "fn" && !a.args.is_empty() {
+        let n = a.args.len();
+        let params = a.args[..n - 1].iter().map(|x| ann_to_ty(&x.node)).collect();
+        let ret = ann_to_ty(&a.args[n - 1].node);
+        let labels = a
+            .row
+            .iter()
+            .flatten()
+            .map(|l| {
+                (
+                    l.node.clone(),
+                    crate::types::EffectLabel {
+                        args: Vec::new(),
+                        span: l.span,
+                    },
+                )
+            })
+            .collect();
+        return Ty::Fn(
+            params,
+            crate::types::EffectRow {
+                labels,
+                tail: crate::types::RowTail::Closed,
+            },
+            Box::new(ret),
+        );
+    }
     match a.name.as_str() {
         "Int" => Ty::int(),
         "Float" => Ty::float(),
@@ -571,6 +607,7 @@ fn lower_expr(
                 clauses: clauses.into(),
                 ret,
                 is_multi_declared,
+                multi: handler.multi,
             }))
         }
         Expr::Resume { arg } => {

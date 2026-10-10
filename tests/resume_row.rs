@@ -218,3 +218,181 @@ fn a_multi_shot_direct_resume_does_not_borrow_the_enclosing_io() {
         warnings("t.elya", src)
     );
 }
+
+// ---- relayed and return-clause effects (2026-10-09, auto-run) -------------
+//
+// Re-found by the async-step-1 review: `resume`'s row took the handled
+// body's LABELS only, so an effect the body RELAYS through a parameter's row
+// (`task(body)` calling `body()`) and the RETURN clause's effects were not in
+// the row of a lambda that resumes. Such a lambda, stored and called after
+// the outer handler returned, performed an effect nothing handled: `check`
+// clean, the evaluator stopped on "unhandled effect", natively the runtime's
+// "no clause" guard.
+
+const RELAY_HEAD: &str = "effect Y { fn yld() -> Unit }\n\
+effect L { fn lg() -> Int }\n\
+effect Z { fn z() -> Int }\n";
+
+#[test]
+fn a_resume_carries_effects_the_body_relays_through_a_parameter() {
+    for (tag, field_row, run) in [
+        ("pure field", "", "match t { D(x) -> x  K(k) -> match k() { D(x) -> x  K(j) -> 0 } }"),
+        (
+            "field admits Z",
+            " / {Z}",
+            "handle { match t { D(x) -> x  K(k) -> match k() { D(x) -> x  K(j) -> 0 } } } with { Z.z() -> resume(1)  return(r) -> r }",
+        ),
+    ] {
+        let src = format!(
+            "{RELAY_HEAD}type T {{ D(Int), K(fn(){field_row} -> T) }}\n\
+             fn task(body) {{ handle {{ body() }} with {{ Y.yld() -> K(fn() {{ resume(Unit) }})  return(x) -> D(x) }} }}\n\
+             pub fn main() -> Int {{\n\
+             \x20 let t = handle {{ task(fn() {{ let _ = yld()  lg() }}) }} with {{ L.lg() -> resume(1)  return(r) -> r }}\n\
+             \x20 {run}\n\
+             }}\n"
+        );
+        let err = check_err(&src);
+        assert!(err.contains("E0423") || err.contains("E0420"), "{tag}: {err}");
+    }
+}
+
+#[test]
+fn a_resume_carries_the_return_clauses_effects() {
+    let err = check_err(&format!(
+        "{RELAY_HEAD}type T {{ D(Int), K(fn() / {{Z}} -> T) }}\n\
+         fn sp() -> T {{ handle {{ let _ = yld()  5 }} with {{ Y.yld() -> K(fn() {{ resume(Unit) }})  return(x) -> D(x + lg()) }} }}\n\
+         pub fn main() -> Int {{\n\
+         \x20 let t = handle {{ sp() }} with {{ L.lg() -> resume(1)  return(r) -> r }}\n\
+         \x20 handle {{ match t {{ D(x) -> x  K(k) -> match k() {{ D(x) -> x  K(j) -> 0 }} }} }} with {{ Z.z() -> resume(1)  return(r) -> r }}\n\
+         }}\n"
+    ));
+    assert!(err.contains("E0423") || err.contains("E0420"), "{err}");
+}
+
+/// The same relay, the resuming lambda returned as the handle's value: its
+/// row names the body's relay, so calling it where L is not handled is E0420.
+const RELAY_RETURNED: &str = "fn task(body) { handle { body() } with { Y.yld() -> fn() { let a = z()  let r = resume(Unit)  r() + a }  return(x) -> fn() { x } } }\n";
+
+#[test]
+fn a_returned_resuming_lambda_carries_the_relay() {
+    let err = check_err(&format!(
+        "{RELAY_HEAD}{RELAY_RETURNED}\
+         pub fn main() -> Int {{\n\
+         \x20 let k = handle {{ task(fn() {{ let _ = yld()  lg() }}) }} with {{ L.lg() -> resume(1)  return(r) -> r }}\n\
+         \x20 handle {{ k() }} with {{ Z.z() -> resume(1)  return(r) -> r }}\n\
+         }}\n"
+    ));
+    assert!(err.contains("E0420"), "{err}");
+}
+
+#[test]
+fn a_relayed_resume_called_under_its_handlers_checks_and_runs() {
+    // The control: the same lambda called while L is still handled. Rows
+    // unify by equality, so the lambda's own `z` reaches the relayed row of
+    // `body` and with it `task`'s row: Z is handled around the whole run.
+    checks_and_prints(
+        &format!(
+            "{RELAY_HEAD}{RELAY_RETURNED}\
+             pub fn main() {{\n\
+             \x20 let v = handle {{ handle {{\n\
+             \x20   let k = task(fn() {{ let _ = yld()  lg() }})\n\
+             \x20   k()\n\
+             \x20 }} with {{ Z.z() -> resume(1)  return(r) -> r }} }} with {{ L.lg() -> resume(1)  return(r) -> r }}\n\
+             \x20 io.println(if v == 2 {{ \"2\" }} else {{ \"wrong\" }})\n\
+             }}\n"
+        ),
+        "2\n",
+    );
+}
+
+/// The resumed body re-enters the SAME clause at its second `get()`, and the
+/// clause performs T before building the lambda: the lambda's row must hold
+/// every clause's effects, which are known only after all clauses are typed.
+const REENTERS: &str = "effect S { fn get() -> Int }\n\
+effect T { fn t() -> Int }\n\
+fn inner() { handle { get() + get() } with { S.get() -> { let y = t()  fn(s) { (resume(s + y))(s) } }  return(x) -> fn(s) { x } } }\n";
+
+#[test]
+fn a_resume_carries_the_effects_of_clauses_it_re_enters() {
+    let err = check_err(&format!(
+        "{REENTERS}pub fn main() -> Int {{\n\
+         \x20 let f = handle {{ inner() }} with {{ T.t() -> resume(10)  return(r) -> r }}\n\
+         \x20 f(5)\n\
+         }}\n"
+    ));
+    assert!(err.contains("E0420"), "{err}");
+}
+
+#[test]
+fn a_re_entering_resume_called_under_its_handler_checks_and_runs() {
+    // (5 + 10) + (5 + 10) = 30: both gets, each clause run adds y = 10.
+    checks_and_prints(
+        &format!(
+            "{REENTERS}pub fn main() {{\n\
+             \x20 let v = handle {{ let f = inner()  f(5) }} with {{ T.t() -> resume(10)  return(r) -> r }}\n\
+             \x20 io.println(if v == 30 {{ \"30\" }} else {{ \"wrong\" }})\n\
+             }}\n"
+        ),
+        "30\n",
+    );
+}
+
+// ---- the independent review of the re-entered-clause half -----------------
+//
+// The first version kept a resuming lambda's row open until its handle was
+// done, keyed on the lambda: a `let` generalized that open row first (its
+// later labels never reached the uses), and a resume inside a nested handle
+// inside the lambda was recorded on the nested handle's ambient, so the lambda
+// closed early. Both checked clean and stopped on "unhandled effect `lg`".
+// Now an escaped resume's ambient takes the handle's CLAUSES ROW as a tail,
+// which is neither closed nor generalized until the handle is done.
+
+const RC_HEAD: &str = "effect Y { fn yld() -> Unit  fn get() -> Int }\n\
+effect L { fn lg() -> Int }\n\
+effect Z { fn z() -> Int }\n\
+type T { D(Int), K(fn() -> T) }\n";
+
+fn rc_program(yld_clause: &str) -> String {
+    format!(
+        "{RC_HEAD}fn sp() -> T {{ handle {{ let _ = yld()  get() }} with {{ {yld_clause}  Y.get() -> resume(lg())  return(x) -> D(x) }} }}\n\
+         pub fn main() -> Int {{\n\
+         \x20 let t = handle {{ sp() }} with {{ L.lg() -> resume(4)  return(r) -> r }}\n\
+         \x20 match t {{ D(x) -> x  K(k) -> match k() {{ D(x) -> x  K(j) -> 0 }} }}\n\
+         }}\n"
+    )
+}
+
+#[test]
+fn a_let_bound_resuming_lambda_carries_the_clauses_it_re_enters() {
+    let err = check_err(&rc_program(
+        "Y.yld() -> { let k = fn() { resume(Unit) }  K(k) }",
+    ));
+    assert!(err.contains("E0423"), "{err}");
+}
+
+#[test]
+fn a_resume_in_a_nested_handle_inside_a_lambda_carries_the_clauses_it_re_enters() {
+    for clause in [
+        "Y.yld() -> K(fn() { handle { resume(Unit) } with { Z.z() -> resume(0)  return(r) -> r } })",
+        "Y.yld() -> K(fn() { handle { 0 } with { Z.z() -> resume(0)  return(r) -> resume(Unit) } })",
+    ] {
+        let err = check_err(&rc_program(clause));
+        assert!(err.contains("E0423"), "{clause}: {err}");
+    }
+}
+
+#[test]
+fn a_local_lambda_forwarding_a_parameter_shares_its_row_known_limitation() {
+    // Rows unify by equality: `k` relays `f`'s row, so `k`'s uses under two
+    // handlers put L and Z into `f`'s row, and L reaches `g` (E0420). The same
+    // program calling `f` directly instead of `k` was already rejected this way;
+    // before 2026-10-09 `k` was closed at the lambda (forcing `f` pure), which
+    // accepted this and rejected `wrap(f)` used at an effect.
+    let err = check_err(
+        "effect L { fn lg(x: Int) -> Int }\n\
+         effect Z { fn z() -> Int }\n\
+         fn g(f) { let k = fn(x) { f(x) }  let a = handle { k(1) + lg(1) } with { L.lg(x) -> resume(100)  return(r) -> r }  let b = handle { k(2) + z() } with { Z.z() -> resume(10)  return(r) -> r }  a + b }\n\
+         pub fn main() -> Int { g(fn(x) { x }) }\n",
+    );
+    assert!(err.contains("E0420"), "{err}");
+}

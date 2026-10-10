@@ -9,17 +9,20 @@
 //! Proof is EXECUTION (tests/native_codegen.rs), never IR inspection (spec §0):
 //! `emit_ir` is a debugging aid and nothing in the suite asserts on its output.
 //! Semantic-fidelity rule (§3.4, §4.1): native codegen must be neither more- nor
-//! less-undefined than the tree evaluator. Hence no Div/Rem (UB on a zero
-//! divisor, and it drags in the runtime-error path), Add/Sub/Mul emitted WITHOUT
-//! nsw/nuw so overflow is defined two's-complement wrapping, and `&&`/`||`
+//! less-undefined than the tree evaluator. Hence `Int` arithmetic is exact or
+//! fails by name on both sides (2026-10-10: overflow and a zero divisor trap
+//! through the runtime with the evaluator's words), and `&&`/`||`
 //! STRICT rather than short-circuiting — because both of Elya's evaluators are
 //! strict, so a short-circuit diamond would make native binaries *less*
-//! undefined than `elya run`, observable the moment Div lands. Short-circuiting
-//! is a front-end question, not a back-end one.
+//! undefined than `elya run` -- observable now that `/` can fail:
+//! `False && 1 / 0 == 0` fails on both sides. Short-circuiting is a front-end
+//! question, not a back-end one.
 
 mod closure;
 mod cps;
 mod cps_emit;
+mod patterns;
+mod specialize;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -986,24 +989,74 @@ fn arm_body<'ctx>(
 /// values were computed before a continuation site, applies exactly the same
 /// operators -- one table, not two that could drift.
 fn prim_values<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
     b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
     op: BinOp,
     l: IntValue<'ctx>,
     r: IntValue<'ctx>,
 ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
-    // Deliberately NO nsw/nuw flags: defined two's-complement wrapping
-    // (§3.4). Overflow reconciliation with the evaluator is tracked in
-    // spec §11 — not silently decided here.
-    //
+    // `Int` arithmetic is exact or fails by name (spec
+    // 2026-10-10-elya-checked-integer-arithmetic, D3), as in the evaluator:
+    // `+ - *` through LLVM's overflow intrinsics, `/` and `%` guarded so that
+    // `sdiv`/`srem` never see an input where they are undefined.
+    match op {
+        BinOp::Add => return checked(ctx, func, b, lc, "llvm.sadd.with.overflow", l, r),
+        BinOp::Sub => return checked(ctx, func, b, lc, "llvm.ssub.with.overflow", l, r),
+        BinOp::Mul => return checked(ctx, func, b, lc, "llvm.smul.with.overflow", l, r),
+        BinOp::Div => {
+            let i64t = ctx.i64_type();
+            let zero = b
+                .build_int_compare(IntPredicate::EQ, r, i64t.const_zero(), "dz")
+                .map_err(internal)?;
+            trap_if(ctx, func, b, zero, lc.div_zero, "div_zero")?;
+            let min = b
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    l,
+                    i64t.const_int(i64::MIN as u64, true),
+                    "dmin",
+                )
+                .map_err(internal)?;
+            let neg1 = b
+                .build_int_compare(IntPredicate::EQ, r, i64t.const_all_ones(), "dneg1")
+                .map_err(internal)?;
+            let ovf = b.build_and(min, neg1, "dovf").map_err(internal)?;
+            trap_if(ctx, func, b, ovf, lc.int_overflow, "div_overflow")?;
+            return b
+                .build_int_signed_div(l, r, "div")
+                .map(|v| v.into())
+                .map_err(internal);
+        }
+        BinOp::Rem => {
+            let i64t = ctx.i64_type();
+            let zero = b
+                .build_int_compare(IntPredicate::EQ, r, i64t.const_zero(), "rz")
+                .map_err(internal)?;
+            trap_if(ctx, func, b, zero, lc.rem_zero, "rem_zero")?;
+            // `x % -1` is 0 for every x, and `srem MIN, -1` is undefined: divide
+            // by 1 instead, which gives the same 0 without the undefined input.
+            let neg1 = b
+                .build_int_compare(IntPredicate::EQ, r, i64t.const_all_ones(), "rneg1")
+                .map_err(internal)?;
+            let d = b
+                .build_select(neg1, i64t.const_int(1, false), r, "rdiv")
+                .map_err(internal)?
+                .into_int_value();
+            return b
+                .build_int_signed_rem(l, d, "rem")
+                .map(|v| v.into())
+                .map_err(internal);
+        }
+        _ => {}
+    }
     // Comparisons are SIGNED: Elya's Int is i64 two's-complement, so
     // `(0 - 1) < 1` must be true. `and`/`or` are strict and bit-wise on
     // i1 because BOTH evaluators are strict (spec §4.1) — a
     // short-circuit diamond here would make native less-undefined than
-    // `elya run`, which is the mirror image of the Div trade.
+    // `elya run` (a guarded `/` on the right of `&&` would be skipped).
     let built = match op {
-        BinOp::Add => b.build_int_add(l, r, "add"),
-        BinOp::Sub => b.build_int_sub(l, r, "sub"),
-        BinOp::Mul => b.build_int_mul(l, r, "mul"),
         BinOp::Lt => b.build_int_compare(IntPredicate::SLT, l, r, "lt"),
         BinOp::Le => b.build_int_compare(IntPredicate::SLE, l, r, "le"),
         BinOp::Gt => b.build_int_compare(IntPredicate::SGT, l, r, "gt"),
@@ -1015,6 +1068,60 @@ fn prim_values<'ctx>(
         other => return Err(CodegenError::Unsupported(op_label(other))),
     };
     built.map(|v| v.into()).map_err(internal)
+}
+
+/// One of LLVM's `*.with.overflow.i64` intrinsics: the result, and a branch
+/// to `elya_int_overflow` when its overflow bit is set.
+#[allow(clippy::too_many_arguments)]
+fn checked<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    intrinsic: &str,
+    l: IntValue<'ctx>,
+    r: IntValue<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    let decl = inkwell::intrinsics::Intrinsic::find(intrinsic)
+        .and_then(|i| i.get_declaration(lc.module, &[i64t.into()]))
+        .ok_or_else(|| internal(format!("no intrinsic {intrinsic}")))?;
+    let pair = b
+        .build_call(decl, &[l.into(), r.into()], "ck")
+        .map_err(internal)?
+        .try_as_basic_value()
+        .left()
+        .ok_or_else(|| internal("overflow intrinsic returned nothing"))?
+        .into_struct_value();
+    let value = b.build_extract_value(pair, 0, "ckv").map_err(internal)?;
+    let ovf = b
+        .build_extract_value(pair, 1, "cko")
+        .map_err(internal)?
+        .into_int_value();
+    trap_if(ctx, func, b, ovf, lc.int_overflow, "overflow")?;
+    Ok(value)
+}
+
+/// Branch to a block that calls `trap` (which exits) when `cond` holds; the
+/// builder continues in the other block.
+fn trap_if<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    cond: IntValue<'ctx>,
+    trap: FunctionValue<'ctx>,
+    name: &str,
+) -> Result<(), CodegenError> {
+    let bad = ctx.append_basic_block(func, name);
+    let ok = ctx.append_basic_block(func, "arith_ok");
+    b.build_conditional_branch(cond, bad, ok)
+        .map_err(internal)?;
+    b.position_at_end(bad);
+    b.build_call(trap, &[], "trap").map_err(internal)?;
+    // The trap exits; a placeholder terminator, not the trap itself.
+    b.build_unreachable().map_err(internal)?;
+    b.position_at_end(ok);
+    Ok(())
 }
 
 /// §3.3 expression lowering: a recursive fold returning a `BasicValueEnum`,
@@ -1144,7 +1251,7 @@ fn lower_expr<'ctx>(
             }
             let l = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
             let r = lower_expr(ctx, func, b, lc, &args[1], env)?.into_int_value();
-            prim_values(b, *op, l, r)
+            prim_values(ctx, func, b, lc, *op, l, r)
         }
         CoreKind::App(callee, args) => {
             // Ordinary (non-tail) position: `tailcc` convention, NO tail-call
@@ -1341,6 +1448,10 @@ pub(crate) struct Descriptors {
     pub(crate) site_tags: std::collections::BTreeMap<usize, usize>,
     /// Handle key (`HandlerSite::key`) -> the tag its handler frame carries.
     pub(crate) handler_tags: std::collections::BTreeMap<usize, usize>,
+    /// The first handler tag. Handler rows are exactly `[handler_lo, cont_tag)`
+    /// (guarded below): `elya_cont_copy` tells a handler frame from a site
+    /// frame by that range alone (native multi-shot, spec D3).
+    pub(crate) handler_lo: usize,
     /// D13: the continuation object's tag.
     pub(crate) cont_tag: usize,
 }
@@ -1463,6 +1574,7 @@ fn descriptor_rows(
     // value j is bit j+4. Always its own row -- its arity is never the frame
     // row's.
     let mut handler_tags = std::collections::BTreeMap::new();
+    let handler_lo = desc.len() / 2;
     for h in handlers {
         handler_tags.insert(h.key, desc.len() / 2);
         desc.push(4 + h.saved.len() as u64);
@@ -1482,6 +1594,11 @@ fn descriptor_rows(
     // is the handler that was current at the perform, which a resume makes
     // current again (traced, bit 2).
     let cont_tag = desc.len() / 2;
+    if handler_lo + handlers.len() != cont_tag {
+        return Err(CodegenError::Unsupported(
+            "handler tags are not contiguous below the continuation tag",
+        ));
+    }
     desc.push(3);
     desc.push(0b101);
     Ok(Descriptors {
@@ -1489,6 +1606,7 @@ fn descriptor_rows(
         frame_tag,
         site_tags,
         handler_tags,
+        handler_lo,
         cont_tag,
     })
 }
@@ -1549,6 +1667,14 @@ struct LowerCtx<'a, 'ctx> {
     current_handler: inkwell::values::PointerValue<'ctx>,
     resume_twice: FunctionValue<'ctx>,
     unhandled: FunctionValue<'ctx>,
+    /// Checked `Int` arithmetic's traps (`ccc`, they exit):
+    /// `elya_int_overflow`, `elya_div_zero`, `elya_rem_zero`.
+    int_overflow: FunctionValue<'ctx>,
+    div_zero: FunctionValue<'ctx>,
+    rem_zero: FunctionValue<'ctx>,
+    /// Native multi-shot (spec D3): `elya_cont_copy(cont, hlo, hhi) -> cont'`
+    /// (`ccc`), a fresh continuation over a copy of the captured frames.
+    cont_copy: FunctionValue<'ctx>,
 }
 
 /// Fold `core.types` into a flat constructor table: name -> (tag, field types).
@@ -1584,6 +1710,15 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
             ));
         }
     }
+
+    // N7 part 1: monomorphize rows where a reference needs another convention,
+    // and eta-expand upcasts, so every phase below sees types that say the
+    // right convention. Pure Core-to-Core; nothing is emitted yet.
+    let specialized = specialize::run(core)?;
+    // Nested and literal patterns become the flat matches, `if`s and `let`s
+    // both emitters support (spec 2026-10-10-elya-native-pattern-compilation).
+    let specialized = patterns::run(&specialized);
+    let core = &specialized;
 
     // The closure tags continue the constructor numbering, so `first_tag` is the
     // number of REAL descriptor rows — computed the same way the descriptor table
@@ -1674,6 +1809,11 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let trap_ty = ctx.void_type().fn_type(&[], false);
     let resume_twice = module.add_function("elya_resume_twice", trap_ty, None); // ccc
     let unhandled = module.add_function("elya_unhandled_effect", trap_ty, None); // ccc
+    let int_overflow = module.add_function("elya_int_overflow", trap_ty, None); // ccc
+    let div_zero = module.add_function("elya_div_zero", trap_ty, None); // ccc
+    let rem_zero = module.add_function("elya_rem_zero", trap_ty, None); // ccc
+    let cont_copy_ty = ptrt.fn_type(&[ptrt.into(), i64t.into(), i64t.into()], false);
+    let cont_copy = module.add_function("elya_cont_copy", cont_copy_ty, None); // ccc
 
     // `elya_current_handler`: a declaration (no initializer); the definition
     // lives in runtime.c.
@@ -1712,7 +1852,11 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         op_ids: &op_ids,
         current_handler,
         resume_twice,
+        int_overflow,
+        div_zero,
+        rem_zero,
         unhandled,
+        cont_copy,
     };
     let b = ctx.create_builder();
     for f in &core.fns {
@@ -1998,10 +2142,15 @@ mod tests {
         );
     }
 
+    // Was `rejects_div_specifically` (5b-1: no Div until a guard existed). The
+    // checked-arithmetic decision (2026-10-10) supplies the guard; execution
+    // is proved in `tests/native_codegen.rs` (`integer_division_runs_natively`).
     #[test]
-    fn rejects_div_specifically() {
-        let err = emit_ir(&main_fn(prim(BinOp::Div, int_lit(1), int_lit(2)))).unwrap_err();
-        assert!(matches!(err, CodegenError::Unsupported("Div")), "{err:?}");
+    fn div_and_rem_lower_to_verifier_clean_ir() {
+        for op in [BinOp::Div, BinOp::Rem] {
+            emit_ir(&main_fn(prim(op, int_lit(7), int_lit(2))))
+                .unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
+        }
     }
 
     #[test]
@@ -2303,25 +2452,24 @@ mod tests {
                 clauses: clauses.into(),
                 ret: None,
                 is_multi_declared: multi,
+                multi,
             })),
         }
     }
 
+    /// Native multi-shot (2026-10-10) replaces 5b-8's
+    /// `a_multi_shot_handler_is_refused_by_its_own_name`: the refusal is lifted.
     #[test]
-    fn a_multi_shot_handler_is_refused_by_its_own_name() {
-        let err = emit_ir(&main_fn(handle_expr(Vec::new(), true))).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("multi"),
-            "the message must name the feature: {msg}"
-        );
+    fn a_multi_shot_handler_compiles() {
+        emit_ir(&main_fn(handle_expr(Vec::new(), true))).expect("a multi handle compiles");
     }
 
+    /// Native multi-shot (2026-10-10) replaces 5b-8's
+    /// `the_multi_refusal_fires_before_any_clause_body_is_lowered`: with no
+    /// handle-node refusal, the poisonous clause body is lowered and refuses
+    /// with ITS OWN message.
     #[test]
-    fn the_multi_refusal_fires_before_any_clause_body_is_lowered() {
-        // `Var("unbound")` in the clause body would refuse with its OWN
-        // message; seeing "multi" proves the handle-node refusal fired first
-        // (spec 5.4).
+    fn a_multi_shot_handlers_clause_bodies_are_lowered() {
         let poisonous = CoreExpr {
             span: Span::EMPTY,
             ty: Ty::Base(TyCon::Int),
@@ -2335,16 +2483,13 @@ mod tests {
         };
         let err = emit_ir(&main_fn(handle_expr(vec![clause], true))).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("multi"), "{msg}");
-        assert!(
-            !msg.contains("unbound"),
-            "the clause body was lowered before the refusal fired: {msg}"
-        );
+        assert!(msg.contains("unbound"), "{msg}");
+        assert!(!msg.contains("multi"), "the handle node was refused: {msg}");
     }
 
     /// Source -> Core, with the front end allowed to WARN: `with multi` is
     /// deliberately not an error (E0426 stays a warning), so it type-checks
-    /// and lowers; the refusal is codegen's alone.
+    /// and lowers.
     fn lower_warned_source(src: &str) -> CoreModule {
         let session = elya::Session::new();
         let (m, pd) = elya::parse::parse_module(&session, src);
@@ -2359,15 +2504,16 @@ mod tests {
         elya::core::lower_module(&m, &table).expect("must lower to Core")
     }
 
+    /// Native multi-shot (2026-10-10) replaces 5b-8's
+    /// `a_multi_shot_handler_written_in_source_reaches_the_codegen_refusal`.
     #[test]
-    fn a_multi_shot_handler_written_in_source_reaches_the_codegen_refusal() {
+    fn a_multi_shot_handler_written_in_source_compiles() {
         let src = "effect multi Flip { fn flip() -> Bool }\n\
                    fn g() -> Int { if flip() { 1 } else { 0 } }\n\
                    pub fn main() -> Int {\n\
                    \x20 handle g() with multi { Flip.flip() -> resume(True) }\n\
                    }\n";
-        let err = emit_ir(&lower_warned_source(src)).unwrap_err();
-        assert!(err.to_string().contains("multi"), "{err:?}");
+        emit_ir(&lower_warned_source(src)).expect("a multi handle compiles");
     }
 
     #[test]
@@ -2392,22 +2538,17 @@ mod tests {
     }
 
     #[test]
-    fn an_effect_polymorphic_function_used_at_a_user_effect_is_refused() {
-        // D16: `apply` is compiled once, direct; this instantiation would call
-        // an effectful lambda with the direct convention. N7's territory.
-        let err = refused(
-            "fn apply(f) { f(1) + 1 }\n\
-             pub fn main() -> Int {\n\
-             \x20 handle { apply(fn(x) { x * get() }) } with {\n\
-             \x20   S.get() -> resume(10)\n    return(r) -> r\n  }\n}\n",
-        );
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("effect-polymorphic function used at a user effect")
-            ),
-            "{err:?}"
-        );
+    fn an_effect_polymorphic_function_used_at_a_user_effect_compiles() {
+        // N7 part 1 (replaces `..._is_refused`, D16's pin): `apply` is
+        // compiled direct for its pure uses, and this instantiation at {S}
+        // goes to a clone whose rows say S, so it compiles CPS.
+        emit_ir(&core_of(&format!(
+            "{S_W}fn apply(f) {{ f(1) + 1 }}\n\
+             pub fn main() -> Int {{\n\
+             \x20 handle {{ apply(fn(x) {{ x * get() }}) }} with {{\n\
+             \x20   S.get() -> resume(10)\n    return(r) -> r\n  }}\n}}\n"
+        )))
+        .expect("a clone of `apply` at {S} compiles");
     }
 
     #[test]
@@ -2441,29 +2582,22 @@ mod tests {
     }
 
     #[test]
-    fn a_let_bound_effect_polymorphic_lambda_used_at_a_user_effect_is_refused() {
-        // 5b-9b review (a REGRESSION caught before commit): `app` is generic in
-        // its effect row, so its lifted body uses the DIRECT convention, but the
-        // call `app(..)` is instantiated at {S} -- and was compiled as a CPS jump
-        // into the direct function: native SIGSEGV where the evaluator printed
-        // 8. D16 refused this for top-level functions only; a local binding
-        // now gets the same refusal, by the same name.
+    fn a_let_bound_effect_polymorphic_lambda_used_at_a_user_effect_compiles() {
+        // N7 part 1 (replaces `..._is_refused`, the 5b-9b review's pin: a
+        // SIGSEGV where the evaluator printed 8, then refused by name): the
+        // use at {S} goes to a local clone `let app.spec.k = ..` bound next
+        // to `app`, whose type says S. Execution: `CONVENTIONS` in
+        // tests/native_codegen.rs.
         for body in [
             "let app = fn(g) { g() + 1 }  app(fn() { get() })",
             "let app = fn(g) { g() + 1 }  let h = fn() { get() }  app(h) * 2",
         ] {
-            let err = refused(&format!(
-                "pub fn main() -> Int {{\n\
+            emit_ir(&core_of(&format!(
+                "{S_W}pub fn main() -> Int {{\n\
                  \x20 handle {{ {body} }} with {{\n\
                  \x20   S.get() -> resume(7)\n    return(r) -> r\n  }}\n}}\n"
-            ));
-            assert!(
-                matches!(
-                    err,
-                    CodegenError::Unsupported("effect-polymorphic function used at a user effect")
-                ),
-                "{body}: {err:?}"
-            );
+            )))
+            .unwrap_or_else(|e| panic!("{body}: {e:?}"));
         }
     }
 
@@ -2680,21 +2814,15 @@ mod tests {
         );
     }
 
+    // Was `rejects_a_non_adt_match_scrutinee` (N6 §8.4). Native pattern
+    // compilation (2026-10-10) rewrites every match on a non-ADT value into
+    // `let`s and `if`s before the emitters run, so this program now compiles;
+    // its value is proved by execution (`nested_and_literal_patterns_run_natively`,
+    // p2). The emitters keep the refusal as a guard for a match the pass leaves.
     #[test]
-    fn rejects_a_non_adt_match_scrutinee() {
-        // N6 §8.4. An Int scrutinee has no tag word; `.into_pointer_value()`
-        // would panic on it (inkwell, not a Result), and a `Str` scrutinee —
-        // newly representable — would load the string's tag and fall through to
-        // elya_match_fail, which is wrong behaviour rather than a crash. Both are
-        // refused by name, at the top of the arm, before any lowering happens.
-        let err = emit_ir(&core_of("pub fn main() { match 1 { _ -> 2 } }")).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("match scrutinee is not an ADT")
-            ),
-            "{err:?}"
-        );
+    fn a_non_adt_match_scrutinee_is_compiled_away() {
+        emit_ir(&core_of("pub fn main() { match 1 { _ -> 2 } }"))
+            .expect("a wildcard match on an Int compiles");
     }
 
     #[test]
@@ -2822,5 +2950,38 @@ mod tests {
             &[2, 0b10],
             "frame row: arity 2, mask 0b10 (D5) -- not the spec's 0b11"
         );
+    }
+
+    /// Native multi-shot (spec D3): `elya_cont_copy` tells handler frames from
+    /// site frames by tag range alone, so the handler rows must be exactly
+    /// `[handler_lo, cont_tag)`.
+    #[test]
+    fn handler_tags_sit_contiguously_below_the_continuation_tag() {
+        let core = core_of(
+            "effect multi Flip { fn flip() -> Bool }\n\
+             effect Ask { fn ask() -> Int }\n\
+             effect Tell { fn tell(v: Int) -> Unit }\n\
+             fn inner() {\n\
+             \x20 handle {\n\
+             \x20   handle { let b = flip()  let y = ask()  let _ = tell(y)  if b { y } else { y + 1 } }\n\
+             \x20   with { Tell.tell(v) -> resume(Unit) }\n\
+             \x20 } with { Ask.ask() -> resume(5) * 2 }\n\
+             }\n\
+             pub fn main() -> Int { handle inner() with multi { Flip.flip() -> resume(True) * 1000 + resume(False) } }\n",
+        );
+        let n_real_ctors: usize = core.types.iter().map(|t| t.ctors.len()).sum();
+        let lambdas = closure::collect_lambdas(&core, n_real_ctors);
+        let string_tag = n_real_ctors + lambdas.len();
+        let sites = cps::collect_sites(&core);
+        let handlers = cps::collect_handlers(&core);
+        assert_eq!(handlers.len(), 3);
+        assert!(!sites.is_empty());
+        let d = descriptor_rows(&core, &lambdas, &sites, &handlers, n_real_ctors, string_tag)
+            .expect("rows");
+        assert_eq!(d.handler_lo, d.cont_tag - 3);
+        let mut tags: Vec<usize> = d.handler_tags.values().copied().collect();
+        tags.sort_unstable();
+        assert_eq!(tags, (d.handler_lo..d.cont_tag).collect::<Vec<_>>());
+        assert!(d.site_tags.values().all(|t| *t < d.handler_lo));
     }
 }

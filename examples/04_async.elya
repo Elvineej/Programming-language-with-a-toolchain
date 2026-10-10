@@ -1,0 +1,93 @@
+// Async without function colouring, written in Elya.
+//
+// Suspension is an effect. A task performs `Async.yld()` to give up the
+// processor and `Async.fork(f)` to start another task; nothing else marks it
+// as asynchronous. `task` is an ordinary handler that turns a computation into
+// a `Task`: at each `yld` it stops and hands back the rest of the computation
+// (`resume`, wrapped in a closure). `run` is the scheduler: a round-robin
+// queue of tasks, written as plain Elya.
+//
+// `each` is ONE function. Below it walks a range in ordinary code and, inside
+// the workers, walks a range that yields at every step: there is no async
+// copy of it, and no `await` at its call sites. Its type says what it does --
+// it performs whatever its argument performs.
+
+effect Async {
+  fn fork(f: fn() / {Async, Log} -> Unit) -> Unit
+  fn yld() -> Unit
+}
+
+// What the tasks say, printed by the outermost handler.
+effect Log { fn say(line: String) -> Unit }
+
+// A computation, as seen by the scheduler: finished, stopped at a `yld` (the
+// rest of it), or stopped at a `fork` (the new task's body, and the rest).
+type Task {
+  Done,
+  Paused(fn() / {Log} -> Task),
+  Forked(fn() / {Async, Log} -> Unit, fn() / {Log} -> Task)
+}
+
+type Queue { Empty, Push(Task, Queue) }
+
+fn task(body: fn() / {Async, Log} -> Unit) -> Task {
+  handle { body() } with {
+    Async.yld() -> Paused(fn() { resume(Unit) })
+    Async.fork(f) -> Forked(f, fn() { resume(Unit) })
+    return(u) -> Done
+  }
+}
+
+fn append(q: Queue, t: Task) -> Queue {
+  match q {
+    Empty -> Push(t, Empty)
+    Push(h, rest) -> Push(h, append(rest, t))
+  }
+}
+
+// Round robin: run the task at the front until it stops, put what is left of
+// it at the back. Answers how many tasks finished.
+fn run(q: Queue) -> Int {
+  match q {
+    Empty -> 0
+    Push(t, rest) -> match t {
+      Done -> 1 + run(rest)
+      Paused(k) -> run(append(rest, k()))
+      Forked(child, parent) -> run(append(append(rest, parent()), task(child)))
+    }
+  }
+}
+
+fn each(f: fn(Int) -> Unit, n: Int) -> Unit {
+  if n == 0 { Unit } else {
+    let _ = f(n)
+    each(f, n - 1)
+  }
+}
+
+fn worker(name: String, steps: Int) -> Unit {
+  each(fn(i) {
+    let _ = say(name)
+    yld()
+  }, steps)
+}
+
+fn program() -> Unit {
+  let _ = say("main: start")
+  let _ = fork(fn() { worker("  ping", 3) })
+  let _ = fork(fn() { worker("    pong", 2) })
+  let _ = worker("main", 2)
+  say("main: done")
+}
+
+pub fn main() -> Int {
+  // The same `each`, in ordinary code: no handler, no scheduler.
+  let _ = each(fn(i) { Unit }, 10)
+  handle { run(Push(task(fn() { program() }), Empty)) } with {
+    Log.say(line) -> {
+      io.println(line)
+      resume(Unit)
+    }
+    return(finished) -> finished
+  }
+}

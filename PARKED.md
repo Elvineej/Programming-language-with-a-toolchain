@@ -156,7 +156,12 @@ slice: root every live binding (shadowed ones included), with this program as th
   names a user effect, even with a pure lambda (its generic signature has an open row). Lift
   with N7.
 
-## Evaluator: non-tail recursion under a handler is quadratic (found 2026-10-03)
+## RESOLVED (2026-10-10): Evaluator: non-tail recursion under a handler is quadratic (found 2026-10-03)
+
+Not the handler: a per-step depth walk and frame-copying capture/resume. Fixed by a
+segmented continuation; see `docs/superpowers/specs/2026-10-10-elya-eval-linear-continuations-design.md`.
+Original report:
+
 
 `deep(n)` (non-tail recursion that keeps a `Cons` per level) under a `handle` takes 0.12 s at
 n = 1000, 0.43 s at 2000, 1.70 s at 4000 (debug `elya run`): ~4x per doubling, and n = 100 000
@@ -255,7 +260,7 @@ the bare `ping` as `Ty::Error` silently -- and `elya run` ends in E0300 "unbound
 `ping`". Pre-existing; 5c-2's non-goal. Decide: reject a bare op reference (an error), or
 make an op a first-class value (an eta-expanded perform).
 
-## PARTLY RESOLVED (branch `claude/resume-row`, 2026-10-08): `resume` is typed effect-free -- an escaped resume can perform an unhandled effect (found by slice 5b-10)
+## RESOLVED (auto/elya, 2026-10-09: relays, the return clause and re-entered clauses -- spec 2026-10-09-elya-resume-row-complete-design.md): `resume` is typed effect-free -- an escaped resume can perform an unhandled effect (found by slice 5b-10)
 
 `resume` now adds the handled body's labels (minus the handled effect) to the ambient at
 the resume site (`tests/resume_row.rs`); the program below is E0420 and m10's
@@ -340,7 +345,16 @@ for every op (an error), or keep forwarding and put the unhandled ops in the han
   into its row and is rejected (the evaluator prints 12) -- likely the same root as
   "recursion through a handle body".
 
-## Language question: effect rows unify by equality -- sub-effecting? (row-soundness sweep, 2026-10-08)
+## Language question: rows unify by EQUALITY, so relays are shared both ways (2026-10-09)
+
+Since a lambda relaying an enclosing parameter keeps its row open (resume-row completion),
+a local `let k = fn(x) { f(x) }` used under two different handlers puts both handlers'
+effects into `f`'s row (pinned: `a_local_lambda_forwarding_a_parameter_shares_its_row_known_limitation`),
+and a stored lambda that relays `body` and performs `z` puts `z` into `task`'s row (r5 in
+that spec). Calling `f` directly has always behaved so. Inclusion constraints for relays
+(`ambient ⊇ ρ` without equality) would accept both; a real inference change.
+
+## RESOLVED in part (sub-effecting, 2026-10-09): effect rows unify by equality -- sub-effecting? (row-soundness sweep, 2026-10-08)
 
 Rows of function values, `if` branches and clause values unify by EQUALITY (spec 3.6: no
 sub-effecting), and a call pours the callee's row into the caller by unifying tails. So a

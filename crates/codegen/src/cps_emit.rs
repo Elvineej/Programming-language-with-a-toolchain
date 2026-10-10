@@ -149,7 +149,7 @@ pub(crate) fn prepass(core: &CoreModule, cps_fns: &HashSet<String>) -> R<()> {
             .iter()
             .map(|p| (p.name.clone(), Some(p.ty.clone())))
             .collect();
-        check_local_conventions(&f.body, &mut locals)?;
+        check_local_conventions(&f.body, &mut locals, &core.types)?;
     }
     Ok(())
 }
@@ -161,11 +161,16 @@ pub(crate) fn prepass(core: &CoreModule, cps_fns: &HashSet<String>) -> R<()> {
 /// convention) and the use instantiates it at a user effect -- the call would
 /// jump into a direct function with the CPS signature (measured: SIGSEGV where
 /// the evaluator printed 8). Refused by the same name as the top-level case.
-/// Binders whose type is not tracked (pattern and return binders, `$cont`)
-/// carry `None` and are never refused here.
-fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>) -> R<()> {
-    let go =
-        |c: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>| check_local_conventions(c, locals);
+/// Binders whose type is not tracked (`$cont`, and pattern binders of a
+/// parametric type's fields) carry `None` and are never refused here.
+fn check_local_conventions(
+    e: &CoreExpr,
+    locals: &mut Vec<(String, Option<Ty>)>,
+    types: &[elya::core::CoreType],
+) -> R<()> {
+    let go = |c: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>| {
+        check_local_conventions(c, locals, types)
+    };
     match &e.kind {
         CoreKind::Lit(_) => Ok(()),
         // Sub-effecting (2026-10-08): a direct closure may now be USED where an
@@ -173,9 +178,13 @@ fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>)
         // }`). Its code has the direct convention, so a CPS call of it would
         // jump into it with the wrong signature -- measured: 2 where the
         // evaluator printed 13. Refused by name until an adapter wraps it.
+        // N7 part 1: compared at EVERY covariant layer -- an upcast in a
+        // function's result (measured: 2 where the evaluator printed 3306) has
+        // agreeing outer conventions. `specialize` eta-expands every upcast of
+        // a tracked binder, so this fires only if that pass missed one.
         CoreKind::Var(name) => {
             if let Some((_, Some(bound))) = locals.iter().rev().find(|(n, _)| n == name) {
-                if needs_cps(&e.ty) && !needs_cps(bound) {
+                if !crate::specialize::conv_eq(bound, &e.ty) {
                     return Err(CodegenError::Unsupported(
                         "direct function used where an effectful one is expected",
                     ));
@@ -189,6 +198,19 @@ fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>)
                     if needs_cps(&callee.ty) && !needs_cps(bound) {
                         return Err(CodegenError::Unsupported(
                             "effect-polymorphic function used at a user effect",
+                        ));
+                    }
+                    // N7 part 1 review: a disagreement in a deeper layer (the
+                    // result of an alias of a generic local; natively it hung
+                    // where the evaluator printed 8). `specialize` coerces the
+                    // results it can; this refuses what it could not.
+                    if !crate::specialize::conv_eq(bound, &callee.ty) {
+                        return Err(CodegenError::Unsupported(
+                            if crate::specialize::user_subst(bound, &callee.ty).is_empty() {
+                                "direct function used where an effectful one is expected"
+                            } else {
+                                "effect-polymorphic function used at a user effect"
+                            },
                         ));
                     }
                 }
@@ -218,10 +240,12 @@ fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>)
         CoreKind::Match(s, arms) => {
             go(s, locals)?;
             for arm in arms.iter() {
-                let mut names = Vec::new();
-                crate::closure::pat_binders(&arm.pat, &mut names);
+                // Pattern binders are tracked since function types may be
+                // written in declarations (a closure in a field).
+                let mut binders = Vec::new();
+                crate::specialize::pat_binder_types(&arm.pat, &s.ty, types, &mut binders);
                 let depth = locals.len();
-                locals.extend(names.into_iter().map(|n| (n, None)));
+                locals.extend(binders);
                 let r = go(&arm.body, locals);
                 locals.truncate(depth);
                 r?;
@@ -334,14 +358,6 @@ fn check(
             r
         }
         CoreKind::Handle(h) => {
-            // spec 5.4 / A2: refused on the handle node, FIRST -- before any
-            // other check and before any clause body is looked at. Keyed on the
-            // bit lowering stamped from the effect's declaration (D4).
-            if h.is_multi_declared {
-                return Err(CodegenError::Unsupported(
-                    "multi-shot handler (`with multi`)",
-                ));
-            }
             // A clause takes the op's arguments, the continuation and the
             // handler frame (Task 8): MAX_PARAMS is the measured win64 limit.
             if h.clauses.iter().any(|c| c.params.len() + 2 > MAX_PARAMS) {
@@ -373,9 +389,10 @@ fn check(
 
 /// D16's two refusals at a reference to a top-level function.
 fn check_reference(target: &elya::core::CoreFn, at: &Ty, cps_fns: &HashSet<String>) -> R<()> {
-    let generic_is_polymorphic = target.params.iter().any(|p| cps::ty_has_open_row(&p.ty))
-        || cps::ty_has_open_row(&target.body.ty);
-    if generic_is_polymorphic && cps::ty_names_user_effect(at) {
+    // D16, stated precisely since N7 part 1: one of the target's open row
+    // variables is instantiated at a user effect here. `specialize` sends every
+    // such reference to a clone, so this fires only if that pass missed one.
+    if crate::specialize::instantiates_user_effect(target, at) {
         return Err(CodegenError::Unsupported(
             "effect-polymorphic function used at a user effect",
         ));
@@ -1022,6 +1039,7 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
         v: BasicValueEnum<'ctx>,
         arg_ty: &Ty,
         k_after: PointerValue<'ctx>,
+        multi: bool,
     ) -> R<()> {
         let cont = st
             .env
@@ -1029,7 +1047,12 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             .copied()
             .ok_or(CodegenError::Unsupported("resume outside a handler clause"))?
             .into_pointer_value();
-        let (k, code, h, inner) = take_continuation(self, cont)?;
+        let roots = if multi {
+            Some(self.root_live(st, &[v, k_after.into()])?)
+        } else {
+            None
+        };
+        let (k, code, h, inner) = take_continuation(self, cont, roots)?;
         let i64t = self.i64t();
         let aw = self
             .b
@@ -1237,7 +1260,10 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             return Err(CodegenError::Unsupported(op_label(op)));
         }
         prim_values(
+            self.ctx,
+            self.func,
             self.b,
+            self.lc,
             op,
             vals[0].into_int_value(),
             vals[1].into_int_value(),
@@ -1403,7 +1429,8 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                     return Ok(None);
                 };
                 let k = self.site_frame(st, e, &[v])?;
-                self.resume_cps(st, v, &arg.ty, k)?;
+                let multi = self.lc.fx.multi_resumes.contains(&key_of(e));
+                self.resume_cps(st, v, &arg.ty, k, multi)?;
                 Ok(None)
             }
             // A direct resume whose argument suspends (a CPS lambda inside a
@@ -1728,7 +1755,8 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                     return Ok(());
                 };
                 let k = st.kont;
-                self.resume_cps(st, v, &arg.ty, k)
+                let multi = self.lc.fx.multi_resumes.contains(&key_of(e));
+                self.resume_cps(st, v, &arg.ty, k, multi)
             }
             CoreKind::Handle(_) if self.lc.fx.leaking.contains(&key_of(e)) => {
                 self.handle_cps(st, e, true)
@@ -2203,7 +2231,8 @@ fn clause_tail<'ctx>(
         }
         CoreKind::Resume(arg) => {
             let v = lower_expr(cx.ctx, cx.func, cx.b, cx.lc, arg, env)?;
-            let (word, k, code, handler) = resume_prologue(cx, v, &arg.ty, env)?;
+            let multi = cx.lc.fx.multi_resumes.contains(&key_of(e));
+            let (word, k, code, handler) = resume_prologue(cx, v, &arg.ty, env, multi)?;
             // The resumed computation performs to ITS handler.
             cx.b.build_store(cx.lc.current_handler, handler)
                 .map_err(internal)?;
@@ -2228,15 +2257,35 @@ fn clause_tail<'ctx>(
 /// named trap, never re-runs), mark the continuation consumed (word 2, the
 /// answering frame, becomes 0) and load its chain `k`, `k`'s code, the
 /// answering frame `h` and the handler that was current at the perform.
+///
+/// A resume of a `with multi` handle (`multi_roots` is `Some`: the caller has
+/// rooted that many live values) instead re-enters a COPY of the captured
+/// frames (native multi-shot, spec D2/D3): `elya_cont_copy` returns a fresh
+/// continuation object over the copy, the original is never run or marked,
+/// and the roots are popped once the copy is made.
 fn take_continuation<'ctx>(
     cx: &Cx<'_, '_, 'ctx>,
     cont: PointerValue<'ctx>,
+    multi_roots: Option<usize>,
 ) -> R<(
     PointerValue<'ctx>,
     PointerValue<'ctx>,
     PointerValue<'ctx>,
     PointerValue<'ctx>,
 )> {
+    if let Some(roots) = multi_roots {
+        let lo = cx.i64t().const_int(cx.lc.desc.handler_lo as u64, false);
+        let hi = cx.i64t().const_int(cx.lc.desc.cont_tag as u64, false);
+        let copied =
+            cx.b.build_call(cx.lc.cont_copy, &[cont.into(), lo.into(), hi.into()], "cc")
+                .map_err(internal)?
+                .try_as_basic_value()
+                .left()
+                .ok_or(CodegenError::Unsupported("call returned no value"))?
+                .into_pointer_value();
+        gc_unroot(cx.b, cx.lc, roots)?;
+        return load_continuation(cx, copied);
+    }
     let hw = cx.load_word(cont, 2)?;
     let twice =
         cx.b.build_int_compare(
@@ -2260,6 +2309,35 @@ fn take_continuation<'ctx>(
     let h =
         cx.b.build_int_to_ptr(hw, cx.ptrt(), "rhf")
             .map_err(internal)?;
+    let (k, code, inner) = load_chain(cx, cont)?;
+    Ok((k, code, h, inner))
+}
+
+/// A continuation object's chain `k`, `k`'s code, answering frame `h` and
+/// innermost handler.
+fn load_continuation<'ctx>(
+    cx: &Cx<'_, '_, 'ctx>,
+    cont: PointerValue<'ctx>,
+) -> R<(
+    PointerValue<'ctx>,
+    PointerValue<'ctx>,
+    PointerValue<'ctx>,
+    PointerValue<'ctx>,
+)> {
+    let hw = cx.load_word(cont, 2)?;
+    let h =
+        cx.b.build_int_to_ptr(hw, cx.ptrt(), "rhf")
+            .map_err(internal)?;
+    let (k, code, inner) = load_chain(cx, cont)?;
+    Ok((k, code, h, inner))
+}
+
+/// A continuation object's chain `k`, `k`'s code and innermost handler (`h`
+/// is read by the caller: the one-shot path reads it before marking).
+fn load_chain<'ctx>(
+    cx: &Cx<'_, '_, 'ctx>,
+    cont: PointerValue<'ctx>,
+) -> R<(PointerValue<'ctx>, PointerValue<'ctx>, PointerValue<'ctx>)> {
     let k = cx.load_word(cont, 1)?;
     let k =
         cx.b.build_int_to_ptr(k, cx.ptrt(), "rk")
@@ -2272,7 +2350,7 @@ fn take_continuation<'ctx>(
     let inner =
         cx.b.build_int_to_ptr(iw, cx.ptrt(), "rh")
             .map_err(internal)?;
-    Ok((k, code, h, inner))
+    Ok((k, code, inner))
 }
 
 /// The shared half of a DIRECT `resume(v)` (a handle that leaks nothing):
@@ -2283,6 +2361,7 @@ fn resume_prologue<'ctx>(
     v: BasicValueEnum<'ctx>,
     arg_ty: &Ty,
     env: &HashMap<String, BasicValueEnum<'ctx>>,
+    multi: bool,
 ) -> R<(
     IntValue<'ctx>,
     PointerValue<'ctx>,
@@ -2294,7 +2373,18 @@ fn resume_prologue<'ctx>(
         .copied()
         .ok_or(CodegenError::Unsupported("resume outside a handler clause"))?
         .into_pointer_value();
-    let (k, code, h, inner) = take_continuation(cx, cont)?;
+    // A multi-shot copy allocates: everything live here, and the argument,
+    // must survive it.
+    let roots = if multi {
+        let mut n = gc_root_env(cx.b, cx.lc, env)?;
+        if cx.push(v)? {
+            n += 1;
+        }
+        Some(n)
+    } else {
+        None
+    };
+    let (k, code, h, inner) = take_continuation(cx, cont, roots)?;
     cx.reparent(h)?;
     let word = value_to_word(cx.b, v, arg_ty, cx.i64t())?;
     Ok((word, k, code, inner))
@@ -2335,7 +2425,8 @@ fn resume_nested<'ctx>(
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
 ) -> R<BasicValueEnum<'ctx>> {
     let cx = Cx { ctx, func, b, lc };
-    let (word, k, code, handler) = resume_prologue(&cx, v, arg_ty, env)?;
+    let multi = lc.fx.multi_resumes.contains(&key_of(e));
+    let (word, k, code, handler) = resume_prologue(&cx, v, arg_ty, env, multi)?;
     let i64t = ctx.i64_type();
     let code_ty = i64t.fn_type(&[i64t.into(), cx.ptrt().into()], false);
     // The resumed computation performs to ITS handler; the caller's comes
@@ -2538,7 +2629,8 @@ fn emit_resume_fn<'ctx>(
                     } else {
                         cx.site_frame(&mut st, a, &[cur])?
                     };
-                    return cx.resume_cps(&mut st, cur, &arg.ty, k);
+                    let multi = lc.fx.multi_resumes.contains(&step.key);
+                    return cx.resume_cps(&mut st, cur, &arg.ty, k, multi);
                 }
                 cur = resume_nested(ctx, func, b, lc, a, cur, &arg.ty, &mut st.env)?;
             }

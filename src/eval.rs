@@ -183,6 +183,8 @@ pub fn fn_table<'a>(module: &'a Module) -> Fns<'a> {
 pub struct Interp {
     output: String,
     peak_kont: usize,
+    steps: u64,
+    kont_work: u64,
 }
 
 impl Interp {
@@ -190,6 +192,8 @@ impl Interp {
         Interp {
             output: String::new(),
             peak_kont: 0,
+            steps: 0,
+            kont_work: 0,
         }
     }
     pub fn output(&self) -> &str {
@@ -197,6 +201,16 @@ impl Interp {
     }
     pub fn peak_kont_depth(&self) -> usize {
         self.peak_kont
+    }
+    /// The machine's work, timing-free: steps taken plus every continuation node
+    /// a whole-continuation operation visited or copied (the depth probe, a
+    /// perform's search and capture, a resume's re-installation). A program that
+    /// does linear work costs linearly; `tests/eval_complexity.rs` pins it.
+    pub fn cost(&self) -> u64 {
+        self.steps + self.kont_work
+    }
+    fn note_kont_work(&mut self, n: usize) {
+        self.kont_work += n as u64;
     }
     fn println(&mut self, s: &str) {
         self.output.push_str(s);
@@ -213,6 +227,10 @@ impl Default for Interp {
     }
 }
 
+fn overflow(span: Span) -> RuntimeError {
+    rt(span, "integer overflow")
+}
+
 pub(crate) fn apply_binop(
     op: BinOp,
     l: Value,
@@ -222,12 +240,17 @@ pub(crate) fn apply_binop(
     use BinOp::*;
     use Value::*;
     match (op, l, r) {
-        (Add, Int(a), Int(b)) => Ok(Int(a + b)),
-        (Sub, Int(a), Int(b)) => Ok(Int(a - b)),
-        (Mul, Int(a), Int(b)) => Ok(Int(a * b)),
+        // `Int` arithmetic is exact or fails by name (spec
+        // 2026-10-10-elya-checked-integer-arithmetic, D1): never a wrapped value,
+        // never a host panic. Native code traps on the same inputs.
+        (Add, Int(a), Int(b)) => a.checked_add(b).map(Int).ok_or_else(|| overflow(span)),
+        (Sub, Int(a), Int(b)) => a.checked_sub(b).map(Int).ok_or_else(|| overflow(span)),
+        (Mul, Int(a), Int(b)) => a.checked_mul(b).map(Int).ok_or_else(|| overflow(span)),
         (Div, Int(_), Int(0)) => Err(rt(span, "division by zero")),
-        (Div, Int(a), Int(b)) => Ok(Int(a / b)),
+        (Div, Int(a), Int(b)) => a.checked_div(b).map(Int).ok_or_else(|| overflow(span)),
         (Rem, Int(_), Int(0)) => Err(rt(span, "remainder by zero")),
+        // `MIN % -1` is exactly 0; `checked_rem` would call it an overflow.
+        (Rem, Int(_), Int(-1)) => Ok(Int(0)),
         (Rem, Int(a), Int(b)) => Ok(Int(a % b)),
         (AddF, Float(a), Float(b)) => Ok(Float(a + b)),
         (SubF, Float(a), Float(b)) => Ok(Float(a - b)),
@@ -248,7 +271,10 @@ pub(crate) fn apply_binop(
 
 pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, RuntimeError> {
     match (op, v) {
-        (UnOp::Neg, Value::Int(n)) => Ok(Value::Int(-n)),
+        (UnOp::Neg, Value::Int(n)) => n
+            .checked_neg()
+            .map(Value::Int)
+            .ok_or_else(|| overflow(span)),
         (UnOp::Neg, Value::Float(x)) => Ok(Value::Float(-x)),
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
         _ => Err(rt(span, "type error in unary operator")),
@@ -482,16 +508,30 @@ pub mod cek {
         crate::ast::op_effects(module)
     }
 
-    /// A first-class captured continuation: the frames above the handler at the
-    /// perform point (`captured`, top-first), the handler to re-install beneath
-    /// them (deep handler), the environment its clauses run in, and the one-shot
-    /// consumed flag (`E0425` on a second `resume`; 3d relaxes this for `multi`).
-    #[derive(Debug)]
+    /// A first-class captured continuation: the segment of frames above the
+    /// innermost handler at the perform point (`top`, shared, never copied), the
+    /// handler boundaries the perform skipped on its way out (`skipped`, innermost
+    /// first: each one's handler, environment and the segment beneath it), the
+    /// answering handler to re-install beneath them all (deep handler), the
+    /// environment its clauses run in, and the one-shot consumed flag (`E0425` on
+    /// a second `resume`; `with multi` lifts it).
     pub struct ResumeData {
-        captured: Vec<Frame>,
+        top: Seg,
+        skipped: Vec<(Rc<Handler>, Env, Seg)>,
         handler: Rc<Handler>,
         ret_env: Env,
         consumed: std::cell::Cell<bool>,
+    }
+
+    // By hand: a derived `Debug` would print every captured frame.
+    impl std::fmt::Debug for ResumeData {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ResumeData")
+                .field("top_len", &seg_len(&self.top))
+                .field("skipped", &self.skipped.len())
+                .field("consumed", &self.consumed.get())
+                .finish()
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -552,12 +592,6 @@ pub mod cek {
             env: Env,
             span: Span,
         },
-        // Installed by `handle`; catches the body's normal return (the return
-        // clause) and is the boundary an operation searches for.
-        HandleK {
-            handler: Rc<Handler>,
-            env: Env,
-        },
         // Evaluating a `resume(arg)`; on return, re-enters the continuation.
         ResumeApply {
             resume: Value,
@@ -571,16 +605,115 @@ pub mod cek {
         },
     }
 
+    // The continuation is segmented at handlers (spec
+    // 2026-10-10-elya-eval-linear-continuations, D1): `top` is the frames above
+    // the innermost handler, `meta` the handler boundaries beneath it, each with
+    // the segment of frames below it. A perform walks boundaries, never frames,
+    // and shares `top` instead of copying it; a resume rebuilds only the
+    // boundaries the perform skipped. Every node caches its depth (D2), so the
+    // peak-depth probe is O(1) per step.
+
+    /// One frame of a segment, and the rest of that segment.
     struct KontNode {
         frame: Frame,
-        rest: Kont,
+        rest: Seg,
+        /// Frames in the segment from this node down: `1 + seg_len(rest)`.
+        len: usize,
     }
     // Alias is non-recursive because the recursion goes through the named
     // `KontNode` struct (recursive type *aliases* are not allowed).
-    type Kont = Option<Rc<KontNode>>;
+    type Seg = Option<Rc<KontNode>>;
+
+    /// A handler boundary: an installed `handle`. It catches the segment above
+    /// it returning normally (the return clause), and it is what a perform
+    /// searches for.
+    struct MetaNode {
+        handler: Rc<Handler>,
+        env: Env,
+        /// The frames between this boundary and the next one down.
+        below: Seg,
+        rest: Meta,
+        /// The whole depth from this boundary down: the boundary counts as one
+        /// frame (what `HandleK` counted), plus `below`, plus `rest`.
+        depth: usize,
+    }
+    type Meta = Option<Rc<MetaNode>>;
+
+    #[derive(Clone, Default)]
+    struct Kont {
+        top: Seg,
+        meta: Meta,
+    }
+
+    impl Kont {
+        fn is_empty(&self) -> bool {
+            self.top.is_none() && self.meta.is_none()
+        }
+        fn depth(&self) -> usize {
+            seg_len(&self.top) + meta_depth(&self.meta)
+        }
+    }
+
+    fn seg_len(s: &Seg) -> usize {
+        s.as_ref().map_or(0, |n| n.len)
+    }
+
+    fn meta_depth(m: &Meta) -> usize {
+        m.as_ref().map_or(0, |n| n.depth)
+    }
+
+    // Iterative drops (D3): an abandoned 100 000-frame continuation must not
+    // recurse through nested destructors on the host stack. Only uniquely-owned
+    // successors are dismantled; a shared one is freed by its last owner.
+    impl Drop for KontNode {
+        fn drop(&mut self) {
+            let mut cur = self.rest.take();
+            while let Some(rc) = cur {
+                cur = match Rc::try_unwrap(rc) {
+                    Ok(mut node) => node.rest.take(),
+                    Err(_) => None,
+                };
+            }
+        }
+    }
+
+    impl Drop for MetaNode {
+        fn drop(&mut self) {
+            let mut cur = self.rest.take();
+            while let Some(rc) = cur {
+                cur = match Rc::try_unwrap(rc) {
+                    Ok(mut node) => node.rest.take(),
+                    Err(_) => None,
+                };
+            }
+        }
+    }
 
     fn push(f: Frame, k: Kont) -> Kont {
-        Some(Rc::new(KontNode { frame: f, rest: k }))
+        let len = seg_len(&k.top) + 1;
+        Kont {
+            top: Some(Rc::new(KontNode {
+                frame: f,
+                rest: k.top,
+                len,
+            })),
+            meta: k.meta,
+        }
+    }
+
+    /// Install a handler boundary over `k`: the new `top` is empty.
+    fn install(handler: Rc<Handler>, env: Env, k: Kont) -> Kont {
+        let depth = 1 + k.depth();
+        Kont {
+            top: None,
+            meta: Some(Rc::new(MetaNode {
+                handler,
+                env,
+                below: k.top,
+                rest: k.meta,
+                depth,
+            })),
+        }
     }
 
     enum State {
@@ -599,7 +732,7 @@ pub mod cek {
         let Some(main) = fns.get("main").copied() else {
             return Err(rt(Span::EMPTY, "no `main` function found"));
         };
-        let start = eval_block_state(&main.body.node, Env::new(), None);
+        let start = eval_block_state(&main.body.node, Env::new(), Kont::default());
         let v = run_loop(&mut interp, &fns, &ops, start)?;
         Ok((interp, v))
     }
@@ -664,14 +797,15 @@ pub mod cek {
         mut st: State,
     ) -> Result<Value, RuntimeError> {
         loop {
-            interp.note_kont_depth(kont_len(kont_of(&st)));
+            interp.steps += 1;
+            interp.note_kont_depth(kont_of(&st).depth());
             // The machine halts exactly when a `Return` meets an empty
             // continuation, and that value is `main`'s result. Catching it here
             // rather than letting `step` fall off the end is what lets the value
             // escape the loop at all; `run_module` still discards it, so nothing
             // about `elya run` changes.
             st = match st {
-                State::Return(v, None) => return Ok(v),
+                State::Return(v, k) if k.is_empty() => return Ok(v),
                 other => match step(interp, fns, ops, other)? {
                     Some(next) => next,
                     // `ret` returns `None` only for an empty continuation, which
@@ -685,16 +819,6 @@ pub mod cek {
                 },
             };
         }
-    }
-
-    fn kont_len(k: &Kont) -> usize {
-        let mut n = 0;
-        let mut cur = k;
-        while let Some(node) = cur {
-            n += 1;
-            cur = &node.rest;
-        }
-        n
     }
 
     fn kont_of(st: &State) -> &Kont {
@@ -711,12 +835,13 @@ pub mod cek {
         st: State,
     ) -> Result<Option<State>, RuntimeError> {
         match st {
-            State::Eval(e, env, k) => Ok(Some(eval(fns, ops, &e, env, k)?)),
+            State::Eval(e, env, k) => Ok(Some(eval(interp, fns, ops, &e, env, k)?)),
             State::Return(v, k) => ret(interp, fns, v, k),
         }
     }
 
     fn eval(
+        interp: &mut Interp,
         fns: &Fns,
         ops: &Ops,
         e: &Spanned<Expr>,
@@ -833,7 +958,7 @@ pub mod cek {
                     ),
                     // A zero-arg operation performs immediately (no args to eval).
                     CalleeSlot::Operation { effect, op } if args.is_empty() => {
-                        perform(effect, op, Vec::new(), span, k)?
+                        perform(interp, effect, op, Vec::new(), span, k)?
                     }
                     // Builtin or operation with args: evaluate the args, then apply.
                     other => {
@@ -859,17 +984,9 @@ pub mod cek {
                 }
             }
             // Install the handler and evaluate the body under it.
-            Expr::Handle { body, handler } => State::Eval(
-                body.clone(),
-                env.clone(),
-                push(
-                    Frame::HandleK {
-                        handler: handler.clone(),
-                        env,
-                    },
-                    k,
-                ),
-            ),
+            Expr::Handle { body, handler } => {
+                State::Eval(body.clone(), env.clone(), install(handler.clone(), env, k))
+            }
             // Evaluate resume's argument, then re-enter the captured continuation.
             Expr::Resume { arg } => {
                 let resume = env
@@ -903,12 +1020,47 @@ pub mod cek {
         v: Value,
         k: Kont,
     ) -> Result<Option<State>, RuntimeError> {
-        let Some(node) = k else {
-            return Ok(None); // final result; output already captured via io.println
+        let Kont { top, meta } = k;
+        let Some(mut node) = top else {
+            let Some(boundary) = meta else {
+                return Ok(None); // final result; output already captured via io.println
+            };
+            // The segment above a handler returned normally (no outstanding
+            // operation): run the return clause (or identity), discharging it.
+            let rest = Kont {
+                top: boundary.below.clone(),
+                meta: boundary.rest.clone(),
+            };
+            return Ok(Some(match &boundary.handler.ret {
+                Some(ret_clause) => {
+                    let env2 = boundary.env.extend(&[(ret_clause.binder.clone(), v)]);
+                    State::Eval(ret_clause.body.clone(), env2, rest)
+                }
+                None => State::Return(v, rest),
+            }));
         };
-        let (frame, rest) = match Rc::try_unwrap(node) {
-            Ok(node) => (node.frame, node.rest),
-            Err(shared) => (shared.frame.clone(), shared.rest.clone()),
+        // Pop the top frame: moved out when this continuation owns it, cloned
+        // when it is shared (a multi-shot continuation resumed again later).
+        // `KontNode` has a `Drop`, so its fields cannot be destructured out;
+        // the owned frame is swapped for an inert placeholder that is dropped
+        // with the emptied node on the next line and never read.
+        let (frame, seg_rest) = match Rc::get_mut(&mut node) {
+            Some(owned) => (
+                std::mem::replace(
+                    &mut owned.frame,
+                    Frame::UnApply {
+                        op: UnOp::Neg,
+                        span: Span::EMPTY,
+                    },
+                ),
+                owned.rest.take(),
+            ),
+            None => (node.frame.clone(), node.rest.clone()),
+        };
+        drop(node);
+        let rest = Kont {
+            top: seg_rest,
+            meta,
         };
         Ok(Some(match frame {
             Frame::BinRight { op, rhs, env, span } => {
@@ -952,18 +1104,9 @@ pub mod cek {
                 env,
                 span,
             } => advance_call(interp, fns, v, callee, done, args, cursor, env, span, rest)?,
-            // The body returned normally (no outstanding operation): run the
-            // return clause (or identity), discharging the handler.
-            Frame::HandleK { handler, env } => match &handler.ret {
-                Some(ret_clause) => {
-                    let env2 = env.extend(&[(ret_clause.binder.clone(), v)]);
-                    State::Eval(ret_clause.body.clone(), env2, rest)
-                }
-                None => State::Return(v, rest),
-            },
             // `resume(v)` re-enters the captured continuation: deep-handler
             // semantics re-install the handler beneath the captured frames.
-            Frame::ResumeApply { resume, span } => resume_apply(resume, v, span, rest)?,
+            Frame::ResumeApply { resume, span } => resume_apply(interp, resume, v, span, rest)?,
             // The scrutinee returned `v`: dispatch to the first matching arm and
             // evaluate its body in the match's continuation slot (tail position).
             Frame::MatchK { arms, env, span } => {
@@ -985,9 +1128,12 @@ pub mod cek {
     /// Re-enter a captured continuation with value `u`. A one-shot handler
     /// enforces a single use (`E0425` on a second `resume`); a `with multi`
     /// handler permits re-entry — each resumption is an independent run of the
-    /// *same immutable* captured frames. Rebuilds `Kont' = k_cap ++ [HandleK] ++
-    /// k_now`, deepest-first.
+    /// *same immutable* captured segment. Builds `top ++ skipped ++ [handler] ++
+    /// k_now`: the answering handler becomes a boundary over `k_now`, the skipped
+    /// boundaries are rebuilt over it, and `top` is reused as is -- O(skipped + 1),
+    /// whatever the depth.
     fn resume_apply(
+        interp: &mut Interp,
         resume: Value,
         u: Value,
         span: Span,
@@ -997,10 +1143,10 @@ pub mod cek {
             return Err(rt(span, "internal: `resume` target is not a continuation"));
         };
         // One-shot enforcement — skipped for `with multi`. This is the ONLY
-        // difference between one-shot and multi-shot: the re-push below is
-        // identical, because `rd.captured` is an immutable owned snapshot and
-        // each `f.clone()` builds a fresh, independent `Kont` (persistent frames,
-        // copy-on-write `Env`) — so re-entering it more than once is sound.
+        // difference between one-shot and multi-shot: the re-installation below
+        // is identical, because `rd.top` is an immutable persistent segment
+        // (popping a shared node clones its frame; copy-on-write `Env`) — so
+        // re-entering it more than once is sound.
         if !rd.handler.multi {
             if rd.consumed.get() {
                 return Err(RuntimeError {
@@ -1013,56 +1159,70 @@ pub mod cek {
             }
             rd.consumed.set(true);
         }
-        let mut k = k_now;
-        k = push(
-            Frame::HandleK {
-                handler: rd.handler.clone(),
-                env: rd.ret_env.clone(),
-            },
-            k,
-        );
-        for f in rd.captured.iter().rev() {
-            k = push(f.clone(), k);
+        let mut k = install(rd.handler.clone(), rd.ret_env.clone(), k_now);
+        interp.note_kont_work(1);
+        for (handler, env, below) in rd.skipped.iter().rev() {
+            interp.note_kont_work(1);
+            let depth = 1 + seg_len(below) + meta_depth(&k.meta);
+            k.meta = Some(Rc::new(MetaNode {
+                handler: handler.clone(),
+                env: env.clone(),
+                below: below.clone(),
+                rest: k.meta.take(),
+                depth,
+            }));
         }
+        k.top = rd.top.clone();
         Ok(State::Return(u, k))
     }
 
-    /// Perform operation `op` of effect `effect`: walk the continuation for the
-    /// nearest matching handler, split it into the captured prefix `k_cap` and
-    /// the suffix `k_rest`, and run the matching clause with `resume` bound.
+    /// Perform operation `op` of effect `effect`: walk the handler boundaries for
+    /// the nearest matching handler, split the continuation into the captured
+    /// part (`top` and the boundaries skipped) and the suffix `k_rest` beneath the
+    /// answering handler, and run the matching clause with `resume` bound.
     fn perform(
+        interp: &mut Interp,
         effect: String,
         op: String,
         args: Vec<Value>,
         span: Span,
         k: Kont,
     ) -> Result<State, RuntimeError> {
-        let mut cap: Vec<Frame> = Vec::new();
-        let mut cur = k;
+        let Kont { top, meta } = k;
+        let mut skipped: Vec<(Rc<Handler>, Env, Seg)> = Vec::new();
+        let mut cur = meta;
         loop {
-            let Some(node) = cur else {
+            let Some(boundary) = cur else {
                 // A well-typed program never gets here (E0420 is static); defensive.
                 return Err(rt(
                     span,
                     format!("internal: unhandled effect `{op}` reached the machine"),
                 ));
             };
-            if let Frame::HandleK { handler, env } = &node.frame {
-                if handler_handles(handler, &effect, &op) {
-                    return run_clause(
-                        cap,
-                        handler.clone(),
-                        env.clone(),
-                        &effect,
-                        &op,
-                        args,
-                        span,
-                        node.rest.clone(),
-                    );
-                }
+            interp.note_kont_work(1);
+            if handler_handles(&boundary.handler, &effect, &op) {
+                let k_rest = Kont {
+                    top: boundary.below.clone(),
+                    meta: boundary.rest.clone(),
+                };
+                let captured = Captured { top, skipped };
+                return run_clause(
+                    captured,
+                    boundary.handler.clone(),
+                    boundary.env.clone(),
+                    &effect,
+                    &op,
+                    args,
+                    span,
+                    k_rest,
+                );
             }
-            cap.push(node.frame.clone());
-            cur = node.rest.clone();
+            skipped.push((
+                boundary.handler.clone(),
+                boundary.env.clone(),
+                boundary.below.clone(),
+            ));
+            cur = boundary.rest.clone();
         }
     }
 
@@ -1082,9 +1242,16 @@ pub mod cek {
             .any(|c| clause_matches(&c.node, effect, op))
     }
 
+    /// What a perform captures: the segment above the innermost handler and the
+    /// boundaries between it and the answering handler.
+    struct Captured {
+        top: Seg,
+        skipped: Vec<(Rc<Handler>, Env, Seg)>,
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_clause(
-        cap: Vec<Frame>,
+        cap: Captured,
         handler: Rc<Handler>,
         ret_env: Env,
         effect: &str,
@@ -1099,7 +1266,8 @@ pub mod cek {
             .find(|c| clause_matches(&c.node, effect, op))
             .ok_or_else(|| rt(span, format!("internal: handler has no clause for `{op}`")))?;
         let rd = Rc::new(ResumeData {
-            captured: cap,
+            top: cap.top,
+            skipped: cap.skipped,
             handler: handler.clone(),
             ret_env: ret_env.clone(),
             consumed: std::cell::Cell::new(false),
@@ -1201,7 +1369,7 @@ pub mod cek {
                 let call_env = Env::new().extend(&bindings);
                 Ok(eval_block_state(&fdecl.body.node, call_env, k)) // reuses `k` — no frame
             }
-            CalleeSlot::Operation { effect, op } => perform(effect, op, args, span, k),
+            CalleeSlot::Operation { effect, op } => perform(interp, effect, op, args, span, k),
             CalleeSlot::Ctor { name } => {
                 Ok(State::Return(Value::Ctor(name, CtorArgs(Rc::new(args))), k))
             }

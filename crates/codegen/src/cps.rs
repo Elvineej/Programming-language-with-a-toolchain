@@ -33,11 +33,12 @@ fn row_needs_cps(row: &EffectRow) -> bool {
         return true;
     }
     match row.tail {
-        // D16: an open tail ALONE is direct. A row-polymorphic function is
-        // compiled once, so the convention must not depend on what its row
-        // variable is later instantiated with; an instantiation at a user
-        // effect is refused by name instead (`ty_names_user_effect` +
-        // `ty_has_open_row`, checked at every reference). 7a answered `true`
+        // D16: an open tail ALONE is direct. A row-polymorphic function's
+        // code must not depend on what its row variable is later instantiated
+        // with; since N7 part 1 an instantiation at a user effect goes to a
+        // CLONE whose rows are substituted (`specialize.rs`), and the guard
+        // at every reference (`specialize::instantiates_user_effect`) refuses
+        // by name anything that pass missed. 7a answered `true`
         // here "conservatively", but over-CPS is not safe across a convention
         // boundary: `apply(fn(x) { x * 10 })` would call a direct lambda with
         // the CPS convention (measured: it compiles and prints 11 at 831b023).
@@ -204,6 +205,10 @@ fn handler_saved(h: &elya::core::CoreHandle, scope: &[String]) -> Vec<(Saved, Ty
 pub struct Fx {
     pub leaking: HashSet<usize>,
     pub cps_resumes: HashSet<usize>,
+    /// Native multi-shot (spec D1): the `resume`s whose handle is `with
+    /// multi`. Each re-enters a COPY of its captured frames; every other
+    /// resume is one-shot (D13).
+    pub multi_resumes: HashSet<usize>,
 }
 
 /// Computes `Fx` structurally, to a fixpoint: a region's user effects are what
@@ -214,8 +219,9 @@ pub struct Fx {
 /// The convention checks (D16) refuse, by name, any disagreement with the types.
 pub fn effect_facts(core: &CoreModule) -> Fx {
     let mut owner: HashMap<usize, usize> = HashMap::new();
+    let mut multi_resumes: HashSet<usize> = HashSet::new();
     for f in &core.fns {
-        resume_owners(&f.body, None, &mut owner);
+        resume_owners(&f.body, None, &mut owner, &mut multi_resumes);
     }
     // Every op the module performs, by effect: a handle HANDLES an effect only
     // if it has a clause for each of them. The front end accepts a handle with
@@ -251,6 +257,7 @@ pub fn effect_facts(core: &CoreModule) -> Fx {
     Fx {
         leaking,
         cps_resumes,
+        multi_resumes,
     }
 }
 
@@ -302,11 +309,19 @@ fn performed_ops(e: &CoreExpr, out: &mut HashMap<String, BTreeSet<String>>) {
 }
 
 /// Each `resume` node -> the `handle` whose clause encloses it.
-fn resume_owners(e: &CoreExpr, clause_of: Option<usize>, out: &mut HashMap<usize, usize>) {
-    if let (CoreKind::Resume(_), Some(h)) = (&e.kind, clause_of) {
+fn resume_owners(
+    e: &CoreExpr,
+    clause_of: Option<(usize, bool)>,
+    out: &mut HashMap<usize, usize>,
+    multi: &mut HashSet<usize>,
+) {
+    if let (CoreKind::Resume(_), Some((h, is_multi))) = (&e.kind, clause_of) {
         out.insert(key(e), h);
+        if is_multi {
+            multi.insert(key(e));
+        }
     }
-    let mut go = |c: &CoreExpr| resume_owners(c, clause_of, out);
+    let mut go = |c: &CoreExpr| resume_owners(c, clause_of, out, multi);
     match &e.kind {
         CoreKind::Lit(_) | CoreKind::Var(_) => {}
         CoreKind::App(f, args) => {
@@ -341,7 +356,7 @@ fn resume_owners(e: &CoreExpr, clause_of: Option<usize>, out: &mut HashMap<usize
     }
     if let CoreKind::Handle(h) = &e.kind {
         for c in h.clauses.iter() {
-            resume_owners(&c.body, Some(key(e)), out);
+            resume_owners(&c.body, Some((key(e), h.multi)), out, multi);
         }
     }
 }
@@ -455,20 +470,6 @@ pub fn contains_effect(e: &CoreExpr, fx: &Fx) -> bool {
         CoreKind::If(c, t, f) => go(c) || go(t) || go(f),
         CoreKind::Match(s, arms) => go(s) || arms.iter().any(|a| go(&a.body)),
         CoreKind::Resume(v) => go(v),
-    }
-}
-
-/// Does `ty` NAME a user-declared effect anywhere -- in its own row, or in a
-/// row inside a parameter, result or constructor argument? (D16's refusal.)
-pub fn ty_names_user_effect(ty: &Ty) -> bool {
-    match ty {
-        Ty::Fn(ps, row, r) => {
-            row.labels.keys().any(|l| l != BUILTIN_EFFECT)
-                || ps.iter().any(ty_names_user_effect)
-                || ty_names_user_effect(r)
-        }
-        Ty::Con(_, args) => args.iter().any(ty_names_user_effect),
-        _ => false,
     }
 }
 

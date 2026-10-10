@@ -545,6 +545,7 @@ mod tests {
                 clauses: clauses.into(),
                 ret,
                 is_multi_declared: false,
+                multi: false,
             })),
         )
     }

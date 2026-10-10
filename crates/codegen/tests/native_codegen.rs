@@ -3489,10 +3489,12 @@ fn native_output_matches_the_evaluator_across_the_sub_effecting_corpus() {
 /// Sub-effecting lets a DIRECT closure (`f`, generic and pure) be used where an
 /// effectful function is expected (the `if` joins it with a T-performing
 /// lambda). Its code has the direct convention, so the CPS call of `g` jumped
-/// into it with the wrong signature: measured 2 where the evaluator printed 13.
-/// Refused by name until an adapter wraps such a closure.
+/// into it with the wrong signature: measured 2 where the evaluator printed 13,
+/// then refused by name. N7 part 1 (replaces
+/// `a_direct_closure_used_where_an_effectful_one_is_expected_is_refused_by_name`):
+/// the use is eta-expanded into an adapter lambda with the CPS convention.
 #[test]
-fn a_direct_closure_used_where_an_effectful_one_is_expected_is_refused_by_name() {
+fn a_direct_closure_used_where_an_effectful_one_is_expected_runs_through_an_adapter() {
     let src = "effect T { fn t() -> Int }\n\
                fn h(c) {\n\
                \x20 let f = fn(x) { x + 1 }\n\
@@ -3501,22 +3503,16 @@ fn a_direct_closure_used_where_an_effectful_one_is_expected_is_refused_by_name()
                }\n\
                pub fn main() -> Int { handle { h(True) + h(False) } with { T.t() -> resume(10)  return(r) -> r } }\n";
     assert_eq!(eval_main_int(src), "13");
-    let dir = temp_dir("direct-closure-upcast");
-    let err = try_compile_and_link(&lower_src(src), &dir, "direct-closure-upcast").unwrap_err();
-    assert!(
-        err.contains("direct function used where an effectful one is expected"),
-        "{err}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
+    assert_native_matches(src, "13", "direct-closure-upcast");
 }
 
 /// The sub-effecting review's F3: the same upcast reached through a handler's
 /// RETURN binder (`x`, the direct closure `mk()` returns, joined with an
-/// effectful lambda) was not refused -- the return binder's type was not
-/// tracked -- and the CPS call jumped into direct code: 2 where the
-/// evaluator printed 102.
+/// effectful lambda): 2 where the evaluator printed 102, then refused by name.
+/// N7 part 1 (replaces `a_direct_closure_upcast_through_a_return_binder_is_refused_by_name`):
+/// the return binder is tracked, so its upcast gets the adapter too.
 #[test]
-fn a_direct_closure_upcast_through_a_return_binder_is_refused_by_name() {
+fn a_direct_closure_upcast_through_a_return_binder_runs_through_an_adapter() {
     let src = "effect T { fn t() -> Int }\n\
                fn mk() { fn(x) { x + 1 } }\n\
                fn h(c) {\n\
@@ -3525,11 +3521,1118 @@ fn a_direct_closure_upcast_through_a_return_binder_is_refused_by_name() {
                }\n\
                pub fn main() -> Int { handle { h(True) + 100 } with { T.t() -> resume(10)  return(r) -> r } }\n";
     assert_eq!(eval_main_int(src), "102");
-    let dir = temp_dir("direct-closure-upcast-ret");
-    let err = try_compile_and_link(&lower_src(src), &dir, "direct-closure-upcast-ret").unwrap_err();
+    assert_native_matches(src, "102", "direct-closure-upcast-ret");
+}
+
+/// N7 part 1, measured on `main` at 5799ba9: the upcast one level down, in the
+/// RESULT of a function value. The outer conventions agree (both direct), so
+/// the outermost-only refusal let it through, and the inner direct closure was
+/// called with the CPS convention: native printed 2 where the evaluator
+/// printed 3306. The adapter now coerces every covariant layer.
+#[test]
+fn a_direct_closure_returned_where_an_effectful_one_is_expected_runs() {
+    let src = "effect T { fn t() -> Int }\n\
+               fn h(c) {\n\
+               \x20 let f = fn() { fn(x) { x + 1 } }\n\
+               \x20 let g = if c { f } else { fn() { fn(x) { t() + x } } }\n\
+               \x20 let k = g()\n\
+               \x20 k(1) * 3\n\
+               }\n\
+               pub fn main() -> Int { handle { h(True) + h(False) * 100 } with { T.t() -> resume(10)  return(r) -> r } }\n";
+    assert_eq!(eval_main_int(src), "3306");
+    assert_native_matches(src, "3306", "direct-closure-result-upcast");
+}
+
+fn assert_native_matches(src: &str, want: &str, tag: &str) {
+    let dir = temp_dir(tag);
+    let exe = try_compile_and_link(&lower_src(src), &dir, tag).unwrap_or_else(|e| panic!("{e}"));
+    let out = Command::new(&exe).output().expect("run produced binary");
+    diagnose_stack_overflow(&out.status, tag);
+    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(out.status.success(), "{tag}: {:?}", out.status);
+    assert_eq!(got, want, "{tag}");
+}
+
+/// N7 part 1 (spec `2026-10-09-elya-n7a-convention-specialization-design.md`):
+/// row-polymorphic functions used at user effects (each was refused by name,
+/// "effect-polymorphic function used at a user effect") and direct closures
+/// upcast to effectful types (refused, "direct function used where an
+/// effectful one is expected"). Values are the evaluator's.
+const CONVENTIONS: &[(&str, &str, &str)] = &[
+    (
+        // `w`'s own `lg` and `k`'s row: `r` is instantiated at nothing new, so
+        // no clone is needed; the old guard refused it anyway.
+        "pure-callback-into-a-relay",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn w(k) { k(0) + lg(1) }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { w(fn(x) { x + 5 }) } with { L.lg(x) -> resume(x * 10)  return(r) -> r }\n\
+         }\n",
+        "15",
+    ),
+    (
+        "apply-at-pure-and-at-a-user-effect",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn apply(f) { f(1) + 1 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = apply(fn(x) { x * 7 })\n\
+         \x20 let b = handle { apply(fn(x) { lg(x) }) } with { L.lg(x) -> resume(x + 40)  return(r) -> r }\n\
+         \x20 a * 100 + b\n\
+         }\n",
+        "842",
+    ),
+    (
+        "recursive-map-at-two-rows",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn mapl(f, n) { if n == 0 { 0 } else { f(n) + mapl(f, n - 1) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let pure = mapl(fn(x) { x }, 10)\n\
+         \x20 let eff = handle { mapl(fn(x) { lg(x) }, 10) } with { L.lg(x) -> resume(x * 2)  return(r) -> r }\n\
+         \x20 pure * 1000 + eff\n\
+         }\n",
+        "55110",
+    ),
+    (
+        "let-bound-generic-lambda",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { let app = fn(g) { g() + 1 }  let h = fn() { get() }  app(h) * 2 + app(fn() { 3 }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "20",
+    ),
+    (
+        "annotated-twice",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn twice(f: fn(Int) -> Int, x: Int) -> Int { f(f(x)) }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = twice(fn(x) { x * 3 }, 2)\n\
+         \x20 let b = handle { twice(fn(x) { lg(x) + 1 }, 3) } with { L.lg(x) -> resume(x * 10)  return(r) -> r }\n\
+         \x20 a * 1000 + b\n\
+         }\n",
+        "18311",
+    ),
+    (
+        "mutual-recursion-over-a-callback",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn ev(f: fn(Int) -> Int, n: Int) -> Int { if n == 0 { 0 } else { f(n) + od(f, n - 1) } }\n\
+         fn od(f: fn(Int) -> Int, n: Int) -> Int { if n == 0 { 0 } else { ev(f, n - 1) - f(n) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = ev(fn(x) { x }, 10)\n\
+         \x20 let b = handle { ev(fn(x) { lg(x) }, 10) } with { L.lg(x) -> resume(x * 3)  return(r) -> r }\n\
+         \x20 a * 1000 + b\n\
+         }\n",
+        "5015",
+    ),
+    (
+        "a-generic-function-calls-a-generic-function",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn apply(f: fn(Int) -> Int) -> Int { f(1) }\n\
+         fn apply2(f: fn(Int) -> Int) -> Int { apply(f) + apply(f) * 10 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = apply2(fn(x) { x + 1 })\n\
+         \x20 let b = handle { apply2(fn(x) { lg(x) + 2 }) } with { L.lg(x) -> resume(x * 5)  return(r) -> r }\n\
+         \x20 a * 1000 + b\n\
+         }\n",
+        "22077",
+    ),
+    (
+        "three-instantiations-three-clones",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         effect M { fn mm(x: Int) -> Int }\n\
+         fn apply(f: fn(Int) -> Int) -> Int { f(2) + 1 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = handle { apply(fn(x) { lg(x) }) } with { L.lg(x) -> resume(x * 5)  return(r) -> r }\n\
+         \x20 let b = handle { apply(fn(x) { mm(x) }) } with { M.mm(x) -> resume(x * 7)  return(r) -> r }\n\
+         \x20 let c = handle { handle { apply(fn(x) { mm(x) + lg(x) }) } with { M.mm(x) -> resume(x * 7)  return(r) -> r } } with { L.lg(x) -> resume(x * 100)  return(r) -> r }\n\
+         \x20 a * 10000 + b * 100 + c\n\
+         }\n",
+        "111715",
+    ),
+    (
+        "a-generic-call-inside-an-effectful-lambda",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn apply(f: fn(Int) -> Int) -> Int { f(3) * 2 }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { let k = fn(y) { apply(fn(x) { lg(x) + y }) }  k(1) + k(2) } with { L.lg(x) -> resume(x * 10)  return(r) -> r }\n\
+         }\n",
+        "126",
+    ),
+    (
+        // `guard` handles E around `f()`; at `{E, L}` the clone's handle
+        // LEAKS L, so it is a CPS handle -- the leak analysis sees the label.
+        "a-clone-whose-handle-leaks-the-instantiated-effect",
+        "effect E { fn e() -> Int }\n\
+         effect L { fn lg(x: Int) -> Int }\n\
+         fn guard(f) { handle { f() } with { E.e() -> resume(5)  return(r) -> r + 1 } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = guard(fn() { e() * 2 })\n\
+         \x20 let b = handle { guard(fn() { e() + lg(4) }) } with { L.lg(x) -> resume(x * 10)  return(r) -> r }\n\
+         \x20 a * 1000 + b\n\
+         }\n",
+        "11046",
+    ),
+    (
+        "non-tail-recursion-through-a-clone",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn go(f: fn(Int) -> Int, n: Int) -> Int { if n == 0 { 0 } else { go(f, n - 1) + f(n) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { go(fn(x) { lg(x) }, 2000) } with { L.lg(x) -> resume(x)  return(r) -> r }\n\
+         }\n",
+        "2001000",
+    ),
+    (
+        "upcast-of-a-let-bound-direct-closure",
+        "effect T { fn t() -> Int }\n\
+         fn pick(c) {\n\
+         \x20 let f = fn(x) { x + 1 }\n\
+         \x20 let g = if c { f } else { fn(x) { t() + x } }\n\
+         \x20 g(10)\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { pick(True) + pick(False) } with { T.t() -> resume(2)  return(r) -> r }\n\
+         }\n",
+        "23",
+    ),
+    (
+        "upcast-through-a-return-binder",
+        "effect T { fn t() -> Int }\n\
+         fn mk() { fn(x) { x + 1 } }\n\
+         fn h(c) {\n\
+         \x20 let g = handle { mk() } with { T.t() -> resume(0)  return(x) -> if c { x } else { fn(s) { t() + s } } }\n\
+         \x20 g(1)\n\
+         }\n\
+         pub fn main() -> Int { handle { h(True) + 100 + h(False) * 1000 } with { T.t() -> resume(10)  return(r) -> r } }\n",
+        "11102",
+    ),
+    (
+        "a-direct-closure-passed-for-an-effectful-parameter",
+        "effect T { fn t() -> Int }\n\
+         fn h(f: fn(Int) / {T} -> Int) -> Int { f(1) + f(2) * 10 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let p = fn(x) { x + 4 }\n\
+         \x20 handle { h(p) + h(fn(x) { t() * x }) * 100 } with { T.t() -> resume(3)  return(r) -> r }\n\
+         }\n",
+        "6365",
+    ),
+    (
+        "upcast-of-a-capturing-closure-saved-across-a-site",
+        "effect T { fn t() -> Int }\n\
+         fn h(c, n) {\n\
+         \x20 let f = fn(x) { x + n }\n\
+         \x20 let g = if c { f } else { fn(x) { t() + x } }\n\
+         \x20 let a = g(10)\n\
+         \x20 a + g(20) * 100\n\
+         }\n\
+         pub fn main() -> Int { handle { h(True, 1) + h(False, 2) * 100000 } with { T.t() -> resume(7)  return(r) -> r } }\n",
+        "271702111",
+    ),
+    (
+        "upcast-in-a-result-layer",
+        "effect T { fn t() -> Int }\n\
+         fn h(c) {\n\
+         \x20 let f = fn() { fn(x) { x + 1 } }\n\
+         \x20 let g = if c { f } else { fn() { fn(x) { t() + x } } }\n\
+         \x20 let k = g()\n\
+         \x20 k(1) * 3\n\
+         }\n\
+         pub fn main() -> Int { handle { h(True) + h(False) * 100 } with { T.t() -> resume(10)  return(r) -> r } }\n",
+        "3306",
+    ),
+    (
+        // 2026-10-09: a lambda relaying an ENCLOSING parameter keeps its row
+        // open (it forced `f` pure, E0423); `wrap` is then effect-polymorphic
+        // in its result and gets a clone at {L}.
+        "a-returned-lambda-relays-an-enclosing-parameter",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn wrap(f: fn(Int) -> Int) { fn(x: Int) { f(x) + 1 } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = wrap(fn(x) { x * 2 })\n\
+         \x20 let b = handle { let w = wrap(fn(x) { lg(x) })  w(3) + w(4) } with { L.lg(x) -> resume(x * 10)  return(r) -> r }\n\
+         \x20 a(5) * 1000 + b\n\
+         }\n",
+        "11072",
+    ),
+];
+
+#[test]
+fn the_conventions_corpus_compiles_and_runs() {
+    run_value_corpus(CONVENTIONS, "conventions");
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_conventions_corpus() {
+    run_differential_corpus(CONVENTIONS, "conventions-diff");
+}
+
+/// The independent review of N7 part 1. Local clones were bound INSIDE the
+/// scope of the binder they copy, so a free occurrence of the same name in the
+/// lambda (an outer `let`, parameter, clause parameter, return binder or
+/// top-level function) captured the generic lambda itself: compiler panics,
+/// a segfault, "match failed", and 1007 for 12. And an upcast in a callee's
+/// RESULT (`if c { f() } else { .. }`, pre-existing): 11 for 1511.
+const CONVENTIONS_REVIEW: &[(&str, &str, &str)] = &[
+    (
+        "clone-captures-an-outer-int-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 let x = 10\n\
+         \x20 let x = fn(g) { g() + x }\n\
+         \x20 handle { x(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "17",
+    ),
+    (
+        "clone-captures-an-outer-adt-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         type Opt { None, Some(Int) }\n\
+         pub fn main() -> Int {\n\
+         \x20 let x = Some(5)\n\
+         \x20 let x = fn(g) { g() + match x { Some(n) -> n  _ -> 1000 } }\n\
+         \x20 handle { x(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "12",
+    ),
+    (
+        "clone-captures-an-outer-closure-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 let x = fn(y) { y * 3 }\n\
+         \x20 let x = fn(g) { g() + x(4) }\n\
+         \x20 handle { x(fn() { get() }) + x(fn() { 1 }) * 100 } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "1319",
+    ),
+    (
+        "clone-captures-a-top-level-function-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         fn scale(n: Int) -> Int { n * 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let scale = fn(g) { g() + scale(2) }\n\
+         \x20 handle { scale(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "2007",
+    ),
+    (
+        "clone-captures-a-return-binder-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { 5 } with {\n\
+         \x20   S.get() -> resume(1)\n\
+         \x20   return(v) -> {\n\
+         \x20     let v = fn(g) { g() + v }\n\
+         \x20     handle { v(fn() { get() }) } with { S.get() -> resume(70)  return(r) -> r }\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+        "75",
+    ),
+    (
+        "clone-captures-a-clause-parameter-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         effect K { fn kk(x: Int) -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { kk(5) } with {\n\
+         \x20   K.kk(x) -> {\n\
+         \x20     let x = fn(g) { g() + x }\n\
+         \x20     resume(handle { x(fn() { get() }) } with { S.get() -> resume(70)  return(r) -> r })\n\
+         \x20   }\n\
+         \x20   return(r) -> r\n\
+         \x20 }\n\
+         }\n",
+        "75",
+    ),
+    (
+        "clone-captures-a-parameter-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         fn h(app) {\n\
+         \x20 let app = fn(g) { g() + app }\n\
+         \x20 handle { app(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n\
+         pub fn main() -> Int { h(3) }\n",
+        "10",
+    ),
+    (
+        "clone-of-a-clone-of-the-same-name",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 let k = 5\n\
+         \x20 let k = fn(g) { g() + k }\n\
+         \x20 let k = fn(g) { k(g) * 10 }\n\
+         \x20 handle { k(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "120",
+    ),
+    (
+        "result-upcast-at-a-callee",
+        "effect T { fn t() -> Int }\n\
+         fn h(c) {\n\
+         \x20 let f = fn() { fn(x) { x + 1 } }\n\
+         \x20 let k = if c { f() } else { fn(x) { t() + x } }\n\
+         \x20 k(10)\n\
+         }\n\
+         pub fn main() -> Int { handle { h(True) + h(False) * 100 } with { T.t() -> resume(5)  return(r) -> r } }\n",
+        "1511",
+    ),
+    (
+        "result-upcast-at-a-two-parameter-callee",
+        "effect T { fn t() -> Int }\n\
+         fn h(c) {\n\
+         \x20 let f = fn(a, b) { fn(x) { x + a + b } }\n\
+         \x20 let k = if c { f(1, 2) } else { fn(x) { t() + x } }\n\
+         \x20 k(10) + k(20)\n\
+         }\n\
+         pub fn main() -> Int { handle { h(True) + h(False) * 1000 } with { T.t() -> resume(5)  return(r) -> r } }\n",
+        "40036",
+    ),
+    (
+        "result-upcast-with-an-annotated-parameter",
+        "effect S { fn get() -> Int }\n\
+         fn run(c) {\n\
+         \x20 let mk = fn(n) { fn(g: fn() / {} -> Int) { g() + n } }\n\
+         \x20 let k = if c { mk(1) } else { fn(g: fn() / {} -> Int) { get() + g() } }\n\
+         \x20 k(fn() { 5 })\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { run(True) + run(False) * 100 } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "1206",
+    ),
+];
+
+#[test]
+fn the_conventions_review_corpus_matches_the_evaluator() {
+    run_value_corpus(CONVENTIONS_REVIEW, "conventions-review");
+    run_differential_corpus(CONVENTIONS_REVIEW, "conventions-review-diff");
+}
+
+/// The review's finding 3 (pre-existing): an ALIAS of a generic local
+/// (`let mk2 = mk`) gets no clone, and the result of `mk2(1)` was a direct
+/// closure called with the CPS convention -- natively it hung where the
+/// evaluator printed 8. The deep callee guard refuses it by name: the
+/// result layer is an instantiation of `mk`'s open row at {S}.
+#[test]
+fn an_alias_of_a_generic_local_used_at_a_user_effect_is_refused_by_name() {
+    let src = "effect S { fn get() -> Int }\n\
+               pub fn main() -> Int {\n\
+               \x20 let mk = fn(n) { fn(g) { g() + n } }\n\
+               \x20 let mk2 = mk\n\
+               \x20 let k = mk2(1)\n\
+               \x20 handle { k(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+               }\n";
+    assert_eq!(eval_main_int(src), "8");
+    let dir = temp_dir("generic-alias");
+    let err = try_compile_and_link(&lower_src(src), &dir, "generic-alias").unwrap_err();
+    std::fs::remove_dir_all(&dir).ok();
     assert!(
-        err.contains("direct function used where an effectful one is expected"),
+        err.contains("effect-polymorphic function used at a user effect"),
         "{err}"
     );
+}
+
+/// Async step 1 (spec `2026-10-09-elya-async-step1-design.md`): function
+/// types in declarations. A closure in a constructor field or an operation
+/// argument, generator-style tasks built by a handler that stores `resume` in a
+/// field, and a round-robin scheduler. `an-upcast-of-a-pattern-binder` was a
+/// miscompile while pattern binders were untracked (4 for 304).
+const FN_FIELDS: &[(&str, &str, &str)] = &[
+    (
+        "a-closure-in-a-field",
+        "type B { B(fn(Int) -> Int) }\n\
+         pub fn main() -> Int { let f = fn(x) { x + 1 }  match B(f) { B(g) -> g(41) } }\n",
+        "42",
+    ),
+    (
+        "a-written-row-in-a-field",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         type B { B(fn(Int) / {L} -> Int) }\n\
+         fn call(b) { match b { B(g) -> g(5) } }\n\
+         pub fn main() -> Int { handle { call(B(fn(x) { lg(x) + 1 })) + call(B(fn(x) { x })) } with { L.lg(x) -> resume(x * 100)  return(r) -> r } }\n",
+        "506",
+    ),
+    (
+        "a-direct-closure-into-an-effectful-field",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         type B { B(fn(Int) / {L} -> Int) }\n\
+         fn call(b) { match b { B(g) -> g(5) } }\n\
+         pub fn main() -> Int { let p = fn(x) { x + 7 }  handle { call(B(p)) } with { L.lg(x) -> resume(x * 100)  return(r) -> r } }\n",
+        "12",
+    ),
+    (
+        "an-upcast-of-a-pattern-binder",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         type P { P(fn(Int) -> Int) }\n\
+         fn h(c, b) { match b { P(g) -> { let k = if c { g } else { fn(x) { lg(x) } }  k(3) } } }\n\
+         pub fn main() -> Int { handle { h(True, P(fn(x) { x + 1 })) + h(False, P(fn(x) { x })) } with { L.lg(x) -> resume(x * 100)  return(r) -> r } }\n",
+        "304",
+    ),
+    (
+        "an-operation-takes-a-function",
+        "effect Ap { fn ap(f: fn(Int) -> Int, x: Int) -> Int }\n\
+         pub fn main() -> Int { handle { ap(fn(x) { x * 2 }, 20) + 2 } with { Ap.ap(f, x) -> resume(f(x))  return(r) -> r } }\n",
+        "42",
+    ),
+    (
+        "a-generator-task",
+        "effect Yield { fn yld() -> Unit }\n\
+         type Task { Done(Int), Paused(fn() -> Task) }\n\
+         fn count(n: Int, acc: Int) -> Int { if n == 0 { acc } else { let _ = yld()  count(n - 1, acc + n) } }\n\
+         fn spawn(n: Int) -> Task { handle { count(n, 0) } with { Yield.yld() -> Paused(fn() { resume(Unit) })  return(x) -> Done(x) } }\n\
+         fn finish(t: Task) -> Int { match t { Done(x) -> x  Paused(k) -> finish(k()) } }\n\
+         fn run2(a: Task, b: Task) -> Int { match a { Done(x) -> x * 1000 + finish(b)  Paused(k) -> run2(b, k()) } }\n\
+         pub fn main() -> Int { run2(spawn(3), spawn(5)) }\n",
+        "6015",
+    ),
+    (
+        "two-tasks-interleave-their-log",
+        "effect Yield { fn yld() -> Unit }\n\
+         effect Log { fn emit(d: Int) -> Unit }\n\
+         type Task { Done(Int), Paused(fn() / {Log} -> Task) }\n\
+         fn work(id: Int, n: Int) -> Int { if n == 0 { id } else { let _ = emit(id)  let _ = yld()  work(id, n - 1) } }\n\
+         fn spawn(id: Int, n: Int) -> Task { handle { work(id, n) } with { Yield.yld() -> Paused(fn() { resume(Unit) })  return(x) -> Done(x) } }\n\
+         fn finish(t: Task) -> Int { match t { Done(x) -> x  Paused(k) -> finish(k()) } }\n\
+         fn run2(a: Task, b: Task) -> Int { match a { Done(x) -> x + finish(b)  Paused(k) -> run2(b, k()) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let f = handle { run2(spawn(1, 3), spawn(2, 2)) } with {\n\
+         \x20   Log.emit(d) -> fn(acc) { (resume(Unit))(acc * 10 + d) }\n\
+         \x20   return(x) -> fn(acc) { acc * 10 + x }\n\
+         \x20 }\n\
+         \x20 f(0)\n\
+         }\n",
+        "121213",
+    ),
+    (
+        "fork-and-yield",
+        "effect Async {\n\
+         \x20 fn fork(f: fn() / {Async, Log} -> Unit) -> Unit\n\
+         \x20 fn yld() -> Unit\n\
+         }\n\
+         effect Log { fn emit(d: Int) -> Unit }\n\
+         \n\
+         type Task { Done, Paused(fn() / {Log} -> Task), Forked(fn() / {Async, Log} -> Unit, fn() / {Log} -> Task) }\n\
+         type Queue { Empty, Push(Task, Queue) }\n\
+         \n\
+         fn task(body: fn() / {Async, Log} -> Unit) -> Task {\n\
+         \x20 handle { body() } with {\n\
+         \x20   Async.yld() -> Paused(fn() { resume(Unit) })\n\
+         \x20   Async.fork(f) -> Forked(f, fn() { resume(Unit) })\n\
+         \x20   return(u) -> Done\n\
+         \x20 }\n\
+         }\n\
+         \n\
+         fn append(q: Queue, t: Task) -> Queue { match q { Empty -> Push(t, Empty)  Push(h, r) -> Push(h, append(r, t)) } }\n\
+         \n\
+         fn run(q: Queue) -> Int {\n\
+         \x20 match q {\n\
+         \x20   Empty -> 0\n\
+         \x20   Push(t, rest) -> match t {\n\
+         \x20     Done -> 1 + run(rest)\n\
+         \x20     Paused(k) -> run(append(rest, k()))\n\
+         \x20     Forked(child, parent) -> run(append(append(rest, parent()), task(child)))\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n\
+         \n\
+         fn each(f: fn(Int) -> Unit, n: Int) -> Unit { if n == 0 { Unit } else { let _ = f(n)  each(f, n - 1) } }\n\
+         \n\
+         fn worker(id: Int) -> Unit { each(fn(i) { let _ = emit(id)  yld() }, 3) }\n\
+         \n\
+         pub fn main() -> Int {\n\
+         \x20 let pure_sum = each(fn(i) { Unit }, 5)\n\
+         \x20 let f = handle {\n\
+         \x20   run(Push(task(fn() { let _ = fork(fn() { worker(2) })  worker(1) }), Empty))\n\
+         \x20 } with {\n\
+         \x20   Log.emit(d) -> fn(acc) { (resume(Unit))(acc * 10 + d) }\n\
+         \x20   return(x) -> fn(acc) { acc * 10 + x }\n\
+         \x20 }\n\
+         \x20 f(0)\n\
+         }\n",
+        "1212122",
+    ),
+];
+
+#[test]
+fn the_fn_fields_corpus_matches_the_evaluator() {
+    run_value_corpus(FN_FIELDS, "fn-fields");
+    run_differential_corpus(FN_FIELDS, "fn-fields-diff");
+}
+
+#[test]
+fn the_async_example_runs_natively() {
+    // `examples/04_async.elya`: a scheduler written as an Elya handler, the
+    // same bytes printed natively as by the evaluator, and the same count.
+    let src = include_str!("../../../examples/04_async.elya");
+    let dir = temp_dir("async-example");
+    let exe = compile_and_link(&lower_src(src), &dir, "async");
+    let (text, value) = native_text_value(&exe, "async");
     std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(text, eval_main_text(src));
+    assert!(
+        text.starts_with("main: start\n  ping\nmain\n    pong\n"),
+        "{text}"
+    );
+    assert_eq!(value, "3");
+    assert_eq!(value, eval_main_int(src));
+}
+
+/// Native multi-shot handlers (2026-10-10, spec
+/// `2026-10-10-elya-native-multi-shot-design.md`, §0's table). A `with multi`
+/// resume re-enters a COPY of its captured frames (D2): m3 and m10 are the
+/// shapes where the first run mutates a handler frame inside the captured
+/// segment (an inner clause's non-tail resume rewrites its frame's `next`;
+/// m10 also crosses a `parent` link), so running the chain itself twice is
+/// wrong there -- the controls K1 (no copy: m3 prints 40200) and K2 (no
+/// `parent` remap: m10 prints 10024, m3 still right) fail them.
+const MULTI_SHOT: &[(&str, &str, &str)] = &[
+    (
+        "m1-two-branches",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn choose() { if flip() { 1 } else { 2 } }\n\
+         pub fn main() -> Int { handle choose() with multi { Flip.flip() -> resume(True) * 10 + resume(False) } }\n",
+        "12",
+    ),
+    (
+        "m2-two-flips",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn choose() {\n\
+         \x20 let a = if flip() { 1 } else { 0 }\n\
+         \x20 let b = if flip() { 2 } else { 0 }\n\
+         \x20 a * 10 + b\n\
+         }\n\
+         pub fn main() -> Int { handle choose() with multi { Flip.flip() -> resume(True) * 1000 + resume(False) } }\n",
+        "12012000",
+    ),
+    (
+        "m3-inner-handler-frame",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         effect Ask { fn ask() -> Int }\n\
+         fn inner() {\n\
+         \x20 handle {\n\
+         \x20   let x = ask()\n\
+         \x20   let b = flip()\n\
+         \x20   let y = ask()\n\
+         \x20   if b { x + y } else { x * y }\n\
+         \x20 } with { Ask.ask() -> resume(5) * 2 }\n\
+         }\n\
+         pub fn main() -> Int { handle inner() with multi { Flip.flip() -> resume(True) * 1000 + resume(False) } }\n",
+        "40100",
+    ),
+    (
+        "m4-backtracking",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn count(n, acc) { if n == 0 { if acc == 7 { 1 } else { 0 } } else { if flip() { count(n - 1, acc + n) } else { count(n - 1, acc) } } }\n\
+         pub fn main() -> Int { handle count(12, 0) with multi { Flip.flip() -> resume(True) + resume(False) } }\n",
+        "5",
+    ),
+    (
+        "m7-resume-in-a-lambda",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn choose() { if flip() { 1 } else { 2 } }\n\
+         pub fn main() -> Int { handle choose() with multi { Flip.flip() -> { let k = fn(b) { resume(b) }  k(True) * 10 + k(False) } } }\n",
+        "12",
+    ),
+    (
+        "m8-nested-multi",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         effect multi Pick { fn pick() -> Int }\n\
+         fn body() { let b = flip()  let n = pick()  if b { n } else { 0 - n } }\n\
+         fn mid() { handle body() with multi { Pick.pick() -> resume(1) * 100 + resume(2) } }\n\
+         pub fn main() -> Int { handle mid() with multi { Flip.flip() -> resume(True) * 100000 + resume(False) } }\n",
+        "10199898",
+    ),
+    (
+        "m10-parent-in-the-segment",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         effect Ask { fn ask() -> Int }\n\
+         effect Tell { fn tell(v: Int) -> Unit }\n\
+         fn inner() {\n\
+         \x20 handle {\n\
+         \x20   handle {\n\
+         \x20     let b = flip()\n\
+         \x20     let y = ask()\n\
+         \x20     let _ = tell(y)\n\
+         \x20     if b { y } else { y + 1 }\n\
+         \x20   } with { Tell.tell(v) -> resume(Unit) }\n\
+         \x20 } with { Ask.ask() -> resume(5) * 2 }\n\
+         }\n\
+         pub fn main() -> Int { handle inner() with multi { Flip.flip() -> resume(True) * 1000 + resume(False) } }\n",
+        "10012",
+    ),
+    (
+        "m11-deep-chain",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn sum(n) { if n == 0 { if flip() { 1 } else { 2 } } else { n + sum(n - 1) } }\n\
+         fn go(i, acc) { if i == 0 { acc } else { go(i - 1, acc + handle sum(300) with multi { Flip.flip() -> resume(True) + resume(False) }) } }\n\
+         pub fn main() -> Int { go(40, 0) }\n",
+        "3612120",
+    ),
+    (
+        "m12-many-runs",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn count(n, acc) { if n == 0 { acc } else { if flip() { count(n - 1, acc + 1) } else { count(n - 1, acc) } } }\n\
+         fn go(i, acc) { if i == 0 { acc } else { go(i - 1, acc + handle count(8, 0) with multi { Flip.flip() -> resume(True) + resume(False) }) } }\n\
+         pub fn main() -> Int { go(1000, 0) }\n",
+        "1024000",
+    ),
+];
+
+#[test]
+fn the_multi_shot_corpus_prints_the_evaluators_values() {
+    run_value_corpus(MULTI_SHOT, "multi-shot");
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_multi_shot_corpus() {
+    run_differential_corpus(MULTI_SHOT, "multi-shot-diff");
+}
+
+/// Spec D1: re-entry keys on the HANDLER's `with multi`. A plain `with` over a
+/// `multi`-declared effect is one-shot natively, as in the evaluator: it
+/// compiles (5b-8 refused it by the declaration) and a second resume traps.
+#[test]
+fn a_plain_handler_over_a_multi_effect_is_one_shot_natively() {
+    let dir = temp_dir("multi-plain");
+    let once = "effect multi Flip { fn flip() -> Bool }\n\
+                fn choose() { if flip() { 1 } else { 2 } }\n\
+                pub fn main() -> Int { handle choose() with { Flip.flip() -> resume(True) } }\n";
+    let exe = compile_and_link(&lower_src(once), &dir, "once");
+    assert_runs(&exe, "1");
+    let twice = "effect multi Flip { fn flip() -> Bool }\n\
+                 fn choose() { if flip() { 1 } else { 2 } }\n\
+                 pub fn main() -> Int { handle choose() with { Flip.flip() -> resume(True) + resume(False) } }\n";
+    let session = Session::new();
+    let (m, pd) = parse_module(&session, twice);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let eval = elya::eval::run_module_value(&m);
+    assert!(
+        matches!(&eval, Err(e) if format!("{e:?}").contains("E0425")),
+        "the evaluator must refuse the second resume with E0425"
+    );
+    let exe = compile_and_link(&lower_src(twice), &dir, "twice");
+    let out = Command::new(&exe).output().expect("run produced binary");
+    assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("elya: resume: a one-shot continuation was resumed twice"),
+        "stderr should name the trap, got: {stderr}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Spec D4: copies are shallow -- a ONE-SHOT continuation saved in a
+/// multi-shot segment is shared by both runs, so the second run's resume of it
+/// fails: E0425 in the evaluator, the named trap natively.
+#[test]
+fn a_one_shot_continuation_saved_in_a_multi_shot_segment_fails_on_both_sides() {
+    let src = "effect multi Flip { fn flip() -> Bool }\n\
+               effect Ask { fn ask() -> Int }\n\
+               fn inner() {\n\
+               \x20 handle { let x = ask()  x + 1 } with { Ask.ask() -> if flip() { resume(5) } else { resume(6) } }\n\
+               }\n\
+               pub fn main() -> Int { handle inner() with multi { Flip.flip() -> resume(True) * 1000 + resume(False) } }\n";
+    let session = Session::new();
+    let (m, pd) = parse_module(&session, src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let eval = elya::eval::run_module_value(&m);
+    assert!(
+        matches!(&eval, Err(e) if format!("{e:?}").contains("E0425")),
+        "the evaluator must refuse the second resume with E0425"
+    );
+    let dir = temp_dir("multi-shared-one-shot");
+    let exe = compile_and_link(&lower_src(src), &dir, "shared");
+    let out = Command::new(&exe).output().expect("run produced binary");
+    assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("elya: resume: a one-shot continuation was resumed twice"),
+        "stderr should name the trap, got: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).is_empty(),
+        "no answer may be printed"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Spec D5 (Invariant N8-1): copies are heap frames, so a multi-shot loop's
+/// live set stays bounded across N -- a copy that stayed reachable would grow
+/// it by at least a word per iteration.
+///
+/// Unlike A4's tail loop, the level is NOT equal across N: the last collection
+/// lands at a different point of the 64-run search each time, with a different
+/// number of copies pending (measured: 84, 80, 80, 89 words). So the bound is
+/// read off N itself -- every level below the smallest N, which a leak of one
+/// word per iteration would exceed -- and a growing control (the same loop
+/// keeping one `Cons` per iteration) must break that bound, so the instrument
+/// is shown to see growth.
+#[test]
+fn a_multi_shot_loops_live_set_stays_bounded() {
+    let dir = temp_dir("multi-settles");
+    let ns = [2_500i64, 5_000, 10_000, 20_000];
+    let run = |n: i64, keep: bool| -> GcStats {
+        let src = if keep {
+            format!(
+                "type L {{ Nil, Cons(Int, L) }}\n\
+                 effect multi Flip {{ fn flip() -> Bool }}\n\
+                 fn count(n, acc) {{ if n == 0 {{ acc }} else {{ if flip() {{ count(n - 1, acc + 1) }} else {{ count(n - 1, acc) }} }} }}\n\
+                 fn sum(l) {{ match l {{ Nil -> 0  Cons(x, r) -> x + sum(r) }} }}\n\
+                 fn go(i, acc) {{ if i == 0 {{ sum(acc) }} else {{ go(i - 1, Cons(handle count(6, 0) with multi {{ Flip.flip() -> resume(True) + resume(False) }}, acc)) }} }}\n\
+                 pub fn main() -> Int {{ go({n}, Nil) }}\n"
+            )
+        } else {
+            format!(
+                "effect multi Flip {{ fn flip() -> Bool }}\n\
+                 fn count(n, acc) {{ if n == 0 {{ acc }} else {{ if flip() {{ count(n - 1, acc + 1) }} else {{ count(n - 1, acc) }} }} }}\n\
+                 fn go(i, acc) {{ if i == 0 {{ acc }} else {{ go(i - 1, acc + handle count(6, 0) with multi {{ Flip.flip() -> resume(True) + resume(False) }}) }} }}\n\
+                 pub fn main() -> Int {{ go({n}, 0) }}\n"
+            )
+        };
+        let tag = format!("multi-settles-{n}-{keep}");
+        let exe = compile_and_link(&lower_src(&src), &dir, &tag);
+        let (stdout, stats) = run_with_gc_stats(&exe, &tag);
+        assert_eq!(stdout, (192 * n).to_string(), "{tag}");
+        assert!(
+            stats.collections > 0,
+            "{tag}: no collection happened, so `live` measures nothing"
+        );
+        assert!(
+            stats.live > 0,
+            "{tag}: live=0 means the level was never computed"
+        );
+        stats
+    };
+    let levels: Vec<(i64, i64)> = ns.iter().map(|&n| (n, run(n, false).live)).collect();
+    println!("multi-shot levels: {levels:?}");
+    for (n, live) in &levels {
+        assert!(
+            *live < ns[0],
+            "live set must not grow with N (a level of N words or more is a copy leak): {levels:?}, at N={n}"
+        );
+    }
+    let control = run(ns[3], true).live;
+    println!("growing control at N={}: {control}", ns[3]);
+    assert!(
+        control >= ns[0],
+        "the growing control did not break the bound, so the instrument sees nothing: {control}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Spec D3: the copy allocates, so a collection can run in the middle of one.
+/// m11 copies 300-frame chains 80 times and must collect; the answer must
+/// still be the evaluator's.
+#[test]
+fn copies_survive_a_collection_mid_copy() {
+    let (_, src, want) = MULTI_SHOT
+        .iter()
+        .find(|(t, _, _)| *t == "m11-deep-chain")
+        .expect("m11 in the corpus");
+    let dir = temp_dir("multi-gc");
+    let exe = compile_and_link(&lower_src(src), &dir, "multi-gc");
+    let (stdout, stats) = run_with_gc_stats(&exe, "multi-gc");
+    assert!(stats.collections > 0, "no collection ran: {stats:?}");
+    assert_eq!(&stdout, want);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `Int` arithmetic is exact or fails by name (2026-10-10, spec
+/// `2026-10-10-elya-checked-integer-arithmetic-design.md`). `/` and `%` compile
+/// natively; each value agrees with the evaluator. `ix` and `ex` take their
+/// operands from a perform, so `/` and `%` also run through the CPS emitter.
+/// Control K2 (no `-1` select in `%`): `min-rem-minus-one` dies on SIGFPE.
+const INT_DIVISION: &[(&str, &str, &str)] = &[
+    (
+        "signs",
+        "fn d(a, b) { a / b * 1000 + a % b }\n\
+         pub fn main() -> Int { d(0 - 7, 2) * 1000000 + d(7, 0 - 2) * 1000 + d(0 - 7, 0 - 2) }\n",
+        "-3003996001",
+    ),
+    (
+        "min-rem-minus-one",
+        "fn r(a, b) { a % b }\n\
+         pub fn main() -> Int { r(0 - 9223372036854775807 - 1, 0 - 1) + 5 }\n",
+        "5",
+    ),
+    (
+        "min-div-one",
+        "fn d(a, b) { a / b }\n\
+         pub fn main() -> Int { d(0 - 9223372036854775807 - 1, 1) / 1000000000000 }\n",
+        "-9223372",
+    ),
+    (
+        "through-cps",
+        "effect Ix { fn ix() -> Int }\n\
+         fn ex(n) {\n let v = n * 100 + ix()\n v / 7 * 10 + v % 7\n }\n\
+         pub fn main() -> Int { handle { ex(5) + ex(0 - 5) } with { Ix.ix() -> resume(3) } }\n",
+        "6",
+    ),
+    (
+        "lcg",
+        "fn next(s) { (s * 1103515245 + 12345) % 2147483648 }\n\
+         fn go(s, n) { if n == 0 { s } else { go(next(s), n - 1) } }\n\
+         pub fn main() -> Int { go(2026, 1000) }\n",
+        "",
+    ),
+];
+
+#[test]
+fn integer_division_runs_natively() {
+    let dir = temp_dir("int-division");
+    for (tag, src, expected) in INT_DIVISION {
+        let exe = compile_and_link(&lower_src(src), &dir, tag);
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_crash(&out.status, tag);
+        assert!(out.status.success(), "{tag}: exited {:?}", out.status);
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(got, eval_main_int(src), "{tag}: native vs evaluator");
+        if !expected.is_empty() {
+            assert_eq!(got, *expected, "{tag}");
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Every failing input stops natively with exit 1 and the named message, and
+/// the evaluator stops with E0300 and the same words. The operands come
+/// through a function so neither side can fold them away early.
+/// Control K1 (`add` without the overflow check): `add` prints a wrapped value.
+#[test]
+fn integer_traps_are_named_on_both_sides() {
+    const MIN: &str = "(0 - 9223372036854775807 - 1)";
+    const MAX: &str = "9223372036854775807";
+    let cases = [
+        ("add", format!("f({MAX}, 1, 0)"), "integer overflow"),
+        ("sub", format!("f({MIN}, 1, 1)"), "integer overflow"),
+        ("mul", format!("f({MAX}, 2, 2)"), "integer overflow"),
+        ("div-min", format!("f({MIN}, 0 - 1, 3)"), "integer overflow"),
+        ("div-zero", "f(7, 0, 3)".to_string(), "division by zero"),
+        ("rem-zero", "f(7, 0, 4)".to_string(), "remainder by zero"),
+    ];
+    let dir = temp_dir("int-traps");
+    for (tag, call, name) in cases {
+        let src = format!(
+            "fn f(a, b, op) {{ if op == 0 {{ a + b }} else {{ if op == 1 {{ a - b }} else {{\n\
+             if op == 2 {{ a * b }} else {{ if op == 3 {{ a / b }} else {{ a % b }} }} }} }} }}\n\
+             pub fn main() -> Int {{ {call} }}\n"
+        );
+        let session = Session::new();
+        let (m, pd) = parse_module(&session, &src);
+        assert!(pd.is_empty(), "parse: {pd:?}");
+        match elya::eval::run_module_value(&m) {
+            Err(e) => {
+                assert_eq!(e.diag.code, "E0300", "{tag}");
+                assert_eq!(e.diag.message, name, "{tag}");
+            }
+            Ok((_, v)) => panic!("{tag}: the evaluator returned {v:?}"),
+        }
+        let exe = compile_and_link(&lower_src(&src), &dir, tag);
+        let out = Command::new(&exe).output().expect("run produced binary");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{tag}: {:?}, stdout {:?}, stderr {stderr:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert_eq!(stderr, format!("elya: {name}\n"), "{tag}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Native pattern compilation (2026-10-10, spec
+/// `2026-10-10-elya-native-pattern-compilation-design.md`, §0's table): nested
+/// constructor patterns and literal patterns compile through a Core-to-Core pass
+/// into the flat matches both emitters already support. Each value is the
+/// evaluator's (and pinned where computed by hand).
+/// p8 and p9 are the review's: with failure continuations copied they took
+/// 9.2 s / 6.4 MB and 11.4 s / 6.3 MB to build (exponential in the arms).
+const PATTERNS: &[(&str, &str, &str)] = &[
+    (
+        "p1-nested-fallthrough",
+        "type E { A(Int), B(Int, Int) }\n\
+         type L { Nil, Cons(E, L) }\n\
+         fn f(l) { match l {\n\
+         \x20 Cons(A(x), Cons(B(y, z), _)) -> x * 100 + y * 10 + z\n\
+         \x20 Cons(A(x), _) -> x\n\
+         \x20 Cons(B(y, z), rest) -> y + z + f(rest)\n\
+         \x20 Nil -> 0\n\
+         } }\n\
+         pub fn main() -> Int { f(Cons(A(1), Cons(B(2, 3), Nil))) * 10000 + f(Cons(A(7), Nil)) * 100 + f(Cons(B(4, 5), Cons(A(6), Nil))) }\n",
+        "1230715",
+    ),
+    (
+        "p2-int-and-bool-literals",
+        "fn g(n) { match n {\n\
+         \x20 0 -> 100\n\
+         \x20 1 -> 200\n\
+         \x20 k -> k * 3\n\
+         } }\n\
+         fn h(b) { match b {\n\
+         \x20 True -> 1\n\
+         \x20 False -> 2\n\
+         } }\n\
+         pub fn main() -> Int { g(0) + g(1) + g(5) + h(True) * 1000 + h(False) * 10000 }\n",
+        "21315",
+    ),
+    (
+        "p3-literal-in-constructor",
+        "type O { None, Some(Int) }\n\
+         fn f(o) { match o {\n\
+         \x20 Some(0) -> 10\n\
+         \x20 Some(n) -> n\n\
+         \x20 None -> 0 - 1\n\
+         } }\n\
+         pub fn main() -> Int { f(Some(0)) * 10000 + f(Some(42)) * 10 + f(None) }\n",
+        "100419",
+    ),
+    (
+        "p4-outer-name",
+        "type P { P(Int, Q) }\n\
+         type Q { Q(Int) }\n\
+         fn f(p, x) { match p {\n\
+         \x20 P(x, Q(1)) -> x\n\
+         \x20 P(_, Q(_)) -> x\n\
+         } }\n\
+         pub fn main() -> Int { f(P(5, Q(1)), 9) * 100 + f(P(5, Q(2)), 9) }\n",
+        "509",
+    ),
+    (
+        "p5-effectful-arms",
+        "effect Ask { fn ask() -> Int }\n\
+         type O { None, Some(Int) }\n\
+         type W { W(O) }\n\
+         fn f(w) { match w {\n\
+         \x20 W(Some(0)) -> ask()\n\
+         \x20 W(Some(n)) -> n + ask()\n\
+         \x20 W(None) -> ask() * 2\n\
+         } }\n\
+         pub fn main() -> Int { handle { f(W(Some(0))) * 10000 + f(W(Some(5))) * 100 + f(W(None)) } with { Ask.ask() -> resume(7) } }\n",
+        "71214",
+    ),
+    (
+        "p6-pairs-loop",
+        "type L { Nil, Cons(Int, L) }\n\
+         fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }\n\
+         fn pairs(l, acc) { match l {\n\
+         \x20 Cons(a, Cons(b, rest)) -> pairs(rest, acc + a * b)\n\
+         \x20 Cons(a, Nil) -> acc + a\n\
+         \x20 Nil -> acc\n\
+         } }\n\
+         pub fn main() -> Int { pairs(build(100001, Nil), 0) % 1000000007 }\n",
+        "",
+    ),
+    (
+        "p7-literal-in-lambda",
+        "type O { None, Some(Int) }\n\
+         pub fn main() -> Int {\n\
+         \x20 let f = fn(o) { match o {\n\
+         \x20   Some(1) -> 10\n\
+         \x20   Some(m) -> m\n\
+         \x20   None -> 0\n\
+         \x20 } }\n\
+         \x20 f(Some(1)) + f(Some(5)) * 100\n\
+         }\n",
+        "510",
+    ),
+    (
+        "p8-simplifier",
+        "type E { Num(Int), Add(E, E), Mul(E, E), Neg(E) }\n\
+         fn simp(e) { match e {\n\
+         \x20 Add(Num(0), x) -> x\n\
+         \x20 Add(x, Num(0)) -> x\n\
+         \x20 Mul(Num(1), x) -> x\n\
+         \x20 Mul(x, Num(1)) -> x\n\
+         \x20 Mul(Num(0), _) -> Num(0)\n\
+         \x20 Mul(_, Num(0)) -> Num(0)\n\
+         \x20 Neg(Neg(x)) -> x\n\
+         \x20 Neg(Num(n)) -> Num(0 - n)\n\
+         \x20 Add(Num(a), Num(b)) -> Num(a + b)\n\
+         \x20 Mul(Num(a), Num(b)) -> Num(a * b)\n\
+         \x20 other -> other\n\
+         } }\n\
+         fn ev(e) { match simp(e) {\n\
+         \x20 Num(n) -> n\n\
+         \x20 Add(a, b) -> ev(a) + ev(b)\n\
+         \x20 Mul(a, b) -> ev(a) * ev(b)\n\
+         \x20 Neg(a) -> 0 - ev(a)\n\
+         } }\n\
+         pub fn main() -> Int { ev(Add(Mul(Num(1), Neg(Neg(Num(5)))), Add(Num(0), Mul(Num(3), Num(4))))) }\n",
+        "17",
+    ),
+    (
+        "p9-six-nested-arms",
+        "type L { Nil, Cons(Int, L) }\n\
+         fn f(l) { match l {\n\
+         \x20 Cons(0, Cons(1, Cons(2, Nil))) -> 1\n\
+         \x20 Cons(1, Cons(2, Cons(3, Nil))) -> 2\n\
+         \x20 Cons(2, Cons(3, Cons(4, Nil))) -> 3\n\
+         \x20 Cons(3, Cons(4, Cons(5, Nil))) -> 4\n\
+         \x20 Cons(4, Cons(5, Cons(6, Nil))) -> 5\n\
+         \x20 Cons(5, Cons(6, Cons(7, Nil))) -> 6\n\
+         \x20 _ -> 0\n\
+         } }\n\
+         fn mk(i) { Cons(i, Cons(i + 1, Cons(i + 2, Nil))) }\n\
+         pub fn main() -> Int { f(mk(0)) * 1 + f(mk(1)) * 10 + f(mk(2)) * 100 + f(mk(3)) * 1000 + f(mk(4)) * 10000 + f(mk(5)) * 100000 + f(mk(6)) * 1000000 }\n",
+        "654321",
+    ),
+];
+
+#[test]
+fn nested_and_literal_patterns_run_natively() {
+    let dir = temp_dir("patterns");
+    for (tag, src, expected) in PATTERNS {
+        let exe = compile_and_link(&lower_src(src), &dir, tag);
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_crash(&out.status, tag);
+        assert!(
+            out.status.success(),
+            "{tag}: exited {:?}, stderr {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(got, eval_main_int(src), "{tag}: native vs evaluator");
+        if !expected.is_empty() {
+            assert_eq!(got, *expected, "{tag}");
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Spec D3: a user binder is bound only once its whole arm has matched. `f`'s
+/// first arm binds `x` and then fails on `Q(2)`; the second arm must read the
+/// PARAMETER `x` (9), not the failed arm's field (5).
+#[test]
+fn a_failed_nested_arm_does_not_shadow_an_outer_name() {
+    let src = PATTERNS
+        .iter()
+        .find(|(t, _, _)| *t == "p4-outer-name")
+        .map(|(_, s, _)| *s)
+        .unwrap();
+    let dir = temp_dir("pattern-shadow");
+    let exe = compile_and_link(&lower_src(src), &dir, "p4");
+    assert_runs(&exe, "509");
+    assert_eq!(eval_main_int(src), "509");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `examples/05_replay.elya` (2026-10-10): record, replay and a test double as
+/// ordinary handlers; the same bytes and value natively as in the evaluator.
+/// Needed `%` (checked arithmetic) and nested patterns (pattern compilation).
+#[test]
+fn the_replay_example_runs_natively() {
+    let src = include_str!("../../../examples/05_replay.elya");
+    let dir = temp_dir("replay-example");
+    let exe = compile_and_link(&lower_src(src), &dir, "replay");
+    let (text, value) = native_text_value(&exe, "replay");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(text, eval_main_text(src));
+    assert_eq!(
+        text,
+        "test: 5 quick sixes score 60\nrecorded a live run\nreplay: same score\n\
+         replay of the changed game: diverged at an 8-sided roll\n"
+    );
+    assert_eq!(value, "2106");
+    assert_eq!(value, eval_main_int(src));
 }

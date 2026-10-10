@@ -118,22 +118,68 @@ Elya is a typed language on a CEK machine, built up through these slices:
 
 `elya build` compiles through a typed Core IR to native code with LLVM 18:
 
-- integers, booleans and control flow; functions with **guaranteed tail calls**
-  (`tailcc` + `musttail`, run 1,000,000 deep);
-- ADTs and pattern matching (a failed match traps); closures, including indirect
+- integers, booleans and control flow; **integer arithmetic is exact or fails by
+  name** (overflow and a zero divisor stop the program, the same words as the
+  evaluator); functions with **guaranteed tail calls** (`tailcc` + `musttail`, run
+  1,000,000 deep);
+- ADTs and pattern matching, nested and literal patterns included (compiled to flat
+  matches; a failed match traps); closures, including indirect
   tail calls; strings and `io.println`;
 - Elya's **own precise mark-sweep garbage collector**: non-moving, with a shadow
   stack, compiler-generated descriptor tables and free lists;
 - **one-shot effect handlers** (selective CPS): `handle`/`resume` anywhere in a
   clause, deep re-installation, O(1) handler lookup, one-shot enforced by a named
-  trap, and a state-passing handler loop bounded at N = 1,000,000.
+  trap, and a state-passing handler loop bounded at N = 1,000,000; effectful
+  lambdas and closure calls, and handles nested in handlers or effectful code;
+- **effect-polymorphic functions**: a function generic in its effect row is
+  specialized per calling convention at the rows it is used with, and a pure
+  closure used where an effectful one is expected gets an adapter;
+- **multi-shot handlers** (`with multi`): each resume re-enters a copy of the
+  captured frames, so backtracking and search handlers run natively.
 
 Every native program is checked against the reference evaluator, for both the
 value and the exact bytes printed. CI runs the full gate on Windows too.
 
-Not yet native (refused by name): multi-shot handlers (`with multi`), effectful
-lambdas and closure calls, a `handle` nested in another handler or in effectful
-code, and polymorphic code that stays polymorphic (`Ty::Var`).
+Not yet native (refused by name): code polymorphic in a type variable (`Ty::Var`).
+
+### Async without function colouring
+
+Suspension is an effect, so a scheduler is just a handler. In
+[`examples/04_async.elya`](examples/04_async.elya) tasks call `yld()` and `fork(f)`;
+the handler `task` turns a computation into a value that holds the rest of it (its
+`resume`, stored in a constructor field), and `run` is a round-robin queue written in
+plain Elya. The same `each` loops in ordinary code and, inside the tasks, over a body
+that yields at every step: there is no async copy of it and no `await`. It runs in the
+evaluator and natively, printing the same interleaving:
+
+```
+main: start
+  ping
+main
+    pong
+  ping
+...
+```
+
+Function types can be written in `type` and `effect` declarations for this
+(`Paused(fn() / {Log} -> Task)`); a declaration's rows are exactly what is written.
+
+### Exact replay, and tests without mocks
+
+A program touches the outside world only through effects, so whoever handles them decides
+what the world says. In [`examples/05_replay.elya`](examples/05_replay.elya) a dice game
+asks a `World` effect for rolls and clock readings. `record` sits between the program and
+any world and logs every answer; `replay` feeds a log back with no world at all and stops
+by name -- `Diverged(WantRoll(8), ..)` -- the first time the program asks for something the
+recording does not hold; `fixed` is a test double. All four are ordinary handlers, the
+game is written once, and it runs the same in the evaluator and natively:
+
+```
+test: 5 quick sixes score 60
+recorded a live run
+replay: same score
+replay of the changed game: diverged at an 8-sided roll
+```
 
 ### Affine resources
 

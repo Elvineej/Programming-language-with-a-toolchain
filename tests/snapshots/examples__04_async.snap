@@ -1,0 +1,13 @@
+---
+source: tests/examples.rs
+expression: "run_example(\"04_async.elya\")"
+---
+main: start
+  ping
+main
+    pong
+  ping
+main
+    pong
+  ping
+main: done
