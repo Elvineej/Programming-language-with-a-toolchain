@@ -7,6 +7,12 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 
 - Previous run (01:53) never marked DONE; over 3 hours old, so this run takes over.
   Its work is on `auto/elya`: native multi-shot handlers (01a7e36, fd32b81; gate 845 / 79).
+- LLVM 18 dev headers (and libzstd-dev) were missing again; installed via apt. Codegen gate runs.
+- **Done: evaluator linear continuations** (dfd83ca), HANDOFF step 1. Spec
+  `docs/superpowers/specs/2026-10-10-elya-eval-linear-continuations-design.md`. Gate 859 / 81
+  (predicted 859). Review: no findings.
+- Next: HANDOFF step 1 (exact replay / handler-based testing, `examples/05_replay.elya`).
+- Windows-gate debt added: dfd83ca.
 
 ## 2026-10-10 01:53 UTC — ended without a DONE mark (taken over 09:49)
 
