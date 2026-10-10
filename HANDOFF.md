@@ -13,7 +13,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 845 passed, 79 suites. The runtime gained
+- Linux gate at the tip of `auto/elya`: 859 passed, 81 suites. The runtime gained
   `elya_cont_copy` (multi-shot); `gc_mark` is unchanged.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
@@ -162,17 +162,16 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   run. Keyed on the handler's `with multi` (`CoreHandle::multi`), so a plain `with` over a
   `multi` effect is one-shot natively, as in the evaluator. The live set stays bounded.
 
+- **The evaluator's continuation costs linearly at any depth** (2026-10-10, branch
+  `auto/elya`): spec `docs/superpowers/specs/2026-10-10-elya-eval-linear-continuations-design.md`.
+  Two causes, not the handler: a per-step depth walk, and perform/resume copying frames.
+  The continuation is now segmented at handlers (a meta-continuation): a perform walks
+  handler boundaries and shares the frames above them. `Interp::cost()` pins it
+  timing-free (`tests/eval_complexity.rs`); the PARKED shape runs at n = 100 000.
+
 ## The next five steps
 
-### 1. Evaluator: non-tail recursion under a handler is quadratic
-
-PARKED: about 4× time per doubling (n=4000 takes 1.7 s; n=100 000 did not finish in 10
-minutes). This caps every differential test's N. Profile (frame capture copies the
-continuation?), predict the complexity, fix, and pin it with a timing-free test that
-counts steps or allocations. The evaluator is the reference semantics, so the
-differential corpora must stay green unchanged.
-
-### 2. Exact replay and handler-based testing (ROADMAP priority 3)
+### 1. Exact replay and handler-based testing (ROADMAP priority 3)
 
 A `Record` handler that wraps a computation and logs every effect's answer (op name,
 arguments, the value it resumed with), and a `Replay` handler that feeds a log back and
@@ -183,7 +182,7 @@ handlers instead of mocking. Evaluator and native. Ship `examples/05_replay.elya
 tests and a README section; the CLI flag (`elya run --record/--replay`) comes after real
 I/O effects exist.
 
-### 3. N7 part 2: type variables natively
+### 2. N7 part 2: type variables natively
 
 `twice(f, x)` with `x: 'a`, and every unannotated `wrap`/`compose` (now accepted by the
 front end), are "unrepresentable type" natively. Monomorphize type variables like rows
@@ -192,26 +191,33 @@ budget, or pass dictionaries -- decide in the spec. Parametric ADTs (`type Q(a)`
 same question for constructors. Also: aliases of generic locals (`let mk2 = mk`) are
 refused by name.
 
-### 4. Async step 2: structured concurrency and a poll loop
+### 3. Async step 2: structured concurrency and a poll loop
 
 ROADMAP 1b/1c on top of `examples/04_async.elya`: a scope handler that joins its children
 (a `spawn` returning a handle, `await` as an effect), then real I/O readiness through a
 runtime poll loop the scheduler consults. Recursion through a handle body (PARKED) blocks
 the natural recursive `task`: measure whether it is the next front-end fix.
 
-### 5. A backtracking example, and handler frames in deep chains
+### 4. A backtracking example, and handler frames in deep chains
 
 Multi-shot runs natively now; show it: `examples/05_search.elya` (or the next free
 number), an N-queens or subset-sum search written as an ordinary function over a
 `multi` `Choose` effect, with handlers that collect all answers, the first answer, and a
 count -- one search, three meanings, the same bytes natively. Then measure the one shape
 the multi-shot review could not build: a captured chain holding MANY handler frames
-(blocked by PARKED's "recursion through a handle body"); if step 4's front-end fix lands
+(blocked by PARKED's "recursion through a handle body"); if step 3's front-end fix lands
 first, add it to `MULTI_SHOT` and time the copy (it maps parents through a hash table, so
 it should stay linear).
 
-Also open, unscheduled: native strings (`<>` refused natively, no Int-to-String; the
-builtin's name is Claude's call now -- `int.to_string` is the natural one); the roadmap's
+### 5. Native strings
+
+`<>` is refused natively and there is no Int-to-String, so every native example prints a
+number. Add the builtin (`int.to_string`, Claude's call) to the front end and evaluator,
+then strings natively: concatenation in the runtime (GC-managed byte arrays), the builtin,
+and `io.println` of a computed string. Measure first which examples and corpora this
+unlocks (the CEK machine's output, step 2's replay log), and pin it with differential tests.
+
+Also open, unscheduled: the roadmap's
 other priorities (record/replay handlers, then capabilities once modules exist); the rest
 of the soundness sweep (resume's row lacks return-clause and re-entered-clause effects;
 recursion through a lambda the function handles around, PARKED); recursion through a

@@ -156,7 +156,12 @@ slice: root every live binding (shadowed ones included), with this program as th
   names a user effect, even with a pure lambda (its generic signature has an open row). Lift
   with N7.
 
-## Evaluator: non-tail recursion under a handler is quadratic (found 2026-10-03)
+## RESOLVED (2026-10-10): Evaluator: non-tail recursion under a handler is quadratic (found 2026-10-03)
+
+Not the handler: a per-step depth walk and frame-copying capture/resume. Fixed by a
+segmented continuation; see `docs/superpowers/specs/2026-10-10-elya-eval-linear-continuations-design.md`.
+Original report:
+
 
 `deep(n)` (non-tail recursion that keeps a `Cons` per level) under a `handle` takes 0.12 s at
 n = 1000, 0.43 s at 2000, 1.70 s at 4000 (debug `elya run`): ~4x per doubling, and n = 100 000
