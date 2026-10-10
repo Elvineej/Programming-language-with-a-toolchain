@@ -3,7 +3,12 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-09 17:53 UTC — IN PROGRESS
+## 2026-10-10 01:53 UTC — IN PROGRESS
+
+- Previous run (2026-10-09 17:53) never marked DONE; it is over 3 hours old, so this run
+  takes over. Its work (786df15, 1a59091, b56566f) is intact on `auto/elya`.
+
+## 2026-10-09 17:53 UTC — ended without a DONE mark (taken over 2026-10-10 01:53)
 
 - Branch `auto/elya` created from `origin/main` (5799ba9, #21 merged). Draft PR #22.
 - LLVM 18 dev headers were missing in the container; installed `llvm-18-dev` via apt, so
