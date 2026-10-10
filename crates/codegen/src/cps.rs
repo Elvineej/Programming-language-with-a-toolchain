@@ -205,6 +205,10 @@ fn handler_saved(h: &elya::core::CoreHandle, scope: &[String]) -> Vec<(Saved, Ty
 pub struct Fx {
     pub leaking: HashSet<usize>,
     pub cps_resumes: HashSet<usize>,
+    /// Native multi-shot (spec D1): the `resume`s whose handle is `with
+    /// multi`. Each re-enters a COPY of its captured frames; every other
+    /// resume is one-shot (D13).
+    pub multi_resumes: HashSet<usize>,
 }
 
 /// Computes `Fx` structurally, to a fixpoint: a region's user effects are what
@@ -215,8 +219,9 @@ pub struct Fx {
 /// The convention checks (D16) refuse, by name, any disagreement with the types.
 pub fn effect_facts(core: &CoreModule) -> Fx {
     let mut owner: HashMap<usize, usize> = HashMap::new();
+    let mut multi_resumes: HashSet<usize> = HashSet::new();
     for f in &core.fns {
-        resume_owners(&f.body, None, &mut owner);
+        resume_owners(&f.body, None, &mut owner, &mut multi_resumes);
     }
     // Every op the module performs, by effect: a handle HANDLES an effect only
     // if it has a clause for each of them. The front end accepts a handle with
@@ -252,6 +257,7 @@ pub fn effect_facts(core: &CoreModule) -> Fx {
     Fx {
         leaking,
         cps_resumes,
+        multi_resumes,
     }
 }
 
@@ -303,11 +309,19 @@ fn performed_ops(e: &CoreExpr, out: &mut HashMap<String, BTreeSet<String>>) {
 }
 
 /// Each `resume` node -> the `handle` whose clause encloses it.
-fn resume_owners(e: &CoreExpr, clause_of: Option<usize>, out: &mut HashMap<usize, usize>) {
-    if let (CoreKind::Resume(_), Some(h)) = (&e.kind, clause_of) {
+fn resume_owners(
+    e: &CoreExpr,
+    clause_of: Option<(usize, bool)>,
+    out: &mut HashMap<usize, usize>,
+    multi: &mut HashSet<usize>,
+) {
+    if let (CoreKind::Resume(_), Some((h, is_multi))) = (&e.kind, clause_of) {
         out.insert(key(e), h);
+        if is_multi {
+            multi.insert(key(e));
+        }
     }
-    let mut go = |c: &CoreExpr| resume_owners(c, clause_of, out);
+    let mut go = |c: &CoreExpr| resume_owners(c, clause_of, out, multi);
     match &e.kind {
         CoreKind::Lit(_) | CoreKind::Var(_) => {}
         CoreKind::App(f, args) => {
@@ -342,7 +356,7 @@ fn resume_owners(e: &CoreExpr, clause_of: Option<usize>, out: &mut HashMap<usize
     }
     if let CoreKind::Handle(h) = &e.kind {
         for c in h.clauses.iter() {
-            resume_owners(&c.body, Some(key(e)), out);
+            resume_owners(&c.body, Some((key(e), h.multi)), out, multi);
         }
     }
 }

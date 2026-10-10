@@ -325,3 +325,119 @@ void elya_println(void *s) {
     fwrite(bytes, 1, (size_t)len, stdout);
     fputc('\n', stdout);
 }
+
+/* Native multi-shot (spec 2026-10-10, D2-D4). A resume of a `with multi`
+ * handle re-enters a COPY of its captured frames, so the original chain is
+ * never run and any number of later resumes see it exactly as captured. Site
+ * frames are never written after allocation, but handler frames are: every
+ * resume rewrites its frame's `next` and `parent` (5b-10), including the
+ * frames of handles INSIDE the captured segment. So the whole chain from `k`
+ * through `next` (word 2) to the answering frame `h` is copied, each copy's
+ * `next` relinked to the next copy, and the `parent` (word 4) of every copied
+ * handler frame -- recognised by tag, `[hlo, hhi)` -- that points into the
+ * segment redirected to the corresponding copy, as is the continuation's
+ * `innermost`. Copies are shallow (D4): saved values are shared, as the
+ * evaluator shares them. Returns a fresh continuation object
+ * `[tag][k'][h'][innermost']`. The caller has rooted what it still needs;
+ * the continuation and every copy are rooted here while the copy allocates. */
+static void elya_chain_broken(void) {
+    fputs("elya: resume: a continuation's frame chain does not reach its handler\n", stderr);
+    exit(1);
+}
+
+#define CONT_NEXT 2
+#define CONT_PARENT 4
+
+void *elya_cont_copy(void *cont, int64_t hlo, int64_t hhi) {
+    int64_t *c = (int64_t *)cont;
+    int64_t *k = (int64_t *)(intptr_t)c[1];
+    int64_t *h = (int64_t *)(intptr_t)c[2];
+    int64_t n = 0;
+    for (int64_t *f = k;; f = (int64_t *)(intptr_t)f[CONT_NEXT]) {
+        if (!f) {
+            elya_chain_broken();
+        }
+        n++;
+        if (f == h) {
+            break;
+        }
+    }
+    int64_t **orig = (int64_t **)malloc((size_t)n * sizeof(int64_t *));
+    int64_t **copy = (int64_t **)malloc((size_t)n * sizeof(int64_t *));
+    /* Open addressing, original frame address -> its index: a `parent` or
+     * `innermost` is mapped in O(1), so a chain with many handler frames does
+     * not copy in quadratic time. */
+    int64_t cap = 16;
+    while (cap < 2 * n) {
+        cap *= 2;
+    }
+    int64_t **keys = (int64_t **)calloc((size_t)cap, sizeof(int64_t *));
+    int64_t *vals = (int64_t *)malloc((size_t)cap * sizeof(int64_t));
+    if (!orig || !copy || !keys || !vals) {
+        fputs("elya: out of memory copying a continuation\n", stderr);
+        exit(1);
+    }
+    int64_t i = 0;
+    for (int64_t *f = k; i < n; f = (int64_t *)(intptr_t)f[CONT_NEXT]) {
+        orig[i] = f;
+        uint64_t s = ((uint64_t)(uintptr_t)f >> 3) & (uint64_t)(cap - 1);
+        while (keys[s]) {
+            s = (s + 1) & (uint64_t)(cap - 1);
+        }
+        keys[s] = f;
+        vals[s] = i;
+        i++;
+    }
+    elya_gc_push(cont);
+    for (i = 0; i < n; i++) {
+        int64_t words = (int64_t)(gc_block_of(orig[i])->meta >> 1);
+        int64_t *p = (int64_t *)elya_alloc(words);
+        memcpy(p, orig[i], (size_t)words * 8);
+        copy[i] = p;
+        elya_gc_push(p);
+    }
+#define LOOKUP(ptr, out)                                                        \
+    do {                                                                        \
+        int64_t *q_ = (ptr);                                                    \
+        (out) = -1;                                                             \
+        if (q_) {                                                               \
+            uint64_t s_ = ((uint64_t)(uintptr_t)q_ >> 3) & (uint64_t)(cap - 1); \
+            while (keys[s_]) {                                                  \
+                if (keys[s_] == q_) {                                           \
+                    (out) = vals[s_];                                           \
+                    break;                                                      \
+                }                                                               \
+                s_ = (s_ + 1) & (uint64_t)(cap - 1);                            \
+            }                                                                   \
+        }                                                                       \
+    } while (0)
+    for (i = 0; i < n; i++) {
+        if (i + 1 < n) {
+            copy[i][CONT_NEXT] = (int64_t)(intptr_t)copy[i + 1];
+        }
+        int64_t tag = copy[i][0];
+        if (tag >= hlo && tag < hhi) {
+            int64_t j;
+            LOOKUP((int64_t *)(intptr_t)copy[i][CONT_PARENT], j);
+            if (j >= 0) {
+                copy[i][CONT_PARENT] = (int64_t)(intptr_t)copy[j];
+            }
+        }
+    }
+    int64_t *fresh = (int64_t *)elya_alloc(4);
+    fresh[0] = c[0];
+    fresh[1] = (int64_t)(intptr_t)copy[0];
+    fresh[2] = (int64_t)(intptr_t)copy[n - 1];
+    int64_t j;
+    LOOKUP((int64_t *)(intptr_t)c[3], j);
+    fresh[3] = j >= 0 ? (int64_t)(intptr_t)copy[j] : c[3];
+#undef LOOKUP
+    for (i = 0; i <= n; i++) {
+        elya_gc_pop();
+    }
+    free(orig);
+    free(copy);
+    free(keys);
+    free(vals);
+    return fresh;
+}

@@ -1,6 +1,6 @@
 # Native multi-shot handlers (`with multi`)
 
-**Status:** in progress (2026-10-10). HANDOFF step 1. Design choices are Claude's (rule 2).
+**Status:** done (2026-10-10). HANDOFF step 1. Design choices are Claude's (rule 2).
 
 ## 0. Measured first
 
@@ -112,16 +112,42 @@ set must settle across N (M4 below), and a copy that leaked would grow it.
   evaluator's values, and differentially.
 - **M2** m5 runs (1); m6 stops with the named one-shot trap (and E0425 in the evaluator).
 - **M3** m9: both sides fail (E0425; the trap).
-- **M4** a multi-shot loop's live set is equal over four N across an 8x spread, with
-  collections > 0.
+- **M4** a multi-shot loop's live set stays below the smallest N over four N across an 8x
+  spread, with collections > 0, and a growing control breaks that bound. (Planned as
+  equality, as A4; measured 84, 80, 80, 89 words: the last collection lands at a different
+  point of the search each time, so the level is bounded, not constant. A leak of one word
+  per iteration would put it at N or more.)
 - **M5** m11 collects (ELY_GC_STATS) and still prints 3612120 natively: copies survive a
   collection that happens mid-copy.
 - **M6** Core stamps `multi` from `with multi` only (a plain `with` over a `multi` effect is
   `multi = false`, `is_multi_declared = true`).
 - Negative controls (each reverted): K1 no copy (share the chain) -> m3 wrong (predicted
-  40200); K2 no `parent` remap -> m10 wrong (predicted 10024) while m3 stays right; K3 the
+  40200); K2 no `parent` remap -> m10 wrong (predicted 10024; measured 5012) while m3 stays right; K3 the
   one-shot flag kept on multi resumes -> m1 traps; K4 `innermost` not remapped -> m10 wrong.
 
 ## 3. Evidence
 
-(Filled at close-out.)
+- Gate: 845 passed, 79 suites (predicted 845: one new root test counted twice, six native
+  tests, one new unit test; three unit tests replaced, net 0).
+- Native: `MULTI_SHOT` (m1, m2, m3, m4, m7, m8, m10, m11, m12) by value and differentially;
+  m5/m6 (`a_plain_handler_over_a_multi_effect_is_one_shot_natively`), m9
+  (`a_one_shot_continuation_saved_in_a_multi_shot_segment_fails_on_both_sides`), M4
+  (`a_multi_shot_loops_live_set_stays_bounded`: 84, 80, 80, 89 words; the control 59996),
+  M5 (`copies_survive_a_collection_mid_copy`). Core: `with_multi_alone_stamps_the_handler_multi_bit`.
+- Replaced (the refusal is lifted, named in the commit): `a_multi_shot_handler_is_refused_by_its_own_name`
+  -> `a_multi_shot_handler_compiles`; `the_multi_refusal_fires_before_any_clause_body_is_lowered`
+  -> `a_multi_shot_handlers_clause_bodies_are_lowered`;
+  `a_multi_shot_handler_written_in_source_reaches_the_codegen_refusal` -> `..._compiles`.
+- Negative controls, each reverted (`cmp`):
+  - K1 no copy: m3 40200, m10 10024, m8 10199998 (both corpus tests red);
+  - K2 no `parent` remap: m10 5012, every other row right;
+  - K3 one-shot flag on multi resumes: m1, m10, m11, m12 exit 1 (the trap);
+  - K4 `innermost` not remapped: m3 20100, m10 5012, m2/m4/m8/m12 exit 1.
+- Independent review: no findings. It re-ran the corpus and some 30 new shapes (heap
+  results held across the second resume, resumes in lambdas, call arguments, constructor
+  fields and match scrutinees, stored multi continuations resumed after their handle
+  returned, multi inside one-shot and the reverse, a 200 000-frame chain copied twice)
+  against the evaluator, also under a runtime that collects on EVERY allocation and poisons
+  freed blocks. Not covered: a chain with many intermediate handler frames (the front end
+  rejects the recursive shapes that would build one; PARKED's "recursion through a handle
+  body").

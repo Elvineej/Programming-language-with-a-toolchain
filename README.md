@@ -130,13 +130,14 @@ Elya is a typed language on a CEK machine, built up through these slices:
   lambdas and closure calls, and handles nested in handlers or effectful code;
 - **effect-polymorphic functions**: a function generic in its effect row is
   specialized per calling convention at the rows it is used with, and a pure
-  closure used where an effectful one is expected gets an adapter.
+  closure used where an effectful one is expected gets an adapter;
+- **multi-shot handlers** (`with multi`): each resume re-enters a copy of the
+  captured frames, so backtracking and search handlers run natively.
 
 Every native program is checked against the reference evaluator, for both the
 value and the exact bytes printed. CI runs the full gate on Windows too.
 
-Not yet native (refused by name): multi-shot handlers (`with multi`), and code
-polymorphic in a type variable (`Ty::Var`).
+Not yet native (refused by name): code polymorphic in a type variable (`Ty::Var`).
 
 ### Async without function colouring
 

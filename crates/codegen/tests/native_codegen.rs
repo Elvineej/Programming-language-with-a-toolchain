@@ -4074,3 +4074,263 @@ fn the_async_example_runs_natively() {
     assert_eq!(value, "3");
     assert_eq!(value, eval_main_int(src));
 }
+
+/// Native multi-shot handlers (2026-10-10, spec
+/// `2026-10-10-elya-native-multi-shot-design.md`, §0's table). A `with multi`
+/// resume re-enters a COPY of its captured frames (D2): m3 and m10 are the
+/// shapes where the first run mutates a handler frame inside the captured
+/// segment (an inner clause's non-tail resume rewrites its frame's `next`;
+/// m10 also crosses a `parent` link), so running the chain itself twice is
+/// wrong there -- the controls K1 (no copy: m3 prints 40200) and K2 (no
+/// `parent` remap: m10 prints 10024, m3 still right) fail them.
+const MULTI_SHOT: &[(&str, &str, &str)] = &[
+    (
+        "m1-two-branches",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn choose() { if flip() { 1 } else { 2 } }\n\
+         pub fn main() -> Int { handle choose() with multi { Flip.flip() -> resume(True) * 10 + resume(False) } }\n",
+        "12",
+    ),
+    (
+        "m2-two-flips",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn choose() {\n\
+         \x20 let a = if flip() { 1 } else { 0 }\n\
+         \x20 let b = if flip() { 2 } else { 0 }\n\
+         \x20 a * 10 + b\n\
+         }\n\
+         pub fn main() -> Int { handle choose() with multi { Flip.flip() -> resume(True) * 1000 + resume(False) } }\n",
+        "12012000",
+    ),
+    (
+        "m3-inner-handler-frame",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         effect Ask { fn ask() -> Int }\n\
+         fn inner() {\n\
+         \x20 handle {\n\
+         \x20   let x = ask()\n\
+         \x20   let b = flip()\n\
+         \x20   let y = ask()\n\
+         \x20   if b { x + y } else { x * y }\n\
+         \x20 } with { Ask.ask() -> resume(5) * 2 }\n\
+         }\n\
+         pub fn main() -> Int { handle inner() with multi { Flip.flip() -> resume(True) * 1000 + resume(False) } }\n",
+        "40100",
+    ),
+    (
+        "m4-backtracking",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn count(n, acc) { if n == 0 { if acc == 7 { 1 } else { 0 } } else { if flip() { count(n - 1, acc + n) } else { count(n - 1, acc) } } }\n\
+         pub fn main() -> Int { handle count(12, 0) with multi { Flip.flip() -> resume(True) + resume(False) } }\n",
+        "5",
+    ),
+    (
+        "m7-resume-in-a-lambda",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn choose() { if flip() { 1 } else { 2 } }\n\
+         pub fn main() -> Int { handle choose() with multi { Flip.flip() -> { let k = fn(b) { resume(b) }  k(True) * 10 + k(False) } } }\n",
+        "12",
+    ),
+    (
+        "m8-nested-multi",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         effect multi Pick { fn pick() -> Int }\n\
+         fn body() { let b = flip()  let n = pick()  if b { n } else { 0 - n } }\n\
+         fn mid() { handle body() with multi { Pick.pick() -> resume(1) * 100 + resume(2) } }\n\
+         pub fn main() -> Int { handle mid() with multi { Flip.flip() -> resume(True) * 100000 + resume(False) } }\n",
+        "10199898",
+    ),
+    (
+        "m10-parent-in-the-segment",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         effect Ask { fn ask() -> Int }\n\
+         effect Tell { fn tell(v: Int) -> Unit }\n\
+         fn inner() {\n\
+         \x20 handle {\n\
+         \x20   handle {\n\
+         \x20     let b = flip()\n\
+         \x20     let y = ask()\n\
+         \x20     let _ = tell(y)\n\
+         \x20     if b { y } else { y + 1 }\n\
+         \x20   } with { Tell.tell(v) -> resume(Unit) }\n\
+         \x20 } with { Ask.ask() -> resume(5) * 2 }\n\
+         }\n\
+         pub fn main() -> Int { handle inner() with multi { Flip.flip() -> resume(True) * 1000 + resume(False) } }\n",
+        "10012",
+    ),
+    (
+        "m11-deep-chain",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn sum(n) { if n == 0 { if flip() { 1 } else { 2 } } else { n + sum(n - 1) } }\n\
+         fn go(i, acc) { if i == 0 { acc } else { go(i - 1, acc + handle sum(300) with multi { Flip.flip() -> resume(True) + resume(False) }) } }\n\
+         pub fn main() -> Int { go(40, 0) }\n",
+        "3612120",
+    ),
+    (
+        "m12-many-runs",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn count(n, acc) { if n == 0 { acc } else { if flip() { count(n - 1, acc + 1) } else { count(n - 1, acc) } } }\n\
+         fn go(i, acc) { if i == 0 { acc } else { go(i - 1, acc + handle count(8, 0) with multi { Flip.flip() -> resume(True) + resume(False) }) } }\n\
+         pub fn main() -> Int { go(1000, 0) }\n",
+        "1024000",
+    ),
+];
+
+#[test]
+fn the_multi_shot_corpus_prints_the_evaluators_values() {
+    run_value_corpus(MULTI_SHOT, "multi-shot");
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_multi_shot_corpus() {
+    run_differential_corpus(MULTI_SHOT, "multi-shot-diff");
+}
+
+/// Spec D1: re-entry keys on the HANDLER's `with multi`. A plain `with` over a
+/// `multi`-declared effect is one-shot natively, as in the evaluator: it
+/// compiles (5b-8 refused it by the declaration) and a second resume traps.
+#[test]
+fn a_plain_handler_over_a_multi_effect_is_one_shot_natively() {
+    let dir = temp_dir("multi-plain");
+    let once = "effect multi Flip { fn flip() -> Bool }\n\
+                fn choose() { if flip() { 1 } else { 2 } }\n\
+                pub fn main() -> Int { handle choose() with { Flip.flip() -> resume(True) } }\n";
+    let exe = compile_and_link(&lower_src(once), &dir, "once");
+    assert_runs(&exe, "1");
+    let twice = "effect multi Flip { fn flip() -> Bool }\n\
+                 fn choose() { if flip() { 1 } else { 2 } }\n\
+                 pub fn main() -> Int { handle choose() with { Flip.flip() -> resume(True) + resume(False) } }\n";
+    let session = Session::new();
+    let (m, pd) = parse_module(&session, twice);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let eval = elya::eval::run_module_value(&m);
+    assert!(
+        matches!(&eval, Err(e) if format!("{e:?}").contains("E0425")),
+        "the evaluator must refuse the second resume with E0425"
+    );
+    let exe = compile_and_link(&lower_src(twice), &dir, "twice");
+    let out = Command::new(&exe).output().expect("run produced binary");
+    assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("elya: resume: a one-shot continuation was resumed twice"),
+        "stderr should name the trap, got: {stderr}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Spec D4: copies are shallow -- a ONE-SHOT continuation saved in a
+/// multi-shot segment is shared by both runs, so the second run's resume of it
+/// fails: E0425 in the evaluator, the named trap natively.
+#[test]
+fn a_one_shot_continuation_saved_in_a_multi_shot_segment_fails_on_both_sides() {
+    let src = "effect multi Flip { fn flip() -> Bool }\n\
+               effect Ask { fn ask() -> Int }\n\
+               fn inner() {\n\
+               \x20 handle { let x = ask()  x + 1 } with { Ask.ask() -> if flip() { resume(5) } else { resume(6) } }\n\
+               }\n\
+               pub fn main() -> Int { handle inner() with multi { Flip.flip() -> resume(True) * 1000 + resume(False) } }\n";
+    let session = Session::new();
+    let (m, pd) = parse_module(&session, src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let eval = elya::eval::run_module_value(&m);
+    assert!(
+        matches!(&eval, Err(e) if format!("{e:?}").contains("E0425")),
+        "the evaluator must refuse the second resume with E0425"
+    );
+    let dir = temp_dir("multi-shared-one-shot");
+    let exe = compile_and_link(&lower_src(src), &dir, "shared");
+    let out = Command::new(&exe).output().expect("run produced binary");
+    assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("elya: resume: a one-shot continuation was resumed twice"),
+        "stderr should name the trap, got: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).is_empty(),
+        "no answer may be printed"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Spec D5 (Invariant N8-1): copies are heap frames, so a multi-shot loop's
+/// live set stays bounded across N -- a copy that stayed reachable would grow
+/// it by at least a word per iteration.
+///
+/// Unlike A4's tail loop, the level is NOT equal across N: the last collection
+/// lands at a different point of the 64-run search each time, with a different
+/// number of copies pending (measured: 84, 80, 80, 89 words). So the bound is
+/// read off N itself -- every level below the smallest N, which a leak of one
+/// word per iteration would exceed -- and a growing control (the same loop
+/// keeping one `Cons` per iteration) must break that bound, so the instrument
+/// is shown to see growth.
+#[test]
+fn a_multi_shot_loops_live_set_stays_bounded() {
+    let dir = temp_dir("multi-settles");
+    let ns = [2_500i64, 5_000, 10_000, 20_000];
+    let run = |n: i64, keep: bool| -> GcStats {
+        let src = if keep {
+            format!(
+                "type L {{ Nil, Cons(Int, L) }}\n\
+                 effect multi Flip {{ fn flip() -> Bool }}\n\
+                 fn count(n, acc) {{ if n == 0 {{ acc }} else {{ if flip() {{ count(n - 1, acc + 1) }} else {{ count(n - 1, acc) }} }} }}\n\
+                 fn sum(l) {{ match l {{ Nil -> 0  Cons(x, r) -> x + sum(r) }} }}\n\
+                 fn go(i, acc) {{ if i == 0 {{ sum(acc) }} else {{ go(i - 1, Cons(handle count(6, 0) with multi {{ Flip.flip() -> resume(True) + resume(False) }}, acc)) }} }}\n\
+                 pub fn main() -> Int {{ go({n}, Nil) }}\n"
+            )
+        } else {
+            format!(
+                "effect multi Flip {{ fn flip() -> Bool }}\n\
+                 fn count(n, acc) {{ if n == 0 {{ acc }} else {{ if flip() {{ count(n - 1, acc + 1) }} else {{ count(n - 1, acc) }} }} }}\n\
+                 fn go(i, acc) {{ if i == 0 {{ acc }} else {{ go(i - 1, acc + handle count(6, 0) with multi {{ Flip.flip() -> resume(True) + resume(False) }}) }} }}\n\
+                 pub fn main() -> Int {{ go({n}, 0) }}\n"
+            )
+        };
+        let tag = format!("multi-settles-{n}-{keep}");
+        let exe = compile_and_link(&lower_src(&src), &dir, &tag);
+        let (stdout, stats) = run_with_gc_stats(&exe, &tag);
+        assert_eq!(stdout, (192 * n).to_string(), "{tag}");
+        assert!(
+            stats.collections > 0,
+            "{tag}: no collection happened, so `live` measures nothing"
+        );
+        assert!(
+            stats.live > 0,
+            "{tag}: live=0 means the level was never computed"
+        );
+        stats
+    };
+    let levels: Vec<(i64, i64)> = ns.iter().map(|&n| (n, run(n, false).live)).collect();
+    println!("multi-shot levels: {levels:?}");
+    for (n, live) in &levels {
+        assert!(
+            *live < ns[0],
+            "live set must not grow with N (a level of N words or more is a copy leak): {levels:?}, at N={n}"
+        );
+    }
+    let control = run(ns[3], true).live;
+    println!("growing control at N={}: {control}", ns[3]);
+    assert!(
+        control >= ns[0],
+        "the growing control did not break the bound, so the instrument sees nothing: {control}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Spec D3: the copy allocates, so a collection can run in the middle of one.
+/// m11 copies 300-frame chains 80 times and must collect; the answer must
+/// still be the evaluator's.
+#[test]
+fn copies_survive_a_collection_mid_copy() {
+    let (_, src, want) = MULTI_SHOT
+        .iter()
+        .find(|(t, _, _)| *t == "m11-deep-chain")
+        .expect("m11 in the corpus");
+    let dir = temp_dir("multi-gc");
+    let exe = compile_and_link(&lower_src(src), &dir, "multi-gc");
+    let (stdout, stats) = run_with_gc_stats(&exe, "multi-gc");
+    assert!(stats.collections > 0, "no collection ran: {stats:?}");
+    assert_eq!(&stdout, want);
+    std::fs::remove_dir_all(&dir).ok();
+}

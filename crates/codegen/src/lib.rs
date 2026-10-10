@@ -1342,6 +1342,10 @@ pub(crate) struct Descriptors {
     pub(crate) site_tags: std::collections::BTreeMap<usize, usize>,
     /// Handle key (`HandlerSite::key`) -> the tag its handler frame carries.
     pub(crate) handler_tags: std::collections::BTreeMap<usize, usize>,
+    /// The first handler tag. Handler rows are exactly `[handler_lo, cont_tag)`
+    /// (guarded below): `elya_cont_copy` tells a handler frame from a site
+    /// frame by that range alone (native multi-shot, spec D3).
+    pub(crate) handler_lo: usize,
     /// D13: the continuation object's tag.
     pub(crate) cont_tag: usize,
 }
@@ -1464,6 +1468,7 @@ fn descriptor_rows(
     // value j is bit j+4. Always its own row -- its arity is never the frame
     // row's.
     let mut handler_tags = std::collections::BTreeMap::new();
+    let handler_lo = desc.len() / 2;
     for h in handlers {
         handler_tags.insert(h.key, desc.len() / 2);
         desc.push(4 + h.saved.len() as u64);
@@ -1483,6 +1488,11 @@ fn descriptor_rows(
     // is the handler that was current at the perform, which a resume makes
     // current again (traced, bit 2).
     let cont_tag = desc.len() / 2;
+    if handler_lo + handlers.len() != cont_tag {
+        return Err(CodegenError::Unsupported(
+            "handler tags are not contiguous below the continuation tag",
+        ));
+    }
     desc.push(3);
     desc.push(0b101);
     Ok(Descriptors {
@@ -1490,6 +1500,7 @@ fn descriptor_rows(
         frame_tag,
         site_tags,
         handler_tags,
+        handler_lo,
         cont_tag,
     })
 }
@@ -1550,6 +1561,9 @@ struct LowerCtx<'a, 'ctx> {
     current_handler: inkwell::values::PointerValue<'ctx>,
     resume_twice: FunctionValue<'ctx>,
     unhandled: FunctionValue<'ctx>,
+    /// Native multi-shot (spec D3): `elya_cont_copy(cont, hlo, hhi) -> cont'`
+    /// (`ccc`), a fresh continuation over a copy of the captured frames.
+    cont_copy: FunctionValue<'ctx>,
 }
 
 /// Fold `core.types` into a flat constructor table: name -> (tag, field types).
@@ -1681,6 +1695,8 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let trap_ty = ctx.void_type().fn_type(&[], false);
     let resume_twice = module.add_function("elya_resume_twice", trap_ty, None); // ccc
     let unhandled = module.add_function("elya_unhandled_effect", trap_ty, None); // ccc
+    let cont_copy_ty = ptrt.fn_type(&[ptrt.into(), i64t.into(), i64t.into()], false);
+    let cont_copy = module.add_function("elya_cont_copy", cont_copy_ty, None); // ccc
 
     // `elya_current_handler`: a declaration (no initializer); the definition
     // lives in runtime.c.
@@ -1720,6 +1736,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         current_handler,
         resume_twice,
         unhandled,
+        cont_copy,
     };
     let b = ctx.create_builder();
     for f in &core.fns {
@@ -2315,21 +2332,19 @@ mod tests {
         }
     }
 
+    /// Native multi-shot (2026-10-10) replaces 5b-8's
+    /// `a_multi_shot_handler_is_refused_by_its_own_name`: the refusal is lifted.
     #[test]
-    fn a_multi_shot_handler_is_refused_by_its_own_name() {
-        let err = emit_ir(&main_fn(handle_expr(Vec::new(), true))).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("multi"),
-            "the message must name the feature: {msg}"
-        );
+    fn a_multi_shot_handler_compiles() {
+        emit_ir(&main_fn(handle_expr(Vec::new(), true))).expect("a multi handle compiles");
     }
 
+    /// Native multi-shot (2026-10-10) replaces 5b-8's
+    /// `the_multi_refusal_fires_before_any_clause_body_is_lowered`: with no
+    /// handle-node refusal, the poisonous clause body is lowered and refuses
+    /// with ITS OWN message.
     #[test]
-    fn the_multi_refusal_fires_before_any_clause_body_is_lowered() {
-        // `Var("unbound")` in the clause body would refuse with its OWN
-        // message; seeing "multi" proves the handle-node refusal fired first
-        // (spec 5.4).
+    fn a_multi_shot_handlers_clause_bodies_are_lowered() {
         let poisonous = CoreExpr {
             span: Span::EMPTY,
             ty: Ty::Base(TyCon::Int),
@@ -2343,16 +2358,13 @@ mod tests {
         };
         let err = emit_ir(&main_fn(handle_expr(vec![clause], true))).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("multi"), "{msg}");
-        assert!(
-            !msg.contains("unbound"),
-            "the clause body was lowered before the refusal fired: {msg}"
-        );
+        assert!(msg.contains("unbound"), "{msg}");
+        assert!(!msg.contains("multi"), "the handle node was refused: {msg}");
     }
 
     /// Source -> Core, with the front end allowed to WARN: `with multi` is
     /// deliberately not an error (E0426 stays a warning), so it type-checks
-    /// and lowers; the refusal is codegen's alone.
+    /// and lowers.
     fn lower_warned_source(src: &str) -> CoreModule {
         let session = elya::Session::new();
         let (m, pd) = elya::parse::parse_module(&session, src);
@@ -2367,15 +2379,16 @@ mod tests {
         elya::core::lower_module(&m, &table).expect("must lower to Core")
     }
 
+    /// Native multi-shot (2026-10-10) replaces 5b-8's
+    /// `a_multi_shot_handler_written_in_source_reaches_the_codegen_refusal`.
     #[test]
-    fn a_multi_shot_handler_written_in_source_reaches_the_codegen_refusal() {
+    fn a_multi_shot_handler_written_in_source_compiles() {
         let src = "effect multi Flip { fn flip() -> Bool }\n\
                    fn g() -> Int { if flip() { 1 } else { 0 } }\n\
                    pub fn main() -> Int {\n\
                    \x20 handle g() with multi { Flip.flip() -> resume(True) }\n\
                    }\n";
-        let err = emit_ir(&lower_warned_source(src)).unwrap_err();
-        assert!(err.to_string().contains("multi"), "{err:?}");
+        emit_ir(&lower_warned_source(src)).expect("a multi handle compiles");
     }
 
     #[test]
@@ -2818,5 +2831,38 @@ mod tests {
             &[2, 0b10],
             "frame row: arity 2, mask 0b10 (D5) -- not the spec's 0b11"
         );
+    }
+
+    /// Native multi-shot (spec D3): `elya_cont_copy` tells handler frames from
+    /// site frames by tag range alone, so the handler rows must be exactly
+    /// `[handler_lo, cont_tag)`.
+    #[test]
+    fn handler_tags_sit_contiguously_below_the_continuation_tag() {
+        let core = core_of(
+            "effect multi Flip { fn flip() -> Bool }\n\
+             effect Ask { fn ask() -> Int }\n\
+             effect Tell { fn tell(v: Int) -> Unit }\n\
+             fn inner() {\n\
+             \x20 handle {\n\
+             \x20   handle { let b = flip()  let y = ask()  let _ = tell(y)  if b { y } else { y + 1 } }\n\
+             \x20   with { Tell.tell(v) -> resume(Unit) }\n\
+             \x20 } with { Ask.ask() -> resume(5) * 2 }\n\
+             }\n\
+             pub fn main() -> Int { handle inner() with multi { Flip.flip() -> resume(True) * 1000 + resume(False) } }\n",
+        );
+        let n_real_ctors: usize = core.types.iter().map(|t| t.ctors.len()).sum();
+        let lambdas = closure::collect_lambdas(&core, n_real_ctors);
+        let string_tag = n_real_ctors + lambdas.len();
+        let sites = cps::collect_sites(&core);
+        let handlers = cps::collect_handlers(&core);
+        assert_eq!(handlers.len(), 3);
+        assert!(!sites.is_empty());
+        let d = descriptor_rows(&core, &lambdas, &sites, &handlers, n_real_ctors, string_tag)
+            .expect("rows");
+        assert_eq!(d.handler_lo, d.cont_tag - 3);
+        let mut tags: Vec<usize> = d.handler_tags.values().copied().collect();
+        tags.sort_unstable();
+        assert_eq!(tags, (d.handler_lo..d.cont_tag).collect::<Vec<_>>());
+        assert!(d.site_tags.values().all(|t| *t < d.handler_lo));
     }
 }

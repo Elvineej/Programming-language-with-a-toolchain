@@ -3,7 +3,7 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-09, auto-run)
+## State at handoff (updated 2026-10-10, auto-run)
 
 - `main` has everything through #21 (sub-effecting and checked annotations).
 - Scheduled auto-runs work on branch `auto/elya` (one draft PR to `main`) and log in
@@ -13,8 +13,8 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 836 passed, 79 suites. The runtime is
-  untouched (`gc_mark` unchanged).
+- Linux gate at the tip of `auto/elya`: 845 passed, 79 suites. The runtime gained
+  `elya_cont_copy` (multi-shot); `gc_mark` is unchanged.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
   language decisions taken. The maintainer delegated all choices (rule 2).
@@ -155,20 +155,16 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   unhandled effect); a lambda relaying an ENCLOSING parameter keeps its row open, so
   `wrap(f)`/`compose` are accepted (natively with annotations, via N7 part 1).
 
+- **Native multi-shot handlers (`with multi`)** (2026-10-10, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-10-elya-native-multi-shot-design.md`. A resume of a
+  `with multi` handle re-enters a COPY of its captured frames (`elya_cont_copy` in the
+  runtime: next relinked, handler parents and `innermost` remapped); the original is never
+  run. Keyed on the handler's `with multi` (`CoreHandle::multi`), so a plain `with` over a
+  `multi` effect is one-shot natively, as in the evaluator. The live set stays bounded.
+
 ## The next five steps
 
-### 1. Native multi-shot handlers (`with multi`)
-
-Refused natively by name since 5b-8 (A2); the evaluator runs them. A multi-shot resume
-re-runs a captured continuation, but native frames are consumed in place -- and since 5b-10
-a resume also MUTATES its handler frame (`next`, `parent`): a second resume needs the frame
-chain, handler frames included, COPIED first, and the one-shot word replaced by a
-copy-on-resume rule. Measure first (the evaluator's multi-shot corpus, e.g.
-`multi_shot_collects_both_branches`, through `build`), then a spec with the copy cost
-stated and gated against A4's live-set instrument. Multi-shot is what a native
-probabilistic or backtracking handler needs (ROADMAP), so it is worth doing natively.
-
-### 2. Evaluator: non-tail recursion under a handler is quadratic
+### 1. Evaluator: non-tail recursion under a handler is quadratic
 
 PARKED: about 4× time per doubling (n=4000 takes 1.7 s; n=100 000 did not finish in 10
 minutes). This caps every differential test's N. Profile (frame capture copies the
@@ -176,7 +172,7 @@ continuation?), predict the complexity, fix, and pin it with a timing-free test 
 counts steps or allocations. The evaluator is the reference semantics, so the
 differential corpora must stay green unchanged.
 
-### 3. Exact replay and handler-based testing (ROADMAP priority 3)
+### 2. Exact replay and handler-based testing (ROADMAP priority 3)
 
 A `Record` handler that wraps a computation and logs every effect's answer (op name,
 arguments, the value it resumed with), and a `Replay` handler that feeds a log back and
@@ -187,7 +183,7 @@ handlers instead of mocking. Evaluator and native. Ship `examples/05_replay.elya
 tests and a README section; the CLI flag (`elya run --record/--replay`) comes after real
 I/O effects exist.
 
-### 4. N7 part 2: type variables natively
+### 3. N7 part 2: type variables natively
 
 `twice(f, x)` with `x: 'a`, and every unannotated `wrap`/`compose` (now accepted by the
 front end), are "unrepresentable type" natively. Monomorphize type variables like rows
@@ -196,12 +192,23 @@ budget, or pass dictionaries -- decide in the spec. Parametric ADTs (`type Q(a)`
 same question for constructors. Also: aliases of generic locals (`let mk2 = mk`) are
 refused by name.
 
-### 5. Async step 2: structured concurrency and a poll loop
+### 4. Async step 2: structured concurrency and a poll loop
 
 ROADMAP 1b/1c on top of `examples/04_async.elya`: a scope handler that joins its children
 (a `spawn` returning a handle, `await` as an effect), then real I/O readiness through a
 runtime poll loop the scheduler consults. Recursion through a handle body (PARKED) blocks
 the natural recursive `task`: measure whether it is the next front-end fix.
+
+### 5. A backtracking example, and handler frames in deep chains
+
+Multi-shot runs natively now; show it: `examples/05_search.elya` (or the next free
+number), an N-queens or subset-sum search written as an ordinary function over a
+`multi` `Choose` effect, with handlers that collect all answers, the first answer, and a
+count -- one search, three meanings, the same bytes natively. Then measure the one shape
+the multi-shot review could not build: a captured chain holding MANY handler frames
+(blocked by PARKED's "recursion through a handle body"); if step 4's front-end fix lands
+first, add it to `MULTI_SHOT` and time the copy (it maps parents through a hash table, so
+it should stay linear).
 
 Also open, unscheduled: native strings (`<>` refused natively, no Int-to-String; the
 builtin's name is Claude's call now -- `int.to_string` is the natural one); the roadmap's
