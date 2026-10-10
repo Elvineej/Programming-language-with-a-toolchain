@@ -699,6 +699,28 @@ fn a_with_multi_over_a_multi_declared_effect_is_stamped_multi() {
     );
 }
 
+/// Native multi-shot (2026-10-10, spec D1): `multi` is the HANDLER's `with multi`
+/// bit, the one native re-entry keys on -- unlike `is_multi_declared`, a plain
+/// `with` over a `multi`-declared effect is NOT multi (the evaluator makes it
+/// one-shot, E0425 on a second resume).
+#[test]
+fn with_multi_alone_stamps_the_handler_multi_bit() {
+    let handle_bits = |with_kw: &str| -> (bool, bool) {
+        let src = format!(
+            "effect multi Flip {{ fn flip() -> Bool }}\n\
+             fn g() -> Int {{ if flip() {{ 1 }} else {{ 0 }} }}\n\
+             pub fn main() -> Int {{\n\
+             \x20 handle {{ g() }} {with_kw} {{ Flip.flip() -> resume(True) }}\n\
+             }}\n"
+        );
+        let (core, _table) = lower_src(&src);
+        let h = first_handle(&core);
+        (h.multi, h.is_multi_declared)
+    };
+    assert_eq!(handle_bits("with multi"), (true, true));
+    assert_eq!(handle_bits("with"), (false, true));
+}
+
 #[test]
 fn an_unqualified_handler_clause_lowers_with_its_ops_effect() {
     // Slice 5c-1 (replaces 5b-8's `an_unqualified_handler_clause_is_refused_at_

@@ -2310,6 +2310,7 @@ mod tests {
                 clauses: clauses.into(),
                 ret: None,
                 is_multi_declared: multi,
+                multi,
             })),
         }
     }

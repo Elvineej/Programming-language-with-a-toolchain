@@ -82,6 +82,11 @@ pub struct CoreHandle {
     /// `multi`-declared effect is stamped too (§5.2's deliberate over-refusal).
     /// §5.4 puts the REFUSAL in codegen, where an execution test can observe it.
     pub is_multi_declared: bool,
+    /// The handler's own `with multi` (native multi-shot, 2026-10-10, spec D1):
+    /// the bit native re-entry keys on. A resume of a `multi` handle re-enters
+    /// a COPY of its captured frames; every other resume is one-shot, as in the
+    /// evaluator (E0425), so a plain `with` over a `multi` effect is `false`.
+    pub multi: bool,
 }
 
 /// One `Effect.op(params) -> body` clause. `effect` is always the name the
@@ -602,6 +607,7 @@ fn lower_expr(
                 clauses: clauses.into(),
                 ret,
                 is_multi_declared,
+                multi: handler.multi,
             }))
         }
         Expr::Resume { arg } => {

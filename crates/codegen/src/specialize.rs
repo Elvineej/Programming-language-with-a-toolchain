@@ -226,6 +226,7 @@ pub(crate) fn subst_expr(e: &CoreExpr, s: &RowSubst) -> CoreExpr {
                 })
             }),
             is_multi_declared: h.is_multi_declared,
+            multi: h.multi,
         })),
         CoreKind::Resume(v) => CoreKind::Resume(go(v)),
         CoreKind::Perform(p) => CoreKind::Perform(Rc::new(CorePerform {
@@ -409,6 +410,7 @@ impl<'a> Specializer<'a> {
                     clauses: clauses.into(),
                     ret,
                     is_multi_declared: h.is_multi_declared,
+                    multi: h.multi,
                 }))
             }
             CoreKind::Resume(v) => CoreKind::Resume(Rc::new(self.rewrite(v, locals)?)),
@@ -842,6 +844,7 @@ impl Adapter<'_> {
                     clauses: clauses.into(),
                     ret,
                     is_multi_declared: h.is_multi_declared,
+                    multi: h.multi,
                 }))
             }
             CoreKind::Resume(v) => CoreKind::Resume(Rc::new(self.walk(v, locals)?)),
