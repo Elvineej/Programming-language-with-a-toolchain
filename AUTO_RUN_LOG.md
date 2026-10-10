@@ -11,8 +11,13 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 - **Done: evaluator linear continuations** (dfd83ca), HANDOFF step 1. Spec
   `docs/superpowers/specs/2026-10-10-elya-eval-linear-continuations-design.md`. Gate 859 / 81
   (predicted 859). Review: no findings.
+- **Done: checked Int arithmetic; `/` and `%` natively** (8080b9f), prerequisite of replay.
+  Spec `docs/superpowers/specs/2026-10-10-elya-checked-integer-arithmetic-design.md`.
+  **Language decision (mine, per rule 2; please review):** Int overflow is a named runtime
+  error on both sides (was: evaluator panic / native wrap). Gate 869 / 83. Review: no findings.
 - Next: HANDOFF step 1 (exact replay / handler-based testing, `examples/05_replay.elya`).
-- Windows-gate debt added: dfd83ca.
+- Windows-gate debt added: dfd83ca, 8080b9f (8080b9f adds runtime.c traps and LLVM overflow
+  intrinsics -- worth a Windows run).
 
 ## 2026-10-10 01:53 UTC — ended without a DONE mark (taken over 09:49)
 
