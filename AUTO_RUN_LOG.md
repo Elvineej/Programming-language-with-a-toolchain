@@ -15,9 +15,16 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   Spec `docs/superpowers/specs/2026-10-10-elya-checked-integer-arithmetic-design.md`.
   **Language decision (mine, per rule 2; please review):** Int overflow is a named runtime
   error on both sides (was: evaluator panic / native wrap). Gate 869 / 83. Review: no findings.
-- Next: HANDOFF step 1 (exact replay / handler-based testing, `examples/05_replay.elya`).
-- Windows-gate debt added: dfd83ca, 8080b9f (8080b9f adds runtime.c traps and LLVM overflow
-  intrinsics -- worth a Windows run).
+- **Done: nested and literal patterns natively** (c684b0b), prerequisite of replay. Spec
+  `docs/superpowers/specs/2026-10-10-elya-native-pattern-compilation-design.md`. Review found
+  exponential code size in my first design; redesigned test-first (linear). Gate 873 / 83.
+- **Done: exact replay / handler-based testing** (9524cb3), HANDOFF step 1.
+  `examples/05_replay.elya`. Gate 886 / 85.
+- Next: HANDOFF step 1 (N7 part 2: type variables natively).
+- Noticed, recorded in HANDOFF (not fixed): the parser continues a call across a newline
+  (`f()` then a line starting `(` is `f()(...)`) -- a layout rule is a language decision.
+- Windows-gate debt added: dfd83ca, 8080b9f, c684b0b, 9524cb3 (8080b9f adds runtime.c
+  traps and LLVM overflow intrinsics -- worth a Windows run).
 
 ## 2026-10-10 01:53 UTC — ended without a DONE mark (taken over 09:49)
 
