@@ -9,13 +9,14 @@
 //! Proof is EXECUTION (tests/native_codegen.rs), never IR inspection (spec §0):
 //! `emit_ir` is a debugging aid and nothing in the suite asserts on its output.
 //! Semantic-fidelity rule (§3.4, §4.1): native codegen must be neither more- nor
-//! less-undefined than the tree evaluator. Hence no Div/Rem (UB on a zero
-//! divisor, and it drags in the runtime-error path), Add/Sub/Mul emitted WITHOUT
-//! nsw/nuw so overflow is defined two's-complement wrapping, and `&&`/`||`
+//! less-undefined than the tree evaluator. Hence `Int` arithmetic is exact or
+//! fails by name on both sides (2026-10-10: overflow and a zero divisor trap
+//! through the runtime with the evaluator's words), and `&&`/`||`
 //! STRICT rather than short-circuiting — because both of Elya's evaluators are
 //! strict, so a short-circuit diamond would make native binaries *less*
-//! undefined than `elya run`, observable the moment Div lands. Short-circuiting
-//! is a front-end question, not a back-end one.
+//! undefined than `elya run` -- observable now that `/` can fail:
+//! `False && 1 / 0 == 0` fails on both sides. Short-circuiting is a front-end
+//! question, not a back-end one.
 
 mod closure;
 mod cps;
@@ -987,24 +988,74 @@ fn arm_body<'ctx>(
 /// values were computed before a continuation site, applies exactly the same
 /// operators -- one table, not two that could drift.
 fn prim_values<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
     b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
     op: BinOp,
     l: IntValue<'ctx>,
     r: IntValue<'ctx>,
 ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
-    // Deliberately NO nsw/nuw flags: defined two's-complement wrapping
-    // (§3.4). Overflow reconciliation with the evaluator is tracked in
-    // spec §11 — not silently decided here.
-    //
+    // `Int` arithmetic is exact or fails by name (spec
+    // 2026-10-10-elya-checked-integer-arithmetic, D3), as in the evaluator:
+    // `+ - *` through LLVM's overflow intrinsics, `/` and `%` guarded so that
+    // `sdiv`/`srem` never see an input where they are undefined.
+    match op {
+        BinOp::Add => return checked(ctx, func, b, lc, "llvm.sadd.with.overflow", l, r),
+        BinOp::Sub => return checked(ctx, func, b, lc, "llvm.ssub.with.overflow", l, r),
+        BinOp::Mul => return checked(ctx, func, b, lc, "llvm.smul.with.overflow", l, r),
+        BinOp::Div => {
+            let i64t = ctx.i64_type();
+            let zero = b
+                .build_int_compare(IntPredicate::EQ, r, i64t.const_zero(), "dz")
+                .map_err(internal)?;
+            trap_if(ctx, func, b, zero, lc.div_zero, "div_zero")?;
+            let min = b
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    l,
+                    i64t.const_int(i64::MIN as u64, true),
+                    "dmin",
+                )
+                .map_err(internal)?;
+            let neg1 = b
+                .build_int_compare(IntPredicate::EQ, r, i64t.const_all_ones(), "dneg1")
+                .map_err(internal)?;
+            let ovf = b.build_and(min, neg1, "dovf").map_err(internal)?;
+            trap_if(ctx, func, b, ovf, lc.int_overflow, "div_overflow")?;
+            return b
+                .build_int_signed_div(l, r, "div")
+                .map(|v| v.into())
+                .map_err(internal);
+        }
+        BinOp::Rem => {
+            let i64t = ctx.i64_type();
+            let zero = b
+                .build_int_compare(IntPredicate::EQ, r, i64t.const_zero(), "rz")
+                .map_err(internal)?;
+            trap_if(ctx, func, b, zero, lc.rem_zero, "rem_zero")?;
+            // `x % -1` is 0 for every x, and `srem MIN, -1` is undefined: divide
+            // by 1 instead, which gives the same 0 without the undefined input.
+            let neg1 = b
+                .build_int_compare(IntPredicate::EQ, r, i64t.const_all_ones(), "rneg1")
+                .map_err(internal)?;
+            let d = b
+                .build_select(neg1, i64t.const_int(1, false), r, "rdiv")
+                .map_err(internal)?
+                .into_int_value();
+            return b
+                .build_int_signed_rem(l, d, "rem")
+                .map(|v| v.into())
+                .map_err(internal);
+        }
+        _ => {}
+    }
     // Comparisons are SIGNED: Elya's Int is i64 two's-complement, so
     // `(0 - 1) < 1` must be true. `and`/`or` are strict and bit-wise on
     // i1 because BOTH evaluators are strict (spec §4.1) — a
     // short-circuit diamond here would make native less-undefined than
-    // `elya run`, which is the mirror image of the Div trade.
+    // `elya run` (a guarded `/` on the right of `&&` would be skipped).
     let built = match op {
-        BinOp::Add => b.build_int_add(l, r, "add"),
-        BinOp::Sub => b.build_int_sub(l, r, "sub"),
-        BinOp::Mul => b.build_int_mul(l, r, "mul"),
         BinOp::Lt => b.build_int_compare(IntPredicate::SLT, l, r, "lt"),
         BinOp::Le => b.build_int_compare(IntPredicate::SLE, l, r, "le"),
         BinOp::Gt => b.build_int_compare(IntPredicate::SGT, l, r, "gt"),
@@ -1016,6 +1067,60 @@ fn prim_values<'ctx>(
         other => return Err(CodegenError::Unsupported(op_label(other))),
     };
     built.map(|v| v.into()).map_err(internal)
+}
+
+/// One of LLVM's `*.with.overflow.i64` intrinsics: the result, and a branch
+/// to `elya_int_overflow` when its overflow bit is set.
+#[allow(clippy::too_many_arguments)]
+fn checked<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    intrinsic: &str,
+    l: IntValue<'ctx>,
+    r: IntValue<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    let decl = inkwell::intrinsics::Intrinsic::find(intrinsic)
+        .and_then(|i| i.get_declaration(lc.module, &[i64t.into()]))
+        .ok_or_else(|| internal(format!("no intrinsic {intrinsic}")))?;
+    let pair = b
+        .build_call(decl, &[l.into(), r.into()], "ck")
+        .map_err(internal)?
+        .try_as_basic_value()
+        .left()
+        .ok_or_else(|| internal("overflow intrinsic returned nothing"))?
+        .into_struct_value();
+    let value = b.build_extract_value(pair, 0, "ckv").map_err(internal)?;
+    let ovf = b
+        .build_extract_value(pair, 1, "cko")
+        .map_err(internal)?
+        .into_int_value();
+    trap_if(ctx, func, b, ovf, lc.int_overflow, "overflow")?;
+    Ok(value)
+}
+
+/// Branch to a block that calls `trap` (which exits) when `cond` holds; the
+/// builder continues in the other block.
+fn trap_if<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    cond: IntValue<'ctx>,
+    trap: FunctionValue<'ctx>,
+    name: &str,
+) -> Result<(), CodegenError> {
+    let bad = ctx.append_basic_block(func, name);
+    let ok = ctx.append_basic_block(func, "arith_ok");
+    b.build_conditional_branch(cond, bad, ok)
+        .map_err(internal)?;
+    b.position_at_end(bad);
+    b.build_call(trap, &[], "trap").map_err(internal)?;
+    // The trap exits; a placeholder terminator, not the trap itself.
+    b.build_unreachable().map_err(internal)?;
+    b.position_at_end(ok);
+    Ok(())
 }
 
 /// §3.3 expression lowering: a recursive fold returning a `BasicValueEnum`,
@@ -1145,7 +1250,7 @@ fn lower_expr<'ctx>(
             }
             let l = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
             let r = lower_expr(ctx, func, b, lc, &args[1], env)?.into_int_value();
-            prim_values(b, *op, l, r)
+            prim_values(ctx, func, b, lc, *op, l, r)
         }
         CoreKind::App(callee, args) => {
             // Ordinary (non-tail) position: `tailcc` convention, NO tail-call
@@ -1561,6 +1666,11 @@ struct LowerCtx<'a, 'ctx> {
     current_handler: inkwell::values::PointerValue<'ctx>,
     resume_twice: FunctionValue<'ctx>,
     unhandled: FunctionValue<'ctx>,
+    /// Checked `Int` arithmetic's traps (`ccc`, they exit):
+    /// `elya_int_overflow`, `elya_div_zero`, `elya_rem_zero`.
+    int_overflow: FunctionValue<'ctx>,
+    div_zero: FunctionValue<'ctx>,
+    rem_zero: FunctionValue<'ctx>,
     /// Native multi-shot (spec D3): `elya_cont_copy(cont, hlo, hhi) -> cont'`
     /// (`ccc`), a fresh continuation over a copy of the captured frames.
     cont_copy: FunctionValue<'ctx>,
@@ -1695,6 +1805,9 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let trap_ty = ctx.void_type().fn_type(&[], false);
     let resume_twice = module.add_function("elya_resume_twice", trap_ty, None); // ccc
     let unhandled = module.add_function("elya_unhandled_effect", trap_ty, None); // ccc
+    let int_overflow = module.add_function("elya_int_overflow", trap_ty, None); // ccc
+    let div_zero = module.add_function("elya_div_zero", trap_ty, None); // ccc
+    let rem_zero = module.add_function("elya_rem_zero", trap_ty, None); // ccc
     let cont_copy_ty = ptrt.fn_type(&[ptrt.into(), i64t.into(), i64t.into()], false);
     let cont_copy = module.add_function("elya_cont_copy", cont_copy_ty, None); // ccc
 
@@ -1735,6 +1848,9 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         op_ids: &op_ids,
         current_handler,
         resume_twice,
+        int_overflow,
+        div_zero,
+        rem_zero,
         unhandled,
         cont_copy,
     };
@@ -2022,10 +2138,15 @@ mod tests {
         );
     }
 
+    // Was `rejects_div_specifically` (5b-1: no Div until a guard existed). The
+    // checked-arithmetic decision (2026-10-10) supplies the guard; execution
+    // is proved in `tests/native_codegen.rs` (`integer_division_runs_natively`).
     #[test]
-    fn rejects_div_specifically() {
-        let err = emit_ir(&main_fn(prim(BinOp::Div, int_lit(1), int_lit(2)))).unwrap_err();
-        assert!(matches!(err, CodegenError::Unsupported("Div")), "{err:?}");
+    fn div_and_rem_lower_to_verifier_clean_ir() {
+        for op in [BinOp::Div, BinOp::Rem] {
+            emit_ir(&main_fn(prim(op, int_lit(7), int_lit(2))))
+                .unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
+        }
     }
 
     #[test]

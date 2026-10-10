@@ -227,6 +227,10 @@ impl Default for Interp {
     }
 }
 
+fn overflow(span: Span) -> RuntimeError {
+    rt(span, "integer overflow")
+}
+
 pub(crate) fn apply_binop(
     op: BinOp,
     l: Value,
@@ -236,12 +240,17 @@ pub(crate) fn apply_binop(
     use BinOp::*;
     use Value::*;
     match (op, l, r) {
-        (Add, Int(a), Int(b)) => Ok(Int(a + b)),
-        (Sub, Int(a), Int(b)) => Ok(Int(a - b)),
-        (Mul, Int(a), Int(b)) => Ok(Int(a * b)),
+        // `Int` arithmetic is exact or fails by name (spec
+        // 2026-10-10-elya-checked-integer-arithmetic, D1): never a wrapped value,
+        // never a host panic. Native code traps on the same inputs.
+        (Add, Int(a), Int(b)) => a.checked_add(b).map(Int).ok_or_else(|| overflow(span)),
+        (Sub, Int(a), Int(b)) => a.checked_sub(b).map(Int).ok_or_else(|| overflow(span)),
+        (Mul, Int(a), Int(b)) => a.checked_mul(b).map(Int).ok_or_else(|| overflow(span)),
         (Div, Int(_), Int(0)) => Err(rt(span, "division by zero")),
-        (Div, Int(a), Int(b)) => Ok(Int(a / b)),
+        (Div, Int(a), Int(b)) => a.checked_div(b).map(Int).ok_or_else(|| overflow(span)),
         (Rem, Int(_), Int(0)) => Err(rt(span, "remainder by zero")),
+        // `MIN % -1` is exactly 0; `checked_rem` would call it an overflow.
+        (Rem, Int(_), Int(-1)) => Ok(Int(0)),
         (Rem, Int(a), Int(b)) => Ok(Int(a % b)),
         (AddF, Float(a), Float(b)) => Ok(Float(a + b)),
         (SubF, Float(a), Float(b)) => Ok(Float(a - b)),
@@ -262,7 +271,10 @@ pub(crate) fn apply_binop(
 
 pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, RuntimeError> {
     match (op, v) {
-        (UnOp::Neg, Value::Int(n)) => Ok(Value::Int(-n)),
+        (UnOp::Neg, Value::Int(n)) => n
+            .checked_neg()
+            .map(Value::Int)
+            .ok_or_else(|| overflow(span)),
         (UnOp::Neg, Value::Float(x)) => Ok(Value::Float(-x)),
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
         _ => Err(rt(span, "type error in unary operator")),

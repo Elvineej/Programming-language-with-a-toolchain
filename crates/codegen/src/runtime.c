@@ -294,6 +294,24 @@ void elya_resume_twice(void) {
     exit(1);
 }
 
+/* `Int` arithmetic is exact or fails by name (spec
+ * 2026-10-10-elya-checked-integer-arithmetic, D3): the same words, and the
+ * same exit status, as the evaluator's E0300. */
+void elya_int_overflow(void) {
+    fputs("elya: integer overflow\n", stderr);
+    exit(1);
+}
+
+void elya_div_zero(void) {
+    fputs("elya: division by zero\n", stderr);
+    exit(1);
+}
+
+void elya_rem_zero(void) {
+    fputs("elya: remainder by zero\n", stderr);
+    exit(1);
+}
+
 /* A perform whose handler has no clause for it. The type checker makes this
  * unreachable; a guard, never `unreachable`. */
 void elya_unhandled_effect(void) {

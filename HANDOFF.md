@@ -13,7 +13,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 859 passed, 81 suites. The runtime gained
+- Linux gate at the tip of `auto/elya`: 869 passed, 83 suites. The runtime gained
   `elya_cont_copy` (multi-shot); `gc_mark` is unchanged.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
@@ -169,6 +169,12 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   handler boundaries and shares the frames above them. `Interp::cost()` pins it
   timing-free (`tests/eval_complexity.rs`); the PARKED shape runs at n = 100 000.
 
+- **`Int` arithmetic is exact or fails by name; `/` and `%` natively** (2026-10-10, branch
+  `auto/elya`, a prerequisite of the replay step): spec
+  `docs/superpowers/specs/2026-10-10-elya-checked-integer-arithmetic-design.md`. Overflow,
+  `MIN / -1` and a zero divisor stop both sides by the same name (the evaluator used to
+  panic, native wrapped); `MIN % -1` is 0. Closes 5b-1 §11's deferred overflow question.
+
 ## The next five steps
 
 ### 1. Exact replay and handler-based testing (ROADMAP priority 3)
@@ -217,7 +223,13 @@ then strings natively: concatenation in the runtime (GC-managed byte arrays), th
 and `io.println` of a computed string. Measure first which examples and corpora this
 unlocks (the CEK machine's output, step 2's replay log), and pin it with differential tests.
 
-Also open, unscheduled: the roadmap's
+Also open, unscheduled: explicit wrapping arithmetic (`int.wrapping_mul` and friends, for
+hashes and generators) and unary minus natively (Core refuses "Unary"); a two-parameter
+lambda passed to a higher-order function is "unrepresentable" natively (N7 part 2?); the
+one-shot trap's words differ (evaluator "continuation resumed more than once", native
+"a one-shot continuation was resumed twice"); the parser continues a call across a
+newline (`f()` then a line starting `(` is `f()(...)`) -- a layout rule is a language
+decision; the roadmap's
 other priorities (record/replay handlers, then capabilities once modules exist); the rest
 of the soundness sweep (resume's row lacks return-clause and re-entered-clause effects;
 recursion through a lambda the function handles around, PARKED); recursion through a

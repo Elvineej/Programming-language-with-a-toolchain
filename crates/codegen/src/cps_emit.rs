@@ -1260,7 +1260,10 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             return Err(CodegenError::Unsupported(op_label(op)));
         }
         prim_values(
+            self.ctx,
+            self.func,
             self.b,
+            self.lc,
             op,
             vals[0].into_int_value(),
             vals[1].into_int_value(),

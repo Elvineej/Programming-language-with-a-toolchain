@@ -4334,3 +4334,108 @@ fn copies_survive_a_collection_mid_copy() {
     assert_eq!(&stdout, want);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `Int` arithmetic is exact or fails by name (2026-10-10, spec
+/// `2026-10-10-elya-checked-integer-arithmetic-design.md`). `/` and `%` compile
+/// natively; each value agrees with the evaluator. `ix` and `ex` take their
+/// operands from a perform, so `/` and `%` also run through the CPS emitter.
+/// Control K2 (no `-1` select in `%`): `min-rem-minus-one` dies on SIGFPE.
+const INT_DIVISION: &[(&str, &str, &str)] = &[
+    (
+        "signs",
+        "fn d(a, b) { a / b * 1000 + a % b }\n\
+         pub fn main() -> Int { d(0 - 7, 2) * 1000000 + d(7, 0 - 2) * 1000 + d(0 - 7, 0 - 2) }\n",
+        "-3003996001",
+    ),
+    (
+        "min-rem-minus-one",
+        "fn r(a, b) { a % b }\n\
+         pub fn main() -> Int { r(0 - 9223372036854775807 - 1, 0 - 1) + 5 }\n",
+        "5",
+    ),
+    (
+        "min-div-one",
+        "fn d(a, b) { a / b }\n\
+         pub fn main() -> Int { d(0 - 9223372036854775807 - 1, 1) / 1000000000000 }\n",
+        "-9223372",
+    ),
+    (
+        "through-cps",
+        "effect Ix { fn ix() -> Int }\n\
+         fn ex(n) {\n let v = n * 100 + ix()\n v / 7 * 10 + v % 7\n }\n\
+         pub fn main() -> Int { handle { ex(5) + ex(0 - 5) } with { Ix.ix() -> resume(3) } }\n",
+        "6",
+    ),
+    (
+        "lcg",
+        "fn next(s) { (s * 1103515245 + 12345) % 2147483648 }\n\
+         fn go(s, n) { if n == 0 { s } else { go(next(s), n - 1) } }\n\
+         pub fn main() -> Int { go(2026, 1000) }\n",
+        "",
+    ),
+];
+
+#[test]
+fn integer_division_runs_natively() {
+    let dir = temp_dir("int-division");
+    for (tag, src, expected) in INT_DIVISION {
+        let exe = compile_and_link(&lower_src(src), &dir, tag);
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_crash(&out.status, tag);
+        assert!(out.status.success(), "{tag}: exited {:?}", out.status);
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(got, eval_main_int(src), "{tag}: native vs evaluator");
+        if !expected.is_empty() {
+            assert_eq!(got, *expected, "{tag}");
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Every failing input stops natively with exit 1 and the named message, and
+/// the evaluator stops with E0300 and the same words. The operands come
+/// through a function so neither side can fold them away early.
+/// Control K1 (`add` without the overflow check): `add` prints a wrapped value.
+#[test]
+fn integer_traps_are_named_on_both_sides() {
+    const MIN: &str = "(0 - 9223372036854775807 - 1)";
+    const MAX: &str = "9223372036854775807";
+    let cases = [
+        ("add", format!("f({MAX}, 1, 0)"), "integer overflow"),
+        ("sub", format!("f({MIN}, 1, 1)"), "integer overflow"),
+        ("mul", format!("f({MAX}, 2, 2)"), "integer overflow"),
+        ("div-min", format!("f({MIN}, 0 - 1, 3)"), "integer overflow"),
+        ("div-zero", "f(7, 0, 3)".to_string(), "division by zero"),
+        ("rem-zero", "f(7, 0, 4)".to_string(), "remainder by zero"),
+    ];
+    let dir = temp_dir("int-traps");
+    for (tag, call, name) in cases {
+        let src = format!(
+            "fn f(a, b, op) {{ if op == 0 {{ a + b }} else {{ if op == 1 {{ a - b }} else {{\n\
+             if op == 2 {{ a * b }} else {{ if op == 3 {{ a / b }} else {{ a % b }} }} }} }} }}\n\
+             pub fn main() -> Int {{ {call} }}\n"
+        );
+        let session = Session::new();
+        let (m, pd) = parse_module(&session, &src);
+        assert!(pd.is_empty(), "parse: {pd:?}");
+        match elya::eval::run_module_value(&m) {
+            Err(e) => {
+                assert_eq!(e.diag.code, "E0300", "{tag}");
+                assert_eq!(e.diag.message, name, "{tag}");
+            }
+            Ok((_, v)) => panic!("{tag}: the evaluator returned {v:?}"),
+        }
+        let exe = compile_and_link(&lower_src(&src), &dir, tag);
+        let out = Command::new(&exe).output().expect("run produced binary");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{tag}: {:?}, stdout {:?}, stderr {stderr:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert_eq!(stderr, format!("elya: {name}\n"), "{tag}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
