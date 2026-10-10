@@ -21,6 +21,7 @@
 mod closure;
 mod cps;
 mod cps_emit;
+mod patterns;
 mod specialize;
 
 use std::collections::{HashMap, HashSet};
@@ -1714,6 +1715,9 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     // and eta-expand upcasts, so every phase below sees types that say the
     // right convention. Pure Core-to-Core; nothing is emitted yet.
     let specialized = specialize::run(core)?;
+    // Nested and literal patterns become the flat matches, `if`s and `let`s
+    // both emitters support (spec 2026-10-10-elya-native-pattern-compilation).
+    let specialized = patterns::run(&specialized);
     let core = &specialized;
 
     // The closure tags continue the constructor numbering, so `first_tag` is the
@@ -2810,21 +2814,15 @@ mod tests {
         );
     }
 
+    // Was `rejects_a_non_adt_match_scrutinee` (N6 §8.4). Native pattern
+    // compilation (2026-10-10) rewrites every match on a non-ADT value into
+    // `let`s and `if`s before the emitters run, so this program now compiles;
+    // its value is proved by execution (`nested_and_literal_patterns_run_natively`,
+    // p2). The emitters keep the refusal as a guard for a match the pass leaves.
     #[test]
-    fn rejects_a_non_adt_match_scrutinee() {
-        // N6 §8.4. An Int scrutinee has no tag word; `.into_pointer_value()`
-        // would panic on it (inkwell, not a Result), and a `Str` scrutinee —
-        // newly representable — would load the string's tag and fall through to
-        // elya_match_fail, which is wrong behaviour rather than a crash. Both are
-        // refused by name, at the top of the arm, before any lowering happens.
-        let err = emit_ir(&core_of("pub fn main() { match 1 { _ -> 2 } }")).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("match scrutinee is not an ADT")
-            ),
-            "{err:?}"
-        );
+    fn a_non_adt_match_scrutinee_is_compiled_away() {
+        emit_ir(&core_of("pub fn main() { match 1 { _ -> 2 } }"))
+            .expect("a wildcard match on an Int compiles");
     }
 
     #[test]

@@ -4439,3 +4439,180 @@ fn integer_traps_are_named_on_both_sides() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Native pattern compilation (2026-10-10, spec
+/// `2026-10-10-elya-native-pattern-compilation-design.md`, §0's table): nested
+/// constructor patterns and literal patterns compile through a Core-to-Core pass
+/// into the flat matches both emitters already support. Each value is the
+/// evaluator's (and pinned where computed by hand).
+/// p8 and p9 are the review's: with failure continuations copied they took
+/// 9.2 s / 6.4 MB and 11.4 s / 6.3 MB to build (exponential in the arms).
+const PATTERNS: &[(&str, &str, &str)] = &[
+    (
+        "p1-nested-fallthrough",
+        "type E { A(Int), B(Int, Int) }\n\
+         type L { Nil, Cons(E, L) }\n\
+         fn f(l) { match l {\n\
+         \x20 Cons(A(x), Cons(B(y, z), _)) -> x * 100 + y * 10 + z\n\
+         \x20 Cons(A(x), _) -> x\n\
+         \x20 Cons(B(y, z), rest) -> y + z + f(rest)\n\
+         \x20 Nil -> 0\n\
+         } }\n\
+         pub fn main() -> Int { f(Cons(A(1), Cons(B(2, 3), Nil))) * 10000 + f(Cons(A(7), Nil)) * 100 + f(Cons(B(4, 5), Cons(A(6), Nil))) }\n",
+        "1230715",
+    ),
+    (
+        "p2-int-and-bool-literals",
+        "fn g(n) { match n {\n\
+         \x20 0 -> 100\n\
+         \x20 1 -> 200\n\
+         \x20 k -> k * 3\n\
+         } }\n\
+         fn h(b) { match b {\n\
+         \x20 True -> 1\n\
+         \x20 False -> 2\n\
+         } }\n\
+         pub fn main() -> Int { g(0) + g(1) + g(5) + h(True) * 1000 + h(False) * 10000 }\n",
+        "21315",
+    ),
+    (
+        "p3-literal-in-constructor",
+        "type O { None, Some(Int) }\n\
+         fn f(o) { match o {\n\
+         \x20 Some(0) -> 10\n\
+         \x20 Some(n) -> n\n\
+         \x20 None -> 0 - 1\n\
+         } }\n\
+         pub fn main() -> Int { f(Some(0)) * 10000 + f(Some(42)) * 10 + f(None) }\n",
+        "100419",
+    ),
+    (
+        "p4-outer-name",
+        "type P { P(Int, Q) }\n\
+         type Q { Q(Int) }\n\
+         fn f(p, x) { match p {\n\
+         \x20 P(x, Q(1)) -> x\n\
+         \x20 P(_, Q(_)) -> x\n\
+         } }\n\
+         pub fn main() -> Int { f(P(5, Q(1)), 9) * 100 + f(P(5, Q(2)), 9) }\n",
+        "509",
+    ),
+    (
+        "p5-effectful-arms",
+        "effect Ask { fn ask() -> Int }\n\
+         type O { None, Some(Int) }\n\
+         type W { W(O) }\n\
+         fn f(w) { match w {\n\
+         \x20 W(Some(0)) -> ask()\n\
+         \x20 W(Some(n)) -> n + ask()\n\
+         \x20 W(None) -> ask() * 2\n\
+         } }\n\
+         pub fn main() -> Int { handle { f(W(Some(0))) * 10000 + f(W(Some(5))) * 100 + f(W(None)) } with { Ask.ask() -> resume(7) } }\n",
+        "71214",
+    ),
+    (
+        "p6-pairs-loop",
+        "type L { Nil, Cons(Int, L) }\n\
+         fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }\n\
+         fn pairs(l, acc) { match l {\n\
+         \x20 Cons(a, Cons(b, rest)) -> pairs(rest, acc + a * b)\n\
+         \x20 Cons(a, Nil) -> acc + a\n\
+         \x20 Nil -> acc\n\
+         } }\n\
+         pub fn main() -> Int { pairs(build(100001, Nil), 0) % 1000000007 }\n",
+        "",
+    ),
+    (
+        "p7-literal-in-lambda",
+        "type O { None, Some(Int) }\n\
+         pub fn main() -> Int {\n\
+         \x20 let f = fn(o) { match o {\n\
+         \x20   Some(1) -> 10\n\
+         \x20   Some(m) -> m\n\
+         \x20   None -> 0\n\
+         \x20 } }\n\
+         \x20 f(Some(1)) + f(Some(5)) * 100\n\
+         }\n",
+        "510",
+    ),
+    (
+        "p8-simplifier",
+        "type E { Num(Int), Add(E, E), Mul(E, E), Neg(E) }\n\
+         fn simp(e) { match e {\n\
+         \x20 Add(Num(0), x) -> x\n\
+         \x20 Add(x, Num(0)) -> x\n\
+         \x20 Mul(Num(1), x) -> x\n\
+         \x20 Mul(x, Num(1)) -> x\n\
+         \x20 Mul(Num(0), _) -> Num(0)\n\
+         \x20 Mul(_, Num(0)) -> Num(0)\n\
+         \x20 Neg(Neg(x)) -> x\n\
+         \x20 Neg(Num(n)) -> Num(0 - n)\n\
+         \x20 Add(Num(a), Num(b)) -> Num(a + b)\n\
+         \x20 Mul(Num(a), Num(b)) -> Num(a * b)\n\
+         \x20 other -> other\n\
+         } }\n\
+         fn ev(e) { match simp(e) {\n\
+         \x20 Num(n) -> n\n\
+         \x20 Add(a, b) -> ev(a) + ev(b)\n\
+         \x20 Mul(a, b) -> ev(a) * ev(b)\n\
+         \x20 Neg(a) -> 0 - ev(a)\n\
+         } }\n\
+         pub fn main() -> Int { ev(Add(Mul(Num(1), Neg(Neg(Num(5)))), Add(Num(0), Mul(Num(3), Num(4))))) }\n",
+        "17",
+    ),
+    (
+        "p9-six-nested-arms",
+        "type L { Nil, Cons(Int, L) }\n\
+         fn f(l) { match l {\n\
+         \x20 Cons(0, Cons(1, Cons(2, Nil))) -> 1\n\
+         \x20 Cons(1, Cons(2, Cons(3, Nil))) -> 2\n\
+         \x20 Cons(2, Cons(3, Cons(4, Nil))) -> 3\n\
+         \x20 Cons(3, Cons(4, Cons(5, Nil))) -> 4\n\
+         \x20 Cons(4, Cons(5, Cons(6, Nil))) -> 5\n\
+         \x20 Cons(5, Cons(6, Cons(7, Nil))) -> 6\n\
+         \x20 _ -> 0\n\
+         } }\n\
+         fn mk(i) { Cons(i, Cons(i + 1, Cons(i + 2, Nil))) }\n\
+         pub fn main() -> Int { f(mk(0)) * 1 + f(mk(1)) * 10 + f(mk(2)) * 100 + f(mk(3)) * 1000 + f(mk(4)) * 10000 + f(mk(5)) * 100000 + f(mk(6)) * 1000000 }\n",
+        "654321",
+    ),
+];
+
+#[test]
+fn nested_and_literal_patterns_run_natively() {
+    let dir = temp_dir("patterns");
+    for (tag, src, expected) in PATTERNS {
+        let exe = compile_and_link(&lower_src(src), &dir, tag);
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_crash(&out.status, tag);
+        assert!(
+            out.status.success(),
+            "{tag}: exited {:?}, stderr {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(got, eval_main_int(src), "{tag}: native vs evaluator");
+        if !expected.is_empty() {
+            assert_eq!(got, *expected, "{tag}");
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Spec D3: a user binder is bound only once its whole arm has matched. `f`'s
+/// first arm binds `x` and then fails on `Q(2)`; the second arm must read the
+/// PARAMETER `x` (9), not the failed arm's field (5).
+#[test]
+fn a_failed_nested_arm_does_not_shadow_an_outer_name() {
+    let src = PATTERNS
+        .iter()
+        .find(|(t, _, _)| *t == "p4-outer-name")
+        .map(|(_, s, _)| *s)
+        .unwrap();
+    let dir = temp_dir("pattern-shadow");
+    let exe = compile_and_link(&lower_src(src), &dir, "p4");
+    assert_runs(&exe, "509");
+    assert_eq!(eval_main_int(src), "509");
+    std::fs::remove_dir_all(&dir).ok();
+}

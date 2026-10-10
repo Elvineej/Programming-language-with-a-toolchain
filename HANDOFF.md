@@ -13,7 +13,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 869 passed, 83 suites. The runtime gained
+- Linux gate at the tip of `auto/elya`: 873 passed, 83 suites. The runtime gained
   `elya_cont_copy` (multi-shot); `gc_mark` is unchanged.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
@@ -174,6 +174,12 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   `docs/superpowers/specs/2026-10-10-elya-checked-integer-arithmetic-design.md`. Overflow,
   `MIN / -1` and a zero divisor stop both sides by the same name (the evaluator used to
   panic, native wrapped); `MIN % -1` is 0. Closes 5b-1 §11's deferred overflow question.
+
+- **Nested and literal patterns natively** (2026-10-10, branch `auto/elya`, a prerequisite
+  of the replay step): spec `docs/superpowers/specs/2026-10-10-elya-native-pattern-compilation-design.md`.
+  A Core-to-Core pass (`crates/codegen/src/patterns.rs`) compiles them to flat matches
+  (test, then destructure: linear size). The first version copied failure continuations
+  and the review measured exponential code size; fixed test-first.
 
 ## The next five steps
 
