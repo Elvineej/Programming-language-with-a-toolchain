@@ -28,6 +28,13 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   now E0423 under the exact-row rule. Gate 909 / 87. Review: 2 soundness holes in my
   first version, fixed test-first (also closes a pre-existing hole of the same shape).
 - Windows-gate debt added: 4c692e2.
+- **Done: recursion through a lambda** (bce002c), same spec §5: a lambda that includes a
+  recursive member's row closes with the group. **Two existing test expectations changed
+  by this decision** (row_soundness `go`: E0420 instead of E0423; `go` under its handler
+  now accepted, 64) -- named in the commit; please review. Review: 1 root cause (a
+  member's later relay), fixed test-first; it also closed a hole present at 9eb8d5f.
+  Gate 913 / 87.
+- Windows-gate debt added: bce002c.
 
 ## 2026-10-10 09:49 UTC — ended without a DONE mark (taken over 2026-10-15 17:53)
 
