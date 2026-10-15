@@ -4893,3 +4893,51 @@ fn a_parametric_list_survives_collection() {
     assert_eq!(value, "5000050000");
     assert!(stats.collections > 0, "the collector never ran: {stats:?}");
 }
+
+// ---- Recursion through a handle body (2026-10-15) ----
+// Spec `docs/superpowers/specs/2026-10-15-elya-handle-recursion-design.md`.
+// Before it, none of these passed the front end. n1 builds a chain of 1000
+// nested handler frames, and every `get` walks to the innermost one.
+const HANDLE_RECURSION: &[(&str, &str, &str)] = &[
+    (
+        "n1-a-chain-of-1000-handlers",
+        "effect S { fn get() -> Int }\neffect T { fn t() -> Int }\n\
+         fn nest(n: Int) / {T} -> Int { if n == 0 { t() } else { handle { nest(n - 1) + get() } with { S.get() -> resume(1)  return(r) -> r } } }\n\
+         pub fn main() -> Int { handle { nest(1000) } with { T.t() -> resume(0)  return(r) -> r } }\n",
+        "1000",
+    ),
+    (
+        "n6-an-outer-effect-under-300-handlers",
+        "effect S { fn get() -> Int }\neffect T { fn t() -> Int }\n\
+         fn h(n) { handle { if n == 0 { t() } else { h(n - 1) + get() } } with { S.get() -> resume(1)  return(r) -> r } }\n\
+         pub fn main() -> Int { handle { h(300) } with { T.t() -> resume(7)  return(r) -> r * 10 } }\n",
+        "3070",
+    ),
+    (
+        "n8-the-innermost-handler-answers",
+        "effect S { fn get() -> Int }\neffect T { fn t() -> Int }\n\
+         fn h(n) { if n == 0 { get() + t() } else { handle { h(n - 1) } with { S.get() -> resume(n)  return(r) -> r + 1 } } }\n\
+         pub fn main() -> Int { handle { handle { h(3) } with { S.get() -> resume(100)  return(r) -> r } } with { T.t() -> resume(1000)  return(r) -> r } }\n",
+        "1004",
+    ),
+    (
+        "m2-an-effectful-callback-relayed",
+        "effect S { fn get() -> Int }\neffect L { fn lg(x: Int) -> Int }\n\
+         fn h(f, n) { if n == 0 { 0 } else { handle { h(f, n - 1) + f() + get() } with { S.get() -> resume(1)  return(r) -> r } } }\n\
+         pub fn main() -> Int { handle { h(fn() { lg(2) }, 10) } with { L.lg(x) -> resume(x * 2)  return(r) -> r } }\n",
+        "50",
+    ),
+    (
+        "m3-the-callback-meets-the-innermost-handler",
+        "effect S { fn get() -> Int }\n\
+         fn h(f, n) { if n == 0 { f() } else { handle { h(f, n - 1) + get() } with { S.get() -> resume(1)  return(r) -> r } } }\n\
+         pub fn main() -> Int { handle { h(fn() { get() * 100 }, 3) } with { S.get() -> resume(5)  return(r) -> r } }\n",
+        "103",
+    ),
+];
+
+#[test]
+fn recursion_through_a_handle_body_runs_natively() {
+    run_value_corpus(HANDLE_RECURSION, "handle-recursion");
+    run_differential_corpus(HANDLE_RECURSION, "handle-recursion-diff");
+}

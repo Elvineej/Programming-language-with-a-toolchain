@@ -14,7 +14,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 900 passed, 85 suites. The runtime gained
+- Linux gate at the tip of `auto/elya`: 909 passed, 87 suites. The runtime gained
   `elya_cont_copy` (multi-shot); `gc_mark` is unchanged.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
@@ -197,14 +197,23 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   found closures inside parametric types miscompiled (row tails in instance keys) and a
   phantom-effect-parameter regression; both fixed test-first.
 
+- **Recursion through a handle body** (2026-10-15, branch `auto/elya`, a prerequisite of
+  steps 1 and 2): spec `docs/superpowers/specs/2026-10-15-elya-handle-recursion-design.md`.
+  A recursive call directly in a handle body includes the member's row (labels, with
+  their arguments unified) instead of unifying with it, so the handled effect no longer
+  leaks into the function's type. Natively a chain of 1000 nested handlers runs. The
+  review found two soundness holes in the first version (effect arguments; an escaped
+  `resume`), fixed test-first; a function annotated with the formerly leaking effect is
+  now E0423 (the exact-row rule).
+
 ## The next five steps
 
 ### 1. Async step 2: structured concurrency and a poll loop
 
 ROADMAP 1b/1c on top of `examples/04_async.elya`: a scope handler that joins its children
 (a `spawn` returning a handle, `await` as an effect), then real I/O readiness through a
-runtime poll loop the scheduler consults. Recursion through a handle body (PARKED) blocks
-the natural recursive `task`: measure whether it is the next front-end fix.
+runtime poll loop the scheduler consults. Recursion through a handle body is accepted
+since 2026-10-15 (Done above), so the natural recursive `task` can be written.
 
 ### 2. A backtracking example, and handler frames in deep chains
 
@@ -213,8 +222,8 @@ number), an N-queens or subset-sum search written as an ordinary function over a
 `multi` `Choose` effect, with handlers that collect all answers, the first answer, and a
 count -- one search, three meanings, the same bytes natively. Then measure the one shape
 the multi-shot review could not build: a captured chain holding MANY handler frames
-(blocked by PARKED's "recursion through a handle body"); if step 1's front-end fix lands
-first, add it to `MULTI_SHOT` and time the copy (it maps parents through a hash table, so
+(unblocked 2026-10-15: recursion through a handle body is accepted); add it to
+`MULTI_SHOT` and time the copy (it maps parents through a hash table, so
 it should stay linear).
 
 ### 3. Native strings

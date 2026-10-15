@@ -185,6 +185,21 @@ pub struct Infer {
     /// callee's row equal to the caller's), and flushed -- labels only -- before
     /// a lambda's ambient closes and when the group is done.
     pending_incl: Vec<(RowVar, RowVar, Span)>,
+    /// Recursion through a handle body (2026-10-15): `(member ambient, handle
+    /// body ambient)` -- a call of a function of the SCC group being inferred,
+    /// made directly in a handle's body, performs the member's row, so the body
+    /// must INCLUDE its labels; unifying the two rows (as a call otherwise
+    /// does) made the member's row EQUAL to the body's, which holds the handled
+    /// effect, and the handled effect leaked into the function's type.
+    /// Flushed with `pending_incl`, labels only.
+    pending_member_incl: Vec<(RowVar, RowVar, Span)>,
+    /// The ambients of the SCC group's members while the group is inferred.
+    group_ambs: Vec<RowVar>,
+    /// The parameter types of the group's members.
+    group_params: Vec<Ty>,
+    /// The body ambient of every handle whose body is being inferred, with the
+    /// lambda depth at the handle.
+    handle_bodies: Vec<(RowVar, usize)>,
     /// The parameter types in scope (function, lambda and clause parameters):
     /// a callee tail shared with one is a RELAY and is unified, never treated
     /// as an upcast -- generalization needs the shared variable.
@@ -239,6 +254,10 @@ impl Infer {
             lambda_depth: 0,
             phantom: HashSet::new(),
             pending_incl: Vec::new(),
+            pending_member_incl: Vec::new(),
+            group_ambs: Vec::new(),
+            group_params: Vec::new(),
+            handle_bodies: Vec::new(),
             param_tys: Vec::new(),
             ctor_arity: HashMap::new(),
             effect_multi: HashMap::new(),
@@ -703,6 +722,31 @@ impl Infer {
                         changed = true;
                     } else {
                         self.pending_incl.retain(|p| *p != (src, dst, span));
+                    }
+                    self.surface_conflict(r);
+                }
+            }
+            for (src, dst, span) in self.pending_member_incl.clone() {
+                let have = self.resolve_row(&EffectRow::open(dst));
+                let want = self.resolve_row(&EffectRow::open(src));
+                for (label, l) in want.labels.iter() {
+                    if let Some(h) = have.labels.get(label) {
+                        // The same effect on both sides: its type arguments
+                        // must agree (the review's F1 -- skipping this let a
+                        // member's `St(String)` hide under the handled
+                        // `St(Bool)`). A conflict is reported once.
+                        let before = self.diags.len();
+                        self.unify_effect_args(label, &h.args.clone(), &l.args.clone(), span);
+                        if self.diags.len() > before {
+                            self.pending_member_incl.retain(|p| *p != (src, dst, span));
+                        }
+                        continue;
+                    }
+                    let r = self.add_effect(dst, label, l.args.clone(), span);
+                    if r.is_ok() {
+                        changed = true;
+                    } else {
+                        self.pending_member_incl.retain(|p| *p != (src, dst, span));
                     }
                     self.surface_conflict(r);
                 }
@@ -1260,6 +1304,17 @@ impl Infer {
                             let all = EffectRow::open(cx.clauses_row);
                             let r = self.add_row(amb, &all, span);
                             self.surface_conflict(r);
+                            // ... and it re-runs the body's recursive calls,
+                            // whose member rows may still grow: include them
+                            // here too, so a later label reaches this lambda or
+                            // is reported against its closed row (the
+                            // handle-recursion review's F2).
+                            let body_tail = self.resolve_row(&EffectRow::open(cx.body_amb)).tail;
+                            for (m, dst, sp) in self.pending_member_incl.clone() {
+                                if self.resolve_row(&EffectRow::open(dst)).tail == body_tail {
+                                    self.pending_member_incl.push((m, amb, sp));
+                                }
+                            }
                         }
                         let mut in_params = Vec::new();
                         for p in self.param_tys.clone() {
@@ -1595,6 +1650,11 @@ impl Infer {
             if self.phantom.contains(&v) && !in_params.contains(&v) {
                 self.pending_incl.push((v, amb, span));
                 eff.tail = RowTail::Closed;
+            } else if !in_params.contains(&v) {
+                if let Some(m) = self.member_in_handle_body(v, amb) {
+                    self.pending_member_incl.push((m, amb, span));
+                    eff.tail = RowTail::Closed;
+                }
             }
         }
         {
@@ -1602,6 +1662,35 @@ impl Infer {
             self.surface_conflict(r);
         }
         result
+    }
+
+    /// Is a callee row ending in `v` a member of the group being inferred,
+    /// called directly in the body of a handle (not in a lambda inside it)
+    /// whose ambient `amb` is not already that member's row? Then the member
+    /// to include (recursion through a handle body, 2026-10-15).
+    fn member_in_handle_body(&mut self, v: RowVar, amb: RowVar) -> Option<RowVar> {
+        let &(body, depth) = self.handle_bodies.last()?;
+        if depth != self.lambda_depth {
+            return None;
+        }
+        let amb_tail = self.resolve_row(&EffectRow::open(amb)).tail;
+        if amb_tail != self.resolve_row(&EffectRow::open(body)).tail || amb_tail == RowTail::Open(v)
+        {
+            return None;
+        }
+        // A tail shared with a member's parameter is a RELAY (it becomes what
+        // the arguments perform): it must be unified, as any relay is.
+        let mut relayed = Vec::new();
+        for p in self.group_params.clone() {
+            free_row_vars(self, &p, &mut relayed);
+        }
+        if relayed.contains(&v) {
+            return None;
+        }
+        self.group_ambs
+            .clone()
+            .into_iter()
+            .find(|&m| self.resolve_row(&EffectRow::open(m)).tail == RowTail::Open(v))
     }
 
     /// Type `handle e with H`: infer `e` under a fresh inner ambient seeded with
@@ -1658,7 +1747,9 @@ impl Infer {
                 self.surface_conflict(r);
             }
         }
+        self.handle_bodies.push((amb_in, self.lambda_depth));
         let body_ty = self.infer_expr(body, env, amb_in);
+        self.handle_bodies.pop();
 
         // R — the handle's result type, shared by every clause and `return`.
         let result = self.fresh();
@@ -2516,6 +2607,11 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             ann_vars_of.insert(i, std::mem::take(&mut inf.ann_vars));
             member_ty.insert(i, (params, amb_f, result));
         }
+        inf.group_ambs = group.iter().map(|i| member_ty[i].1).collect();
+        inf.group_params = group
+            .iter()
+            .flat_map(|i| member_ty[i].0.iter().cloned())
+            .collect();
         // 2. infer each body under its params + ambient (monomorphic in-group).
         for &i in group {
             let f = fns[i];
@@ -2587,6 +2683,9 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
         //      is closed (Koka's close-at-generalization; value uses re-open).
         inf.flush_inclusions();
         inf.pending_incl.clear();
+        inf.pending_member_incl.clear();
+        inf.group_ambs.clear();
+        inf.group_params.clear();
         let pending: Vec<RowVar> = inf.phantom.iter().copied().collect();
         for v in pending {
             if inf.row_subst[v as usize].is_none() {
