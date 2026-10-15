@@ -3,6 +3,12 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
+## 2026-10-15 21:43 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue")
+
+- The interactive session that fixed d07afea is working on `auto/elya` now, so scheduled
+  runs started within 3 hours of this entry exit, as the protocol says. It marks this
+  entry DONE, or hands it over, before it stops.
+
 ## 2026-10-15 21:35 UTC — interactive session (not a scheduled run), DONE
 
 **A silent miscompile in N7 part 2 (988348e). FIXED in d07afea.** The fix is on this
