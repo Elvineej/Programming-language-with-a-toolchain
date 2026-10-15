@@ -478,7 +478,8 @@ fn lower_expr(
         }
         Expr::Call { callee, args } => {
             if let Expr::Qualified { module, name } = &callee.node {
-                if module == "io" && name == "println" {
+                let full = format!("{module}.{name}");
+                if crate::resolve::builtins().contains(&full.as_str()) {
                     let mut lowered = Vec::with_capacity(args.len());
                     for a in args.iter() {
                         lowered.push(lower_expr(&a.node, a.span, table, cx)?);
@@ -486,7 +487,7 @@ fn lower_expr(
                     return Ok(CoreExpr {
                         span,
                         ty,
-                        kind: CoreKind::Builtin("io.println".to_string(), lowered.into()),
+                        kind: CoreKind::Builtin(full, lowered.into()),
                     });
                 }
             }

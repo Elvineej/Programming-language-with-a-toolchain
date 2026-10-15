@@ -401,6 +401,16 @@ pub mod tree {
                         interp.println(s);
                         return Ok(Value::Unit);
                     }
+                    if module == "int" && name == "to_string" {
+                        let mut vals = Vec::new();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        let [Value::Int(n)] = &vals[..] else {
+                            return Err(rt(span, "int.to_string expects a single Int"));
+                        };
+                        return Ok(Value::Str(n.to_string()));
+                    }
                     return Err(rt(span, format!("unknown builtin `{module}.{name}`")));
                 }
                 // Constructor application: `Cons(1, Nil)` builds a `Ctor` value.
@@ -920,6 +930,9 @@ pub mod cek {
                     Expr::Qualified { module, name } if module == "io" && name == "println" => {
                         CalleeSlot::Builtin("io.println")
                     }
+                    Expr::Qualified { module, name } if module == "int" && name == "to_string" => {
+                        CalleeSlot::Builtin("int.to_string")
+                    }
                     Expr::Qualified { module, name } => {
                         return Err(rt(span, format!("unknown builtin `{module}.{name}`")))
                     }
@@ -1342,6 +1355,12 @@ pub mod cek {
                 };
                 interp.println(s);
                 Ok(State::Return(Value::Unit, k))
+            }
+            CalleeSlot::Builtin("int.to_string") => {
+                let [Value::Int(n)] = &args[..] else {
+                    return Err(rt(span, "int.to_string expects a single Int"));
+                };
+                Ok(State::Return(Value::Str(n.to_string()), k))
             }
             CalleeSlot::Builtin(other) => Err(rt(span, format!("unknown builtin `{other}`"))),
             CalleeSlot::Value(Value::Fn(name)) => {
