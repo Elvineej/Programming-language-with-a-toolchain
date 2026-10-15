@@ -40,6 +40,9 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   `docs/superpowers/specs/2026-10-15-elya-async-step2-structured-design.md`. Part 2 (I/O
   poll loop) is now HANDOFF step 1. Gate 916 / 87.
 - Windows-gate debt added: 511d6ed.
+- **Done: backtracking example + deep multi-shot chains** (865322c, HANDOFF step 2): `examples/07_search.elya`;
+  100 000-frame multi-shot copy natively, linear. Gate 920 / 87.
+- Windows-gate debt added: 865322c.
 
 ## 2026-10-10 09:49 UTC — ended without a DONE mark (taken over 2026-10-15 17:53)
 
