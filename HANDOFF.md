@@ -14,7 +14,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 916 passed, 87 suites. The runtime gained
+- Linux gate at the tip of `auto/elya`: 920 passed, 87 suites. The runtime gained
   `elya_cont_copy` (multi-shot); `gc_mark` is unchanged.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
@@ -214,6 +214,12 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   task started in it, as ordinary handlers over the generic `List`/`Pair`; a task that
   spawns itself and a scope per call (`pfib`). The same bytes natively.
 
+- **A backtracking example, and multi-shot copies of deep handler chains** (2026-10-15,
+  branch `auto/elya`): spec `docs/superpowers/specs/2026-10-15-elya-search-and-deep-chains-design.md`.
+  `examples/07_search.elya`: N-queens over a `multi` `Choose`, three handlers (all
+  solutions, a count, the first), the same bytes natively. A multi-shot copy of a chain
+  of 100 000 handler frames runs natively in linear time.
+
 ## The next five steps
 
 ### 1. Async step 2, part 2: I/O readiness through a poll loop
@@ -225,18 +231,7 @@ in the spec, and keep it testable deterministically). Also from part 1's spec: d
 detection (a full pass of only `Awaiting` tasks) and cancellation of a scope's children
 when its body fails (needs a failure effect).
 
-### 2. A backtracking example, and handler frames in deep chains
-
-Multi-shot runs natively now; show it: `examples/05_search.elya` (or the next free
-number), an N-queens or subset-sum search written as an ordinary function over a
-`multi` `Choose` effect, with handlers that collect all answers, the first answer, and a
-count -- one search, three meanings, the same bytes natively. Then measure the one shape
-the multi-shot review could not build: a captured chain holding MANY handler frames
-(unblocked 2026-10-15: recursion through a handle body is accepted); add it to
-`MULTI_SHOT` and time the copy (it maps parents through a hash table, so
-it should stay linear).
-
-### 3. Native strings
+### 2. Native strings
 
 `<>` is refused natively and there is no Int-to-String, so every native example prints a
 number. Add the builtin (`int.to_string`, Claude's call) to the front end and evaluator,
@@ -245,17 +240,17 @@ and `io.println` of a computed string. Measure first which examples and corpora 
 unlocks (the CEK machine's output, the replay log of `examples/05_replay.elya`), and pin
 it with differential tests.
 
-### 4. Effect-polymorphic handlers (a recorder for ANY effect)
+### 3. Effect-polymorphic handlers (a recorder for ANY effect)
 
 Replay (done, `examples/05_replay.elya`) records one fixed effect: a handler covers
 exactly one effect, every operation of it, so a generic `record` would need a handler
 over "every operation of some effect `e`" -- the ROADMAP's next replay step before the CLI
 flags. Measure what the type system needs (an operation-generic clause? an effect-row
 variable a handler can be abstracted over?), survey Koka/Effekt/Frank, decide in a spec,
-and prototype in the evaluator first. Strings natively (step 3) are a prerequisite of a
+and prototype in the evaluator first. Strings natively (step 2) are a prerequisite of a
 serialized log.
 
-### 5. A function's own row in Core
+### 4. A function's own row in Core
 
 `CoreFn` has no latent row, so a type or row variable that appears ONLY in a function's
 own row is invisible at its references: N7 part 2 refuses such type variables by name
@@ -265,6 +260,15 @@ type (its row included) in Core -- the typed table's node-count tripwire
 (`infer_with_types_records_every_node_and_zonks_after_inference`) moves if it is recorded
 there, so decide where it lives in the spec -- then match it at references in both
 passes and lift the refusal. Measure first which corpus programs it unlocks.
+
+### 5. A failure effect and scope cancellation
+
+Structured concurrency (Done) cannot cancel a scope's children: Elya has no failure
+effect in its examples. Design `effect Fail { fn fail(reason: String) -> Never }`-style
+failure (decide: a bottom type, or an op whose result type is free), a `catch`
+handler, and a scope that, when its body fails, drops its queued children instead of
+running them -- then show it in `examples/06_structured.elya` or a new example. Measure
+first what the type system needs for an op that never returns.
 
 Also open, unscheduled: explicit wrapping arithmetic (`int.wrapping_mul` and friends, for
 hashes and generators) and unary minus natively (Core refuses "Unary"); the

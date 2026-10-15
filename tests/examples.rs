@@ -42,3 +42,10 @@ fn structured_concurrency() {
     // it started, as ordinary handlers; nested scopes per call (2026-10-15).
     insta::assert_snapshot!("06_structured", run_example("06_structured.elya"));
 }
+
+#[test]
+fn search() {
+    // One backtracking search over a multi-shot effect, three meanings by
+    // three handlers: all solutions, a count, the first (2026-10-15).
+    insta::assert_snapshot!("07_search", run_example("07_search.elya"));
+}

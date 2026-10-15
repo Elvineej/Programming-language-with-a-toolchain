@@ -1,0 +1,7 @@
+---
+source: tests/examples.rs
+expression: "run_example(\"07_search.elya\")"
+---
+6 queens: 4 solutions, all collected
+8 queens: 92 solutions, counted
+8 queens: the first solution, found without the others

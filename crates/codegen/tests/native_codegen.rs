@@ -4175,6 +4175,16 @@ const MULTI_SHOT: &[(&str, &str, &str)] = &[
          pub fn main() -> Int { go(1000, 0) }\n",
         "1024000",
     ),
+    (
+        // The shape the multi-shot review could not build (2026-10-15, unblocked by
+        // recursion through a handle body): the captured chain holds 1000 handler
+        // frames, and the copy maps every frame's `parent`.
+        "m-deep-handler-chain",
+        "effect multi Flip { fn flip() -> Bool }\neffect S { fn get() -> Int }\n\
+         fn nest(n) { if n == 0 { if flip() { 1 } else { 2 } } else { handle { nest(n - 1) + get() } with { S.get() -> resume(1)  return(r) -> r } } }\n\
+         pub fn main() -> Int { handle nest(1000) with multi { Flip.flip() -> resume(True) * 1000000 + resume(False) } }\n",
+        "1001001002",
+    ),
 ];
 
 #[test]
@@ -4977,4 +4987,39 @@ fn the_structured_concurrency_example_runs_natively() {
     );
     assert_eq!(value, "25555");
     assert_eq!(value, eval_main_int(src));
+}
+
+/// `examples/07_search.elya` (2026-10-15): one backtracking search over a
+/// `multi` effect, three handlers (all solutions, a count, the first one).
+#[test]
+fn the_search_example_runs_natively() {
+    let src = include_str!("../../../examples/07_search.elya");
+    let dir = temp_dir("search-example");
+    let exe = compile_and_link(&lower_src(src), &dir, "search");
+    let (text, value) = native_text_value(&exe, "search");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(text, eval_main_text(src));
+    assert_eq!(
+        text,
+        "6 queens: 4 solutions, all collected\n8 queens: 92 solutions, counted\n\
+         8 queens: the first solution, found without the others\n"
+    );
+    assert_eq!(value, "13215863724");
+    assert_eq!(value, eval_main_int(src));
+}
+
+/// A multi-shot copy of a chain of 100 000 handler frames, natively (the
+/// evaluator is the oracle at 1000 in `MULTI_SHOT`). Measured 2026-10-15:
+/// 0.004 s, 0.014 s, 0.138 s at 1000, 10 000, 100 000 frames -- linear.
+#[test]
+fn a_multi_shot_copy_of_100000_handler_frames() {
+    let src = "effect multi Flip { fn flip() -> Bool }\neffect S { fn get() -> Int }\n\
+               fn nest(n) { if n == 0 { if flip() { 1 } else { 2 } } else { handle { nest(n - 1) + get() } with { S.get() -> resume(1)  return(r) -> r } } }\n\
+               pub fn main() -> Int { handle nest(100000) with multi { Flip.flip() -> resume(True) * 1000000 + resume(False) } }\n";
+    let dir = temp_dir("deep-multi");
+    let exe = compile_and_link(&lower_src(src), &dir, "deep-multi");
+    let out = Command::new(&exe).output().expect("runs");
+    std::fs::remove_dir_all(&dir).ok();
+    diagnose_crash(&out.status, "deep-multi");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "100001100002");
 }
