@@ -3,7 +3,13 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-10 09:49 UTC — IN PROGRESS
+## 2026-10-15 17:53 UTC — IN PROGRESS
+
+- Previous run (2026-10-10 09:49) never marked DONE; over 3 hours old, so this run takes over.
+  PR #22 was merged into `main` (c2a169f); `auto/elya` fast-forwarded to it. A new draft PR
+  will carry this run's work.
+
+## 2026-10-10 09:49 UTC — ended without a DONE mark (taken over 2026-10-15 17:53)
 
 - Previous run (01:53) never marked DONE; over 3 hours old, so this run takes over.
   Its work is on `auto/elya`: native multi-shot handlers (01a7e36, fd32b81; gate 845 / 79).
