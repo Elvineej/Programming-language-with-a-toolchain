@@ -5,7 +5,10 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 
 ## 2026-10-15 21:35 UTC — interactive session (not a scheduled run), DONE
 
-**A silent miscompile in N7 part 2 (988348e). Fix it FIRST.**
+**A silent miscompile in N7 part 2 (988348e). FIXED in d07afea.** The fix is on this
+branch: an instance key renders a row as its convention. It was tested red to green, with
+negative control C1. Gate 920 / 87 (predicted 920). Windows-gate debt: d07afea. Nothing
+below is left for the next run except the "computed callee" note.
 
 - **What fails.** This program prints `x` then 42 under `elya run`. Built natively at
   4b9d7c6, it stops with "elya: match failed (no arm matched)":
@@ -29,10 +32,12 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   `needs_cps` holds), not its labels. One value has the same convention at every use, so
   the binder field types stay right.
 
-- **A tested patch.** It will be pushed to branch `claude/io-instance-key`, based on
-  4b9d7c6: a red test with these programs, the fix, a negative control, and a green
-  gate. If the branch exists, cherry-pick it and re-run the gate; otherwise implement the
-  fix test-first.
+- **Tests.** Three rows in `TYPE_VARS`, `f3-*`. They don't print: an annotation puts `IO`
+  in the type. All three failed with "match failed" in both corpus tests before the fix.
+  - The fix was made on `claude/io-instance-key`, then fast-forwarded here.
+  - C1 (the convention marker dropped too): only `f3-one-type-at-both-conventions` fails,
+    by D16's refusal name. Reverted, `cmp` clean.
+  - Re-running the ~700-program sweep: the disagreement is gone, and nothing else moved.
 
 - **How it was found.** A differential sweep of ~700 programs (earlier review corpora plus
   `examples/`) at 4b9d7c6: native against the evaluator. The two programs above were the
