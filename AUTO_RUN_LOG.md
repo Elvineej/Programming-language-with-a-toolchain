@@ -20,6 +20,14 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   (predicted 899, +1 from the review). Review: 2 findings (closures in parametric types
   miscompiled; phantom effect parameter regression), both fixed test-first.
 - Windows-gate debt added: 988348e.
+- **Done: recursion through a handle body** (4c692e2), a prerequisite of HANDOFF steps 1-2
+  (PARKED since 5b-10). Spec `docs/superpowers/specs/2026-10-15-elya-handle-recursion-design.md`.
+  **Decision (mine; please review):** a recursive call directly in a handle body includes
+  the member's row instead of unifying with it. Consequence by design: a function
+  annotated with the effect that used to leak (`/ {S}` where all S is handled inside) is
+  now E0423 under the exact-row rule. Gate 909 / 87. Review: 2 soundness holes in my
+  first version, fixed test-first (also closes a pre-existing hole of the same shape).
+- Windows-gate debt added: 4c692e2.
 
 ## 2026-10-10 09:49 UTC — ended without a DONE mark (taken over 2026-10-15 17:53)
 
