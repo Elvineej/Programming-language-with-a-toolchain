@@ -1,0 +1,133 @@
+// Structured concurrency, written in Elya.
+//
+// `spawn(f)` starts a task and answers its id; `await(id)` waits for that
+// task's answer; `yld()` lets the others run. Like `examples/04_async.elya`,
+// suspension is an effect and the scheduler is an ordinary handler -- here
+// with one rule more: a `scope` does not return until every task started in
+// it has finished. No task outlives the scope that started it, so a scope is
+// a plain function call from the outside: `pfib` below opens a scope per
+// level, and nobody calling it can tell.
+//
+// The scheduler's queue and result table are the generic `List` and `Pair`.
+
+effect Async {
+  fn spawn(f: fn() / {Async, Log} -> Int) -> Int
+  fn await(id: Int) -> Int
+  fn yld() -> Unit
+}
+
+// What the tasks say, printed by the outermost handler.
+effect Log { fn say(line: String) -> Unit }
+
+type List(a) { Nil, Cons(a, List(a)) }
+type Pair(a, b) { Pair(a, b) }
+
+// A task as the scheduler sees it: finished, or stopped at an operation with
+// the rest of its computation.
+type Step {
+  Done(Int),
+  Yielded(fn() / {Log} -> Step),
+  Spawned(fn() / {Async, Log} -> Int, fn(Int) / {Log} -> Step),
+  Awaiting(Int, fn(Int) / {Log} -> Step)
+}
+
+fn step(body: fn() / {Async, Log} -> Int) -> Step {
+  handle { Done(body()) } with {
+    Async.yld() -> Yielded(fn() { resume(Unit) })
+    Async.spawn(f) -> Spawned(f, fn(id) { resume(id) })
+    Async.await(id) -> Awaiting(id, fn(v) { resume(v) })
+    return(s) -> s
+  }
+}
+
+fn append(l, x) {
+  match l {
+    Nil -> Cons(x, Nil)
+    Cons(h, t) -> Cons(h, append(t, x))
+  }
+}
+
+fn find(rs, id) {
+  match rs {
+    Nil -> None
+    Cons(Pair(i, v), rest) -> if i == id { Some(v) } else { find(rest, id) }
+  }
+}
+
+type Option(a) { None, Some(a) }
+
+// Round robin over (id, step) until nothing is left; answers the results.
+fn run(q, results, next) {
+  match q {
+    Nil -> results
+    Cons(Pair(id, s), rest) -> match s {
+      Done(v) -> run(rest, Cons(Pair(id, v), results), next)
+      Yielded(k) -> run(append(rest, Pair(id, k())), results, next)
+      Spawned(f, k) -> run(append(append(rest, Pair(id, k(next))), Pair(next, step(f))), results, next + 1)
+      Awaiting(c, k) -> match find(results, c) {
+        Some(v) -> run(append(rest, Pair(id, k(v))), results, next)
+        None -> run(append(rest, Pair(id, s)), results, next)
+      }
+    }
+  }
+}
+
+// The scope: its body is task 0; it answers the body's value once the queue
+// is empty -- every task the body (or its tasks) started has finished.
+fn scope(body: fn() / {Async, Log} -> Int) / {Log} -> Int {
+  match find(run(Cons(Pair(0, step(body)), Nil), Nil, 1), 0) {
+    Some(v) -> v
+    None -> 0 - 1
+  }
+}
+
+fn worker(name: String, n: Int) / {Async, Log} -> Int {
+  if n == 0 { 0 } else {
+    let _ = say(name)
+    let _ = yld()
+    1 + worker(name, n - 1)
+  }
+}
+
+// A task that spawns itself: the recursion runs through a lambda.
+fn fib(n: Int) / {Async} -> Int {
+  if n < 2 { n } else {
+    let a = spawn(fn() { fib(n - 1) })
+    let b = spawn(fn() { fib(n - 2) })
+    await(a) + await(b)
+  }
+}
+
+// A scope per level: from the outside, `pfib` is an ordinary function.
+fn pfib(n: Int) / {Log} -> Int {
+  if n < 2 { n } else {
+    scope(fn() {
+      let a = spawn(fn() { pfib(n - 1) })
+      pfib(n - 2) + await(a)
+    })
+  }
+}
+
+pub fn main() -> Int {
+  handle {
+    let _ = say("scope: start")
+    let steps = scope(fn() {
+      let _ = spawn(fn() { worker("  ping", 3) })
+      let p = spawn(fn() { worker("    pong", 2) })
+      let _ = say("  body: done, the children run on")
+      await(p)
+    })
+    let _ = say("scope: joined")
+    let f = scope(fn() { fib(10) })
+    let _ = say("fib(10) by spawned tasks")
+    let pf = pfib(10)
+    let _ = say("pfib(10) by nested scopes")
+    steps * 10000 + f * 100 + pf
+  } with {
+    Log.say(line) -> {
+      io.println(line)
+      resume(Unit)
+    }
+    return(v) -> v
+  }
+}

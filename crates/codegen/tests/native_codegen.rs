@@ -4957,3 +4957,24 @@ fn recursion_through_a_handle_body_runs_natively() {
     run_value_corpus(HANDLE_RECURSION, "handle-recursion");
     run_differential_corpus(HANDLE_RECURSION, "handle-recursion-diff");
 }
+
+/// `examples/06_structured.elya` (2026-10-15): spawn/await and a joining
+/// scope as ordinary handlers over the generic `List` and `Pair`; a task that
+/// spawns itself (recursion through a lambda) and a scope per call. The same
+/// bytes and value natively as in the evaluator.
+#[test]
+fn the_structured_concurrency_example_runs_natively() {
+    let src = include_str!("../../../examples/06_structured.elya");
+    let dir = temp_dir("structured-example");
+    let exe = compile_and_link(&lower_src(src), &dir, "structured");
+    let (text, value) = native_text_value(&exe, "structured");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(text, eval_main_text(src));
+    assert_eq!(
+        text,
+        "scope: start\n  ping\n  body: done, the children run on\n    pong\n  ping\n    pong\n  ping\n\
+         scope: joined\nfib(10) by spawned tasks\npfib(10) by nested scopes\n"
+    );
+    assert_eq!(value, "25555");
+    assert_eq!(value, eval_main_int(src));
+}

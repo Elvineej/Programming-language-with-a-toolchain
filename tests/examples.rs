@@ -35,3 +35,10 @@ fn replay() {
     // each an ordinary handler over the same program (2026-10-10).
     insta::assert_snapshot!("05_replay", run_example("05_replay.elya"));
 }
+
+#[test]
+fn structured_concurrency() {
+    // Structured concurrency: spawn/await and a scope that joins every task
+    // it started, as ordinary handlers; nested scopes per call (2026-10-15).
+    insta::assert_snapshot!("06_structured", run_example("06_structured.elya"));
+}

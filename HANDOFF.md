@@ -14,7 +14,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 913 passed, 87 suites. The runtime gained
+- Linux gate at the tip of `auto/elya`: 916 passed, 87 suites. The runtime gained
   `elya_cont_copy` (multi-shot); `gc_mark` is unchanged.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
@@ -208,14 +208,22 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   (a lambda including a member closes with the group): `spawn(fn() { fib(n - 1) })`
   checks, and row_soundness's `go` under its handler is accepted (64).
 
+- **Async step 2, part 1: structured concurrency** (2026-10-15, branch `auto/elya`):
+  spec `docs/superpowers/specs/2026-10-15-elya-async-step2-structured-design.md`.
+  `examples/06_structured.elya`: `spawn`/`await`/`yld` and a `scope` that joins every
+  task started in it, as ordinary handlers over the generic `List`/`Pair`; a task that
+  spawns itself and a scope per call (`pfib`). The same bytes natively.
+
 ## The next five steps
 
-### 1. Async step 2: structured concurrency and a poll loop
+### 1. Async step 2, part 2: I/O readiness through a poll loop
 
-ROADMAP 1b/1c on top of `examples/04_async.elya`: a scope handler that joins its children
-(a `spawn` returning a handle, `await` as an effect), then real I/O readiness through a
-runtime poll loop the scheduler consults. Recursion through a handle body is accepted
-since 2026-10-15 (Done above), so the natural recursive `task` can be written.
+ROADMAP 1b on top of `examples/06_structured.elya`: a task waiting on an I/O source is
+parked, and when nothing can run the scheduler asks the runtime which sources are ready
+(a poll/select builtin over, at first, timers or pipes -- decide what an I/O source is
+in the spec, and keep it testable deterministically). Also from part 1's spec: deadlock
+detection (a full pass of only `Awaiting` tasks) and cancellation of a scope's children
+when its body fails (needs a failure effect).
 
 ### 2. A backtracking example, and handler frames in deep chains
 
