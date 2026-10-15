@@ -197,9 +197,15 @@ pub struct Infer {
     group_ambs: Vec<RowVar>,
     /// The parameter types of the group's members.
     group_params: Vec<Ty>,
-    /// The body ambient of every handle whose body is being inferred, with the
-    /// lambda depth at the handle.
-    handle_bodies: Vec<(RowVar, usize)>,
+    /// The regions being inferred, innermost last: a handle body or a lambda
+    /// body (`true`: a group member called directly in it is INCLUDED, not
+    /// unified), or a clause or return-clause body (`false`).
+    regions: Vec<(RowVar, bool)>,
+    /// Lambda ambients that include a group member's row (recursion through a
+    /// lambda, 2026-10-15): their labels are complete only when the group is,
+    /// so they are neither closed at the lambda's end nor generalized, and are
+    /// closed with the group.
+    deferred_rows: Vec<(RowVar, Vec<Ty>)>,
     /// The parameter types in scope (function, lambda and clause parameters):
     /// a callee tail shared with one is a RELAY and is unified, never treated
     /// as an upcast -- generalization needs the shared variable.
@@ -257,7 +263,8 @@ impl Infer {
             pending_member_incl: Vec::new(),
             group_ambs: Vec::new(),
             group_params: Vec::new(),
-            handle_bodies: Vec::new(),
+            regions: Vec::new(),
+            deferred_rows: Vec::new(),
             param_tys: Vec::new(),
             ctor_arity: HashMap::new(),
             effect_multi: HashMap::new(),
@@ -726,9 +733,29 @@ impl Infer {
                     self.surface_conflict(r);
                 }
             }
+            let mut relayed = Vec::new();
+            for p in self.group_params.clone() {
+                free_row_vars(self, &p, &mut relayed);
+            }
             for (src, dst, span) in self.pending_member_incl.clone() {
                 let have = self.resolve_row(&EffectRow::open(dst));
                 let want = self.resolve_row(&EffectRow::open(src));
+                // A member's tail that has since become a RELAY of a member's
+                // parameter is whatever the arguments perform: the including
+                // row must take it too, as a relay is taken anywhere (the
+                // lambda review's F1: a lambda closed pure while the member
+                // relayed `k`, and an escaped resume missed it, F1b).
+                if let RowTail::Open(w) = want.tail {
+                    if relayed.contains(&w) && have.tail != RowTail::Open(w) {
+                        let r = self.unify_row(&EffectRow::open(dst), &EffectRow::open(w), span);
+                        if r.is_ok() {
+                            changed = true;
+                        } else {
+                            self.pending_member_incl.retain(|p| *p != (src, dst, span));
+                        }
+                        self.surface_conflict(r);
+                    }
+                }
                 for (label, l) in want.labels.iter() {
                     if let Some(h) = have.labels.get(label) {
                         // The same effect on both sides: its type arguments
@@ -1400,7 +1427,9 @@ impl Infer {
                 let mark = self.param_tys.len();
                 self.param_tys.extend(param_tys.iter().cloned());
                 self.lambda_depth += 1;
+                self.regions.push((lam_amb, true));
                 let body_ty = self.infer_block(&body.node, env, lam_amb);
+                self.regions.pop();
                 self.lambda_depth -= 1;
                 self.param_tys.truncate(mark);
                 env.pop();
@@ -1418,7 +1447,20 @@ impl Infer {
                 self.flush_inclusions();
                 let mut scope_params = self.param_tys.clone();
                 scope_params.extend(param_tys.iter().cloned());
-                self.close_unrelayed_residual(lam_amb, &scope_params);
+                // Recursion through a lambda (2026-10-15): a lambda that
+                // includes a group member's row cannot close yet -- the member
+                // may perform more later in its body. Closed with the group.
+                let lam_tail = self.resolve_row(&EffectRow::open(lam_amb)).tail;
+                let includes_member = self
+                    .pending_member_incl
+                    .clone()
+                    .into_iter()
+                    .any(|(_, dst, _)| self.resolve_row(&EffectRow::open(dst)).tail == lam_tail);
+                if includes_member && matches!(lam_tail, RowTail::Open(_)) {
+                    self.deferred_rows.push((lam_amb, scope_params));
+                } else {
+                    self.close_unrelayed_residual(lam_amb, &scope_params);
+                }
                 // Sub-effecting (the maintainer's decision, 2026-10-08): the
                 // VALUE's row is open even when the body's is closed -- a
                 // function that performs ε may stand where ε ∪ ρ is expected.
@@ -1665,16 +1707,18 @@ impl Infer {
     }
 
     /// Is a callee row ending in `v` a member of the group being inferred,
-    /// called directly in the body of a handle (not in a lambda inside it)
-    /// whose ambient `amb` is not already that member's row? Then the member
-    /// to include (recursion through a handle body, 2026-10-15).
+    /// called directly in the body of a handle or a lambda (not in a clause,
+    /// nor in a region nested inside) whose ambient `amb` is not already that
+    /// member's row? Then the member to include (recursion through a handle
+    /// body or a lambda, 2026-10-15).
     fn member_in_handle_body(&mut self, v: RowVar, amb: RowVar) -> Option<RowVar> {
-        let &(body, depth) = self.handle_bodies.last()?;
-        if depth != self.lambda_depth {
+        let &(region, includes) = self.regions.last()?;
+        if !includes {
             return None;
         }
         let amb_tail = self.resolve_row(&EffectRow::open(amb)).tail;
-        if amb_tail != self.resolve_row(&EffectRow::open(body)).tail || amb_tail == RowTail::Open(v)
+        if amb_tail != self.resolve_row(&EffectRow::open(region)).tail
+            || amb_tail == RowTail::Open(v)
         {
             return None;
         }
@@ -1747,9 +1791,9 @@ impl Infer {
                 self.surface_conflict(r);
             }
         }
-        self.handle_bodies.push((amb_in, self.lambda_depth));
+        self.regions.push((amb_in, true));
         let body_ty = self.infer_expr(body, env, amb_in);
-        self.handle_bodies.pop();
+        self.regions.pop();
 
         // R — the handle's result type, shared by every clause and `return`.
         let result = self.fresh();
@@ -1772,7 +1816,9 @@ impl Infer {
                         ty: body_ty.clone(),
                     },
                 );
+                self.regions.push((ret_amb, false));
                 let ret_ty = self.infer_expr(&ret.body, env, ret_amb);
+                self.regions.pop();
                 self.unify(&ret_ty, &result, ret.body.span);
                 env.pop();
             }
@@ -1848,7 +1894,9 @@ impl Infer {
             });
             let mark = self.param_tys.len();
             self.param_tys.extend(params.iter().cloned());
+            self.regions.push((clause_amb, false));
             let clause_ty = self.infer_expr(&clause.body, env, clause_amb);
+            self.regions.pop();
             self.flush_inclusions();
             let scope_params = self.param_tys.clone();
             self.close_unrelayed_residual(clause_amb, &scope_params);
@@ -1979,7 +2027,12 @@ impl Infer {
         env_free_row_vars(self, env, &mut row_in_env);
         // A handle's clauses row still being filled is not quantified: its
         // labels arrive when the handle is done (the resume-row review's F1).
-        for c in self.pending_clause_rows.clone() {
+        for c in self.pending_clause_rows.clone().into_iter().chain(
+            self.deferred_rows
+                .iter()
+                .map(|(r, _)| *r)
+                .collect::<Vec<_>>(),
+        ) {
             if let RowTail::Open(v) = self.resolve_row(&EffectRow::open(c)).tail {
                 row_in_env.push(v);
             }
@@ -2662,6 +2715,14 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             }
         }
         inf.flush_inclusions();
+        // 2.45. Deferred lambda rows (recursion through a lambda): the group's
+        //       labels are all in, so they close now, unless relayed through
+        //       a parameter in the lambda's scope or a member's.
+        let group_params = inf.group_params.clone();
+        for (l, mut params) in std::mem::take(&mut inf.deferred_rows) {
+            params.extend(group_params.iter().cloned());
+            inf.close_unrelayed_residual(l, &params);
+        }
         // 2.5. close each member's residual ambient (once all in-group effects
         //      are accumulated), unless it is relayed through a parameter.
         for &i in group {

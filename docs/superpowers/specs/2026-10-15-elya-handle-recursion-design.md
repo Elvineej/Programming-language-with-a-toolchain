@@ -81,3 +81,44 @@ every accepted one. Fixed, red first (`the_reviews_soundness_holes_are_rejected`
   applied to the corrected row. Accepted, not changed.
 - Minor, left: the E0426 multi-shot lint reads the body's labels when the handle is
   inferred, so it can miss a member label known only later (a best-effort lint).
+
+## 5. Extension: recursion through a lambda
+
+Measured next (writing async step 2's structured scope): `fn fib(n) / {Async} -> Int`
+spawning `fn() { fib(n - 1) }` is E0423 ("this effect reaches a row that was already
+closed"), and so is row_soundness's `go` under its handler (the evaluator runs it: 64,
+recorded there as "the cost"). A lambda's ambient closes when the lambda ends; a call of
+a group member inside it had UNIFIED the lambda's row with the member's, so the close
+closed the member's own row before its later performs.
+
+**Choice (the same rule, one more region):** a member called directly in a LAMBDA body
+is included (labels) like one in a handle body, and a lambda whose row includes a member
+is not closed at its end: it is kept open -- excluded from `let` generalization, like a
+handle's clauses row -- and closed when its group is (step 2.45, unless relayed through a
+parameter in its scope). Clause and return-clause bodies stay as they were (`regions`
+marks them non-including): their rows close at the clause's end, and a member's later
+label would be a conflict there.
+
+Two existing expectations change with this decision (`tests/row_soundness.rs`):
+`go` without a handler is now E0420 (L reaches `main`; still "not dropped"), and `go`
+under its handler is accepted and prints 64 (was the recorded cost, E0423).
+
+Evidence: `a_function_recursing_inside_a_lambda_checks_and_runs` (64; a self-spawning
+`fib(15)` = 610 under an eager spawn handler; a handle around a recursing lambda, 100),
+red at the previous commit (E0423); natively g1 and g2 in `HANDLE_RECURSION`.
+
+Gate 911 passed, 87 suites (predicted 911). The second review (about 35 probes, every
+accepted one through the evaluator and natively; the async scheduler of
+`examples/04_async.elya` with `fork(fn() { tree(n - 1) })` among them) found no regression
+and one root cause in both halves, fixed red first
+(`a_member_that_becomes_a_relay_later_reaches_the_including_row`):
+
+- **F1 (high).** An inclusion copied the member's LABELS only. A member whose row was a
+  fresh variable at the inclusion and became a relay of a parameter later (`k(n)` after
+  the lambda) left the deferred lambda closed pure; the lambda escaped and `lg` met no
+  handler. **F1b**, the same through an escaped `resume` -- accepted at `9eb8d5f` too.
+  A member's tail that is a relay of a member's parameter is now unified into the
+  including row, exactly as a relay is taken at a call. Both programs are rejected (E0420,
+  E0423); no accepted probe changed.
+
+Final gate: 913 passed, 87 suites.

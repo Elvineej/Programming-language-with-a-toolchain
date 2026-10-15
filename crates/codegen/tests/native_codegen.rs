@@ -4934,6 +4934,22 @@ const HANDLE_RECURSION: &[(&str, &str, &str)] = &[
          pub fn main() -> Int { handle { h(fn() { get() * 100 }, 3) } with { S.get() -> resume(5)  return(r) -> r } }\n",
         "103",
     ),
+    // Recursion through a lambda (spec §5).
+    (
+        "g1-go-under-its-handler",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn go(n) { let f = fn(s) { s + (if n == 0 { 0 } else { go(n - 1) }) }  f(1) + lg(n) }\n\
+         pub fn main() -> Int { handle { go(3) } with { L.lg(x) -> resume(x * 10)  return(r) -> r } }\n",
+        "64",
+    ),
+    (
+        "g2-a-task-spawning-itself",
+        "effect Async { fn spawn(f: fn() / {Async} -> Int) -> Int  fn await(id: Int) -> Int }\n\
+         fn fib(n: Int) / {Async} -> Int { if n < 2 { n } else { let a = spawn(fn() { fib(n - 1) })  let b = spawn(fn() { fib(n - 2) })  await(a) + await(b) } }\n\
+         fn eager(f: fn() / {Async} -> Int) -> Int { handle { f() } with { Async.spawn(g) -> resume(eager(g))  Async.await(v) -> resume(v)  return(r) -> r } }\n\
+         pub fn main() -> Int { eager(fn() { fib(15) }) }\n",
+        "610",
+    ),
 ];
 
 #[test]

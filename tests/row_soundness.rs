@@ -23,6 +23,8 @@
 //! - C2, the environment rule restored: the three regression guards fail
 //!   (E0420 for the handled effect, E0423 for the two forwarding programs),
 //!   and both `go` tests change diagnosis (E0420 / accepted: `go` keeps L).
+//!   (Since recursion through a lambda, 2026-10-15, both `go` tests expect
+//!   exactly that: E0420 and accepted.)
 
 use elya::{check_source, run_source};
 
@@ -39,12 +41,6 @@ fn checks_and_prints(src: &str, want: &str) {
     assert_eq!(run_source("t.elya", src).expect("runs"), want);
 }
 
-fn closed_row_conflict(err: &str) {
-    assert!(err.contains("E0423"), "expected E0423: {err}");
-    assert!(err.contains("already closed"), "{err}");
-    assert!(err.contains('L'), "should name L: {err}");
-}
-
 /// `go`'s lambda calls `go`, so its row is `go`'s; the lambda's closing step
 /// closed it before `lg(n)` was inferred.
 const GO: &str = "effect L { fn lg(x: Int) -> Int }\n\
@@ -53,10 +49,14 @@ fn go(n) { let f = fn(s) { s + (if n == 0 { 0 } else { go(n - 1) }) }  f(1) + lg
 #[test]
 fn an_effect_after_a_lambda_that_calls_its_recursive_function_is_not_dropped() {
     // Before: `go : fn(Int) -> Int`, `check` clean, the evaluator stopped on an
-    // unhandled `lg`.
-    closed_row_conflict(&check_err(&format!(
-        "{GO}pub fn main() -> Int {{ go(3) }}\n"
-    )));
+    // unhandled `lg`. Then E0423 ("already closed"): the lambda closed `go`'s
+    // row early. Since recursion through a lambda (2026-10-15, spec
+    // `2026-10-15-elya-handle-recursion-design.md` §5) the lambda's row waits
+    // for the group, `go` gets its real row {L}, and L reaches `main`
+    // unhandled: E0420. Not dropped either way (expectation changed by that
+    // decision).
+    let err = check_err(&format!("{GO}pub fn main() -> Int {{ go(3) }}\n"));
+    assert!(err.contains("E0420") && err.contains('L'), "{err}");
 }
 
 #[test]
@@ -74,13 +74,16 @@ fn an_effect_after_an_if_that_joins_a_pure_lambda_is_not_dropped() {
 }
 
 #[test]
-fn the_recursive_program_under_a_handler_is_rejected_too() {
-    // The cost, recorded: the evaluator runs this (64), but `go`'s row was
-    // closed before `lg` reached it, and without sub-effecting there is no
-    // sound type to give it. It checked clean before only by dropping L.
-    closed_row_conflict(&check_err(&format!(
-        "{GO}pub fn main() -> Int {{ handle {{ go(3) }} with {{ L.lg(x) -> resume(x * 10)  return(r) -> r }} }}\n"
-    )));
+fn the_recursive_program_under_a_handler_is_accepted() {
+    // Was `the_recursive_program_under_a_handler_is_rejected_too`: "the cost,
+    // recorded: the evaluator runs this (64), but `go`'s row was closed before
+    // `lg` reached it". Recursion through a lambda (2026-10-15) defers the
+    // lambda's close to its group, so `go : fn(Int) / {L} -> Int` and the
+    // program checks and runs (expectation changed by that decision).
+    let src = format!(
+        "{GO}pub fn main() {{ io.println(if handle {{ go(3) }} with {{ L.lg(x) -> resume(x * 10)  return(r) -> r }} == 64 {{ \"64\" }} else {{ \"wrong\" }}) }}\n"
+    );
+    checks_and_prints(&src, "64\n");
 }
 
 // ---- regression guards: sound programs base accepted, kept accepted ----

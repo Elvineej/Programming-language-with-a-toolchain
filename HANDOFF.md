@@ -14,7 +14,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 909 passed, 87 suites. The runtime gained
+- Linux gate at the tip of `auto/elya`: 913 passed, 87 suites. The runtime gained
   `elya_cont_copy` (multi-shot); `gc_mark` is unchanged.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
@@ -204,7 +204,9 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   leaks into the function's type. Natively a chain of 1000 nested handlers runs. The
   review found two soundness holes in the first version (effect arguments; an escaped
   `resume`), fixed test-first; a function annotated with the formerly leaking effect is
-  now E0423 (the exact-row rule).
+  now E0423 (the exact-row rule). Extended the same day to recursion through a LAMBDA
+  (a lambda including a member closes with the group): `spawn(fn() { fib(n - 1) })`
+  checks, and row_soundness's `go` under its handler is accepted (64).
 
 ## The next five steps
 
@@ -263,9 +265,8 @@ one-shot trap's words differ (evaluator "continuation resumed more than once", n
 newline (`f()` then a line starting `(` is `f()(...)`) -- a layout rule is a language
 decision; the roadmap's
 other priorities (record/replay handlers, then capabilities once modules exist); the rest
-of the soundness sweep (resume's row lacks return-clause and re-entered-clause effects;
-recursion through a lambda the function handles around, PARKED); recursion through a
-handle body is rejected by inference (PARKED). A perform walks the handler chain, so a program whose handler stack really grows
+of the soundness sweep (recursion through a handle body and through a lambda: done
+2026-10-15). A perform walks the handler chain, so a program whose handler stack really grows
 (a resume inside a fresh handle every iteration) pays O(depth) per perform; the evaluator
 is no faster there. Also: the Elya CEK machine's next versions (a parser for its terms, a step
 counter as an Elya effect); PIC/PIE linking (needs a Windows run), and a named diagnosis for

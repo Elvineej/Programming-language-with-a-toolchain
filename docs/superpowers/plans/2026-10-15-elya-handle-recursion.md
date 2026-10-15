@@ -13,3 +13,7 @@ Predicted gate: 900 + 6 + 1 = **907 passed, 87 suites**.
 
 Measured: **907 passed, 87 suites**. Review: F1 and F2 fixed red first, one test (+2,
 counted twice). Final gate predicted **909 passed, 87 suites**.
+
+Extension, recursion through a lambda: one test (+2), two `row_soundness` expectations
+changed (count unchanged), two native corpus rows: predicted 911, measured 911. Its
+review: one test (+2): predicted and measured **913 passed, 87 suites**.
