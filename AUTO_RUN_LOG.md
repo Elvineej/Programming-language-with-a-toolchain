@@ -8,6 +8,18 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 - Previous run (2026-10-10 09:49) never marked DONE; over 3 hours old, so this run takes over.
   PR #22 was merged into `main` (c2a169f); `auto/elya` fast-forwarded to it. A new draft PR
   will carry this run's work.
+- LLVM 18 dev headers missing again; installed `llvm-18-dev libzstd-dev libpolly-18-dev`
+  via apt. Codegen gate runs. Baseline 886 / 85.
+- **Done: N7 part 2, type variables and parametric ADTs natively** (988348e), HANDOFF
+  step 1. Spec `docs/superpowers/specs/2026-10-15-elya-n7b-type-monomorphization-design.md`.
+  **Language/compiler decisions (mine, rule 2; please review):** whole-program
+  monomorphization (not tagged ints or dictionaries; the collector stays precise, `Int`
+  stays 64-bit); ambiguous type variables default to `Unit`; a type variable visible
+  only in a function's own effect row is refused natively by name (now HANDOFF step 5).
+  Two existing refusal tests now assert compilation (named in the commit). Gate 900 / 85
+  (predicted 899, +1 from the review). Review: 2 findings (closures in parametric types
+  miscompiled; phantom effect parameter regression), both fixed test-first.
+- Windows-gate debt added: 988348e.
 
 ## 2026-10-10 09:49 UTC — ended without a DONE mark (taken over 2026-10-15 17:53)
 
@@ -26,7 +38,7 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   exponential code size in my first design; redesigned test-first (linear). Gate 873 / 83.
 - **Done: exact replay / handler-based testing** (9524cb3), HANDOFF step 1.
   `examples/05_replay.elya`. Gate 886 / 85.
-- Next: HANDOFF step 1 (N7 part 2: type variables natively).
+- Next: HANDOFF step 1 (N7 part 2: type variables natively). (Done 2026-10-15.)
 - Noticed, recorded in HANDOFF (not fixed): the parser continues a call across a newline
   (`f()` then a line starting `(` is `f()(...)`) -- a layout rule is a language decision.
 - Windows-gate debt added: dfd83ca, 8080b9f, c684b0b, 9524cb3 (8080b9f adds runtime.c
