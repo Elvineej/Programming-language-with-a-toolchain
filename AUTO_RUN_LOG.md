@@ -35,6 +35,11 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   member's later relay), fixed test-first; it also closed a hole present at 9eb8d5f.
   Gate 913 / 87.
 - Windows-gate debt added: bce002c.
+- **Done: async step 2 part 1, structured concurrency** (511d6ed): `examples/06_structured.elya`
+  (spawn/await/scope as handlers; same bytes natively). Spec
+  `docs/superpowers/specs/2026-10-15-elya-async-step2-structured-design.md`. Part 2 (I/O
+  poll loop) is now HANDOFF step 1. Gate 916 / 87.
+- Windows-gate debt added: 511d6ed.
 
 ## 2026-10-10 09:49 UTC — ended without a DONE mark (taken over 2026-10-15 17:53)
 
