@@ -349,11 +349,23 @@ impl Cx<'_> {
                 }
             }
             Expr::Qualified { module, name } => {
+                // Not in call position (a callee is checked in the `Call` arm):
+                // a builtin can only be called, like an operation (E0206). The
+                // native-strings review (2026-10-15): `let f = int.to_string`
+                // passed `check`, then failed at run time.
                 let full = format!("{module}.{name}");
                 if !builtins().contains(&full.as_str()) {
                     self.diags.push(
                         Diagnostic::error("E0201", format!("unknown builtin `{full}`"))
                             .with_label(span, "no such function"),
+                    );
+                } else {
+                    self.diags.push(
+                        Diagnostic::error("E0208", format!("builtin `{full}` used as a value"))
+                            .with_label(span, "a builtin can only be called")
+                            .with_help(format!(
+                                "to pass it on, wrap it in a function: `fn(x) {{ {full}(x) }}`"
+                            )),
                     );
                 }
             }
@@ -369,6 +381,16 @@ impl Cx<'_> {
                 // place an operation name may appear (E0206 is for the others).
                 match &callee.node {
                     Expr::Var(name) => self.check_name(name, callee.span, scope),
+                    // A called builtin only has to exist.
+                    Expr::Qualified { module, name } => {
+                        let full = format!("{module}.{name}");
+                        if !builtins().contains(&full.as_str()) {
+                            self.diags.push(
+                                Diagnostic::error("E0201", format!("unknown builtin `{full}`"))
+                                    .with_label(callee.span, "no such function"),
+                            );
+                        }
+                    }
                     other => self.check_expr(other, callee.span, scope),
                 }
                 for a in args.iter() {

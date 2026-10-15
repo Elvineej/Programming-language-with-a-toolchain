@@ -47,8 +47,7 @@ use elya::types::{Ty, TyCon};
 use crate::cps::{self, contains_effect, is_tail_slot, needs_cps, ContSite, HandlerSite, Saved};
 use crate::{
     bind_local, eq_operand_label, fn_type_of, gc_root_env, gc_unroot, internal, lower_expr, mangle,
-    op_label, prim_values, repr_ty, value_to_word, word_to_value, CodegenError, LowerCtx,
-    MAX_PARAMS, TAILCC,
+    prim_values, repr_ty, value_to_word, word_to_value, CodegenError, LowerCtx, MAX_PARAMS, TAILCC,
 };
 use crate::{unbind_local, Shadowed};
 
@@ -1244,6 +1243,7 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
 
     fn prim(
         &self,
+        st: &St<'ctx>,
         op: BinOp,
         args: &[CoreExpr],
         vals: &[BasicValueEnum<'ctx>],
@@ -1252,13 +1252,30 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
         if vals.len() != 2 {
             return Err(CodegenError::Unsupported("binary Prim arity"));
         }
+        // Strings (2026-10-15): the operands are already rooted (`operand`);
+        // `<>` allocates, so what this function still needs is rooted across
+        // it, as `ctor` does (spec D4).
+        if crate::is_string_prim(op, args) {
+            let roots = if op == BinOp::Concat {
+                self.root_live(st, vals)?
+            } else {
+                0
+            };
+            let v = crate::string_prim(
+                self.ctx,
+                self.b,
+                self.lc,
+                op,
+                vals[0].into_pointer_value(),
+                vals[1].into_pointer_value(),
+            )?;
+            gc_unroot(self.b, self.lc, roots)?;
+            return Ok(v);
+        }
         if matches!(op, BinOp::Eq | BinOp::Ne)
             && !matches!(args[0].ty, Ty::Base(TyCon::Int) | Ty::Base(TyCon::Bool))
         {
             return Err(CodegenError::Unsupported(eq_operand_label(op)));
-        }
-        if matches!(op, BinOp::Concat) {
-            return Err(CodegenError::Unsupported(op_label(op)));
         }
         prim_values(
             self.ctx,
@@ -1269,6 +1286,26 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             vals[0].into_int_value(),
             vals[1].into_int_value(),
         )
+    }
+
+    /// A builtin call on lowered operands: `io.println`, or `int.to_string`
+    /// (which allocates, so what this function needs is rooted across it).
+    fn builtin(
+        &self,
+        st: &St<'ctx>,
+        name: &str,
+        vals: &[BasicValueEnum<'ctx>],
+    ) -> R<BasicValueEnum<'ctx>> {
+        match name {
+            "io.println" => self.println(vals),
+            "int.to_string" if vals.len() == 1 => {
+                let roots = self.root_live(st, &[])?;
+                let v = crate::int_to_string(self.ctx, self.b, self.lc, vals[0])?;
+                gc_unroot(self.b, self.lc, roots)?;
+                Ok(v)
+            }
+            _ => Err(CodegenError::UnsupportedBuiltin(name.to_string())),
+        }
     }
 
     fn println(&self, vals: &[BasicValueEnum<'ctx>]) -> R<BasicValueEnum<'ctx>> {
@@ -1379,18 +1416,18 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                 let Some(vals) = self.operands(st, args)? else {
                     return Ok(None);
                 };
-                let v = self.prim(*op, args, &vals)?;
+                let v = self.prim(st, *op, args, &vals)?;
                 self.settle(st, before)?;
                 Ok(Some(v))
             }
             CoreKind::Builtin(name, args) => {
-                if name != "io.println" {
+                if name != "io.println" && name != "int.to_string" {
                     return Err(CodegenError::UnsupportedBuiltin(name.clone()));
                 }
                 let Some(vals) = self.operands(st, args)? else {
                     return Ok(None);
                 };
-                let v = self.println(&vals)?;
+                let v = self.builtin(st, name, &vals)?;
                 self.settle(st, before)?;
                 Ok(Some(v))
             }
@@ -2559,16 +2596,16 @@ fn emit_resume_fn<'ctx>(
                 let Some(vals) = resume_operands(&cx, &mut st, args, step.slot, cur)? else {
                     return Ok(());
                 };
-                cur = cx.prim(*op, args, &vals)?;
+                cur = cx.prim(&st, *op, args, &vals)?;
             }
             CoreKind::Builtin(name, args) => {
-                if name != "io.println" {
+                if name != "io.println" && name != "int.to_string" {
                     return Err(CodegenError::UnsupportedBuiltin(name.clone()));
                 }
                 let Some(vals) = resume_operands(&cx, &mut st, args, step.slot, cur)? else {
                     return Ok(());
                 };
-                cur = cx.println(&vals)?;
+                cur = cx.builtin(&st, name, &vals)?;
             }
             CoreKind::Ctor(name, fields) => {
                 let Some(vals) = resume_operands(&cx, &mut st, fields, step.slot, cur)? else {

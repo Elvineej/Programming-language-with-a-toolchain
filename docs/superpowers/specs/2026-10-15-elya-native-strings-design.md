@@ -1,6 +1,6 @@
 # Native strings: `<>`, `==` and `int.to_string`
 
-**Status:** in progress (2026-10-15). HANDOFF step 2, taken before step 1 on purpose: the
+**Status:** done (2026-10-15), after an independent review (§3). HANDOFF step 2, taken before step 1 on purpose: the
 poll-loop example of step 1 has to print times and task ids, and nothing can turn an
 `Int` into text today. The design choices are Claude's under the maintainer's
 delegation (rule 2), recorded here.
@@ -42,8 +42,15 @@ prints a number, because nothing else could be built.
     depth, as `elya_cont_copy` does).
 - **D5. Portable runtime code only**: `memcpy`, `memcmp`, `snprintf("%lld")`. There are no
   platform calls, so the Windows gate needs nothing new.
+- **D6. A builtin used as a value is E0208** ("builtin `int.to_string` used as a value",
+  with help on how to wrap it in a function). It used to pass `check`, then fail at run
+  time ("must be called") or in the native build. That was already true of
+  `io.println`. Refusing it matches how an operation used as a value is handled
+  (E0206).
+  - *Rejected:* making a builtin a first-class value by eta-expansion. It would
+    work, but nothing needs it, and a lambda says the same thing explicitly.
 
-## 2. Evidence (planned)
+## 2. Evidence (planned; as measured in §3)
 
 - `tests/strings.rs`: the front end and the evaluator for `int.to_string`. This covers
   its type, its purity, a misspelt builtin, and decimal output at `0`, a negative and
@@ -59,3 +66,42 @@ prints a number, because nothing else could be built.
   `rejects_concat_by_name` and `rejects_eq_on_strings_by_name`. The third,
   `rejects_eq_on_an_unrepresentable_operand_type`, keeps guarding `==`'s allow-list with
   an ADT operand instead of a `String`.
+
+## 3. As measured, and the review
+
+- **Sweep.** On the ~700-program sweep, exactly the 17 programs refused before (16 for
+  "Concat", 1 for string `==`) now compile, and all 17 match the evaluator byte for
+  byte. No other native result changed.
+- **Controls.**
+  - C2 (lengths-only `==`) and C3 (no minus sign) failed exactly the rows predicted.
+  - **C1** (the left operand not rooted while the right is lowered) failed nothing at
+    first. A collection frees about 30,000 blocks, and the per-size free lists hand
+    back the OLDEST dead block first, so a freed operand was almost never reused
+    before it was read.
+    - A program built to make the reuse certain became
+      `a_left_operand_survives_a_collection_in_the_right_one`. Its left operand is a
+      9-word literal, the only block of its size class, and its right operand churns
+      and then allocates a same-size string. C1 fails it: 0 instead of 1, and the
+      collector reports `live=0`.
+- **Independent review: no correctness bug.** The reviewer re-ran the gate (930 / 89)
+  and the sweep (the same 17). It also ran a torture runtime that collects on every
+  allocation, poisons freed blocks and checks shadow-stack balance at exit; all 402
+  programs that run under it are balanced and match the evaluator. Its findings, all
+  fixed test-first:
+  - **CPS roots (medium).** Controls C4 and C5 (no `root_live` around a CPS `<>` /
+    `int.to_string`) failed nothing in my probes, and I had called them defence in
+    depth. That was wrong. In a resumption function the resumed frame is dead, so the
+    continuation and the frame's saved bindings are reachable only through what
+    `root_live` pushes.
+    - Two deterministic tests now pin them:
+      `cps_live_values_survive_a_concat_in_a_resumption` (C4: 7021 for 20 000) and
+      `cps_live_values_survive_int_to_string_in_a_resumption` (C5: 5242).
+  - **A builtin used as a value passed `check` (low, existed before this change).**
+    Now E0208 (D6).
+  - **String-literal patterns compile natively.** `patterns.rs` turns a literal test
+    into `==`. This was a side effect; it is now pinned by three corpus rows (flat,
+    nested, and on a perform's answer). A non-exhaustive `String` match is still
+    E0430.
+  - **Docs:** the README's "strings have no operations" sentence; the `gc_root` doc
+    comment, which my helpers had separated from its function; and the plan's test
+    counts.

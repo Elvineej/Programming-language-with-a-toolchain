@@ -5062,3 +5062,308 @@ fn a_multi_shot_copy_of_100000_handler_frames() {
     diagnose_crash(&out.status, "deep-multi");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "100001100002");
 }
+
+// ---- 2026-10-15: native strings (`<>`, `==`, `int.to_string`) ----------------
+
+/// Spec `2026-10-15-elya-native-strings-design.md`. Every row was refused before:
+/// "Concat", "Eq on an unrepresentable operand type", or the unknown builtin.
+/// `(tag, source, text, value)`; both halves are also the evaluator's.
+///
+/// Negative controls, each reverted (`cmp` against a saved copy):
+/// - C2, `==` on strings compares lengths only: `eq-same-length` fails (1 for 10);
+/// - C3, `int.to_string` drops the sign: `int-to-string` fails.
+///
+/// C1 is recorded on `a_left_operand_survives_a_collection_in_the_right_one`.
+const STRINGS: &[(&str, &str, &str, &str)] = &[
+    (
+        "concat-literals",
+        "pub fn main() -> Int {\n  io.println(\"ab\" <> \"cd\")\n  0\n}\n",
+        "abcd\n",
+        "0",
+    ),
+    (
+        "concat-computed-and-compared",
+        "fn greet(n) { \"hi \" <> n }\n\
+         pub fn main() -> Int {\n\
+         \x20 let s = greet(\"ada\")\n\
+         \x20 io.println(s <> \"!\")\n\
+         \x20 if s == \"hi ada\" { 1 } else { 0 }\n\
+         }\n",
+        "hi ada!\n",
+        "1",
+    ),
+    (
+        "eq-same-length",
+        "pub fn main() -> Int { (if \"abc\" == \"abd\" { 1 } else { 0 }) + (if \"abc\" != \"abd\" { 10 } else { 0 }) }\n",
+        "",
+        "10",
+    ),
+    (
+        "eq-different-length",
+        "pub fn main() -> Int { (if \"ab\" == \"abc\" { 1 } else { 0 }) + (if \"\" == \"\" { 10 } else { 0 }) }\n",
+        "",
+        "10",
+    ),
+    (
+        "int-to-string",
+        "pub fn main() -> Int {\n\
+         \x20 io.println(int.to_string(0))\n\
+         \x20 io.println(int.to_string(0 - 42))\n\
+         \x20 io.println(\"n=\" <> int.to_string(12345))\n\
+         \x20 io.println(int.to_string(0 - 9223372036854775807 - 1))\n\
+         \x20 0\n\
+         }\n",
+        "0\n-42\nn=12345\n-9223372036854775808\n",
+        "0",
+    ),
+    (
+        "empty-strings",
+        "pub fn main() -> Int {\n\
+         \x20 io.println(\"\" <> \"x\" <> \"\")\n\
+         \x20 if \"\" <> \"\" == \"\" { 1 } else { 0 }\n\
+         }\n",
+        "x\n",
+        "1",
+    ),
+    (
+        // A generic fold over a list of strings (N7 part 2 meets strings).
+        "join-a-list-of-strings",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn join(l, sep) { match l { Nil -> \"\"  Cons(h, Nil) -> h  Cons(h, t) -> h <> sep <> join(t, sep) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 io.println(join(Cons(\"a\", Cons(\"b\", Cons(\"c\", Nil))), \", \"))\n\
+         \x20 0\n\
+         }\n",
+        "a, b, c\n",
+        "0",
+    ),
+    (
+        // Inside effectful code: the operand is a perform's answer.
+        "to-string-of-an-effects-answer",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn show(n) { io.println(\"v=\" <> int.to_string(lg(n))) }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { show(3)  show(4)  0 } with { L.lg(x) -> resume(x * 10)  return(r) -> r }\n\
+         }\n",
+        "v=30\nv=40\n",
+        "0",
+    ),
+    (
+        // The RIGHT operand performs: the left one waits across the site.
+        "concat-whose-right-operand-performs",
+        "effect N { fn name() -> String }\n\
+         fn hello() { \"hello, \" <> name() }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { io.println(hello())  0 } with { N.name() -> resume(\"ada\")  return(r) -> r }\n\
+         }\n",
+        "hello, ada\n",
+        "0",
+    ),
+    // String-literal patterns compile natively since `==` on strings does
+    // (`patterns.rs` turns a literal test into `==`; found by the review).
+    (
+        "string-literal-patterns",
+        "fn cls(s) { match s { \"a\" -> 1  \"bb\" -> 2  _ -> 3 } }\n\
+         pub fn main() -> Int { cls(\"a\") + 10 * cls(\"bb\") + 100 * cls(\"a\" <> \"b\") + 1000 * cls(\"\") }\n",
+        "",
+        "3321",
+    ),
+    (
+        "a-nested-string-literal-pattern",
+        "type Pair(a, b) { Pair(a, b) }\n\
+         fn cls(p) { match p { Pair(\"x\", n) -> n  Pair(_, n) -> n * 2 } }\n\
+         pub fn main() -> Int { cls(Pair(\"x\", 1)) + cls(Pair(\"y\" <> \"\", 10)) }\n",
+        "",
+        "21",
+    ),
+    (
+        "a-string-pattern-on-a-performs-answer",
+        "effect N { fn name() -> String }\n\
+         fn cls() { match name() { \"a\" -> 1  \"bb\" -> 2  _ -> 3 } }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { cls() * 100 + cls() * 10 + cls() } with { N.name() -> resume(\"bb\")  return(r) -> r }\n\
+         }\n",
+        "",
+        "222",
+    ),
+];
+
+#[test]
+fn native_strings_match_the_evaluator() {
+    let dir = temp_dir("strings");
+    let mut failures = Vec::new();
+    for (tag, src, text, value) in STRINGS {
+        let exe = match try_compile_and_link(&lower_src(src), &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        if !out.status.success() {
+            failures.push(format!(
+                "{tag}: {:?} {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+            continue;
+        }
+        let got = split_text_and_value(&String::from_utf8_lossy(&out.stdout), tag);
+        let want = ((*text).to_string(), (*value).to_string());
+        let eval = (eval_main_text(src), eval_main_int(src));
+        if got != want || got != eval {
+            failures.push(format!(
+                "{tag}: native={got:?} want={want:?} evaluator={eval:?}"
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Strings are heap values the collector must keep while they are live. 20 000
+/// labels `"<i>-<2i>"` are built and kept in a list while collections run; each
+/// is then compared with a freshly built copy. The right operand of the outer
+/// `<>` is itself a `<>` that allocates while the left operand waits. (C1 does
+/// not show here: a collection frees ~30 000 blocks and the free lists hand
+/// back the OLDEST dead block first, so the left operand's block is almost
+/// never reused before it is read -- the next test is built so that it is.)
+#[test]
+fn strings_survive_collection() {
+    let src = format!(
+        "{LIST}fn label(i) {{ int.to_string(i) <> (\"-\" <> int.to_string(i * 2)) }}\n\
+         fn build(i, acc) {{ if i == 0 {{ acc }} else {{ build(i - 1, Cons(Pair(i, label(i)), acc)) }} }}\n\
+         type Pair(a, b) {{ Pair(a, b) }}\n\
+         fn check(l, n) {{ match l {{ Nil -> n  Cons(Pair(i, s), t) -> check(t, if s == label(i) {{ n + 1 }} else {{ n }}) }} }}\n\
+         pub fn main() -> Int {{ check(build(20000, Nil), 0) }}\n"
+    );
+    let dir = temp_dir("strings-gc");
+    let exe = compile_and_link(&lower_src(&src), &dir, "strings-gc");
+    let (stdout, stats) = run_with_gc_stats(&exe, "strings-gc");
+    assert_eq!(stdout, "20000", "every label survived and compares equal");
+    assert!(
+        stats.collections > 0,
+        "the collector ran: {}",
+        stats.collections
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The left operand of `<>` waits while the right one runs, and here the right
+/// one collects. The left is a 54-byte literal (9 words), the only block of its
+/// size class; `right()` churns 70 000 cells (collections) and then allocates
+/// another 9-word string. A collection that does not see the left operand frees
+/// it, and the free list hands exactly that block to `right()`'s literal: the
+/// two operands alias and the comparison fails.
+///
+/// Negative control C1 (reverted, `cmp` clean): the left operand not rooted while
+/// the right one is lowered -- this program answers 0 (the evaluator: 1), and
+/// the collector reports `live=0` where it reports the rooted 9 words.
+#[test]
+fn a_left_operand_survives_a_collection_in_the_right_one() {
+    let a = "A".repeat(54);
+    let b = "B".repeat(54);
+    let src = format!(
+        "{LIST}fn churn(n) {{ if n == 0 {{ 0 }} else {{ let c = Cons(n, Nil)  churn(n - 1) }} }}\n\
+         fn right() {{ let _ = churn(70000)  \"{b}\" }}\n\
+         pub fn main() -> Int {{\n\
+         \x20 let s = \"{a}\" <> right()\n\
+         \x20 if s == \"{a}{b}\" {{ 1 }} else {{ 0 }}\n\
+         }}\n"
+    );
+    assert_eq!(eval_main_int(&src), "1");
+    let dir = temp_dir("strings-left-operand");
+    let exe = compile_and_link(&lower_src(&src), &dir, "strings-left-operand");
+    let (stdout, stats) = run_with_gc_stats(&exe, "strings-left-operand");
+    assert_eq!(stdout, "1");
+    assert!(
+        stats.collections > 0,
+        "the collector ran: {}",
+        stats.collections
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The CPS emitter's half of the same obligation: in effectful code the left
+/// operand of `<>` waits across a continuation site (the right one performs),
+/// thousands of times, while collections run. The CPS emitter's own roots
+/// around `<>` and `int.to_string` (C4, C5) are pinned by the next two tests.
+#[test]
+fn a_string_operand_survives_an_effect_site() {
+    let src = "effect N { fn next(i: Int) -> String }\n\
+               fn go(i, acc) { if i == 0 { acc } else { go(i - 1, if (int.to_string(i) <> next(i)) == (int.to_string(i) <> \"x\") { acc + 1 } else { acc }) } }\n\
+               pub fn main() -> Int { handle { go(5000, 0) } with { N.next(i) -> resume(\"x\")  return(r) -> r } }\n";
+    assert_eq!(eval_main_int(src), "5000");
+    let dir = temp_dir("strings-cps-gc");
+    let exe = compile_and_link(&lower_src(src), &dir, "strings-cps-gc");
+    let (stdout, stats) = run_with_gc_stats(&exe, "strings-cps-gc");
+    assert_eq!(stdout, "5000");
+    assert!(
+        stats.collections > 0,
+        "the collector ran: {}",
+        stats.collections
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// In a resumption function the frame being resumed is DEAD: the continuation
+/// and the frame's saved bindings are reachable only through what `root_live`
+/// pushes around an allocation. Here `<>` (the answer of `name()` and `"y"`) is
+/// computed in the resumption, and `s`, a 54-byte string (a size class nothing
+/// else uses) bound since the start, must survive every collection it triggers;
+/// `u` allocates a same-size string each iteration, so a freed `s` is reused at
+/// once and the comparison changes. Found by the review of native strings: the
+/// author's own control C4 had failed nothing.
+///
+/// Negative control C4 (reverted, `cmp` clean): no `root_live` around a CPS
+/// `<>` -- 7021 instead of 20000 (deterministic).
+#[test]
+fn cps_live_values_survive_a_concat_in_a_resumption() {
+    let a = "A".repeat(54);
+    let b = "B".repeat(54);
+    let src = format!(
+        "effect N {{ fn name() -> String }}\n\
+         fn go(i, s, acc) {{ if i == 0 {{ acc }} else {{ let t = name() <> \"y\"  let u = \"{b}\"  go(i - 1, s, if s == u {{ acc }} else {{ acc + 1 }}) }} }}\n\
+         pub fn main() -> Int {{ handle {{ go(20000, \"{a}\", 0) }} with {{ N.name() -> resume(\"q\") }} }}\n"
+    );
+    assert_eq!(eval_main_int(&src), "20000");
+    let dir = temp_dir("strings-cps-concat-roots");
+    let exe = compile_and_link(&lower_src(&src), &dir, "strings-cps-concat-roots");
+    let (stdout, stats) = run_with_gc_stats(&exe, "strings-cps-concat-roots");
+    assert_eq!(stdout, "20000");
+    assert!(
+        stats.collections > 0,
+        "the collector ran: {}",
+        stats.collections
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same obligation for `int.to_string` of a perform's answer, computed in
+/// the resumption.
+///
+/// Negative control C5 (reverted, `cmp` clean): no `root_live` around a CPS
+/// `int.to_string` -- the count is wrong (5242 for 50 000 in the review).
+#[test]
+fn cps_live_values_survive_int_to_string_in_a_resumption() {
+    let a = "A".repeat(54);
+    let b = "B".repeat(54);
+    let src = format!(
+        "effect K {{ fn tick(n: Int) -> Int }}\n\
+         fn go(i, s, acc) {{ if i == 0 {{ acc }} else {{ let t = int.to_string(tick(i))  let u = \"{b}\"  let w = \"\"  go(i - 1, s, if s == u {{ acc }} else {{ acc + 1 }}) }} }}\n\
+         pub fn main() -> Int {{ handle {{ go(20000, \"{a}\", 0) }} with {{ K.tick(x) -> resume(x) }} }}\n"
+    );
+    assert_eq!(eval_main_int(&src), "20000");
+    let dir = temp_dir("strings-cps-itos-roots");
+    let exe = compile_and_link(&lower_src(&src), &dir, "strings-cps-itos-roots");
+    let (stdout, stats) = run_with_gc_stats(&exe, "strings-cps-itos-roots");
+    assert_eq!(stdout, "20000");
+    assert!(
+        stats.collections > 0,
+        "the collector ran: {}",
+        stats.collections
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -412,6 +412,89 @@ fn emit_body<'ctx>(
     lower_tail(ctx, func, b, lc, &f.body, &mut env)
 }
 
+/// `<>`, `==` or `!=` on two lowered `String` operands (both emitters). The
+/// caller roots what must survive: `<>` allocates (spec
+/// 2026-10-15-elya-native-strings D4), `==` does not.
+pub(crate) fn string_prim<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    op: BinOp,
+    l: inkwell::values::PointerValue<'ctx>,
+    r: inkwell::values::PointerValue<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    match op {
+        BinOp::Concat => Ok(b
+            .build_call(
+                lc.str_concat,
+                &[
+                    i64t.const_int(lc.string_tag as u64, false).into(),
+                    l.into(),
+                    r.into(),
+                ],
+                "cat",
+            )
+            .map_err(internal)?
+            .try_as_basic_value()
+            .left()
+            .ok_or(CodegenError::Unsupported(
+                "elya_str_concat returned no value",
+            ))?),
+        BinOp::Eq | BinOp::Ne => {
+            let w = b
+                .build_call(lc.str_eq, &[l.into(), r.into()], "streq")
+                .map_err(internal)?
+                .try_as_basic_value()
+                .left()
+                .ok_or(CodegenError::Unsupported("elya_str_eq returned no value"))?
+                .into_int_value();
+            let pred = if op == BinOp::Eq {
+                IntPredicate::NE
+            } else {
+                IntPredicate::EQ
+            };
+            Ok(b.build_int_compare(pred, w, i64t.const_zero(), "streqb")
+                .map_err(internal)?
+                .into())
+        }
+        _ => Err(CodegenError::Unsupported(op_label(op))),
+    }
+}
+
+/// `int.to_string(n)`: a fresh string. Allocates: the caller roots.
+pub(crate) fn int_to_string<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    n: BasicValueEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    b.build_call(
+        lc.int_to_string,
+        &[
+            i64t.const_int(lc.string_tag as u64, false).into(),
+            n.into_int_value().into(),
+        ],
+        "itos",
+    )
+    .map_err(internal)?
+    .try_as_basic_value()
+    .left()
+    .ok_or(CodegenError::Unsupported(
+        "elya_int_to_string returned no value",
+    ))
+}
+
+/// Is this `Prim` a string operation (`<>`, or `==`/`!=` on `String`s)?
+pub(crate) fn is_string_prim(op: BinOp, args: &[CoreExpr]) -> bool {
+    match op {
+        BinOp::Concat => true,
+        BinOp::Eq | BinOp::Ne => matches!(args[0].ty, Ty::Base(TyCon::Str)),
+        _ => false,
+    }
+}
+
 /// One place where an Elya call becomes an LLVM call, used from both `lower_expr`
 /// (ordinary position) and, in Task 4, `lower_tail` (tail position). The only
 /// difference between the two is the tail-call kind the caller sets afterwards.
@@ -1198,6 +1281,13 @@ fn lower_expr<'ctx>(
             gc_unroot(b, lc, env_roots)?;
             Ok(p.into())
         }
+        CoreKind::Builtin(builtin, args) if builtin == "int.to_string" && args.len() == 1 => {
+            let n = lower_expr(ctx, func, b, lc, &args[0], env)?;
+            let roots = gc_root_env(b, lc, env)?;
+            let v = int_to_string(ctx, b, lc, n)?;
+            gc_unroot(b, lc, roots)?;
+            Ok(v)
+        }
         CoreKind::Builtin(builtin, args) => {
             // Refuse by the actual owned Core name before touching any argument.
             if builtin != "io.println" {
@@ -1239,16 +1329,34 @@ fn lower_expr<'ctx>(
             // names the operator rather than reporting the operand's type as
             // unrepresentable. Every other operator in the subset is monomorphic
             // by the time it reaches here.
+            // Strings (2026-10-15): pointer operands, a runtime call. The left
+            // operand is rooted while the right one is lowered (it may
+            // allocate), and `<>` roots the environment across its own
+            // allocation, as `Ctor` does (spec D4).
+            if is_string_prim(*op, args) {
+                let l = lower_expr(ctx, func, b, lc, &args[0], env)?;
+                let held = gc_root(b, lc, l)?;
+                let r = lower_expr(ctx, func, b, lc, &args[1], env)?;
+                let roots = if *op == BinOp::Concat {
+                    gc_root_env(b, lc, env)?
+                } else {
+                    0
+                };
+                let v = string_prim(
+                    ctx,
+                    b,
+                    lc,
+                    *op,
+                    l.into_pointer_value(),
+                    r.into_pointer_value(),
+                )?;
+                gc_unroot(b, lc, roots + usize::from(held))?;
+                return Ok(v);
+            }
             if matches!(op, BinOp::Eq | BinOp::Ne)
                 && !matches!(args[0].ty, Ty::Base(TyCon::Int) | Ty::Base(TyCon::Bool))
             {
                 return Err(CodegenError::Unsupported(eq_operand_label(*op)));
-            }
-            // N6 §8.2: `<>` is String × String → String; its operands are pointers, so
-            // `.into_int_value()` at the lines below would PANIC (inkwell, not a Result).
-            // Refused by name, reusing op_label's existing "Concat" message.
-            if matches!(op, BinOp::Concat) {
-                return Err(CodegenError::Unsupported(op_label(*op)));
             }
             let l = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
             let r = lower_expr(ctx, func, b, lc, &args[1], env)?.into_int_value();
@@ -1631,6 +1739,10 @@ struct LowerCtx<'a, 'ctx> {
     pub(crate) lambda_regions: &'a HashMap<usize, cps::LambdaRegion>,
     alloc: FunctionValue<'ctx>,
     str_lit: FunctionValue<'ctx>,
+    /// Native strings (2026-10-15): `<>`, `==` on strings, `int.to_string`.
+    str_concat: FunctionValue<'ctx>,
+    str_eq: FunctionValue<'ctx>,
+    int_to_string: FunctionValue<'ctx>,
     println: FunctionValue<'ctx>,
     string_tag: usize,
     fail: FunctionValue<'ctx>,
@@ -1793,6 +1905,12 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let alloc = module.add_function("elya_alloc", alloc_ty, None); // ccc
     let str_lit_ty = ptrt.fn_type(&[i64t.into(), ptrt.into(), i64t.into()], false);
     let str_lit = module.add_function("elya_str_lit", str_lit_ty, None); // ccc
+    let str_concat_ty = ptrt.fn_type(&[i64t.into(), ptrt.into(), ptrt.into()], false);
+    let str_concat = module.add_function("elya_str_concat", str_concat_ty, None); // ccc
+    let str_eq_ty = i64t.fn_type(&[ptrt.into(), ptrt.into()], false);
+    let str_eq = module.add_function("elya_str_eq", str_eq_ty, None); // ccc
+    let int_to_string_ty = ptrt.fn_type(&[i64t.into(), i64t.into()], false);
+    let int_to_string = module.add_function("elya_int_to_string", int_to_string_ty, None); // ccc
     let println_ty = ctx.void_type().fn_type(&[ptrt.into()], false);
     let println = module.add_function("elya_println", println_ty, None); // ccc
     let fail_ty = ctx.void_type().fn_type(&[], false);
@@ -1841,6 +1959,9 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         lambda_regions: &lambda_regions,
         alloc,
         str_lit,
+        str_concat,
+        str_eq,
+        int_to_string,
         println,
         string_tag,
         fail,
@@ -2215,22 +2336,17 @@ mod tests {
     #[test]
     fn rejects_eq_on_an_unrepresentable_operand_type() {
         // Eq/Ne are the only fully polymorphic operators in the subset: the
-        // checker is happy with `Str == Str` and there is no representation for
-        // it. Dispatched on the OPERAND type before the operands are lowered, so
-        // the message names the operator (§3.3) rather than the operand. Wrapped
-        // in an `if` because a Bool-bodied main is refused earlier, by
-        // `require_int`, with a different message.
-        let s = CoreExpr {
-            span: Span::EMPTY,
-            ty: Ty::Base(TyCon::Str),
-            kind: CoreKind::Lit(CoreLit::Str("a".into())),
-        };
-        let bad = CoreExpr {
-            span: Span::EMPTY,
-            ty: Ty::Base(TyCon::Bool),
-            kind: CoreKind::Prim(BinOp::Eq, vec![s.clone(), s].into()),
-        };
-        let err = emit_ir(&main_fn(if_expr(bad, int_lit(1), int_lit(0)))).unwrap_err();
+        // checker is happy with `T == T` for an ADT and there is no native
+        // equality for it. Dispatched on the OPERAND type before the operands
+        // are lowered, so the message names the operator (§3.3) rather than the
+        // operand. Wrapped in an `if` because a Bool-bodied main is refused
+        // earlier, by `require_int`, with a different message. (Until
+        // 2026-10-15 the operand here was a `String`; strings compare natively
+        // since, so an ADT keeps the allow-list guarded.)
+        let err = emit_ir(&core_of(
+            "type T { A, B }\npub fn main() -> Int { if A == B { 1 } else { 0 } }\n",
+        ))
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2751,25 +2867,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_concat_by_name() {
-        // N6 §8.2. `repr_ty` no longer refuses `Str`, so `<>` now reaches the
-        // `Prim` arm, where its pointer operands would panic `.into_int_value()`
-        // without the by-name guard.
-        //
-        // The concatenation is BOUND in a `let` whose body is `1` on purpose. As
-        // `main`'s own body it would type `main` as `String` and `require_int`
-        // would refuse with "non-Int value" before the `Prim` arm was ever
-        // reached — the test would be pinning the return-type guard while
-        // claiming, by name, to pin the Concat guard. If this assertion ever
-        // reports "non-Int value", the test has stopped testing anything.
-        let err = emit_ir(&core_of(
+    fn concat_verifies() {
+        // Was `rejects_concat_by_name` (N6 §8.2) until native strings
+        // (2026-10-15): `<>` is a runtime call now, its operands pointers, so the
+        // `Prim` arm must not reach `.into_int_value()` for it. BOUND in a `let`
+        // whose body is `1`, so `require_int` cannot mask the arm.
+        emit_ir(&core_of(
             "pub fn main() {\n  let s = \"a\" <> \"b\"\n  1\n}\n",
         ))
-        .unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("Concat")),
-            "{err:?}"
-        );
+        .expect("`<>` verifies");
     }
 
     #[test]
@@ -2834,23 +2940,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_eq_on_strings_by_name() {
-        // `==` is polymorphic (src/types.rs:920-922 unifies the operands and pins
-        // neither), so the refusal is dispatched on the OPERAND type. This one
-        // already fires today; it is pinned here because the widening makes a
-        // `Str` operand representable, and the guard's allow-list — Int and Bool,
-        // named explicitly — is the only thing still keeping it out.
-        let err = emit_ir(&core_of(
+    fn eq_on_strings_verifies() {
+        // Was `rejects_eq_on_strings_by_name` until native strings (2026-10-15):
+        // the allow-list is Int, Bool and String now (byte equality, a runtime
+        // call); every other operand type is still refused by name
+        // (`rejects_eq_on_an_unrepresentable_operand_type`).
+        emit_ir(&core_of(
             "pub fn main() { if \"a\" == \"a\" { 1 } else { 0 } }",
         ))
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("Eq on an unrepresentable operand type")
-            ),
-            "{err:?}"
-        );
+        .expect("String `==` verifies");
     }
 
     #[test]

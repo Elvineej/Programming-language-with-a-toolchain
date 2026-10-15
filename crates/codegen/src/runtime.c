@@ -268,6 +268,43 @@ void *elya_str_lit(int64_t tag, const char *bytes, int64_t len) {
     return p;
 }
 
+/* Native strings (spec 2026-10-15-elya-native-strings, D2/D4). `a <> b` is a
+ * fresh immutable string. Both operands are rooted while it allocates: callers
+ * root them too (an operand is a temporary the emitter pushed), so this is
+ * defence in depth, as in elya_cont_copy. */
+void *elya_str_concat(int64_t tag, void *a, void *b) {
+    int64_t la = ((int64_t *)a)[1];
+    int64_t lb = ((int64_t *)b)[1];
+    elya_gc_push(a);
+    elya_gc_push(b);
+    int64_t *p = (int64_t *)elya_alloc(2 + ((la + lb + 1) + 7) / 8);
+    elya_gc_pop();
+    elya_gc_pop();
+    p[0] = tag;
+    p[1] = la + lb;
+    memcpy(&p[2], &((int64_t *)a)[2], (size_t)la);
+    memcpy((char *)&p[2] + la, &((int64_t *)b)[2], (size_t)lb);
+    return p;
+}
+
+/* `==` on strings (D3): byte equality, as the evaluator's. Allocates nothing. */
+int64_t elya_str_eq(void *a, void *b) {
+    int64_t la = ((int64_t *)a)[1];
+    int64_t lb = ((int64_t *)b)[1];
+    if (la != lb) {
+        return 0;
+    }
+    return memcmp(&((int64_t *)a)[2], &((int64_t *)b)[2], (size_t)la) == 0;
+}
+
+/* `int.to_string` (D1): decimal, a leading '-' for a negative, INT64_MIN
+ * included (20 characters at most). */
+void *elya_int_to_string(int64_t tag, int64_t n) {
+    char buf[32];
+    int len = snprintf(buf, sizeof buf, "%lld", (long long)n);
+    return elya_str_lit(tag, buf, (int64_t)len);
+}
+
 /* The deterministic failed-match trap. Spec 5b-4 §5: never `unreachable`. */
 void elya_match_fail(void) {
     fputs("elya: match failed (no arm matched)\n", stderr);

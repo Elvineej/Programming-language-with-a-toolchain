@@ -48,3 +48,28 @@ fn a_misspelt_builtin_is_still_unknown() {
     let err = check_source("t.elya", src).expect_err("no such builtin");
     assert!(format!("{err:?}").contains("E0201"), "{err:?}");
 }
+
+#[test]
+fn a_builtin_used_as_a_value_is_refused() {
+    // The review of native strings (2026-10-15): `let f = int.to_string` passed
+    // `check` -- a bare qualified name was typed `Ty::Error`, silently -- and
+    // then failed at run time ("must be called") or in the native build. As for
+    // an operation (E0206), a builtin can only be called; to pass it on, wrap it.
+    for src in [
+        "pub fn main() { let f = int.to_string  io.println(f(1)) }\n",
+        "fn apply(g, x) { g(x) }\npub fn main() { apply(io.println, \"x\") }\n",
+    ] {
+        let err = check_source("t.elya", src).expect_err("a builtin used as a value");
+        let text = format!("{err:?}");
+        assert!(text.contains("E0208"), "{text}");
+        assert!(text.contains("wrap it in a function"), "{text}");
+    }
+    // Wrapped, it is an ordinary function value.
+    let ok = "fn apply(g, x) { g(x) }\npub fn main() { io.println(apply(fn(n) { int.to_string(n) }, 5)) }\n";
+    assert!(
+        check_source("t.elya", ok).is_ok(),
+        "{:?}",
+        check_source("t.elya", ok)
+    );
+    assert_eq!(run_source("t.elya", ok).expect("runs"), "5\n");
+}
