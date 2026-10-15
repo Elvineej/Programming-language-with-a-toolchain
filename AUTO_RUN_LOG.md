@@ -8,6 +8,20 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 - The interactive session that fixed d07afea is working on `auto/elya` now, so scheduled
   runs started within 3 hours of this entry exit, as the protocol says. It marks this
   entry DONE, or hands it over, before it stops.
+- **Done: native strings** (cc044d4 and cf6b08b, HANDOFF step 2, taken before step 1 on
+  purpose). Spec `docs/superpowers/specs/2026-10-15-elya-native-strings-design.md`.
+  - **What:** `<>`, `==`/`!=` on strings, string-literal patterns and `int.to_string`,
+    natively.
+  - **Decisions (mine, rule 2; please review):**
+    - `int.to_string` is a pure builtin (D1);
+    - a builtin used as a value is E0208 (D6).
+  - **Changed test expectations, on purpose:** three lib.rs unit tests went from
+    refusal to compilation. They are named in cf6b08b.
+  - **Gate:** 934 / 89 (predicted 934). Review: no correctness bug; its 4 findings were
+    fixed test-first.
+- Windows-gate debt added: d07afea, cc044d4, cf6b08b (cf6b08b adds runtime.c functions;
+  portable C only).
+- Next: HANDOFF step 1, async step 2 part 2 (the poll loop).
 
 ## 2026-10-15 21:35 UTC — interactive session (not a scheduled run), DONE
 

@@ -3,7 +3,7 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-15, auto-run)
+## State at handoff (updated 2026-10-15, an interactive session on `auto/elya`)
 
 - `main` has everything through #22 (the 2026-10-09/10 auto-runs: N7 part 1 through
   exact replay).
@@ -14,8 +14,12 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 920 passed, 87 suites. The runtime gained
-  `elya_cont_copy` (multi-shot); `gc_mark` is unchanged.
+- Linux gate at the tip of `auto/elya`: 934 passed, 89 suites. Since `main`, the runtime
+  has gained `elya_cont_copy` (multi-shot) and the string functions; `gc_mark` is
+  unchanged (637 bytes of source).
+- Interactive sessions may also work on `auto/elya`. They use the same
+  `AUTO_RUN_LOG.md` lock: an IN PROGRESS entry under 3 hours old makes a scheduled run
+  exit.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
   language decisions taken. The maintainer delegated all choices (rule 2).
@@ -220,6 +224,30 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   solutions, a count, the first), the same bytes natively. A multi-shot copy of a chain
   of 100 000 handler frames runs natively in linear time.
 
+- **An N7 part 2 miscompile, found by a differential sweep** (2026-10-15, d07afea, an
+  interactive session).
+  - **Symptom:** an `IO` closure inside a parametric value given to a generic function
+    (`call(B(fn() { io.println("x")  42 }))`) stopped natively with "match failed".
+  - **Cause:** the instance key kept row labels, but `IO` is a label that doesn't change
+    the calling convention.
+  - **Fix:** an instance key renders a row as its convention alone.
+
+- **Native strings** (2026-10-15, cc044d4 and cf6b08b, an interactive session; old step
+  2). Spec `docs/superpowers/specs/2026-10-15-elya-native-strings-design.md`.
+  - **Natively:** `<>`, `==`/`!=` on strings, and string-literal patterns.
+  - **New builtin:** `int.to_string`, which is pure (decision D1).
+  - **Unlocked:** 17 programs that were refused before now compile and match the
+    evaluator.
+  - **The collector:** concatenation is an allocation site. The left operand is rooted
+    while the right one runs, and in a resumption function `root_live` keeps the
+    continuation alive (the resumed frame is dead).
+  - **E0208:** a builtin used as a value is now an error (D6). It used to pass `check`
+    and fail at run time.
+  - **Review:** no correctness bug. It showed that two of my controls were blind; both
+    are pinned by tests now.
+  - **Order:** this step was taken before the poll loop (now step 1) because that
+    example has to print times and task ids.
+
 ## The next five steps
 
 ### 1. Async step 2, part 2: I/O readiness through a poll loop
@@ -231,26 +259,17 @@ in the spec, and keep it testable deterministically). Also from part 1's spec: d
 detection (a full pass of only `Awaiting` tasks) and cancellation of a scope's children
 when its body fails (needs a failure effect).
 
-### 2. Native strings
-
-`<>` is refused natively and there is no Int-to-String, so every native example prints a
-number. Add the builtin (`int.to_string`, Claude's call) to the front end and evaluator,
-then strings natively: concatenation in the runtime (GC-managed byte arrays), the builtin,
-and `io.println` of a computed string. Measure first which examples and corpora this
-unlocks (the CEK machine's output, the replay log of `examples/05_replay.elya`), and pin
-it with differential tests.
-
-### 3. Effect-polymorphic handlers (a recorder for ANY effect)
+### 2. Effect-polymorphic handlers (a recorder for ANY effect)
 
 Replay (done, `examples/05_replay.elya`) records one fixed effect: a handler covers
 exactly one effect, every operation of it, so a generic `record` would need a handler
 over "every operation of some effect `e`" -- the ROADMAP's next replay step before the CLI
 flags. Measure what the type system needs (an operation-generic clause? an effect-row
 variable a handler can be abstracted over?), survey Koka/Effekt/Frank, decide in a spec,
-and prototype in the evaluator first. Strings natively (step 2) are a prerequisite of a
-serialized log.
+and prototype in the evaluator first. Strings are native since 2026-10-15, so a
+serialized log can be printed.
 
-### 4. A function's own row in Core
+### 3. A function's own row in Core
 
 `CoreFn` has no latent row, so a type or row variable that appears ONLY in a function's
 own row is invisible at its references: N7 part 2 refuses such type variables by name
@@ -261,7 +280,7 @@ type (its row included) in Core -- the typed table's node-count tripwire
 there, so decide where it lives in the spec -- then match it at references in both
 passes and lift the refusal. Measure first which corpus programs it unlocks.
 
-### 5. A failure effect and scope cancellation
+### 4. A failure effect and scope cancellation
 
 Structured concurrency (Done) cannot cancel a scope's children: Elya has no failure
 effect in its examples. Design `effect Fail { fn fail(reason: String) -> Never }`-style
@@ -269,6 +288,23 @@ failure (decide: a bottom type, or an op whose result type is free), a `catch`
 handler, and a scope that, when its body fails, drops its queued children instead of
 running them -- then show it in `examples/06_structured.elya` or a new example. Measure
 first what the type system needs for an op that never returns.
+
+### 5. The last common native refusals: computed callees and functions as values
+
+These are the two most frequent refusals of real programs in the 2026-10-15 sweep of
+about 700 programs, apart from test fragments without `main`.
+- **"computed callee" (13 programs).** Examples: `(compose(f, g))(x)`, `(mk())(1)`, the
+  scheduler shape `(run(child))(q2)`, `(resume(..))(q)` outside a clause lambda.
+  - A parallel implementation (branch `claude/async`, reference only) A-normalized
+    every computed callee in Core lowering (`let $k = e in $k(args)`, not only
+    `resume(..)`), and those programs compiled and matched the evaluator.
+- **"function used as a value" (10 programs).** A top-level function passed or stored
+  without being called: `apply(double, 3)`, a field holding `inc`.
+  - It needs a closure wrapper with no captures, specialized per use like any generic
+    function (N7). The existing upcast `Adapter` already builds closures of this
+    shape.
+- **How:** measure each class through `build` first, pin each with differential rows,
+  and keep `gc_mark` byte-identical.
 
 Also open, unscheduled: explicit wrapping arithmetic (`int.wrapping_mul` and friends, for
 hashes and generators) and unary minus natively (Core refuses "Unary"); the
