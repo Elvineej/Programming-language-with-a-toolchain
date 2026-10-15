@@ -3,7 +3,50 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-15 17:53 UTC — IN PROGRESS
+## 2026-10-15 21:35 UTC — interactive session (not a scheduled run), DONE
+
+**A silent miscompile in N7 part 2 (988348e). Fix it FIRST.**
+
+- **What fails.** This program prints `x` then 42 under `elya run`. Built natively at
+  4b9d7c6, it stops with "elya: match failed (no arm matched)":
+
+  ```
+  type Box(a) { B(a) }
+  fn call(b) { match b { B(f) -> f() } }
+  pub fn main() -> Int { call(B(fn() { io.println("x")  42 })) }
+  ```
+
+  Same class: a generic `run_all` over a `List` holding one printing closure and one pure
+  one (evaluator `a`, 56).
+
+- **Cause.** In `crates/codegen/src/mono.rs`, `canon` with `rows == None` (the INSTANCE
+  key) drops row tails but keeps LABELS, on the premise that only labels change a field's
+  convention. `IO` is a label that does NOT change the convention: `cps::needs_cps` treats
+  it as direct. So `main`'s `Box(fn() / {IO} -> Int)` and `call`'s `Box(fn() / {|r} -> Int)`
+  become two instances with different constructor tags.
+
+- **Fix.** In an instance key, render each function row as its convention only (whether
+  `needs_cps` holds), not its labels. One value has the same convention at every use, so
+  the binder field types stay right.
+
+- **A tested patch.** It will be pushed to branch `claude/io-instance-key`, based on
+  4b9d7c6: a red test with these programs, the fix, a negative control, and a green
+  gate. If the branch exists, cherry-pick it and re-run the gate; otherwise implement the
+  fix test-first.
+
+- **How it was found.** A differential sweep of ~700 programs (earlier review corpora plus
+  `examples/`) at 4b9d7c6: native against the evaluator. The two programs above were the
+  only native results that disagreed with the evaluator. Every other result matched,
+  failed the same way on both sides, timed out in the evaluator, or was a named refusal.
+
+- **Refusals worth a slice.** 11 programs are refused natively as "computed callee", for
+  example `(compose(f, g))(x)` or `(mk())(1)`. In a parallel implementation (local, not
+  pushed), Core lowering A-normalized every computed callee (`let $k = e in $k(args)`), and
+  those 11 programs compiled and matched the evaluator.
+
+- **The previous run (17:53) ended at 19:53 UTC on the usage limit** without a DONE mark.
+
+## 2026-10-15 17:53 UTC — ended without a DONE mark (usage limit at 19:53 UTC)
 
 - Previous run (2026-10-10 09:49) never marked DONE; over 3 hours old, so this run takes over.
   PR #22 was merged into `main` (c2a169f); `auto/elya` fast-forwarded to it. A new draft PR
