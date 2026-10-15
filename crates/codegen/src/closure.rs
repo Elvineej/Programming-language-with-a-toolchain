@@ -403,6 +403,8 @@ mod tests {
             "the builtin name is not a variable, but every argument is walked"
         );
         let core = CoreModule {
+            generic_types: Vec::new(),
+            effect_params_used: Default::default(),
             fns: vec![CoreFn {
                 name: "main".to_string(),
                 params: Rc::from([]),
@@ -433,6 +435,8 @@ mod tests {
             ),
         );
         let core = CoreModule {
+            generic_types: Vec::new(),
+            effect_params_used: Default::default(),
             fns: vec![CoreFn {
                 name: "wrap".to_string(),
                 params: Rc::from([param("k")]),
@@ -465,6 +469,8 @@ mod tests {
             CoreKind::Lambda(Rc::from([param("x")]), Rc::new(var("x"))),
         );
         let core = CoreModule {
+            generic_types: Vec::new(),
+            effect_params_used: Default::default(),
             fns: vec![CoreFn {
                 name: "id".to_string(),
                 params: Rc::from([]),
@@ -511,6 +517,8 @@ mod tests {
             ),
         );
         let core = CoreModule {
+            generic_types: Vec::new(),
+            effect_params_used: Default::default(),
             fns: vec![CoreFn {
                 name: "two".to_string(),
                 params: Rc::from([]),
@@ -612,6 +620,8 @@ mod tests {
             Some(("r", lam("w"))),
         );
         let core = CoreModule {
+            generic_types: Vec::new(),
+            effect_params_used: Default::default(),
             fns: vec![CoreFn {
                 name: "h".to_string(),
                 params: Rc::from([]),
@@ -660,6 +670,8 @@ mod tests {
             CoreKind::Lambda(Rc::from([param("x")]), Rc::new(var("x"))),
         );
         let core = CoreModule {
+            generic_types: Vec::new(),
+            effect_params_used: Default::default(),
             fns: vec![CoreFn {
                 name: "p".to_string(),
                 params: Rc::from([]),

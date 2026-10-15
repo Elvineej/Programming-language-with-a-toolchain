@@ -26,8 +26,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use elya::core::{
-    CoreClause, CoreExpr, CoreFn, CoreHandle, CoreKind, CoreModule, CoreParam, CorePat,
-    CorePerform, CoreReturn, CoreType,
+    CoreClause, CoreExpr, CoreFn, CoreGenericType, CoreHandle, CoreKind, CoreModule, CoreParam,
+    CorePat, CorePerform, CoreReturn, CoreType,
 };
 use elya::types::{EffectLabel, EffectRow, RowTail, RowVar, Ty};
 
@@ -544,6 +544,8 @@ pub(crate) fn specialize_rows(core: &CoreModule) -> R<CoreModule> {
     Ok(CoreModule {
         fns,
         types: core.types.clone(),
+        generic_types: core.generic_types.clone(),
+        effect_params_used: core.effect_params_used.clone(),
     })
 }
 
@@ -604,15 +606,17 @@ fn coercible(from: &Ty, to: &Ty) -> bool {
 /// The binders of a pattern matched against a value of type `scrut`, in
 /// `closure::pat_binders` order, each with its type where it is known: a
 /// variable pattern has the scrutinee's type; a constructor's sub-patterns
-/// have its declared field types. A parametric type's fields mention its
-/// parameters, so they are not tracked (`None`); natively such constructors
-/// are refused anyway. Since function types may be written in declarations
+/// have its declared field types -- a parametric type's substituted at the
+/// scrutinee's arguments (N7 part 2: this runs before the instances exist).
+/// After the instances exist (`cps_emit`), `generic` is empty and every
+/// scrutinee type is ground. Since function types may be written in declarations
 /// (async step 1), a pattern binder can hold a closure, so it must be tracked
 /// for the upcast adapter and its guard like any other binder.
 pub(crate) fn pat_binder_types(
     p: &CorePat,
     scrut: &Ty,
     types: &[CoreType],
+    generic: &[CoreGenericType],
     out: &mut Vec<(String, Option<Ty>)>,
 ) {
     match p {
@@ -624,10 +628,11 @@ pub(crate) fn pat_binder_types(
                 .filter(|t| matches!(scrut, Ty::Con(n, args) if *n == t.name && args.is_empty()))
                 .flat_map(|t| t.ctors.iter())
                 .find(|c| c.name == *name)
-                .map(|c| c.fields.clone());
+                .map(|c| c.fields.clone())
+                .or_else(|| crate::mono::generic_fields(generic, scrut, name));
             for (i, sp) in subs.iter().enumerate() {
                 match fields.as_ref().and_then(|f| f.get(i)) {
-                    Some(ft) => pat_binder_types(sp, ft, types, out),
+                    Some(ft) => pat_binder_types(sp, ft, types, generic, out),
                     None => {
                         let mut names = Vec::new();
                         crate::closure::pat_binders(sp, &mut names);
@@ -642,6 +647,7 @@ pub(crate) fn pat_binder_types(
 struct Adapter<'t> {
     counter: usize,
     types: &'t [CoreType],
+    generic: &'t [CoreGenericType],
 }
 
 impl Adapter<'_> {
@@ -795,7 +801,7 @@ impl Adapter<'_> {
                 let mut out = Vec::with_capacity(arms.len());
                 for a in arms.iter() {
                     let mut binders = Vec::new();
-                    pat_binder_types(&a.pat, &s.ty, self.types, &mut binders);
+                    pat_binder_types(&a.pat, &s.ty, self.types, self.generic, &mut binders);
                     let depth = locals.len();
                     locals.extend(binders);
                     let body = self.walk(&a.body, locals);
@@ -880,6 +886,7 @@ pub(crate) fn adapt_upcasts(core: &CoreModule) -> R<CoreModule> {
     let mut ad = Adapter {
         counter: 0,
         types: &core.types,
+        generic: &core.generic_types,
     };
     let mut fns = Vec::with_capacity(core.fns.len());
     for f in &core.fns {
@@ -898,6 +905,8 @@ pub(crate) fn adapt_upcasts(core: &CoreModule) -> R<CoreModule> {
     Ok(CoreModule {
         fns,
         types: core.types.clone(),
+        generic_types: core.generic_types.clone(),
+        effect_params_used: core.effect_params_used.clone(),
     })
 }
 

@@ -840,3 +840,45 @@ fn a_perform_carries_the_effect_instantiation() {
         "the perform must carry the op's instantiated type"
     );
 }
+
+#[test]
+fn parametric_declarations_are_recorded_in_generic_types() {
+    // N7 part 2 (spec 2026-10-15 §2): a parametric declaration reaches Core in
+    // `generic_types`, each field with `Ty::Var(i)` for the i-th parameter, so
+    // the back end can instantiate it. `types` keeps only ground declarations
+    // (the printer and its snapshots are unchanged).
+    let (core, _t) = lower_src(
+        "type Pair(a, b) { Pair(b, a), Solo(a, Pair(b, a), Int) }\n\
+         type Tok { Tok }\n\
+         effect E(a, b) { fn e(x: Pair(Int, a)) -> Int }\n\
+         effect M { fn m() -> Int }\n\
+         fn f(x) { x }\n",
+    );
+    // Which effect parameters an operation uses (the review's F2): `b` is
+    // phantom; a monomorphic effect has no entry.
+    assert_eq!(
+        core.effect_params_used.get("E").cloned(),
+        Some(vec![true, false])
+    );
+    assert!(!core.effect_params_used.contains_key("M"));
+    assert_eq!(
+        core.types
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Tok"]
+    );
+    assert_eq!(core.generic_types.len(), 1);
+    let g = &core.generic_types[0];
+    assert_eq!((g.name.as_str(), g.params), ("Pair", 2));
+    assert_eq!(g.ctors[0].name, "Pair");
+    assert_eq!(g.ctors[0].fields, vec![Ty::Var(1), Ty::Var(0)]);
+    assert_eq!(
+        g.ctors[1].fields,
+        vec![
+            Ty::Var(0),
+            Ty::Con("Pair".into(), vec![Ty::Var(1), Ty::Var(0)]),
+            Ty::Base(TyCon::Int)
+        ]
+    );
+}

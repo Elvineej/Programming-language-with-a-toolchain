@@ -834,6 +834,8 @@ fn a_failed_match_traps_with_a_named_error() {
     use std::rc::Rc;
 
     let core = CoreModule {
+        generic_types: vec![],
+        effect_params_used: Default::default(),
         types: vec![CoreType {
             name: "T".into(),
             ctors: vec![
@@ -1294,10 +1296,9 @@ fn a_unit_typed_adt_field_round_trips_through_the_word_helpers() {
 ///
 /// The lambda is inline in `main` rather than returned from a helper, and `z` is
 /// pinned to `Int` on purpose. A helper like `fn wrap(u) { fn(z) { u } }` is
-/// polymorphic, and `repr_ty` refuses `Ty::Var(_)` for the WHOLE module — see
-/// `a_polymorphic_function_refuses_the_whole_module`. That shape dies before the
-/// `Unit` arm is ever reached, so it would prove nothing about it: N7 knocking,
-/// not N6 failing.
+/// polymorphic, and before N7 part 2 `repr_ty` refused `Ty::Var(_)` for the
+/// WHOLE module. That shape died before the `Unit` arm was ever reached, so it
+/// would have proved nothing about it: N7 knocking, not N6 failing.
 #[test]
 fn a_unit_typed_closure_capture_round_trips_through_the_word_helpers() {
     let src = "pub fn main() { let u = io.println(\"x\")  \
@@ -1358,9 +1359,9 @@ fn a_printing_program_under_gc_stats_splits_by_the_same_rule() {
 /// the program compiles, links, runs and prints main's `0`. Measured: exactly
 /// that. Not a miscompile and not a refusal — the effect is invisible here.
 ///
-/// The `Ty::Var` half of the answer (an unconstrained type parameter) is a
-/// refusal and produces no binary, so it lives beside its sibling in `lib.rs`'s
-/// `mod tests`: `a3_an_unconstrained_polymorphic_effect_meets_the_ty_var_refusal`.
+/// The `Ty::Var` half of the answer (an unconstrained type parameter) was a
+/// refusal until N7 part 2 (2026-10-15); it lives beside its sibling in
+/// `lib.rs`'s `mod tests`: `a3_an_unconstrained_polymorphic_effect_is_not_emitted`.
 #[test]
 fn a3_a_polymorphic_effect_declaration_compiles_and_runs_natively() {
     let src = "effect State(s) { fn get() -> s  fn set(v: s) -> Unit }\n\
@@ -4635,4 +4636,260 @@ fn the_replay_example_runs_natively() {
     );
     assert_eq!(value, "2106");
     assert_eq!(value, eval_main_int(src));
+}
+
+// ---- N7 part 2: type variables and parametric ADTs natively (2026-10-15) ----
+// Spec `docs/superpowers/specs/2026-10-15-elya-n7b-type-monomorphization-design.md`.
+// Every program below was refused natively before the slice ("unrepresentable
+// type" or "parametric ADT"); the expected values are the evaluator's, measured
+// first (spec §0).
+//
+// Negative controls (each reverted, `git diff --quiet` after):
+// - K1, references not redirected to clones (`Mono::resolve` returns `x`): the
+//   whole corpus is refused by name, "callee is not a top-level function" (the
+//   generic originals are no longer emitted, so nothing answers the name).
+// - K2, instance fields left unsubstituted: the compiler panics in inkwell (an
+//   i64 where a pointer was expected) on all three tests -- not a named
+//   refusal, but an unsubstituted field cannot leave the pass. K2b, the mask
+//   alone wrong (descriptor rows skip `Cons.mono.*` fields): r20's binary exits
+//   1 after a collection, the other two tests pass -- the collector test is
+//   what has the teeth for the mask.
+// - K3, ambiguous variables not defaulted: r26 refused, "unrepresentable type"
+//   (r19 still passed: its variable sits under an instance name -- r26 was
+//   added for this control).
+// - K4, the effect-position check off: r24 compiles (a String typed as Unit).
+// - K5, instances built eagerly: r18 hits "too many type instances".
+
+const LIST: &str = "type List(a) { Nil, Cons(a, List(a)) }\n";
+
+const TYPE_VARS: &[(&str, &str, &str)] = &[
+    (
+        "q1-twice",
+        "fn twice(f, x) { f(f(x)) }\n\
+         pub fn main() -> Int { twice(fn(n) { n * 3 + 1 }, 5) }\n",
+        "49",
+    ),
+    (
+        "q2-id-at-two-types",
+        "fn id(x) { x }\n\
+         pub fn main() -> Int { if id(True) { id(40) + 2 } else { 0 } }\n",
+        "42",
+    ),
+    (
+        "q3-compose",
+        "fn compose(f, g) { fn(x) { g(f(x)) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let h = compose(fn(n) { n + 1 }, fn(n) { n * 10 })\n\
+         \x20 let b = compose(fn(n) { n > 3 }, fn(c) { if c { 7 } else { 9 } })\n\
+         \x20 h(4) + b(5)\n\
+         }\n",
+        "57",
+    ),
+    (
+        "q4-list-at-two-types",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }\n\
+         fn sum(l) { match l { Nil -> 0  Cons(h, t) -> h + sum(t) } }\n\
+         pub fn main() -> Int { sum(Cons(1, Cons(2, Cons(3, Nil)))) * 100 + len(Cons(True, Nil)) }\n",
+        "601",
+    ),
+    (
+        "q5-map-fold-range",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn map(f, l) { match l { Nil -> Nil  Cons(h, t) -> Cons(f(h), map(f, t)) } }\n\
+         fn foldl(f, acc, l) { match l { Nil -> acc  Cons(h, t) -> foldl(f, f(acc, h), t) } }\n\
+         fn range(a, b) { if a >= b { Nil } else { Cons(a, range(a + 1, b)) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let xs = map(fn(n) { Cons(n, Nil) }, range(0, 2000))\n\
+         \x20 foldl(fn(acc, l) { match l { Nil -> acc  Cons(h, _) -> acc + h } }, 0, xs)\n\
+         }\n",
+        "1999000",
+    ),
+    (
+        "q6-generic-local",
+        "pub fn main() -> Int {\n\
+         \x20 let id = fn(x) { x }\n\
+         \x20 if id(True) { id(41) + 1 } else { 0 }\n\
+         }\n",
+        "42",
+    ),
+    (
+        "q7-option",
+        "type Option(a) { None, Some(a) }\n\
+         fn get(o, d) { match o { None -> d  Some(x) -> x } }\n\
+         pub fn main() -> Int { get(Some(3), 0) + get(None, 4) }\n",
+        "7",
+    ),
+    (
+        "q8-a-row-and-a-type-variable",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn twice(f, x) { f(f(x)) }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { twice(fn(n) { lg(n) + 1 }, 5) } with { L.lg(v) -> resume(v * 2)  return(r) -> r * 1000 }\n\
+         }\n",
+        "23000",
+    ),
+    (
+        // Measured as `mk(5)(True)`; a computed callee is refused natively by
+        // its own name (5b-1 §5.3, not a type question), so it is bound first.
+        "q9-closures-over-generic-values",
+        "fn mk(x) { let m = fn(y) { x }  m }\n\
+         fn pair(a, b) { fn(k) { k(a, b) } }\n\
+         pub fn main() -> Int { let p = pair(3, True)  let m5 = mk(5)  p(fn(a, b) { if b { a } else { 0 } }) + m5(True) }\n",
+        "8",
+    ),
+    (
+        "r11-a-generic-nil-at-two-types",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }\n\
+         pub fn main() -> Int { let n = Nil  len(Cons(1, n)) * 10 + len(Cons(True, Cons(False, n))) }\n",
+        "12",
+    ),
+    (
+        "r13-a-generic-handler",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         effect St(s) { fn get() -> s  fn put(v: s) -> Int }\n\
+         fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }\n\
+         fn twice_get(d) { handle { len(get()) + len(get()) } with { St.get() -> resume(d)  St.put(v) -> resume(0)  return(r) -> r } }\n\
+         pub fn main() -> Int { twice_get(Cons(1, Cons(2, Nil))) * 10 + twice_get(Cons(True, Nil)) }\n",
+        "42",
+    ),
+    (
+        "r15-mutually-recursive-generics",
+        "fn ev(f, x, n) { if n == 0 { f(x) } else { od(f, x, n - 1) } }\n\
+         fn od(f, x, n) { if n == 0 { f(x) } else { ev(f, x, n - 1) } }\n\
+         pub fn main() -> Int { let a = ev(fn(b) { if b { 1 } else { 2 } }, True, 7)  a * 100 + ev(fn(k) { k * 3 }, 11, 4) }\n",
+        "133",
+    ),
+    (
+        "r17-a-function-field-with-an-effect",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         type Box(a) { Box(fn(a) / {L} -> a, a) }\n\
+         fn open(b) { match b { Box(f, v) -> f(f(v)) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { open(Box(fn(n) { lg(n) + 1 }, 4)) } with { L.lg(v) -> resume(v * 3)  return(r) -> r }\n\
+         }\n",
+        "40",
+    ),
+    (
+        "r18-a-non-regular-type",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         type Nest(a) { NNil, NCons(a, Nest(List(a))) }\n\
+         fn depth(n) { match n { NNil -> 0  NCons(_, _) -> 1 } }\n\
+         pub fn main() -> Int { depth(NCons(1, NCons(Cons(2, Nil), NNil))) }\n",
+        "1",
+    ),
+    (
+        "r19-an-ambiguous-variable",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn seven(l) { 7 }\n\
+         pub fn main() -> Int { seven(Nil) + seven(Cons(Nil, Nil)) }\n",
+        "14",
+    ),
+    (
+        // Added by negative control K3: with no default, r19 still compiled (its
+        // ambiguous variable sits under an instance name), so nothing native
+        // needed the default. Here the ambiguous variable is a lambda's own
+        // parameter type, which must be represented.
+        "r26-an-ambiguous-lambda-parameter",
+        "fn ignore(g) { 7 }\n\
+         pub fn main() -> Int { ignore(fn(x) { x }) + ignore(fn(x) { 1 }) }\n",
+        "14",
+    ),
+    (
+        "r21-a-two-parameter-lambda",
+        "fn pair(a, b) { fn(k) { k(a, b) } }\n\
+         pub fn main() -> Int { let p = pair(3, True)  p(fn(a, b) { if b { a } else { 0 } }) }\n",
+        "3",
+    ),
+    (
+        "r22-a-generic-local-to-a-generic-local",
+        "pub fn main() -> Int {\n\
+         \x20 let id = fn(x) { x }\n\
+         \x20 let ap = fn(f, y) { f(y) }\n\
+         \x20 ap(id, 5) + (if ap(id, True) { 10 } else { 0 })\n\
+         }\n",
+        "15",
+    ),
+    (
+        "r23-nested-generic-patterns",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn head_or(l, d) { match l { Nil -> d  Cons(Cons(x, _), _) -> x  Cons(Nil, _) -> d } }\n\
+         pub fn main() -> Int { head_or(Cons(Cons(42, Nil), Nil), 0) + head_or(Cons(Nil, Nil), 1) }\n",
+        "43",
+    ),
+    (
+        "r25-a-generic-effect",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         effect Gen(a) { fn yield(x: a) -> Int }\n\
+         fn each(l) { match l { Nil -> 0  Cons(h, t) -> yield(h) + each(t) } }\n\
+         fn count(l) { handle { each(l) } with { Gen.yield(x) -> resume(1)  return(r) -> r } }\n\
+         pub fn main() -> Int { count(Cons(1, Cons(2, Nil))) * 10 + count(Cons(True, Nil)) }\n",
+        "21",
+    ),
+    // The review (2026-10-15), each red first.
+    (
+        // F1 (high, new): the constructor's instance was keyed at a closed row,
+        // the matching parameter's at an open one -- two instances, two tag
+        // sets, "match failed" natively.
+        "f1-a-pure-closure-in-an-option",
+        "type Option(a) { None, Some(a) }\n\
+         fn total(o) { match o { None -> 0  Some(f) -> f(1) } }\n\
+         pub fn main() -> Int { total(Some(fn(x) { x + 1 })) }\n",
+        "2",
+    ),
+    (
+        "f1-a-list-of-closures",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn run(l, x) { match l { Nil -> x  Cons(f, t) -> run(t, f(x)) } }\n\
+         pub fn main() -> Int { run(Cons(fn(x) { x * 4 }, Cons(fn(x) { x + 1 }, Nil)), 5) }\n",
+        "21",
+    ),
+    (
+        "f1-a-ground-type-holding-closures",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         type Bag { Bag(List(fn(Int) -> Int)) }\n\
+         fn first(b) { match b { Bag(l) -> match l { Nil -> 0  Cons(f, _) -> f(10) } } }\n\
+         pub fn main() -> Int { first(Bag(Cons(fn(x) { x * 3 }, Nil))) }\n",
+        "30",
+    ),
+    (
+        // F2 (medium, a regression): an effect parameter no operation uses
+        // carries no value, so defaulting it is sound; it was refused.
+        "f2-a-phantom-effect-parameter",
+        "effect E(a) { fn e() -> Int }\n\
+         fn go() { e() + 1 }\n\
+         pub fn main() -> Int { handle { go() + e() } with { E.e() -> resume(2)  return(r) -> r } }\n",
+        "5",
+    ),
+];
+
+#[test]
+fn the_type_variable_corpus_runs_natively() {
+    run_value_corpus(TYPE_VARS, "type-vars");
+}
+
+#[test]
+fn the_type_variable_corpus_matches_the_evaluator() {
+    run_differential_corpus(TYPE_VARS, "type-vars-diff");
+}
+
+/// r20: a `List(Option(Int))` of 100 000 built by a tail loop, then summed.
+/// The `Some` cells are reachable only through the list's HEAD field, which is
+/// a pointer in `List(Option(Int))`'s instance and not in `List(Int)`'s: the
+/// mask must come from the substituted field type (negative control K2).
+#[test]
+fn a_parametric_list_survives_collection() {
+    let src = format!(
+        "{LIST}type Option(a) {{ None, Some(a) }}\n\
+         fn build(i, acc) {{ if i == 0 {{ acc }} else {{ build(i - 1, Cons(Some(i), acc)) }} }}\n\
+         fn total(l, s) {{ match l {{ Nil -> s  Cons(o, t) -> match o {{ None -> total(t, s)  Some(v) -> total(t, s + v) }} }} }}\n\
+         pub fn main() -> Int {{ total(build(100000, Nil), 0) }}\n"
+    );
+    let dir = temp_dir("type-vars-gc");
+    let exe = compile_and_link(&lower_src(&src), &dir, "r20");
+    let (value, stats) = run_with_gc_stats(&exe, "r20");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(value, "5000050000");
+    assert!(stats.collections > 0, "the collector never ran: {stats:?}");
 }

@@ -3,9 +3,10 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-10, auto-run)
+## State at handoff (updated 2026-10-15, auto-run)
 
-- `main` has everything through #21 (sub-effecting and checked annotations).
+- `main` has everything through #22 (the 2026-10-09/10 auto-runs: N7 part 1 through
+  exact replay).
 - Scheduled auto-runs work on branch `auto/elya` (one draft PR to `main`) and log in
   `AUTO_RUN_LOG.md`; the maintainer reviews on GitHub.
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
@@ -13,7 +14,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 886 passed, 85 suites. The runtime gained
+- Linux gate at the tip of `auto/elya`: 900 passed, 85 suites. The runtime gained
   `elya_cont_copy` (multi-shot); `gc_mark` is unchanged.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
@@ -186,36 +187,37 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   `record`, `replay` (stops by name on the first divergence, rejects leftovers) and a test
   double, as ordinary handlers over one program; the same bytes natively.
 
+- **N7 part 2: type variables and parametric ADTs natively** (2026-10-15, branch
+  `auto/elya`): spec `docs/superpowers/specs/2026-10-15-elya-n7b-type-monomorphization-design.md`.
+  Whole-program monomorphization (`crates/codegen/src/mono.rs`): generic functions and
+  generic `let` values are cloned per instantiation (originals not emitted), ambiguous
+  variables default to `Unit`, and parametric types become ground instances built
+  lazily (non-regular types work) AFTER part 1's rows. A variable only in a function's
+  own row is refused by name (defaulting it was measured unsound: a crash). The review
+  found closures inside parametric types miscompiled (row tails in instance keys) and a
+  phantom-effect-parameter regression; both fixed test-first.
+
 ## The next five steps
 
-### 1. N7 part 2: type variables natively
-
-`twice(f, x)` with `x: 'a`, and every unannotated `wrap`/`compose` (now accepted by the
-front end), are "unrepresentable type" natively. Monomorphize type variables like rows
-(N7 part 1's `specialize.rs` already matches signatures against uses), with the code-size
-budget, or pass dictionaries -- decide in the spec. Parametric ADTs (`type Q(a)`) are the
-same question for constructors. Also: aliases of generic locals (`let mk2 = mk`) are
-refused by name.
-
-### 2. Async step 2: structured concurrency and a poll loop
+### 1. Async step 2: structured concurrency and a poll loop
 
 ROADMAP 1b/1c on top of `examples/04_async.elya`: a scope handler that joins its children
 (a `spawn` returning a handle, `await` as an effect), then real I/O readiness through a
 runtime poll loop the scheduler consults. Recursion through a handle body (PARKED) blocks
 the natural recursive `task`: measure whether it is the next front-end fix.
 
-### 3. A backtracking example, and handler frames in deep chains
+### 2. A backtracking example, and handler frames in deep chains
 
 Multi-shot runs natively now; show it: `examples/05_search.elya` (or the next free
 number), an N-queens or subset-sum search written as an ordinary function over a
 `multi` `Choose` effect, with handlers that collect all answers, the first answer, and a
 count -- one search, three meanings, the same bytes natively. Then measure the one shape
 the multi-shot review could not build: a captured chain holding MANY handler frames
-(blocked by PARKED's "recursion through a handle body"); if step 2's front-end fix lands
+(blocked by PARKED's "recursion through a handle body"); if step 1's front-end fix lands
 first, add it to `MULTI_SHOT` and time the copy (it maps parents through a hash table, so
 it should stay linear).
 
-### 4. Native strings
+### 3. Native strings
 
 `<>` is refused natively and there is no Int-to-String, so every native example prints a
 number. Add the builtin (`int.to_string`, Claude's call) to the front end and evaluator,
@@ -224,19 +226,29 @@ and `io.println` of a computed string. Measure first which examples and corpora 
 unlocks (the CEK machine's output, the replay log of `examples/05_replay.elya`), and pin
 it with differential tests.
 
-### 5. Effect-polymorphic handlers (a recorder for ANY effect)
+### 4. Effect-polymorphic handlers (a recorder for ANY effect)
 
 Replay (done, `examples/05_replay.elya`) records one fixed effect: a handler covers
 exactly one effect, every operation of it, so a generic `record` would need a handler
 over "every operation of some effect `e`" -- the ROADMAP's next replay step before the CLI
 flags. Measure what the type system needs (an operation-generic clause? an effect-row
 variable a handler can be abstracted over?), survey Koka/Effekt/Frank, decide in a spec,
-and prototype in the evaluator first. Strings natively (step 4) are a prerequisite of a
+and prototype in the evaluator first. Strings natively (step 3) are a prerequisite of a
 serialized log.
 
+### 5. A function's own row in Core
+
+`CoreFn` has no latent row, so a type or row variable that appears ONLY in a function's
+own row is invisible at its references: N7 part 2 refuses such type variables by name
+("type variable only in an effect row": `fn dup() { put(get()) }` over `St(s)`), and
+part 1 §6 cannot specialize such row variables. Record each top-level function's full
+type (its row included) in Core -- the typed table's node-count tripwire
+(`infer_with_types_records_every_node_and_zonks_after_inference`) moves if it is recorded
+there, so decide where it lives in the spec -- then match it at references in both
+passes and lift the refusal. Measure first which corpus programs it unlocks.
+
 Also open, unscheduled: explicit wrapping arithmetic (`int.wrapping_mul` and friends, for
-hashes and generators) and unary minus natively (Core refuses "Unary"); a two-parameter
-lambda passed to a higher-order function is "unrepresentable" natively (N7 part 2?); the
+hashes and generators) and unary minus natively (Core refuses "Unary"); the
 one-shot trap's words differ (evaluator "continuation resumed more than once", native
 "a one-shot continuation was resumed twice"); the parser continues a call across a
 newline (`f()` then a line starting `(` is `f()(...)`) -- a layout rule is a language

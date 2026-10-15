@@ -52,6 +52,8 @@ pub(crate) fn run(core: &CoreModule) -> CoreModule {
     CoreModule {
         fns,
         types: core.types.clone(),
+        generic_types: core.generic_types.clone(),
+        effect_params_used: core.effect_params_used.clone(),
     }
 }
 

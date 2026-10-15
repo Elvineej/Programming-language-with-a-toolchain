@@ -21,6 +21,7 @@
 mod closure;
 mod cps;
 mod cps_emit;
+mod mono;
 mod patterns;
 mod specialize;
 
@@ -191,8 +192,8 @@ fn find_main(core: &CoreModule) -> Result<&CoreFn, CodegenError> {
 /// §3.1 type mapping: `Int` -> i64, `Bool` -> i1, `Ty::Con` -> a pointer (N4),
 /// and — since N6 — `Str` -> a pointer and `Unit` -> i64. Reads the INLINE `ty`
 /// field on each Core node (Shape C — the reason this fold needs no side-table
-/// lookups). Everything else is refused by name, `Ty::Var(_)` included; when that
-/// fires, that is N7 knocking.
+/// lookups). Everything else is refused by name, `Ty::Var(_)` included; since
+/// N7 part 2 (`mono.rs`) no type variable reaches here, so that is a guard.
 fn repr_ty<'ctx>(ctx: &'ctx Context, ty: &Ty) -> Result<BasicTypeEnum<'ctx>, CodegenError> {
     match ty {
         Ty::Base(TyCon::Int) => Ok(ctx.i64_type().into()),
@@ -1711,10 +1712,16 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         }
     }
 
+    // N7 part 2: clone generic functions and locals per type instantiation,
+    // so no type variable reaches the back end (spec 2026-10-15).
+    let specialized = mono::run(core)?;
     // N7 part 1: monomorphize rows where a reference needs another convention,
     // and eta-expand upcasts, so every phase below sees types that say the
     // right convention. Pure Core-to-Core; nothing is emitted yet.
-    let specialized = specialize::run(core)?;
+    let specialized = specialize::run(&specialized)?;
+    // N7 part 2: applied parametric types become ground instances, AFTER the
+    // rows inside their arguments are substituted (spec 2026-10-15 §2).
+    let specialized = mono::instantiate_types(&specialized)?;
     // Nested and literal patterns become the flat matches, `if`s and `let`s
     // both emitters support (spec 2026-10-10-elya-native-pattern-compilation).
     let specialized = patterns::run(&specialized);
@@ -2040,6 +2047,8 @@ mod tests {
                 body,
             }],
             types: Vec::new(),
+            generic_types: Vec::new(),
+            effect_params_used: Default::default(),
         }
     }
 
@@ -2419,17 +2428,15 @@ mod tests {
     }
 
     #[test]
-    fn a_polymorphic_function_refuses_the_whole_module() {
-        // §5.2 / obligation T2. `repr_ty` refuses `Ty::Var(_)`, and `declare_all`
-        // runs it over every parameter and body type in the module — so `id`
-        // refuses this module even though `main` never calls it. That
-        // whole-module strictness is deliberate; the relaxation path (emit only
-        // what is reachable from `main`) is recorded as T2, not taken here.
-        let err = emit_ir(&core_of("fn id(x) { x }\npub fn main() { 1 }\n")).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("unrepresentable type")),
-            "{err:?}"
-        );
+    fn a_polymorphic_function_is_not_emitted_unless_instantiated() {
+        // §5.2 / obligation T2, revised by N7 part 2 (2026-10-15): this test
+        // used to assert that the unused generic `id` refused the whole module
+        // ("unrepresentable type"). Generic originals are no longer emitted --
+        // only their clones, one per instantiation -- so the module compiles,
+        // and the module compiles. The whole-module strictness stays for every
+        // NON-generic function (each is still emitted and checked).
+        emit_ir(&core_of("fn id(x) { x }\npub fn main() { 1 }\n"))
+            .expect("the generic original is dropped");
     }
 
     // ---- 5b-8 7b-3 refusals (D16, D17, and what Task 8 owns) ----------------
@@ -2646,7 +2653,7 @@ mod tests {
     }
 
     #[test]
-    fn a3_an_unconstrained_polymorphic_effect_meets_the_ty_var_refusal() {
+    fn a3_an_unconstrained_polymorphic_effect_is_not_emitted() {
         // A3 (spec §11), measured. A polymorphic effect has no refusal of its
         // own: when `reader` leaves the effect's parameter unconstrained, the
         // parameter survives into `reader`'s type as a `Ty::Var`, and that is
@@ -2668,11 +2675,12 @@ mod tests {
             "the unconstrained parameter should reach Core as a Ty::Var: {:?}",
             reader.body.ty
         );
-        let err = emit_ir(&core).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("unrepresentable type")),
-            "{err:?}"
-        );
+        // N7 part 2 (2026-10-15): `reader` is generic in its result, so it is
+        // emitted only as clones, and nothing instantiates it: the module
+        // compiles (this asserted the "unrepresentable type" refusal before).
+        // An instantiated row-only variable is refused by its own name -- see
+        // `mono::tests::a_row_only_type_variable_is_refused_by_name`.
+        emit_ir(&core).expect("the uninstantiated generic `reader` is not emitted");
     }
 
     #[test]

@@ -161,8 +161,9 @@ pub(crate) fn prepass(core: &CoreModule, cps_fns: &HashSet<String>) -> R<()> {
 /// convention) and the use instantiates it at a user effect -- the call would
 /// jump into a direct function with the CPS signature (measured: SIGSEGV where
 /// the evaluator printed 8). Refused by the same name as the top-level case.
-/// Binders whose type is not tracked (`$cont`, and pattern binders of a
-/// parametric type's fields) carry `None` and are never refused here.
+/// Binders whose type is not tracked (`$cont`) carry `None` and are never
+/// refused here. Every type is ground by now (N7 part 2), so pattern binders
+/// are tracked from the instances' field types.
 fn check_local_conventions(
     e: &CoreExpr,
     locals: &mut Vec<(String, Option<Ty>)>,
@@ -243,7 +244,7 @@ fn check_local_conventions(
                 // Pattern binders are tracked since function types may be
                 // written in declarations (a closure in a field).
                 let mut binders = Vec::new();
-                crate::specialize::pat_binder_types(&arm.pat, &s.ty, types, &mut binders);
+                crate::specialize::pat_binder_types(&arm.pat, &s.ty, types, &[], &mut binders);
                 let depth = locals.len();
                 locals.extend(binders);
                 let r = go(&arm.body, locals);
