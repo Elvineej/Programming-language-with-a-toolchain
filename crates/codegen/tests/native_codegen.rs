@@ -5367,3 +5367,55 @@ fn cps_live_values_survive_int_to_string_in_a_resumption() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- 2026-10-15: time, the first I/O source (async step 2, part 2) ----------
+
+/// `time.now_ms` and `time.sleep_ms` natively (spec
+/// `2026-10-15-elya-async-step2-timers-design.md` D3): the clock advances by at
+/// least the sleep, in direct code and in a handler clause (the CPS emitter),
+/// and a non-positive sleep returns at once. Each answer is 1 only if it does.
+///
+/// Negative control T3 (reverted, `cmp` clean): `elya_time_sleep_ms` returns at
+/// once -- both rows answer 0.
+#[test]
+fn the_clock_advances_natively() {
+    let rows = [
+        (
+            "direct",
+            "pub fn main() -> Int {\n\
+             \x20 let a = time.now_ms()\n\
+             \x20 time.sleep_ms(20)\n\
+             \x20 let b = time.now_ms()\n\
+             \x20 time.sleep_ms(0 - 5)\n\
+             \x20 if a >= 0 && b - a >= 20 && time.now_ms() >= b { 1 } else { 0 }\n\
+             }\n",
+        ),
+        (
+            "in-a-clause",
+            "effect W { fn wait(ms: Int) -> Unit }\n\
+             fn pause() { wait(15)  wait(10) }\n\
+             pub fn main() -> Int {\n\
+             \x20 let a = time.now_ms()\n\
+             \x20 handle { pause() } with { W.wait(ms) -> { time.sleep_ms(ms)  resume(Unit) } }\n\
+             \x20 if time.now_ms() - a >= 25 { 1 } else { 0 }\n\
+             }\n",
+        ),
+    ];
+    let dir = temp_dir("time-builtins");
+    let mut failures = Vec::new();
+    for (tag, src) in rows {
+        assert_eq!(eval_main_int(src), "1", "{tag}: the evaluator");
+        match try_compile_and_link(&lower_src(src), &dir, tag) {
+            Ok(exe) => {
+                let out = Command::new(&exe).output().expect("run produced binary");
+                let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !out.status.success() || got != "1" {
+                    failures.push(format!("{tag}: {:?} {got:?}", out.status));
+                }
+            }
+            Err(e) => failures.push(format!("{tag}: {e}")),
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}

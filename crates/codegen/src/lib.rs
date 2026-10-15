@@ -486,6 +486,41 @@ pub(crate) fn int_to_string<'ctx>(
     ))
 }
 
+/// `time.now_ms()` / `time.sleep_ms(ms)` on lowered operands (both emitters).
+/// Neither allocates, so nothing needs rooting. `Unit` is the word 0.
+pub(crate) fn time_builtin<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    name: &str,
+    vals: &[BasicValueEnum<'ctx>],
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    match (name, vals) {
+        ("time.now_ms", []) => b
+            .build_call(lc.time_now_ms, &[], "now")
+            .map_err(internal)?
+            .try_as_basic_value()
+            .left()
+            .ok_or(CodegenError::Unsupported(
+                "elya_time_now_ms returned no value",
+            )),
+        ("time.sleep_ms", [ms]) => {
+            b.build_call(lc.time_sleep_ms, &[ms.into_int_value().into()], "")
+                .map_err(internal)?;
+            Ok(ctx.i64_type().const_int(0, false).into())
+        }
+        _ => Err(CodegenError::UnsupportedBuiltin(name.to_string())),
+    }
+}
+
+/// The builtins the native back end implements.
+pub(crate) fn is_native_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "io.println" | "int.to_string" | "time.now_ms" | "time.sleep_ms"
+    )
+}
+
 /// Is this `Prim` a string operation (`<>`, or `==`/`!=` on `String`s)?
 pub(crate) fn is_string_prim(op: BinOp, args: &[CoreExpr]) -> bool {
     match op {
@@ -1281,6 +1316,13 @@ fn lower_expr<'ctx>(
             gc_unroot(b, lc, env_roots)?;
             Ok(p.into())
         }
+        CoreKind::Builtin(builtin, args) if builtin.starts_with("time.") => {
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args.iter() {
+                vals.push(lower_expr(ctx, func, b, lc, a, env)?);
+            }
+            time_builtin(ctx, b, lc, builtin, &vals)
+        }
         CoreKind::Builtin(builtin, args) if builtin == "int.to_string" && args.len() == 1 => {
             let n = lower_expr(ctx, func, b, lc, &args[0], env)?;
             let roots = gc_root_env(b, lc, env)?;
@@ -1743,6 +1785,9 @@ struct LowerCtx<'a, 'ctx> {
     str_concat: FunctionValue<'ctx>,
     str_eq: FunctionValue<'ctx>,
     int_to_string: FunctionValue<'ctx>,
+    /// Time (2026-10-15): `time.now_ms`, `time.sleep_ms`.
+    time_now_ms: FunctionValue<'ctx>,
+    time_sleep_ms: FunctionValue<'ctx>,
     println: FunctionValue<'ctx>,
     string_tag: usize,
     fail: FunctionValue<'ctx>,
@@ -1911,6 +1956,10 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let str_eq = module.add_function("elya_str_eq", str_eq_ty, None); // ccc
     let int_to_string_ty = ptrt.fn_type(&[i64t.into(), i64t.into()], false);
     let int_to_string = module.add_function("elya_int_to_string", int_to_string_ty, None); // ccc
+    let time_now_ms_ty = i64t.fn_type(&[], false);
+    let time_now_ms = module.add_function("elya_time_now_ms", time_now_ms_ty, None); // ccc
+    let time_sleep_ms_ty = ctx.void_type().fn_type(&[i64t.into()], false);
+    let time_sleep_ms = module.add_function("elya_time_sleep_ms", time_sleep_ms_ty, None); // ccc
     let println_ty = ctx.void_type().fn_type(&[ptrt.into()], false);
     let println = module.add_function("elya_println", println_ty, None); // ccc
     let fail_ty = ctx.void_type().fn_type(&[], false);
@@ -1962,6 +2011,8 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         str_concat,
         str_eq,
         int_to_string,
+        time_now_ms,
+        time_sleep_ms,
         println,
         string_tag,
         fail,

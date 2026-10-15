@@ -1298,6 +1298,9 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
     ) -> R<BasicValueEnum<'ctx>> {
         match name {
             "io.println" => self.println(vals),
+            "time.now_ms" | "time.sleep_ms" => {
+                crate::time_builtin(self.ctx, self.b, self.lc, name, vals)
+            }
             "int.to_string" if vals.len() == 1 => {
                 let roots = self.root_live(st, &[])?;
                 let v = crate::int_to_string(self.ctx, self.b, self.lc, vals[0])?;
@@ -1421,7 +1424,7 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                 Ok(Some(v))
             }
             CoreKind::Builtin(name, args) => {
-                if name != "io.println" && name != "int.to_string" {
+                if !crate::is_native_builtin(name) {
                     return Err(CodegenError::UnsupportedBuiltin(name.clone()));
                 }
                 let Some(vals) = self.operands(st, args)? else {
@@ -2599,7 +2602,7 @@ fn emit_resume_fn<'ctx>(
                 cur = cx.prim(&st, *op, args, &vals)?;
             }
             CoreKind::Builtin(name, args) => {
-                if name != "io.println" && name != "int.to_string" {
+                if !crate::is_native_builtin(name) {
                     return Err(CodegenError::UnsupportedBuiltin(name.clone()));
                 }
                 let Some(vals) = resume_operands(&cx, &mut st, args, step.slot, cur)? else {

@@ -5,6 +5,11 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <errno.h>
+#include <time.h>
 #endif
 
 /* The Elya native runtime: a stop-the-world, non-moving mark-sweep collector.
@@ -303,6 +308,46 @@ void *elya_int_to_string(int64_t tag, int64_t n) {
     char buf[32];
     int len = snprintf(buf, sizeof buf, "%lld", (long long)n);
     return elya_str_lit(tag, buf, (int64_t)len);
+}
+
+/* Time, the first I/O source (spec 2026-10-15-elya-async-step2-timers, D3).
+ * `time.now_ms`: monotonic milliseconds since the first reading. `time.sleep_ms`:
+ * a wait of at least `ms` (none when `ms <= 0`); an interrupted nanosleep goes on
+ * with what remains. Neither allocates. */
+static int64_t elya_time_raw_ms(void) {
+#ifdef _WIN32
+    return (int64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+#endif
+}
+
+int64_t elya_time_now_ms(void) {
+    static int64_t start = -1;
+    int64_t now = elya_time_raw_ms();
+    if (start < 0) {
+        start = now;
+    }
+    return now - start;
+}
+
+void elya_time_sleep_ms(int64_t ms) {
+    if (ms <= 0) {
+        return;
+    }
+#ifdef _WIN32
+    while (ms > 0) {
+        DWORD part = ms > 0x7fffffff ? 0x7fffffff : (DWORD)ms;
+        Sleep(part);
+        ms -= part;
+    }
+#else
+    struct timespec req = {(time_t)(ms / 1000), (long)((ms % 1000) * 1000000L)};
+    while (nanosleep(&req, &req) == -1 && errno == EINTR) {
+    }
+#endif
 }
 
 /* The deterministic failed-match trap. Spec 5b-4 §5: never `unreachable`. */
