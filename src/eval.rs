@@ -401,6 +401,13 @@ pub mod tree {
                         interp.println(s);
                         return Ok(Value::Unit);
                     }
+                    if module == "time" && (name == "now_ms" || name == "sleep_ms") {
+                        let mut vals = Vec::new();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        return super::time_builtin(name, &vals, span);
+                    }
                     if module == "int" && name == "to_string" {
                         let mut vals = Vec::new();
                         for a in args.iter() {
@@ -933,6 +940,12 @@ pub mod cek {
                     Expr::Qualified { module, name } if module == "int" && name == "to_string" => {
                         CalleeSlot::Builtin("int.to_string")
                     }
+                    Expr::Qualified { module, name } if module == "time" && name == "now_ms" => {
+                        CalleeSlot::Builtin("time.now_ms")
+                    }
+                    Expr::Qualified { module, name } if module == "time" && name == "sleep_ms" => {
+                        CalleeSlot::Builtin("time.sleep_ms")
+                    }
                     Expr::Qualified { module, name } => {
                         return Err(rt(span, format!("unknown builtin `{module}.{name}`")))
                     }
@@ -972,6 +985,10 @@ pub mod cek {
                     // A zero-arg operation performs immediately (no args to eval).
                     CalleeSlot::Operation { effect, op } if args.is_empty() => {
                         perform(interp, effect, op, Vec::new(), span, k)?
+                    }
+                    // A zero-arg builtin (`time.now_ms()`) applies immediately.
+                    CalleeSlot::Builtin(b) if args.is_empty() => {
+                        apply_callee(interp, fns, CalleeSlot::Builtin(b), Vec::new(), span, k)?
                     }
                     // Builtin or operation with args: evaluate the args, then apply.
                     other => {
@@ -1356,6 +1373,10 @@ pub mod cek {
                 interp.println(s);
                 Ok(State::Return(Value::Unit, k))
             }
+            CalleeSlot::Builtin(b @ ("time.now_ms" | "time.sleep_ms")) => {
+                let v = super::time_builtin(&b["time.".len()..], &args, span)?;
+                Ok(State::Return(v, k))
+            }
             CalleeSlot::Builtin("int.to_string") => {
                 let [Value::Int(n)] = &args[..] else {
                     return Err(rt(span, "int.to_string expects a single Int"));
@@ -1413,6 +1434,26 @@ pub mod cek {
             CalleeSlot::Value(_) => Err(rt(span, "value is not callable")),
             CalleeSlot::Pending => Err(rt(span, "internal: unresolved callee")),
         }
+    }
+}
+
+/// `time.now_ms()` and `time.sleep_ms(ms)` (spec
+/// 2026-10-15-elya-async-step2-timers D3): monotonic milliseconds since the
+/// first reading in this process, and a wait of at least `ms` (none if `ms <= 0`).
+fn time_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, RuntimeError> {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    match (name, args) {
+        ("now_ms", []) => Ok(Value::Int(
+            i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX),
+        )),
+        ("sleep_ms", [Value::Int(ms)]) => {
+            if *ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(*ms as u64));
+            }
+            Ok(Value::Unit)
+        }
+        _ => Err(rt(span, format!("time.{name}: wrong arguments"))),
     }
 }
 

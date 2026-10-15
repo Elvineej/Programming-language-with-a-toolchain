@@ -1579,6 +1579,43 @@ impl Infer {
                 );
                 return Ty::unit();
             }
+            // `time.now_ms : fn() -> Int` and `time.sleep_ms : fn(Int) -> Unit`,
+            // both performing `IO` (spec 2026-10-15-elya-async-step2-timers D3).
+            if module == "time" && (name == "now_ms" || name == "sleep_ms") {
+                let (params, ret) = if name == "now_ms" {
+                    (Vec::new(), Ty::int())
+                } else {
+                    (vec![Ty::int()], Ty::unit())
+                };
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+                let want = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(ret.clone()));
+                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
+                self.unify(&want, &got, span);
+                {
+                    let r = self.add_effect(amb, "IO", Vec::new(), span);
+                    self.surface_conflict(r);
+                }
+                let mut io_labels = BTreeMap::new();
+                io_labels.insert(
+                    "IO".to_string(),
+                    EffectLabel {
+                        args: Vec::new(),
+                        span: callee.span,
+                    },
+                );
+                self.node_types.insert(
+                    callee.span,
+                    Ty::Fn(
+                        params,
+                        EffectRow {
+                            labels: io_labels,
+                            tail: RowTail::Closed,
+                        },
+                        Box::new(ret.clone()),
+                    ),
+                );
+                return ret;
+            }
             // `int.to_string : fn(Int) -> String`, pure (spec
             // 2026-10-15-elya-native-strings D1).
             if module == "int" && name == "to_string" {

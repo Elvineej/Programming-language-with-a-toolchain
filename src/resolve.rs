@@ -8,7 +8,12 @@ use crate::Session;
 use std::collections::{HashMap, HashSet};
 
 pub fn builtins() -> &'static [&'static str] {
-    &["io.println", "int.to_string"]
+    &[
+        "io.println",
+        "int.to_string",
+        "time.now_ms",
+        "time.sleep_ms",
+    ]
 }
 
 pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
