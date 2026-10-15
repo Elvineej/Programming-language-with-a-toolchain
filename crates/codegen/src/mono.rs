@@ -260,8 +260,9 @@ fn map_expr(e: &CoreExpr, f: &dyn Fn(&Ty) -> Ty) -> CoreExpr {
 /// `rows == None` row tails are left out entirely: an INSTANCE key (the
 /// review's F1 -- `Option(fn(Int) -> Int)` built where
 /// `Option(fn(Int) / {|r} -> Int)` is matched must be ONE type with one tag
-/// set). A tail never changes a field's representation or convention: only
-/// the labels do (part 1 §4, K3).
+/// set). A tail never changes a field's representation or convention, and
+/// neither do labels as such: an instance key renders a function row as its
+/// convention alone (`cps::needs_cps`), since `IO` is a label and direct (f3).
 fn canon(t: &Ty, rows: &mut Option<HashMap<RowVar, usize>>, out: &mut String) {
     match t {
         Ty::Var(v) => out.push_str(&format!("'{v}")),
@@ -274,14 +275,27 @@ fn canon(t: &Ty, rows: &mut Option<HashMap<RowVar, usize>>, out: &mut String) {
                 out.push(',');
             }
             out.push_str(")/{");
-            for (l, lab) in &row.labels {
-                out.push_str(l);
-                out.push('(');
-                for a in &lab.args {
-                    canon(a, rows, out);
-                    out.push(',');
+            if rows.is_none() {
+                // An INSTANCE key: a row contributes its convention and
+                // nothing else. Labels do not decide it either -- `IO` is a
+                // label and direct (`cps::needs_cps`) -- so `Box(fn() / {IO}
+                // -> Int)` built in `main` and `Box(fn() / {|r} -> Int)`
+                // matched in a generic `call` were two instances, two tag
+                // sets: "match failed" natively (f3). One value has one
+                // convention at every use, so binder field types stay right.
+                if crate::cps::needs_cps(t) {
+                    out.push_str("cps");
                 }
-                out.push_str("),");
+            } else {
+                for (l, lab) in &row.labels {
+                    out.push_str(l);
+                    out.push('(');
+                    for a in &lab.args {
+                        canon(a, rows, out);
+                        out.push(',');
+                    }
+                    out.push_str("),");
+                }
             }
             match (&row.tail, rows.as_mut()) {
                 (_, None) => {}

@@ -4872,6 +4872,45 @@ const TYPE_VARS: &[(&str, &str, &str)] = &[
          pub fn main() -> Int { handle { go() + e() } with { E.e() -> resume(2)  return(r) -> r } }\n",
         "5",
     ),
+    // A differential sweep (2026-10-15, an interactive session): the instance
+    // key kept row LABELS, but `IO` is a label that does not change the
+    // convention -- `Box(fn() / {IO} -> Int)` built in `main` and
+    // `Box(fn() / {|r} -> Int)` matched in `call` were two instances, two tag
+    // sets: "match failed" natively where the evaluator printed 42. (The
+    // annotation puts `IO` in the type without printing; a closure that
+    // prints fails the same way.)
+    (
+        "f3-an-io-closure-in-a-box",
+        "type Box(a) { B(a) }\n\
+         fn call(b) { match b { B(f) -> f() } }\n\
+         pub fn main() -> Int { let g: fn() / {IO} -> Int = fn() { 42 }  call(B(g)) }\n",
+        "42",
+    ),
+    (
+        "f3-io-and-pure-closures-in-a-list",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn run_all(fs, x) { match fs { Nil -> 0  Cons(f, rest) -> f(x) + run_all(rest, x) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let p: fn(Int) / {IO} -> Int = fn(x) { x + 1 }\n\
+         \x20 run_all(Cons(p, Cons(fn(x) { x * 10 }, Nil)), 5)\n\
+         }\n",
+        "56",
+    ),
+    (
+        // The key keeps the CONVENTION: one type at both conventions is still
+        // two instances, so a binder's field type says how to call it.
+        "f3-one-type-at-both-conventions",
+        "effect S { fn get() -> Int }\n\
+         type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn run_all(fs) { match fs { Nil -> 0  Cons(f, rest) -> f() + run_all(rest) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let p: fn() / {IO} -> Int = fn() { 1 }\n\
+         \x20 let a = run_all(Cons(p, Cons(fn() { 2 }, Nil)))\n\
+         \x20 let b = handle { run_all(Cons(fn() { get() }, Nil)) } with { S.get() -> resume(100)  return(r) -> r }\n\
+         \x20 a + b\n\
+         }\n",
+        "103",
+    ),
 ];
 
 #[test]
