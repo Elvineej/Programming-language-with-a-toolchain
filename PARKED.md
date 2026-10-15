@@ -265,7 +265,27 @@ clauses the resumed body re-enters are not in resume's row --
 `return(x) -> { let y = t()  fn(s) { x + y } }`, and a clause `{ let y = t()  fn(s) {
 (resume(s + y))(s) } }` over `get() + get()`; nor are effects the body only relays through
 an open row. Including them needs the clause rows before the clauses are typed (a second
-pass, or a row variable shared without merging). Original:
+pass, or a row variable shared without merging).
+
+**Reachable in the scheduler shape since async (review6, 2026-10-10).**
+- **The unsound case (s03).** An UNANNOTATED `run(task)` whose task performs an outer `T`
+  checks clean. The scheduler has a queue of `fn(Q) / {IO} -> Unit` and the clause
+  `fn(q2) { (resume(Unit))(q2) }`. The evaluator stops with "unhandled effect `t`".
+  `examples/04_async.elya` writes `task: fn() / {Async, IO} -> Unit`, so it is not
+  affected.
+- **The native refusal (review2's a1).** `h(k)` has
+  `f = handle { k() + get() } with { S.get() -> fn(s) { (resume(s))(s) } .. }`. It is
+  refused natively by name, "resume of an effectful handler in direct code", which is what
+  base does. The evaluator prints 301.
+  - The unmerged async tree compiled it only through the deferral leak review6 found. The
+    clause lambda's ambient got tied to `h`'s, which relays `k`.
+- **The obvious fix doesn't work.** Tying the resume site's ambient to the relayed tail by
+  equality, as a call of a parameter does, closes the relayed row in the scheduler. The
+  queue's `{IO}` is closed, and `IO` is already in the lambda's own labels. Unannotated
+  tasks would then have to be `Async`-only, which breaks
+  `a_yield_only_scheduler_checks_and_interleaves`.
+- **What's needed.** An inclusion with an upper bound (`w ⊆ {IO}`), or the clause rows
+  known before the clauses are typed. Original:
 
 
 **Soundness.** `check` accepts this, and the evaluator stops with "internal: unhandled
@@ -367,6 +387,25 @@ sub-effecting at function-value joins (a pure function usable where `{T}` is exp
   (the annotation is unified with a fresh variable before the body is inferred).
 - Type variables are flexible, not rigid: `fn f(x: Int) -> a` is accepted. Rigid
   variables behind an explicit `forall` would need skolems.
-- Function-typed ADT fields and effect-operation parameters are a named error ("not
-  supported yet"): they need a row story for type declarations.
+- RESOLVED (async, 2026-10-10): function-typed ADT fields and effect-operation
+  parameters -- a function type in a declaration has exactly its written row (closed;
+  unwritten means pure). A generic effect in such a row (`{State}`) is still a named
+  error.
+
+## Native specialization: what is still refused or imprecise (review6, 2026-10-10)
+
+`crates/codegen/src/specialize.rs` (convention clones, monomorphization, parametric ADT
+instances) leaves these, none a miscompile:
+- **Shadowing a generic top-level name keeps the original alive.** In d04, a local `id`
+  shadows a generic top-level `id`. `refs` counts names, not bindings, so the generic
+  original stays "reachable", and the build refuses with "unrepresentable type". Base
+  refused it too. Fix: make the reachability walk scope-aware, as `Redirect` already is.
+- **A misleading refusal name.** In f05, an unused `fn unused() -> Int { len(Nil) }`
+  keeps its reference to `len` (a non-ground use: `Nil`'s element type is never fixed)
+  while the generic `len` is dropped. The refusal then reads "callee is not a top-level
+  function". Base said "unrepresentable type".
+- **Still refused by name:** nested constructor patterns, let-polymorphic lambdas, a
+  generic function used as a value (not called), a direct closure upcast through a `let`,
+  a field or a pattern (D16 until an adapter wraps it), and non-regular parametric types
+  (they would need a uniform boxed representation).
 

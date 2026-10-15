@@ -154,6 +154,11 @@ pub struct CoreFn {
 #[derive(Clone, Debug)]
 pub struct CoreType {
     pub name: String,
+    /// Type parameters (2026-10-09). A field type names parameter `p` as
+    /// `Ty::Con(p, [])` (lowercase, so it cannot clash with a declared type);
+    /// the native back end monomorphizes each ground instantiation it meets
+    /// and never sees a parametric type itself.
+    pub params: Vec<String>,
     /// Constructors in declaration order — the index IS the tag (5b-4 §2.2).
     pub ctors: Vec<CoreCtor>,
 }
@@ -194,11 +199,9 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
             for v in &t.variants {
                 ctor_names.insert(v.node.name.clone());
             }
-            // Only GROUND (monomorphic) ADTs are recorded in `types`: the back end
-            // is monomorphic-only (5b-4 §6), and a parametric field type would need
-            // a type-parameter substitution this slice deliberately defers. The field
-            // elaboration below is therefore param-free and never sees a type param.
-            if t.params.is_empty() {
+            // Every ADT is recorded, parametric ones with their parameters
+            // (2026-10-09): the back end monomorphizes them (`specialize`).
+            {
                 let mut ctors = Vec::with_capacity(t.variants.len());
                 for v in &t.variants {
                     let vd = &v.node;
@@ -210,6 +213,7 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
                 }
                 types.push(CoreType {
                     name: t.name.clone(),
+                    params: t.params.clone(),
                     ctors,
                 });
             }
@@ -284,6 +288,35 @@ struct LowerCx {
 /// reference and maps to `Ty::Con` with its args elaborated. No type parameters
 /// reach here, so there is no substitution.
 fn ann_to_ty(a: &TypeAnn) -> Ty {
+    // A function-typed field (2026-10-09): exactly its written row, closed --
+    // the type checker's reading (`elaborate_adt_ty`).
+    if a.name == "fn" && !a.args.is_empty() {
+        let n = a.args.len();
+        let params = a.args[..n - 1].iter().map(|x| ann_to_ty(&x.node)).collect();
+        let ret = ann_to_ty(&a.args[n - 1].node);
+        let labels = a
+            .row
+            .iter()
+            .flatten()
+            .map(|l| {
+                (
+                    l.node.clone(),
+                    crate::types::EffectLabel {
+                        args: Vec::new(),
+                        span: l.span,
+                    },
+                )
+            })
+            .collect();
+        return Ty::Fn(
+            params,
+            crate::types::EffectRow {
+                labels,
+                tail: crate::types::RowTail::Closed,
+            },
+            Box::new(ret),
+        );
+    }
     match a.name.as_str() {
         "Int" => Ty::int(),
         "Float" => Ty::float(),
@@ -413,10 +446,13 @@ fn lower_expr(
                     });
                 }
             }
-            if let Expr::Resume { .. } = &callee.node {
+            if !matches!(callee.node, Expr::Var(_)) {
                 // A-normalize an APPLIED resume (spec §3.2) so codegen meets a `Var`
                 // callee, never a computed one:
                 //     resume(v)(args)  ==>  let $k = resume(v) in $k(args)
+                // Since 2026-10-09 every computed callee, not only `resume`:
+                // `(run(child))(q)`, `(fn(x) { .. })(1)` (the async scheduler
+                // needed it; codegen refused "computed callee").
                 // A bare `resume(v)` never reaches here — it is not a Call. `$k` is
                 // SYNTHESIZED (D7): the Let and the `$k` Var take the resume's span,
                 // and the Var's type is cloned from the resume node, never looked up.

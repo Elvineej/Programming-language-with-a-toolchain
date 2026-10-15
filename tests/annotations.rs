@@ -220,16 +220,35 @@ fn parenthesised_and_empty_types_parse() {
 }
 
 #[test]
-fn a_function_type_in_a_declaration_is_named_not_unknown() {
-    // F7: function types now parse everywhere; in a type or effect
-    // declaration they are not supported yet, and the error says so.
-    for src in [
-        "type Box { B(fn(Int) -> Int) }\npub fn main() -> Int { 0 }\n",
-        "effect E { fn ap(f: fn(Int) -> Int) -> Int }\npub fn main() -> Int { 0 }\n",
-    ] {
-        let err = check_err(src);
-        assert!(err.contains("function type"), "{err}");
-    }
+fn a_function_type_in_a_declaration_has_exactly_its_written_row() {
+    // Replaces `a_function_type_in_a_declaration_is_named_not_unknown` (the
+    // review's F7 named error), lifted the same day for the async scheduler:
+    // a declaration has no row parameters, so a field's or an operation
+    // parameter's function type has exactly the row written (none: pure). A
+    // pure value fits an effectful field by sub-effecting; an effectful one
+    // does not fit a pure field.
+    checks_and_prints(
+        "effect L { fn lg(x: Int) -> Int }\n\
+         type Box { B(fn(Int) / {L} -> Int) }\n\
+         fn call(b) { match b { B(f) -> f(2) } }\n\
+         pub fn main() {\n\
+           let r = handle { call(B(fn(x) { lg(x) })) + call(B(fn(x) { x })) } with { L.lg(x) -> resume(x * 10)  return(r) -> r }\n\
+           io.println(if r == 22 { \"22\" } else { \"wrong\" })\n\
+         }\n",
+        "22\n",
+    );
+    let err = check_err(
+        "effect L { fn lg(x: Int) -> Int }\n\
+         type Box { B(fn(Int) -> Int) }\n\
+         pub fn main() -> Int { match B(fn(x) { lg(x) }) { B(f) -> 0 } }\n",
+    );
+    assert!(err.contains("E0423"), "{err}");
+    let err = check_err(
+        "effect State(s) { fn get() -> s }\n\
+         type Box { B(fn() / {State} -> Int) }\n\
+         pub fn main() -> Int { 0 }\n",
+    );
+    assert!(err.contains("generic effect"), "{err}");
 }
 
 #[test]

@@ -141,6 +141,11 @@ pub(crate) fn prepass(core: &CoreModule, cps_fns: &HashSet<String>) -> R<()> {
             }
         }
     }
+    let ctor_fields: HashMap<String, Vec<Ty>> = core
+        .types
+        .iter()
+        .flat_map(|t| t.ctors.iter().map(|c| (c.name.clone(), c.fields.clone())))
+        .collect();
     for f in &core.fns {
         let mut scope: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
         check(&f.body, &mut scope, &fns, cps_fns)?;
@@ -149,9 +154,48 @@ pub(crate) fn prepass(core: &CoreModule, cps_fns: &HashSet<String>) -> R<()> {
             .iter()
             .map(|p| (p.name.clone(), Some(p.ty.clone())))
             .collect();
-        check_local_conventions(&f.body, &mut locals)?;
+        check_local_conventions(&f.body, &mut locals, &ctor_fields)?;
     }
     Ok(())
+}
+
+/// A match arm's binders with their types where they are known: a variable
+/// pattern is the scrutinee, a constructor's variable field its declared
+/// field type (2026-10-09: ADT fields can hold functions, so a binder can be
+/// a closure whose convention is the field type's). Anything else is `None`.
+/// A monomorphized instance's field rows are those of whichever use
+/// registered it first, but instances are keyed by convention
+/// (`specialize::layout_key`), so its fields' conventions -- all this
+/// reads -- are every use's.
+fn typed_binders(
+    pat: &CorePat,
+    scrutinee: &Ty,
+    ctors: &HashMap<String, Vec<Ty>>,
+) -> Vec<(String, Option<Ty>)> {
+    match pat {
+        CorePat::Var(v) => vec![(v.clone(), Some(scrutinee.clone()))],
+        CorePat::Ctor(name, args) => {
+            let mut out = Vec::new();
+            for (i, p) in args.iter().enumerate() {
+                match p {
+                    CorePat::Var(v) => {
+                        out.push((v.clone(), ctors.get(name).and_then(|fs| fs.get(i)).cloned()))
+                    }
+                    other => {
+                        let mut names = Vec::new();
+                        crate::closure::pat_binders(other, &mut names);
+                        out.extend(names.into_iter().map(|n| (n, None)));
+                    }
+                }
+            }
+            out
+        }
+        other => {
+            let mut names = Vec::new();
+            crate::closure::pat_binders(other, &mut names);
+            names.into_iter().map(|n| (n, None)).collect()
+        }
+    }
 }
 
 /// D16 for LOCAL bindings (5b-9b review). A closure's convention is fixed by
@@ -161,11 +205,16 @@ pub(crate) fn prepass(core: &CoreModule, cps_fns: &HashSet<String>) -> R<()> {
 /// convention) and the use instantiates it at a user effect -- the call would
 /// jump into a direct function with the CPS signature (measured: SIGSEGV where
 /// the evaluator printed 8). Refused by the same name as the top-level case.
-/// Binders whose type is not tracked (pattern and return binders, `$cont`)
-/// carry `None` and are never refused here.
-fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>) -> R<()> {
-    let go =
-        |c: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>| check_local_conventions(c, locals);
+/// Binders whose type is not tracked (nested pattern binders, `$cont`) carry
+/// `None` and are never refused here.
+fn check_local_conventions(
+    e: &CoreExpr,
+    locals: &mut Vec<(String, Option<Ty>)>,
+    ctors: &HashMap<String, Vec<Ty>>,
+) -> R<()> {
+    let go = |c: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>| {
+        check_local_conventions(c, locals, ctors)
+    };
     match &e.kind {
         CoreKind::Lit(_) => Ok(()),
         // Sub-effecting (2026-10-08): a direct closure may now be USED where an
@@ -218,10 +267,8 @@ fn check_local_conventions(e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>)
         CoreKind::Match(s, arms) => {
             go(s, locals)?;
             for arm in arms.iter() {
-                let mut names = Vec::new();
-                crate::closure::pat_binders(&arm.pat, &mut names);
                 let depth = locals.len();
-                locals.extend(names.into_iter().map(|n| (n, None)));
+                locals.extend(typed_binders(&arm.pat, &s.ty, ctors));
                 let r = go(&arm.body, locals);
                 locals.truncate(depth);
                 r?;
@@ -373,9 +420,10 @@ fn check(
 
 /// D16's two refusals at a reference to a top-level function.
 fn check_reference(target: &elya::core::CoreFn, at: &Ty, cps_fns: &HashSet<String>) -> R<()> {
-    let generic_is_polymorphic = target.params.iter().any(|p| cps::ty_has_open_row(&p.ty))
-        || cps::ty_has_open_row(&target.body.ty);
-    if generic_is_polymorphic && cps::ty_names_user_effect(at) {
+    // N7 part 1: a use that instantiates a signature row variable at a user
+    // effect is redirected to a clone by `specialize`; one still reaching here
+    // (none from a clean module) is refused by the old name.
+    if crate::specialize::instantiation_mask(target, at) != 0 {
         return Err(CodegenError::Unsupported(
             "effect-polymorphic function used at a user effect",
         ));

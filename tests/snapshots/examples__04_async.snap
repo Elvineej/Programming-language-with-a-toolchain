@@ -1,0 +1,20 @@
+---
+source: tests/examples.rs
+expression: "run_example(\"04_async.elya\")"
+---
+-- sync: each with a plain callback
+one
+two
+three
+-- async: the same each, inside two tasks that yield
+task B
+uno
+task A
+one
+task B
+dos
+task A
+two
+task A
+three
+-- all tasks done

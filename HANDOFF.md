@@ -3,20 +3,22 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-09)
+## State at handoff (updated 2026-10-10)
 
 - `main` has everything through #15 (5b-9b). The stacked PRs #16-#19 were merged into
   each other's branches, not into `main`, so `main` still lacks 5b-10, the three
-  soundness fixes, E0207 and sub-effecting. **One PR lands all of it:** branch
+  soundness fixes, E0207 and sub-effecting. **One PR lands all of it:** #20, branch
   `claude/sub-effecting` -> `main`. From now on: one PR at a time, always based on `main`.
+- Waiting on the maintainer's merge, in order: #20 (sub-effecting and everything before
+  it), #21 (`claude/annotations`), then the async PR (`claude/async`, built on the
+  annotations commit). Each targets `main` and shows only its own commits once the one
+  before it merges.
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
   university address; every branch was force-pushed. Do not push old local branches.
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Branch `claude/annotations` (checked type annotations) is stacked on #20's branch; its
-  PR targets `main` and shows only its own commit once #20 merges.
-- Linux gate at the annotations tip: 783 passed, 77 suites. `gc_mark` 637 bytes.
+- Linux gate at the async tip: 812 passed, 79 suites. `gc_mark` 637 bytes.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
   language decisions taken. The maintainer delegated all choices (rule 2).
@@ -135,32 +137,42 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   review found a native GC unsoundness through a generalized annotation variable (3395 for
   42), fixed first.
 
+- **Async without function colouring, with N7's specialization** (2026-10-10, branch
+  `claude/async`; old steps 1 and 2). Spec:
+  `docs/superpowers/specs/2026-10-09-elya-async-design.md`.
+  - **The example:** `examples/04_async.elya` is a round-robin scheduler written as an
+    Elya handler, with `fork` and ONE `each` used by sync code and by yielding tasks. It
+    runs natively with the evaluator's output.
+  - **Front end:**
+    - function types in type and effect declarations;
+    - deferred lambda closing, where the value row includes the ambient and is
+      generalized with the inclusion copied.
+  - **Native** (`crates/codegen/src/specialize.rs`):
+    - convention clones (`$poly`);
+    - type-variable monomorphization;
+    - parametric ADT instances keyed up to rows;
+    - computed callees A-normalized.
+  - **Review6 found** a tag miscompile (one instantiation became several types), a build
+    that never finished on a non-regular type, and the deferral over-rejecting six
+    programs base accepted. All three were fixed test-first, with controls.
+  - **Not done from old step 1:** the closure adapter (now step 5).
+
 ## The next five steps
 
-### 1. N7 part 1: convention specialization and the closure adapter (native)
+### 1. `resume` carries the rows its body relays (soundness)
 
-What sub-effecting newly accepts mostly stops at two native refusals: "effect-polymorphic
-function used at a user effect" (D16) and "direct function used where an effectful one is
-expected". Both are about CONVENTION, not representation. A row-polymorphic function
-needs at most two compiled versions (direct, and CPS when its row variable is instantiated
-at a user effect), so compile the CPS clone on demand: inside it, an open row variable of
-the function's own type counts as effectful. A direct closure used at an effectful type
-gets an adapter closure, `adapt(clos, args.., k) = k(code(clos.inner, args..))`, with one
-descriptor row. Measure first (`w(k) { k(0) + lg(1) }`, `twice`, the review's a1/q1/s1h,
-`tests/sub_effecting.rs`, through `build`), keep `gc_mark` byte-identical; the type-variable
-half of N7 (`Ty::Var`, "unrepresentable type"; specialisation plus dictionary passing,
-`@specialize`/`@share`, a code-size budget) is part 2.
+PARKED, now reachable in the scheduler shape: an UNANNOTATED `run(task)` whose task
+performs an outer `T` checks clean and the evaluator stops on an unhandled effect
+(review6's s03); review2's a1 is refused natively for the same reason. `resume` adds the
+handled body's labels but not a tail it only relays. Tying the resume site to that tail
+by equality (as a call of a parameter does) forces an unannotated scheduler's tasks to be
+`Async`-only -- the queue's closed `{IO}` closes the relayed row -- so it needs a real
+design: an upper-bounded inclusion (`w ⊆ {IO}`), or the clause rows known before the
+clauses are typed (the return clause's and re-entered clauses' effects are the same
+family). Measure s03, s04, a1 and `tests/async_effect.rs` first; nothing that checks
+today may start failing without a named reason.
 
-### 2. Async as an effect: a scheduler handler (ROADMAP priority 1)
-
-An `Async` effect (`fork`, `yield`) and a round-robin scheduler written as an ordinary
-Elya handler that keeps a queue of suspended continuations. Show that the same `map` works
-for sync and async code (no function colouring). The evaluator first, then natively (a
-queue of continuations needs escaped resumes, which work natively; `fork` may need
-multi-shot or a second continuation: measure). Ship `examples/04_async.elya`, with tests
-and a README section.
-
-### 3. Native multi-shot handlers (`with multi`)
+### 2. Native multi-shot handlers (`with multi`)
 
 Refused natively by name since 5b-8 (A2); the evaluator runs them. A multi-shot resume
 re-runs a captured continuation, but native frames are consumed in place -- and since 5b-10
@@ -171,7 +183,7 @@ copy-on-resume rule. Measure first (the evaluator's multi-shot corpus, e.g.
 stated and gated against A4's live-set instrument. Multi-shot is what a native
 probabilistic or backtracking handler needs (ROADMAP), so it is worth doing natively.
 
-### 4. Evaluator: non-tail recursion under a handler is quadratic
+### 3. Evaluator: non-tail recursion under a handler is quadratic
 
 PARKED: about 4× time per doubling (n=4000 takes 1.7 s; n=100 000 did not finish in 10
 minutes). This caps every differential test's N. Profile (frame capture copies the
@@ -179,7 +191,7 @@ continuation?), predict the complexity, fix, and pin it with a timing-free test 
 counts steps or allocations. The evaluator is the reference semantics, so the
 differential corpora must stay green unchanged.
 
-### 5. Exact replay and handler-based testing (ROADMAP priority 3)
+### 4. Exact replay and handler-based testing (ROADMAP priority 3)
 
 A `Record` handler that wraps a computation and logs every effect's answer (op name,
 arguments, the value it resumed with), and a `Replay` handler that feeds a log back and
@@ -189,6 +201,23 @@ effect set first (needs a list of answers: an ADT log is enough; strings wait fo
 handlers instead of mocking. Evaluator and native. Ship `examples/05_replay.elya` with
 tests and a README section; the CLI flag (`elya run --record/--replay`) comes after real
 I/O effects exist.
+
+### 5. The closure adapter, and what specialization still refuses (native)
+
+**The adapter.** A direct closure used where an effectful function is expected is
+refused by name, "direct function used where an effectful one is expected". This is
+D16: its code has the direct convention, and the caller calls it as CPS. Wrap it at the
+upcast in an adapter closure, `adapt(clos, args.., k) = k(code(clos.inner, args..))`,
+with one descriptor row. That accepts review6's x1 and the j01/j03/j07 shapes (a `let`,
+a field, a pattern).
+
+**Same pass, the specialization leftovers (PARKED):**
+- a generic function used as a value: clone it at the value's type;
+- shadowing a generic name keeps the original (d04): make `refs` scope-aware;
+- f05's misleading refusal name;
+- let-polymorphic lambdas: clone per instantiation, or refuse them more clearly.
+
+**Rules:** measure through `build` first and keep `gc_mark` byte-identical.
 
 Also open, unscheduled: native strings (`<>` refused natively, no Int-to-String; the
 builtin's name is Claude's call now -- `int.to_string` is the natural one); the roadmap's

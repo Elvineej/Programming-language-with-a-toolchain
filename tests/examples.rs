@@ -21,3 +21,10 @@ fn cek() {
     // A CEK machine written in Elya, running a lambda calculus (2026-10-05).
     insta::assert_snapshot!("03_cek", run_example("03_cek.elya"));
 }
+
+#[test]
+fn async_scheduler() {
+    // Async without function colouring (2026-10-09): a scheduler written as
+    // an Elya handler, and one `each` used by sync code and by tasks.
+    insta::assert_snapshot!("04_async", run_example("04_async.elya"));
+}

@@ -836,6 +836,7 @@ fn a_failed_match_traps_with_a_named_error() {
     let core = CoreModule {
         types: vec![CoreType {
             name: "T".into(),
+            params: vec![],
             ctors: vec![
                 CoreCtor {
                     name: "A".into(),
@@ -1764,6 +1765,27 @@ const CPS_ROOTING: &[(&str, &str)] = &[
          }
          pub fn main() -> Int { handle { user() } with { T.t() -> resume(7)  return(r) -> r } }
 ",
+    ),
+    (
+        // 2026-10-09, parametric ADTs monomorphized: `List(String)` and
+        // `List(Int)` are separate instances with separate GC rows (the head
+        // is traced in one and not the other). Both lists are live across a
+        // 30,000-cell build: a shared row would trace an Int as a pointer or
+        // leave a String untraced. 30000 + 3 + 3 + 6.
+        "monomorphized-lists-keep-their-own-gc-rows",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         effect S { fn get() -> Int }\n\
+         fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }\n\
+         fn len(xs) { match xs { Nil -> 0  Cons(_, t) -> 1 + len(t) } }\n\
+         fn sum(xs) { match xs { Nil -> 0  Cons(h, t) -> h + sum(t) } }\n\
+         fn user() -> Int {\n\
+         \x20 let ws = Cons(\"a\", Cons(\"b\", Cons(\"c\", Nil)))\n\
+         \x20 let ns = Cons(1, Cons(2, Cons(3, Nil)))\n\
+         \x20 let junk = len(build(30000, Nil))\n\
+         \x20 let k = get()\n\
+         \x20 junk + len(ws) + len(ns) + sum(ns) + k\n\
+         }\n\
+         pub fn main() -> Int { handle { user() } with { S.get() -> resume(0)  return(r) -> r } }\n",
     ),
 ];
 
@@ -3532,4 +3554,280 @@ fn a_direct_closure_upcast_through_a_return_binder_is_refused_by_name() {
         "{err}"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- 2026-10-09: async without colouring, N7 part 1 (specialization) -------
+
+/// `examples/04_async.elya` natively: the scheduler (an Elya handler keeping a
+/// queue of continuations), `fork`, and ONE `each` used by sync code and by
+/// tasks that yield. Before this slice `elya build` refused it four ways
+/// (spec `2026-10-09-elya-async-design.md` §0); the native text must be the
+/// evaluator's, line for line.
+#[test]
+fn the_async_example_runs_natively_like_the_evaluator() {
+    let path = format!(
+        "{}/../../examples/04_async.elya",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let src = std::fs::read_to_string(&path).expect("read the example");
+    let dir = temp_dir("async-example");
+    let exe = compile_and_link(&lower_src(&src), &dir, "async-example");
+    let out = Command::new(&exe).output().expect("run produced binary");
+    diagnose_crash(&out.status, "async-example");
+    assert!(out.status.success(), "binary exited {:?}", out.status);
+    let (text, _unit) =
+        split_text_and_value(&String::from_utf8_lossy(&out.stdout), "async-example");
+    assert_eq!(text, eval_main_text_any(&src));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The evaluator's printed text, for a `main` of any type.
+fn eval_main_text_any(src: &str) -> String {
+    let session = Session::new();
+    let (m, pd) = parse_module(&session, src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let (interp, _) = elya::eval::run_module_value(&m).expect("evaluator runs");
+    interp.output().to_string()
+}
+
+/// N7 by specialization. Every row was refused before: "unrepresentable
+/// type" (a type variable in a generic function's signature) or
+/// "effect-polymorphic function used at a user effect" (D16). Values are the
+/// evaluator's (the differential test compares them).
+///
+/// Negative controls, each reverted (`cmp` against a saved copy), each
+/// failing differently (the async example and the monomorphized-lists
+/// `CPS_ROOTING` row are in the same footprints):
+/// - S1, no type-variable clones (rows only): every row fails to build, each
+///   by the refusal it first meets ("parametric ADT", D16's "effect-polymorphic
+///   function used at a user effect", "unrepresentable type");
+/// - S2, no row clones (`$poly` never substituted): only the
+///   effect-polymorphic row and the async example fail, by D16's refusal;
+/// - S3, generic originals always emitted: as S1 but the generic original is
+///   what fails ("unrepresentable type" where S1 met D16's refusal);
+/// - M1, no type instances: every row fails as "parametric ADT";
+/// - M2, an instance's fields not substituted: the compiler panics on a
+///   mistyped value (inkwell) -- per-instance rows are load-bearing.
+const SPECIALIZED: &[(&str, &str, &str)] = &[
+    (
+        // one generic `map` and `len`, used at Int and Bool lists.
+        "map-at-two-types",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn map(xs, f) { match xs { Nil -> Nil  Cons(h, t) -> Cons(f(h), map(t, f)) } }\n\
+         fn len(xs) { match xs { Nil -> 0  Cons(_, t) -> 1 + len(t) } }\n\
+         fn count(bs) { match bs { Nil -> 0  Cons(b, t) -> (if b { 1 } else { 0 }) + count(t) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let xs = Cons(1, Cons(2, Cons(3, Nil)))\n\
+         \x20 len(map(xs, fn(x) { x * 2 })) * 10 + count(map(xs, fn(x) { x > 1 }))\n\
+         }\n",
+        "32",
+    ),
+    (
+        // the colourless helper: the same `apply_all` with a pure callback and
+        // with one that performs (a CPS clone with `$poly`).
+        "one-helper-pure-and-effectful",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn sum_with(xs, f) { match xs { Nil -> 0  Cons(h, t) -> f(h) + sum_with(t, f) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let xs = Cons(1, Cons(2, Cons(3, Nil)))\n\
+         \x20 let a = sum_with(xs, fn(x) { x })\n\
+         \x20 let b = handle { sum_with(xs, fn(x) { lg(x) }) } with { L.lg(x) -> resume(x * 100)  return(r) -> r }\n\
+         \x20 a + b\n\
+         }\n",
+        "606",
+    ),
+    (
+        // a generic function calling a generic function, both specialized.
+        "generic-calls-generic",
+        "type Box(a) { B(a) }\n\
+         fn unbox(b) { match b { B(x) -> x } }\n\
+         fn twice_unbox(b) { unbox(B(unbox(b))) }\n\
+         pub fn main() -> Int { if twice_unbox(B(True)) { twice_unbox(B(41)) + 1 } else { 0 } }\n",
+        "42",
+    ),
+];
+
+#[test]
+fn specialized_programs_compile_and_run() {
+    run_value_corpus(SPECIALIZED, "specialized");
+}
+
+#[test]
+fn native_output_matches_the_evaluator_across_the_specialized_corpus() {
+    run_differential_corpus(SPECIALIZED, "specialized-diff");
+}
+
+/// One ADT instantiation must be ONE native type (review6's first finding).
+/// Instances were keyed by the `Debug` text of their type arguments, which
+/// carries effect-row detail a layout does not depend on -- an open row
+/// variable's id, the `$poly` marker against the real effect, a label's span
+/// -- so one value's constructor tag was another's: a wildcard arm ran (0
+/// where the evaluator printed 42) or no arm matched. `(tag, source, text,
+/// value)`; both halves are also the evaluator's.
+///
+/// Negative controls, each reverted (`cmp` against a saved copy):
+/// - K1, instances keyed by the raw `Debug` text again: every row but the
+///   plain-type guard fails (wrong value or "match failed");
+/// - K2, the key drops the calling convention too: only the two-conventions
+///   row fails, by D16's "effect-polymorphic function used at a user effect";
+/// - B1 (for the next test), no depth bound: the non-regular build times out.
+const INSTANCE_KEYS: &[(&str, &str, &str, &str)] = &[
+    (
+        // an open row variable in the clone, `{}` in main.
+        "opt-of-closure-through-a-clone",
+        "type Opt(a) { None, Some(a) }\n\
+         fn call_or(o, d) { match o { Some(f) -> f(1)  _ -> d } }\n\
+         pub fn main() -> Int { call_or(Some(fn(x) { x + 41 }), 0) }\n",
+        "",
+        "42",
+    ),
+    (
+        "box-of-closure-no-wildcard",
+        "type Box(a) { B(a) }\n\
+         fn call(b) { match b { B(f) -> f() } }\n\
+         pub fn main() -> Int { call(B(fn() { 42 })) }\n",
+        "",
+        "42",
+    ),
+    (
+        // `$poly` in the convention clone, `S` at the caller.
+        "list-of-user-effect-closures-through-a-clone",
+        "effect S { fn get() -> Int }\n\
+         type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn run_all(fs, x) { match fs { Nil -> 0  Cons(f, rest) -> f(x) + run_all(rest, x) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle {\n\
+         \x20   let fs = Cons(fn(x) { x + get() }, Cons(fn(x) { x * 10 }, Nil))\n\
+         \x20   run_all(fs, 5)\n\
+         \x20 } with { S.get() -> resume(100)  return(r) -> r }\n\
+         }\n",
+        "",
+        "155",
+    ),
+    (
+        // no generic function at all: two labels' spans differ.
+        "two-lists-of-io-closures",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         pub fn main() -> Int {\n\
+         \x20 let xs = Cons(fn() { io.println(\"a\")  1 }, Nil)\n\
+         \x20 let ys = Cons(fn() { io.println(\"b\")  2 }, xs)\n\
+         \x20 match ys { Nil -> 0  Cons(f, rest) -> f() + match rest { Nil -> 0  Cons(g, _) -> g() } }\n\
+         }\n",
+        "b\na\n",
+        "3",
+    ),
+    (
+        // a helper whose parameter type is written with a closed row.
+        "annotated-list-of-io-closures",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn run_all(fs: List(fn() / {IO} -> Int)) / {IO} -> Int {\n\
+         \x20 match fs { Nil -> 0  Cons(f, rest) -> f() + run_all(rest) }\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 let fs = Cons(fn() { io.println(\"a\")  1 }, Cons(fn() { io.println(\"b\")  2 }, Nil))\n\
+         \x20 run_all(fs)\n\
+         }\n",
+        "a\nb\n",
+        "3",
+    ),
+    (
+        // review4's n2, refused by name before this slice.
+        "pattern-bound-closure-joined-in-a-clone",
+        "effect T { fn t() -> Int }\n\
+         type Box(a) { B(a) }\n\
+         fn h(c, b) { match b { B(f) -> { let g = if c { f } else { fn(x) { t() + x } }  g(1) } } }\n\
+         pub fn main() -> Int { handle { h(True, B(fn(x) { x + 1 })) + h(False, B(fn(x) { x + 1 })) } with { T.t() -> resume(10)  return(r) -> r } }\n",
+        "",
+        "13",
+    ),
+    (
+        // one type at BOTH conventions: the key keeps the convention, so a
+        // binder's field type still says how its closure is called.
+        "one-type-direct-and-cps-closures",
+        "effect S { fn get() -> Int }\n\
+         type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn run_all(fs) { match fs { Nil -> 0  Cons(f, rest) -> f() + run_all(rest) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = run_all(Cons(fn() { 1 }, Cons(fn() { 2 }, Nil)))\n\
+         \x20 let b = handle { run_all(Cons(fn() { get() }, Nil)) } with { S.get() -> resume(100)  return(r) -> r }\n\
+         \x20 a + b\n\
+         }\n",
+        "",
+        "103",
+    ),
+    (
+        // guard: a plain type's fields name instances too (rewritten since
+        // review6; the back end only needed a heap pointer there before).
+        "plain-type-holding-instances",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         type Q { Q(List(Int), List(String)) }\n\
+         fn sum(xs) { match xs { Nil -> 0  Cons(x, t) -> x + sum(t) } }\n\
+         fn len(xs) { match xs { Nil -> 0  Cons(_, t) -> 1 + len(t) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let q = Q(Cons(40, Cons(1, Nil)), Cons(\"a\", Nil))\n\
+         \x20 match q { Q(xs, ss) -> sum(xs) + len(ss) }\n\
+         }\n",
+        "",
+        "42",
+    ),
+];
+
+#[test]
+fn one_adt_instantiation_is_one_native_type() {
+    let dir = temp_dir("instance-keys");
+    let mut failures = Vec::new();
+    for (tag, src, text, value) in INSTANCE_KEYS {
+        let exe = match try_compile_and_link(&lower_src(src), &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        if !out.status.success() {
+            failures.push(format!(
+                "{tag}: {:?} {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+            continue;
+        }
+        let got = split_text_and_value(&String::from_utf8_lossy(&out.stdout), tag);
+        let want = ((*text).to_string(), (*value).to_string());
+        let eval = (eval_main_text(src), eval_main_int(src));
+        if got != want || got != eval {
+            failures.push(format!(
+                "{tag}: native={got:?} want={want:?} evaluator={eval:?}"
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A non-regular parametric type (`Nest(a)` holds a `Nest(Box(a))`) has
+/// infinitely many instances; monomorphizing it registered them forever --
+/// `elya build` never finished (review6's second finding). Refused by name,
+/// promptly: the build runs on a thread so a regression fails instead of
+/// hanging the suite.
+#[test]
+fn a_non_regular_parametric_type_is_refused_by_name() {
+    let src = "type Box(a) { B(a) }\n\
+               type Nest(a) { Leaf, N(a, Nest(Box(a))) }\n\
+               fn depth(n) { match n { Leaf -> 0  N(_, rest) -> 1 } }\n\
+               pub fn main() -> Int { let x = N(1, Leaf)  depth(x) }\n";
+    assert_eq!(eval_main_int(src), "1");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = elya_codegen::emit_ir(&lower_src(src)).map(|_| ());
+        tx.send(r.map_err(|e| format!("{e:?}"))).ok();
+    });
+    let r = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the build finished");
+    let err = r.expect_err("a non-regular type is refused");
+    assert!(err.contains("non-regular parametric type"), "{err}");
 }

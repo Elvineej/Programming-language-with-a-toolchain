@@ -1,0 +1,78 @@
+// Async without function colouring.
+//
+// In JavaScript, Rust, Python or C#, `async` splits a program in two: an async
+// function cannot be called from a sync one without ceremony, and every
+// higher-order helper needs an async twin. In Elya, suspending is just an
+// effect. A task that waits performs `Async`; the scheduler is an ordinary
+// handler, written below in Elya, that keeps the continuations of suspended
+// tasks in a queue and resumes them in turn. Nothing is coloured: `each` is ONE
+// function, used by synchronous code and by tasks that yield.
+
+effect Async {
+  fn yield_() -> Unit
+  fn fork(task: fn() / {Async, IO} -> Unit) -> Unit
+}
+
+// The run queue: every entry resumes one suspended task.
+type Queue { Empty, Next(fn(Queue) / {IO} -> Unit, Queue) }
+
+fn enqueue(q, k) {
+  match q {
+    Empty -> Next(k, Empty)
+    Next(first, rest) -> Next(first, enqueue(rest, k))
+  }
+}
+
+fn run_next(q) {
+  match q {
+    Empty -> Unit
+    Next(k, rest) -> k(rest)
+  }
+}
+
+// A round-robin scheduler. The handled task's continuation is captured by
+// `resume`; on `yield_` it goes to the back of the queue, on `fork` the child
+// goes there instead. When a task finishes, the next one runs.
+fn run(task: fn() / {Async, IO} -> Unit) {
+  handle { task() } with {
+    Async.yield_() -> fn(q) { run_next(enqueue(q, fn(q2) { (resume(Unit))(q2) })) }
+    Async.fork(child) -> fn(q) { (resume(Unit))(enqueue(q, fn(q2) { (run(child))(q2) })) }
+    return(done) -> fn(q) { run_next(q) }
+  }
+}
+
+type Words { End, Word(String, Words) }
+
+// One `each`, no colour: its effects are whatever `f` performs.
+fn each(ws, f) {
+  match ws {
+    End -> Unit
+    Word(w, rest) -> {
+      f(w)
+      each(rest, f)
+    }
+  }
+}
+
+fn worker(name, ws) {
+  each(ws, fn(w) {
+    io.println(name)
+    io.println(w)
+    yield_()
+  })
+}
+
+pub fn main() {
+  let ws = Word("one", Word("two", Word("three", End)))
+
+  io.println("-- sync: each with a plain callback")
+  each(ws, fn(w) { io.println(w) })
+
+  io.println("-- async: the same each, inside two tasks that yield")
+  let program = run(fn() {
+    fork(fn() { worker("task A", ws) })
+    worker("task B", Word("uno", Word("dos", End)))
+  })
+  program(Empty)
+  io.println("-- all tasks done")
+}

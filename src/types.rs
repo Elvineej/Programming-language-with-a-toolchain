@@ -190,6 +190,21 @@ pub struct Infer {
     node_types: HashMap<Span, Ty>,
     /// Declared type names -> arity, for elaborating annotations (2026-10-09).
     known_types: HashMap<String, usize>,
+    /// Declared effect names -> type-parameter count (2026-10-09).
+    declared_effects: HashMap<String, usize>,
+    /// Lambdas whose ambient could not close yet: an inclusion into it still
+    /// has a source that may grow (a call of a value whose type is not known
+    /// yet, e.g. `resume(..)`'s result in a clause). Closed at the group's end,
+    /// and never generalized meanwhile (2026-10-09, the async scheduler).
+    deferred_lambdas: Vec<(RowVar, Vec<Ty>)>,
+    /// `(deferred ambient, value row)`: a deferred lambda's VALUE row includes
+    /// its ambient -- labels only, flushed with `pending_incl` -- instead of
+    /// being it (review6: being it let every later use join the ambient by
+    /// equality, so a context's effects leaked into the lambda and on to its
+    /// other uses). The value row's tail is phantom and may be generalized:
+    /// `instantiate` copies the inclusion to each instance, so a label the
+    /// ambient gains later still reaches every use.
+    deferred_incl: Vec<(RowVar, RowVar)>,
     /// The current top-level function's annotation type variables: a lowercase
     /// name in any annotation of one function (its signature, its `let`s and
     /// lambdas) is one shared unification variable.
@@ -213,6 +228,9 @@ impl Infer {
             affine_sites: HashSet::new(),
             node_types: HashMap::new(),
             known_types: HashMap::new(),
+            declared_effects: HashMap::new(),
+            deferred_lambdas: Vec::new(),
+            deferred_incl: Vec::new(),
             ann_vars: HashMap::new(),
             diags: Vec::new(),
         }
@@ -674,10 +692,89 @@ impl Infer {
                     self.surface_conflict(r);
                 }
             }
+            // A deferred lambda's ambient reaches its value rows: labels only.
+            // The relay rule above does not apply -- the ambient is meaningful
+            // by construction, and unifying would make the value row the
+            // ambient again.
+            for (src, dst) in self.deferred_incl.clone() {
+                let have = self.resolve_row(&EffectRow::open(dst));
+                let want = self.resolve_row(&EffectRow::open(src));
+                for (label, l) in want.labels.iter() {
+                    if have.labels.contains_key(label) {
+                        continue;
+                    }
+                    let r = self.add_label_keeping_phantom(dst, label, l.args.clone(), l.span);
+                    if r.is_ok() {
+                        changed = true;
+                    } else {
+                        self.deferred_incl.retain(|p| *p != (src, dst));
+                    }
+                    self.surface_conflict(r);
+                }
+            }
             if !changed {
                 break;
             }
         }
+    }
+
+    /// `add_effect` for a VALUE row: what remains of a phantom tail is still
+    /// phantom (as in `absorb`), so the row stays an upcast tail its callers
+    /// include rather than unify with.
+    fn add_label_keeping_phantom(
+        &mut self,
+        v: RowVar,
+        op: &str,
+        args: Vec<Ty>,
+        span: Span,
+    ) -> Result<(), RowConflict> {
+        let phantom_tail = match self.resolve_row(&EffectRow::open(v)).tail {
+            RowTail::Open(t) => self.phantom.contains(&t),
+            _ => false,
+        };
+        let fresh = if phantom_tail {
+            self.fresh_phantom_row()
+        } else {
+            self.fresh_row()
+        };
+        let mut labels = BTreeMap::new();
+        labels.insert(op.to_string(), EffectLabel { args, span });
+        let target = EffectRow {
+            labels,
+            tail: RowTail::Open(fresh),
+        };
+        self.unify_row(&EffectRow::open(v), &target, span)
+    }
+
+    /// The value row of a deferred lambda: its ambient's labels so far and a
+    /// fresh phantom tail, recorded as including the ambient (`deferred_incl`).
+    fn deferred_value_row(&mut self, amb: RowVar) -> EffectRow {
+        let now = self.resolve_row(&EffectRow::open(amb));
+        let tail = self.fresh_phantom_row();
+        let row = EffectRow {
+            labels: now.labels,
+            tail: RowTail::Open(tail),
+        };
+        let dst = self.fresh_phantom_row();
+        self.bind_row(dst, &row, Span::EMPTY);
+        self.deferred_incl.push((amb, dst));
+        row
+    }
+
+    /// Whether a pending inclusion targets `amb`'s row while its source is
+    /// still open (it may gain labels later).
+    fn has_open_inclusion_into(&self, amb: RowVar) -> bool {
+        let tail = self.resolve_row(&EffectRow::open(amb)).tail;
+        let RowTail::Open(_) = tail else {
+            return false;
+        };
+        self.pending_incl.iter().any(|(src, dst, _)| {
+            self.resolve_row(&EffectRow::open(*dst)).tail == tail
+                && matches!(
+                    self.resolve_row(&EffectRow::open(*src)).tail,
+                    RowTail::Open(_)
+                )
+        })
     }
 
     fn fresh_phantom_row(&mut self) -> RowVar {
@@ -1059,6 +1156,23 @@ impl Infer {
             };
             row_mapping.insert(*v, fresh);
         }
+        // A generalized value row of a deferred lambda still includes the
+        // (shared, ungeneralized) ambient: so does each instance of it.
+        for (src, dst) in self.deferred_incl.clone() {
+            let row = self.resolve_row(&EffectRow::open(dst));
+            let RowTail::Open(q) = row.tail else {
+                continue;
+            };
+            if !row_mapping.contains_key(&q) {
+                continue;
+            }
+            let carrier = Ty::Fn(Vec::new(), row, Box::new(Ty::Error));
+            if let Ty::Fn(_, inst, _) = subst_vars(&carrier, &mapping, &row_mapping) {
+                let d = self.fresh_phantom_row();
+                self.bind_row(d, &inst, Span::EMPTY);
+                self.deferred_incl.push((src, d));
+            }
+        }
         subst_vars(&s.ty, &mapping, &row_mapping)
     }
 
@@ -1299,6 +1413,18 @@ impl Infer {
                 // Pending sub-effecting inclusions reach this ambient before it
                 // closes (a label arriving later is a surfaced conflict).
                 self.flush_inclusions();
+                // An inclusion into this ambient whose source is still open may
+                // add labels later (measured: a scheduler's `fn(q2) {
+                // (resume(Unit))(q2) }` -- `resume`'s result type is only known
+                // once the clause's value is, so closing now made its IO a
+                // closed-row conflict). Then the ambient stays open, closed at
+                // the group's end, and the value's row INCLUDES it (review6:
+                // not the ambient itself, see `deferred_incl`).
+                if self.has_open_inclusion_into(lam_amb) {
+                    self.deferred_lambdas.push((lam_amb, param_tys.clone()));
+                    let row = self.deferred_value_row(lam_amb);
+                    return Ty::Fn(param_tys, row, Box::new(body_ty));
+                }
                 self.close_unrelayed_residual(lam_amb, &param_tys);
                 // Sub-effecting (the maintainer's decision, 2026-10-08): the
                 // VALUE's row is open even when the body's is closed -- a
@@ -1770,6 +1896,12 @@ impl Infer {
         free_row_vars(self, &resolved, &mut row_in_ty);
         let mut row_in_env = Vec::new();
         env_free_row_vars(self, env, &mut row_in_env);
+        // A deferred lambda's ambient is still being solved: not generalized.
+        for (amb, _) in self.deferred_lambdas.clone() {
+            if let RowTail::Open(v) = self.resolve_row(&EffectRow::open(amb)).tail {
+                row_in_env.push(v);
+            }
+        }
         let row_vars: Vec<RowVar> = row_in_ty
             .into_iter()
             .filter(|v| !row_in_env.contains(v))
@@ -1897,18 +2029,61 @@ fn elaborate_adt_ty(
     known: &HashMap<String, usize>,
 ) -> Ty {
     let t = &ann.node;
-    if t.name == "fn" {
-        inf.diags.push(
-            Diagnostic::error(
-                "E0432",
-                "a function type in a type or effect declaration is not supported yet",
-            )
-            .with_label(
-                ann.span,
-                "function-typed fields and operation parameters come later",
-            ),
+    // A function type in a type or effect declaration (2026-10-09): its row is
+    // EXACTLY what is written -- unwritten means pure. A declaration has no
+    // row parameters, so a field cannot be effect-polymorphic; writing the
+    // effects (`More(fn(Q) / {IO} -> Unit, Q)`) is how a queue of effectful
+    // tasks is declared. A pure value still fits an effectful field by
+    // sub-effecting.
+    if t.name == "fn" && !t.args.is_empty() {
+        let n = t.args.len();
+        let params: Vec<Ty> = t.args[..n - 1]
+            .iter()
+            .map(|a| elaborate_adt_ty(inf, a, param_env, known))
+            .collect();
+        let ret = elaborate_adt_ty(inf, &t.args[n - 1], param_env, known);
+        let mut labels = BTreeMap::new();
+        for l in t.row.iter().flatten() {
+            match inf.declared_effects.get(&l.node).copied() {
+                Some(0) => {}
+                None if l.node == "IO" => {}
+                Some(_) => {
+                    inf.diags.push(
+                        Diagnostic::error(
+                            "E0432",
+                            format!(
+                                "a generic effect (`{}`) in a declaration's function type is not supported yet",
+                                l.node
+                            ),
+                        )
+                        .with_label(l.span, "only effects without type parameters here"),
+                    );
+                    continue;
+                }
+                None => {
+                    inf.diags.push(
+                        Diagnostic::error("E0432", format!("unknown effect `{}`", l.node))
+                            .with_label(l.span, "no such effect"),
+                    );
+                    continue;
+                }
+            }
+            labels.insert(
+                l.node.clone(),
+                EffectLabel {
+                    args: Vec::new(),
+                    span: l.span,
+                },
+            );
+        }
+        return Ty::Fn(
+            params,
+            EffectRow {
+                labels,
+                tail: RowTail::Closed,
+            },
+            Box::new(ret),
         );
-        return Ty::Error;
     }
     if t.args.is_empty() {
         if let Some(ty) = param_env.get(&t.name) {
@@ -2175,6 +2350,14 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
         }
     }
     inf.known_types = known_types.clone();
+    // Every declared effect and its type-parameter count, before anything is
+    // elaborated: a function type in a type or effect declaration names
+    // effects in its row (`fn() / {Async, IO} -> Unit`), its own included.
+    for d in &module.decls {
+        if let Decl::Effect(e) = &d.node {
+            inf.declared_effects.insert(e.name.clone(), e.params.len());
+        }
+    }
     for d in &module.decls {
         if let Decl::Type(t) = &d.node {
             let param_vars: Vec<Ty> = t.params.iter().map(|_| inf.fresh()).collect();
@@ -2376,6 +2559,53 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             }
         }
         inf.flush_inclusions();
+        // 2.45. the deferred lambdas' ambients close now that every inclusion
+        //       has reached them.
+        //       A tail shared with a member's PARAMETER is a relay of it and
+        //       stays open (closing it forced `k` pure: review2's a1).
+        let member_params: Vec<Ty> = group.iter().flat_map(|i| member_ty[i].0.clone()).collect();
+        for (amb, mut params) in std::mem::take(&mut inf.deferred_lambdas) {
+            params.extend(member_params.iter().cloned());
+            inf.close_unrelayed_residual(amb, &params);
+            // Still open: the ambient relays a member's parameter, and each
+            // value row must take whatever that row takes -- its tail grows
+            // into the relayed one (labels it lacks first).
+            let now = inf.resolve_row(&EffectRow::open(amb));
+            if let RowTail::Open(w) = now.tail {
+                for (src, dst) in inf.deferred_incl.clone() {
+                    if inf.resolve_row(&EffectRow::open(src)).tail != RowTail::Open(w) {
+                        continue;
+                    }
+                    let have = inf.resolve_row(&EffectRow::open(dst));
+                    match have.tail {
+                        RowTail::Open(t) if t != w => {
+                            let missing: BTreeMap<String, EffectLabel> = now
+                                .labels
+                                .iter()
+                                .filter(|(k, _)| !have.labels.contains_key(*k))
+                                .map(|(k, l)| (k.clone(), l.clone()))
+                                .collect();
+                            inf.bind_row(
+                                t,
+                                &EffectRow {
+                                    labels: missing,
+                                    tail: RowTail::Open(w),
+                                },
+                                Span::EMPTY,
+                            );
+                        }
+                        RowTail::Open(_) => {}
+                        _ => {
+                            let r = inf.unify_row(&have, &now, Span::EMPTY);
+                            inf.surface_conflict(r);
+                        }
+                    }
+                }
+            }
+        }
+        // What the closed ambients finally hold reaches every value row, and
+        // their callers, before any row is checked.
+        inf.flush_inclusions();
         // 2.5. close each member's residual ambient (once all in-group effects
         //      are accumulated), unless it is relayed through a parameter.
         for &i in group {
@@ -2397,6 +2627,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
         //      is closed (Koka's close-at-generalization; value uses re-open).
         inf.flush_inclusions();
         inf.pending_incl.clear();
+        inf.deferred_incl.clear();
         let pending: Vec<RowVar> = inf.phantom.iter().copied().collect();
         for v in pending {
             if inf.row_subst[v as usize].is_none() {

@@ -125,15 +125,50 @@ Elya is a typed language on a CEK machine, built up through these slices:
 - Elya's **own precise mark-sweep garbage collector**: non-moving, with a shadow
   stack, compiler-generated descriptor tables and free lists;
 - **one-shot effect handlers** (selective CPS): `handle`/`resume` anywhere in a
-  clause, deep re-installation, O(1) handler lookup, one-shot enforced by a named
-  trap, and a state-passing handler loop bounded at N = 1,000,000.
+  clause, deep re-installation, a state-passing handler loop bounded at
+  N = 1,000,000. Handles can be nested, and lambdas can perform effects;
+- **generic code, specialized per use:** a row-polymorphic function used at a
+  user effect gets a CPS clone; a function used at concrete types gets a
+  monomorphic clone; each instantiation of a parametric type gets its own layout.
 
 Every native program is checked against the reference evaluator, for both the
 value and the exact bytes printed. CI runs the full gate on Windows too.
 
-Not yet native (refused by name): multi-shot handlers (`with multi`), effectful
-lambdas and closure calls, a `handle` nested in another handler or in effectful
-code, and polymorphic code that stays polymorphic (`Ty::Var`).
+Not yet native (refused by name):
+- multi-shot handlers (`with multi`);
+- a generic function used as a value rather than called;
+- non-regular parametric types;
+- a direct closure used where an effectful function is expected.
+
+### Async without function colouring
+
+In most languages `async` splits a program in two. An async function cannot be called
+from a sync one without ceremony, and every higher-order helper needs an async twin. In
+Elya, suspending is just an effect. The scheduler is an ordinary handler, written in Elya,
+that keeps suspended tasks' continuations in a queue (`examples/04_async.elya`):
+
+```elya
+effect Async {
+  fn yield_() -> Unit
+  fn fork(task: fn() / {Async, IO} -> Unit) -> Unit
+}
+
+// ONE `each`, no colour: its effects are whatever `f` performs.
+fn each(ws, f) {
+  match ws {
+    End -> Unit
+    Word(w, rest) -> {
+      f(w)
+      each(rest, f)
+    }
+  }
+}
+```
+
+The same `each` runs a plain callback in synchronous code and a callback that yields
+inside two interleaved tasks. The program runs under `elya run` and as a native binary,
+with identical output. Natively, `each` is compiled twice from one definition: a direct
+version for the plain callback, and a CPS version for the yielding one.
 
 ### Affine resources
 

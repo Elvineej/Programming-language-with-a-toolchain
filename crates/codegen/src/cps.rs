@@ -36,8 +36,8 @@ fn row_needs_cps(row: &EffectRow) -> bool {
         // D16: an open tail ALONE is direct. A row-polymorphic function is
         // compiled once, so the convention must not depend on what its row
         // variable is later instantiated with; an instantiation at a user
-        // effect is refused by name instead (`ty_names_user_effect` +
-        // `ty_has_open_row`, checked at every reference). 7a answered `true`
+        // effect gets a CPS clone of its own (N7 part 1, `specialize`;
+        // before 2026-10-09 it was refused by name). 7a answered `true`
         // here "conservatively", but over-CPS is not safe across a convention
         // boundary: `apply(fn(x) { x * 10 })` would call a direct lambda with
         // the CPS convention (measured: it compiles and prints 11 at 831b023).
@@ -455,33 +455,6 @@ pub fn contains_effect(e: &CoreExpr, fx: &Fx) -> bool {
         CoreKind::If(c, t, f) => go(c) || go(t) || go(f),
         CoreKind::Match(s, arms) => go(s) || arms.iter().any(|a| go(&a.body)),
         CoreKind::Resume(v) => go(v),
-    }
-}
-
-/// Does `ty` NAME a user-declared effect anywhere -- in its own row, or in a
-/// row inside a parameter, result or constructor argument? (D16's refusal.)
-pub fn ty_names_user_effect(ty: &Ty) -> bool {
-    match ty {
-        Ty::Fn(ps, row, r) => {
-            row.labels.keys().any(|l| l != BUILTIN_EFFECT)
-                || ps.iter().any(ty_names_user_effect)
-                || ty_names_user_effect(r)
-        }
-        Ty::Con(_, args) => args.iter().any(ty_names_user_effect),
-        _ => false,
-    }
-}
-
-/// Does `ty` contain an open row tail anywhere -- is it effect-polymorphic?
-pub fn ty_has_open_row(ty: &Ty) -> bool {
-    match ty {
-        Ty::Fn(ps, row, r) => {
-            matches!(row.tail, RowTail::Open(_))
-                || ps.iter().any(ty_has_open_row)
-                || ty_has_open_row(r)
-        }
-        Ty::Con(_, args) => args.iter().any(ty_has_open_row),
-        _ => false,
     }
 }
 

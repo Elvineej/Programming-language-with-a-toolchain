@@ -20,6 +20,7 @@
 mod closure;
 mod cps;
 mod cps_emit;
+mod specialize;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1572,6 +1573,11 @@ fn build_ctor_table(core: &CoreModule) -> HashMap<String, (usize, Vec<Ty>)> {
 /// and `@main` shim. Returns the handle so `emit_ir` and `compile_module` share
 /// one construction path.
 fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'ctx>, CodegenError> {
+    // N7 part 1 (2026-10-09): a row-polymorphic function used at a user effect
+    // gets a CPS clone of its own (`specialize`), so every later pass sees a
+    // module where conventions are fixed by types alone.
+    let specialized = specialize::specialize(core)?;
+    let core = &specialized;
     // §5.1, FIRST STATEMENT ON PURPOSE. The failure this prevents is LLVM's
     // `report_fatal_error` for a win64 guaranteed tail call: no source span, no
     // `Result`, the process simply dies. It must therefore be impossible for
@@ -2270,17 +2276,19 @@ mod tests {
     }
 
     #[test]
-    fn a_polymorphic_function_refuses_the_whole_module() {
-        // §5.2 / obligation T2. `repr_ty` refuses `Ty::Var(_)`, and `declare_all`
-        // runs it over every parameter and body type in the module — so `id`
-        // refuses this module even though `main` never calls it. That
-        // whole-module strictness is deliberate; the relaxation path (emit only
-        // what is reachable from `main`) is recorded as T2, not taken here.
-        let err = emit_ir(&core_of("fn id(x) { x }\npub fn main() { 1 }\n")).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("unrepresentable type")),
-            "{err:?}"
-        );
+    fn an_unused_polymorphic_function_is_not_emitted() {
+        // N7 (2026-10-09; replaces `a_polymorphic_function_refuses_the_whole_module`,
+        // which pinned obligation T2's whole-module strictness): `specialize`
+        // monomorphizes every use at ground types and drops a generic original
+        // that nothing reachable from `main` uses -- T2's relaxation, taken.
+        emit_ir(&core_of("fn id(x) { x }\npub fn main() { 1 }\n"))
+            .expect("an unused generic function no longer refuses the module");
+        // Used at two types, it gets two clones.
+        let ir = emit_ir(&core_of(
+            "fn id(x) { x }\npub fn main() -> Int { if id(True) { id(1) } else { 0 } }\n",
+        ))
+        .expect("each use is monomorphized");
+        assert!(ir.matches("id$s").count() >= 2, "{ir}");
     }
 
     // ---- 5b-8 7b-3 refusals (D16, D17, and what Task 8 owns) ----------------
@@ -2392,22 +2400,18 @@ mod tests {
     }
 
     #[test]
-    fn an_effect_polymorphic_function_used_at_a_user_effect_is_refused() {
-        // D16: `apply` is compiled once, direct; this instantiation would call
-        // an effectful lambda with the direct convention. N7's territory.
-        let err = refused(
-            "fn apply(f) { f(1) + 1 }\n\
-             pub fn main() -> Int {\n\
-             \x20 handle { apply(fn(x) { x * get() }) } with {\n\
-             \x20   S.get() -> resume(10)\n    return(r) -> r\n  }\n}\n",
-        );
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("effect-polymorphic function used at a user effect")
-            ),
-            "{err:?}"
-        );
+    fn an_effect_polymorphic_function_used_at_a_user_effect_compiles() {
+        // N7 part 1 (2026-10-09; replaces `..._is_refused`, D16's refusal):
+        // `apply` used at {S} gets a CPS clone with its row variable as the
+        // `$poly` marker; the original stays direct for direct uses.
+        let ir = emit_ir(&core_of(&format!(
+            "{S_W}fn apply(f) {{ f(1) + 1 }}\n\
+             pub fn main() -> Int {{\n\
+             \x20 handle {{ apply(fn(x) {{ x * get() }}) }} with {{\n\
+             \x20   S.get() -> resume(10)\n    return(r) -> r\n  }}\n}}\n"
+        )))
+        .expect("the use at a user effect gets a clone");
+        assert!(ir.contains("apply$s"), "{ir}");
     }
 
     #[test]
@@ -2512,13 +2516,11 @@ mod tests {
     }
 
     #[test]
-    fn a3_an_unconstrained_polymorphic_effect_meets_the_ty_var_refusal() {
-        // A3 (spec §11), measured. A polymorphic effect has no refusal of its
-        // own: when `reader` leaves the effect's parameter unconstrained, the
-        // parameter survives into `reader`'s type as a `Ty::Var`, and that is
-        // refused by the SAME `repr_ty` rule as `id` above (5b-8 plan D2).
-        // Constrain it (`get() + 1`) and the measured refusal moves to the
-        // monomorphic program's, so the `Ty::Var` is the cause, not the effect.
+    fn a3_an_unconstrained_polymorphic_effect_no_longer_refuses_an_unused_reader() {
+        // A3 (spec §11; expected outcome changed by N7, 2026-10-09): `reader`
+        // leaves the effect's parameter unconstrained, so it reaches Core as a
+        // `Ty::Var` -- and since nothing uses it, `specialize` drops it and the
+        // module compiles. (Used at a ground type, it would get a clone.)
         let core = core_of(
             "effect State(s) { fn get() -> s  fn set(v: s) -> Unit }\n\
              fn reader() { get() }\n\
@@ -2534,29 +2536,17 @@ mod tests {
             "the unconstrained parameter should reach Core as a Ty::Var: {:?}",
             reader.body.ty
         );
-        let err = emit_ir(&core).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("unrepresentable type")),
-            "{err:?}"
-        );
+        emit_ir(&core).expect("an unused generic reader is not emitted");
     }
 
     #[test]
-    fn rejects_a_computed_callee_specifically() {
-        // §5.3, witnessed by a program a user could actually write. The Pratt
-        // parser applies the postfix call loop to ANY atom and `(expr)` unwraps
-        // with no wrapper node, so this parses to `Call { callee: Lambda, .. }`
-        // and lowers to `App(Lambda, ..)` — it really does reach the back end.
-        //
-        // Order matters and is in our control: `build_elya_call` inspects the
-        // callee kind FIRST, so "computed callee" fires before the pre-existing
-        // `Lambda` arm of `lower_expr` is ever visited. If this test starts
-        // reporting `Unsupported("Lambda")`, that ordering has been inverted.
-        let err = emit_ir(&core_of("pub fn main() { (fn(x) { x + 1 })(3) }\n")).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("computed callee")),
-            "{err:?}"
-        );
+    fn a_computed_callee_is_a_normalized_and_compiles() {
+        // 2026-10-09 (replaces `rejects_a_computed_callee_specifically`): Core
+        // lowering A-normalizes EVERY computed callee (`let $k = e in $k(..)`),
+        // not only an applied `resume`, so this reaches the back end as a call
+        // of a local and compiles.
+        emit_ir(&core_of("pub fn main() -> Int { (fn(x) { x + 1 })(3) }\n"))
+            .expect("a computed callee compiles");
     }
 
     #[test]

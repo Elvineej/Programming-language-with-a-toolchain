@@ -21,6 +21,12 @@ fn cek_matches_tree_on_examples() {
         let p = entry.unwrap().path();
         if p.extension().and_then(|e| e.to_str()) == Some("elya") {
             let src = std::fs::read_to_string(&p).unwrap();
+            // The tree-walker does not evaluate effects (it is the oracle for
+            // pure programs only); an example that declares one, such as
+            // `04_async.elya`, is compared by its snapshot instead.
+            if src.lines().any(|l| l.trim_start().starts_with("effect ")) {
+                continue;
+            }
             // The tree-walker recurses on the HOST stack for every call (no
             // tail calls; that is why it is the oracle only for shallow
             // programs). `examples/03_cek.elya` -- a CEK machine written in
