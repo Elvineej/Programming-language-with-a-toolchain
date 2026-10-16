@@ -13,6 +13,12 @@ pub fn builtins() -> &'static [&'static str] {
         "int.to_string",
         "time.now_ms",
         "time.sleep_ms",
+        // On an operation `o` of a `with any` clause (2026-10-16).
+        "op.name",
+        "op.show",
+        "op.perform",
+        "op.encode",
+        "op.decode",
     ]
 }
 
@@ -425,6 +431,17 @@ impl Cx<'_> {
                 let mut handled: HashSet<&str> = HashSet::new();
                 for c in &handler.clauses {
                     let clause = &c.node;
+                    if handler.any {
+                        // `op(o)` names no operation: it is every one (the parser
+                        // admits nothing else in a `with any` handler).
+                        scope.push(HashSet::new());
+                        for p in &clause.params {
+                            scope.last_mut().unwrap().insert(p.node.name.clone());
+                        }
+                        self.check_expr(&clause.body.node, clause.body.span, scope);
+                        scope.pop();
+                        continue;
+                    }
                     let malformed = self.check_clause_names_an_op(clause, c.span);
                     // E0204 (5c-2): one clause per op. Op names are unique, so the
                     // op name decides whatever the spelling. A clause already
@@ -456,7 +473,9 @@ impl Cx<'_> {
                     scope.pop();
                 }
                 self.in_handler -= 1;
-                self.check_handler_covers_its_effect(handler, span);
+                if !handler.any {
+                    self.check_handler_covers_its_effect(handler, span);
+                }
                 if let Some(ret) = &handler.ret {
                     // The return clause runs after the computation completes;
                     // `resume` is not in scope there.

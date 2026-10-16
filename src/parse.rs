@@ -797,11 +797,21 @@ impl<'a> Parser<'a> {
             return None;
         }
         let multi = self.eat(&TokenKind::KwMulti);
+        // `with any` (2026-10-16): `any` is contextual, a keyword only here.
+        let any = matches!(self.peek(), Some(TokenKind::Lower(n)) if n == "any");
+        if any {
+            let at = self.peek_span();
+            self.bump();
+            if multi {
+                self.error(at, "a `with any` handler is one-shot: drop `multi`");
+                return None;
+            }
+        }
         if !self.eat(&TokenKind::LBrace) {
             self.error(self.peek_span(), "expected `{`");
             return None;
         }
-        let mut clauses = Vec::new();
+        let mut clauses: Vec<Spanned<OpClause>> = Vec::new();
         let mut ret = None;
         while self.peek().is_some() && self.peek() != Some(&TokenKind::RBrace) {
             if self.peek() == Some(&TokenKind::KwReturn) {
@@ -835,6 +845,21 @@ impl<'a> Parser<'a> {
                 });
             } else {
                 let c = self.op_clause()?;
+                if any {
+                    let ok =
+                        c.node.effect.is_none() && c.node.op == "op" && c.node.params.len() == 1;
+                    if !ok {
+                        self.error(
+                            c.span,
+                            "a `with any` handler has one operation clause, `op(o)`, and a `return` clause",
+                        );
+                        return None;
+                    }
+                    if !clauses.is_empty() {
+                        self.error(c.span, "a `with any` handler has one `op(o)` clause");
+                        return None;
+                    }
+                }
                 clauses.push(c);
             }
         }
@@ -845,6 +870,7 @@ impl<'a> Parser<'a> {
                 body: Rc::new(body),
                 handler: Rc::new(Handler {
                     multi,
+                    any,
                     clauses,
                     ret,
                 }),

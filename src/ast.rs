@@ -115,6 +115,10 @@ pub struct ReturnClause {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Handler {
     pub multi: bool,
+    /// `with any` (2026-10-16): an operation-generic handler. It handles every
+    /// operation its body performs but `IO`; its one clause is `op(o)`, stored as
+    /// an unqualified `OpClause` named `op` with the one binder `o`.
+    pub any: bool,
     pub clauses: Vec<Spanned<OpClause>>,
     pub ret: Option<ReturnClause>,
 }
@@ -657,6 +661,7 @@ mod tests {
         // handle x with { Log.log(m) -> resume(m) return(r) -> r }
         let handler = Handler {
             multi: false,
+            any: false,
             clauses: vec![sp(OpClause {
                 effect: Some("Log".into()),
                 op: "log".into(),
