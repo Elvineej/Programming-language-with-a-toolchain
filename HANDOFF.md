@@ -3,7 +3,7 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-15, an interactive session on `auto/elya`)
+## State at handoff (updated 2026-10-16, a scheduled run on `auto/elya`)
 
 - `main` has everything through #22 (the 2026-10-09/10 auto-runs: N7 part 1 through
   exact replay).
@@ -14,9 +14,9 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 934 passed, 89 suites. Since `main`, the runtime
-  has gained `elya_cont_copy` (multi-shot) and the string functions; `gc_mark` is
-  unchanged (637 bytes of source).
+- Linux gate at the tip of `auto/elya`: 946 passed, 91 suites. Since `main`, the runtime
+  has gained `elya_cont_copy` (multi-shot), the string functions and the two time
+  functions; `gc_mark` is unchanged (637 bytes of source).
 - Interactive sessions may also work on `auto/elya`. They use the same
   `AUTO_RUN_LOG.md` lock: an IN PROGRESS entry under 3 hours old makes a scheduled run
   exit.
@@ -248,18 +248,22 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   - **Order:** this step was taken before the poll loop (now step 1) because that
     example has to print times and task ids.
 
+- **Async step 2, part 2: waiting for time, and a poll loop** (2026-10-15/16, e84c105,
+  7c951d2, 1d9f565, 61a84f9; old step 1). Spec
+  `docs/superpowers/specs/2026-10-15-elya-async-step2-timers-design.md`.
+  - **Builtins:** `time.now_ms()` and `time.sleep_ms(ms)`, both `IO`, in both evaluator
+    paths and natively.
+  - **`examples/08_timers.elya`:** `sleep` parks a task on a timer list; every turn
+    wakes an expired timer; when every task is stuck the scheduler performs
+    `Clock.wait_until` on the earliest deadline, and with none left names a deadlock.
+    `virtual_clock` (exact, instant) and `real_clock` run the same scheduler.
+  - **Review:** no correctness bug; starvation of an expired timer, an early-returning
+    Windows `Sleep` and a timing-dependent value were fixed test-first.
+  - **Found:** an effectful function of five parameters is refused natively (new step 5).
+
 ## The next five steps
 
-### 1. Async step 2, part 2: I/O readiness through a poll loop
-
-ROADMAP 1b on top of `examples/06_structured.elya`: a task waiting on an I/O source is
-parked, and when nothing can run the scheduler asks the runtime which sources are ready
-(a poll/select builtin over, at first, timers or pipes -- decide what an I/O source is
-in the spec, and keep it testable deterministically). Also from part 1's spec: deadlock
-detection (a full pass of only `Awaiting` tasks) and cancellation of a scope's children
-when its body fails (needs a failure effect).
-
-### 2. Effect-polymorphic handlers (a recorder for ANY effect)
+### 1. Effect-polymorphic handlers (a recorder for ANY effect)
 
 Replay (done, `examples/05_replay.elya`) records one fixed effect: a handler covers
 exactly one effect, every operation of it, so a generic `record` would need a handler
@@ -269,7 +273,7 @@ variable a handler can be abstracted over?), survey Koka/Effekt/Frank, decide in
 and prototype in the evaluator first. Strings are native since 2026-10-15, so a
 serialized log can be printed.
 
-### 3. A function's own row in Core
+### 2. A function's own row in Core
 
 `CoreFn` has no latent row, so a type or row variable that appears ONLY in a function's
 own row is invisible at its references: N7 part 2 refuses such type variables by name
@@ -280,7 +284,7 @@ type (its row included) in Core -- the typed table's node-count tripwire
 there, so decide where it lives in the spec -- then match it at references in both
 passes and lift the refusal. Measure first which corpus programs it unlocks.
 
-### 4. A failure effect and scope cancellation
+### 3. A failure effect and scope cancellation
 
 Structured concurrency (Done) cannot cancel a scope's children: Elya has no failure
 effect in its examples. Design `effect Fail { fn fail(reason: String) -> Never }`-style
@@ -289,7 +293,7 @@ handler, and a scope that, when its body fails, drops its queued children instea
 running them -- then show it in `examples/06_structured.elya` or a new example. Measure
 first what the type system needs for an op that never returns.
 
-### 5. The last common native refusals: computed callees and functions as values
+### 4. The last common native refusals: computed callees and functions as values
 
 These are the two most frequent refusals of real programs in the 2026-10-15 sweep of
 about 700 programs, apart from test fragments without `main`.
@@ -306,7 +310,24 @@ about 700 programs, apart from test fragments without `main`.
 - **How:** measure each class through `build` first, pin each with differential rows,
   and keep `gc_mark` byte-identical.
 
-Also open, unscheduled: explicit wrapping arithmetic (`int.wrapping_mul` and friends, for
+### 5. Native arity: more parameters than the win64 tail-call cap
+
+`MAX_PARAMS` (5 LLVM parameters) refuses an effectful function of five source
+parameters, a lambda of five, a direct function of six, and clauses of four. It is the
+measured win64 `musttail` limit (5b-3 §2). Real schedulers hit it:
+`examples/08_timers.elya`'s first `run(q, timers, results, next, stalled)` was refused,
+and the example now packs its state into one value.
+- **Likely shape:** past the cap, the trailing parameters travel in one heap block
+  (an argument record) built at the call and unpacked in the callee's entry. The
+  callee keeps the guaranteed tail call; the block is an allocation site, so it is
+  rooted like a closure.
+- **Decide in the spec:** spill always past the cap, or only on win64 (one convention
+  everywhere is simpler and is what the gate can test).
+- **Measure first:** how many corpus programs hit each of the four arity refusals.
+- The Windows gate must run it; note it as debt.
+
+Also open, unscheduled: I/O sources beyond timers (pipes, sockets: a readiness builtin
+per platform, deferred by the timers spec D1); explicit wrapping arithmetic (`int.wrapping_mul` and friends, for
 hashes and generators) and unary minus natively (Core refuses "Unary"); the
 one-shot trap's words differ (evaluator "continuation resumed more than once", native
 "a one-shot continuation was resumed twice"); the parser continues a call across a

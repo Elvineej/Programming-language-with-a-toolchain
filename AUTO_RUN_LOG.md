@@ -6,8 +6,23 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 ## 2026-10-16 05:53 UTC — IN PROGRESS (scheduled run)
 
 - The 2026-10-15 21:43 entry never marked DONE; its last commit (7c951d2) is from 23:17,
-  over 3 hours ago, so this run takes over. Starting at HANDOFF step 1, task 3 (the
-  timers example).
+  over 3 hours ago, so this run takes over. LLVM 18 dev headers were missing again;
+  installed via apt (after `apt-get update`). Baseline 941 / 91.
+- **Done: HANDOFF step 1, async step 2 part 2 (timers and a poll loop).**
+  - 1d9f565: `examples/08_timers.elya` (sleep, a timer list, `Clock` under a virtual
+    and a real clock, a deadlock named), snapshot, crosscheck row, native same-bytes
+    test. Gate 944 / 91 (predicted 944).
+  - 61a84f9: review findings fixed test-first (expired timers starved by a busy queue;
+    Windows `Sleep` returning early; a value that depended on real time). Gate 946 / 91.
+  - Plan prediction that was wrong, recorded in the spec: control T1 (virtual clock
+    never advances) changes the elapsed line, not the answer order.
+- **Decisions (mine, rule 2; please review):** the clocks are generic in their answer;
+  a deadline is taken when the scheduler dequeues `Sleeping` (one lap late at most).
+- **Found:** an effectful function with five parameters is refused natively (the win64
+  tail-call cap). It is the new HANDOFF step 5.
+- **Windows-gate debt added:** e84c105, 7c951d2, 61a84f9 (runtime.c `_WIN32` time
+  branch, now looping on `GetTickCount64`), 1d9f565.
+- Next: HANDOFF step 1 (effect-polymorphic handlers).
 
 ## 2026-10-15 21:43 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue")
 
