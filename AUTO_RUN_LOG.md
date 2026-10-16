@@ -3,7 +3,13 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-16 05:53 UTC — IN PROGRESS (scheduled run)
+## 2026-10-16 12:30 UTC — IN PROGRESS (scheduled run, resumed session)
+
+- The 2026-10-15 17:53 run's session resumed after its usage limit. The 05:53 run's last
+  commit (0d1d0dc) is 07:55, over 3 hours ago, so this run takes over at 0d1d0dc.
+- PR #23 was marked ready for review by the maintainer (2026-10-16 12:29); it stays open.
+
+## 2026-10-16 05:53 UTC — ended without a DONE mark (taken over 2026-10-16 12:30)
 
 - The 2026-10-15 21:43 entry never marked DONE; its last commit (7c951d2) is from 23:17,
   over 3 hours ago, so this run takes over. LLVM 18 dev headers were missing again;
@@ -52,7 +58,7 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   - Changed expectation (this slice's own): the 09 snapshot spells `Unit`, not `()`.
 - Next: HANDOFF step 1, a function's own row in Core.
 
-## 2026-10-15 21:43 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue")
+## 2026-10-15 21:43 UTC — ended without a DONE mark (interactive session, at the maintainer's "Continue")
 
 - The interactive session that fixed d07afea is working on `auto/elya` now, so scheduled
   runs started within 3 hours of this entry exit, as the protocol says. It marks this
