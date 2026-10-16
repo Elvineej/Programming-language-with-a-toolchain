@@ -3,6 +3,12 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
+## 2026-10-16 05:53 UTC — IN PROGRESS (scheduled run)
+
+- The 2026-10-15 21:43 entry never marked DONE; its last commit (7c951d2) is from 23:17,
+  over 3 hours ago, so this run takes over. Starting at HANDOFF step 1, task 3 (the
+  timers example).
+
 ## 2026-10-15 21:43 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue")
 
 - The interactive session that fixed d07afea is working on `auto/elya` now, so scheduled
