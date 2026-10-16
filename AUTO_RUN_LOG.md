@@ -36,6 +36,15 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     `rejects_eq_on_an_unrepresentable_operand_type` now builds its operand by hand (the
     ADT it used compiles); the expected refusal is unchanged.
 - Windows-gate debt added: 9bb6f5d.
+- **Done: a repeatable differential sweep** (9176644, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-16-elya-differential-sweep-design.md`.
+  `python3 scripts/sweep.py` (needs Python 3; not part of the gate). New CLI flag
+  **`elya run --value`** (decision: mine; prints main's value as a native binary does).
+  `elya run` now keeps output printed before a runtime error (was dropped). Result at
+  9bb6f5d: 409 checked programs, 382 identical, **no disagreement and no native crash**;
+  found and fixed `elya build` panicking (debug build) on warning-only programs. Top
+  native gap: `with any` (9 programs), now HANDOFF step 1. Gate 1054 / 101.
+- Windows-gate debt added: 9176644.
 - PR #23 was merged by the maintainer (2026-10-16 18:32, at ab791b6); a new draft PR is
   open from `auto/elya`.
 - Windows-gate debt added: 94ee05e (**priority**: the Windows `elya_start` path --
