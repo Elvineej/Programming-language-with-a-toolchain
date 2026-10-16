@@ -25,6 +25,12 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   types, constructors, effects were silent overwrites). `examples/10_failure.elya`.
   Review: 1 finding (the duplicate names), fixed test-first. Gate 1010 / 95.
 - Windows-gate debt added: 4e2ca0b.
+- **Done: computed callees and functions as values natively** (05f0676, HANDOFF step 1).
+  Spec `docs/superpowers/specs/2026-10-16-elya-callees-and-function-values-design.md`.
+  **Changed expectations by this decision:** two lib.rs refusal tests now assert
+  compilation (named in the commit). Review: 1 finding (a widened row on the inner
+  call), fixed test-first. Gate 1012 / 95.
+- Windows-gate debt added: 05f0676.
 
 ## 2026-10-16 05:53 UTC — ended without a DONE mark (taken over 2026-10-16 12:30)
 
