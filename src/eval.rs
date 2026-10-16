@@ -31,6 +31,13 @@ pub enum Value {
         body: Rc<Spanned<Block>>,
         env: Env,
     },
+    /// An operation caught by a `with any` handler (2026-10-16): its effect, its
+    /// name and its arguments. Only `op.*` builtins look inside.
+    Op {
+        effect: String,
+        op: String,
+        args: Rc<Vec<Value>>,
+    },
 }
 
 /// The `Rc`-shared payload of a `Value::Ctor`. Its `Drop` is iterative so that
@@ -181,6 +188,8 @@ pub fn fn_table<'a>(module: &'a Module) -> Fns<'a> {
 }
 
 pub struct Interp {
+    /// The module's constructors and operation signatures, for `op.decode`.
+    types: Rc<crate::literal::TypeInfo>,
     output: String,
     peak_kont: usize,
     steps: u64,
@@ -190,6 +199,7 @@ pub struct Interp {
 impl Interp {
     pub fn new() -> Interp {
         Interp {
+            types: Rc::new(crate::literal::TypeInfo::default()),
             output: String::new(),
             peak_kont: 0,
             steps: 0,
@@ -746,6 +756,7 @@ pub mod cek {
         let fns = fn_table(module);
         let ops = op_table(module);
         let mut interp = Interp::new();
+        interp.types = Rc::new(crate::literal::TypeInfo::of(module));
         let Some(main) = fns.get("main").copied() else {
             return Err(rt(Span::EMPTY, "no `main` function found"));
         };
@@ -946,6 +957,14 @@ pub mod cek {
                     Expr::Qualified { module, name } if module == "time" && name == "sleep_ms" => {
                         CalleeSlot::Builtin("time.sleep_ms")
                     }
+                    Expr::Qualified { module, name } if module == "op" => match name.as_str() {
+                        "name" => CalleeSlot::Builtin("op.name"),
+                        "show" => CalleeSlot::Builtin("op.show"),
+                        "perform" => CalleeSlot::Builtin("op.perform"),
+                        "encode" => CalleeSlot::Builtin("op.encode"),
+                        "decode" => CalleeSlot::Builtin("op.decode"),
+                        _ => return Err(rt(span, format!("unknown builtin `op.{name}`"))),
+                    },
                     Expr::Qualified { module, name } => {
                         return Err(rt(span, format!("unknown builtin `{module}.{name}`")))
                     }
@@ -1266,6 +1285,11 @@ pub mod cek {
     }
 
     fn handler_handles(handler: &Handler, effect: &str, op: &str) -> bool {
+        // `with any` handles every operation that reaches it (D2: `IO` never
+        // does -- it is builtins, not performs).
+        if handler.any {
+            return true;
+        }
         handler
             .clauses
             .iter()
@@ -1293,8 +1317,18 @@ pub mod cek {
         let clause = handler
             .clauses
             .iter()
-            .find(|c| clause_matches(&c.node, effect, op))
+            .find(|c| handler.any || clause_matches(&c.node, effect, op))
             .ok_or_else(|| rt(span, format!("internal: handler has no clause for `{op}`")))?;
+        // A `with any` clause binds the operation itself.
+        let args = if handler.any {
+            vec![Value::Op {
+                effect: effect.to_string(),
+                op: op.to_string(),
+                args: Rc::new(args),
+            }]
+        } else {
+            args
+        };
         let rd = Rc::new(ResumeData {
             top: cap.top,
             skipped: cap.skipped,
@@ -1382,6 +1416,52 @@ pub mod cek {
                     return Err(rt(span, "int.to_string expects a single Int"));
                 };
                 Ok(State::Return(Value::Str(n.to_string()), k))
+            }
+            CalleeSlot::Builtin(b) if b.starts_with("op.") => {
+                let Some(Value::Op {
+                    effect,
+                    op,
+                    args: op_args,
+                }) = args.first()
+                else {
+                    return Err(rt(span, format!("{b} expects an operation")));
+                };
+                let (effect, op, op_args) = (effect.clone(), op.clone(), op_args.clone());
+                let named = format!("{effect}.{op}");
+                match (b, &args[1..]) {
+                    ("op.name", []) => Ok(State::Return(Value::Str(named), k)),
+                    ("op.show", []) => match crate::literal::show_op(&effect, &op, &op_args) {
+                        Ok(s) => Ok(State::Return(Value::Str(s), k)),
+                        Err(what) => Err(rt(
+                            span,
+                            format!(
+                                "op.show: an argument of `{named}` is {what}, which is not data"
+                            ),
+                        )),
+                    },
+                    // The same operation again, from the clause: outside the
+                    // handler, so it reaches the next one out.
+                    ("op.perform", []) => perform(interp, effect, op, (*op_args).clone(), span, k),
+                    ("op.encode", [v]) => match crate::literal::show(v) {
+                        Ok(s) => Ok(State::Return(Value::Str(s), k)),
+                        Err(what) => Err(rt(
+                            span,
+                            format!(
+                                "op.encode: the answer of `{named}` is {what}, which is not data"
+                            ),
+                        )),
+                    },
+                    ("op.decode", [Value::Str(text)]) => {
+                        match crate::literal::decode(&interp.types, &op, text) {
+                            Ok(v) => Ok(State::Return(v, k)),
+                            Err(why) => Err(rt(
+                                span,
+                                format!("op.decode: {why}, for an answer of `{named}`"),
+                            )),
+                        }
+                    }
+                    _ => Err(rt(span, format!("{b}: wrong arguments"))),
+                }
             }
             CalleeSlot::Builtin(other) => Err(rt(span, format!("unknown builtin `{other}`"))),
             CalleeSlot::Value(Value::Fn(name)) => {

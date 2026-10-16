@@ -7,6 +7,7 @@ pub mod diag;
 pub mod eval;
 pub mod exhaust;
 pub mod lex;
+pub mod literal;
 pub mod parse;
 pub mod resolve;
 pub mod span;

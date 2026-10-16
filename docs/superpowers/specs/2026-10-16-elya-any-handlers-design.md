@@ -87,6 +87,22 @@ a typed answer that can be logged and fed back. That is what this slice adds.
       becomes generic in turn.
     - Checks run when a binding group is generalized (callees are generalized before
       their callers).
+  - **Revised in task 4 (measured): a forwarding handler's tail is not checked
+    statically.**
+    - A handler that performs its operations again (`op.perform`) pours the handled
+      tail into its own row, and a call unifies the callee's row with the caller's
+      ambient (`add_row` unifies tails).
+    - So after a call, a forwarding recorder's handled tail stands for everything the
+      CALLER performs. The first version reported E0434 for `IO` and for a
+      function-taking effect that the recorded body never touched (a recorder used
+      inside a scheduler, or under `main`'s `IO`).
+    - **Rule:** the labels the body performs as known at the handle are always
+      checked. The tail of a handler that does not forward ("discharging": it does
+      not occur in its function's own row) is checked at every instantiation, where
+      it is precise.
+    - A forwarding tail is checked at run time instead: `op.show`/`op.encode` of a
+      non-data value fails by name ("... is a function, which is not data").
+    - `IO` through a forwarding tail is harmless: the caller's row keeps it.
   - A type variable left in an effect's argument, or in a handled operation's type, at
     check time is E0434 as well ("not known to be data"). That is the stricter option:
     a generalized `s` in `St(s)` could later be a function.

@@ -69,6 +69,10 @@ fn malformed_any_handlers_are_refused() {
             "fn f(body) { handle { body() } with multi any { op(o) -> resume(1) } }\n",
             "multi",
         ),
+        (
+            "fn f(body) { handle { body() } with any { return(x) -> x } }\n",
+            "no operation clause",
+        ),
     ] {
         let d = parse_errors(src);
         assert!(
@@ -238,6 +242,122 @@ fn a_generic_caller_is_checked_at_its_own_callers() {
     assert_eq!(errors(&ok), "");
     let bad = format!(
         "{WORLD}{MAKE}{RECORD}{wrap}pub fn main() -> Int {{ wrap(fn() {{ make() }})(1) }}\n"
+    );
+    assert!(errors(&bad).contains("E0434"), "{}", errors(&bad));
+}
+
+/// Two unrelated effects, one program; a generic recorder that prints each question
+/// and its encoded answer through `Log`, forwarding to the real handlers outside.
+const TWO: &str = "effect World { fn roll(sides: Int) -> Int }\n\
+effect Ask { fn ask(q: String, n: Int) -> Opt(String) }\n\
+effect Log { fn say(line: String) -> Unit }\n\
+type Opt(a) { No, Yes(a) }\n\
+fn program() / {World, Ask} -> Int {\n\
+  let r = roll(6)\n\
+  match ask(\"name \\\"q\\\"\", 0 - 3) { No -> r  Yes(s) -> r * 10 }\n\
+}\n\
+fn traced(body) {\n\
+  handle { body() } with any {\n\
+    op(o) -> {\n\
+      let v = op.perform(o)\n\
+      let _ = say(op.name(o) <> \" | \" <> op.show(o) <> \" = \" <> op.encode(o, v))\n\
+      resume(v)\n\
+    }\n\
+  }\n\
+}\n";
+
+#[test]
+fn a_generic_recorder_forwards_shows_and_encodes() {
+    let src = format!(
+        "{TWO}pub fn main() {{\n\
+           handle {{\n\
+             let x = handle {{\n\
+               handle {{ traced(fn() {{ program() }}) }} with {{ World.roll(s) -> resume(4) }}\n\
+             }} with {{ Ask.ask(q, n) -> resume(Yes(q <> \"!\")) }}\n\
+             say(int.to_string(x))\n\
+           }} with {{ Log.say(line) -> {{ io.println(line)  resume(Unit) }} }}\n\
+         }}\n"
+    );
+    assert_eq!(errors(&src), "");
+    assert_eq!(
+        run_source("t.elya", &src).expect("runs"),
+        "World.roll | World.roll(6) = 4\n\
+         Ask.ask | Ask.ask(\"name \\\"q\\\"\", -3) = Yes(\"name \\\"q\\\"!\")\n\
+         40\n"
+    );
+}
+
+#[test]
+fn a_generic_replayer_decodes_answers() {
+    // Answers come from a list of literals, in order; the program runs without any
+    // World or Ask handler.
+    let src = format!(
+        "{TWO}type Log2 {{ End, Ent(String, Log2) }}\n\
+         fn replay(body, log) {{\n\
+           let run = handle {{ body() }} with any {{\n\
+             op(o) -> fn(l) {{ match l {{ Ent(a, rest) -> resume(op.decode(o, a))(rest)  End -> 0 - 1 }} }}\n\
+             return(x) -> fn(l) {{ x }}\n\
+           }}\n\
+           run(log)\n\
+         }}\n\
+         pub fn main() {{\n\
+           io.println(int.to_string(replay(fn() {{ program() }}, Ent(\"5\", Ent(\" Yes( \\\"a\\\\\\\"b\\\" ) \", End)))))\n\
+           io.println(int.to_string(replay(fn() {{ program() }}, Ent(\"-2\", Ent(\"No\", End)))))\n\
+         }}\n"
+    );
+    assert_eq!(errors(&src), "");
+    assert_eq!(run_source("t.elya", &src).expect("runs"), "50\n-2\n");
+}
+
+#[test]
+fn decoding_a_value_of_the_wrong_type_fails_by_name() {
+    for (answer, why) in [
+        ("\\\"4\\\"", "a String for an Int"),
+        ("True", "a Bool for an Int"),
+        ("Yes(1)", "a constructor for an Int"),
+        ("4 4", "trailing input"),
+        ("", "nothing"),
+    ] {
+        let src = format!(
+            "{WORLD}fn replay(body) {{ handle {{ body() }} with any {{ op(o) -> resume(op.decode(o, \"{answer}\")) }} }}\n\
+             pub fn main() {{ io.println(int.to_string(replay(fn() {{ roll(6) }}))) }}\n"
+        );
+        assert_eq!(errors(&src), "", "{why}");
+        let err = run_source("t.elya", &src).expect_err(why);
+        assert!(err.contains("op.decode"), "{why}: {err}");
+    }
+    // The answer type's constructors are checked through the declared type.
+    let src = format!(
+        "{TWO}type Other {{ Yes2(Int) }}\n\
+         fn replay(body) {{ handle {{ body() }} with any {{ op(o) -> resume(op.decode(o, if op.name(o) == \"World.roll\" {{ \"1\" }} else {{ \"Yes(4)\" }})) }} }}\n\
+         pub fn main() {{ io.println(int.to_string(replay(fn() {{ program() }}))) }}\n"
+    );
+    let err = run_source("t.elya", &src).expect_err("Yes(4) is not an Opt(String)");
+    assert!(err.contains("op.decode"), "{err}");
+}
+
+/// A forwarding handler's tail is its function's own row, which a call unifies with
+/// the caller's ambient: the caller's other effects (here one taking a function, and
+/// IO) are not the body's, and are not charged to the handler (spec D5).
+#[test]
+fn a_forwarding_recorder_is_not_charged_with_its_callers_effects() {
+    let src = format!(
+        "{WORLD}{RECORD}effect Spawn {{ fn spawn(f: fn() -> Int) -> Int }}\n\
+         pub fn main() -> Int {{\n\
+           handle {{\n\
+             handle {{\n\
+               let a = spawn(fn() {{ 1 }})\n\
+               io.println(\"x\")\n\
+               a + record(fn() {{ roll(6) }})\n\
+             }} with {{ Spawn.spawn(f) -> resume(f()) }}\n\
+           }} with {{ World.roll(s) -> resume(4) }}\n\
+         }}\n"
+    );
+    assert_eq!(errors(&src), "");
+    // The same body through the discharging replayer is still checked.
+    let bad = src.replace(
+        "record(fn() { roll(6) })",
+        "replay(fn() { let _ = spawn(fn() { 2 })  roll(6) })",
     );
     assert!(errors(&bad).contains("E0434"), "{}", errors(&bad));
 }

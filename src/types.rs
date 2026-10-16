@@ -172,6 +172,21 @@ struct ResumeCx {
     clauses_row: RowVar,
 }
 
+/// A row a `with any` handler handles, queued for E0434 (2026-10-16, D5).
+struct GenericSite {
+    /// The labels the handled body performs, as known at the handle (empty for
+    /// an instantiation): always checked.
+    labels: BTreeMap<String, EffectLabel>,
+    /// The handled row's tail (or an instantiated copy of a generalized one).
+    tail: EffectRow,
+    /// Whether the handler performs its operations again (`op.perform`): its
+    /// tail is then its function's own row, which a call unifies with the
+    /// caller's ambient, so labels arriving through it are not the body's and
+    /// are left to the run-time check.
+    forwarded: bool,
+    span: Span,
+}
+
 /// A declared type's parameter variables and each constructor's field types.
 type AdtFields = (Vec<u32>, Vec<Vec<Ty>>);
 
@@ -262,9 +277,7 @@ pub struct Infer {
     generic_rows: HashSet<RowVar>,
     /// Rows a `with any` handler handles, with the span to blame: checked for
     /// data (`check_generic_rows`) when their binding group is solved.
-    /// The flag: whether the site already put a concrete `IO` in its residual
-    /// (a handle does; an instantiated tail never can).
-    pending_generic: Vec<(EffectRow, Span, bool)>,
+    pending_generic: Vec<GenericSite>,
     /// The span of the expression being inferred (an instantiation's site).
     cur_span: Span,
     /// Declared type -> its parameters' variables and each constructor's
@@ -1201,9 +1214,17 @@ impl Infer {
             } else {
                 self.fresh_row()
             };
-            if self.generic_rows.contains(v) {
-                self.pending_generic
-                    .push((EffectRow::open(fresh), self.cur_span, false));
+            // A handled tail that is also the function's own row (a forwarding
+            // handler) stands for the caller's ambient after the call: not
+            // checked statically (D5).
+            let latent = matches!(&s.ty, Ty::Fn(_, r, _) if r.tail == RowTail::Open(*v));
+            if self.generic_rows.contains(v) && !latent {
+                self.pending_generic.push(GenericSite {
+                    labels: BTreeMap::new(),
+                    tail: EffectRow::open(fresh),
+                    forwarded: false,
+                    span: self.cur_span,
+                });
             }
             row_mapping.insert(*v, fresh);
         }
@@ -2167,6 +2188,7 @@ impl Infer {
         // data (E0434), checked when the group is solved.
         let mut handled = self.resolve_row(&EffectRow::open(amb_in));
         handled.labels.remove("IO");
+        let snapshot = handled.labels.clone();
 
         let mut clause_ambs: Vec<RowVar> = Vec::new();
         let clauses_row = self.fresh_row();
@@ -2245,13 +2267,26 @@ impl Infer {
         }
         // The residual: `IO`, never dispatched to a handler, if the body has it.
         let body_row = self.resolve_row(&EffectRow::open(amb_in));
-        let io_residual = body_row.labels.contains_key("IO");
         if let Some(io) = body_row.labels.get("IO") {
             let r = self.add_effect(amb, "IO", io.args.clone(), io.span);
             self.surface_conflict(r);
         }
-        self.pending_generic
-            .push((EffectRow::open(amb_in), span, io_residual));
+        // Forwarding: a clause that performs its operation again poured the
+        // handled tail into its ambient (`add_row` unifies tails).
+        let handled_tail = self.resolve_row(&handled).tail;
+        let forwarded = matches!(handled_tail, RowTail::Open(_))
+            && clause_ambs
+                .iter()
+                .any(|&ca| self.resolve_row(&EffectRow::open(ca)).tail == handled_tail);
+        self.pending_generic.push(GenericSite {
+            labels: snapshot,
+            tail: EffectRow {
+                labels: BTreeMap::new(),
+                tail: handled.tail.clone(),
+            },
+            forwarded,
+            span,
+        });
         // E0435: an answer type stays in its clause.
         for (sk, sp) in new_skolems {
             self.check_skolem_escape(&sk, sp, &result, env, amb);
@@ -2321,19 +2356,29 @@ impl Infer {
     /// answer data at the label's arguments. A tail still open becomes a
     /// generically handled variable, checked again wherever it is instantiated.
     fn check_generic_rows(&mut self) {
-        for (row, span, io_residual) in std::mem::take(&mut self.pending_generic) {
-            let row = self.resolve_row(&row);
-            for (label, l) in &row.labels {
-                if label == "IO" {
-                    continue; // a concrete IO at the handle is the residual (D2)
+        for site in std::mem::take(&mut self.pending_generic) {
+            let mut labels = site.labels.clone();
+            let row = self.resolve_row(&site.tail);
+            if !site.forwarded {
+                for (k, l) in &row.labels {
+                    labels.entry(k.clone()).or_insert_with(|| l.clone());
                 }
-                let ops: Vec<(String, OpInfo)> = self
+            }
+            for (label, l) in &labels {
+                if label == "IO" {
+                    self.diags.push(
+                        Diagnostic::error("E0434", "`IO` cannot be handled by `with any`")
+                            .with_label(site.span, "the computation given to a `with any` handler performs `IO`")
+                            .with_help("`IO` is never dispatched to a handler, so a generic handler that does not perform its operations again would hide it; handle a user effect instead"),
+                    );
+                    continue;
+                }
+                let mut ops: Vec<(String, OpInfo)> = self
                     .ops
                     .iter()
                     .filter(|(_, o)| &o.effect == label)
                     .map(|(n, o)| (n.clone(), o.clone()))
                     .collect();
-                let mut ops = ops;
                 ops.sort_by(|a, b| a.0.cmp(&b.0));
                 for (name, op) in ops {
                     let m: HashMap<u32, Ty> = op
@@ -2343,40 +2388,25 @@ impl Infer {
                         .zip(l.args.iter().cloned())
                         .collect();
                     let rm = HashMap::new();
-                    let tys = op
+                    let tys: Vec<Ty> = op
                         .params
                         .iter()
                         .chain(std::iter::once(&op.ret))
-                        .map(|t| subst_vars(t, &m, &rm));
-                    for t in tys.collect::<Vec<_>>() {
-                        if let Some(why) = self.not_data(&t, &mut Vec::new()) {
-                            self.diags.push(
-                                Diagnostic::error(
-                                    "E0434",
-                                    "an effect handled by `with any` must be data",
-                                )
-                                .with_label(span, format!("`{label}.{name}` is handled here generically"))
+                        .map(|t| subst_vars(t, &m, &rm))
+                        .collect();
+                    if let Some(why) = tys.iter().find_map(|t| self.not_data(t, &mut Vec::new())) {
+                        self.diags.push(
+                            Diagnostic::error("E0434", "an effect handled by `with any` must be data")
+                                .with_label(site.span, format!("`{label}.{name}` is handled here generically"))
                                 .with_help(format!(
                                     "a `with any` handler shows, encodes and decodes every operation it handles, so their argument and answer types must be data (no functions); `{label}.{name}` has {why}"
                                 )),
-                            );
-                        }
+                        );
                     }
                 }
             }
-            match row.tail {
-                RowTail::Open(v) => {
-                    // `IO` arriving through a tail would be handled: E0434 too.
-                    self.generic_rows.insert(v);
-                }
-                RowTail::Closed | RowTail::ErrorRow => {}
-            }
-            if row.labels.contains_key("IO") && !io_residual {
-                self.diags.push(
-                    Diagnostic::error("E0434", "`IO` cannot be handled by `with any`")
-                        .with_label(span, "the computation given to a `with any` handler performs `IO`")
-                        .with_help("`IO` is never dispatched to a handler, so a generic handler cannot record or replace it; handle a user effect instead"),
-                );
+            if let RowTail::Open(v) = row.tail {
+                self.generic_rows.insert(v);
             }
         }
     }

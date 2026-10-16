@@ -864,6 +864,10 @@ impl<'a> Parser<'a> {
             }
         }
         let end = self.peek_span();
+        if any && clauses.is_empty() {
+            self.error(end, "a `with any` handler needs its `op(o)` clause");
+            return None;
+        }
         self.eat(&TokenKind::RBrace);
         Some(spanned(
             Expr::Handle {
