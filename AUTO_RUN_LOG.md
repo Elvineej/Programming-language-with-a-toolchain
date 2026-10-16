@@ -8,6 +8,16 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 - The 2026-10-15 17:53 run's session resumed after its usage limit. The 05:53 run's last
   commit (0d1d0dc) is 07:55, over 3 hours ago, so this run takes over at 0d1d0dc.
 - PR #23 was marked ready for review by the maintainer (2026-10-16 12:29); it stays open.
+- Baseline at 7cbef8a: 998 / 93.
+- **Done: HANDOFF step 1, a function's own row in Core** (adb66f5). Spec
+  `docs/superpowers/specs/2026-10-16-elya-own-row-in-core-design.md`. **Decision (mine;
+  please review):** the function's type is recorded in the typed table at its
+  declaration span. **Changed expectations by this decision:** the node-count tripwire
+  (5 -> 6), seven `typed_inference` snapshots (one added line each), and mono.rs's two
+  row-only refusal tests (now clones). Found: N7 part 2's K4 "crash" was a native stack
+  overflow; deep non-tail recursion natively is the new HANDOFF step 5. Review: 52
+  probes, no finding. Gate 1001 / 93 (predicted 1001).
+- Windows-gate debt added: adb66f5.
 
 ## 2026-10-16 05:53 UTC — ended without a DONE mark (taken over 2026-10-16 12:30)
 
