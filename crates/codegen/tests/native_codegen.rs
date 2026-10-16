@@ -5496,3 +5496,22 @@ fn row_only_type_variables_run_natively() {
     run_value_corpus(OWN_ROW, "own-row");
     run_differential_corpus(OWN_ROW, "own-row-diff");
 }
+
+/// `examples/10_failure.elya` (2026-10-16): failure as an effect answering
+/// the empty `Never` (an empty match is a trap natively, never reached), a
+/// `catch` handler, and scopes that drop their queued tasks when one fails.
+#[test]
+fn the_failure_example_runs_natively() {
+    let src = include_str!("../../../examples/10_failure.elya");
+    let dir = temp_dir("failure-example");
+    let exe = compile_and_link(&lower_src(src), &dir, "failure");
+    let (text, value) = native_text_value(&exe, "failure");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(text, eval_main_text(src));
+    assert!(
+        text.contains("  scope cancelled, 3 task(s) dropped\nscope failed: division by zero\n"),
+        "{text}"
+    );
+    assert_eq!(value, "-123");
+    assert_eq!(value, eval_main_int(src));
+}

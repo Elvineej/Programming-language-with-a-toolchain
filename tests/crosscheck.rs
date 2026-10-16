@@ -26,6 +26,7 @@ const EFFECTFUL_EXAMPLES: &[&str] = &[
     "07_search.elya",
     "08_timers.elya",
     "09_record_any.elya",
+    "10_failure.elya",
 ];
 
 #[test]
@@ -42,7 +43,8 @@ fn cek_matches_tree_on_examples() {
                 // checked against the native backend instead
                 // (`the_async_example_runs_natively`, `the_replay_example_runs_natively`,
                 // `the_structured_concurrency_example_runs_natively`,
-                // `the_search_example_runs_natively`, `the_timers_example_runs_natively`).
+                // `the_search_example_runs_natively`, `the_timers_example_runs_natively`,
+                // `the_failure_example_runs_natively`).
                 let (m, d) = parse_module(&Session::new(), &src);
                 assert!(d.is_empty(), "parse: {d:?}");
                 let err = elya::eval::run_module_tree(&m)

@@ -14,7 +14,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1001 passed, 93 suites. Since `main`, the runtime
+- Linux gate at the tip of `auto/elya`: 1010 passed, 95 suites. Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions; `gc_mark` is unchanged (637 bytes of source).
 - Interactive sessions may also work on `auto/elya`. They use the same
@@ -286,18 +286,16 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   instead of refused. The node-count tripwire moved 5 -> 6 and the `typed_inference`
   snapshots gained one line per declaration (decided, recorded).
 
+- **Failure as an effect, and scope cancellation** (2026-10-16, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-16-elya-failure-and-cancellation-design.md`. An empty
+  `match e { }` is exhaustive exactly on a type with no constructors, and has any type;
+  so `type Never { }`, `fail : String -> Never` and a library `raise`. A name declared
+  twice (function, type, constructor, effect) is now E0209. `examples/10_failure.elya`:
+  `catch`, and scopes that drop their queued tasks when one fails; the same bytes natively.
+
 ## The next five steps
 
-### 1. A failure effect and scope cancellation
-
-Structured concurrency (Done) cannot cancel a scope's children: Elya has no failure
-effect in its examples. Design `effect Fail { fn fail(reason: String) -> Never }`-style
-failure (decide: a bottom type, or an op whose result type is free), a `catch`
-handler, and a scope that, when its body fails, drops its queued children instead of
-running them -- then show it in `examples/06_structured.elya` or a new example. Measure
-first what the type system needs for an op that never returns.
-
-### 2. The last common native refusals: computed callees and functions as values
+### 1. The last common native refusals: computed callees and functions as values
 
 These are the two most frequent refusals of real programs in the 2026-10-15 sweep of
 about 700 programs, apart from test fragments without `main`.
@@ -314,7 +312,7 @@ about 700 programs, apart from test fragments without `main`.
 - **How:** measure each class through `build` first, pin each with differential rows,
   and keep `gc_mark` byte-identical.
 
-### 3. Native arity: more parameters than the win64 tail-call cap
+### 2. Native arity: more parameters than the win64 tail-call cap
 
 `MAX_PARAMS` (5 LLVM parameters) refuses an effectful function of five source
 parameters, a lambda of five, a direct function of six, and clauses of four. It is the
@@ -330,7 +328,7 @@ and the example now packs its state into one value.
 - **Measure first:** how many corpus programs hit each of the four arity refusals.
 - The Windows gate must run it; note it as debt.
 
-### 4. Record and replay from the command line
+### 3. Record and replay from the command line
 
 ROADMAP priority 3's last step: `elya run --record trace.txt prog.elya` runs `main` under
 a `with any` recorder and writes its log, and `elya run --replay trace.txt` feeds it
@@ -344,7 +342,7 @@ back. A divergence stops by name, at the entry where it happened.
 - Evaluator first. Natively, `with any` needs per-operation type tables in the runtime
   (D6). That is a slice of its own, listed under "Also open".
 
-### 5. Deep non-tail recursion natively
+### 4. Deep non-tail recursion natively
 
 Measured 2026-10-16: `fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }` over
 200 000 elements runs in the evaluator (its continuation is on the heap) and dies
@@ -352,6 +350,15 @@ natively with SIGSEGV (the machine stack; fine under `ulimit -s unlimited`). Dec
 spec: a large dedicated stack for `main` (mmap with a guard page) plus a NAMED
 "native stack overflow" diagnostic from the guard page, or deeper changes (CPS for deep
 recursion). Measure the current depth limit first, on Linux and Windows.
+
+### 5. Structural equality
+
+`==` on an ADT value, a tuple or a list is refused natively ("Eq on an unrepresentable
+operand type") and decided by the evaluator's own rules. Measure what the evaluator does
+on ADTs and closures today, decide in a spec what `==` means (structural on data, an
+error on functions -- E04xx at check time rather than at run time), and compile it
+natively (a runtime walk guided by the descriptor table, or generated per-type
+equality functions after N7 part 2's instances).
 
 Also open, unscheduled: `with any` natively (per-operation name and
 type tables in the runtime, `op.decode` at an effect's parameter once the instantiation

@@ -64,3 +64,10 @@ fn record_any() {
     // effects; a replay diverging by name; leftovers noticed (2026-10-16).
     insta::assert_snapshot!("09_record_any", run_example("09_record_any.elya"));
 }
+
+#[test]
+fn failure_and_cancellation() {
+    // Failure as an effect answering the empty `Never`, a `catch` handler,
+    // and a scope that drops its queued tasks when one fails (2026-10-16).
+    insta::assert_snapshot!("10_failure", run_example("10_failure.elya"));
+}

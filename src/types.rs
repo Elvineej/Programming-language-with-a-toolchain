@@ -253,6 +253,9 @@ pub struct Infer {
     effect_multi: HashMap<String, bool>,
     /// Names of `linear`-declared types (Slice 4d-2) — their values are affine.
     linear_types: HashSet<String>,
+    /// Names of declared types with no constructors (2026-10-16): the only
+    /// scrutinee types an empty `match` may have.
+    empty_types: HashSet<String>,
     /// Spans of bindings whose inferred type is linear (affine binding sites),
     /// exposed to the `affine::check` pass. The one bounded reach for 4d-2.
     affine_sites: HashSet<Span>,
@@ -306,6 +309,7 @@ impl Infer {
             ctor_arity: HashMap::new(),
             effect_multi: HashMap::new(),
             linear_types: HashSet::new(),
+            empty_types: HashSet::new(),
             affine_sites: HashSet::new(),
             node_types: HashMap::new(),
             known_types: HashMap::new(),
@@ -1447,6 +1451,26 @@ impl Infer {
             Expr::Match { scrutinee, arms } => {
                 let s = self.infer_expr(scrutinee, env, amb);
                 let result = self.fresh();
+                // An empty match is exhaustive exactly when the scrutinee's type
+                // has no constructors; its result then has any type (spec
+                // 2026-10-16). `exhaust.rs` is type-free and leaves it here.
+                if arms.is_empty() {
+                    let st = self.resolve(&s);
+                    let empty = matches!(&st, Ty::Con(n, _) if self.empty_types.contains(n));
+                    if !empty && st != Ty::Error {
+                        self.diags.push(
+                            Diagnostic::error(
+                                "E0430",
+                                format!(
+                                    "a match with no arms needs a scrutinee whose type has no constructors; this is `{}`",
+                                    display_ty(self, &st)
+                                ),
+                            )
+                            .with_label(scrutinee.span, "a value of this type may exist")
+                            .with_help("add arms, or match a value of an empty type such as `type Never { }`"),
+                        );
+                    }
+                }
                 for arm in arms.iter() {
                     let mut bindings = Vec::new();
                     self.check_pattern(&arm.node.pat, &s, env, &mut bindings);
@@ -2997,6 +3021,9 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
         if let Decl::Type(t) = &d.node {
             if t.is_linear {
                 inf.linear_types.insert(t.name.clone());
+            }
+            if t.variants.is_empty() {
+                inf.empty_types.insert(t.name.clone());
             }
         }
     }

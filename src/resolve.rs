@@ -52,12 +52,35 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
     let mut dup_ops: HashSet<String> = HashSet::new();
     let mut effect_names: HashSet<String> = HashSet::new();
     let mut dup_diags: Vec<Diagnostic> = Vec::new();
+    // E0209 (2026-10-16): a function, type, constructor or effect name declared
+    // twice was a silent overwrite -- whichever declaration a pass consulted
+    // won -- and an empty match on a name declared once empty and once not
+    // accepted a real value (the failure slice's review). Each kind is its own
+    // namespace.
+    let mut seen: HashSet<(&str, String)> = HashSet::new();
+    let mut dup =
+        |kind: &'static str, name: &str, span: crate::span::Span, out: &mut Vec<Diagnostic>| {
+            if !seen.insert((kind, name.to_string())) {
+                out.push(
+                    Diagnostic::error(
+                        "E0209",
+                        format!("{kind} `{name}` is declared more than once"),
+                    )
+                    .with_label(span, "a second declaration of this name")
+                    .with_help(format!(
+                        "rename one of them: a {kind} name is unique across a module"
+                    )),
+                );
+            }
+        };
     for d in &module.decls {
         match &d.node {
             Decl::Fn(f) => {
+                dup("function", &f.name, d.span, &mut dup_diags);
                 fn_names.insert(f.name.clone());
             }
             Decl::Effect(e) => {
+                dup("effect", &e.name, d.span, &mut dup_diags);
                 effect_names.insert(e.name.clone());
                 for op in &e.ops {
                     let name = &op.node.name;
@@ -88,7 +111,9 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
                 }
             }
             Decl::Type(t) => {
+                dup("type", &t.name, d.span, &mut dup_diags);
                 for v in &t.variants {
+                    dup("constructor", &v.node.name, v.span, &mut dup_diags);
                     ctor_names.insert(v.node.name.clone());
                 }
             }

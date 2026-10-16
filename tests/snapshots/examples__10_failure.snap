@@ -1,0 +1,16 @@
+---
+source: tests/examples.rs
+expression: "run_example(\"10_failure.elya\")"
+---
+caught: -1
+  steady 5
+  doomed 1
+  steady 4
+  late 3
+  steady 3
+  late 2
+  scope cancelled, 3 task(s) dropped
+scope failed: division by zero
+  scope cancelled, 0 task(s) dropped
+  scope cancelled, 1 task(s) dropped
+nested: inner
