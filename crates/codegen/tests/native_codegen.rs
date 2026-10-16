@@ -5047,6 +5047,30 @@ fn the_search_example_runs_natively() {
     assert_eq!(value, eval_main_int(src));
 }
 
+/// `examples/08_timers.elya` (2026-10-16): the structured scheduler with
+/// `sleep`, a poll loop over timers, a `Clock` effect under a virtual clock
+/// and the real one (`time.now_ms`/`time.sleep_ms`), and a deadlock named.
+/// The same bytes and value natively as in the evaluator.
+#[test]
+fn the_timers_example_runs_natively() {
+    let src = include_str!("../../../examples/08_timers.elya");
+    let dir = temp_dir("timers-example");
+    let exe = compile_and_link(&lower_src(src), &dir, "timers");
+    let (text, value) = native_text_value(&exe, "timers");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(text, eval_main_text(src));
+    assert_eq!(
+        text,
+        "virtual clock:\n  b answered (10 ms)\n  c answered (20 ms)\n  a answered (30 ms)\n\
+         \x20 60 ms of requests in 30 virtual ms\na deadlock:\n\
+         \x20 deadlock: tasks 1 0 2 wait on each other\nreal clock:\n\
+         \x20 b answered (10 ms)\n  c answered (20 ms)\n  a answered (30 ms)\n\
+         \x20 at least 30 real ms\n"
+    );
+    assert_eq!(value, "600361");
+    assert_eq!(value, eval_main_int(src));
+}
+
 /// A multi-shot copy of a chain of 100 000 handler frames, natively (the
 /// evaluator is the oracle at 1000 in `MULTI_SHOT`). Measured 2026-10-15:
 /// 0.004 s, 0.014 s, 0.138 s at 1000, 10 000, 100 000 frames -- linear.

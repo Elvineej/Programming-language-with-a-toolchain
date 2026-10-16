@@ -1,6 +1,6 @@
 # Async step 2, part 2: waiting for time, and a poll loop
 
-**Status:** in progress (2026-10-15). HANDOFF step 1 (ROADMAP 1b), on top of
+**Status:** done (2026-10-15 to 2026-10-16). HANDOFF step 1 (ROADMAP 1b), on top of
 `examples/06_structured.elya`. The design choices are Claude's under the maintainer's
 delegation (rule 2), recorded here.
 
@@ -58,3 +58,30 @@ clock, and none can wait.
   real time cannot change: the answer order, and whether at least 30 ms elapsed.
 - `native_codegen.rs`: the example natively prints the evaluator's bytes, and the
   builtins natively advance the clock by at least the requested time.
+
+## 3. The example (task 3, 2026-10-16)
+
+`examples/08_timers.elya`. The draft named in §0 was not committed, so the example was
+rewritten from 06's scheduler. Measured on the way:
+
+- **A native arity refusal.** The first version's `run(q, timers, results, next,
+  stalled)` is an effectful function of five parameters: natively "effectful function
+  takes more than four parameters" (the win64 `musttail` cap, `MAX_PARAMS`). The
+  scheduler's state besides its queue is now one value, `Sched(timers, results, next)`.
+  Lifting the cap is not this slice's (it needs the Windows gate); recorded in HANDOFF.
+- **Exact rows.** `fetches` and `deadlocked` perform only `Async` themselves (the `Log`
+  is inside the spawned lambdas), and `real_clock` is `/ {Log, IO}`.
+- **Output.** Virtual clock: b, c, a, and "60 ms of requests in 30 virtual ms". The
+  deadlock names tasks 1 0 2. The real clock: b, c, a and "at least 30 real ms". The
+  native binary prints the same bytes and answers 600361, the evaluator's value.
+
+**Controls** (each reverted, `cmp` clean):
+- **T1** (the virtual clock ignores `wait_until`): the snapshot fails, but on the
+  elapsed line ("in 0 virtual ms"), NOT the order. The plan predicted request order;
+  that was wrong, because the order comes from the timer list's insertion, not from
+  the clock. So a second control was added:
+- **T1b** (`insert` ignores deadlines): answers in request order a, b, c.
+- **T2** (deadlock detection off): `elya run` never finishes (killed by `timeout 10`,
+  exit 124), already in the virtual part. The poll loop itself depends on the stall
+  count: a body awaiting sleeping tasks is "stuck" until a timer fires.
+- **T3** was task 2's (`sleep_ms` returning at once).

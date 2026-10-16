@@ -1,0 +1,16 @@
+---
+source: tests/examples.rs
+expression: "run_example(\"08_timers.elya\")"
+---
+virtual clock:
+  b answered (10 ms)
+  c answered (20 ms)
+  a answered (30 ms)
+  60 ms of requests in 30 virtual ms
+a deadlock:
+  deadlock: tasks 1 0 2 wait on each other
+real clock:
+  b answered (10 ms)
+  c answered (20 ms)
+  a answered (30 ms)
+  at least 30 real ms

@@ -1,0 +1,246 @@
+// Waiting for time, written in Elya.
+//
+// `examples/06_structured.elya`'s scheduler, with one operation more:
+// `sleep(ms)` parks a task until a deadline. When nothing can run, the
+// scheduler waits for the earliest deadline -- the poll loop every event loop
+// has, over the one kind of source there is so far, a timer.
+//
+// The scheduler never reads time itself: it performs `Clock`. Whoever handles
+// `Clock` decides what time is. `virtual_clock` moves time only when the
+// scheduler waits, so it is exact and instant -- a test of timing code that
+// needs no mock and no sleep. `real_clock` asks the machine. The scheduler and
+// the tasks are the same code under both.
+//
+// Two tasks that await each other can never run again. With no timer left to
+// wait for, the scope says so by name instead of looping forever.
+
+effect Async {
+  fn spawn(f: fn() / {Async, Log} -> Int) -> Int
+  fn await(id: Int) -> Int
+  fn yld() -> Unit
+  fn sleep(ms: Int) -> Unit
+}
+
+// What the tasks say, printed by the outermost handler.
+effect Log { fn say(line: String) -> Unit }
+
+// Time, as the scheduler sees it.
+effect Clock {
+  fn now() -> Int
+  fn wait_until(t: Int) -> Unit
+}
+
+type List(a) { Nil, Cons(a, List(a)) }
+type Pair(a, b) { Pair(a, b) }
+type Option(a) { None, Some(a) }
+
+// A task as the scheduler sees it: finished, or stopped at an operation with
+// the rest of its computation.
+type Step {
+  Done(Int),
+  Yielded(fn() / {Log} -> Step),
+  Spawned(fn() / {Async, Log} -> Int, fn(Int) / {Log} -> Step),
+  Awaiting(Int, fn(Int) / {Log} -> Step),
+  Sleeping(Int, fn(Unit) / {Log} -> Step)
+}
+
+// A parked task: its deadline, its id, and the rest of it.
+type Timer { Timer(Int, Int, fn(Unit) / {Log} -> Step) }
+
+// How a run of the queue ended: every task finished (with the results), or
+// the tasks left all await tasks that cannot finish (their ids).
+type Ending { Finished(List(Pair(Int, Int))), Deadlock(List(Int)) }
+
+fn step(body: fn() / {Async, Log} -> Int) -> Step {
+  handle { Done(body()) } with {
+    Async.yld() -> Yielded(fn() { resume(Unit) })
+    Async.spawn(f) -> Spawned(f, fn(id) { resume(id) })
+    Async.await(id) -> Awaiting(id, fn(v) { resume(v) })
+    Async.sleep(ms) -> Sleeping(ms, fn(u) { resume(u) })
+    return(s) -> s
+  }
+}
+
+fn append(l, x) {
+  match l {
+    Nil -> Cons(x, Nil)
+    Cons(h, t) -> Cons(h, append(t, x))
+  }
+}
+
+fn length(l) {
+  match l {
+    Nil -> 0
+    Cons(h, t) -> 1 + length(t)
+  }
+}
+
+fn find(rs, id) {
+  match rs {
+    Nil -> None
+    Cons(Pair(i, v), rest) -> if i == id { Some(v) } else { find(rest, id) }
+  }
+}
+
+// Timers in deadline order; a timer goes after those with the same deadline,
+// so ties wake in the order they were set.
+fn insert(ts, t) {
+  match t {
+    Timer(d, i, k) -> match ts {
+      Nil -> Cons(t, Nil)
+      Cons(Timer(d2, i2, k2), rest) ->
+        if d < d2 { Cons(t, ts) } else { Cons(Timer(d2, i2, k2), insert(rest, t)) }
+    }
+  }
+}
+
+fn ids(q) {
+  match q {
+    Nil -> Nil
+    Cons(Pair(id, s), rest) -> Cons(id, ids(rest))
+  }
+}
+
+// The scheduler's state besides its queue: the parked tasks, the results so
+// far, and the next task id.
+type Sched { Sched(List(Timer), List(Pair(Int, Int)), Int) }
+
+// Every task in `q` is stuck. Wait for the earliest timer and run its task;
+// with no timer left, nothing can ever change: a deadlock.
+fn stuck(q, st) {
+  match st {
+    Sched(timers, results, next) -> match timers {
+      Nil -> Deadlock(ids(q))
+      Cons(Timer(d, id, k), later) -> {
+        let _ = wait_until(d)
+        run(append(q, Pair(id, k(Unit))), Sched(later, results, next), 0)
+      }
+    }
+  }
+}
+
+// Round robin over (id, step). `stalled` counts the tasks passed over since
+// the last one that made progress: once it covers the whole queue, every
+// task is stuck.
+fn run(q, st, stalled) {
+  match st {
+    Sched(timers, results, next) -> match q {
+      Nil -> match timers {
+        Nil -> Finished(results)
+        Cons(t, later) -> stuck(Nil, st)
+      }
+      Cons(Pair(id, s), rest) -> match s {
+        Done(v) -> run(rest, Sched(timers, Cons(Pair(id, v), results), next), 0)
+        Yielded(k) -> run(append(rest, Pair(id, k())), st, 0)
+        Spawned(f, k) ->
+          run(append(append(rest, Pair(id, k(next))), Pair(next, step(f))), Sched(timers, results, next + 1), 0)
+        Sleeping(ms, k) -> run(rest, Sched(insert(timers, Timer(now() + ms, id, k)), results, next), 0)
+        Awaiting(c, k) -> match find(results, c) {
+          Some(v) -> run(append(rest, Pair(id, k(v))), st, 0)
+          None ->
+            if stalled >= length(rest) { stuck(append(rest, Pair(id, s)), st) }
+            else { run(append(rest, Pair(id, s)), st, stalled + 1) }
+        }
+      }
+    }
+  }
+}
+
+fn show_ids(l) {
+  match l {
+    Nil -> ""
+    Cons(i, rest) -> " " <> int.to_string(i) <> show_ids(rest)
+  }
+}
+
+// The scope: its body is task 0; it answers the body's value once every task
+// started in it has finished, or -1 after naming the tasks of a deadlock.
+fn scope(body: fn() / {Async, Log} -> Int) / {Log, Clock} -> Int {
+  match run(Cons(Pair(0, step(body)), Nil), Sched(Nil, Nil, 1), 0) {
+    Finished(results) -> match find(results, 0) {
+      Some(v) -> v
+      None -> 0 - 1
+    }
+    Deadlock(stuck_ids) -> {
+      let _ = say("  deadlock: tasks" <> show_ids(stuck_ids) <> " wait on each other")
+      0 - 1
+    }
+  }
+}
+
+// --- clocks ---------------------------------------------------------------
+
+// Time that moves only when the scheduler waits. A handler's answer can be a
+// function: here, of the current time.
+fn virtual_clock(body: fn() / {Clock, Log} -> Int) / {Log} -> Int {
+  let go = handle { body() } with {
+    Clock.now() -> fn(t: Int) { resume(t)(t) }
+    Clock.wait_until(d) -> fn(t: Int) { if d > t { resume(Unit)(d) } else { resume(Unit)(t) } }
+    return(x) -> fn(t: Int) { x }
+  }
+  go(0)
+}
+
+// The machine's clock.
+fn real_clock(body: fn() / {Clock, Log} -> Int) / {Log, IO} -> Int {
+  handle { body() } with {
+    Clock.now() -> resume(time.now_ms())
+    Clock.wait_until(d) -> {
+      time.sleep_ms(d - time.now_ms())
+      resume(Unit)
+    }
+    return(x) -> x
+  }
+}
+
+// --- the program ----------------------------------------------------------
+
+// A request that takes `ms` to answer.
+fn fetch(name: String, ms: Int) / {Async, Log} -> Int {
+  let _ = sleep(ms)
+  let _ = say("  " <> name <> " answered (" <> int.to_string(ms) <> " ms)")
+  ms
+}
+
+// Three requests at once: they answer in deadline order, and together they
+// take as long as the slowest, not the sum.
+fn fetches() / {Async} -> Int {
+  let a = spawn(fn() { fetch("a", 30) })
+  let b = spawn(fn() { fetch("b", 10) })
+  let c = spawn(fn() { fetch("c", 20) })
+  await(a) + await(b) + await(c)
+}
+
+// Two tasks, each waiting for the other.
+fn deadlocked() / {Async} -> Int {
+  let x = spawn(fn() { await(2) })
+  let y = spawn(fn() { await(1) })
+  await(x) + await(y)
+}
+
+// The fetches in a scope, and the time they took.
+fn timed() / {Clock, Log} -> Int {
+  let t0 = now()
+  let total = scope(fn() { fetches() })
+  total * 1000 + (now() - t0)
+}
+
+pub fn main() -> Int {
+  handle {
+    let _ = say("virtual clock:")
+    let v = virtual_clock(fn() { timed() })
+    let _ = say("  60 ms of requests in " <> int.to_string(v % 1000) <> " virtual ms")
+    let _ = say("a deadlock:")
+    let d = virtual_clock(fn() { scope(fn() { deadlocked() }) })
+    let _ = say("real clock:")
+    let r = real_clock(fn() { timed() })
+    let _ = say(if r % 1000 >= 30 { "  at least 30 real ms" } else { "  too soon" })
+    v * 10 + d * (0 - 1) + r / 1000
+  } with {
+    Log.say(line) -> {
+      io.println(line)
+      resume(Unit)
+    }
+    return(v) -> v
+  }
+}

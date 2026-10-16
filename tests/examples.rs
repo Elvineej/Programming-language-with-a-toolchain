@@ -49,3 +49,11 @@ fn search() {
     // three handlers: all solutions, a count, the first (2026-10-15).
     insta::assert_snapshot!("07_search", run_example("07_search.elya"));
 }
+
+#[test]
+fn timers() {
+    // Waiting for time: a poll loop over timers, a `Clock` effect handled by
+    // a virtual clock and by the real one, and a deadlock named (2026-10-16).
+    // The real-clock part prints only what real time cannot change.
+    insta::assert_snapshot!("08_timers", run_example("08_timers.elya"));
+}
