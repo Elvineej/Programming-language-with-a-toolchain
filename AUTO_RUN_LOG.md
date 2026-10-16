@@ -24,6 +24,18 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     `start` failed to link against the runtime's own symbol).
   - Existing native tests run their binaries with `ELYA_STACK_MIB=8` (the stack they were
     written against), so tail-call regressions still overflow.
+- **Done: structural equality** (9bb6f5d, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-16-elya-structural-equality-design.md`. `==` on data
+  only; comparing functions is the **new diagnostic E0436** (via equality type
+  variables, SML-style); iterative in the evaluator, `elya_eq` natively. Review: 1 high
+  (two pre-existing tests broke) + 3 low, fixed. Gate 1049 / 101.
+  - **Decisions (mine; please review):** E0436 rather than identity equality or a
+    run-time error on functions; `with any` operation values are data (N3 kept);
+    phantom type parameters at function types are rejected.
+  - **Changed expectation by this decision:** lib.rs
+    `rejects_eq_on_an_unrepresentable_operand_type` now builds its operand by hand (the
+    ADT it used compiles); the expected refusal is unchanged.
+- Windows-gate debt added: 9bb6f5d.
 - PR #23 was merged by the maintainer (2026-10-16 18:32, at ab791b6); a new draft PR is
   open from `auto/elya`.
 - Windows-gate debt added: 94ee05e (**priority**: the Windows `elya_start` path --
