@@ -22,7 +22,35 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   tail-call cap). It is the new HANDOFF step 5.
 - **Windows-gate debt added:** e84c105, 7c951d2, 61a84f9 (runtime.c `_WIN32` time
   branch, now looping on `GetTickCount64`), 1d9f565.
-- Next: HANDOFF step 1 (effect-polymorphic handlers).
+- **Done: HANDOFF step 1 (old step 2), operation-generic handlers `with any`.**
+  - Spec `docs/superpowers/specs/2026-10-16-elya-any-handlers-design.md`; plan
+    `docs/superpowers/plans/2026-10-16-elya-any-handlers.md`.
+  - Commits:
+    - fe8b10c parse;
+    - ae7d7c1 types and E0435;
+    - 564ca33 E0434;
+    - 17ac4c8 evaluator and literals;
+    - 16c03fd native refusal by name;
+    - cf474e8 `examples/09_record_any.elya`;
+    - cd70f3e and 6798543 review fixes.
+  - Gate: 998 / 93. Every task matched its prediction, or the commit says why it did
+    not (tests added).
+  - **Decisions for review (rule 2; spec section 1):**
+    - the syntax `with any { op(o) -> ... }`;
+    - `IO` is never handled;
+    - the answer type is rigid per clause;
+    - five `op.*` builtins;
+    - Elya literal syntax is the encoding;
+    - the handled effects must be data (E0434), but a forwarding handler's tail is
+      checked at run time, because a call's row unification makes it the caller's
+      ambient (measured);
+    - evaluator only for now.
+  - **Two independent reviews** found 4 soundness holes. All are fixed test-first.
+    One is PRE-EXISTING for plain handlers: an escaped `resume` that re-enters a
+    clause calling a parameter was typed without that parameter's row. It is fixed
+    in `infer_handle` too and pinned in `tests/resume_row.rs`.
+  - Changed expectation (this slice's own): the 09 snapshot spells `Unit`, not `()`.
+- Next: HANDOFF step 1, a function's own row in Core.
 
 ## 2026-10-15 21:43 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue")
 

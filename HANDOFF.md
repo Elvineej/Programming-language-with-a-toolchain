@@ -14,7 +14,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 946 passed, 91 suites. Since `main`, the runtime
+- Linux gate at the tip of `auto/elya`: 998 passed, 93 suites. Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions; `gc_mark` is unchanged (637 bytes of source).
 - Interactive sessions may also work on `auto/elya`. They use the same
@@ -261,19 +261,26 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
     Windows `Sleep` and a timing-dependent value were fixed test-first.
   - **Found:** an effectful function of five parameters is refused natively (new step 5).
 
+- **Operation-generic handlers, `with any`: a recorder for any effect** (2026-10-16,
+  fe8b10c..6798543; old step 1). Spec
+  `docs/superpowers/specs/2026-10-16-elya-any-handlers-design.md`, which includes a
+  survey: Koka, Effekt, Frank, Eff, Links and Unison name their effects, and OCaml 5's
+  generic `effc` is untyped.
+  - `handle e with any { op(o) -> ... }` handles everything `e` performs but `IO`.
+    `o : Op(t / H)` has a rigid answer type `t` per clause (E0435 when it escapes).
+  - Builtins `op.name/show/perform/encode/decode`; Elya literal syntax is the
+    encoding.
+  - E0434: the handled effects must be data. A forwarding handler's tail is checked
+    at run time (D5 revised, measured).
+  - `examples/09_record_any.elya`: one `record`/`replay` for a dice game and a shop.
+  - Evaluator only. Natively it is refused by name.
+  - Two reviews found 4 soundness holes and fixed them test-first. One of them (an
+    escaped resume dropping a clause's relayed row) was pre-existing for plain
+    handlers too.
+
 ## The next five steps
 
-### 1. Effect-polymorphic handlers (a recorder for ANY effect)
-
-Replay (done, `examples/05_replay.elya`) records one fixed effect: a handler covers
-exactly one effect, every operation of it, so a generic `record` would need a handler
-over "every operation of some effect `e`" -- the ROADMAP's next replay step before the CLI
-flags. Measure what the type system needs (an operation-generic clause? an effect-row
-variable a handler can be abstracted over?), survey Koka/Effekt/Frank, decide in a spec,
-and prototype in the evaluator first. Strings are native since 2026-10-15, so a
-serialized log can be printed.
-
-### 2. A function's own row in Core
+### 1. A function's own row in Core
 
 `CoreFn` has no latent row, so a type or row variable that appears ONLY in a function's
 own row is invisible at its references: N7 part 2 refuses such type variables by name
@@ -284,7 +291,7 @@ type (its row included) in Core -- the typed table's node-count tripwire
 there, so decide where it lives in the spec -- then match it at references in both
 passes and lift the refusal. Measure first which corpus programs it unlocks.
 
-### 3. A failure effect and scope cancellation
+### 2. A failure effect and scope cancellation
 
 Structured concurrency (Done) cannot cancel a scope's children: Elya has no failure
 effect in its examples. Design `effect Fail { fn fail(reason: String) -> Never }`-style
@@ -293,7 +300,7 @@ handler, and a scope that, when its body fails, drops its queued children instea
 running them -- then show it in `examples/06_structured.elya` or a new example. Measure
 first what the type system needs for an op that never returns.
 
-### 4. The last common native refusals: computed callees and functions as values
+### 3. The last common native refusals: computed callees and functions as values
 
 These are the two most frequent refusals of real programs in the 2026-10-15 sweep of
 about 700 programs, apart from test fragments without `main`.
@@ -310,7 +317,7 @@ about 700 programs, apart from test fragments without `main`.
 - **How:** measure each class through `build` first, pin each with differential rows,
   and keep `gc_mark` byte-identical.
 
-### 5. Native arity: more parameters than the win64 tail-call cap
+### 4. Native arity: more parameters than the win64 tail-call cap
 
 `MAX_PARAMS` (5 LLVM parameters) refuses an effectful function of five source
 parameters, a lambda of five, a direct function of six, and clauses of four. It is the
@@ -326,7 +333,23 @@ and the example now packs its state into one value.
 - **Measure first:** how many corpus programs hit each of the four arity refusals.
 - The Windows gate must run it; note it as debt.
 
-Also open, unscheduled: I/O sources beyond timers (pipes, sockets: a readiness builtin
+### 5. Record and replay from the command line
+
+ROADMAP priority 3's last step: `elya run --record trace.txt prog.elya` runs `main` under
+a `with any` recorder and writes its log, and `elya run --replay trace.txt` feeds it
+back. A divergence stops by name, at the entry where it happened.
+- **Decide in the spec:**
+  - the trace format (one `op.show` question and one `op.encode` answer per line?);
+  - whether `main`'s own effects are recorded (it may perform only `IO`, so the
+    recorder needs `main` to delegate to a function performing user effects, or a
+    standard world effect);
+  - how `IO` output relates to a replay.
+- Evaluator first. Natively, `with any` needs per-operation type tables in the runtime
+  (D6). That is a slice of its own, listed under "Also open".
+
+Also open, unscheduled: `with any` natively (per-operation name and
+type tables in the runtime, `op.decode` at an effect's parameter once the instantiation
+is carried); row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
 per platform, deferred by the timers spec D1); explicit wrapping arithmetic (`int.wrapping_mul` and friends, for
 hashes and generators) and unary minus natively (Core refuses "Unary"); the
 one-shot trap's words differ (evaluator "continuation resumed more than once", native
