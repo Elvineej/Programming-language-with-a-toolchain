@@ -882,3 +882,21 @@ fn parametric_declarations_are_recorded_in_generic_types() {
         ]
     );
 }
+
+#[test]
+fn an_operation_generic_handler_is_refused_at_lowering() {
+    // `with any` (2026-10-16) runs in the evaluator only: natively, `op.show` and
+    // `op.decode` need each operation's name and declared types at run time.
+    // Refused by name (spec D6), not lowered as if it named an operation `op`.
+    let src = "effect W { fn roll(s: Int) -> Int }\n\
+               fn replay(body) { handle { body() } with any { op(o) -> resume(op.decode(o, \"4\")) } }\n\
+               pub fn main() -> Int { replay(fn() { roll(6) }) }\n";
+    let (m, pd) = parse_module(&Session::new(), src);
+    assert!(pd.is_empty(), "{pd:?}");
+    let (diags, table) = infer_typed_table(&Session::new(), &m);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(
+        lower_module(&m, &table).unwrap_err(),
+        elya::core::LowerError::Unsupported("operation-generic handler (`with any`)"),
+    );
+}

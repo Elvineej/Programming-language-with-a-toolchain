@@ -632,6 +632,12 @@ fn lower_expr(
         // that lookup returns is then unused.
         Expr::Block(b) => return lower_block(b, table, cx),
         Expr::Handle { body, handler } => {
+            // `with any` (2026-10-16, spec D6): the evaluator only, for now.
+            if handler.any {
+                return Err(LowerError::Unsupported(
+                    "operation-generic handler (`with any`)",
+                ));
+            }
             // An unqualified clause (`op(..) -> ..`) means its op's effect (slice
             // 5c-1): op names are unique per module (E0202), and the evaluator
             // dispatches it exactly so. A clause naming no declared op is E0203 in
