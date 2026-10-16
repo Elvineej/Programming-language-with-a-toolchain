@@ -39,6 +39,13 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   high finding (record keys), fixed test-first. Gate 1015 / 95.
 - Windows-gate debt added: 742a840 (**priority**: the point of the slice is win64's
   tail-call cap).
+- **Done: record and replay from the command line** (a90d362, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-16-elya-cli-record-replay-design.md`. **Decisions
+  (mine; please review):** the trace is the HOST's answers (`time.*`), not user effects;
+  text format `elya trace 1` + `question = answer`; plain `elya run` with extra
+  arguments is now a usage error (exit 2). Review: 1 medium + several low findings,
+  fixed. Gate 1033 / 99.
+- Windows-gate debt added: a90d362.
 
 ## 2026-10-16 05:53 UTC — ended without a DONE mark (taken over 2026-10-16 12:30)
 
