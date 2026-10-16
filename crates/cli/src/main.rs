@@ -3,12 +3,26 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("run")
+            if matches!(
+                args.get(2).map(String::as_str),
+                Some("--record" | "--replay")
+            ) =>
+        {
+            trace_cmd(&args)
+        }
+        Some("run") if args.len() > 3 => {
+            eprintln!("usage: elya run <file.elya>  (flags go before the program: elya run --record <trace> <file.elya>)");
+            ExitCode::from(2)
+        }
         Some("run") => cmd(&args, true),
         Some("check") => cmd(&args, false),
         #[cfg(feature = "codegen")]
         Some("build") => build_cmd(&args),
         _ => {
             eprintln!("usage: elya <run|check|build> <file.elya>");
+            eprintln!("       elya run --record <trace> <file.elya>");
+            eprintln!("       elya run --replay <trace> <file.elya>");
             ExitCode::from(2)
         }
     }
@@ -135,4 +149,61 @@ fn build_cmd(args: &[String]) -> ExitCode {
     }
     println!("built {}", exe.display());
     ExitCode::SUCCESS
+}
+
+/// `elya run --record <trace> <file.elya>` and `elya run --replay <trace>
+/// <file.elya>` (spec 2026-10-16-elya-cli-record-replay): the trace is the
+/// host's answers; a replay reproduces the run or stops by name.
+fn trace_cmd(args: &[String]) -> ExitCode {
+    // Exactly `run <flag> <trace> <file.elya>`: a flag after the program, an
+    // extra argument, or a trace path that is a flag or the program itself
+    // is a usage error (the record-replay review's findings).
+    let (Some(flag), Some(trace), Some(path), None) =
+        (args.get(2), args.get(3), args.get(4), args.get(5))
+    else {
+        eprintln!("usage: elya run --record|--replay <trace> <file.elya>");
+        return ExitCode::from(2);
+    };
+    if trace.starts_with("--") || trace == path {
+        eprintln!("error: `{trace}` is not a trace path (it is a flag or the program)");
+        eprintln!("usage: elya run --record|--replay <trace> <file.elya>");
+        return ExitCode::from(2);
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: cannot read {path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let result = if flag == "--record" {
+        let (log, out) = elya::run_source_recording(path, &text);
+        // Written even when the run fails: that run is the one to replay.
+        if let Some(log) = log {
+            if let Err(e) = std::fs::write(trace, log) {
+                eprintln!("error: cannot write {trace}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        out
+    } else {
+        match std::fs::read_to_string(trace) {
+            Ok(log) => elya::run_source_replaying(path, &text, &log),
+            Err(e) => {
+                eprintln!("error: cannot read {trace}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    };
+    match result {
+        Ok(out) => {
+            surface_warnings(path, &text);
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(diags) => {
+            eprint!("{diags}");
+            ExitCode::FAILURE
+        }
+    }
 }

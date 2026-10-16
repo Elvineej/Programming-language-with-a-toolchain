@@ -14,7 +14,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1015 passed, 95 suites. Since `main`, the runtime
+- Linux gate at the tip of `auto/elya`: 1033 passed, 99 suites. Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions; `gc_mark` is unchanged (637 bytes of source).
 - Interactive sessions may also work on `auto/elya`. They use the same
@@ -306,23 +306,15 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   and passes the rest in one synthesized record (`spill.rs`), so no kind can exceed its
   win64 tail-call cap; every arity refusal is gone. Needs the Windows gate.
 
+- **Record and replay from the command line** (2026-10-16, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-16-elya-cli-record-replay-design.md`. `elya run
+  --record T prog` writes the host's answers (`time.*`) as a text trace, also for a
+  failing run; `--replay T` reproduces the run from it, stopping by name at a divergence
+  or on unread entries. Evaluator only.
+
 ## The next five steps
 
-### 1. Record and replay from the command line
-
-ROADMAP priority 3's last step: `elya run --record trace.txt prog.elya` runs `main` under
-a `with any` recorder and writes its log, and `elya run --replay trace.txt` feeds it
-back. A divergence stops by name, at the entry where it happened.
-- **Decide in the spec:**
-  - the trace format (one `op.show` question and one `op.encode` answer per line?);
-  - whether `main`'s own effects are recorded (it may perform only `IO`, so the
-    recorder needs `main` to delegate to a function performing user effects, or a
-    standard world effect);
-  - how `IO` output relates to a replay.
-- Evaluator first. Natively, `with any` needs per-operation type tables in the runtime
-  (D6). That is a slice of its own, listed under "Also open".
-
-### 2. Deep non-tail recursion natively
+### 1. Deep non-tail recursion natively
 
 Measured 2026-10-16: `fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }` over
 200 000 elements runs in the evaluator (its continuation is on the heap) and dies
@@ -331,7 +323,7 @@ spec: a large dedicated stack for `main` (mmap with a guard page) plus a NAMED
 "native stack overflow" diagnostic from the guard page, or deeper changes (CPS for deep
 recursion). Measure the current depth limit first, on Linux and Windows.
 
-### 3. Structural equality
+### 2. Structural equality
 
 `==` on an ADT value, a tuple or a list is refused natively ("Eq on an unrepresentable
 operand type") and decided by the evaluator's own rules. Measure what the evaluator does
@@ -340,7 +332,7 @@ error on functions -- E04xx at check time rather than at run time), and compile 
 natively (a runtime walk guided by the descriptor table, or generated per-type
 equality functions after N7 part 2's instances).
 
-### 4. A differential sweep, again
+### 3. A differential sweep, again
 
 The 2026-10-15 sweep (about 700 programs: every corpus, example and probe through
 `elya run` and `elya build`) found the N7 instance-key miscompile and ranked the native
@@ -348,12 +340,20 @@ refusals. Re-run it at the tip: list every program the evaluator runs and native
 or gets wrong, rank the refusals by count, and turn the top one into the next step.
 Keep the sweep script under `scripts/` so the next run can repeat it.
 
-### 5. Unary minus and wrapping arithmetic natively
+### 4. Unary minus and wrapping arithmetic natively
 
 Also-open items since 2026-10-10: Core refuses unary minus ("Unary"), so every native
 example writes `0 - 1`; and hashes and generators need explicit wrapping arithmetic
 (`int.wrapping_mul` and friends) now that `Int` is checked. Measure which corpus programs
 use `-x`, add the lowering, and decide the wrapping builtins' names in a spec.
+
+### 5. Record and replay natively
+
+`elya run --record/--replay` (Done) works in the evaluator only; a native binary asks
+the runtime's clock directly. Add the same trace to the runtime (an environment
+variable or flag read by the shim: `ELYA_RECORD=file` / `ELYA_REPLAY=file`), with the
+same format and the same named failures, and a differential test that a trace recorded
+by `elya run` replays natively and the reverse.
 
 Also open, unscheduled: `with any` natively (per-operation name and
 type tables in the runtime, `op.decode` at an effect's parameter once the instantiation
