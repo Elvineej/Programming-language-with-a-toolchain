@@ -119,3 +119,39 @@ fn elya_build_reports_front_end_errors_and_emits_nothing() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Found by the 2026-10-16 sweep: `elya build` asserted that inference returned
+/// no diagnostics at all, so a program with only a warning (E0426) panicked
+/// the debug binary instead of building.
+#[test]
+fn a_program_with_only_warnings_builds() {
+    let dir = temp_dir("warning-only");
+    let src = dir.join("multi.elya");
+    std::fs::write(
+        &src,
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn noisy() { let x = flip()  let _ = io.println(\"tick\")  x }\n\
+         pub fn main() {\n\
+         \x20 let _ = handle noisy() with multi { Flip.flip() -> resume(True) }\n\
+         \x20 io.println(\"done\")\n\
+         }\n",
+    )
+    .expect("write program");
+    let exe = dir.join(format!("multi{}", std::env::consts::EXE_SUFFIX));
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .arg("build")
+        .arg(&src)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .expect("spawn elya build");
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("E0426"),
+        "the warning is still shown: {out:?}"
+    );
+    let run = Command::new(&exe).output().expect("run produced binary");
+    assert!(run.status.success(), "{run:?}");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "tick\ndone\n0\n");
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -65,3 +65,85 @@ fn elya_run_refuses_misplaced_trace_arguments() {
     assert_eq!(std::fs::read_to_string(&prog).expect("still there"), src);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+fn scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("elya-run-cli-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    dir
+}
+
+/// Spec 2026-10-16-elya-differential-sweep D1: what a program printed before a
+/// runtime error stays printed (it was dropped: the error path returned only
+/// the diagnostic), as a native binary keeps it.
+#[test]
+fn elya_run_keeps_output_written_before_a_runtime_error() {
+    let dir = scratch("keep");
+    let prog = dir.join("div.elya");
+    std::fs::write(
+        &prog,
+        "fn z(x) { x - x }\npub fn main() -> Int { io.println(\"before\")  1 / z(3) }\n",
+    )
+    .expect("write program");
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .arg("run")
+        .arg(&prog)
+        .output()
+        .expect("spawn elya run");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "before\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("division by zero"),
+        "{out:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// D2: `elya run --value` ends with main's value as the native shim prints it.
+#[test]
+fn elya_run_value_prints_main_as_a_native_binary_does() {
+    let dir = scratch("value");
+    let run = |name: &str, src: &str, args: &[&str]| {
+        let prog = dir.join(name);
+        std::fs::write(&prog, src).expect("write program");
+        Command::new(env!("CARGO_BIN_EXE_elya"))
+            .arg("run")
+            .args(args)
+            .arg(&prog)
+            .output()
+            .expect("spawn elya run --value")
+    };
+    let int = run(
+        "int.elya",
+        "pub fn main() -> Int { io.println(\"a\")  40 + 2 }\n",
+        &["--value"],
+    );
+    assert!(int.status.success(), "{int:?}");
+    assert_eq!(String::from_utf8_lossy(&int.stdout), "a\n42\n");
+    let unit = run(
+        "unit.elya",
+        "pub fn main() { io.println(\"x\") }\n",
+        &["--value"],
+    );
+    assert!(unit.status.success(), "{unit:?}");
+    assert_eq!(String::from_utf8_lossy(&unit.stdout), "x\n0\n");
+    let boolean = run(
+        "bool.elya",
+        "pub fn main() -> Bool { True }\n",
+        &["--value"],
+    );
+    assert_eq!(boolean.status.code(), Some(1), "{boolean:?}");
+    assert!(
+        String::from_utf8_lossy(&boolean.stderr).contains("main's value is not an `Int` or `Unit`"),
+        "{boolean:?}"
+    );
+    // A runtime error: the output so far, then no value line.
+    let failing = run(
+        "fail.elya",
+        "fn z(x) { x - x }\npub fn main() -> Int { io.println(\"b\")  1 / z(1) }\n",
+        &["--value"],
+    );
+    assert_eq!(failing.status.code(), Some(1), "{failing:?}");
+    assert_eq!(String::from_utf8_lossy(&failing.stdout), "b\n");
+    std::fs::remove_dir_all(&dir).ok();
+}

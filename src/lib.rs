@@ -57,6 +57,51 @@ pub fn run_source(name: &str, text: &str) -> Result<String, String> {
     }
 }
 
+/// What `elya run` shows (spec 2026-10-16-elya-differential-sweep): the
+/// program's output, kept when the run fails (D1), and main's value as a native
+/// binary prints it (D2: an `Int` in decimal, `Unit` as `0`; `None` for any
+/// other type). `error` is the rendered diagnostic of a front-end or runtime
+/// failure.
+pub struct RunOutcome {
+    pub output: String,
+    pub value: Option<Result<i64, String>>,
+    pub error: Option<String>,
+}
+
+pub fn run_source_outcome(name: &str, text: &str) -> RunOutcome {
+    let session = Session::new();
+    let sm = SourceMap::new(name, text);
+    let (module, diags) = front_end(&session, text);
+    if let Some(rendered) = fail_if_errors(&diags, &sm) {
+        return RunOutcome {
+            output: String::new(),
+            value: None,
+            error: Some(rendered),
+        };
+    }
+    let (interp, result) = eval::run_module_keeping(&module, eval::World::Live);
+    let output = interp.output().to_string();
+    match result {
+        Ok(v) => RunOutcome {
+            output,
+            value: Some(match v {
+                eval::Value::Int(n) => Ok(n),
+                eval::Value::Unit => Ok(0),
+                _ => Err(
+                    "main's value is not an `Int` or `Unit`, so it has no native value line"
+                        .to_string(),
+                ),
+            }),
+            error: None,
+        },
+        Err(e) => RunOutcome {
+            output,
+            value: None,
+            error: Some(render(&[e.diag], &sm)),
+        },
+    }
+}
+
 /// The trace format's first line (spec 2026-10-16-elya-cli-record-replay).
 const TRACE_HEADER: &str = "elya trace 1";
 

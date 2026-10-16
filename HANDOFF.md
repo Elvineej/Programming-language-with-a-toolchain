@@ -14,7 +14,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1049 passed, 101 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1054 passed, 101 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions; `gc_mark` is unchanged (637 bytes of source).
@@ -330,15 +330,27 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   longer overflow the host stack) and natively (`elya_eq`, a worklist over the
   descriptor table); `Unit` and every declared type compare natively.
 
+- **A repeatable differential sweep** (2026-10-16, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-16-elya-differential-sweep-design.md`.
+  `scripts/sweep.py` runs every program in the repository through `elya run --value`
+  (new: main's value as the native shim prints it) and natively, and classifies the
+  results; `elya run` now keeps output printed before a runtime error. At 9bb6f5d: 409
+  checked programs, 382 byte-identical, no disagreement or crash; `with any` is the top
+  native gap (9 programs). Found and fixed: `elya build` panicked on a warning-only
+  program.
+
 ## The next five steps
 
-### 1. A differential sweep, again
+### 1. `with any` natively
 
-The 2026-10-15 sweep (about 700 programs: every corpus, example and probe through
-`elya run` and `elya build`) found the N7 instance-key miscompile and ranked the native
-refusals. Re-run it at the tip: list every program the evaluator runs and native refuses
-or gets wrong, rank the refusals by count, and turn the top one into the next step.
-Keep the sweep script under `scripts/` so the next run can repeat it.
+The top native gap of the 2026-10-16 sweep (9 programs). Operation-generic handlers
+(`examples/09_record_any.elya`) run in the evaluator only;
+`elya build` refuses them by name. Natively they need, per operation, its name and its
+parameter and answer types at run time (`op.show`, `op.decode`, `op.perform`), and
+`op.decode` needs the instantiation carried to the handler. Measure what 09 and the
+`any_handler` corpus need, decide in a spec how operation values are represented (a
+runtime table of operation descriptors keyed by the operation ids `cps_emit` already
+assigns), and compile them.
 
 ### 2. Unary minus and wrapping arithmetic natively
 
@@ -364,21 +376,21 @@ memory natively, because every resume copies the whole captured chain
 the native growth by depth, then decide in a spec: share the chain's unchanged prefix
 (copy-on-write of handler frames only), or copy lazily as frames are re-entered.
 
-### 5. `with any` natively
+### 5. One wording for the one-shot trap, and the sweep's smaller gaps
 
-Operation-generic handlers (`examples/09_record_any.elya`) run in the evaluator only;
-`elya build` refuses them by name. Natively they need, per operation, its name and its
-parameter and answer types at run time (`op.show`, `op.decode`, `op.perform`), and
-`op.decode` needs the instantiation carried to the handler. Measure what 09 and the
-`any_handler` corpus need, decide in a spec how operation values are represented (a
-runtime table of operation descriptors keyed by the operation ids `cps_emit` already
-assigns), and compile them.
+The sweep's four `both-fail-differently` programs: a second resume of a one-shot
+continuation is "continuation resumed more than once" in the evaluator and "a one-shot
+continuation was resumed twice" natively. Decide one wording (spec), change both sides
+and the tests that assert either (a decision: call each out). Then the sweep's single
+refusals: a parametric constructor as a function value (`map(xs, Some)`), an
+effect-polymorphic closure through a `let` alias, `Float` in Core.
 
-Also open, unscheduled: row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
+Also open, unscheduled: `elya run --record/--replay` print a failing run's output to
+stderr with the diagnostic (plain `run` now keeps it on stdout); row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
 per platform, deferred by the timers spec D1); explicit wrapping arithmetic (`int.wrapping_mul` and friends, for
-hashes and generators) and unary minus natively (Core refuses "Unary"); the
-one-shot trap's words differ (evaluator "continuation resumed more than once", native
-"a one-shot continuation was resumed twice"); the parser continues a call across a
+hashes and generators) and unary minus natively (Core refuses "Unary"); a user
+effect named `IO` is refused by Core ("effect IO"); Elya functions are mangled
+`elya.<name>`; the parser continues a call across a
 newline (`f()` then a line starting `(` is `f()(...)`) -- a layout rule is a language
 decision; the roadmap's
 other priorities (record/replay handlers, then capabilities once modules exist); the rest

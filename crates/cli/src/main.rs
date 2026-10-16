@@ -11,6 +11,7 @@ fn main() -> ExitCode {
         {
             trace_cmd(&args)
         }
+        Some("run") if args.get(2).map(String::as_str) == Some("--value") => value_cmd(&args),
         Some("run") if args.len() > 3 => {
             eprintln!("usage: elya run <file.elya>  (flags go before the program: elya run --record <trace> <file.elya>)");
             ExitCode::from(2)
@@ -21,6 +22,7 @@ fn main() -> ExitCode {
         Some("build") => build_cmd(&args),
         _ => {
             eprintln!("usage: elya <run|check|build> <file.elya>");
+            eprintln!("       elya run --value <file.elya>");
             eprintln!("       elya run --record <trace> <file.elya>");
             eprintln!("       elya run --replay <trace> <file.elya>");
             ExitCode::from(2)
@@ -41,13 +43,15 @@ fn cmd(args: &[String], run: bool) -> ExitCode {
         }
     };
     if run {
-        match elya::run_source(path, &text) {
-            Ok(out) => {
+        // D1: the output a failing run produced is printed before its error.
+        let o = elya::run_source_outcome(path, &text);
+        print!("{}", o.output);
+        match o.error {
+            None => {
                 surface_warnings(path, &text);
-                print!("{out}");
                 ExitCode::SUCCESS
             }
-            Err(diags) => {
+            Some(diags) => {
                 eprint!("{diags}");
                 ExitCode::FAILURE
             }
@@ -64,6 +68,41 @@ fn cmd(args: &[String], run: bool) -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+/// `elya run --value <file.elya>` (spec 2026-10-16-elya-differential-sweep,
+/// D2): `elya run`, then main's value as the native shim prints it, so an
+/// evaluator run and a native run compare byte for byte.
+fn value_cmd(args: &[String]) -> ExitCode {
+    let (Some(path), None) = (args.get(3), args.get(4)) else {
+        eprintln!("usage: elya run --value <file.elya>");
+        return ExitCode::from(2);
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: cannot read {path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let o = elya::run_source_outcome(path, &text);
+    print!("{}", o.output);
+    if let Some(diags) = o.error {
+        eprint!("{diags}");
+        return ExitCode::FAILURE;
+    }
+    surface_warnings(path, &text);
+    match o.value {
+        Some(Ok(n)) => {
+            println!("{n}");
+            ExitCode::SUCCESS
+        }
+        Some(Err(why)) => {
+            eprintln!("error: {why}");
+            ExitCode::FAILURE
+        }
+        None => ExitCode::FAILURE,
     }
 }
 
@@ -117,8 +156,12 @@ fn build_cmd(args: &[String]) -> ExitCode {
         "check_source passed but parse failed: {pd:?}"
     );
     let (diags, table) = elya::types::infer_typed_table(&session, &module);
+    // Warnings (E0426, E0431) are expected here: `check_source` passed them
+    // through (the 2026-10-16 sweep found this asserting no diagnostics at all).
     debug_assert!(
-        diags.is_empty(),
+        diags
+            .iter()
+            .all(|d| d.severity != elya::diag::Severity::Error),
         "check_source passed but inference errored: {diags:?}"
     );
     let core = match elya::core::lower_module(&module, &table) {
