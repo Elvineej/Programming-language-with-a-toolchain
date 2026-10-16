@@ -2,6 +2,7 @@
 source: tests/typed_inference.rs
 expression: "render(src, &t)"
 ---
+33..80 `fn m(o) { match o { None -> 0  Some(x) -> x } }` : fn(Option(Int)) -> Int
 38..39 `o` : Option(Int)
 43..78 `match o { None -> 0  Some(x) -> x }` : Int
 49..50 `o` : Option(Int)

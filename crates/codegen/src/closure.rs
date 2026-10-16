@@ -406,6 +406,7 @@ mod tests {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
             fns: vec![CoreFn {
+                row: elya::types::EffectRow::pure(),
                 name: "main".to_string(),
                 params: Rc::from([]),
                 body: expr,
@@ -438,6 +439,7 @@ mod tests {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
             fns: vec![CoreFn {
+                row: elya::types::EffectRow::pure(),
                 name: "wrap".to_string(),
                 params: Rc::from([param("k")]),
                 body: lam,
@@ -472,6 +474,7 @@ mod tests {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
             fns: vec![CoreFn {
+                row: elya::types::EffectRow::pure(),
                 name: "id".to_string(),
                 params: Rc::from([]),
                 body: lam,
@@ -520,6 +523,7 @@ mod tests {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
             fns: vec![CoreFn {
+                row: elya::types::EffectRow::pure(),
                 name: "two".to_string(),
                 params: Rc::from([]),
                 body,
@@ -623,6 +627,7 @@ mod tests {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
             fns: vec![CoreFn {
+                row: elya::types::EffectRow::pure(),
                 name: "h".to_string(),
                 params: Rc::from([]),
                 body,
@@ -673,6 +678,7 @@ mod tests {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
             fns: vec![CoreFn {
+                row: elya::types::EffectRow::pure(),
                 name: "p".to_string(),
                 params: Rc::from([]),
                 body: perform("ping", vec![lam]),

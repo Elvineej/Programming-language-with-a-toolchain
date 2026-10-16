@@ -2214,6 +2214,7 @@ mod tests {
     fn main_fn(body: CoreExpr) -> CoreModule {
         CoreModule {
             fns: vec![CoreFn {
+                row: elya::types::EffectRow::pure(),
                 name: "main".into(),
                 params: Rc::from([]),
                 body,
@@ -2309,6 +2310,7 @@ mod tests {
         // would silently uniquify the second symbol rather than complain.
         let mut m = main_fn(int_lit(1));
         m.fns.push(CoreFn {
+            row: elya::types::EffectRow::pure(),
             name: "main".into(),
             params: Rc::from([]),
             body: int_lit(2),

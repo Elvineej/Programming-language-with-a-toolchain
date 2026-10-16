@@ -13,6 +13,7 @@ use crate::ast::{
     TypeAnn,
 };
 use crate::span::Span;
+use crate::types::EffectRow;
 use crate::types::Ty;
 use crate::types::TyPrinter;
 
@@ -154,6 +155,10 @@ pub struct CoreFn {
     /// block type onto the synthesized `Let` spine, so a separate `ret` field
     /// would be a second source of truth (Slice 5b-3 §3.3).
     pub body: CoreExpr,
+    /// The function's own (latent) row, read from its declaration's span in
+    /// the typed table (spec 2026-10-16): a type variable that occurs only
+    /// here is still an instantiation the back end must see.
+    pub row: EffectRow,
 }
 
 #[derive(Clone, Debug)]
@@ -316,10 +321,15 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
                 });
             }
             let body = lower_block(&f.body.node, table, &cx)?;
+            let row = match table.get(&d.span) {
+                Some(Ty::Fn(_, row, _)) => row.clone(),
+                _ => return Err(LowerError::Untyped(d.span)),
+            };
             fns.push(CoreFn {
                 name: f.name.clone(),
                 params: params.into(),
                 body,
+                row,
             });
         }
     }

@@ -2,9 +2,11 @@
 source: tests/typed_inference.rs
 expression: "render(src, &t)"
 ---
+56..78 `fn worker() { set(1) }` : fn() / {State(Int)} -> Unit
 70..73 `set` : fn(Int) / {State(Int)} -> Unit
 70..76 `set(1)` : Unit
 74..75 `1` : Int
+79..114 `fn use_it() { let g = worker  g() }` : fn() / {State(Int)} -> Unit
 101..107 `worker` : fn() / {State(Int)} -> Unit
 109..110 `g` : fn() / {State(Int)} -> Unit
 109..112 `g()` : Unit

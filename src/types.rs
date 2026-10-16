@@ -3127,6 +3127,14 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             Decl::Type(_) => None,
         })
         .collect();
+    // Each function's declaration span, in `fns` order: its whole type (its own
+    // row included) is recorded there for Core (spec 2026-10-16).
+    let decl_spans: Vec<Span> = module
+        .decls
+        .iter()
+        .filter(|d| matches!(d.node, Decl::Fn(_)))
+        .map(|d| d.span)
+        .collect();
     let name_idx: HashMap<&str, usize> = fns
         .iter()
         .enumerate()
@@ -3180,6 +3188,17 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             }
             inf.check_ann(&f.ret_ann, &result, true);
             ann_vars_of.insert(i, std::mem::take(&mut inf.ann_vars));
+            // A function's own row is in no expression's type: recorded at its
+            // declaration's span, pre-zonk like every entry (the single zonk at
+            // the end resolves it), for `CoreFn::row` (spec 2026-10-16).
+            inf.node_types.insert(
+                decl_spans[i],
+                Ty::Fn(
+                    params.clone(),
+                    EffectRow::open(amb_f),
+                    Box::new(result.clone()),
+                ),
+            );
             member_ty.insert(i, (params, amb_f, result));
         }
         inf.group_ambs = group.iter().map(|i| member_ty[i].1).collect();
@@ -3555,18 +3574,26 @@ mod tests {
         // PARAMETER span `x` at 7..8 that the SCC loop records (Slice 5b-3
         // §3.2) — each once. The count is the tripwire: it moved 4 → 5 exactly
         // when parameters started being recorded, and it would move again if a
-        // second recording path appeared.
+        // second recording path appeared. It moved 5 -> 6 on 2026-10-16 (spec
+        // `2026-10-16-elya-own-row-in-core-design.md`): the declaration's span
+        // now records the function's whole type, its own row included.
         assert_eq!(
             table.len(),
-            5,
+            6,
             "wrapper must record every node once: {table:?}"
         );
-        // Ordering: all five zonked to Int (a record-time table would show vars).
+        // Ordering: all five node entries zonked to Int (a record-time table
+        // would show vars), and the declaration's entry to `fn(Int) -> Int`.
         // The parameter entry is included, which is the whole reason §3.2 could
         // record it pre-zonk: the single zonk pass maps over the WHOLE table.
-        assert!(
-            table.values().all(|v| v == "Int"),
+        assert_eq!(
+            table.values().filter(|v| *v == "Int").count(),
+            5,
             "record-then-zonk violated — a node kept its pre-zonk var: {table:?}"
+        );
+        assert!(
+            table.values().any(|v| v == "fn(Int) -> Int"),
+            "the declaration's entry: {table:?}"
         );
     }
 

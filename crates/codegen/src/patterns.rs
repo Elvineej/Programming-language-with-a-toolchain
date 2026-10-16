@@ -43,6 +43,7 @@ pub(crate) fn run(core: &CoreModule) -> CoreModule {
                     name: f.name.clone(),
                     params: f.params.clone(),
                     body: c.expr(&f.body),
+                    row: f.row.clone(),
                 }
             } else {
                 f.clone()

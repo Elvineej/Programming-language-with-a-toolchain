@@ -2,8 +2,10 @@
 source: tests/typed_inference.rs
 expression: "render(src, &t)"
 ---
+0..14 `fn id(x) { x }` : fn(a) -> a
 6..7 `x` : a
 11..12 `x` : a
+15..60 `fn u() { let a = id(5)  let b = id(True)  0 }` : fn() -> Int
 32..34 `id` : fn(Int) -> Int
 32..37 `id(5)` : Int
 35..36 `5` : Int

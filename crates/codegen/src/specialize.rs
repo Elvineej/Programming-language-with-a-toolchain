@@ -560,7 +560,12 @@ fn rewrite_fn(sp: &mut Specializer<'_>, name: String, f: &CoreFn, s: &RowSubst) 
         })
         .collect();
     let body = sp.rewrite(&body, &mut locals)?;
-    Ok(CoreFn { name, params, body })
+    Ok(CoreFn {
+        name,
+        params,
+        body,
+        row: subst_row(&f.row, s),
+    })
 }
 
 // ------------------------------------------------------------ 2. adapter --
@@ -900,6 +905,7 @@ pub(crate) fn adapt_upcasts(core: &CoreModule) -> R<CoreModule> {
             name: f.name.clone(),
             params: f.params.clone(),
             body,
+            row: f.row.clone(),
         });
     }
     Ok(CoreModule {

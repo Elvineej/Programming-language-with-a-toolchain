@@ -14,7 +14,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 998 passed, 93 suites. Since `main`, the runtime
+- Linux gate at the tip of `auto/elya`: 1001 passed, 93 suites. Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions; `gc_mark` is unchanged (637 bytes of source).
 - Interactive sessions may also work on `auto/elya`. They use the same
@@ -278,20 +278,17 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
     escaped resume dropping a clause's relayed row) was pre-existing for plain
     handlers too.
 
+- **A function's own row in Core** (2026-10-16, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-16-elya-own-row-in-core-design.md`. The typed table
+  records each function's whole type at its declaration's span; `CoreFn::row` carries
+  it; N7 part 2 matches it at references, so a type variable generic only through a
+  function's own row (`fn dup() { put(get()) }` over `St(s)`) is instantiated natively
+  instead of refused. The node-count tripwire moved 5 -> 6 and the `typed_inference`
+  snapshots gained one line per declaration (decided, recorded).
+
 ## The next five steps
 
-### 1. A function's own row in Core
-
-`CoreFn` has no latent row, so a type or row variable that appears ONLY in a function's
-own row is invisible at its references: N7 part 2 refuses such type variables by name
-("type variable only in an effect row": `fn dup() { put(get()) }` over `St(s)`), and
-part 1 §6 cannot specialize such row variables. Record each top-level function's full
-type (its row included) in Core -- the typed table's node-count tripwire
-(`infer_with_types_records_every_node_and_zonks_after_inference`) moves if it is recorded
-there, so decide where it lives in the spec -- then match it at references in both
-passes and lift the refusal. Measure first which corpus programs it unlocks.
-
-### 2. A failure effect and scope cancellation
+### 1. A failure effect and scope cancellation
 
 Structured concurrency (Done) cannot cancel a scope's children: Elya has no failure
 effect in its examples. Design `effect Fail { fn fail(reason: String) -> Never }`-style
@@ -300,7 +297,7 @@ handler, and a scope that, when its body fails, drops its queued children instea
 running them -- then show it in `examples/06_structured.elya` or a new example. Measure
 first what the type system needs for an op that never returns.
 
-### 3. The last common native refusals: computed callees and functions as values
+### 2. The last common native refusals: computed callees and functions as values
 
 These are the two most frequent refusals of real programs in the 2026-10-15 sweep of
 about 700 programs, apart from test fragments without `main`.
@@ -317,7 +314,7 @@ about 700 programs, apart from test fragments without `main`.
 - **How:** measure each class through `build` first, pin each with differential rows,
   and keep `gc_mark` byte-identical.
 
-### 4. Native arity: more parameters than the win64 tail-call cap
+### 3. Native arity: more parameters than the win64 tail-call cap
 
 `MAX_PARAMS` (5 LLVM parameters) refuses an effectful function of five source
 parameters, a lambda of five, a direct function of six, and clauses of four. It is the
@@ -333,7 +330,7 @@ and the example now packs its state into one value.
 - **Measure first:** how many corpus programs hit each of the four arity refusals.
 - The Windows gate must run it; note it as debt.
 
-### 5. Record and replay from the command line
+### 4. Record and replay from the command line
 
 ROADMAP priority 3's last step: `elya run --record trace.txt prog.elya` runs `main` under
 a `with any` recorder and writes its log, and `elya run --replay trace.txt` feeds it
@@ -346,6 +343,15 @@ back. A divergence stops by name, at the entry where it happened.
   - how `IO` output relates to a replay.
 - Evaluator first. Natively, `with any` needs per-operation type tables in the runtime
   (D6). That is a slice of its own, listed under "Also open".
+
+### 5. Deep non-tail recursion natively
+
+Measured 2026-10-16: `fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }` over
+200 000 elements runs in the evaluator (its continuation is on the heap) and dies
+natively with SIGSEGV (the machine stack; fine under `ulimit -s unlimited`). Decide in a
+spec: a large dedicated stack for `main` (mmap with a guard page) plus a NAMED
+"native stack overflow" diagnostic from the guard page, or deeper changes (CPS for deep
+recursion). Measure the current depth limit first, on Linux and Windows.
 
 Also open, unscheduled: `with any` natively (per-operation name and
 type tables in the runtime, `op.decode` at an effect's parameter once the instantiation

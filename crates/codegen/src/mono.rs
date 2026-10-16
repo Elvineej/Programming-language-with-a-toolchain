@@ -358,10 +358,13 @@ fn inst_subst(g: &Ty, at: &Ty) -> TySubst {
 
 // ------------------------------------------------- 1. function clones --
 
+/// A function's whole generic type, its own row included (spec 2026-10-16): a
+/// type variable only in the row's label arguments is still generic, and a
+/// reference's type shows what it is instantiated at.
 fn signature(f: &CoreFn) -> Ty {
     Ty::Fn(
         f.params.iter().map(|p| p.ty.clone()).collect(),
-        EffectRow::pure(),
+        f.row.clone(),
         Box::new(f.body.ty.clone()),
     )
 }
@@ -613,7 +616,11 @@ impl Mono<'_> {
             })
             .collect();
         let body = self.rewrite(&body, &mut locals)?;
-        if params.iter().any(|p| tv_in_label_args(&p.ty, self.used)) || effect_var(&body, self.used)
+        let row = map_row(&f.row, &|t| apply(t, s));
+        let row_ty = Ty::Fn(Vec::new(), row.clone(), Box::new(Ty::Base(TyCon::Unit)));
+        if params.iter().any(|p| tv_in_label_args(&p.ty, self.used))
+            || tv_in_label_args(&row_ty, self.used)
+            || effect_var(&body, self.used)
         {
             return Err(CodegenError::Unsupported(
                 "type variable only in an effect row",
@@ -629,6 +636,7 @@ impl Mono<'_> {
                 })
                 .collect(),
             body: map_expr(&body, &default_unit),
+            row: map_row(&row, &default_unit),
         })
     }
 }
@@ -1006,10 +1014,19 @@ pub(crate) fn instantiate_types(core: &CoreModule) -> R<CoreModule> {
         .collect();
     let mut fns = Vec::with_capacity(core.fns.len());
     for f in &core.fns {
+        let row_ty = ins.rename_ty(&Ty::Fn(
+            Vec::new(),
+            f.row.clone(),
+            Box::new(Ty::Base(TyCon::Unit)),
+        ));
+        let Ty::Fn(_, row, _) = row_ty else {
+            unreachable!("rename_ty keeps a function type a function type")
+        };
         fns.push(CoreFn {
             name: f.name.clone(),
             params: ins.params(&f.params),
             body: ins.expr(&f.body, &core.types)?,
+            row,
         });
     }
     types.extend(ins.out);
@@ -1180,34 +1197,46 @@ mod tests {
         );
     }
 
+    /// The clone a module makes of `name`, with its own row.
+    fn only_clone<'m>(m: &'m CoreModule, name: &str) -> &'m CoreFn {
+        let cs: Vec<&CoreFn> = m
+            .fns
+            .iter()
+            .filter(|f| f.name.starts_with(&format!("{name}.mono.")))
+            .collect();
+        assert_eq!(cs.len(), 1, "{:?}", names(m));
+        assert!(
+            !m.fns.iter().any(|f| f.name == name),
+            "the original is not emitted"
+        );
+        cs[0]
+    }
+
     #[test]
-    fn a_row_only_type_variable_is_refused_by_name() {
-        let err = run(&core_of(
+    fn a_row_only_type_variable_is_instantiated_from_the_reference() {
+        // Was `a_row_only_type_variable_is_refused_by_name` (N7 part 2): `s`
+        // occurs only in `dup`'s own row, which Core did not carry. Since
+        // `CoreFn::row` (spec 2026-10-16) the reference at
+        // `fn() / {St(String)} -> Int` instantiates it.
+        let m = run(&core_of(
             "effect St(s) { fn get() -> s  fn put(v: s) -> Int }\n\
              fn dup() { put(get()) }\n\
              pub fn main() -> Int {\n\
              \x20 handle { dup()  5 } with { St.get() -> resume(\"x\")  St.put(v) -> resume(0)  return(r) -> r }\n\
              }\n",
         ))
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("type variable only in an effect row")
-            ),
-            "{err:?}"
-        );
+        .expect("monomorphizes");
+        let dup = only_clone(&m, "dup");
+        assert_eq!(dup.row.labels["St"].args, vec![Ty::Base(TyCon::Str)]);
     }
 
     #[test]
-    fn a_row_only_type_variable_through_a_generic_callee_is_refused() {
-        // The review's F2 fix narrows the check to effect parameters an
-        // operation uses. `dup3` performs nothing itself: the `String` reaches
-        // it from `getter`'s result and leaves through `putter`, both generic
-        // in `s`, with `s` visible in `dup3` only in the callees' rows.
-        // Defaulting would type it `Unit` (unrooted). Negative control: with
-        // label arguments ignored, this test fails (measured).
-        let err = run(&core_of(
+    fn a_row_only_type_variable_through_generic_callees_is_instantiated() {
+        // Was `a_row_only_type_variable_through_a_generic_callee_is_refused`:
+        // the `String` crosses `dup3` only through its callees' rows; `dup3`'s
+        // own row now says `St(s)`, so it is generic and cloned at `String`,
+        // and so are `getter` and `putter` from inside the clone.
+        let m = run(&core_of(
             "effect St(s) { fn get() -> s  fn put(v: s) -> Int }\n\
              fn getter() { get() }\n\
              fn putter(v) { put(v) }\n\
@@ -1216,14 +1245,14 @@ mod tests {
              \x20 handle { dup3() } with { St.get() -> resume(\"x\")  St.put(v) -> resume(0)  return(r) -> r }\n\
              }\n",
         ))
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("type variable only in an effect row")
-            ),
-            "{err:?}"
-        );
+        .expect("monomorphizes");
+        for n in ["dup3", "getter", "putter"] {
+            assert_eq!(
+                only_clone(&m, n).row.labels["St"].args,
+                vec![Ty::Base(TyCon::Str)],
+                "{n}"
+            );
+        }
     }
 
     #[test]

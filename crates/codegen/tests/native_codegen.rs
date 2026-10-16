@@ -850,6 +850,7 @@ fn a_failed_match_traps_with_a_named_error() {
             ],
         }],
         fns: vec![CoreFn {
+            row: elya::types::EffectRow::pure(),
             name: "main".into(),
             params: Rc::from([]),
             body: CoreExpr {
@@ -5442,4 +5443,56 @@ fn the_clock_advances_natively() {
     }
     std::fs::remove_dir_all(&dir).ok();
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+// ---- A function's own row in Core (2026-10-16) ----
+// Spec `docs/superpowers/specs/2026-10-16-elya-own-row-in-core-design.md`. Each
+// was refused natively ("type variable only in an effect row"): `s` is generic
+// only through the functions' own rows.
+const OWN_ROW: &[(&str, &str, &str)] = &[
+    (
+        "r10-dup-at-int",
+        "effect St(s) { fn get() -> s  fn put(v: s) -> Int }\n\
+         fn dup() { put(get()) }\n\
+         pub fn main() -> Int { handle { dup()  5 } with { St.get() -> resume(3)  St.put(v) -> resume(0)  return(r) -> r } }\n",
+        "5",
+    ),
+    (
+        "r24-dup-at-string",
+        "effect St(s) { fn get() -> s  fn put(v: s) -> Int }\n\
+         fn dup() { put(get()) }\n\
+         pub fn main() -> Int { handle { dup()  5 } with { St.get() -> resume(\"x\")  St.put(v) -> resume(0)  return(r) -> r } }\n",
+        "5",
+    ),
+    (
+        // Defaulting `s` to `Unit` left the list unrooted: natively 4130074439
+        // (a collected list summed), measured with the refusal switched off.
+        // `len` counts by a tail loop: 200 000 non-tail calls overflow the
+        // native stack (SIGSEGV), which is not what this row is about.
+        "r27-a-list-across-collections",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         effect St(s) { fn get() -> s  fn put(v: s) -> Int }\n\
+         fn build(i, acc) { if i == 0 { acc } else { build(i - 1, Cons(i, acc)) } }\n\
+         fn count(l, k) { match l { Nil -> k  Cons(_, t) -> count(t, k + 1) } }\n\
+         fn len(l) { count(l, 0) }\n\
+         fn sum(l, s) { match l { Nil -> s  Cons(h, t) -> sum(t, s + h) } }\n\
+         fn dup() { let v = get()  let n = len(build(200000, Nil))  put(v) + n }\n\
+         pub fn main() -> Int { handle { dup() } with { St.get() -> resume(build(1000, Nil))  St.put(v) -> resume(sum(v, 0))  return(r) -> r } }\n",
+        "700500",
+    ),
+    (
+        "g1-through-generic-callees",
+        "effect St(s) { fn get() -> s  fn put(v: s) -> Int }\n\
+         fn getter() { get() }\n\
+         fn putter(v) { put(v) }\n\
+         fn dup3() { let v = getter()  putter(v) }\n\
+         pub fn main() -> Int { handle { dup3() } with { St.get() -> resume(\"x\")  St.put(v) -> resume(0)  return(r) -> r } }\n",
+        "0",
+    ),
+];
+
+#[test]
+fn row_only_type_variables_run_natively() {
+    run_value_corpus(OWN_ROW, "own-row");
+    run_differential_corpus(OWN_ROW, "own-row-diff");
 }

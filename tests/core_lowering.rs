@@ -900,3 +900,20 @@ fn an_operation_generic_handler_is_refused_at_lowering() {
         elya::core::LowerError::Unsupported("operation-generic handler (`with any`)"),
     );
 }
+
+#[test]
+fn a_function_carries_its_own_row() {
+    // A function's own (latent) row reaches Core (spec 2026-10-16): `dup` is
+    // generic in `s` only through `St(s)` in its row, which nothing else in
+    // Core shows; `pure` closes to the empty row; `main` handles St.
+    let (core, _t) = lower_src(
+        "effect St(s) { fn get() -> s  fn put(v: s) -> Int }\n\
+         fn dup() { put(get()) }\n\
+         fn pure(x) { x + 1 }\n",
+    );
+    let f = |n: &str| core.fns.iter().find(|f| f.name == n).expect(n).row.clone();
+    let dup = f("dup");
+    let st = dup.labels.get("St").expect("dup performs St");
+    assert!(matches!(st.args[..], [Ty::Var(_)]), "{dup:?}");
+    assert!(f("pure").labels.is_empty());
+}
