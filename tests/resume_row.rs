@@ -396,3 +396,25 @@ fn a_local_lambda_forwarding_a_parameter_shares_its_row_known_limitation() {
     );
     assert!(err.contains("E0420"), "{err}");
 }
+
+/// A plain handler's escaped `resume` re-enters a clause that calls a
+/// parameter: the lambda performs the parameter's row (found by the `with any`
+/// review of 2026-10-16; it was typed pure, and its perform reached no handler).
+#[test]
+fn an_escaped_resume_carries_a_clause_parameters_row() {
+    let src = "effect World { fn roll(s: Int) -> Int }\n\
+               effect Tick { fn tick() -> Int }\n\
+               fn rec(k) {\n\
+                 let run = handle { tick() + tick() } with {\n\
+                   Tick.tick() -> { let _ = k()  fn(u: Int) { resume(1)(u) } }\n\
+                   return(x) -> fn(u: Int) { x }\n\
+                 }\n\
+                 run\n\
+               }\n\
+               pub fn main() -> Int {\n\
+                 let g = handle { rec(fn() { roll(1) }) } with { World.roll(s) -> resume(s) }\n\
+                 g(0)\n\
+               }\n";
+    let err = elya::check_source("t.elya", src).expect_err("World escapes its handler");
+    assert!(err.contains("E0420"), "{err}");
+}

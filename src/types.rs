@@ -2088,6 +2088,17 @@ impl Infer {
                 let r = self.add_effect(clauses_row, label, l.args.clone(), l.span);
                 self.surface_conflict(r);
             }
+            // A clause's open tail (a parameter's row it relays) is performed
+            // again by an escaped resume that re-enters the clause (found by
+            // the `with any` review, 2026-10-16: the lambda was typed pure).
+            if matches!(row.tail, RowTail::Open(_)) {
+                let tail = EffectRow {
+                    labels: BTreeMap::new(),
+                    tail: row.tail.clone(),
+                };
+                let r = self.add_row(clauses_row, &tail, span);
+                self.surface_conflict(r);
+            }
         }
         self.flush_inclusions();
         let own_tail = self.resolve_row(&EffectRow::open(amb)).tail;
@@ -2252,17 +2263,17 @@ impl Infer {
         // Escaped resumes may re-enter the clause, whose effects -- the
         // operations it performs again included -- happen outside the handler.
         self.pending_clause_rows.pop();
-        let handled_now = self.resolve_row(&handled).tail;
         for &ca in &clause_ambs {
             let row = self.resolve_row(&EffectRow::open(ca));
             for (label, l) in row.labels.iter() {
                 let r = self.add_effect(clauses_row, label, l.args.clone(), l.span);
                 self.surface_conflict(r);
             }
-            // A forwarding clause performs the handled tail too: an escaped
-            // resume that re-enters it does (the review's S1: such a lambda
-            // was typed pure, and its performs reached no handler).
-            if matches!(row.tail, RowTail::Open(_)) && row.tail == handled_now {
+            // A clause's open tail -- the handled one when it forwards, or a
+            // parameter's it relays -- is performed again by an escaped resume
+            // that re-enters it (the review's S1 and F1: such a lambda was
+            // typed pure, and its performs reached no handler).
+            if matches!(row.tail, RowTail::Open(_)) {
                 let tail = EffectRow {
                     labels: BTreeMap::new(),
                     tail: row.tail.clone(),
@@ -2539,7 +2550,7 @@ impl Infer {
         // runs when the top-level group is solved), stays monomorphic in a
         // local `let`: generalized, its later instantiations were never
         // checked (the review's S3: `IO` hidden from a pure function).
-        for site in &self.pending_generic {
+        for site in self.pending_generic.iter().filter(|s| !s.forwarded) {
             if let RowTail::Open(v) = self.resolve_row(&site.tail).tail {
                 row_in_env.push(v);
             }

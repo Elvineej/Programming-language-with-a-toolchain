@@ -166,3 +166,16 @@ An independent review found three soundness holes and three bugs, all fixed test
   (`record` around `07_search`) fails by name at run time (E0425, "resumed more than
   once"). The same holds today for any one-shot handler whose clause performs a
   `multi` operation, so it is not specific to `with any`.
+
+A second review of the fixes held S2, S3, B1 to B3 and the nits. It found:
+- **F1, soundness, pre-existing for plain handlers too.** S1's fix covered only the
+  handled tail. A clause that calls a PARAMETER (`k()`) relays that parameter's row,
+  and an escaped resume that re-enters the clause performs it. The clauses row took
+  only labels, so the lambda was typed pure. This was already true of plain handlers
+  at 82e2245. Every open clause tail now goes into the clauses row, in both handle
+  kinds (`tests/resume_row.rs` pins the plain one).
+- **F2, a false positive from S3's fix.** The S3 rule also froze FORWARDING sites,
+  whose tails are never checked statically. Such sites are now excluded, so a local
+  forwarding recorder stays polymorphic.
+- **F3.** A constructor named `NaN` decoded as a float. The float word is now `nan`
+  (lowercase, so no constructor can collide with it).

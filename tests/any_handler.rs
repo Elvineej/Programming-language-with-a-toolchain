@@ -529,3 +529,65 @@ fn an_operation_equals_itself() {
                pub fn main() { io.println(int.to_string(f(fn() { roll(6) + 1 }))) }\n";
     assert_eq!(run_source("t.elya", src).expect("runs"), "3\n");
 }
+
+// ---- the second review of 2026-10-16 (each red first) -----------------------
+
+/// F1: an escaped `resume` re-enters the clause, which may perform any relayed
+/// tail of its own (here a parameter's), not only the handled one.
+#[test]
+fn an_escaped_resume_carries_a_relayed_clause_tail() {
+    let src = "effect World { fn roll(s: Int) -> Int }\n\
+               effect Tick { fn tick() -> Int }\n\
+               fn rec(body, k) {\n\
+                 let run = handle { body() } with any {\n\
+                   op(o) -> { let _ = k()  let v = op.decode(o, \"1\")  fn(u: Int) { resume(v)(u) } }\n\
+                   return(x) -> fn(u: Int) { x }\n\
+                 }\n\
+                 run\n\
+               }\n\
+               pub fn main() -> Int {\n\
+                 let g = handle { rec(fn() { tick() + tick() }, fn() { roll(1) }) } with { World.roll(s) -> resume(s) }\n\
+                 g(0)\n\
+               }\n";
+    assert!(errors(src).contains("E0420"), "{}", errors(src));
+}
+
+/// F2: a local FORWARDING recorder is not frozen to one row by the S3 rule (its
+/// tail is never checked statically, so generalizing it loses nothing).
+#[test]
+fn a_local_forwarding_recorder_stays_polymorphic() {
+    let src = "effect World { fn roll(s: Int) -> Int }\n\
+               effect Ask { fn ask() -> Int }\n\
+               fn f() -> Int {\n\
+                 let r = fn(b) { handle { b() } with any { op(o) -> resume(op.perform(o)) } }\n\
+                 let x = handle { r(fn() { roll(6) }) } with { World.roll(s) -> resume(4) }\n\
+                 let y = handle { r(fn() { ask() }) } with { Ask.ask() -> resume(5) }\n\
+                 x + y\n\
+               }\n\
+               pub fn main() { io.println(int.to_string(f())) }\n";
+    assert_eq!(errors(src), "");
+    assert_eq!(run_source("t.elya", src).expect("runs"), "9\n");
+}
+
+/// F3: a constructor named `NaN` is not a float: the float word is `nan`.
+#[test]
+fn a_constructor_named_nan_round_trips() {
+    let src = "type F { NaN, Inf(Float) }\n\
+               effect Q { fn g() -> F  fn f(x: Float) -> Float }\n\
+               fn rt(body) {\n\
+                 handle { body() } with any {\n\
+                   op(o) -> { let v = op.perform(o)  let e = op.encode(o, v)  io.println(e)  resume(op.decode(o, e)) }\n\
+                 }\n\
+               }\n\
+               pub fn main() {\n\
+                 let big = 10000000000000000000000000000000000000000.0\n\
+                 let inf = big *. big *. big *. big *. big *. big *. big *. big\n\
+                 let _ = handle { rt(fn() { let x = f(inf -. inf)  g() }) } with {\n\
+                   Q.g() -> resume(NaN)\n\
+                   Q.f(x) -> resume(x)\n\
+                 }\n\
+                 io.println(\"ok\")\n\
+               }\n";
+    assert_eq!(errors(src), "");
+    assert_eq!(run_source("t.elya", src).expect("runs"), "nan\nNaN\nok\n");
+}

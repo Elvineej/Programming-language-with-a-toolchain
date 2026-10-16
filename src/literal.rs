@@ -7,7 +7,7 @@
 //! declared answer type, through constructors and their fields.
 //!
 //! Floats are decimals without an exponent (`1.0`, `0.0000001`), plus the words
-//! `inf`, `-inf` and `NaN`. Every walk here is iterative: a list of a million cells
+//! `inf`, `-inf` and `nan` (lowercase: a constructor may be named `NaN`). Every walk here is iterative: a list of a million cells
 //! is shown, parsed and checked without recursing on the host stack.
 
 use crate::ast::{Decl, Module, TypeAnn};
@@ -120,10 +120,10 @@ fn write(v: &Value, out: &mut String) -> Result<(), &'static str> {
 }
 
 /// A decimal with a point and no exponent (Rust's shortest round-trip `Display`),
-/// or `inf`, `-inf`, `NaN`.
+/// or `inf`, `-inf`, `nan`.
 fn write_float(f: f64, out: &mut String) {
     if f.is_nan() {
-        out.push_str("NaN");
+        out.push_str("nan");
     } else if f.is_infinite() {
         out.push_str(if f > 0.0 { "inf" } else { "-inf" });
     } else {
@@ -302,6 +302,10 @@ impl Parser<'_> {
                     self.i += 3;
                     Value::Float(f64::INFINITY)
                 }
+                Some(b'n') if self.s[self.i..].starts_with(b"nan") => {
+                    self.i += 3;
+                    Value::Float(f64::NAN)
+                }
                 Some(c) if c.is_ascii_uppercase() => {
                     let name = self.name()?;
                     let save = self.i;
@@ -316,7 +320,6 @@ impl Parser<'_> {
                         "True" => Value::Bool(true),
                         "False" => Value::Bool(false),
                         "Unit" => Value::Unit,
-                        "NaN" => Value::Float(f64::NAN),
                         _ => Value::Ctor(name, CtorArgs(Rc::new(Vec::new()))),
                     }
                 }
