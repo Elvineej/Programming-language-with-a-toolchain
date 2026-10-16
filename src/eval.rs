@@ -31,6 +31,13 @@ pub enum Value {
         body: Rc<Spanned<Block>>,
         env: Env,
     },
+    /// An operation caught by a `with any` handler (2026-10-16): its effect, its
+    /// name and its arguments. Only `op.*` builtins look inside.
+    Op {
+        effect: String,
+        op: String,
+        args: Rc<Vec<Value>>,
+    },
 }
 
 /// The `Rc`-shared payload of a `Value::Ctor`. Its `Drop` is iterative so that
@@ -72,6 +79,19 @@ impl PartialEq for Value {
             (Unit, Unit) => true,
             (Fn(a), Fn(b)) => a == b,
             (Ctor(n1, a1), Ctor(n2, a2)) => n1 == n2 && a1 == a2,
+            // Two operations are equal when they are the same question.
+            (
+                Op {
+                    effect: e1,
+                    op: o1,
+                    args: a1,
+                },
+                Op {
+                    effect: e2,
+                    op: o2,
+                    args: a2,
+                },
+            ) => e1 == e2 && o1 == o2 && a1 == a2,
             _ => false,
         }
     }
@@ -180,7 +200,26 @@ pub fn fn_table<'a>(module: &'a Module) -> Fns<'a> {
     m
 }
 
+/// What answers the host's builtins (spec 2026-10-16-elya-cli-record-replay):
+/// the live host, the live host while every answer is written down, or a
+/// trace whose answers are read back in order.
+#[derive(Clone, Debug, Default)]
+pub enum World {
+    #[default]
+    Live,
+    /// `(question, answer)`, both in literal syntax, in the order asked.
+    Record(Vec<(String, String)>),
+    Replay {
+        entries: Vec<(String, String)>,
+        next: usize,
+    },
+}
+
 pub struct Interp {
+    /// The module's constructors and operation signatures, for `op.decode`.
+    types: Rc<crate::literal::TypeInfo>,
+    /// Who answers `time.*` (record and replay).
+    pub world: World,
     output: String,
     peak_kont: usize,
     steps: u64,
@@ -190,6 +229,8 @@ pub struct Interp {
 impl Interp {
     pub fn new() -> Interp {
         Interp {
+            types: Rc::new(crate::literal::TypeInfo::default()),
+            world: World::Live,
             output: String::new(),
             peak_kont: 0,
             steps: 0,
@@ -296,6 +337,17 @@ pub fn run_module_value(module: &Module) -> Result<(Interp, Value), RuntimeError
     cek::run_module_value(module)
 }
 
+/// [`run_module_value`] with the host's answers given by `world`.
+pub fn run_module_in(module: &Module, world: World) -> Result<(Interp, Value), RuntimeError> {
+    cek::run_module_in(module, world)
+}
+
+/// [`run_module_in`] keeping the interpreter (its output and world) when the
+/// run fails.
+pub fn run_module_keeping(module: &Module, world: World) -> (Interp, Result<Value, RuntimeError>) {
+    cek::run_module_keeping(module, world)
+}
+
 pub mod tree {
     use super::*;
 
@@ -400,6 +452,23 @@ pub mod tree {
                         };
                         interp.println(s);
                         return Ok(Value::Unit);
+                    }
+                    if module == "time" && (name == "now_ms" || name == "sleep_ms") {
+                        let mut vals = Vec::new();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        return super::time_builtin(name, &vals, span);
+                    }
+                    if module == "int" && name == "to_string" {
+                        let mut vals = Vec::new();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        let [Value::Int(n)] = &vals[..] else {
+                            return Err(rt(span, "int.to_string expects a single Int"));
+                        };
+                        return Ok(Value::Str(n.to_string()));
                     }
                     return Err(rt(span, format!("unknown builtin `{module}.{name}`")));
                 }
@@ -726,15 +795,51 @@ pub mod cek {
     /// only `io.println` output — but a compiled binary prints it, so the back
     /// end's differential check needs a way to ask what it should have been.
     pub fn run_module_value(module: &Module) -> Result<(Interp, Value), RuntimeError> {
+        run_module_in(module, super::World::Live)
+    }
+
+    /// `run_module_value` with the host answered by `world`; a replay whose
+    /// trace still has entries when `main` returns is an error.
+    pub fn run_module_in(
+        module: &Module,
+        world: super::World,
+    ) -> Result<(Interp, Value), RuntimeError> {
+        let (interp, v) = run_module_keeping(module, world);
+        v.map(|v| (interp, v))
+    }
+
+    /// [`run_module_in`] that keeps the interpreter whether `main` returns or
+    /// fails: a recording of a failing run is the one most worth replaying
+    /// (the record-replay review's finding).
+    pub fn run_module_keeping(
+        module: &Module,
+        world: super::World,
+    ) -> (Interp, Result<Value, RuntimeError>) {
         let fns = fn_table(module);
         let ops = op_table(module);
         let mut interp = Interp::new();
+        interp.world = world;
+        interp.types = Rc::new(crate::literal::TypeInfo::of(module));
         let Some(main) = fns.get("main").copied() else {
-            return Err(rt(Span::EMPTY, "no `main` function found"));
+            return (interp, Err(rt(Span::EMPTY, "no `main` function found")));
         };
         let start = eval_block_state(&main.body.node, Env::new(), Kont::default());
-        let v = run_loop(&mut interp, &fns, &ops, start)?;
-        Ok((interp, v))
+        let v = match run_loop(&mut interp, &fns, &ops, start) {
+            Ok(v) => v,
+            Err(e) => return (interp, Err(e)),
+        };
+        if let super::World::Replay { entries, next } = &interp.world {
+            let left = entries.len() - *next;
+            if let Some((q, a)) = entries.get(*next) {
+                let n = *next + 1;
+                let noun = if left == 1 { "entry" } else { "entries" };
+                let msg = format!(
+                    "replay: `main` returned with {left} unread trace {noun}, from entry {n} (`{q} = {a}`): the run asked less than the recording"
+                );
+                return (interp, Err(rt(Span::EMPTY, msg)));
+            }
+        }
+        (interp, Ok(v))
     }
 
     pub fn run_module(module: &Module) -> Result<Interp, RuntimeError> {
@@ -920,6 +1025,23 @@ pub mod cek {
                     Expr::Qualified { module, name } if module == "io" && name == "println" => {
                         CalleeSlot::Builtin("io.println")
                     }
+                    Expr::Qualified { module, name } if module == "int" && name == "to_string" => {
+                        CalleeSlot::Builtin("int.to_string")
+                    }
+                    Expr::Qualified { module, name } if module == "time" && name == "now_ms" => {
+                        CalleeSlot::Builtin("time.now_ms")
+                    }
+                    Expr::Qualified { module, name } if module == "time" && name == "sleep_ms" => {
+                        CalleeSlot::Builtin("time.sleep_ms")
+                    }
+                    Expr::Qualified { module, name } if module == "op" => match name.as_str() {
+                        "name" => CalleeSlot::Builtin("op.name"),
+                        "show" => CalleeSlot::Builtin("op.show"),
+                        "perform" => CalleeSlot::Builtin("op.perform"),
+                        "encode" => CalleeSlot::Builtin("op.encode"),
+                        "decode" => CalleeSlot::Builtin("op.decode"),
+                        _ => return Err(rt(span, format!("unknown builtin `op.{name}`"))),
+                    },
                     Expr::Qualified { module, name } => {
                         return Err(rt(span, format!("unknown builtin `{module}.{name}`")))
                     }
@@ -959,6 +1081,10 @@ pub mod cek {
                     // A zero-arg operation performs immediately (no args to eval).
                     CalleeSlot::Operation { effect, op } if args.is_empty() => {
                         perform(interp, effect, op, Vec::new(), span, k)?
+                    }
+                    // A zero-arg builtin (`time.now_ms()`) applies immediately.
+                    CalleeSlot::Builtin(b) if args.is_empty() => {
+                        apply_callee(interp, fns, CalleeSlot::Builtin(b), Vec::new(), span, k)?
                     }
                     // Builtin or operation with args: evaluate the args, then apply.
                     other => {
@@ -1236,6 +1362,11 @@ pub mod cek {
     }
 
     fn handler_handles(handler: &Handler, effect: &str, op: &str) -> bool {
+        // `with any` handles every operation that reaches it (D2: `IO` never
+        // does -- it is builtins, not performs).
+        if handler.any {
+            return true;
+        }
         handler
             .clauses
             .iter()
@@ -1263,8 +1394,18 @@ pub mod cek {
         let clause = handler
             .clauses
             .iter()
-            .find(|c| clause_matches(&c.node, effect, op))
+            .find(|c| handler.any || clause_matches(&c.node, effect, op))
             .ok_or_else(|| rt(span, format!("internal: handler has no clause for `{op}`")))?;
+        // A `with any` clause binds the operation itself.
+        let args = if handler.any {
+            vec![Value::Op {
+                effect: effect.to_string(),
+                op: op.to_string(),
+                args: Rc::new(args),
+            }]
+        } else {
+            args
+        };
         let rd = Rc::new(ResumeData {
             top: cap.top,
             skipped: cap.skipped,
@@ -1343,6 +1484,62 @@ pub mod cek {
                 interp.println(s);
                 Ok(State::Return(Value::Unit, k))
             }
+            CalleeSlot::Builtin(b @ ("time.now_ms" | "time.sleep_ms")) => {
+                let v = super::host_builtin(interp, b, &args, span)?;
+                Ok(State::Return(v, k))
+            }
+            CalleeSlot::Builtin("int.to_string") => {
+                let [Value::Int(n)] = &args[..] else {
+                    return Err(rt(span, "int.to_string expects a single Int"));
+                };
+                Ok(State::Return(Value::Str(n.to_string()), k))
+            }
+            CalleeSlot::Builtin(b) if b.starts_with("op.") => {
+                let Some(Value::Op {
+                    effect,
+                    op,
+                    args: op_args,
+                }) = args.first()
+                else {
+                    return Err(rt(span, format!("{b} expects an operation")));
+                };
+                let (effect, op, op_args) = (effect.clone(), op.clone(), op_args.clone());
+                let named = format!("{effect}.{op}");
+                match (b, &args[1..]) {
+                    ("op.name", []) => Ok(State::Return(Value::Str(named), k)),
+                    ("op.show", []) => match crate::literal::show_op(&effect, &op, &op_args) {
+                        Ok(s) => Ok(State::Return(Value::Str(s), k)),
+                        Err(what) => Err(rt(
+                            span,
+                            format!(
+                                "op.show: an argument of `{named}` is {what}, which is not data"
+                            ),
+                        )),
+                    },
+                    // The same operation again, from the clause: outside the
+                    // handler, so it reaches the next one out.
+                    ("op.perform", []) => perform(interp, effect, op, (*op_args).clone(), span, k),
+                    ("op.encode", [v]) => match crate::literal::show(v) {
+                        Ok(s) => Ok(State::Return(Value::Str(s), k)),
+                        Err(what) => Err(rt(
+                            span,
+                            format!(
+                                "op.encode: the answer of `{named}` is {what}, which is not data"
+                            ),
+                        )),
+                    },
+                    ("op.decode", [Value::Str(text)]) => {
+                        match crate::literal::decode(&interp.types, &op, text) {
+                            Ok(v) => Ok(State::Return(v, k)),
+                            Err(why) => Err(rt(
+                                span,
+                                format!("op.decode: {why}, for an answer of `{named}`"),
+                            )),
+                        }
+                    }
+                    _ => Err(rt(span, format!("{b}: wrong arguments"))),
+                }
+            }
             CalleeSlot::Builtin(other) => Err(rt(span, format!("unknown builtin `{other}`"))),
             CalleeSlot::Value(Value::Fn(name)) => {
                 let fdecl = fns
@@ -1394,6 +1591,85 @@ pub mod cek {
             CalleeSlot::Value(_) => Err(rt(span, "value is not callable")),
             CalleeSlot::Pending => Err(rt(span, "internal: unresolved callee")),
         }
+    }
+}
+
+/// A host builtin's answer under the interpreter's `World`: live, live and
+/// written down, or read back from a trace (spec
+/// 2026-10-16-elya-cli-record-replay §2).
+fn host_builtin(
+    interp: &mut Interp,
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, RuntimeError> {
+    let mut q = format!("{name}(");
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            q.push_str(", ");
+        }
+        q.push_str(&crate::literal::show(a).map_err(|e| rt(span, e))?);
+    }
+    q.push(')');
+    match &mut interp.world {
+        World::Live => time_builtin(&name["time.".len()..], args, span),
+        World::Record(log) => {
+            let v = time_builtin(&name["time.".len()..], args, span)?;
+            let a = crate::literal::show(&v).map_err(|e| rt(span, e))?;
+            log.push((q, a));
+            Ok(v)
+        }
+        World::Replay { entries, next } => {
+            let n = *next + 1;
+            let Some((want, answer)) = entries.get(*next).cloned() else {
+                return Err(rt(
+                    span,
+                    format!("replay diverged at entry {n}: the program asked `{q}`, the trace has ended"),
+                ));
+            };
+            if want != q {
+                return Err(rt(
+                    span,
+                    format!("replay diverged at entry {n}: the program asked `{q}`, the trace holds `{want}`"),
+                ));
+            }
+            *next += 1;
+            // Decoded at the builtin's own result type: a trace cannot inject
+            // a value of another type.
+            match name {
+                "time.now_ms" => answer.trim().parse::<i64>().map(Value::Int).map_err(|_| {
+                    rt(
+                        span,
+                        format!("replay entry {n}: `{answer}` is not an answer of type Int"),
+                    )
+                }),
+                _ if answer.trim() == "Unit" => Ok(Value::Unit),
+                _ => Err(rt(
+                    span,
+                    format!("replay entry {n}: `{answer}` is not an answer of type Unit"),
+                )),
+            }
+        }
+    }
+}
+
+/// `time.now_ms()` and `time.sleep_ms(ms)` (spec
+/// 2026-10-15-elya-async-step2-timers D3): monotonic milliseconds since the
+/// first reading in this process, and a wait of at least `ms` (none if `ms <= 0`).
+fn time_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, RuntimeError> {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    match (name, args) {
+        ("now_ms", []) => Ok(Value::Int(
+            i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX),
+        )),
+        ("sleep_ms", [Value::Int(ms)]) => {
+            if *ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(*ms as u64));
+            }
+            Ok(Value::Unit)
+        }
+        _ => Err(rt(span, format!("time.{name}: wrong arguments"))),
     }
 }
 

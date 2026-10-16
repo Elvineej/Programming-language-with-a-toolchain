@@ -1,0 +1,20 @@
+---
+source: tests/examples.rs
+expression: "run_example(\"09_record_any.elya\")"
+---
+the game, recorded: 24
+  World.roll(6) = 4
+  World.now() = 27
+  World.roll(6) = 6
+  World.now() = 53
+  World.roll(6) = 2
+  World.now() = 35
+the game: replayed, 24
+the game with an eight-sided die: diverged, asked World.roll(8) where the recording holds World.roll(6)
+two rounds of the game: finished with entries left over
+the shop, recorded: 4
+  Store.stock("tea") = Left(10)
+  Store.sell("tea", 3) = Unit
+  Store.stock("cake") = Left(1)
+  Store.sell("cake", 1) = Unit
+the shop: replayed, 4

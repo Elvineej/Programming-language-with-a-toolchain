@@ -1,0 +1,171 @@
+// One recorder and one replayer, for any effect, written in Elya.
+//
+// `examples/05_replay.elya` records ONE effect: its `record` and `replay` name
+// `World` and each of its operations, so every new effect needs both again.
+// Here they are written once. A `with any` handler handles every operation its
+// body performs, whatever the effect. The clause sees the operation as a value
+// `o`: `op.show(o)` is the question as text, `op.perform(o)` asks the handler
+// outside, `op.encode`/`op.decode` turn the answer into text and back. The
+// answer's type is the operation's own, checked by the type system, so a
+// replayed answer of the wrong type cannot get in.
+//
+// Two unrelated programs, a dice game and a shop, are recorded and replayed by
+// the same two functions.
+
+// --- the recorder and the replayer (generic) --------------------------------
+
+// What a run asked, and what it was told: the question as `op.show` writes it,
+// and the answer as `op.encode` writes it.
+type Log { End, Ent(String, String, Log) }
+
+type Recorded(a) { Rec(a, Log) }
+
+// Ask the handlers outside, and write every question and answer down. The log
+// is built as the resumed computation returns, so it is in order.
+fn record(body) {
+  handle { body() } with any {
+    op(o) -> {
+      let v = op.perform(o)
+      match resume(v) {
+        Rec(x, log) -> Rec(x, Ent(op.show(o), op.encode(o, v), log))
+      }
+    }
+    return(x) -> Rec(x, End)
+  }
+}
+
+type Outcome(a) {
+  Replayed(a),
+  // The program asked the first string; the recording held the second.
+  Diverged(String, String),
+  // The program finished with entries left over.
+  Unconsumed(a, Log)
+}
+
+// Answer every question from the recording, which must hold the same question
+// next. No handler of the program's effects is needed.
+fn replay(body, log) {
+  let run = handle { body() } with any {
+    op(o) -> fn(l) {
+      match l {
+        Ent(q, a, rest) ->
+          if q == op.show(o) { resume(op.decode(o, a))(rest) }
+          else { Diverged(op.show(o), q) }
+        End -> Diverged(op.show(o), "the end of the recording")
+      }
+    }
+    return(x) -> fn(l) {
+      match l {
+        End -> Replayed(x)
+        Ent(q, a, rest) -> Unconsumed(x, l)
+      }
+    }
+  }
+  run(log)
+}
+
+fn print_log(log) {
+  match log {
+    End -> Unit
+    Ent(q, a, rest) -> {
+      io.println("  " <> q <> " = " <> a)
+      print_log(rest)
+    }
+  }
+}
+
+fn report(what, outcome) {
+  match outcome {
+    Replayed(x) -> io.println(what <> ": replayed, " <> int.to_string(x))
+    Diverged(asked, held) -> io.println(what <> ": diverged, asked " <> asked <> " where the recording holds " <> held)
+    Unconsumed(x, rest) -> io.println(what <> ": finished with entries left over")
+  }
+}
+
+// --- a dice game ------------------------------------------------------------
+
+effect World {
+  fn roll(sides: Int) -> Int
+  fn now() -> Int
+}
+
+// Score a roll double if the round was quick.
+fn game(rounds: Int, sides: Int, last: Int) / {World} -> Int {
+  if rounds == 0 { 0 } else {
+    let r = roll(sides)
+    let t = now()
+    let s = if t - last < 50 { 2 * r } else { r }
+    s + game(rounds - 1, sides, t)
+  }
+}
+
+// A seeded generator stands in for real dice and a real clock.
+fn next(s: Int) -> Int { (s * 1103515245 + 12345) % 2147483648 }
+
+fn live_world(body: fn() / {World} -> Recorded(Int), seed: Int) -> Recorded(Int) {
+  let run = handle { body() } with {
+    World.roll(sides) -> fn(s: Int) { resume(next(s) % sides + 1)(next(s)) }
+    World.now() -> fn(s: Int) { resume(s % 100)(next(s)) }
+    return(x) -> fn(s: Int) { x }
+  }
+  run(seed)
+}
+
+// --- a shop -----------------------------------------------------------------
+
+type Stock { Out, Left(Int) }
+
+effect Store {
+  fn stock(item: String) -> Stock
+  fn sell(item: String, n: Int) -> Unit
+}
+
+// Sell what is asked for, as far as the stock goes; answer the units sold.
+fn shop() / {Store} -> Int {
+  let a = buy("tea", 3)
+  let b = buy("cake", 2)
+  a + b
+}
+
+fn buy(item: String, n: Int) / {Store} -> Int {
+  match stock(item) {
+    Out -> 0
+    Left(k) -> {
+      let m = if k < n { k } else { n }
+      let _ = sell(item, m)
+      m
+    }
+  }
+}
+
+fn live_store(body: fn() / {Store} -> Recorded(Int)) -> Recorded(Int) {
+  handle { body() } with {
+    Store.stock(item) -> resume(if item == "tea" { Left(10) } else { Left(1) })
+    Store.sell(item, n) -> resume(Unit)
+    return(x) -> x
+  }
+}
+
+// --- one recorder, two programs ---------------------------------------------
+
+pub fn main() -> Int {
+  let g = match live_world(fn() { record(fn() { game(3, 6, 0) }) }, 42) {
+    Rec(score, log) -> {
+      io.println("the game, recorded: " <> int.to_string(score))
+      print_log(log)
+      report("the game", replay(fn() { game(3, 6, 0) }, log))
+      report("the game with an eight-sided die", replay(fn() { game(3, 8, 0) }, log))
+      report("two rounds of the game", replay(fn() { game(2, 6, 0) }, log))
+      score
+    }
+  }
+  let s = match live_store(fn() { record(fn() { shop() }) }) {
+    Rec(sold, log) -> {
+      io.println("the shop, recorded: " <> int.to_string(sold))
+      print_log(log)
+      report("the shop", replay(fn() { shop() }, log))
+      sold
+    }
+  }
+  g * 100 + s
+}

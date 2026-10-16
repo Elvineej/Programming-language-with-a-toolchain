@@ -840,3 +840,80 @@ fn a_perform_carries_the_effect_instantiation() {
         "the perform must carry the op's instantiated type"
     );
 }
+
+#[test]
+fn parametric_declarations_are_recorded_in_generic_types() {
+    // N7 part 2 (spec 2026-10-15 §2): a parametric declaration reaches Core in
+    // `generic_types`, each field with `Ty::Var(i)` for the i-th parameter, so
+    // the back end can instantiate it. `types` keeps only ground declarations
+    // (the printer and its snapshots are unchanged).
+    let (core, _t) = lower_src(
+        "type Pair(a, b) { Pair(b, a), Solo(a, Pair(b, a), Int) }\n\
+         type Tok { Tok }\n\
+         effect E(a, b) { fn e(x: Pair(Int, a)) -> Int }\n\
+         effect M { fn m() -> Int }\n\
+         fn f(x) { x }\n",
+    );
+    // Which effect parameters an operation uses (the review's F2): `b` is
+    // phantom; a monomorphic effect has no entry.
+    assert_eq!(
+        core.effect_params_used.get("E").cloned(),
+        Some(vec![true, false])
+    );
+    assert!(!core.effect_params_used.contains_key("M"));
+    assert_eq!(
+        core.types
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Tok"]
+    );
+    assert_eq!(core.generic_types.len(), 1);
+    let g = &core.generic_types[0];
+    assert_eq!((g.name.as_str(), g.params), ("Pair", 2));
+    assert_eq!(g.ctors[0].name, "Pair");
+    assert_eq!(g.ctors[0].fields, vec![Ty::Var(1), Ty::Var(0)]);
+    assert_eq!(
+        g.ctors[1].fields,
+        vec![
+            Ty::Var(0),
+            Ty::Con("Pair".into(), vec![Ty::Var(1), Ty::Var(0)]),
+            Ty::Base(TyCon::Int)
+        ]
+    );
+}
+
+#[test]
+fn an_operation_generic_handler_is_refused_at_lowering() {
+    // `with any` (2026-10-16) runs in the evaluator only: natively, `op.show` and
+    // `op.decode` need each operation's name and declared types at run time.
+    // Refused by name (spec D6), not lowered as if it named an operation `op`.
+    let src = "effect W { fn roll(s: Int) -> Int }\n\
+               fn replay(body) { handle { body() } with any { op(o) -> resume(op.decode(o, \"4\")) } }\n\
+               pub fn main() -> Int { replay(fn() { roll(6) }) }\n";
+    let (m, pd) = parse_module(&Session::new(), src);
+    assert!(pd.is_empty(), "{pd:?}");
+    let (diags, table) = infer_typed_table(&Session::new(), &m);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(
+        lower_module(&m, &table).unwrap_err(),
+        elya::core::LowerError::Unsupported("operation-generic handler (`with any`)"),
+    );
+}
+
+#[test]
+fn a_function_carries_its_own_row() {
+    // A function's own (latent) row reaches Core (spec 2026-10-16): `dup` is
+    // generic in `s` only through `St(s)` in its row, which nothing else in
+    // Core shows; `pure` closes to the empty row; `main` handles St.
+    let (core, _t) = lower_src(
+        "effect St(s) { fn get() -> s  fn put(v: s) -> Int }\n\
+         fn dup() { put(get()) }\n\
+         fn pure(x) { x + 1 }\n",
+    );
+    let f = |n: &str| core.fns.iter().find(|f| f.name == n).expect(n).row.clone();
+    let dup = f("dup");
+    let st = dup.labels.get("St").expect("dup performs St");
+    assert!(matches!(st.args[..], [Ty::Var(_)]), "{dup:?}");
+    assert!(f("pure").labels.is_empty());
+}

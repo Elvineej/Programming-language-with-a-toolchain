@@ -44,8 +44,9 @@ monomorphic ADTs constructed then matched to extract an `Int`, non-recursive
 lambdas of up to four parameters that capture their enclosing locals, and string
 literals written to stdout by `io.println`), so anything outside it is rejected by
 name rather than mis-compiled — the tree-walking `elya run` remains the full
-language. Strings have no operations yet: `<>` and `==` on strings are refused by
-name, not mis-compiled.
+language. Strings are native too: `<>` concatenates, `==` and `!=` compare bytes,
+string literals can be matched, and `int.to_string(n)` turns a number into text, so
+a compiled program can print what it computes.
 Tail calls are eliminated under a guarantee the LLVM verifier enforces, so
 mutually recursive functions recur to any depth in a compiled binary just as
 they do under `elya run` — and that holds through a closure call, which jumps

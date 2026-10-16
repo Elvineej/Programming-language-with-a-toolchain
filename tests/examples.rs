@@ -35,3 +35,39 @@ fn replay() {
     // each an ordinary handler over the same program (2026-10-10).
     insta::assert_snapshot!("05_replay", run_example("05_replay.elya"));
 }
+
+#[test]
+fn structured_concurrency() {
+    // Structured concurrency: spawn/await and a scope that joins every task
+    // it started, as ordinary handlers; nested scopes per call (2026-10-15).
+    insta::assert_snapshot!("06_structured", run_example("06_structured.elya"));
+}
+
+#[test]
+fn search() {
+    // One backtracking search over a multi-shot effect, three meanings by
+    // three handlers: all solutions, a count, the first (2026-10-15).
+    insta::assert_snapshot!("07_search", run_example("07_search.elya"));
+}
+
+#[test]
+fn timers() {
+    // Waiting for time: a poll loop over timers, a `Clock` effect handled by
+    // a virtual clock and by the real one, and a deadlock named (2026-10-16).
+    // The real-clock part prints only what real time cannot change.
+    insta::assert_snapshot!("08_timers", run_example("08_timers.elya"));
+}
+
+#[test]
+fn record_any() {
+    // One generic recorder and replayer (`with any` handlers) over two unrelated
+    // effects; a replay diverging by name; leftovers noticed (2026-10-16).
+    insta::assert_snapshot!("09_record_any", run_example("09_record_any.elya"));
+}
+
+#[test]
+fn failure_and_cancellation() {
+    // Failure as an effect answering the empty `Never`, a `catch` handler,
+    // and a scope that drops its queued tasks when one fails (2026-10-16).
+    insta::assert_snapshot!("10_failure", run_example("10_failure.elya"));
+}

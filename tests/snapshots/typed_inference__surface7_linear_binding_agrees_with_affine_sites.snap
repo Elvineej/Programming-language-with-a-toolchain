@@ -2,5 +2,7 @@
 source: tests/typed_inference.rs
 expression: "render(src, &t)"
 ---
+24..51 `fn lin() { let t = Tok
+ t }` : fn() -> Tok
 43..46 `Tok` : Tok
 48..49 `t` : Tok

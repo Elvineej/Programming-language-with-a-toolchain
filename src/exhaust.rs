@@ -276,7 +276,11 @@ fn walk_expr(e: &Spanned<Expr>, sib: &Siblings, out: &mut Vec<Diagnostic>) {
             for arm in arms.iter() {
                 walk_expr(&arm.node.body, sib, out);
             }
-            check_match(arms, e.span, sib, out);
+            // A match with no arms is the type checker's to judge: it is
+            // exhaustive exactly on a type with no constructors (2026-10-16).
+            if !arms.is_empty() {
+                check_match(arms, e.span, sib, out);
+            }
         }
         Expr::Call { callee, args } => {
             walk_expr(callee, sib, out);

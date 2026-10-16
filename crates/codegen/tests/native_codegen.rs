@@ -834,6 +834,8 @@ fn a_failed_match_traps_with_a_named_error() {
     use std::rc::Rc;
 
     let core = CoreModule {
+        generic_types: vec![],
+        effect_params_used: Default::default(),
         types: vec![CoreType {
             name: "T".into(),
             ctors: vec![
@@ -848,6 +850,7 @@ fn a_failed_match_traps_with_a_named_error() {
             ],
         }],
         fns: vec![CoreFn {
+            row: elya::types::EffectRow::pure(),
             name: "main".into(),
             params: Rc::from([]),
             body: CoreExpr {
@@ -1294,10 +1297,9 @@ fn a_unit_typed_adt_field_round_trips_through_the_word_helpers() {
 ///
 /// The lambda is inline in `main` rather than returned from a helper, and `z` is
 /// pinned to `Int` on purpose. A helper like `fn wrap(u) { fn(z) { u } }` is
-/// polymorphic, and `repr_ty` refuses `Ty::Var(_)` for the WHOLE module — see
-/// `a_polymorphic_function_refuses_the_whole_module`. That shape dies before the
-/// `Unit` arm is ever reached, so it would prove nothing about it: N7 knocking,
-/// not N6 failing.
+/// polymorphic, and before N7 part 2 `repr_ty` refused `Ty::Var(_)` for the
+/// WHOLE module. That shape died before the `Unit` arm was ever reached, so it
+/// would have proved nothing about it: N7 knocking, not N6 failing.
 #[test]
 fn a_unit_typed_closure_capture_round_trips_through_the_word_helpers() {
     let src = "pub fn main() { let u = io.println(\"x\")  \
@@ -1358,9 +1360,9 @@ fn a_printing_program_under_gc_stats_splits_by_the_same_rule() {
 /// the program compiles, links, runs and prints main's `0`. Measured: exactly
 /// that. Not a miscompile and not a refusal — the effect is invisible here.
 ///
-/// The `Ty::Var` half of the answer (an unconstrained type parameter) is a
-/// refusal and produces no binary, so it lives beside its sibling in `lib.rs`'s
-/// `mod tests`: `a3_an_unconstrained_polymorphic_effect_meets_the_ty_var_refusal`.
+/// The `Ty::Var` half of the answer (an unconstrained type parameter) was a
+/// refusal until N7 part 2 (2026-10-15); it lives beside its sibling in
+/// `lib.rs`'s `mod tests`: `a3_an_unconstrained_polymorphic_effect_is_not_emitted`.
 #[test]
 fn a3_a_polymorphic_effect_declaration_compiles_and_runs_natively() {
     let src = "effect State(s) { fn get() -> s  fn set(v: s) -> Unit }\n\
@@ -4174,6 +4176,16 @@ const MULTI_SHOT: &[(&str, &str, &str)] = &[
          pub fn main() -> Int { go(1000, 0) }\n",
         "1024000",
     ),
+    (
+        // The shape the multi-shot review could not build (2026-10-15, unblocked by
+        // recursion through a handle body): the captured chain holds 1000 handler
+        // frames, and the copy maps every frame's `parent`.
+        "m-deep-handler-chain",
+        "effect multi Flip { fn flip() -> Bool }\neffect S { fn get() -> Int }\n\
+         fn nest(n) { if n == 0 { if flip() { 1 } else { 2 } } else { handle { nest(n - 1) + get() } with { S.get() -> resume(1)  return(r) -> r } } }\n\
+         pub fn main() -> Int { handle nest(1000) with multi { Flip.flip() -> resume(True) * 1000000 + resume(False) } }\n",
+        "1001001002",
+    ),
 ];
 
 #[test]
@@ -4635,4 +4647,1057 @@ fn the_replay_example_runs_natively() {
     );
     assert_eq!(value, "2106");
     assert_eq!(value, eval_main_int(src));
+}
+
+// ---- N7 part 2: type variables and parametric ADTs natively (2026-10-15) ----
+// Spec `docs/superpowers/specs/2026-10-15-elya-n7b-type-monomorphization-design.md`.
+// Every program below was refused natively before the slice ("unrepresentable
+// type" or "parametric ADT"); the expected values are the evaluator's, measured
+// first (spec §0).
+//
+// Negative controls (each reverted, `git diff --quiet` after):
+// - K1, references not redirected to clones (`Mono::resolve` returns `x`): the
+//   whole corpus is refused by name, "callee is not a top-level function" (the
+//   generic originals are no longer emitted, so nothing answers the name).
+// - K2, instance fields left unsubstituted: the compiler panics in inkwell (an
+//   i64 where a pointer was expected) on all three tests -- not a named
+//   refusal, but an unsubstituted field cannot leave the pass. K2b, the mask
+//   alone wrong (descriptor rows skip `Cons.mono.*` fields): r20's binary exits
+//   1 after a collection, the other two tests pass -- the collector test is
+//   what has the teeth for the mask.
+// - K3, ambiguous variables not defaulted: r26 refused, "unrepresentable type"
+//   (r19 still passed: its variable sits under an instance name -- r26 was
+//   added for this control).
+// - K4, the effect-position check off: r24 compiles (a String typed as Unit).
+// - K5, instances built eagerly: r18 hits "too many type instances".
+
+const LIST: &str = "type List(a) { Nil, Cons(a, List(a)) }\n";
+
+const TYPE_VARS: &[(&str, &str, &str)] = &[
+    (
+        "q1-twice",
+        "fn twice(f, x) { f(f(x)) }\n\
+         pub fn main() -> Int { twice(fn(n) { n * 3 + 1 }, 5) }\n",
+        "49",
+    ),
+    (
+        "q2-id-at-two-types",
+        "fn id(x) { x }\n\
+         pub fn main() -> Int { if id(True) { id(40) + 2 } else { 0 } }\n",
+        "42",
+    ),
+    (
+        "q3-compose",
+        "fn compose(f, g) { fn(x) { g(f(x)) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let h = compose(fn(n) { n + 1 }, fn(n) { n * 10 })\n\
+         \x20 let b = compose(fn(n) { n > 3 }, fn(c) { if c { 7 } else { 9 } })\n\
+         \x20 h(4) + b(5)\n\
+         }\n",
+        "57",
+    ),
+    (
+        "q4-list-at-two-types",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }\n\
+         fn sum(l) { match l { Nil -> 0  Cons(h, t) -> h + sum(t) } }\n\
+         pub fn main() -> Int { sum(Cons(1, Cons(2, Cons(3, Nil)))) * 100 + len(Cons(True, Nil)) }\n",
+        "601",
+    ),
+    (
+        "q5-map-fold-range",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn map(f, l) { match l { Nil -> Nil  Cons(h, t) -> Cons(f(h), map(f, t)) } }\n\
+         fn foldl(f, acc, l) { match l { Nil -> acc  Cons(h, t) -> foldl(f, f(acc, h), t) } }\n\
+         fn range(a, b) { if a >= b { Nil } else { Cons(a, range(a + 1, b)) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let xs = map(fn(n) { Cons(n, Nil) }, range(0, 2000))\n\
+         \x20 foldl(fn(acc, l) { match l { Nil -> acc  Cons(h, _) -> acc + h } }, 0, xs)\n\
+         }\n",
+        "1999000",
+    ),
+    (
+        "q6-generic-local",
+        "pub fn main() -> Int {\n\
+         \x20 let id = fn(x) { x }\n\
+         \x20 if id(True) { id(41) + 1 } else { 0 }\n\
+         }\n",
+        "42",
+    ),
+    (
+        "q7-option",
+        "type Option(a) { None, Some(a) }\n\
+         fn get(o, d) { match o { None -> d  Some(x) -> x } }\n\
+         pub fn main() -> Int { get(Some(3), 0) + get(None, 4) }\n",
+        "7",
+    ),
+    (
+        "q8-a-row-and-a-type-variable",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn twice(f, x) { f(f(x)) }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { twice(fn(n) { lg(n) + 1 }, 5) } with { L.lg(v) -> resume(v * 2)  return(r) -> r * 1000 }\n\
+         }\n",
+        "23000",
+    ),
+    (
+        // Measured as `mk(5)(True)`; a computed callee is refused natively by
+        // its own name (5b-1 §5.3, not a type question), so it is bound first.
+        "q9-closures-over-generic-values",
+        "fn mk(x) { let m = fn(y) { x }  m }\n\
+         fn pair(a, b) { fn(k) { k(a, b) } }\n\
+         pub fn main() -> Int { let p = pair(3, True)  let m5 = mk(5)  p(fn(a, b) { if b { a } else { 0 } }) + m5(True) }\n",
+        "8",
+    ),
+    (
+        "r11-a-generic-nil-at-two-types",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }\n\
+         pub fn main() -> Int { let n = Nil  len(Cons(1, n)) * 10 + len(Cons(True, Cons(False, n))) }\n",
+        "12",
+    ),
+    (
+        "r13-a-generic-handler",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         effect St(s) { fn get() -> s  fn put(v: s) -> Int }\n\
+         fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }\n\
+         fn twice_get(d) { handle { len(get()) + len(get()) } with { St.get() -> resume(d)  St.put(v) -> resume(0)  return(r) -> r } }\n\
+         pub fn main() -> Int { twice_get(Cons(1, Cons(2, Nil))) * 10 + twice_get(Cons(True, Nil)) }\n",
+        "42",
+    ),
+    (
+        "r15-mutually-recursive-generics",
+        "fn ev(f, x, n) { if n == 0 { f(x) } else { od(f, x, n - 1) } }\n\
+         fn od(f, x, n) { if n == 0 { f(x) } else { ev(f, x, n - 1) } }\n\
+         pub fn main() -> Int { let a = ev(fn(b) { if b { 1 } else { 2 } }, True, 7)  a * 100 + ev(fn(k) { k * 3 }, 11, 4) }\n",
+        "133",
+    ),
+    (
+        "r17-a-function-field-with-an-effect",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         type Box(a) { Box(fn(a) / {L} -> a, a) }\n\
+         fn open(b) { match b { Box(f, v) -> f(f(v)) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { open(Box(fn(n) { lg(n) + 1 }, 4)) } with { L.lg(v) -> resume(v * 3)  return(r) -> r }\n\
+         }\n",
+        "40",
+    ),
+    (
+        "r18-a-non-regular-type",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         type Nest(a) { NNil, NCons(a, Nest(List(a))) }\n\
+         fn depth(n) { match n { NNil -> 0  NCons(_, _) -> 1 } }\n\
+         pub fn main() -> Int { depth(NCons(1, NCons(Cons(2, Nil), NNil))) }\n",
+        "1",
+    ),
+    (
+        "r19-an-ambiguous-variable",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn seven(l) { 7 }\n\
+         pub fn main() -> Int { seven(Nil) + seven(Cons(Nil, Nil)) }\n",
+        "14",
+    ),
+    (
+        // Added by negative control K3: with no default, r19 still compiled (its
+        // ambiguous variable sits under an instance name), so nothing native
+        // needed the default. Here the ambiguous variable is a lambda's own
+        // parameter type, which must be represented.
+        "r26-an-ambiguous-lambda-parameter",
+        "fn ignore(g) { 7 }\n\
+         pub fn main() -> Int { ignore(fn(x) { x }) + ignore(fn(x) { 1 }) }\n",
+        "14",
+    ),
+    (
+        "r21-a-two-parameter-lambda",
+        "fn pair(a, b) { fn(k) { k(a, b) } }\n\
+         pub fn main() -> Int { let p = pair(3, True)  p(fn(a, b) { if b { a } else { 0 } }) }\n",
+        "3",
+    ),
+    (
+        "r22-a-generic-local-to-a-generic-local",
+        "pub fn main() -> Int {\n\
+         \x20 let id = fn(x) { x }\n\
+         \x20 let ap = fn(f, y) { f(y) }\n\
+         \x20 ap(id, 5) + (if ap(id, True) { 10 } else { 0 })\n\
+         }\n",
+        "15",
+    ),
+    (
+        "r23-nested-generic-patterns",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn head_or(l, d) { match l { Nil -> d  Cons(Cons(x, _), _) -> x  Cons(Nil, _) -> d } }\n\
+         pub fn main() -> Int { head_or(Cons(Cons(42, Nil), Nil), 0) + head_or(Cons(Nil, Nil), 1) }\n",
+        "43",
+    ),
+    (
+        "r25-a-generic-effect",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         effect Gen(a) { fn yield(x: a) -> Int }\n\
+         fn each(l) { match l { Nil -> 0  Cons(h, t) -> yield(h) + each(t) } }\n\
+         fn count(l) { handle { each(l) } with { Gen.yield(x) -> resume(1)  return(r) -> r } }\n\
+         pub fn main() -> Int { count(Cons(1, Cons(2, Nil))) * 10 + count(Cons(True, Nil)) }\n",
+        "21",
+    ),
+    // The review (2026-10-15), each red first.
+    (
+        // F1 (high, new): the constructor's instance was keyed at a closed row,
+        // the matching parameter's at an open one -- two instances, two tag
+        // sets, "match failed" natively.
+        "f1-a-pure-closure-in-an-option",
+        "type Option(a) { None, Some(a) }\n\
+         fn total(o) { match o { None -> 0  Some(f) -> f(1) } }\n\
+         pub fn main() -> Int { total(Some(fn(x) { x + 1 })) }\n",
+        "2",
+    ),
+    (
+        "f1-a-list-of-closures",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn run(l, x) { match l { Nil -> x  Cons(f, t) -> run(t, f(x)) } }\n\
+         pub fn main() -> Int { run(Cons(fn(x) { x * 4 }, Cons(fn(x) { x + 1 }, Nil)), 5) }\n",
+        "21",
+    ),
+    (
+        "f1-a-ground-type-holding-closures",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         type Bag { Bag(List(fn(Int) -> Int)) }\n\
+         fn first(b) { match b { Bag(l) -> match l { Nil -> 0  Cons(f, _) -> f(10) } } }\n\
+         pub fn main() -> Int { first(Bag(Cons(fn(x) { x * 3 }, Nil))) }\n",
+        "30",
+    ),
+    (
+        // F2 (medium, a regression): an effect parameter no operation uses
+        // carries no value, so defaulting it is sound; it was refused.
+        "f2-a-phantom-effect-parameter",
+        "effect E(a) { fn e() -> Int }\n\
+         fn go() { e() + 1 }\n\
+         pub fn main() -> Int { handle { go() + e() } with { E.e() -> resume(2)  return(r) -> r } }\n",
+        "5",
+    ),
+    // A differential sweep (2026-10-15, an interactive session): the instance
+    // key kept row LABELS, but `IO` is a label that does not change the
+    // convention -- `Box(fn() / {IO} -> Int)` built in `main` and
+    // `Box(fn() / {|r} -> Int)` matched in `call` were two instances, two tag
+    // sets: "match failed" natively where the evaluator printed 42. (The
+    // annotation puts `IO` in the type without printing; a closure that
+    // prints fails the same way.)
+    (
+        "f3-an-io-closure-in-a-box",
+        "type Box(a) { B(a) }\n\
+         fn call(b) { match b { B(f) -> f() } }\n\
+         pub fn main() -> Int { let g: fn() / {IO} -> Int = fn() { 42 }  call(B(g)) }\n",
+        "42",
+    ),
+    (
+        "f3-io-and-pure-closures-in-a-list",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn run_all(fs, x) { match fs { Nil -> 0  Cons(f, rest) -> f(x) + run_all(rest, x) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let p: fn(Int) / {IO} -> Int = fn(x) { x + 1 }\n\
+         \x20 run_all(Cons(p, Cons(fn(x) { x * 10 }, Nil)), 5)\n\
+         }\n",
+        "56",
+    ),
+    (
+        // The key keeps the CONVENTION: one type at both conventions is still
+        // two instances, so a binder's field type says how to call it.
+        "f3-one-type-at-both-conventions",
+        "effect S { fn get() -> Int }\n\
+         type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn run_all(fs) { match fs { Nil -> 0  Cons(f, rest) -> f() + run_all(rest) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let p: fn() / {IO} -> Int = fn() { 1 }\n\
+         \x20 let a = run_all(Cons(p, Cons(fn() { 2 }, Nil)))\n\
+         \x20 let b = handle { run_all(Cons(fn() { get() }, Nil)) } with { S.get() -> resume(100)  return(r) -> r }\n\
+         \x20 a + b\n\
+         }\n",
+        "103",
+    ),
+];
+
+#[test]
+fn the_type_variable_corpus_runs_natively() {
+    run_value_corpus(TYPE_VARS, "type-vars");
+}
+
+#[test]
+fn the_type_variable_corpus_matches_the_evaluator() {
+    run_differential_corpus(TYPE_VARS, "type-vars-diff");
+}
+
+/// r20: a `List(Option(Int))` of 100 000 built by a tail loop, then summed.
+/// The `Some` cells are reachable only through the list's HEAD field, which is
+/// a pointer in `List(Option(Int))`'s instance and not in `List(Int)`'s: the
+/// mask must come from the substituted field type (negative control K2).
+#[test]
+fn a_parametric_list_survives_collection() {
+    let src = format!(
+        "{LIST}type Option(a) {{ None, Some(a) }}\n\
+         fn build(i, acc) {{ if i == 0 {{ acc }} else {{ build(i - 1, Cons(Some(i), acc)) }} }}\n\
+         fn total(l, s) {{ match l {{ Nil -> s  Cons(o, t) -> match o {{ None -> total(t, s)  Some(v) -> total(t, s + v) }} }} }}\n\
+         pub fn main() -> Int {{ total(build(100000, Nil), 0) }}\n"
+    );
+    let dir = temp_dir("type-vars-gc");
+    let exe = compile_and_link(&lower_src(&src), &dir, "r20");
+    let (value, stats) = run_with_gc_stats(&exe, "r20");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(value, "5000050000");
+    assert!(stats.collections > 0, "the collector never ran: {stats:?}");
+}
+
+// ---- Recursion through a handle body (2026-10-15) ----
+// Spec `docs/superpowers/specs/2026-10-15-elya-handle-recursion-design.md`.
+// Before it, none of these passed the front end. n1 builds a chain of 1000
+// nested handler frames, and every `get` walks to the innermost one.
+const HANDLE_RECURSION: &[(&str, &str, &str)] = &[
+    (
+        "n1-a-chain-of-1000-handlers",
+        "effect S { fn get() -> Int }\neffect T { fn t() -> Int }\n\
+         fn nest(n: Int) / {T} -> Int { if n == 0 { t() } else { handle { nest(n - 1) + get() } with { S.get() -> resume(1)  return(r) -> r } } }\n\
+         pub fn main() -> Int { handle { nest(1000) } with { T.t() -> resume(0)  return(r) -> r } }\n",
+        "1000",
+    ),
+    (
+        "n6-an-outer-effect-under-300-handlers",
+        "effect S { fn get() -> Int }\neffect T { fn t() -> Int }\n\
+         fn h(n) { handle { if n == 0 { t() } else { h(n - 1) + get() } } with { S.get() -> resume(1)  return(r) -> r } }\n\
+         pub fn main() -> Int { handle { h(300) } with { T.t() -> resume(7)  return(r) -> r * 10 } }\n",
+        "3070",
+    ),
+    (
+        "n8-the-innermost-handler-answers",
+        "effect S { fn get() -> Int }\neffect T { fn t() -> Int }\n\
+         fn h(n) { if n == 0 { get() + t() } else { handle { h(n - 1) } with { S.get() -> resume(n)  return(r) -> r + 1 } } }\n\
+         pub fn main() -> Int { handle { handle { h(3) } with { S.get() -> resume(100)  return(r) -> r } } with { T.t() -> resume(1000)  return(r) -> r } }\n",
+        "1004",
+    ),
+    (
+        "m2-an-effectful-callback-relayed",
+        "effect S { fn get() -> Int }\neffect L { fn lg(x: Int) -> Int }\n\
+         fn h(f, n) { if n == 0 { 0 } else { handle { h(f, n - 1) + f() + get() } with { S.get() -> resume(1)  return(r) -> r } } }\n\
+         pub fn main() -> Int { handle { h(fn() { lg(2) }, 10) } with { L.lg(x) -> resume(x * 2)  return(r) -> r } }\n",
+        "50",
+    ),
+    (
+        "m3-the-callback-meets-the-innermost-handler",
+        "effect S { fn get() -> Int }\n\
+         fn h(f, n) { if n == 0 { f() } else { handle { h(f, n - 1) + get() } with { S.get() -> resume(1)  return(r) -> r } } }\n\
+         pub fn main() -> Int { handle { h(fn() { get() * 100 }, 3) } with { S.get() -> resume(5)  return(r) -> r } }\n",
+        "103",
+    ),
+    // Recursion through a lambda (spec §5).
+    (
+        "g1-go-under-its-handler",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn go(n) { let f = fn(s) { s + (if n == 0 { 0 } else { go(n - 1) }) }  f(1) + lg(n) }\n\
+         pub fn main() -> Int { handle { go(3) } with { L.lg(x) -> resume(x * 10)  return(r) -> r } }\n",
+        "64",
+    ),
+    (
+        "g2-a-task-spawning-itself",
+        "effect Async { fn spawn(f: fn() / {Async} -> Int) -> Int  fn await(id: Int) -> Int }\n\
+         fn fib(n: Int) / {Async} -> Int { if n < 2 { n } else { let a = spawn(fn() { fib(n - 1) })  let b = spawn(fn() { fib(n - 2) })  await(a) + await(b) } }\n\
+         fn eager(f: fn() / {Async} -> Int) -> Int { handle { f() } with { Async.spawn(g) -> resume(eager(g))  Async.await(v) -> resume(v)  return(r) -> r } }\n\
+         pub fn main() -> Int { eager(fn() { fib(15) }) }\n",
+        "610",
+    ),
+];
+
+#[test]
+fn recursion_through_a_handle_body_runs_natively() {
+    run_value_corpus(HANDLE_RECURSION, "handle-recursion");
+    run_differential_corpus(HANDLE_RECURSION, "handle-recursion-diff");
+}
+
+/// `examples/06_structured.elya` (2026-10-15): spawn/await and a joining
+/// scope as ordinary handlers over the generic `List` and `Pair`; a task that
+/// spawns itself (recursion through a lambda) and a scope per call. The same
+/// bytes and value natively as in the evaluator.
+#[test]
+fn the_structured_concurrency_example_runs_natively() {
+    let src = include_str!("../../../examples/06_structured.elya");
+    let dir = temp_dir("structured-example");
+    let exe = compile_and_link(&lower_src(src), &dir, "structured");
+    let (text, value) = native_text_value(&exe, "structured");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(text, eval_main_text(src));
+    assert_eq!(
+        text,
+        "scope: start\n  ping\n  body: done, the children run on\n    pong\n  ping\n    pong\n  ping\n\
+         scope: joined\nfib(10) by spawned tasks\npfib(10) by nested scopes\n"
+    );
+    assert_eq!(value, "25555");
+    assert_eq!(value, eval_main_int(src));
+}
+
+/// `examples/07_search.elya` (2026-10-15): one backtracking search over a
+/// `multi` effect, three handlers (all solutions, a count, the first one).
+#[test]
+fn the_search_example_runs_natively() {
+    let src = include_str!("../../../examples/07_search.elya");
+    let dir = temp_dir("search-example");
+    let exe = compile_and_link(&lower_src(src), &dir, "search");
+    let (text, value) = native_text_value(&exe, "search");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(text, eval_main_text(src));
+    assert_eq!(
+        text,
+        "6 queens: 4 solutions, all collected\n8 queens: 92 solutions, counted\n\
+         8 queens: the first solution, found without the others\n"
+    );
+    assert_eq!(value, "13215863724");
+    assert_eq!(value, eval_main_int(src));
+}
+
+/// `examples/08_timers.elya` (2026-10-16): the structured scheduler with
+/// `sleep`, a poll loop over timers, a `Clock` effect under a virtual clock
+/// and the real one (`time.now_ms`/`time.sleep_ms`), and a deadlock named.
+/// The same bytes and value natively as in the evaluator.
+#[test]
+fn the_timers_example_runs_natively() {
+    let src = include_str!("../../../examples/08_timers.elya");
+    let dir = temp_dir("timers-example");
+    let exe = compile_and_link(&lower_src(src), &dir, "timers");
+    let (text, value) = native_text_value(&exe, "timers");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(text, eval_main_text(src));
+    assert_eq!(
+        text,
+        "virtual clock:\n  b answered (10 ms)\n  c answered (20 ms)\n  a answered (30 ms)\n\
+         \x20 60 ms of requests in 30 virtual ms\na deadlock:\n\
+         \x20 deadlock: tasks 1 0 2 can never finish\nreal clock:\n\
+         \x20 b answered (10 ms)\n  c answered (20 ms)\n  a answered (30 ms)\n\
+         \x20 at least 30 real ms\n"
+    );
+    assert_eq!(value, "60361");
+    assert_eq!(value, eval_main_int(src));
+}
+
+/// A multi-shot copy of a chain of 100 000 handler frames, natively (the
+/// evaluator is the oracle at 1000 in `MULTI_SHOT`). Measured 2026-10-15:
+/// 0.004 s, 0.014 s, 0.138 s at 1000, 10 000, 100 000 frames -- linear.
+#[test]
+fn a_multi_shot_copy_of_100000_handler_frames() {
+    let src = "effect multi Flip { fn flip() -> Bool }\neffect S { fn get() -> Int }\n\
+               fn nest(n) { if n == 0 { if flip() { 1 } else { 2 } } else { handle { nest(n - 1) + get() } with { S.get() -> resume(1)  return(r) -> r } } }\n\
+               pub fn main() -> Int { handle nest(100000) with multi { Flip.flip() -> resume(True) * 1000000 + resume(False) } }\n";
+    let dir = temp_dir("deep-multi");
+    let exe = compile_and_link(&lower_src(src), &dir, "deep-multi");
+    let out = Command::new(&exe).output().expect("runs");
+    std::fs::remove_dir_all(&dir).ok();
+    diagnose_crash(&out.status, "deep-multi");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "100001100002");
+}
+
+// ---- 2026-10-15: native strings (`<>`, `==`, `int.to_string`) ----------------
+
+/// Spec `2026-10-15-elya-native-strings-design.md`. Every row was refused before:
+/// "Concat", "Eq on an unrepresentable operand type", or the unknown builtin.
+/// `(tag, source, text, value)`; both halves are also the evaluator's.
+///
+/// Negative controls, each reverted (`cmp` against a saved copy):
+/// - C2, `==` on strings compares lengths only: `eq-same-length` fails (1 for 10);
+/// - C3, `int.to_string` drops the sign: `int-to-string` fails.
+///
+/// C1 is recorded on `a_left_operand_survives_a_collection_in_the_right_one`.
+const STRINGS: &[(&str, &str, &str, &str)] = &[
+    (
+        "concat-literals",
+        "pub fn main() -> Int {\n  io.println(\"ab\" <> \"cd\")\n  0\n}\n",
+        "abcd\n",
+        "0",
+    ),
+    (
+        "concat-computed-and-compared",
+        "fn greet(n) { \"hi \" <> n }\n\
+         pub fn main() -> Int {\n\
+         \x20 let s = greet(\"ada\")\n\
+         \x20 io.println(s <> \"!\")\n\
+         \x20 if s == \"hi ada\" { 1 } else { 0 }\n\
+         }\n",
+        "hi ada!\n",
+        "1",
+    ),
+    (
+        "eq-same-length",
+        "pub fn main() -> Int { (if \"abc\" == \"abd\" { 1 } else { 0 }) + (if \"abc\" != \"abd\" { 10 } else { 0 }) }\n",
+        "",
+        "10",
+    ),
+    (
+        "eq-different-length",
+        "pub fn main() -> Int { (if \"ab\" == \"abc\" { 1 } else { 0 }) + (if \"\" == \"\" { 10 } else { 0 }) }\n",
+        "",
+        "10",
+    ),
+    (
+        "int-to-string",
+        "pub fn main() -> Int {\n\
+         \x20 io.println(int.to_string(0))\n\
+         \x20 io.println(int.to_string(0 - 42))\n\
+         \x20 io.println(\"n=\" <> int.to_string(12345))\n\
+         \x20 io.println(int.to_string(0 - 9223372036854775807 - 1))\n\
+         \x20 0\n\
+         }\n",
+        "0\n-42\nn=12345\n-9223372036854775808\n",
+        "0",
+    ),
+    (
+        "empty-strings",
+        "pub fn main() -> Int {\n\
+         \x20 io.println(\"\" <> \"x\" <> \"\")\n\
+         \x20 if \"\" <> \"\" == \"\" { 1 } else { 0 }\n\
+         }\n",
+        "x\n",
+        "1",
+    ),
+    (
+        // A generic fold over a list of strings (N7 part 2 meets strings).
+        "join-a-list-of-strings",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn join(l, sep) { match l { Nil -> \"\"  Cons(h, Nil) -> h  Cons(h, t) -> h <> sep <> join(t, sep) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 io.println(join(Cons(\"a\", Cons(\"b\", Cons(\"c\", Nil))), \", \"))\n\
+         \x20 0\n\
+         }\n",
+        "a, b, c\n",
+        "0",
+    ),
+    (
+        // Inside effectful code: the operand is a perform's answer.
+        "to-string-of-an-effects-answer",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn show(n) { io.println(\"v=\" <> int.to_string(lg(n))) }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { show(3)  show(4)  0 } with { L.lg(x) -> resume(x * 10)  return(r) -> r }\n\
+         }\n",
+        "v=30\nv=40\n",
+        "0",
+    ),
+    (
+        // The RIGHT operand performs: the left one waits across the site.
+        "concat-whose-right-operand-performs",
+        "effect N { fn name() -> String }\n\
+         fn hello() { \"hello, \" <> name() }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { io.println(hello())  0 } with { N.name() -> resume(\"ada\")  return(r) -> r }\n\
+         }\n",
+        "hello, ada\n",
+        "0",
+    ),
+    // String-literal patterns compile natively since `==` on strings does
+    // (`patterns.rs` turns a literal test into `==`; found by the review).
+    (
+        "string-literal-patterns",
+        "fn cls(s) { match s { \"a\" -> 1  \"bb\" -> 2  _ -> 3 } }\n\
+         pub fn main() -> Int { cls(\"a\") + 10 * cls(\"bb\") + 100 * cls(\"a\" <> \"b\") + 1000 * cls(\"\") }\n",
+        "",
+        "3321",
+    ),
+    (
+        "a-nested-string-literal-pattern",
+        "type Pair(a, b) { Pair(a, b) }\n\
+         fn cls(p) { match p { Pair(\"x\", n) -> n  Pair(_, n) -> n * 2 } }\n\
+         pub fn main() -> Int { cls(Pair(\"x\", 1)) + cls(Pair(\"y\" <> \"\", 10)) }\n",
+        "",
+        "21",
+    ),
+    (
+        "a-string-pattern-on-a-performs-answer",
+        "effect N { fn name() -> String }\n\
+         fn cls() { match name() { \"a\" -> 1  \"bb\" -> 2  _ -> 3 } }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { cls() * 100 + cls() * 10 + cls() } with { N.name() -> resume(\"bb\")  return(r) -> r }\n\
+         }\n",
+        "",
+        "222",
+    ),
+];
+
+#[test]
+fn native_strings_match_the_evaluator() {
+    let dir = temp_dir("strings");
+    let mut failures = Vec::new();
+    for (tag, src, text, value) in STRINGS {
+        let exe = match try_compile_and_link(&lower_src(src), &dir, tag) {
+            Ok(exe) => exe,
+            Err(e) => {
+                failures.push(format!("{tag}: {e}"));
+                continue;
+            }
+        };
+        let out = Command::new(&exe).output().expect("run produced binary");
+        diagnose_stack_overflow(&out.status, tag);
+        if !out.status.success() {
+            failures.push(format!(
+                "{tag}: {:?} {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+            continue;
+        }
+        let got = split_text_and_value(&String::from_utf8_lossy(&out.stdout), tag);
+        let want = ((*text).to_string(), (*value).to_string());
+        let eval = (eval_main_text(src), eval_main_int(src));
+        if got != want || got != eval {
+            failures.push(format!(
+                "{tag}: native={got:?} want={want:?} evaluator={eval:?}"
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Strings are heap values the collector must keep while they are live. 20 000
+/// labels `"<i>-<2i>"` are built and kept in a list while collections run; each
+/// is then compared with a freshly built copy. The right operand of the outer
+/// `<>` is itself a `<>` that allocates while the left operand waits. (C1 does
+/// not show here: a collection frees ~30 000 blocks and the free lists hand
+/// back the OLDEST dead block first, so the left operand's block is almost
+/// never reused before it is read -- the next test is built so that it is.)
+#[test]
+fn strings_survive_collection() {
+    let src = format!(
+        "{LIST}fn label(i) {{ int.to_string(i) <> (\"-\" <> int.to_string(i * 2)) }}\n\
+         fn build(i, acc) {{ if i == 0 {{ acc }} else {{ build(i - 1, Cons(Pair(i, label(i)), acc)) }} }}\n\
+         type Pair(a, b) {{ Pair(a, b) }}\n\
+         fn check(l, n) {{ match l {{ Nil -> n  Cons(Pair(i, s), t) -> check(t, if s == label(i) {{ n + 1 }} else {{ n }}) }} }}\n\
+         pub fn main() -> Int {{ check(build(20000, Nil), 0) }}\n"
+    );
+    let dir = temp_dir("strings-gc");
+    let exe = compile_and_link(&lower_src(&src), &dir, "strings-gc");
+    let (stdout, stats) = run_with_gc_stats(&exe, "strings-gc");
+    assert_eq!(stdout, "20000", "every label survived and compares equal");
+    assert!(
+        stats.collections > 0,
+        "the collector ran: {}",
+        stats.collections
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The left operand of `<>` waits while the right one runs, and here the right
+/// one collects. The left is a 54-byte literal (9 words), the only block of its
+/// size class; `right()` churns 70 000 cells (collections) and then allocates
+/// another 9-word string. A collection that does not see the left operand frees
+/// it, and the free list hands exactly that block to `right()`'s literal: the
+/// two operands alias and the comparison fails.
+///
+/// Negative control C1 (reverted, `cmp` clean): the left operand not rooted while
+/// the right one is lowered -- this program answers 0 (the evaluator: 1), and
+/// the collector reports `live=0` where it reports the rooted 9 words.
+#[test]
+fn a_left_operand_survives_a_collection_in_the_right_one() {
+    let a = "A".repeat(54);
+    let b = "B".repeat(54);
+    let src = format!(
+        "{LIST}fn churn(n) {{ if n == 0 {{ 0 }} else {{ let c = Cons(n, Nil)  churn(n - 1) }} }}\n\
+         fn right() {{ let _ = churn(70000)  \"{b}\" }}\n\
+         pub fn main() -> Int {{\n\
+         \x20 let s = \"{a}\" <> right()\n\
+         \x20 if s == \"{a}{b}\" {{ 1 }} else {{ 0 }}\n\
+         }}\n"
+    );
+    assert_eq!(eval_main_int(&src), "1");
+    let dir = temp_dir("strings-left-operand");
+    let exe = compile_and_link(&lower_src(&src), &dir, "strings-left-operand");
+    let (stdout, stats) = run_with_gc_stats(&exe, "strings-left-operand");
+    assert_eq!(stdout, "1");
+    assert!(
+        stats.collections > 0,
+        "the collector ran: {}",
+        stats.collections
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The CPS emitter's half of the same obligation: in effectful code the left
+/// operand of `<>` waits across a continuation site (the right one performs),
+/// thousands of times, while collections run. The CPS emitter's own roots
+/// around `<>` and `int.to_string` (C4, C5) are pinned by the next two tests.
+#[test]
+fn a_string_operand_survives_an_effect_site() {
+    let src = "effect N { fn next(i: Int) -> String }\n\
+               fn go(i, acc) { if i == 0 { acc } else { go(i - 1, if (int.to_string(i) <> next(i)) == (int.to_string(i) <> \"x\") { acc + 1 } else { acc }) } }\n\
+               pub fn main() -> Int { handle { go(5000, 0) } with { N.next(i) -> resume(\"x\")  return(r) -> r } }\n";
+    assert_eq!(eval_main_int(src), "5000");
+    let dir = temp_dir("strings-cps-gc");
+    let exe = compile_and_link(&lower_src(src), &dir, "strings-cps-gc");
+    let (stdout, stats) = run_with_gc_stats(&exe, "strings-cps-gc");
+    assert_eq!(stdout, "5000");
+    assert!(
+        stats.collections > 0,
+        "the collector ran: {}",
+        stats.collections
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// In a resumption function the frame being resumed is DEAD: the continuation
+/// and the frame's saved bindings are reachable only through what `root_live`
+/// pushes around an allocation. Here `<>` (the answer of `name()` and `"y"`) is
+/// computed in the resumption, and `s`, a 54-byte string (a size class nothing
+/// else uses) bound since the start, must survive every collection it triggers;
+/// `u` allocates a same-size string each iteration, so a freed `s` is reused at
+/// once and the comparison changes. Found by the review of native strings: the
+/// author's own control C4 had failed nothing.
+///
+/// Negative control C4 (reverted, `cmp` clean): no `root_live` around a CPS
+/// `<>` -- 7021 instead of 20000 (deterministic).
+#[test]
+fn cps_live_values_survive_a_concat_in_a_resumption() {
+    let a = "A".repeat(54);
+    let b = "B".repeat(54);
+    let src = format!(
+        "effect N {{ fn name() -> String }}\n\
+         fn go(i, s, acc) {{ if i == 0 {{ acc }} else {{ let t = name() <> \"y\"  let u = \"{b}\"  go(i - 1, s, if s == u {{ acc }} else {{ acc + 1 }}) }} }}\n\
+         pub fn main() -> Int {{ handle {{ go(20000, \"{a}\", 0) }} with {{ N.name() -> resume(\"q\") }} }}\n"
+    );
+    assert_eq!(eval_main_int(&src), "20000");
+    let dir = temp_dir("strings-cps-concat-roots");
+    let exe = compile_and_link(&lower_src(&src), &dir, "strings-cps-concat-roots");
+    let (stdout, stats) = run_with_gc_stats(&exe, "strings-cps-concat-roots");
+    assert_eq!(stdout, "20000");
+    assert!(
+        stats.collections > 0,
+        "the collector ran: {}",
+        stats.collections
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same obligation for `int.to_string` of a perform's answer, computed in
+/// the resumption.
+///
+/// Negative control C5 (reverted, `cmp` clean): no `root_live` around a CPS
+/// `int.to_string` -- the count is wrong (5242 for 50 000 in the review).
+#[test]
+fn cps_live_values_survive_int_to_string_in_a_resumption() {
+    let a = "A".repeat(54);
+    let b = "B".repeat(54);
+    let src = format!(
+        "effect K {{ fn tick(n: Int) -> Int }}\n\
+         fn go(i, s, acc) {{ if i == 0 {{ acc }} else {{ let t = int.to_string(tick(i))  let u = \"{b}\"  let w = \"\"  go(i - 1, s, if s == u {{ acc }} else {{ acc + 1 }}) }} }}\n\
+         pub fn main() -> Int {{ handle {{ go(20000, \"{a}\", 0) }} with {{ K.tick(x) -> resume(x) }} }}\n"
+    );
+    assert_eq!(eval_main_int(&src), "20000");
+    let dir = temp_dir("strings-cps-itos-roots");
+    let exe = compile_and_link(&lower_src(&src), &dir, "strings-cps-itos-roots");
+    let (stdout, stats) = run_with_gc_stats(&exe, "strings-cps-itos-roots");
+    assert_eq!(stdout, "20000");
+    assert!(
+        stats.collections > 0,
+        "the collector ran: {}",
+        stats.collections
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- 2026-10-15: time, the first I/O source (async step 2, part 2) ----------
+
+/// `time.now_ms` and `time.sleep_ms` natively (spec
+/// `2026-10-15-elya-async-step2-timers-design.md` D3): the clock advances by at
+/// least the sleep, in direct code and in a handler clause (the CPS emitter),
+/// and a non-positive sleep returns at once. Each answer is 1 only if it does.
+///
+/// Negative control T3 (reverted, `cmp` clean): `elya_time_sleep_ms` returns at
+/// once -- both rows answer 0.
+#[test]
+fn the_clock_advances_natively() {
+    let rows = [
+        (
+            "direct",
+            "pub fn main() -> Int {\n\
+             \x20 let a = time.now_ms()\n\
+             \x20 time.sleep_ms(20)\n\
+             \x20 let b = time.now_ms()\n\
+             \x20 time.sleep_ms(0 - 5)\n\
+             \x20 if a >= 0 && b - a >= 20 && time.now_ms() >= b { 1 } else { 0 }\n\
+             }\n",
+        ),
+        (
+            "in-a-clause",
+            "effect W { fn wait(ms: Int) -> Unit }\n\
+             fn pause() { wait(15)  wait(10) }\n\
+             pub fn main() -> Int {\n\
+             \x20 let a = time.now_ms()\n\
+             \x20 handle { pause() } with { W.wait(ms) -> { time.sleep_ms(ms)  resume(Unit) } }\n\
+             \x20 if time.now_ms() - a >= 25 { 1 } else { 0 }\n\
+             }\n",
+        ),
+    ];
+    let dir = temp_dir("time-builtins");
+    let mut failures = Vec::new();
+    for (tag, src) in rows {
+        assert_eq!(eval_main_int(src), "1", "{tag}: the evaluator");
+        match try_compile_and_link(&lower_src(src), &dir, tag) {
+            Ok(exe) => {
+                let out = Command::new(&exe).output().expect("run produced binary");
+                let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !out.status.success() || got != "1" {
+                    failures.push(format!("{tag}: {:?} {got:?}", out.status));
+                }
+            }
+            Err(e) => failures.push(format!("{tag}: {e}")),
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+// ---- A function's own row in Core (2026-10-16) ----
+// Spec `docs/superpowers/specs/2026-10-16-elya-own-row-in-core-design.md`. Each
+// was refused natively ("type variable only in an effect row"): `s` is generic
+// only through the functions' own rows.
+const OWN_ROW: &[(&str, &str, &str)] = &[
+    (
+        "r10-dup-at-int",
+        "effect St(s) { fn get() -> s  fn put(v: s) -> Int }\n\
+         fn dup() { put(get()) }\n\
+         pub fn main() -> Int { handle { dup()  5 } with { St.get() -> resume(3)  St.put(v) -> resume(0)  return(r) -> r } }\n",
+        "5",
+    ),
+    (
+        "r24-dup-at-string",
+        "effect St(s) { fn get() -> s  fn put(v: s) -> Int }\n\
+         fn dup() { put(get()) }\n\
+         pub fn main() -> Int { handle { dup()  5 } with { St.get() -> resume(\"x\")  St.put(v) -> resume(0)  return(r) -> r } }\n",
+        "5",
+    ),
+    (
+        // Defaulting `s` to `Unit` left the list unrooted: natively 4130074439
+        // (a collected list summed), measured with the refusal switched off.
+        // `len` counts by a tail loop: 200 000 non-tail calls overflow the
+        // native stack (SIGSEGV), which is not what this row is about.
+        "r27-a-list-across-collections",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         effect St(s) { fn get() -> s  fn put(v: s) -> Int }\n\
+         fn build(i, acc) { if i == 0 { acc } else { build(i - 1, Cons(i, acc)) } }\n\
+         fn count(l, k) { match l { Nil -> k  Cons(_, t) -> count(t, k + 1) } }\n\
+         fn len(l) { count(l, 0) }\n\
+         fn sum(l, s) { match l { Nil -> s  Cons(h, t) -> sum(t, s + h) } }\n\
+         fn dup() { let v = get()  let n = len(build(200000, Nil))  put(v) + n }\n\
+         pub fn main() -> Int { handle { dup() } with { St.get() -> resume(build(1000, Nil))  St.put(v) -> resume(sum(v, 0))  return(r) -> r } }\n",
+        "700500",
+    ),
+    (
+        "g1-through-generic-callees",
+        "effect St(s) { fn get() -> s  fn put(v: s) -> Int }\n\
+         fn getter() { get() }\n\
+         fn putter(v) { put(v) }\n\
+         fn dup3() { let v = getter()  putter(v) }\n\
+         pub fn main() -> Int { handle { dup3() } with { St.get() -> resume(\"x\")  St.put(v) -> resume(0)  return(r) -> r } }\n",
+        "0",
+    ),
+];
+
+#[test]
+fn row_only_type_variables_run_natively() {
+    run_value_corpus(OWN_ROW, "own-row");
+    run_differential_corpus(OWN_ROW, "own-row-diff");
+}
+
+/// `examples/10_failure.elya` (2026-10-16): failure as an effect answering
+/// the empty `Never` (an empty match is a trap natively, never reached), a
+/// `catch` handler, and scopes that drop their queued tasks when one fails.
+#[test]
+fn the_failure_example_runs_natively() {
+    let src = include_str!("../../../examples/10_failure.elya");
+    let dir = temp_dir("failure-example");
+    let exe = compile_and_link(&lower_src(src), &dir, "failure");
+    let (text, value) = native_text_value(&exe, "failure");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(text, eval_main_text(src));
+    assert!(
+        text.contains("  scope cancelled, 3 task(s) dropped\nscope failed: division by zero\n"),
+        "{text}"
+    );
+    assert_eq!(value, "-123");
+    assert_eq!(value, eval_main_int(src));
+}
+
+// ---- Computed callees and functions as values (2026-10-16) ----
+// Spec `docs/superpowers/specs/2026-10-16-elya-callees-and-function-values-design.md`.
+// Every program was refused natively ("computed callee" or "function used as a
+// value"); values are the evaluator's.
+const CALLEES: &[(&str, &str, &str)] = &[
+    (
+        "c1-computed-callees",
+        "fn compose(f, g) { fn(x) { g(f(x)) } }\n\
+         fn mk() { fn(y) { y * 2 } }\n\
+         pub fn main() -> Int { (compose(fn(a) { a + 1 }, fn(b) { b * 10 }))(4) + (mk())(1) }\n",
+        "52",
+    ),
+    (
+        // The callee before the argument: each `lg` appends its digit below the
+        // rest's, so the order is the number's last two digits (21).
+        "c4-the-callee-first",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn pick(n) { let _ = lg(1)  fn(x) { x + n } }\n\
+         fn arg(v) { let _ = lg(2)  v }\n\
+         pub fn main() -> Int { handle { (pick(1))(arg(2)) } with { L.lg(v) -> resume(0) * 10 + v  return(r) -> r } }\n",
+        "321",
+    ),
+    (
+        "c3-a-function-in-a-local",
+        "fn double(x) { x * 2 }\n\
+         fn apply(f, x) { f(x) }\n\
+         pub fn main() -> Int { let g = double  apply(g, 4) + g(1) }\n",
+        "10",
+    ),
+    (
+        "c5-a-function-in-a-field",
+        "type Box { B(fn(Int) -> Int) }\n\
+         fn inc(x) { x + 1 }\n\
+         fn open(b) { match b { B(f) -> f(41) } }\n\
+         pub fn main() -> Int { open(B(inc)) }\n",
+        "42",
+    ),
+    (
+        "c6-an-effectful-function-as-a-value",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn logd(x) { lg(x) + 1 }\n\
+         fn twice(f, x) { f(f(x)) }\n\
+         pub fn main() -> Int { handle { twice(logd, 5) } with { L.lg(v) -> resume(v * 2)  return(r) -> r } }\n",
+        "23",
+    ),
+    (
+        "c7-a-generic-function-as-a-value",
+        "fn id(x) { x }\n\
+         fn apply(f, x) { f(x) }\n\
+         pub fn main() -> Int { if apply(id, True) { apply(id, 7) } else { 0 } }\n",
+        "7",
+    ),
+    (
+        // A local shadowing a top-level name is the local's value, not wrapped.
+        "c8-a-shadowing-local",
+        "fn inc(x) { x + 1 }\n\
+         fn apply(f, x) { f(x) }\n\
+         pub fn main() -> Int { let inc = fn(x) { x + 100 }  apply(inc, 1) }\n",
+        "101",
+    ),
+    // The review's finding 1: a pure function passed where an effectful one is
+    // expected. The wrapper's inner call had the WIDENED type, so a direct
+    // function was called with the CPS convention ("calling convention
+    // disagrees with the callee").
+    (
+        "r1-a-pure-function-at-an-effectful-type",
+        "effect E { fn ask(n: Int) -> Int }\n\
+         fn inc(x) { x + 1 }\n\
+         fn apply(f, x) { f(x) }\n\
+         pub fn main() -> Int { handle { ask(3) + apply(inc, 0) } with { E.ask(n) -> resume(n * 10)  return(r) -> r } }\n",
+        "31",
+    ),
+    (
+        "r2-pure-and-effectful-values-to-one-function",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn logd(x) { lg(x) + 1 }\n\
+         fn inc(x) { x + 1 }\n\
+         fn twice(f, x) { f(f(x)) }\n\
+         pub fn main() -> Int { handle { twice(logd, 5) + twice(inc, 0) } with { L.lg(v) -> resume(v * 2)  return(r) -> r } }\n",
+        "25",
+    ),
+    (
+        "r3-a-pure-function-in-an-effectful-field",
+        "effect E { fn ask(n: Int) -> Int }\n\
+         type Box { B(fn(Int) / {E} -> Int) }\n\
+         fn inc(x) { x + 1 }\n\
+         fn open(b) { match b { B(f) -> f(ask(1)) } }\n\
+         pub fn main() -> Int { handle { open(B(inc)) } with { E.ask(n) -> resume(n * 10)  return(r) -> r } }\n",
+        "11",
+    ),
+];
+
+#[test]
+fn computed_callees_and_function_values_run_natively() {
+    run_value_corpus(CALLEES, "callees");
+}
+
+#[test]
+fn computed_callees_and_function_values_match_the_evaluator() {
+    run_differential_corpus(CALLEES, "callees-diff");
+}
+
+// ---- Argument records past three parameters (2026-10-16) ----
+// Spec `docs/superpowers/specs/2026-10-16-elya-argument-records-design.md`.
+// Every program was refused natively by an arity cap; values are the
+// evaluator's.
+const ARITY: &[(&str, &str, &str)] = &[
+    (
+        "a1-six-parameters",
+        "fn six(a, b, c, d, e, f) { a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 }\n\
+         pub fn main() -> Int { six(1, 2, 3, 4, 5, 6) }\n",
+        "91",
+    ),
+    (
+        "a2-an-effectful-function-of-five",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn five(a, b, c, d, e) { lg(a) + b * 2 + c * 3 + d * 4 + e * 5 }\n\
+         pub fn main() -> Int { handle { five(1, 2, 3, 4, 5) } with { L.lg(x) -> resume(x * 100)  return(r) -> r } }\n",
+        "154",
+    ),
+    (
+        "a3-a-lambda-of-five",
+        "pub fn main() -> Int { let f = fn(a, b, c, d, e) { a - b + c - d + e * 10 }  f(1, 2, 3, 4, 5) }\n",
+        "48",
+    ),
+    (
+        "a4-an-effectful-lambda-of-four",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         pub fn main() -> Int { handle { let f = fn(a, b, c, d) { lg(a) + b + c + d }  f(1, 2, 3, 4) } with { L.lg(x) -> resume(x * 100)  return(r) -> r } }\n",
+        "109",
+    ),
+    (
+        "a5-an-operation-of-four",
+        "effect W { fn w(a: Int, b: Int, c: Int, d: Int) -> Int }\n\
+         pub fn main() -> Int { handle { w(1, 2, 3, 4) + 1 } with { W.w(a, b, c, d) -> resume(a * 1000 + b * 100 + c * 10 + d)  return(r) -> r } }\n",
+        "1235",
+    ),
+    (
+        "a6-a-six-parameter-loop-of-100000",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn go(l, a, b, c, d, acc) { match l { Nil -> acc + a + b + c + d  Cons(h, t) -> go(t, a + 1, b, c, d, acc + h) } }\n\
+         fn build(i, acc) { if i == 0 { acc } else { build(i - 1, Cons(i, acc)) } }\n\
+         pub fn main() -> Int { go(build(100000, Nil), 0, 1, 2, 3, 0) }\n",
+        "5000150006",
+    ),
+    (
+        "a7-a-five-parameter-lambda-as-an-argument",
+        "fn apply5(f, x) { f(x, x, x, x, x) }\n\
+         pub fn main() -> Int { apply5(fn(a, b, c, d, e) { a + b + c + d + e }, 3) }\n",
+        "15",
+    ),
+    // The review's finding: a function in a spilled position. The call keyed
+    // its record by the argument's type (an open row), the callee by its
+    // parameter's (closed): two records, "match failed" natively.
+    (
+        "r1-a-function-in-the-fourth-position",
+        "fn k(n, s, acc, f) { acc + f(s) }\n\
+         pub fn main() -> Int { k(3, 1, 0, fn(p) { p + 1 }) }\n",
+        "2",
+    ),
+    (
+        "r2-functions-in-a-spilled-tail-loop",
+        "fn loop(n, s, l, f, g, acc) { if n == 0 { acc + l } else { loop(n - 1, f(s), l, f, g, acc + g(s)) } }\n\
+         fn inc(x) { x + 1 }\n\
+         pub fn main() -> Int { loop(100000, 0, 7, inc, fn(x) { x * 2 }, 0) }\n",
+        "9999900007",
+    ),
+    (
+        "r3-an-effectful-function-in-the-fourth-position",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn k(n, s, acc, f) { acc + f(s) + n }\n\
+         pub fn main() -> Int { handle { k(3, 1, 0, fn(p) { lg(p) + 1 }) } with { L.lg(v) -> resume(v * 10)  return(r) -> r } }\n",
+        "14",
+    ),
+];
+
+#[test]
+fn long_parameter_lists_run_natively() {
+    run_value_corpus(ARITY, "arity");
+}
+
+#[test]
+fn long_parameter_lists_match_the_evaluator() {
+    run_differential_corpus(ARITY, "arity-diff");
 }

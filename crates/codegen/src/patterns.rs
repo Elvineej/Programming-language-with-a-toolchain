@@ -43,6 +43,7 @@ pub(crate) fn run(core: &CoreModule) -> CoreModule {
                     name: f.name.clone(),
                     params: f.params.clone(),
                     body: c.expr(&f.body),
+                    row: f.row.clone(),
                 }
             } else {
                 f.clone()
@@ -52,6 +53,8 @@ pub(crate) fn run(core: &CoreModule) -> CoreModule {
     CoreModule {
         fns,
         types: core.types.clone(),
+        generic_types: core.generic_types.clone(),
+        effect_params_used: core.effect_params_used.clone(),
     }
 }
 

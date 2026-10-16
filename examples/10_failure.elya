@@ -1,0 +1,152 @@
+// Failure as an effect, and a scope that cancels its children.
+//
+// `fail` answers `Never`, a type with no values: no handler can resume it,
+// so a failing computation is abandoned -- by the type, not by convention.
+// `raise` turns that into a value of ANY type with an empty match (a match
+// on a type with no constructors needs no arms). `catch` is an ordinary
+// handler that answers a fallback instead.
+//
+// The scheduler is `examples/06_structured.elya`'s, with one rule more: when
+// any task of a scope fails, the scope drops the tasks still queued -- they
+// never run -- and fails itself, with the same reason. A failure inside a
+// nested scope therefore climbs scope by scope until something catches it.
+
+type Never { }
+
+effect Fail { fn fail(reason: String) -> Never }
+
+fn raise(reason: String) / {Fail} -> a { match fail(reason) { } }
+
+// Unannotated, so it is polymorphic in what else `body` and `fallback` do.
+fn catch(body, fallback) {
+  handle { body() } with {
+    Fail.fail(reason) -> fallback(reason)
+    return(v) -> v
+  }
+}
+
+effect Async {
+  fn spawn(f: fn() / {Async, Fail, Log} -> Int) -> Int
+  fn await(id: Int) -> Int
+  fn yld() -> Unit
+}
+
+effect Log { fn say(line: String) -> Unit }
+
+type List(a) { Nil, Cons(a, List(a)) }
+type Pair(a, b) { Pair(a, b) }
+type Option(a) { None, Some(a) }
+
+type Step {
+  Done(Int),
+  Failed(String),
+  Yielded(fn() / {Log} -> Step),
+  Spawned(fn() / {Async, Fail, Log} -> Int, fn(Int) / {Log} -> Step),
+  Awaiting(Int, fn(Int) / {Log} -> Step)
+}
+
+// A task's next step. Its failure ends it: `Failed`, and no resume.
+fn step(body: fn() / {Async, Fail, Log} -> Int) -> Step {
+  handle {
+    handle { Done(body()) } with {
+      Fail.fail(reason) -> Failed(reason)
+      return(s) -> s
+    }
+  } with {
+    Async.yld() -> Yielded(fn() { resume(Unit) })
+    Async.spawn(f) -> Spawned(f, fn(id) { resume(id) })
+    Async.await(id) -> Awaiting(id, fn(v) { resume(v) })
+    return(s) -> s
+  }
+}
+
+fn append(l, x) { match l { Nil -> Cons(x, Nil)  Cons(h, t) -> Cons(h, append(t, x)) } }
+
+fn find(rs, id) {
+  match rs {
+    Nil -> None
+    Cons(Pair(i, v), rest) -> if i == id { Some(v) } else { find(rest, id) }
+  }
+}
+
+fn size(l) { match l { Nil -> 0  Cons(_, t) -> 1 + size(t) } }
+
+// The scope's outcome: every task finished, or the first failure.
+type Outcome { Joined(List(Pair(Int, Int))), Cancelled(String, Int) }
+
+fn run(q, results, next) {
+  match q {
+    Nil -> Joined(results)
+    Cons(Pair(id, s), rest) -> match s {
+      Done(v) -> run(rest, Cons(Pair(id, v), results), next)
+      // Cancellation: the queued tasks are dropped, never run.
+      Failed(reason) -> Cancelled(reason, size(rest))
+      Yielded(k) -> run(append(rest, Pair(id, k())), results, next)
+      Spawned(f, k) -> run(append(append(rest, Pair(id, k(next))), Pair(next, step(f))), results, next + 1)
+      Awaiting(c, k) -> match find(results, c) {
+        Some(v) -> run(append(rest, Pair(id, k(v))), results, next)
+        None -> run(append(rest, Pair(id, s)), results, next)
+      }
+    }
+  }
+}
+
+fn scope(body: fn() / {Async, Fail, Log} -> Int) / {Fail, Log} -> Int {
+  match run(Cons(Pair(0, step(body)), Nil), Nil, 1) {
+    Joined(results) -> match find(results, 0) { Some(v) -> v  None -> 0 }
+    Cancelled(reason, dropped) -> {
+      let _ = say("  scope cancelled, " <> int.to_string(dropped) <> " task(s) dropped")
+      raise(reason)
+    }
+  }
+}
+
+fn worker(name: String, n: Int) / {Async, Log} -> Int {
+  if n == 0 { 0 } else {
+    let _ = say(name <> " " <> int.to_string(n))
+    let _ = yld()
+    1 + worker(name, n - 1)
+  }
+}
+
+fn checked_div(a: Int, b: Int) / {Fail} -> Int {
+  if b == 0 { raise("division by zero") } else { a / b }
+}
+
+pub fn main() -> Int {
+  handle {
+    // 1. A failure caught where it happens.
+    let q = catch(fn() { checked_div(10, 2) + checked_div(1, 0) }, fn(r) { 0 - 1 })
+    let _ = say("caught: " <> int.to_string(q))
+    // 2. A scope whose child fails: the sibling still queued is dropped.
+    let s = catch(fn() {
+      scope(fn() {
+        let _ = spawn(fn() { worker("  steady", 5) })
+        let _ = spawn(fn() { let _ = worker("  doomed", 1)  checked_div(1, 0) })
+        let _ = spawn(fn() { worker("  late", 3) })
+        let _ = yld()
+        42
+      })
+    }, fn(r) {
+      let _ = say("scope failed: " <> r)
+      0 - 2
+    })
+    // 3. Nested scopes: the inner failure climbs through the outer one.
+    let n = catch(fn() {
+      scope(fn() {
+        let a = spawn(fn() { scope(fn() { raise("inner") }) })
+        await(a)
+      })
+    }, fn(r) {
+      let _ = say("nested: " <> r)
+      0 - 3
+    })
+    q * 100 + s * 10 + n
+  } with {
+    Log.say(line) -> {
+      io.println(line)
+      resume(Unit)
+    }
+    return(v) -> v
+  }
+}

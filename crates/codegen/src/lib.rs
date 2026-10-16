@@ -18,11 +18,14 @@
 //! `False && 1 / 0 == 0` fails on both sides. Short-circuiting is a front-end
 //! question, not a back-end one.
 
+mod anf;
 mod closure;
 mod cps;
 mod cps_emit;
+mod mono;
 mod patterns;
 mod specialize;
+mod spill;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -191,8 +194,8 @@ fn find_main(core: &CoreModule) -> Result<&CoreFn, CodegenError> {
 /// §3.1 type mapping: `Int` -> i64, `Bool` -> i1, `Ty::Con` -> a pointer (N4),
 /// and — since N6 — `Str` -> a pointer and `Unit` -> i64. Reads the INLINE `ty`
 /// field on each Core node (Shape C — the reason this fold needs no side-table
-/// lookups). Everything else is refused by name, `Ty::Var(_)` included; when that
-/// fires, that is N7 knocking.
+/// lookups). Everything else is refused by name, `Ty::Var(_)` included; since
+/// N7 part 2 (`mono.rs`) no type variable reaches here, so that is a guard.
 fn repr_ty<'ctx>(ctx: &'ctx Context, ty: &Ty) -> Result<BasicTypeEnum<'ctx>, CodegenError> {
     match ty {
         Ty::Base(TyCon::Int) => Ok(ctx.i64_type().into()),
@@ -409,6 +412,124 @@ fn emit_body<'ctx>(
     // Every function body is in tail position by definition; `lower_tail` emits
     // the terminator, so there is no `build_return` here any more.
     lower_tail(ctx, func, b, lc, &f.body, &mut env)
+}
+
+/// `<>`, `==` or `!=` on two lowered `String` operands (both emitters). The
+/// caller roots what must survive: `<>` allocates (spec
+/// 2026-10-15-elya-native-strings D4), `==` does not.
+pub(crate) fn string_prim<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    op: BinOp,
+    l: inkwell::values::PointerValue<'ctx>,
+    r: inkwell::values::PointerValue<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    match op {
+        BinOp::Concat => Ok(b
+            .build_call(
+                lc.str_concat,
+                &[
+                    i64t.const_int(lc.string_tag as u64, false).into(),
+                    l.into(),
+                    r.into(),
+                ],
+                "cat",
+            )
+            .map_err(internal)?
+            .try_as_basic_value()
+            .left()
+            .ok_or(CodegenError::Unsupported(
+                "elya_str_concat returned no value",
+            ))?),
+        BinOp::Eq | BinOp::Ne => {
+            let w = b
+                .build_call(lc.str_eq, &[l.into(), r.into()], "streq")
+                .map_err(internal)?
+                .try_as_basic_value()
+                .left()
+                .ok_or(CodegenError::Unsupported("elya_str_eq returned no value"))?
+                .into_int_value();
+            let pred = if op == BinOp::Eq {
+                IntPredicate::NE
+            } else {
+                IntPredicate::EQ
+            };
+            Ok(b.build_int_compare(pred, w, i64t.const_zero(), "streqb")
+                .map_err(internal)?
+                .into())
+        }
+        _ => Err(CodegenError::Unsupported(op_label(op))),
+    }
+}
+
+/// `int.to_string(n)`: a fresh string. Allocates: the caller roots.
+pub(crate) fn int_to_string<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    n: BasicValueEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    b.build_call(
+        lc.int_to_string,
+        &[
+            i64t.const_int(lc.string_tag as u64, false).into(),
+            n.into_int_value().into(),
+        ],
+        "itos",
+    )
+    .map_err(internal)?
+    .try_as_basic_value()
+    .left()
+    .ok_or(CodegenError::Unsupported(
+        "elya_int_to_string returned no value",
+    ))
+}
+
+/// `time.now_ms()` / `time.sleep_ms(ms)` on lowered operands (both emitters).
+/// Neither allocates, so nothing needs rooting. `Unit` is the word 0.
+pub(crate) fn time_builtin<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    name: &str,
+    vals: &[BasicValueEnum<'ctx>],
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    match (name, vals) {
+        ("time.now_ms", []) => b
+            .build_call(lc.time_now_ms, &[], "now")
+            .map_err(internal)?
+            .try_as_basic_value()
+            .left()
+            .ok_or(CodegenError::Unsupported(
+                "elya_time_now_ms returned no value",
+            )),
+        ("time.sleep_ms", [ms]) => {
+            b.build_call(lc.time_sleep_ms, &[ms.into_int_value().into()], "")
+                .map_err(internal)?;
+            Ok(ctx.i64_type().const_int(0, false).into())
+        }
+        _ => Err(CodegenError::UnsupportedBuiltin(name.to_string())),
+    }
+}
+
+/// The builtins the native back end implements.
+pub(crate) fn is_native_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "io.println" | "int.to_string" | "time.now_ms" | "time.sleep_ms"
+    )
+}
+
+/// Is this `Prim` a string operation (`<>`, or `==`/`!=` on `String`s)?
+pub(crate) fn is_string_prim(op: BinOp, args: &[CoreExpr]) -> bool {
+    match op {
+        BinOp::Concat => true,
+        BinOp::Eq | BinOp::Ne => matches!(args[0].ty, Ty::Base(TyCon::Str)),
+        _ => false,
+    }
 }
 
 /// One place where an Elya call becomes an LLVM call, used from both `lower_expr`
@@ -1197,6 +1318,20 @@ fn lower_expr<'ctx>(
             gc_unroot(b, lc, env_roots)?;
             Ok(p.into())
         }
+        CoreKind::Builtin(builtin, args) if builtin.starts_with("time.") => {
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args.iter() {
+                vals.push(lower_expr(ctx, func, b, lc, a, env)?);
+            }
+            time_builtin(ctx, b, lc, builtin, &vals)
+        }
+        CoreKind::Builtin(builtin, args) if builtin == "int.to_string" && args.len() == 1 => {
+            let n = lower_expr(ctx, func, b, lc, &args[0], env)?;
+            let roots = gc_root_env(b, lc, env)?;
+            let v = int_to_string(ctx, b, lc, n)?;
+            gc_unroot(b, lc, roots)?;
+            Ok(v)
+        }
         CoreKind::Builtin(builtin, args) => {
             // Refuse by the actual owned Core name before touching any argument.
             if builtin != "io.println" {
@@ -1238,16 +1373,34 @@ fn lower_expr<'ctx>(
             // names the operator rather than reporting the operand's type as
             // unrepresentable. Every other operator in the subset is monomorphic
             // by the time it reaches here.
+            // Strings (2026-10-15): pointer operands, a runtime call. The left
+            // operand is rooted while the right one is lowered (it may
+            // allocate), and `<>` roots the environment across its own
+            // allocation, as `Ctor` does (spec D4).
+            if is_string_prim(*op, args) {
+                let l = lower_expr(ctx, func, b, lc, &args[0], env)?;
+                let held = gc_root(b, lc, l)?;
+                let r = lower_expr(ctx, func, b, lc, &args[1], env)?;
+                let roots = if *op == BinOp::Concat {
+                    gc_root_env(b, lc, env)?
+                } else {
+                    0
+                };
+                let v = string_prim(
+                    ctx,
+                    b,
+                    lc,
+                    *op,
+                    l.into_pointer_value(),
+                    r.into_pointer_value(),
+                )?;
+                gc_unroot(b, lc, roots + usize::from(held))?;
+                return Ok(v);
+            }
             if matches!(op, BinOp::Eq | BinOp::Ne)
                 && !matches!(args[0].ty, Ty::Base(TyCon::Int) | Ty::Base(TyCon::Bool))
             {
                 return Err(CodegenError::Unsupported(eq_operand_label(*op)));
-            }
-            // N6 §8.2: `<>` is String × String → String; its operands are pointers, so
-            // `.into_int_value()` at the lines below would PANIC (inkwell, not a Result).
-            // Refused by name, reusing op_label's existing "Concat" message.
-            if matches!(op, BinOp::Concat) {
-                return Err(CodegenError::Unsupported(op_label(*op)));
             }
             let l = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
             let r = lower_expr(ctx, func, b, lc, &args[1], env)?.into_int_value();
@@ -1630,6 +1783,13 @@ struct LowerCtx<'a, 'ctx> {
     pub(crate) lambda_regions: &'a HashMap<usize, cps::LambdaRegion>,
     alloc: FunctionValue<'ctx>,
     str_lit: FunctionValue<'ctx>,
+    /// Native strings (2026-10-15): `<>`, `==` on strings, `int.to_string`.
+    str_concat: FunctionValue<'ctx>,
+    str_eq: FunctionValue<'ctx>,
+    int_to_string: FunctionValue<'ctx>,
+    /// Time (2026-10-15): `time.now_ms`, `time.sleep_ms`.
+    time_now_ms: FunctionValue<'ctx>,
+    time_sleep_ms: FunctionValue<'ctx>,
     println: FunctionValue<'ctx>,
     string_tag: usize,
     fail: FunctionValue<'ctx>,
@@ -1698,11 +1858,34 @@ fn build_ctor_table(core: &CoreModule) -> HashMap<String, (usize, Vec<Ty>)> {
 /// and `@main` shim. Returns the handle so `emit_ir` and `compile_module` share
 /// one construction path.
 fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'ctx>, CodegenError> {
-    // §5.1, FIRST STATEMENT ON PURPOSE. The failure this prevents is LLVM's
-    // `report_fatal_error` for a win64 guaranteed tail call: no source span, no
-    // `Result`, the process simply dies. It must therefore be impossible for
-    // any emission to have begun when this fires — so it is a whole-module scan
-    // that runs before the module even exists. Tracked as obligation T1.
+    // N7 part 2: clone generic functions and locals per type instantiation,
+    // so no type variable reaches the back end (spec 2026-10-15).
+    // Computed callees are named and top-level functions used as values are
+    // wrapped in closures, so every call below is by name (spec 2026-10-16).
+    let named = anf::run(core);
+    let specialized = mono::run(&named)?;
+    // N7 part 1: monomorphize rows where a reference needs another convention,
+    // and eta-expand upcasts, so every phase below sees types that say the
+    // right convention. Pure Core-to-Core; nothing is emitted yet.
+    let specialized = specialize::run(&specialized)?;
+    // N7 part 2: applied parametric types become ground instances, AFTER the
+    // rows inside their arguments are substituted (spec 2026-10-15 §2).
+    let specialized = mono::instantiate_types(&specialized)?;
+    // Nested and literal patterns become the flat matches, `if`s and `let`s
+    // both emitters support (spec 2026-10-10-elya-native-pattern-compilation).
+    let specialized = patterns::run(&specialized);
+    // Past three parameters, the rest travel in one argument record (spec
+    // 2026-10-16-elya-argument-records), so no kind exceeds its LLVM cap.
+    let specialized = spill::run(&specialized);
+    let core = &specialized;
+
+    // §5.1, FIRST CHECK ON THE EMITTED CORE ON PURPOSE. The failure this
+    // prevents is LLVM's `report_fatal_error` for a win64 guaranteed tail
+    // call: no source span, no `Result`, the process simply dies. It must
+    // therefore be impossible for any emission to have begun when this fires
+    // — so it is a whole-module scan that runs before the module even exists.
+    // Tracked as obligation T1. Since argument records it is a guard: `spill`
+    // leaves at most three source parameters anywhere.
     for f in &core.fns {
         if f.params.len() > MAX_PARAMS {
             return Err(CodegenError::Unsupported(
@@ -1710,15 +1893,6 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
             ));
         }
     }
-
-    // N7 part 1: monomorphize rows where a reference needs another convention,
-    // and eta-expand upcasts, so every phase below sees types that say the
-    // right convention. Pure Core-to-Core; nothing is emitted yet.
-    let specialized = specialize::run(core)?;
-    // Nested and literal patterns become the flat matches, `if`s and `let`s
-    // both emitters support (spec 2026-10-10-elya-native-pattern-compilation).
-    let specialized = patterns::run(&specialized);
-    let core = &specialized;
 
     // The closure tags continue the constructor numbering, so `first_tag` is the
     // number of REAL descriptor rows — computed the same way the descriptor table
@@ -1786,6 +1960,16 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let alloc = module.add_function("elya_alloc", alloc_ty, None); // ccc
     let str_lit_ty = ptrt.fn_type(&[i64t.into(), ptrt.into(), i64t.into()], false);
     let str_lit = module.add_function("elya_str_lit", str_lit_ty, None); // ccc
+    let str_concat_ty = ptrt.fn_type(&[i64t.into(), ptrt.into(), ptrt.into()], false);
+    let str_concat = module.add_function("elya_str_concat", str_concat_ty, None); // ccc
+    let str_eq_ty = i64t.fn_type(&[ptrt.into(), ptrt.into()], false);
+    let str_eq = module.add_function("elya_str_eq", str_eq_ty, None); // ccc
+    let int_to_string_ty = ptrt.fn_type(&[i64t.into(), i64t.into()], false);
+    let int_to_string = module.add_function("elya_int_to_string", int_to_string_ty, None); // ccc
+    let time_now_ms_ty = i64t.fn_type(&[], false);
+    let time_now_ms = module.add_function("elya_time_now_ms", time_now_ms_ty, None); // ccc
+    let time_sleep_ms_ty = ctx.void_type().fn_type(&[i64t.into()], false);
+    let time_sleep_ms = module.add_function("elya_time_sleep_ms", time_sleep_ms_ty, None); // ccc
     let println_ty = ctx.void_type().fn_type(&[ptrt.into()], false);
     let println = module.add_function("elya_println", println_ty, None); // ccc
     let fail_ty = ctx.void_type().fn_type(&[], false);
@@ -1834,6 +2018,11 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         lambda_regions: &lambda_regions,
         alloc,
         str_lit,
+        str_concat,
+        str_eq,
+        int_to_string,
+        time_now_ms,
+        time_sleep_ms,
         println,
         string_tag,
         fail,
@@ -2035,11 +2224,14 @@ mod tests {
     fn main_fn(body: CoreExpr) -> CoreModule {
         CoreModule {
             fns: vec![CoreFn {
+                row: elya::types::EffectRow::pure(),
                 name: "main".into(),
                 params: Rc::from([]),
                 body,
             }],
             types: Vec::new(),
+            generic_types: Vec::new(),
+            effect_params_used: Default::default(),
         }
     }
 
@@ -2128,6 +2320,7 @@ mod tests {
         // would silently uniquify the second symbol rather than complain.
         let mut m = main_fn(int_lit(1));
         m.fns.push(CoreFn {
+            row: elya::types::EffectRow::pure(),
             name: "main".into(),
             params: Rc::from([]),
             body: int_lit(2),
@@ -2206,22 +2399,17 @@ mod tests {
     #[test]
     fn rejects_eq_on_an_unrepresentable_operand_type() {
         // Eq/Ne are the only fully polymorphic operators in the subset: the
-        // checker is happy with `Str == Str` and there is no representation for
-        // it. Dispatched on the OPERAND type before the operands are lowered, so
-        // the message names the operator (§3.3) rather than the operand. Wrapped
-        // in an `if` because a Bool-bodied main is refused earlier, by
-        // `require_int`, with a different message.
-        let s = CoreExpr {
-            span: Span::EMPTY,
-            ty: Ty::Base(TyCon::Str),
-            kind: CoreKind::Lit(CoreLit::Str("a".into())),
-        };
-        let bad = CoreExpr {
-            span: Span::EMPTY,
-            ty: Ty::Base(TyCon::Bool),
-            kind: CoreKind::Prim(BinOp::Eq, vec![s.clone(), s].into()),
-        };
-        let err = emit_ir(&main_fn(if_expr(bad, int_lit(1), int_lit(0)))).unwrap_err();
+        // checker is happy with `T == T` for an ADT and there is no native
+        // equality for it. Dispatched on the OPERAND type before the operands
+        // are lowered, so the message names the operator (§3.3) rather than the
+        // operand. Wrapped in an `if` because a Bool-bodied main is refused
+        // earlier, by `require_int`, with a different message. (Until
+        // 2026-10-15 the operand here was a `String`; strings compare natively
+        // since, so an ADT keeps the allow-list guarded.)
+        let err = emit_ir(&core_of(
+            "type T { A, B }\npub fn main() -> Int { if A == B { 1 } else { 0 } }\n",
+        ))
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2298,7 +2486,10 @@ mod tests {
     /// `report_fatal_error` that kills the process with no source span. Refusing
     /// at five source parameters is what keeps that unreachable.
     #[test]
-    fn rejects_a_lambda_with_five_parameters() {
+    fn a_lambda_with_five_parameters_compiles() {
+        // Was `rejects_a_lambda_with_five_parameters`. Since argument records
+        // (2026-10-16) the last three travel in one record; expectation changed
+        // by that decision.
         let p = |n: &str| elya::core::CoreParam {
             name: n.to_string(),
             ty: Ty::Base(TyCon::Int),
@@ -2315,14 +2506,12 @@ mod tests {
                 Rc::new(int_lit(1)),
             ),
         };
-        let err = emit_ir(&main_fn(e)).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("lambda takes more than four parameters")
-            ),
-            "{err:?}"
-        );
+        let m = main_fn(CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Int),
+            kind: CoreKind::Let("f".into(), Rc::new(e), Rc::new(int_lit(1))),
+        });
+        emit_ir(&m).expect("a five-parameter lambda compiles");
     }
 
     #[test]
@@ -2394,52 +2583,40 @@ mod tests {
     // these violates the §3.4 fidelity rule. Silently mis-compiling would.
 
     #[test]
-    fn rejects_six_parameters_before_emission_begins() {
-        // §5.1. The most load-bearing refusal in the slice: past five
-        // parameters, a win64 guaranteed tail call hits `LLVM ERROR: Can't
-        // handle guaranteed tail call under win64 yet`, a `report_fatal_error`
-        // with no source span that kills the process outright. No `Result` can
-        // catch it, so the scan must complete before any emission starts.
-        let err = emit_ir(&core_of(
+    fn six_parameters_compile_and_no_kind_can_pass_its_cap() {
+        // §5.1. Was `rejects_six_parameters_before_emission_begins`: past five
+        // parameters a win64 guaranteed tail call is a `report_fatal_error`
+        // with no source span, so a whole-module scan refused the module before
+        // emission. Since argument records (2026-10-16) `spill` leaves at most
+        // `MAX_SOURCE_PARAMS` source parameters anywhere, and the scan stays
+        // as a guard; expectation changed by that decision. The invariant that
+        // makes the guard unreachable: the worst kind (an effectful lambda, or
+        // a clause: its closure or frame and its continuation) still fits.
+        emit_ir(&core_of(
             "fn six(a, b, c, d, e, f) { a + b + c + d + e + f }\n\
              pub fn main() { six(1, 2, 3, 4, 5, 6) }\n",
         ))
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("function takes more than five parameters")
-            ),
-            "{err:?}"
-        );
-        // Five is the boundary, and it is exercised, not only refused: the
-        // `five_params` corpus program compiles and runs in
-        // tests/native_codegen.rs.
+        .expect("six parameters compile");
         assert_eq!(MAX_PARAMS, 5);
+        const _: () = assert!(spill::MAX_SOURCE_PARAMS + 2 <= MAX_PARAMS);
     }
 
     #[test]
-    fn a_polymorphic_function_refuses_the_whole_module() {
-        // §5.2 / obligation T2. `repr_ty` refuses `Ty::Var(_)`, and `declare_all`
-        // runs it over every parameter and body type in the module — so `id`
-        // refuses this module even though `main` never calls it. That
-        // whole-module strictness is deliberate; the relaxation path (emit only
-        // what is reachable from `main`) is recorded as T2, not taken here.
-        let err = emit_ir(&core_of("fn id(x) { x }\npub fn main() { 1 }\n")).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("unrepresentable type")),
-            "{err:?}"
-        );
+    fn a_polymorphic_function_is_not_emitted_unless_instantiated() {
+        // §5.2 / obligation T2, revised by N7 part 2 (2026-10-15): this test
+        // used to assert that the unused generic `id` refused the whole module
+        // ("unrepresentable type"). Generic originals are no longer emitted --
+        // only their clones, one per instantiation -- so the module compiles,
+        // and the module compiles. The whole-module strictness stays for every
+        // NON-generic function (each is still emitted and checked).
+        emit_ir(&core_of("fn id(x) { x }\npub fn main() { 1 }\n"))
+            .expect("the generic original is dropped");
     }
 
     // ---- 5b-8 7b-3 refusals (D16, D17, and what Task 8 owns) ----------------
 
     const S_W: &str = "effect S { fn get() -> Int }\n\
                        fn w(b) { if b { get() } else { 2 } }\n";
-
-    fn refused(prog: &str) -> CodegenError {
-        emit_ir(&core_of(&format!("{S_W}{prog}"))).unwrap_err()
-    }
 
     // ---- 5b-8 Task 8 refusals (A2, and the clause arity cap) ---------------
 
@@ -2517,24 +2694,20 @@ mod tests {
     }
 
     #[test]
-    fn an_effect_operation_with_four_parameters_is_refused() {
-        // The clause takes the op's arguments, the continuation and the
-        // handler frame: 4 + 2 is past MAX_PARAMS, the measured win64 limit.
-        let err = emit_ir(&core_of(
+    fn an_effect_operation_with_four_parameters_compiles() {
+        // Was `an_effect_operation_with_four_parameters_is_refused`: the clause
+        // takes the op's arguments, the continuation and the handler frame, and
+        // 4 + 2 is past MAX_PARAMS. Since argument records (2026-10-16) the
+        // fourth argument travels in a record; expectation changed by that
+        // decision. The cap's refusal stays as a guard behind `spill`.
+        emit_ir(&core_of(
             "effect E { fn op(a: Int, b: Int, c: Int, d: Int) -> Int }\n\
              fn body() -> Int { op(1, 2, 3, 4) }\n\
              pub fn main() -> Int {\n\
              \x20 handle { body() } with { E.op(a, b, c, d) -> resume(a + d)  return(r) -> r }\n\
              }\n",
         ))
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("effect operation takes more than three parameters")
-            ),
-            "{err:?}"
-        );
+        .expect("a four-argument operation compiles");
     }
 
     #[test]
@@ -2602,51 +2775,41 @@ mod tests {
     }
 
     #[test]
-    fn an_effectful_lambda_compiles_and_four_parameters_are_refused_by_name() {
-        // 5b-9b (replaces `an_effectful_lambda_is_refused_by_name`, which pinned
-        // the refusal this slice lifts): the same program now compiles, and the
-        // one remaining refusal is the parameter cap -- the closure, the source
-        // parameters and the continuation must fit MAX_PARAMS.
+    fn an_effectful_lambda_compiles_with_four_parameters_too() {
+        // 5b-9b (replaces `an_effectful_lambda_is_refused_by_name`), and since
+        // argument records (2026-10-16) the four-parameter case compiles too:
+        // it was refused by name ("effectful lambda takes more than three
+        // parameters"); expectation changed by that decision.
         emit_ir(&core_of(&format!(
             "{S_W}pub fn main() -> Int {{\n\
              \x20 handle {{ let f = fn(x) {{ x + get() }}  f(1) }} with {{\n\
              \x20   S.get() -> resume(1)\n    return(r) -> r\n  }}\n}}\n"
         )))
         .expect("an effectful lambda compiles");
-        let err = refused(
-            "pub fn main() -> Int {\n\
-             \x20 handle { let f = fn(a, b, c, d) { a + b + c + d + get() }  f(1, 2, 3, 4) } with {\n\
-             \x20   S.get() -> resume(1)\n    return(r) -> r\n  }\n}\n",
-        );
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("effectful lambda takes more than three parameters")
-            ),
-            "{err:?}"
-        );
+        emit_ir(&core_of(&format!(
+            "{S_W}pub fn main() -> Int {{\n\
+             \x20 handle {{ let f = fn(a, b, c, d) {{ a + b + c + d + get() }}  f(1, 2, 3, 4) }} with {{\n\
+             \x20   S.get() -> resume(1)\n    return(r) -> r\n  }}\n}}\n"
+        )))
+        .expect("a four-parameter effectful lambda compiles");
     }
 
     #[test]
-    fn an_effectful_function_with_five_parameters_is_refused() {
-        // D14: the continuation is a sixth LLVM parameter, past MAX_PARAMS.
-        let err = refused(
-            "fn five(a, b, c, d, e) { a + b + c + d + e + get() }\n\
-             pub fn main() -> Int {\n\
-             \x20 handle { five(1, 2, 3, 4, 5) } with {\n\
-             \x20   S.get() -> resume(1)\n    return(r) -> r\n  }\n}\n",
-        );
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("effectful function takes more than four parameters")
-            ),
-            "{err:?}"
-        );
+    fn an_effectful_function_with_five_parameters_compiles() {
+        // Was `an_effectful_function_with_five_parameters_is_refused` (D14: the
+        // continuation is a sixth LLVM parameter). Since argument records
+        // (2026-10-16) it compiles; expectation changed by that decision.
+        emit_ir(&core_of(&format!(
+            "{S_W}fn five(a, b, c, d, e) {{ a + b + c + d + e + get() }}\n\
+             pub fn main() -> Int {{\n\
+             \x20 handle {{ five(1, 2, 3, 4, 5) }} with {{\n\
+             \x20   S.get() -> resume(1)\n    return(r) -> r\n  }}\n}}\n"
+        )))
+        .expect("a five-parameter effectful function compiles");
     }
 
     #[test]
-    fn a3_an_unconstrained_polymorphic_effect_meets_the_ty_var_refusal() {
+    fn a3_an_unconstrained_polymorphic_effect_is_not_emitted() {
         // A3 (spec §11), measured. A polymorphic effect has no refusal of its
         // own: when `reader` leaves the effect's parameter unconstrained, the
         // parameter survives into `reader`'s type as a `Ty::Var`, and that is
@@ -2668,29 +2831,23 @@ mod tests {
             "the unconstrained parameter should reach Core as a Ty::Var: {:?}",
             reader.body.ty
         );
-        let err = emit_ir(&core).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("unrepresentable type")),
-            "{err:?}"
-        );
+        // N7 part 2 (2026-10-15): `reader` is generic in its result, so it is
+        // emitted only as clones, and nothing instantiates it: the module
+        // compiles (this asserted the "unrepresentable type" refusal before).
+        // An instantiated row-only variable is refused by its own name -- see
+        // `mono::tests::a_row_only_type_variable_is_instantiated_from_the_reference`.
+        emit_ir(&core).expect("the uninstantiated generic `reader` is not emitted");
     }
 
     #[test]
-    fn rejects_a_computed_callee_specifically() {
-        // §5.3, witnessed by a program a user could actually write. The Pratt
-        // parser applies the postfix call loop to ANY atom and `(expr)` unwraps
-        // with no wrapper node, so this parses to `Call { callee: Lambda, .. }`
-        // and lowers to `App(Lambda, ..)` — it really does reach the back end.
-        //
-        // Order matters and is in our control: `build_elya_call` inspects the
-        // callee kind FIRST, so "computed callee" fires before the pre-existing
-        // `Lambda` arm of `lower_expr` is ever visited. If this test starts
-        // reporting `Unsupported("Lambda")`, that ordering has been inverted.
-        let err = emit_ir(&core_of("pub fn main() { (fn(x) { x + 1 })(3) }\n")).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("computed callee")),
-            "{err:?}"
-        );
+    fn a_computed_callee_compiles() {
+        // Was `rejects_a_computed_callee_specifically` (§5.3): `(fn(x) { x + 1
+        // })(3)` parses to `App(Lambda, ..)` and was refused by name. Since
+        // 2026-10-16 (`anf.rs`) a computed callee is let-bound first and called
+        // as a local closure; the emitters' "computed callee" refusal stays as
+        // the guard behind the pass. Expectation changed by that decision.
+        emit_ir(&core_of("pub fn main() { (fn(x) { x + 1 })(3) }\n"))
+            .expect("a named callee compiles");
     }
 
     #[test]
@@ -2723,45 +2880,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_function_name_in_value_position() {
-        // §5.4's companion. This IS legal Elya — typed_inference's surface4
-        // type-checks `let g = worker  g()` — so the program reaches the back
-        // end and gets its own message rather than the generic "unbound var",
-        // which would point a reader at name resolution instead of at this gap.
-        // N5 (closures) is what makes it representable.
-        //
-        // The `let` binding is lowered before its body, so this message fires
-        // first; the `f(1)` call never gets as far as `build_elya_call`.
-        let err = emit_ir(&core_of(
+    fn a_function_name_in_value_position_compiles() {
+        // Was `rejects_a_function_name_in_value_position` (§5.4's companion):
+        // `let f = add3` was refused by name. Since 2026-10-16 (`anf.rs`) a
+        // top-level function used as a value is wrapped in a closure with no
+        // captures; the emitters' "function used as a value" refusal stays as
+        // the guard behind the pass. Expectation changed by that decision.
+        emit_ir(&core_of(
             "fn add3(x) { x + 3 }\npub fn main() {\n  let f = add3\n  f(1)\n}\n",
         ))
-        .unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("function used as a value")),
-            "{err:?}"
-        );
+        .expect("a wrapped function value compiles");
     }
 
     #[test]
-    fn rejects_concat_by_name() {
-        // N6 §8.2. `repr_ty` no longer refuses `Str`, so `<>` now reaches the
-        // `Prim` arm, where its pointer operands would panic `.into_int_value()`
-        // without the by-name guard.
-        //
-        // The concatenation is BOUND in a `let` whose body is `1` on purpose. As
-        // `main`'s own body it would type `main` as `String` and `require_int`
-        // would refuse with "non-Int value" before the `Prim` arm was ever
-        // reached — the test would be pinning the return-type guard while
-        // claiming, by name, to pin the Concat guard. If this assertion ever
-        // reports "non-Int value", the test has stopped testing anything.
-        let err = emit_ir(&core_of(
+    fn concat_verifies() {
+        // Was `rejects_concat_by_name` (N6 §8.2) until native strings
+        // (2026-10-15): `<>` is a runtime call now, its operands pointers, so the
+        // `Prim` arm must not reach `.into_int_value()` for it. BOUND in a `let`
+        // whose body is `1`, so `require_int` cannot mask the arm.
+        emit_ir(&core_of(
             "pub fn main() {\n  let s = \"a\" <> \"b\"\n  1\n}\n",
         ))
-        .unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("Concat")),
-            "{err:?}"
-        );
+        .expect("`<>` verifies");
     }
 
     #[test]
@@ -2826,23 +2966,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_eq_on_strings_by_name() {
-        // `==` is polymorphic (src/types.rs:920-922 unifies the operands and pins
-        // neither), so the refusal is dispatched on the OPERAND type. This one
-        // already fires today; it is pinned here because the widening makes a
-        // `Str` operand representable, and the guard's allow-list — Int and Bool,
-        // named explicitly — is the only thing still keeping it out.
-        let err = emit_ir(&core_of(
+    fn eq_on_strings_verifies() {
+        // Was `rejects_eq_on_strings_by_name` until native strings (2026-10-15):
+        // the allow-list is Int, Bool and String now (byte equality, a runtime
+        // call); every other operand type is still refused by name
+        // (`rejects_eq_on_an_unrepresentable_operand_type`).
+        emit_ir(&core_of(
             "pub fn main() { if \"a\" == \"a\" { 1 } else { 0 } }",
         ))
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("Eq on an unrepresentable operand type")
-            ),
-            "{err:?}"
-        );
+        .expect("String `==` verifies");
     }
 
     #[test]

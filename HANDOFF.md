@@ -3,9 +3,10 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-10, auto-run)
+## State at handoff (updated 2026-10-16, a scheduled run on `auto/elya`)
 
-- `main` has everything through #21 (sub-effecting and checked annotations).
+- `main` has everything through #22 (the 2026-10-09/10 auto-runs: N7 part 1 through
+  exact replay).
 - Scheduled auto-runs work on branch `auto/elya` (one draft PR to `main`) and log in
   `AUTO_RUN_LOG.md`; the maintainer reviews on GitHub.
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
@@ -13,8 +14,12 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 886 passed, 85 suites. The runtime gained
-  `elya_cont_copy` (multi-shot); `gc_mark` is unchanged.
+- Linux gate at the tip of `auto/elya`: 1033 passed, 99 suites. Since `main`, the runtime
+  has gained `elya_cont_copy` (multi-shot), the string functions and the two time
+  functions; `gc_mark` is unchanged (637 bytes of source).
+- Interactive sessions may also work on `auto/elya`. They use the same
+  `AUTO_RUN_LOG.md` lock: an IN PROGRESS entry under 3 hours old makes a scheduled run
+  exit.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
   language decisions taken. The maintainer delegated all choices (rule 2).
@@ -186,65 +191,182 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   `record`, `replay` (stops by name on the first divergence, rejects leftovers) and a test
   double, as ordinary handlers over one program; the same bytes natively.
 
+- **N7 part 2: type variables and parametric ADTs natively** (2026-10-15, branch
+  `auto/elya`): spec `docs/superpowers/specs/2026-10-15-elya-n7b-type-monomorphization-design.md`.
+  Whole-program monomorphization (`crates/codegen/src/mono.rs`): generic functions and
+  generic `let` values are cloned per instantiation (originals not emitted), ambiguous
+  variables default to `Unit`, and parametric types become ground instances built
+  lazily (non-regular types work) AFTER part 1's rows. A variable only in a function's
+  own row is refused by name (defaulting it was measured unsound: a crash). The review
+  found closures inside parametric types miscompiled (row tails in instance keys) and a
+  phantom-effect-parameter regression; both fixed test-first.
+
+- **Recursion through a handle body** (2026-10-15, branch `auto/elya`, a prerequisite of
+  steps 1 and 2): spec `docs/superpowers/specs/2026-10-15-elya-handle-recursion-design.md`.
+  A recursive call directly in a handle body includes the member's row (labels, with
+  their arguments unified) instead of unifying with it, so the handled effect no longer
+  leaks into the function's type. Natively a chain of 1000 nested handlers runs. The
+  review found two soundness holes in the first version (effect arguments; an escaped
+  `resume`), fixed test-first; a function annotated with the formerly leaking effect is
+  now E0423 (the exact-row rule). Extended the same day to recursion through a LAMBDA
+  (a lambda including a member closes with the group): `spawn(fn() { fib(n - 1) })`
+  checks, and row_soundness's `go` under its handler is accepted (64).
+
+- **Async step 2, part 1: structured concurrency** (2026-10-15, branch `auto/elya`):
+  spec `docs/superpowers/specs/2026-10-15-elya-async-step2-structured-design.md`.
+  `examples/06_structured.elya`: `spawn`/`await`/`yld` and a `scope` that joins every
+  task started in it, as ordinary handlers over the generic `List`/`Pair`; a task that
+  spawns itself and a scope per call (`pfib`). The same bytes natively.
+
+- **A backtracking example, and multi-shot copies of deep handler chains** (2026-10-15,
+  branch `auto/elya`): spec `docs/superpowers/specs/2026-10-15-elya-search-and-deep-chains-design.md`.
+  `examples/07_search.elya`: N-queens over a `multi` `Choose`, three handlers (all
+  solutions, a count, the first), the same bytes natively. A multi-shot copy of a chain
+  of 100 000 handler frames runs natively in linear time.
+
+- **An N7 part 2 miscompile, found by a differential sweep** (2026-10-15, d07afea, an
+  interactive session).
+  - **Symptom:** an `IO` closure inside a parametric value given to a generic function
+    (`call(B(fn() { io.println("x")  42 }))`) stopped natively with "match failed".
+  - **Cause:** the instance key kept row labels, but `IO` is a label that doesn't change
+    the calling convention.
+  - **Fix:** an instance key renders a row as its convention alone.
+
+- **Native strings** (2026-10-15, cc044d4 and cf6b08b, an interactive session; old step
+  2). Spec `docs/superpowers/specs/2026-10-15-elya-native-strings-design.md`.
+  - **Natively:** `<>`, `==`/`!=` on strings, and string-literal patterns.
+  - **New builtin:** `int.to_string`, which is pure (decision D1).
+  - **Unlocked:** 17 programs that were refused before now compile and match the
+    evaluator.
+  - **The collector:** concatenation is an allocation site. The left operand is rooted
+    while the right one runs, and in a resumption function `root_live` keeps the
+    continuation alive (the resumed frame is dead).
+  - **E0208:** a builtin used as a value is now an error (D6). It used to pass `check`
+    and fail at run time.
+  - **Review:** no correctness bug. It showed that two of my controls were blind; both
+    are pinned by tests now.
+  - **Order:** this step was taken before the poll loop (now step 1) because that
+    example has to print times and task ids.
+
+- **Async step 2, part 2: waiting for time, and a poll loop** (2026-10-15/16, e84c105,
+  7c951d2, 1d9f565, 61a84f9; old step 1). Spec
+  `docs/superpowers/specs/2026-10-15-elya-async-step2-timers-design.md`.
+  - **Builtins:** `time.now_ms()` and `time.sleep_ms(ms)`, both `IO`, in both evaluator
+    paths and natively.
+  - **`examples/08_timers.elya`:** `sleep` parks a task on a timer list; every turn
+    wakes an expired timer; when every task is stuck the scheduler performs
+    `Clock.wait_until` on the earliest deadline, and with none left names a deadlock.
+    `virtual_clock` (exact, instant) and `real_clock` run the same scheduler.
+  - **Review:** no correctness bug; starvation of an expired timer, an early-returning
+    Windows `Sleep` and a timing-dependent value were fixed test-first.
+  - **Found:** an effectful function of five parameters is refused natively (new step 5).
+
+- **Operation-generic handlers, `with any`: a recorder for any effect** (2026-10-16,
+  fe8b10c..6798543; old step 1). Spec
+  `docs/superpowers/specs/2026-10-16-elya-any-handlers-design.md`, which includes a
+  survey: Koka, Effekt, Frank, Eff, Links and Unison name their effects, and OCaml 5's
+  generic `effc` is untyped.
+  - `handle e with any { op(o) -> ... }` handles everything `e` performs but `IO`.
+    `o : Op(t / H)` has a rigid answer type `t` per clause (E0435 when it escapes).
+  - Builtins `op.name/show/perform/encode/decode`; Elya literal syntax is the
+    encoding.
+  - E0434: the handled effects must be data. A forwarding handler's tail is checked
+    at run time (D5 revised, measured).
+  - `examples/09_record_any.elya`: one `record`/`replay` for a dice game and a shop.
+  - Evaluator only. Natively it is refused by name.
+  - Two reviews found 4 soundness holes and fixed them test-first. One of them (an
+    escaped resume dropping a clause's relayed row) was pre-existing for plain
+    handlers too.
+
+- **A function's own row in Core** (2026-10-16, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-16-elya-own-row-in-core-design.md`. The typed table
+  records each function's whole type at its declaration's span; `CoreFn::row` carries
+  it; N7 part 2 matches it at references, so a type variable generic only through a
+  function's own row (`fn dup() { put(get()) }` over `St(s)`) is instantiated natively
+  instead of refused. The node-count tripwire moved 5 -> 6 and the `typed_inference`
+  snapshots gained one line per declaration (decided, recorded).
+
+- **Failure as an effect, and scope cancellation** (2026-10-16, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-16-elya-failure-and-cancellation-design.md`. An empty
+  `match e { }` is exhaustive exactly on a type with no constructors, and has any type;
+  so `type Never { }`, `fail : String -> Never` and a library `raise`. A name declared
+  twice (function, type, constructor, effect) is now E0209. `examples/10_failure.elya`:
+  `catch`, and scopes that drop their queued tasks when one fails; the same bytes natively.
+
+- **Computed callees and functions as values, natively** (2026-10-16, branch
+  `auto/elya`): spec `docs/superpowers/specs/2026-10-16-elya-callees-and-function-values-design.md`.
+  A back-end pass (`anf.rs`) names computed callees (evaluated first, as in the
+  evaluator) and wraps top-level functions used as values in capture-free closures,
+  which N7 then specializes; the two most common native refusals of the 2026-10-15 sweep
+  are gone.
+
+- **Argument records past three parameters** (2026-10-16, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-16-elya-argument-records-design.md`. Every function,
+  lambda, type, call, operation and clause with more than three parameters keeps two
+  and passes the rest in one synthesized record (`spill.rs`), so no kind can exceed its
+  win64 tail-call cap; every arity refusal is gone. Needs the Windows gate.
+
+- **Record and replay from the command line** (2026-10-16, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-16-elya-cli-record-replay-design.md`. `elya run
+  --record T prog` writes the host's answers (`time.*`) as a text trace, also for a
+  failing run; `--replay T` reproduces the run from it, stopping by name at a divergence
+  or on unread entries. Evaluator only.
+
 ## The next five steps
 
-### 1. N7 part 2: type variables natively
+### 1. Deep non-tail recursion natively
 
-`twice(f, x)` with `x: 'a`, and every unannotated `wrap`/`compose` (now accepted by the
-front end), are "unrepresentable type" natively. Monomorphize type variables like rows
-(N7 part 1's `specialize.rs` already matches signatures against uses), with the code-size
-budget, or pass dictionaries -- decide in the spec. Parametric ADTs (`type Q(a)`) are the
-same question for constructors. Also: aliases of generic locals (`let mk2 = mk`) are
-refused by name.
+Measured 2026-10-16: `fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }` over
+200 000 elements runs in the evaluator (its continuation is on the heap) and dies
+natively with SIGSEGV (the machine stack; fine under `ulimit -s unlimited`). Decide in a
+spec: a large dedicated stack for `main` (mmap with a guard page) plus a NAMED
+"native stack overflow" diagnostic from the guard page, or deeper changes (CPS for deep
+recursion). Measure the current depth limit first, on Linux and Windows.
 
-### 2. Async step 2: structured concurrency and a poll loop
+### 2. Structural equality
 
-ROADMAP 1b/1c on top of `examples/04_async.elya`: a scope handler that joins its children
-(a `spawn` returning a handle, `await` as an effect), then real I/O readiness through a
-runtime poll loop the scheduler consults. Recursion through a handle body (PARKED) blocks
-the natural recursive `task`: measure whether it is the next front-end fix.
+`==` on an ADT value, a tuple or a list is refused natively ("Eq on an unrepresentable
+operand type") and decided by the evaluator's own rules. Measure what the evaluator does
+on ADTs and closures today, decide in a spec what `==` means (structural on data, an
+error on functions -- E04xx at check time rather than at run time), and compile it
+natively (a runtime walk guided by the descriptor table, or generated per-type
+equality functions after N7 part 2's instances).
 
-### 3. A backtracking example, and handler frames in deep chains
+### 3. A differential sweep, again
 
-Multi-shot runs natively now; show it: `examples/05_search.elya` (or the next free
-number), an N-queens or subset-sum search written as an ordinary function over a
-`multi` `Choose` effect, with handlers that collect all answers, the first answer, and a
-count -- one search, three meanings, the same bytes natively. Then measure the one shape
-the multi-shot review could not build: a captured chain holding MANY handler frames
-(blocked by PARKED's "recursion through a handle body"); if step 2's front-end fix lands
-first, add it to `MULTI_SHOT` and time the copy (it maps parents through a hash table, so
-it should stay linear).
+The 2026-10-15 sweep (about 700 programs: every corpus, example and probe through
+`elya run` and `elya build`) found the N7 instance-key miscompile and ranked the native
+refusals. Re-run it at the tip: list every program the evaluator runs and native refuses
+or gets wrong, rank the refusals by count, and turn the top one into the next step.
+Keep the sweep script under `scripts/` so the next run can repeat it.
 
-### 4. Native strings
+### 4. Unary minus and wrapping arithmetic natively
 
-`<>` is refused natively and there is no Int-to-String, so every native example prints a
-number. Add the builtin (`int.to_string`, Claude's call) to the front end and evaluator,
-then strings natively: concatenation in the runtime (GC-managed byte arrays), the builtin,
-and `io.println` of a computed string. Measure first which examples and corpora this
-unlocks (the CEK machine's output, the replay log of `examples/05_replay.elya`), and pin
-it with differential tests.
+Also-open items since 2026-10-10: Core refuses unary minus ("Unary"), so every native
+example writes `0 - 1`; and hashes and generators need explicit wrapping arithmetic
+(`int.wrapping_mul` and friends) now that `Int` is checked. Measure which corpus programs
+use `-x`, add the lowering, and decide the wrapping builtins' names in a spec.
 
-### 5. Effect-polymorphic handlers (a recorder for ANY effect)
+### 5. Record and replay natively
 
-Replay (done, `examples/05_replay.elya`) records one fixed effect: a handler covers
-exactly one effect, every operation of it, so a generic `record` would need a handler
-over "every operation of some effect `e`" -- the ROADMAP's next replay step before the CLI
-flags. Measure what the type system needs (an operation-generic clause? an effect-row
-variable a handler can be abstracted over?), survey Koka/Effekt/Frank, decide in a spec,
-and prototype in the evaluator first. Strings natively (step 4) are a prerequisite of a
-serialized log.
+`elya run --record/--replay` (Done) works in the evaluator only; a native binary asks
+the runtime's clock directly. Add the same trace to the runtime (an environment
+variable or flag read by the shim: `ELYA_RECORD=file` / `ELYA_REPLAY=file`), with the
+same format and the same named failures, and a differential test that a trace recorded
+by `elya run` replays natively and the reverse.
 
-Also open, unscheduled: explicit wrapping arithmetic (`int.wrapping_mul` and friends, for
-hashes and generators) and unary minus natively (Core refuses "Unary"); a two-parameter
-lambda passed to a higher-order function is "unrepresentable" natively (N7 part 2?); the
+Also open, unscheduled: `with any` natively (per-operation name and
+type tables in the runtime, `op.decode` at an effect's parameter once the instantiation
+is carried); row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
+per platform, deferred by the timers spec D1); explicit wrapping arithmetic (`int.wrapping_mul` and friends, for
+hashes and generators) and unary minus natively (Core refuses "Unary"); the
 one-shot trap's words differ (evaluator "continuation resumed more than once", native
 "a one-shot continuation was resumed twice"); the parser continues a call across a
 newline (`f()` then a line starting `(` is `f()(...)`) -- a layout rule is a language
 decision; the roadmap's
 other priorities (record/replay handlers, then capabilities once modules exist); the rest
-of the soundness sweep (resume's row lacks return-clause and re-entered-clause effects;
-recursion through a lambda the function handles around, PARKED); recursion through a
-handle body is rejected by inference (PARKED). A perform walks the handler chain, so a program whose handler stack really grows
+of the soundness sweep (recursion through a handle body and through a lambda: done
+2026-10-15). A perform walks the handler chain, so a program whose handler stack really grows
 (a resume inside a fresh handle every iteration) pays O(depth) per perform; the evaluator
 is no faster there. Also: the Elya CEK machine's next versions (a parser for its terms, a step
 counter as an Elya effect); PIC/PIE linking (needs a Windows run), and a named diagnosis for

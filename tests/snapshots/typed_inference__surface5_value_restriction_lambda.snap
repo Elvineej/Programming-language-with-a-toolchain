@@ -2,6 +2,7 @@
 source: tests/typed_inference.rs
 expression: "render(src, &t)"
 ---
+0..67 `fn demo() { let f = fn(x) { x }  let a = f(1)  let b = f(True)  0 }` : fn() -> Int
 20..31 `fn(x) { x }` : fn(a) -> a
 23..24 `x` : a
 28..29 `x` : a

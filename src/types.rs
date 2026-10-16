@@ -160,6 +160,9 @@ struct ResumeCx {
     ret_amb: RowVar,
     /// The handled effect, which the resumed handler handles again.
     handled: Option<String>,
+    /// A `with any` handle (2026-10-16): the resumed handler handles every
+    /// effect of the body but `IO`, its row's tail included.
+    handles_all: bool,
     /// The lambda depth at the clause: a resume at a greater depth is inside a
     /// lambda, which may run after the clause has returned (it ESCAPES).
     lambda_depth: usize,
@@ -168,6 +171,24 @@ struct ResumeCx {
     /// all clauses are typed (the resumed body may re-enter any clause).
     clauses_row: RowVar,
 }
+
+/// A row a `with any` handler handles, queued for E0434 (2026-10-16, D5).
+struct GenericSite {
+    /// The labels the handled body performs, as known at the handle (empty for
+    /// an instantiation): always checked.
+    labels: BTreeMap<String, EffectLabel>,
+    /// The handled row's tail (or an instantiated copy of a generalized one).
+    tail: EffectRow,
+    /// Whether the handler performs its operations again (`op.perform`): its
+    /// tail is then its function's own row, which a call unifies with the
+    /// caller's ambient, so labels arriving through it are not the body's and
+    /// are left to the run-time check.
+    forwarded: bool,
+    span: Span,
+}
+
+/// A declared type's parameter variables and each constructor's field types.
+type AdtFields = (Vec<u32>, Vec<Vec<Ty>>);
 
 pub struct Infer {
     subst: Vec<Option<Ty>>,
@@ -185,6 +206,27 @@ pub struct Infer {
     /// callee's row equal to the caller's), and flushed -- labels only -- before
     /// a lambda's ambient closes and when the group is done.
     pending_incl: Vec<(RowVar, RowVar, Span)>,
+    /// Recursion through a handle body (2026-10-15): `(member ambient, handle
+    /// body ambient)` -- a call of a function of the SCC group being inferred,
+    /// made directly in a handle's body, performs the member's row, so the body
+    /// must INCLUDE its labels; unifying the two rows (as a call otherwise
+    /// does) made the member's row EQUAL to the body's, which holds the handled
+    /// effect, and the handled effect leaked into the function's type.
+    /// Flushed with `pending_incl`, labels only.
+    pending_member_incl: Vec<(RowVar, RowVar, Span)>,
+    /// The ambients of the SCC group's members while the group is inferred.
+    group_ambs: Vec<RowVar>,
+    /// The parameter types of the group's members.
+    group_params: Vec<Ty>,
+    /// The regions being inferred, innermost last: a handle body or a lambda
+    /// body (`true`: a group member called directly in it is INCLUDED, not
+    /// unified), or a clause or return-clause body (`false`).
+    regions: Vec<(RowVar, bool)>,
+    /// Lambda ambients that include a group member's row (recursion through a
+    /// lambda, 2026-10-15): their labels are complete only when the group is,
+    /// so they are neither closed at the lambda's end nor generalized, and are
+    /// closed with the group.
+    deferred_rows: Vec<(RowVar, Vec<Ty>)>,
     /// The parameter types in scope (function, lambda and clause parameters):
     /// a callee tail shared with one is a RELAY and is unified, never treated
     /// as an upcast -- generalization needs the shared variable.
@@ -211,6 +253,9 @@ pub struct Infer {
     effect_multi: HashMap<String, bool>,
     /// Names of `linear`-declared types (Slice 4d-2) — their values are affine.
     linear_types: HashSet<String>,
+    /// Names of declared types with no constructors (2026-10-16): the only
+    /// scrutinee types an empty `match` may have.
+    empty_types: HashSet<String>,
     /// Spans of bindings whose inferred type is linear (affine binding sites),
     /// exposed to the `affine::check` pass. The one bounded reach for 4d-2.
     affine_sites: HashSet<Span>,
@@ -225,6 +270,22 @@ pub struct Infer {
     /// name in any annotation of one function (its signature, its `let`s and
     /// lambdas) is one shared unification variable.
     ann_vars: HashMap<String, Ty>,
+    /// The answer types of `with any` clauses (2026-10-16): rigid, one per
+    /// clause, as `Ty::Con` names that no declaration can spell. Each with its
+    /// clause's span, for E0435 when one escapes.
+    skolems: Vec<(String, Span)>,
+    /// E0434 (2026-10-16): row variables handled by a `with any` handler. A
+    /// scheme generalizing one queues every instantiation's copy for the data
+    /// check (which marks the copy's own tail in turn, if it is still open).
+    generic_rows: HashSet<RowVar>,
+    /// Rows a `with any` handler handles, with the span to blame: checked for
+    /// data (`check_generic_rows`) when their binding group is solved.
+    pending_generic: Vec<GenericSite>,
+    /// The span of the expression being inferred (an instantiation's site).
+    cur_span: Span,
+    /// Declared type -> its parameters' variables and each constructor's
+    /// field types, for the data check.
+    adt_fields: HashMap<String, AdtFields>,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -239,14 +300,25 @@ impl Infer {
             lambda_depth: 0,
             phantom: HashSet::new(),
             pending_incl: Vec::new(),
+            pending_member_incl: Vec::new(),
+            group_ambs: Vec::new(),
+            group_params: Vec::new(),
+            regions: Vec::new(),
+            deferred_rows: Vec::new(),
             param_tys: Vec::new(),
             ctor_arity: HashMap::new(),
             effect_multi: HashMap::new(),
             linear_types: HashSet::new(),
+            empty_types: HashSet::new(),
             affine_sites: HashSet::new(),
             node_types: HashMap::new(),
             known_types: HashMap::new(),
             ann_vars: HashMap::new(),
+            skolems: Vec::new(),
+            generic_rows: HashSet::new(),
+            pending_generic: Vec::new(),
+            cur_span: Span::EMPTY,
+            adt_fields: HashMap::new(),
             diags: Vec::new(),
         }
     }
@@ -707,6 +779,51 @@ impl Infer {
                     self.surface_conflict(r);
                 }
             }
+            let mut relayed = Vec::new();
+            for p in self.group_params.clone() {
+                free_row_vars(self, &p, &mut relayed);
+            }
+            for (src, dst, span) in self.pending_member_incl.clone() {
+                let have = self.resolve_row(&EffectRow::open(dst));
+                let want = self.resolve_row(&EffectRow::open(src));
+                // A member's tail that has since become a RELAY of a member's
+                // parameter is whatever the arguments perform: the including
+                // row must take it too, as a relay is taken anywhere (the
+                // lambda review's F1: a lambda closed pure while the member
+                // relayed `k`, and an escaped resume missed it, F1b).
+                if let RowTail::Open(w) = want.tail {
+                    if relayed.contains(&w) && have.tail != RowTail::Open(w) {
+                        let r = self.unify_row(&EffectRow::open(dst), &EffectRow::open(w), span);
+                        if r.is_ok() {
+                            changed = true;
+                        } else {
+                            self.pending_member_incl.retain(|p| *p != (src, dst, span));
+                        }
+                        self.surface_conflict(r);
+                    }
+                }
+                for (label, l) in want.labels.iter() {
+                    if let Some(h) = have.labels.get(label) {
+                        // The same effect on both sides: its type arguments
+                        // must agree (the review's F1 -- skipping this let a
+                        // member's `St(String)` hide under the handled
+                        // `St(Bool)`). A conflict is reported once.
+                        let before = self.diags.len();
+                        self.unify_effect_args(label, &h.args.clone(), &l.args.clone(), span);
+                        if self.diags.len() > before {
+                            self.pending_member_incl.retain(|p| *p != (src, dst, span));
+                        }
+                        continue;
+                    }
+                    let r = self.add_effect(dst, label, l.args.clone(), span);
+                    if r.is_ok() {
+                        changed = true;
+                    } else {
+                        self.pending_member_incl.retain(|p| *p != (src, dst, span));
+                    }
+                    self.surface_conflict(r);
+                }
+            }
             if !changed {
                 break;
             }
@@ -959,6 +1076,17 @@ fn write_ty(t: &Ty, names: &mut Names, out: &mut String) {
             }
             out.push(')');
         }
+        // An operation of a `with any` clause: `Op(t / {E})`, its answer type
+        // and the row performing it performs.
+        Ty::Con(n, args) if n == "$Op" && args.len() == 2 => {
+            out.push_str("Op(");
+            write_ty(&args[0], names, out);
+            if let Ty::Fn(_, row, _) = &args[1] {
+                out.push_str(" / ");
+                write_row(row, names, out);
+            }
+            out.push(')');
+        }
         Ty::Con(n, args) => {
             out.push_str(n);
             if !args.is_empty() {
@@ -1090,6 +1218,18 @@ impl Infer {
             } else {
                 self.fresh_row()
             };
+            // A handled tail that is also the function's own row (a forwarding
+            // handler) stands for the caller's ambient after the call: not
+            // checked statically (D5).
+            let latent = matches!(&s.ty, Ty::Fn(_, r, _) if r.tail == RowTail::Open(*v));
+            if self.generic_rows.contains(v) && !latent {
+                self.pending_generic.push(GenericSite {
+                    labels: BTreeMap::new(),
+                    tail: EffectRow::open(fresh),
+                    forwarded: false,
+                    span: self.cur_span,
+                });
+            }
             row_mapping.insert(*v, fresh);
         }
         subst_vars(&s.ty, &mapping, &row_mapping)
@@ -1163,6 +1303,7 @@ impl Infer {
     /// `infer_handle` — routes through here, so no node escapes recording. The
     /// final zonk pass runs once in `infer_all`, not at record-time.
     pub fn infer_expr(&mut self, e: &Spanned<Expr>, env: &mut TyEnv, amb: RowVar) -> Ty {
+        self.cur_span = e.span;
         let ty = self.infer_expr_inner(e, env, amb);
         self.node_types.insert(e.span, ty.clone());
         ty
@@ -1260,23 +1401,38 @@ impl Infer {
                             let all = EffectRow::open(cx.clauses_row);
                             let r = self.add_row(amb, &all, span);
                             self.surface_conflict(r);
+                            // ... and it re-runs the body's recursive calls,
+                            // whose member rows may still grow: include them
+                            // here too, so a later label reaches this lambda or
+                            // is reported against its closed row (the
+                            // handle-recursion review's F2).
+                            let body_tail = self.resolve_row(&EffectRow::open(cx.body_amb)).tail;
+                            for (m, dst, sp) in self.pending_member_incl.clone() {
+                                if self.resolve_row(&EffectRow::open(dst)).tail == body_tail {
+                                    self.pending_member_incl.push((m, amb, sp));
+                                }
+                            }
                         }
                         let mut in_params = Vec::new();
                         for p in self.param_tys.clone() {
                             free_row_vars(self, &p, &mut in_params);
                         }
-                        for (src, except) in [(cx.body_amb, cx.handled.clone()), (cx.ret_amb, None)]
-                        {
+                        for (src, except, all) in [
+                            (cx.body_amb, cx.handled.clone(), cx.handles_all),
+                            (cx.ret_amb, None, false),
+                        ] {
                             let now = self.resolve_row(&EffectRow::open(src));
                             for (label, l) in now.labels.iter() {
-                                if except.as_deref() == Some(label.as_str()) {
+                                if except.as_deref() == Some(label.as_str())
+                                    || (all && label != "IO")
+                                {
                                     continue;
                                 }
                                 let r = self.add_effect(amb, label, l.args.clone(), l.span);
                                 self.surface_conflict(r);
                             }
                             if let RowTail::Open(w) = now.tail {
-                                if in_params.contains(&w) {
+                                if in_params.contains(&w) && !all {
                                     let relay = EffectRow {
                                         labels: BTreeMap::new(),
                                         tail: RowTail::Open(w),
@@ -1295,6 +1451,26 @@ impl Infer {
             Expr::Match { scrutinee, arms } => {
                 let s = self.infer_expr(scrutinee, env, amb);
                 let result = self.fresh();
+                // An empty match is exhaustive exactly when the scrutinee's type
+                // has no constructors; its result then has any type (spec
+                // 2026-10-16). `exhaust.rs` is type-free and leaves it here.
+                if arms.is_empty() {
+                    let st = self.resolve(&s);
+                    let empty = matches!(&st, Ty::Con(n, _) if self.empty_types.contains(n));
+                    if !empty && st != Ty::Error {
+                        self.diags.push(
+                            Diagnostic::error(
+                                "E0430",
+                                format!(
+                                    "a match with no arms needs a scrutinee whose type has no constructors; this is `{}`",
+                                    display_ty(self, &st)
+                                ),
+                            )
+                            .with_label(scrutinee.span, "a value of this type may exist")
+                            .with_help("add arms, or match a value of an empty type such as `type Never { }`"),
+                        );
+                    }
+                }
                 for arm in arms.iter() {
                     let mut bindings = Vec::new();
                     self.check_pattern(&arm.node.pat, &s, env, &mut bindings);
@@ -1345,7 +1521,9 @@ impl Infer {
                 let mark = self.param_tys.len();
                 self.param_tys.extend(param_tys.iter().cloned());
                 self.lambda_depth += 1;
+                self.regions.push((lam_amb, true));
                 let body_ty = self.infer_block(&body.node, env, lam_amb);
+                self.regions.pop();
                 self.lambda_depth -= 1;
                 self.param_tys.truncate(mark);
                 env.pop();
@@ -1363,7 +1541,20 @@ impl Infer {
                 self.flush_inclusions();
                 let mut scope_params = self.param_tys.clone();
                 scope_params.extend(param_tys.iter().cloned());
-                self.close_unrelayed_residual(lam_amb, &scope_params);
+                // Recursion through a lambda (2026-10-15): a lambda that
+                // includes a group member's row cannot close yet -- the member
+                // may perform more later in its body. Closed with the group.
+                let lam_tail = self.resolve_row(&EffectRow::open(lam_amb)).tail;
+                let includes_member = self
+                    .pending_member_incl
+                    .clone()
+                    .into_iter()
+                    .any(|(_, dst, _)| self.resolve_row(&EffectRow::open(dst)).tail == lam_tail);
+                if includes_member && matches!(lam_tail, RowTail::Open(_)) {
+                    self.deferred_rows.push((lam_amb, scope_params));
+                } else {
+                    self.close_unrelayed_residual(lam_amb, &scope_params);
+                }
                 // Sub-effecting (the maintainer's decision, 2026-10-08): the
                 // VALUE's row is open even when the body's is closed -- a
                 // function that performs ε may stand where ε ∪ ρ is expected.
@@ -1482,6 +1673,94 @@ impl Infer {
                 );
                 return Ty::unit();
             }
+            // `time.now_ms : fn() -> Int` and `time.sleep_ms : fn(Int) -> Unit`,
+            // both performing `IO` (spec 2026-10-15-elya-async-step2-timers D3).
+            if module == "time" && (name == "now_ms" || name == "sleep_ms") {
+                let (params, ret) = if name == "now_ms" {
+                    (Vec::new(), Ty::int())
+                } else {
+                    (vec![Ty::int()], Ty::unit())
+                };
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+                let want = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(ret.clone()));
+                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
+                self.unify(&want, &got, span);
+                {
+                    let r = self.add_effect(amb, "IO", Vec::new(), span);
+                    self.surface_conflict(r);
+                }
+                let mut io_labels = BTreeMap::new();
+                io_labels.insert(
+                    "IO".to_string(),
+                    EffectLabel {
+                        args: Vec::new(),
+                        span: callee.span,
+                    },
+                );
+                self.node_types.insert(
+                    callee.span,
+                    Ty::Fn(
+                        params,
+                        EffectRow {
+                            labels: io_labels,
+                            tail: RowTail::Closed,
+                        },
+                        Box::new(ret.clone()),
+                    ),
+                );
+                return ret;
+            }
+            // The builtins on an operation of a `with any` clause (2026-10-16,
+            // D4). `o : Op(t, fn() / H -> t)`: `op.perform` performs `H`.
+            if module == "op"
+                && matches!(
+                    name.as_str(),
+                    "name" | "show" | "perform" | "encode" | "decode"
+                )
+            {
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+                let t = self.fresh();
+                let h = self.fresh_row();
+                let op_ty = Ty::Con(
+                    "$Op".to_string(),
+                    vec![
+                        t.clone(),
+                        Ty::Fn(Vec::new(), EffectRow::open(h), Box::new(t.clone())),
+                    ],
+                );
+                let (params, ret) = match name.as_str() {
+                    "name" | "show" => (vec![op_ty], Ty::str()),
+                    "perform" => (vec![op_ty], t.clone()),
+                    "encode" => (vec![op_ty, t.clone()], Ty::str()),
+                    _ => (vec![op_ty, Ty::str()], t.clone()),
+                };
+                let row = if name == "perform" {
+                    EffectRow::open(h)
+                } else {
+                    EffectRow::pure()
+                };
+                let want = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(ret.clone()));
+                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
+                self.unify(&want, &got, span);
+                if name == "perform" {
+                    let performed = self.resolve_row(&EffectRow::open(h));
+                    let r = self.add_row(amb, &performed, span);
+                    self.surface_conflict(r);
+                }
+                self.node_types
+                    .insert(callee.span, Ty::Fn(params, row, Box::new(ret.clone())));
+                return ret;
+            }
+            // `int.to_string : fn(Int) -> String`, pure (spec
+            // 2026-10-15-elya-native-strings D1).
+            if module == "int" && name == "to_string" {
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+                let want = Ty::Fn(vec![Ty::int()], EffectRow::pure(), Box::new(Ty::str()));
+                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::str()));
+                self.unify(&want, &got, span);
+                self.node_types.insert(callee.span, want);
+                return Ty::str();
+            }
             return Ty::Error; // unknown builtin is E0201 from resolution
         }
         // A constructor application: `Cons(h, t)`. Must be saturated (E0433).
@@ -1595,6 +1874,11 @@ impl Infer {
             if self.phantom.contains(&v) && !in_params.contains(&v) {
                 self.pending_incl.push((v, amb, span));
                 eff.tail = RowTail::Closed;
+            } else if !in_params.contains(&v) {
+                if let Some(m) = self.member_in_handle_body(v, amb) {
+                    self.pending_member_incl.push((m, amb, span));
+                    eff.tail = RowTail::Closed;
+                }
             }
         }
         {
@@ -1602,6 +1886,37 @@ impl Infer {
             self.surface_conflict(r);
         }
         result
+    }
+
+    /// Is a callee row ending in `v` a member of the group being inferred,
+    /// called directly in the body of a handle or a lambda (not in a clause,
+    /// nor in a region nested inside) whose ambient `amb` is not already that
+    /// member's row? Then the member to include (recursion through a handle
+    /// body or a lambda, 2026-10-15).
+    fn member_in_handle_body(&mut self, v: RowVar, amb: RowVar) -> Option<RowVar> {
+        let &(region, includes) = self.regions.last()?;
+        if !includes {
+            return None;
+        }
+        let amb_tail = self.resolve_row(&EffectRow::open(amb)).tail;
+        if amb_tail != self.resolve_row(&EffectRow::open(region)).tail
+            || amb_tail == RowTail::Open(v)
+        {
+            return None;
+        }
+        // A tail shared with a member's parameter is a RELAY (it becomes what
+        // the arguments perform): it must be unified, as any relay is.
+        let mut relayed = Vec::new();
+        for p in self.group_params.clone() {
+            free_row_vars(self, &p, &mut relayed);
+        }
+        if relayed.contains(&v) {
+            return None;
+        }
+        self.group_ambs
+            .clone()
+            .into_iter()
+            .find(|&m| self.resolve_row(&EffectRow::open(m)).tail == RowTail::Open(v))
     }
 
     /// Type `handle e with H`: infer `e` under a fresh inner ambient seeded with
@@ -1616,6 +1931,9 @@ impl Infer {
         env: &mut TyEnv,
         amb: RowVar,
     ) -> Ty {
+        if handler.any {
+            return self.infer_any_handle(body, handler, span, env, amb);
+        }
         let effect = self.handler_effect(handler);
         // Conformance (Slice 4d-1): `with multi` is legal only over a `multi`-
         // declared effect. Multi-resuming a one-shot effect is E0427. `is_multi`
@@ -1658,7 +1976,9 @@ impl Infer {
                 self.surface_conflict(r);
             }
         }
+        self.regions.push((amb_in, true));
         let body_ty = self.infer_expr(body, env, amb_in);
+        self.regions.pop();
 
         // R — the handle's result type, shared by every clause and `return`.
         let result = self.fresh();
@@ -1681,7 +2001,9 @@ impl Infer {
                         ty: body_ty.clone(),
                     },
                 );
+                self.regions.push((ret_amb, false));
                 let ret_ty = self.infer_expr(&ret.body, env, ret_amb);
+                self.regions.pop();
                 self.unify(&ret_ty, &result, ret.body.span);
                 env.pop();
             }
@@ -1752,12 +2074,15 @@ impl Infer {
                 body_amb: amb_in,
                 ret_amb,
                 handled: effect.clone(),
+                handles_all: false,
                 lambda_depth: self.lambda_depth,
                 clauses_row,
             });
             let mark = self.param_tys.len();
             self.param_tys.extend(params.iter().cloned());
+            self.regions.push((clause_amb, false));
             let clause_ty = self.infer_expr(&clause.body, env, clause_amb);
+            self.regions.pop();
             self.flush_inclusions();
             let scope_params = self.param_tys.clone();
             self.close_unrelayed_residual(clause_amb, &scope_params);
@@ -1785,6 +2110,17 @@ impl Infer {
                     continue;
                 }
                 let r = self.add_effect(clauses_row, label, l.args.clone(), l.span);
+                self.surface_conflict(r);
+            }
+            // A clause's open tail (a parameter's row it relays) is performed
+            // again by an escaped resume that re-enters the clause (found by
+            // the `with any` review, 2026-10-16: the lambda was typed pure).
+            if matches!(row.tail, RowTail::Open(_)) {
+                let tail = EffectRow {
+                    labels: BTreeMap::new(),
+                    tail: row.tail.clone(),
+                };
+                let r = self.add_row(clauses_row, &tail, span);
                 self.surface_conflict(r);
             }
         }
@@ -1832,6 +2168,342 @@ impl Infer {
             self.surface_conflict(r);
         }
         result
+    }
+
+    /// `handle e with any { op(o) -> c  return(x) -> r }` (2026-10-16, spec
+    /// `2026-10-16-elya-any-handlers-design.md`). Handles everything `e` performs
+    /// but `IO` (D2): the residual is `IO` alone, and the rest -- the body row's
+    /// labels and its tail -- is handled. `o : Op(t, fn() / H -> t)`, where `t` is
+    /// a rigid type of this clause (D3) and `H` the handled row: the function
+    /// type is how the row rides in the operation's type, so `op.perform(o)`
+    /// performs it wherever `o` goes (a function given `o` relays it).
+    fn infer_any_handle(
+        &mut self,
+        body: &Spanned<Expr>,
+        handler: &Handler,
+        span: Span,
+        env: &mut TyEnv,
+        amb: RowVar,
+    ) -> Ty {
+        let amb_in = self.fresh_row();
+        self.regions.push((amb_in, true));
+        let body_ty = self.infer_expr(body, env, amb_in);
+        self.regions.pop();
+
+        let result = self.fresh();
+        let ret_amb = self.fresh_row();
+        match &handler.ret {
+            Some(ret) => {
+                env.push();
+                env.insert(
+                    &ret.binder,
+                    Scheme {
+                        vars: Vec::new(),
+                        row_vars: Vec::new(),
+                        ty: body_ty.clone(),
+                    },
+                );
+                self.regions.push((ret_amb, false));
+                let ret_ty = self.infer_expr(&ret.body, env, ret_amb);
+                self.regions.pop();
+                self.unify(&ret_ty, &result, ret.body.span);
+                env.pop();
+            }
+            None => self.unify(&result, &body_ty, span),
+        }
+        self.flush_inclusions();
+        let scope_params = self.param_tys.clone();
+        self.close_unrelayed_residual(ret_amb, &scope_params);
+        {
+            let ret_row = self.resolve_row(&EffectRow::open(ret_amb));
+            let r = self.add_row(amb, &ret_row, span);
+            self.surface_conflict(r);
+        }
+        // The handled row: the body's, but `IO`. Its labels and tail must be
+        // data (E0434), checked when the group is solved.
+        let mut handled = self.resolve_row(&EffectRow::open(amb_in));
+        handled.labels.remove("IO");
+        let snapshot = handled.labels.clone();
+
+        let mut clause_ambs: Vec<RowVar> = Vec::new();
+        let clauses_row = self.fresh_row();
+        self.pending_clause_rows.push(clauses_row);
+        let mut new_skolems: Vec<(String, Span)> = Vec::new();
+        for c in &handler.clauses {
+            let clause = &c.node;
+            let sk_name = format!("'t{}", self.skolems.len() + 1);
+            self.skolems.push((sk_name.clone(), c.span));
+            new_skolems.push((sk_name.clone(), c.span));
+            let t = Ty::Con(sk_name, Vec::new());
+            let op_ty = Ty::Con(
+                "$Op".to_string(),
+                vec![
+                    t.clone(),
+                    Ty::Fn(Vec::new(), handled.clone(), Box::new(t.clone())),
+                ],
+            );
+            env.push();
+            for p in clause.params.iter() {
+                self.node_types.insert(p.span, op_ty.clone());
+                env.insert(
+                    &p.node.name,
+                    Scheme {
+                        vars: Vec::new(),
+                        row_vars: Vec::new(),
+                        ty: op_ty.clone(),
+                    },
+                );
+            }
+            let clause_amb = self.fresh_row();
+            clause_ambs.push(clause_amb);
+            self.resume_stack.push(ResumeCx {
+                arg: t,
+                result: result.clone(),
+                body_amb: amb_in,
+                ret_amb,
+                handled: None,
+                handles_all: true,
+                lambda_depth: self.lambda_depth,
+                clauses_row,
+            });
+            let mark = self.param_tys.len();
+            self.param_tys.push(op_ty.clone());
+            self.regions.push((clause_amb, false));
+            let clause_ty = self.infer_expr(&clause.body, env, clause_amb);
+            self.regions.pop();
+            self.flush_inclusions();
+            let scope_params = self.param_tys.clone();
+            self.close_unrelayed_residual(clause_amb, &scope_params);
+            self.param_tys.truncate(mark);
+            {
+                let row = self.resolve_row(&EffectRow::open(clause_amb));
+                let r = self.add_row(amb, &row, clause.body.span);
+                self.surface_conflict(r);
+            }
+            self.unify(&clause_ty, &result, clause.body.span);
+            self.resume_stack.pop();
+            env.pop();
+        }
+        // Escaped resumes may re-enter the clause, whose effects -- the
+        // operations it performs again included -- happen outside the handler.
+        self.pending_clause_rows.pop();
+        for &ca in &clause_ambs {
+            let row = self.resolve_row(&EffectRow::open(ca));
+            for (label, l) in row.labels.iter() {
+                let r = self.add_effect(clauses_row, label, l.args.clone(), l.span);
+                self.surface_conflict(r);
+            }
+            // A clause's open tail -- the handled one when it forwards, or a
+            // parameter's it relays -- is performed again by an escaped resume
+            // that re-enters it (the review's S1 and F1: such a lambda was
+            // typed pure, and its performs reached no handler).
+            if matches!(row.tail, RowTail::Open(_)) {
+                let tail = EffectRow {
+                    labels: BTreeMap::new(),
+                    tail: row.tail.clone(),
+                };
+                let r = self.add_row(clauses_row, &tail, span);
+                self.surface_conflict(r);
+            }
+        }
+        self.flush_inclusions();
+        let own_tail = self.resolve_row(&EffectRow::open(amb)).tail;
+        if self.resolve_row(&EffectRow::open(clauses_row)).tail != own_tail {
+            let scope_params = self.param_tys.clone();
+            self.close_unrelayed_residual(clauses_row, &scope_params);
+        }
+        // The residual: `IO`, never dispatched to a handler, if the body has it.
+        let body_row = self.resolve_row(&EffectRow::open(amb_in));
+        if let Some(io) = body_row.labels.get("IO") {
+            let r = self.add_effect(amb, "IO", io.args.clone(), io.span);
+            self.surface_conflict(r);
+        }
+        // Forwarding: a clause that performs its operation again poured the
+        // handled tail into its ambient (`add_row` unifies tails).
+        let handled_tail = self.resolve_row(&handled).tail;
+        let forwarded = matches!(handled_tail, RowTail::Open(_))
+            && clause_ambs
+                .iter()
+                .any(|&ca| self.resolve_row(&EffectRow::open(ca)).tail == handled_tail);
+        self.pending_generic.push(GenericSite {
+            labels: snapshot,
+            tail: EffectRow {
+                labels: BTreeMap::new(),
+                tail: handled.tail.clone(),
+            },
+            forwarded,
+            span,
+        });
+        // E0435: an answer type stays in its clause.
+        for (sk, sp) in new_skolems {
+            self.check_skolem_escape(&sk, sp, &result, env, amb);
+        }
+        result
+    }
+
+    /// E0435 (2026-10-16): the rigid answer type `sk` of a `with any` clause in
+    /// the handle's result, in a binding outside the clause, or in the ambient
+    /// row's effect arguments. One run of the clause would meet another's.
+    fn check_skolem_escape(&mut self, sk: &str, span: Span, result: &Ty, env: &TyEnv, amb: RowVar) {
+        let mut where_: Option<String> = None;
+        if self.mentions_con(result, sk) {
+            where_ = Some("the handle's result type".to_string());
+        }
+        if where_.is_none() {
+            'outer: for scope in &env.scopes {
+                for (name, scheme) in scope {
+                    if self.mentions_con(&scheme.ty, sk) {
+                        where_ = Some(format!("`{name}`, bound outside the clause"));
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if where_.is_none() {
+            let row = self.resolve_row(&EffectRow::open(amb));
+            if row
+                .labels
+                .values()
+                .any(|l| l.args.iter().any(|a| self.mentions_con(a, sk)))
+            {
+                where_ = Some("an effect's type argument".to_string());
+            }
+        }
+        if let Some(w) = where_ {
+            self.diags.push(
+                Diagnostic::error("E0435", "an operation's answer type escapes its clause")
+                    .with_label(span, format!("the answer type of this clause reaches {w}"))
+                    .with_help(
+                        "a `with any` clause runs once per operation, at a different answer type each time; give an answer back with `resume`, or turn it into data with `op.encode`",
+                    ),
+            );
+        }
+    }
+
+    /// Whether the resolved `t` mentions the nominal type `name`, rows included.
+    fn mentions_con(&self, t: &Ty, name: &str) -> bool {
+        match self.resolve(t) {
+            Ty::Con(n, args) => n == name || args.iter().any(|a| self.mentions_con(a, name)),
+            Ty::Fn(ps, row, r) => {
+                ps.iter().any(|p| self.mentions_con(p, name))
+                    || self.mentions_con(&r, name)
+                    || row
+                        .labels
+                        .values()
+                        .any(|l| l.args.iter().any(|a| self.mentions_con(a, name)))
+            }
+            Ty::Tuple(xs) => xs.iter().any(|x| self.mentions_con(x, name)),
+            Ty::Var(_) | Ty::Base(_) | Ty::Error => false,
+        }
+    }
+
+    /// E0434 (2026-10-16, D5): every row a `with any` handler handles, queued
+    /// at the handle and at each instantiation of a scheme generalizing one, is
+    /// data: each label a user effect (never `IO`) whose operations take and
+    /// answer data at the label's arguments. A tail still open becomes a
+    /// generically handled variable, checked again wherever it is instantiated.
+    fn check_generic_rows(&mut self) {
+        for site in std::mem::take(&mut self.pending_generic) {
+            let mut labels = site.labels.clone();
+            let row = self.resolve_row(&site.tail);
+            if !site.forwarded {
+                for (k, l) in &row.labels {
+                    labels.entry(k.clone()).or_insert_with(|| l.clone());
+                }
+            }
+            for (label, l) in &labels {
+                if label == "IO" {
+                    self.diags.push(
+                        Diagnostic::error("E0434", "`IO` cannot be handled by `with any`")
+                            .with_label(site.span, "the computation given to a `with any` handler performs `IO`")
+                            .with_help("`IO` is never dispatched to a handler, so a generic handler that does not perform its operations again would hide it; handle a user effect instead"),
+                    );
+                    continue;
+                }
+                let mut ops: Vec<(String, OpInfo)> = self
+                    .ops
+                    .iter()
+                    .filter(|(_, o)| &o.effect == label)
+                    .map(|(n, o)| (n.clone(), o.clone()))
+                    .collect();
+                ops.sort_by(|a, b| a.0.cmp(&b.0));
+                for (name, op) in ops {
+                    let m: HashMap<u32, Ty> = op
+                        .effect_params
+                        .iter()
+                        .cloned()
+                        .zip(l.args.iter().cloned())
+                        .collect();
+                    let rm = HashMap::new();
+                    let tys: Vec<Ty> = op
+                        .params
+                        .iter()
+                        .chain(std::iter::once(&op.ret))
+                        .map(|t| subst_vars(t, &m, &rm))
+                        .collect();
+                    if let Some(why) = tys.iter().find_map(|t| self.not_data(t, &mut Vec::new())) {
+                        self.diags.push(
+                            Diagnostic::error("E0434", "an effect handled by `with any` must be data")
+                                .with_label(site.span, format!("`{label}.{name}` is handled here generically"))
+                                .with_help(format!(
+                                    "a `with any` handler shows, encodes and decodes every operation it handles, so their argument and answer types must be data (no functions); `{label}.{name}` has {why}"
+                                )),
+                        );
+                    }
+                }
+            }
+            if let RowTail::Open(v) = row.tail {
+                self.generic_rows.insert(v);
+            }
+        }
+    }
+
+    /// Why `t` (resolved) is not data, or `None` if it is: a declared type is
+    /// data when its arguments are and its declaration is (`decl_not_data`).
+    /// Checking the two apart terminates on non-regular types, whose arguments
+    /// grow under recursion (`Nest(a) { S(Nest(Opt(a))) }`; the review's B1).
+    fn not_data(&self, t: &Ty, seen: &mut Vec<String>) -> Option<String> {
+        match self.resolve(t) {
+            Ty::Base(_) | Ty::Error => None,
+            Ty::Fn(..) => Some("a function type".to_string()),
+            Ty::Var(_) => Some("a type not known to be data".to_string()),
+            Ty::Tuple(xs) => xs.iter().find_map(|x| self.not_data(x, seen)),
+            Ty::Con(n, args) => args
+                .iter()
+                .find_map(|a| self.not_data(a, seen))
+                .or_else(|| self.decl_not_data(&n, seen)),
+        }
+    }
+
+    /// Whether a declared type's fields are data, its parameters taken as data
+    /// (its arguments are checked where it is used).
+    fn decl_not_data(&self, name: &str, seen: &mut Vec<String>) -> Option<String> {
+        if seen.iter().any(|n| n == name) {
+            return None;
+        }
+        seen.push(name.to_string());
+        let Some((params, ctors)) = self.adt_fields.get(name).cloned() else {
+            return Some(format!("the type `{name}`"));
+        };
+        ctors
+            .iter()
+            .flatten()
+            .find_map(|f| self.shape_not_data(f, &params, seen))
+    }
+
+    /// `not_data` over a declaration's field type, where its parameters are data.
+    fn shape_not_data(&self, t: &Ty, params: &[u32], seen: &mut Vec<String>) -> Option<String> {
+        match t {
+            Ty::Base(_) | Ty::Error => None,
+            Ty::Fn(..) => Some("a function type".to_string()),
+            Ty::Var(v) if params.contains(v) => None,
+            Ty::Var(_) => Some("a type not known to be data".to_string()),
+            Ty::Tuple(xs) => xs.iter().find_map(|x| self.shape_not_data(x, params, seen)),
+            Ty::Con(n, args) => args
+                .iter()
+                .find_map(|a| self.shape_not_data(a, params, seen))
+                .or_else(|| self.decl_not_data(n, seen)),
+        }
     }
 
     /// The single effect a handler covers — all clauses must agree. Clauses that
@@ -1888,8 +2560,22 @@ impl Infer {
         env_free_row_vars(self, env, &mut row_in_env);
         // A handle's clauses row still being filled is not quantified: its
         // labels arrive when the handle is done (the resume-row review's F1).
-        for c in self.pending_clause_rows.clone() {
+        for c in self.pending_clause_rows.clone().into_iter().chain(
+            self.deferred_rows
+                .iter()
+                .map(|(r, _)| *r)
+                .collect::<Vec<_>>(),
+        ) {
             if let RowTail::Open(v) = self.resolve_row(&EffectRow::open(c)).tail {
+                row_in_env.push(v);
+            }
+        }
+        // A row a `with any` handler handles, not yet checked for data (E0434
+        // runs when the top-level group is solved), stays monomorphic in a
+        // local `let`: generalized, its later instantiations were never
+        // checked (the review's S3: `IO` hidden from a pure function).
+        for site in self.pending_generic.iter().filter(|s| !s.forwarded) {
+            if let RowTail::Open(v) = self.resolve_row(&site.tail).tail {
                 row_in_env.push(v);
             }
         }
@@ -2336,6 +3022,9 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             if t.is_linear {
                 inf.linear_types.insert(t.name.clone());
             }
+            if t.variants.is_empty() {
+                inf.empty_types.insert(t.name.clone());
+            }
         }
     }
     let mut env = TyEnv::new();
@@ -2375,6 +3064,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                 .zip(param_vars.iter().cloned())
                 .collect();
             let result = Ty::Con(t.name.clone(), param_vars.clone());
+            let mut ctors: Vec<Vec<Ty>> = Vec::new();
             for v in &t.variants {
                 let vd = &v.node;
                 inf.ctor_arity.insert(vd.name.clone(), vd.fields.len());
@@ -2388,6 +3078,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                         &effect_arity,
                     ));
                 }
+                ctors.push(field_tys.clone());
                 let ty = if field_tys.is_empty() {
                     result.clone()
                 } else {
@@ -2402,6 +3093,8 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                     },
                 );
             }
+            inf.adt_fields
+                .insert(t.name.clone(), (var_ids.clone(), ctors));
         }
     }
 
@@ -2461,6 +3154,14 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             Decl::Type(_) => None,
         })
         .collect();
+    // Each function's declaration span, in `fns` order: its whole type (its own
+    // row included) is recorded there for Core (spec 2026-10-16).
+    let decl_spans: Vec<Span> = module
+        .decls
+        .iter()
+        .filter(|d| matches!(d.node, Decl::Fn(_)))
+        .map(|d| d.span)
+        .collect();
     let name_idx: HashMap<&str, usize> = fns
         .iter()
         .enumerate()
@@ -2514,8 +3215,24 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             }
             inf.check_ann(&f.ret_ann, &result, true);
             ann_vars_of.insert(i, std::mem::take(&mut inf.ann_vars));
+            // A function's own row is in no expression's type: recorded at its
+            // declaration's span, pre-zonk like every entry (the single zonk at
+            // the end resolves it), for `CoreFn::row` (spec 2026-10-16).
+            inf.node_types.insert(
+                decl_spans[i],
+                Ty::Fn(
+                    params.clone(),
+                    EffectRow::open(amb_f),
+                    Box::new(result.clone()),
+                ),
+            );
             member_ty.insert(i, (params, amb_f, result));
         }
+        inf.group_ambs = group.iter().map(|i| member_ty[i].1).collect();
+        inf.group_params = group
+            .iter()
+            .flat_map(|i| member_ty[i].0.iter().cloned())
+            .collect();
         // 2. infer each body under its params + ambient (monomorphic in-group).
         for &i in group {
             let f = fns[i];
@@ -2566,6 +3283,14 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             }
         }
         inf.flush_inclusions();
+        // 2.45. Deferred lambda rows (recursion through a lambda): the group's
+        //       labels are all in, so they close now, unless relayed through
+        //       a parameter in the lambda's scope or a member's.
+        let group_params = inf.group_params.clone();
+        for (l, mut params) in std::mem::take(&mut inf.deferred_rows) {
+            params.extend(group_params.iter().cloned());
+            inf.close_unrelayed_residual(l, &params);
+        }
         // 2.5. close each member's residual ambient (once all in-group effects
         //      are accumulated), unless it is relayed through a parameter.
         for &i in group {
@@ -2587,6 +3312,9 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
         //      is closed (Koka's close-at-generalization; value uses re-open).
         inf.flush_inclusions();
         inf.pending_incl.clear();
+        inf.pending_member_incl.clear();
+        inf.group_ambs.clear();
+        inf.group_params.clear();
         let pending: Vec<RowVar> = inf.phantom.iter().copied().collect();
         for v in pending {
             if inf.row_subst[v as usize].is_none() {
@@ -2594,6 +3322,9 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             }
         }
         inf.phantom.clear();
+        // 2.8. E0434: what `with any` handlers handle is data. A tail still
+        //      open here is generalized: its instantiations are checked.
+        inf.check_generic_rows();
         // 3. generalize each member and re-insert its polytype for later groups.
         for &i in group {
             let f = fns[i];
@@ -2870,18 +3601,26 @@ mod tests {
         // PARAMETER span `x` at 7..8 that the SCC loop records (Slice 5b-3
         // §3.2) — each once. The count is the tripwire: it moved 4 → 5 exactly
         // when parameters started being recorded, and it would move again if a
-        // second recording path appeared.
+        // second recording path appeared. It moved 5 -> 6 on 2026-10-16 (spec
+        // `2026-10-16-elya-own-row-in-core-design.md`): the declaration's span
+        // now records the function's whole type, its own row included.
         assert_eq!(
             table.len(),
-            5,
+            6,
             "wrapper must record every node once: {table:?}"
         );
-        // Ordering: all five zonked to Int (a record-time table would show vars).
+        // Ordering: all five node entries zonked to Int (a record-time table
+        // would show vars), and the declaration's entry to `fn(Int) -> Int`.
         // The parameter entry is included, which is the whole reason §3.2 could
         // record it pre-zonk: the single zonk pass maps over the WHOLE table.
-        assert!(
-            table.values().all(|v| v == "Int"),
+        assert_eq!(
+            table.values().filter(|v| *v == "Int").count(),
+            5,
             "record-then-zonk violated — a node kept its pre-zonk var: {table:?}"
+        );
+        assert!(
+            table.values().any(|v| v == "fn(Int) -> Int"),
+            "the declaration's entry: {table:?}"
         );
     }
 

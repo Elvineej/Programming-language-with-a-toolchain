@@ -8,7 +8,18 @@ use crate::Session;
 use std::collections::{HashMap, HashSet};
 
 pub fn builtins() -> &'static [&'static str] {
-    &["io.println"]
+    &[
+        "io.println",
+        "int.to_string",
+        "time.now_ms",
+        "time.sleep_ms",
+        // On an operation `o` of a `with any` clause (2026-10-16).
+        "op.name",
+        "op.show",
+        "op.perform",
+        "op.encode",
+        "op.decode",
+    ]
 }
 
 pub fn check(_session: &Session, module: &Module) -> Vec<Diagnostic> {
@@ -41,12 +52,35 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
     let mut dup_ops: HashSet<String> = HashSet::new();
     let mut effect_names: HashSet<String> = HashSet::new();
     let mut dup_diags: Vec<Diagnostic> = Vec::new();
+    // E0209 (2026-10-16): a function, type, constructor or effect name declared
+    // twice was a silent overwrite -- whichever declaration a pass consulted
+    // won -- and an empty match on a name declared once empty and once not
+    // accepted a real value (the failure slice's review). Each kind is its own
+    // namespace.
+    let mut seen: HashSet<(&str, String)> = HashSet::new();
+    let mut dup =
+        |kind: &'static str, name: &str, span: crate::span::Span, out: &mut Vec<Diagnostic>| {
+            if !seen.insert((kind, name.to_string())) {
+                out.push(
+                    Diagnostic::error(
+                        "E0209",
+                        format!("{kind} `{name}` is declared more than once"),
+                    )
+                    .with_label(span, "a second declaration of this name")
+                    .with_help(format!(
+                        "rename one of them: a {kind} name is unique across a module"
+                    )),
+                );
+            }
+        };
     for d in &module.decls {
         match &d.node {
             Decl::Fn(f) => {
+                dup("function", &f.name, d.span, &mut dup_diags);
                 fn_names.insert(f.name.clone());
             }
             Decl::Effect(e) => {
+                dup("effect", &e.name, d.span, &mut dup_diags);
                 effect_names.insert(e.name.clone());
                 for op in &e.ops {
                     let name = &op.node.name;
@@ -77,7 +111,9 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
                 }
             }
             Decl::Type(t) => {
+                dup("type", &t.name, d.span, &mut dup_diags);
                 for v in &t.variants {
+                    dup("constructor", &v.node.name, v.span, &mut dup_diags);
                     ctor_names.insert(v.node.name.clone());
                 }
             }
@@ -349,11 +385,23 @@ impl Cx<'_> {
                 }
             }
             Expr::Qualified { module, name } => {
+                // Not in call position (a callee is checked in the `Call` arm):
+                // a builtin can only be called, like an operation (E0206). The
+                // native-strings review (2026-10-15): `let f = int.to_string`
+                // passed `check`, then failed at run time.
                 let full = format!("{module}.{name}");
                 if !builtins().contains(&full.as_str()) {
                     self.diags.push(
                         Diagnostic::error("E0201", format!("unknown builtin `{full}`"))
                             .with_label(span, "no such function"),
+                    );
+                } else {
+                    self.diags.push(
+                        Diagnostic::error("E0208", format!("builtin `{full}` used as a value"))
+                            .with_label(span, "a builtin can only be called")
+                            .with_help(format!(
+                                "to pass it on, wrap it in a function: `fn(x) {{ {full}(x) }}`"
+                            )),
                     );
                 }
             }
@@ -369,6 +417,16 @@ impl Cx<'_> {
                 // place an operation name may appear (E0206 is for the others).
                 match &callee.node {
                     Expr::Var(name) => self.check_name(name, callee.span, scope),
+                    // A called builtin only has to exist.
+                    Expr::Qualified { module, name } => {
+                        let full = format!("{module}.{name}");
+                        if !builtins().contains(&full.as_str()) {
+                            self.diags.push(
+                                Diagnostic::error("E0201", format!("unknown builtin `{full}`"))
+                                    .with_label(callee.span, "no such function"),
+                            );
+                        }
+                    }
                     other => self.check_expr(other, callee.span, scope),
                 }
                 for a in args.iter() {
@@ -398,6 +456,17 @@ impl Cx<'_> {
                 let mut handled: HashSet<&str> = HashSet::new();
                 for c in &handler.clauses {
                     let clause = &c.node;
+                    if handler.any {
+                        // `op(o)` names no operation: it is every one (the parser
+                        // admits nothing else in a `with any` handler).
+                        scope.push(HashSet::new());
+                        for p in &clause.params {
+                            scope.last_mut().unwrap().insert(p.node.name.clone());
+                        }
+                        self.check_expr(&clause.body.node, clause.body.span, scope);
+                        scope.pop();
+                        continue;
+                    }
                     let malformed = self.check_clause_names_an_op(clause, c.span);
                     // E0204 (5c-2): one clause per op. Op names are unique, so the
                     // op name decides whatever the spelling. A clause already
@@ -429,7 +498,9 @@ impl Cx<'_> {
                     scope.pop();
                 }
                 self.in_handler -= 1;
-                self.check_handler_covers_its_effect(handler, span);
+                if !handler.any {
+                    self.check_handler_covers_its_effect(handler, span);
+                }
                 if let Some(ret) = &handler.ret {
                     // The return clause runs after the computation completes;
                     // `resume` is not in scope there.

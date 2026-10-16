@@ -1,0 +1,14 @@
+---
+source: tests/examples.rs
+expression: "run_example(\"06_structured.elya\")"
+---
+scope: start
+  ping
+  body: done, the children run on
+    pong
+  ping
+    pong
+  ping
+scope: joined
+fib(10) by spawned tasks
+pfib(10) by nested scopes

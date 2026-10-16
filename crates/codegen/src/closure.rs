@@ -403,7 +403,10 @@ mod tests {
             "the builtin name is not a variable, but every argument is walked"
         );
         let core = CoreModule {
+            generic_types: Vec::new(),
+            effect_params_used: Default::default(),
             fns: vec![CoreFn {
+                row: elya::types::EffectRow::pure(),
                 name: "main".to_string(),
                 params: Rc::from([]),
                 body: expr,
@@ -433,7 +436,10 @@ mod tests {
             ),
         );
         let core = CoreModule {
+            generic_types: Vec::new(),
+            effect_params_used: Default::default(),
             fns: vec![CoreFn {
+                row: elya::types::EffectRow::pure(),
                 name: "wrap".to_string(),
                 params: Rc::from([param("k")]),
                 body: lam,
@@ -465,7 +471,10 @@ mod tests {
             CoreKind::Lambda(Rc::from([param("x")]), Rc::new(var("x"))),
         );
         let core = CoreModule {
+            generic_types: Vec::new(),
+            effect_params_used: Default::default(),
             fns: vec![CoreFn {
+                row: elya::types::EffectRow::pure(),
                 name: "id".to_string(),
                 params: Rc::from([]),
                 body: lam,
@@ -511,7 +520,10 @@ mod tests {
             ),
         );
         let core = CoreModule {
+            generic_types: Vec::new(),
+            effect_params_used: Default::default(),
             fns: vec![CoreFn {
+                row: elya::types::EffectRow::pure(),
                 name: "two".to_string(),
                 params: Rc::from([]),
                 body,
@@ -612,7 +624,10 @@ mod tests {
             Some(("r", lam("w"))),
         );
         let core = CoreModule {
+            generic_types: Vec::new(),
+            effect_params_used: Default::default(),
             fns: vec![CoreFn {
+                row: elya::types::EffectRow::pure(),
                 name: "h".to_string(),
                 params: Rc::from([]),
                 body,
@@ -660,7 +675,10 @@ mod tests {
             CoreKind::Lambda(Rc::from([param("x")]), Rc::new(var("x"))),
         );
         let core = CoreModule {
+            generic_types: Vec::new(),
+            effect_params_used: Default::default(),
             fns: vec![CoreFn {
+                row: elya::types::EffectRow::pure(),
                 name: "p".to_string(),
                 params: Rc::from([]),
                 body: perform("ping", vec![lam]),

@@ -16,8 +16,18 @@ fn both(src: &str) -> (String, String) {
 
 /// Examples that perform user effects, which the tree-walker oracle does not
 /// evaluate (it predates Slice 3c). Each is compared with the native backend
-/// in `crates/codegen/tests/native_codegen.rs` instead.
-const EFFECTFUL_EXAMPLES: &[&str] = &["04_async.elya", "05_replay.elya"];
+/// in `crates/codegen/tests/native_codegen.rs` instead -- except
+/// `09_record_any.elya`, whose `with any` handlers are evaluator-only for now
+/// (refused natively by name; its snapshot in `tests/examples.rs` pins it).
+const EFFECTFUL_EXAMPLES: &[&str] = &[
+    "04_async.elya",
+    "05_replay.elya",
+    "06_structured.elya",
+    "07_search.elya",
+    "08_timers.elya",
+    "09_record_any.elya",
+    "10_failure.elya",
+];
 
 #[test]
 fn cek_matches_tree_on_examples() {
@@ -31,7 +41,10 @@ fn cek_matches_tree_on_examples() {
                 // The tree-walker has no effects; it must REFUSE the program
                 // (so this list cannot hide a regression), and the program is
                 // checked against the native backend instead
-                // (`the_async_example_runs_natively`, `the_replay_example_runs_natively`).
+                // (`the_async_example_runs_natively`, `the_replay_example_runs_natively`,
+                // `the_structured_concurrency_example_runs_natively`,
+                // `the_search_example_runs_natively`, `the_timers_example_runs_natively`,
+                // `the_failure_example_runs_natively`).
                 let (m, d) = parse_module(&Session::new(), &src);
                 assert!(d.is_empty(), "parse: {d:?}");
                 let err = elya::eval::run_module_tree(&m)

@@ -5,6 +5,11 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <errno.h>
+#include <time.h>
 #endif
 
 /* The Elya native runtime: a stop-the-world, non-moving mark-sweep collector.
@@ -266,6 +271,89 @@ void *elya_str_lit(int64_t tag, const char *bytes, int64_t len) {
     p[1] = len;
     memcpy(&p[2], bytes, (size_t)len);
     return p;
+}
+
+/* Native strings (spec 2026-10-15-elya-native-strings, D2/D4). `a <> b` is a
+ * fresh immutable string. Both operands are rooted while it allocates: callers
+ * root them too (an operand is a temporary the emitter pushed), so this is
+ * defence in depth, as in elya_cont_copy. */
+void *elya_str_concat(int64_t tag, void *a, void *b) {
+    int64_t la = ((int64_t *)a)[1];
+    int64_t lb = ((int64_t *)b)[1];
+    elya_gc_push(a);
+    elya_gc_push(b);
+    int64_t *p = (int64_t *)elya_alloc(2 + ((la + lb + 1) + 7) / 8);
+    elya_gc_pop();
+    elya_gc_pop();
+    p[0] = tag;
+    p[1] = la + lb;
+    memcpy(&p[2], &((int64_t *)a)[2], (size_t)la);
+    memcpy((char *)&p[2] + la, &((int64_t *)b)[2], (size_t)lb);
+    return p;
+}
+
+/* `==` on strings (D3): byte equality, as the evaluator's. Allocates nothing. */
+int64_t elya_str_eq(void *a, void *b) {
+    int64_t la = ((int64_t *)a)[1];
+    int64_t lb = ((int64_t *)b)[1];
+    if (la != lb) {
+        return 0;
+    }
+    return memcmp(&((int64_t *)a)[2], &((int64_t *)b)[2], (size_t)la) == 0;
+}
+
+/* `int.to_string` (D1): decimal, a leading '-' for a negative, INT64_MIN
+ * included (20 characters at most). */
+void *elya_int_to_string(int64_t tag, int64_t n) {
+    char buf[32];
+    int len = snprintf(buf, sizeof buf, "%lld", (long long)n);
+    return elya_str_lit(tag, buf, (int64_t)len);
+}
+
+/* Time, the first I/O source (spec 2026-10-15-elya-async-step2-timers, D3).
+ * `time.now_ms`: monotonic milliseconds since the first reading. `time.sleep_ms`:
+ * a wait of at least `ms` (none when `ms <= 0`); an interrupted nanosleep goes on
+ * with what remains. Neither allocates. */
+static int64_t elya_time_raw_ms(void) {
+#ifdef _WIN32
+    return (int64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+#endif
+}
+
+int64_t elya_time_now_ms(void) {
+    static int64_t start = -1;
+    int64_t now = elya_time_raw_ms();
+    if (start < 0) {
+        start = now;
+    }
+    return now - start;
+}
+
+void elya_time_sleep_ms(int64_t ms) {
+    if (ms <= 0) {
+        return;
+    }
+#ifdef _WIN32
+    /* `Sleep` may return before its interval, and `GetTickCount64` moves in
+     * 10-16 ms steps, so wait on the clock `time.now_ms` reads until it has
+     * moved by `ms` (the 2026-10-16 review). */
+    int64_t end = elya_time_raw_ms() + ms;
+    for (;;) {
+        int64_t left = end - elya_time_raw_ms();
+        if (left <= 0) {
+            break;
+        }
+        Sleep(left > 0x7fffffff ? 0x7fffffff : (DWORD)left);
+    }
+#else
+    struct timespec req = {(time_t)(ms / 1000), (long)((ms % 1000) * 1000000L)};
+    while (nanosleep(&req, &req) == -1 && errno == EINTR) {
+    }
+#endif
 }
 
 /* The deterministic failed-match trap. Spec 5b-4 §5: never `unreachable`. */

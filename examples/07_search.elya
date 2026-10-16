@@ -1,0 +1,93 @@
+// One search, three meanings: backtracking with a multi-shot effect.
+//
+// `queens` is an ordinary function. It asks `choose(n)` for a column and calls
+// `fail()` when a queen would be attacked -- it says nothing about HOW the
+// choices are explored. Each handler below gives the same search a different
+// meaning: every solution, how many there are, or just the first one. A
+// handler explores a choice by resuming the rest of the search once per
+// column (`with multi`: the continuation may run more than once).
+
+effect multi Choose {
+  fn choose(n: Int) -> Int
+  fn fail() -> Int
+}
+
+type List(a) { Nil, Cons(a, List(a)) }
+type Option(a) { None, Some(a) }
+
+fn attacks(c, placed, d) {
+  match placed {
+    Nil -> False
+    Cons(p, rest) -> if p == c { True } else { if p - c == d { True } else { if c - p == d { True } else { attacks(c, rest, d + 1) } } }
+  }
+}
+
+// Places queens on rows `row..n`; `placed` holds the earlier rows' columns,
+// the latest first.
+fn place(n, row, placed) {
+  if row > n { placed } else {
+    let c = choose(n)
+    if attacks(c, placed, 1) {
+      let _ = fail()
+      Nil
+    } else {
+      place(n, row + 1, Cons(c, placed))
+    }
+  }
+}
+
+fn queens(n) { place(n, 1, Nil) }
+
+// ---- three handlers over the same choices ----
+
+fn concat(a, b) { match a { Nil -> b  Cons(h, t) -> Cons(h, concat(t, b)) } }
+
+fn every(k, n, try) { if k > n { Nil } else { concat(try(k), every(k + 1, n, try)) } }
+fn total(k, n, try) { if k > n { 0 } else { try(k) + total(k + 1, n, try) } }
+fn earliest(k, n, try) {
+  if k > n { None } else {
+    match try(k) {
+      Some(s) -> Some(s)
+      None -> earliest(k + 1, n, try)
+    }
+  }
+}
+
+fn all_solutions(n) {
+  handle { queens(n) } with multi {
+    Choose.choose(m) -> every(1, m, fn(k) { resume(k) })
+    Choose.fail() -> Nil
+    return(s) -> Cons(s, Nil)
+  }
+}
+
+fn count(n) {
+  handle { queens(n) } with multi {
+    Choose.choose(m) -> total(1, m, fn(k) { resume(k) })
+    Choose.fail() -> 0
+    return(s) -> 1
+  }
+}
+
+fn first(n) {
+  handle { queens(n) } with multi {
+    Choose.choose(m) -> earliest(1, m, fn(k) { resume(k) })
+    Choose.fail() -> None
+    return(s) -> Some(s)
+  }
+}
+
+fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }
+
+// A solution as a number, the first row's column first: [.., 3, 1] -> 13...
+fn digits(placed) { match placed { Nil -> 0  Cons(c, rest) -> digits(rest) * 10 + c } }
+
+pub fn main() -> Int {
+  let six = len(all_solutions(6))
+  let _ = if six == 4 { io.println("6 queens: 4 solutions, all collected") } else { io.println("6 queens: wrong") }
+  let eight = count(8)
+  let _ = if eight == 92 { io.println("8 queens: 92 solutions, counted") } else { io.println("8 queens: wrong") }
+  let f = match first(8) { Some(p) -> digits(p)  None -> 0 }
+  let _ = io.println("8 queens: the first solution, found without the others")
+  six * 1000000000 + eight * 100000000 + f
+}

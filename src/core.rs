@@ -13,6 +13,7 @@ use crate::ast::{
     TypeAnn,
 };
 use crate::span::Span;
+use crate::types::EffectRow;
 use crate::types::Ty;
 use crate::types::TyPrinter;
 
@@ -154,6 +155,10 @@ pub struct CoreFn {
     /// block type onto the synthesized `Let` spine, so a separate `ret` field
     /// would be a second source of truth (Slice 5b-3 §3.3).
     pub body: CoreExpr,
+    /// The function's own (latent) row, read from its declaration's span in
+    /// the typed table (spec 2026-10-16): a type variable that occurs only
+    /// here is still an instantiation the back end must see.
+    pub row: EffectRow,
 }
 
 #[derive(Clone, Debug)]
@@ -170,10 +175,32 @@ pub struct CoreCtor {
     pub fields: Vec<Ty>,
 }
 
+/// A parametric ADT declaration (N7 part 2, spec 2026-10-15): its fields
+/// mention the type parameters as `Ty::Var(i)`, `i` the parameter's position.
+/// The back end instantiates it per ground use; nothing else reads it.
+#[derive(Clone, Debug)]
+pub struct CoreGenericType {
+    pub name: String,
+    /// The number of type parameters.
+    pub params: usize,
+    /// Constructors in declaration order (the index is the tag within an
+    /// instance).
+    pub ctors: Vec<CoreCtor>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CoreModule {
     pub fns: Vec<CoreFn>,
+    /// Ground (monomorphic) ADT declarations only.
     pub types: Vec<CoreType>,
+    /// Parametric ADT declarations (N7 part 2). Kept apart from `types` so the
+    /// typed-Core printer, which renders `types`, is unchanged.
+    pub generic_types: Vec<CoreGenericType>,
+    /// Per declared effect with type parameters: whether each parameter occurs
+    /// in some operation's signature (N7 part 2). A parameter no operation
+    /// mentions is phantom -- no value of its type passes through the effect --
+    /// so the back end may default it when it is left unconstrained.
+    pub effect_params_used: BTreeMap<String, Vec<bool>>,
 }
 
 /// Lowering failure. The deferred AST surface is a *typed boundary*, not a panic:
@@ -192,6 +219,8 @@ pub enum LowerError {
 pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreModule, LowerError> {
     let mut ctor_names: HashSet<String> = HashSet::new();
     let mut types = Vec::new();
+    let mut generic_types = Vec::new();
+    let mut effect_params_used = BTreeMap::new();
     for d in &module.decls {
         if let Decl::Type(t) = &d.node {
             // Collect every constructor name regardless of arity, so a constructor
@@ -217,6 +246,40 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
                     name: t.name.clone(),
                     ctors,
                 });
+            } else {
+                let mut ctors = Vec::with_capacity(t.variants.len());
+                for v in &t.variants {
+                    let vd = &v.node;
+                    let fields = vd
+                        .fields
+                        .iter()
+                        .map(|f| ann_to_ty_in(&f.node, &t.params))
+                        .collect();
+                    ctors.push(CoreCtor {
+                        name: vd.name.clone(),
+                        fields,
+                    });
+                }
+                generic_types.push(CoreGenericType {
+                    name: t.name.clone(),
+                    params: t.params.len(),
+                    ctors,
+                });
+            }
+        }
+        if let Decl::Effect(e) = &d.node {
+            if !e.params.is_empty() {
+                let used = e
+                    .params
+                    .iter()
+                    .map(|p| {
+                        e.ops.iter().any(|op| {
+                            op.node.param_tys.iter().any(|t| ann_mentions(&t.node, p))
+                                || ann_mentions(&op.node.ret.node, p)
+                        })
+                    })
+                    .collect();
+                effect_params_used.insert(e.name.clone(), used);
             }
         }
         if let Decl::Effect(e) = &d.node {
@@ -258,14 +321,24 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
                 });
             }
             let body = lower_block(&f.body.node, table, &cx)?;
+            let row = match table.get(&d.span) {
+                Some(Ty::Fn(_, row, _)) => row.clone(),
+                _ => return Err(LowerError::Untyped(d.span)),
+            };
             fns.push(CoreFn {
                 name: f.name.clone(),
                 params: params.into(),
                 body,
+                row,
             });
         }
     }
-    Ok(CoreModule { fns, types })
+    Ok(CoreModule {
+        fns,
+        types,
+        generic_types,
+        effect_params_used,
+    })
 }
 
 /// The module-wide facts the lowering fold reads below `lower_module`, gathered
@@ -284,19 +357,38 @@ struct LowerCx {
     shadowed_op_calls: std::collections::HashSet<Span>,
 }
 
-/// Elaborate a (monomorphic) ADT field type annotation to a `Ty`. Param-free by
-/// design (5b-4 §6): base names map to their `Base`, any other name is an ADT
-/// reference and maps to `Ty::Con` with its args elaborated. No type parameters
-/// reach here, so there is no substitution.
+/// Elaborate a ground ADT field type annotation to a `Ty` (5b-4 §6): base
+/// names map to their `Base`, any other name is an ADT reference and maps to
+/// `Ty::Con` with its args elaborated. A parametric declaration's fields go
+/// through `ann_to_ty_in` with its parameters (N7 part 2).
 fn ann_to_ty(a: &TypeAnn) -> Ty {
+    ann_to_ty_in(a, &[])
+}
+
+/// Does the annotation mention the (type parameter) name `p` anywhere?
+fn ann_mentions(a: &TypeAnn, p: &str) -> bool {
+    (a.name == p && a.args.is_empty()) || a.args.iter().any(|x| ann_mentions(&x.node, p))
+}
+
+/// `ann_to_ty` under a parametric declaration's parameters: a name that is
+/// one of them is `Ty::Var(position)` (N7 part 2).
+fn ann_to_ty_in(a: &TypeAnn, tparams: &[String]) -> Ty {
+    if a.args.is_empty() {
+        if let Some(i) = tparams.iter().position(|p| *p == a.name) {
+            return Ty::Var(i as u32);
+        }
+    }
     // A function type in a declaration (2026-10-09, async step 1): its row is
     // exactly what is written, closed -- the same elaboration inference gives
     // the field (`types::elaborate_adt_ty`), so the back end reads the
     // field's real type (a pattern binder holding a closure is tracked by it).
     if a.name == "fn" && !a.args.is_empty() {
         let n = a.args.len();
-        let params = a.args[..n - 1].iter().map(|x| ann_to_ty(&x.node)).collect();
-        let ret = ann_to_ty(&a.args[n - 1].node);
+        let params = a.args[..n - 1]
+            .iter()
+            .map(|x| ann_to_ty_in(&x.node, tparams))
+            .collect();
+        let ret = ann_to_ty_in(&a.args[n - 1].node, tparams);
         let labels = a
             .row
             .iter()
@@ -327,7 +419,11 @@ fn ann_to_ty(a: &TypeAnn) -> Ty {
         "String" => Ty::str(),
         "Unit" => Ty::unit(),
         other => {
-            let args = a.args.iter().map(|x| ann_to_ty(&x.node)).collect();
+            let args = a
+                .args
+                .iter()
+                .map(|x| ann_to_ty_in(&x.node, tparams))
+                .collect();
             Ty::Con(other.to_string(), args)
         }
     }
@@ -392,7 +488,8 @@ fn lower_expr(
         }
         Expr::Call { callee, args } => {
             if let Expr::Qualified { module, name } = &callee.node {
-                if module == "io" && name == "println" {
+                let full = format!("{module}.{name}");
+                if crate::resolve::builtins().contains(&full.as_str()) {
                     let mut lowered = Vec::with_capacity(args.len());
                     for a in args.iter() {
                         lowered.push(lower_expr(&a.node, a.span, table, cx)?);
@@ -400,7 +497,7 @@ fn lower_expr(
                     return Ok(CoreExpr {
                         span,
                         ty,
-                        kind: CoreKind::Builtin("io.println".to_string(), lowered.into()),
+                        kind: CoreKind::Builtin(full, lowered.into()),
                     });
                 }
             }
@@ -545,6 +642,12 @@ fn lower_expr(
         // that lookup returns is then unused.
         Expr::Block(b) => return lower_block(b, table, cx),
         Expr::Handle { body, handler } => {
+            // `with any` (2026-10-16, spec D6): the evaluator only, for now.
+            if handler.any {
+                return Err(LowerError::Unsupported(
+                    "operation-generic handler (`with any`)",
+                ));
+            }
             // An unqualified clause (`op(..) -> ..`) means its op's effect (slice
             // 5c-1): op names are unique per module (E0202), and the evaluator
             // dispatches it exactly so. A clause naming no declared op is E0203 in

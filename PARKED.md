@@ -295,7 +295,7 @@ Natively the same shape is refused by name ("resume of an effectful handler in d
 code", pinned by `an_escaped_resume_of_a_leaking_handle_is_refused_by_name`); once the
 row is carried, that program (m10 in the 5b-10 spec) should compile.
 
-## Front end: recursion through a handle body is rejected (found by slice 5b-10, 2026-10-08)
+## RESOLVED (auto/elya, 2026-10-15, spec `2026-10-15-elya-handle-recursion-design.md`): recursion through a handle body is rejected (found by slice 5b-10, 2026-10-08)
 
 `fn nest(n: Int) / {T} -> Int { if n == 0 { t() } else { handle { nest(n - 1) + get() }
 with { S.get() -> resume(1)  return(r) -> r } } }` is E0423 ("the rows differ by exactly:
