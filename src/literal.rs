@@ -2,9 +2,13 @@
 //! it handles (2026-10-16, spec `2026-10-16-elya-any-handlers-design.md` D7).
 //!
 //! The encoding is Elya's own literal syntax: `42`, `-7`, `1.5`, `"a\"b"`, `True`,
-//! `False`, `()`, `Cons(1, Nil)`. Constructor names are unique per module, so a
+//! `False`, `Unit`, `Cons(1, Nil)`. Constructor names are unique per module, so a
 //! literal describes itself; `decode` also checks it against the operation's
 //! declared answer type, through constructors and their fields.
+//!
+//! Floats are decimals without an exponent (`1.0`, `0.0000001`), plus the words
+//! `inf`, `-inf` and `NaN`. Every walk here is iterative: a list of a million cells
+//! is shown, parsed and checked without recursing on the host stack.
 
 use crate::ast::{Decl, Module, TypeAnn};
 use crate::eval::{CtorArgs, Value};
@@ -59,45 +63,76 @@ pub fn show(v: &Value) -> Result<String, &'static str> {
     Ok(out)
 }
 
+enum Item<'a> {
+    Val(&'a Value),
+    Text(&'static str),
+}
+
 fn write(v: &Value, out: &mut String) -> Result<(), &'static str> {
-    match v {
-        Value::Int(n) => out.push_str(&n.to_string()),
-        Value::Float(f) => out.push_str(&format!("{f:?}")),
-        Value::Bool(true) => out.push_str("True"),
-        Value::Bool(false) => out.push_str("False"),
-        Value::Unit => out.push_str("()"),
-        Value::Str(s) => {
-            out.push('"');
-            for c in s.chars() {
-                match c {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    '\n' => out.push_str("\\n"),
-                    '\t' => out.push_str("\\t"),
-                    '\r' => out.push_str("\\r"),
-                    c => out.push(c),
-                }
+    let mut stack = vec![Item::Val(v)];
+    while let Some(item) = stack.pop() {
+        let v = match item {
+            Item::Text(t) => {
+                out.push_str(t);
+                continue;
             }
-            out.push('"');
-        }
-        Value::Ctor(name, args) => {
-            out.push_str(name);
-            if !args.0.is_empty() {
-                out.push('(');
-                for (i, a) in args.0.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
+            Item::Val(v) => v,
+        };
+        match v {
+            Value::Int(n) => out.push_str(&n.to_string()),
+            Value::Float(f) => write_float(*f, out),
+            Value::Bool(true) => out.push_str("True"),
+            Value::Bool(false) => out.push_str("False"),
+            Value::Unit => out.push_str("Unit"),
+            Value::Str(s) => {
+                out.push('"');
+                for c in s.chars() {
+                    match c {
+                        '"' => out.push_str("\\\""),
+                        '\\' => out.push_str("\\\\"),
+                        '\n' => out.push_str("\\n"),
+                        '\t' => out.push_str("\\t"),
+                        '\r' => out.push_str("\\r"),
+                        c => out.push(c),
                     }
-                    write(a, out)?;
                 }
-                out.push(')');
+                out.push('"');
             }
+            Value::Ctor(name, args) => {
+                out.push_str(name);
+                if !args.0.is_empty() {
+                    out.push('(');
+                    stack.push(Item::Text(")"));
+                    for (i, a) in args.0.iter().enumerate().rev() {
+                        stack.push(Item::Val(a));
+                        if i > 0 {
+                            stack.push(Item::Text(", "));
+                        }
+                    }
+                }
+            }
+            Value::Fn(_) | Value::Closure { .. } => return Err("a function"),
+            Value::Resume(_) => return Err("a continuation"),
+            Value::Op { .. } => return Err("an operation"),
         }
-        Value::Fn(_) | Value::Closure { .. } => return Err("a function"),
-        Value::Resume(_) => return Err("a continuation"),
-        Value::Op { .. } => return Err("an operation"),
     }
     Ok(())
+}
+
+/// A decimal with a point and no exponent (Rust's shortest round-trip `Display`),
+/// or `inf`, `-inf`, `NaN`.
+fn write_float(f: f64, out: &mut String) {
+    if f.is_nan() {
+        out.push_str("NaN");
+    } else if f.is_infinite() {
+        out.push_str(if f > 0.0 { "inf" } else { "-inf" });
+    } else {
+        let s = format!("{f}");
+        out.push_str(&s);
+        if !s.contains('.') {
+            out.push_str(".0");
+        }
+    }
 }
 
 /// An operation as `Effect.op(args)`.
@@ -121,6 +156,15 @@ pub fn decode(info: &TypeInfo, op: &str, text: &str) -> Result<Value, String> {
         .get(op)
         .cloned()
         .ok_or_else(|| format!("no operation `{op}`"))?;
+    // An effect's own type parameter is not known at run time, so an answer of
+    // that type cannot be checked: refused by name (the review's S2; letting any
+    // data in put a String where an Int was typed).
+    if let Some(p) = params.iter().find(|p| mentions(&ret, p)) {
+        return Err(format!(
+            "the answer type `{}` mentions the effect's parameter `{p}`, which is not known at run time",
+            render_ann(&ret)
+        ));
+    }
     let mut p = Parser {
         s: text.as_bytes(),
         i: 0,
@@ -132,9 +176,7 @@ pub fn decode(info: &TypeInfo, op: &str, text: &str) -> Result<Value, String> {
     if p.i != p.s.len() {
         return Err(format!("`{text}` has input after its value"));
     }
-    // The effect's own parameters are not known at run time: any data (D7).
-    let env: HashMap<String, Option<TypeAnn>> = params.into_iter().map(|p| (p, None)).collect();
-    if !conforms(info, &v, &ret, &env) {
+    if !conforms(info, &v, &ret) {
         return Err(format!(
             "`{text}` is not a value of type `{}`",
             render_ann(&ret)
@@ -143,81 +185,84 @@ pub fn decode(info: &TypeInfo, op: &str, text: &str) -> Result<Value, String> {
     Ok(v)
 }
 
-fn conforms(
-    info: &TypeInfo,
-    v: &Value,
-    ann: &TypeAnn,
-    env: &HashMap<String, Option<TypeAnn>>,
-) -> bool {
-    match ann.name.as_str() {
-        "Int" => matches!(v, Value::Int(_)),
-        "Float" => matches!(v, Value::Float(_)),
-        "Bool" => matches!(v, Value::Bool(_)),
-        "String" => matches!(v, Value::Str(_)),
-        "Unit" => matches!(v, Value::Unit),
-        "fn" => false,
-        n if n.starts_with(|c: char| c.is_ascii_lowercase()) => match env.get(n) {
-            Some(Some(bound)) => conforms(info, v, bound, &HashMap::new()),
-            // An unknown parameter: any data whose constructors exist.
-            _ => known(info, v),
-        },
-        tname => {
-            let Value::Ctor(c, args) = v else {
-                return false;
-            };
-            let Some((owner, params, fields)) = info.ctors.get(c) else {
-                return false;
-            };
-            if owner != tname || fields.len() != args.0.len() {
-                return false;
+fn mentions(ann: &TypeAnn, name: &str) -> bool {
+    let mut stack = vec![ann];
+    while let Some(a) = stack.pop() {
+        if a.name == name {
+            return true;
+        }
+        stack.extend(a.args.iter().map(|x| &x.node));
+    }
+    false
+}
+
+/// Whether `v` is a value of `ann`, through declared types' constructors. The
+/// annotation never names an unknown parameter here (`decode` refused effect
+/// parameters; a declared type's are bound to its arguments).
+fn conforms(info: &TypeInfo, v: &Value, ann: &TypeAnn) -> bool {
+    let mut stack: Vec<(&Value, TypeAnn)> = vec![(v, ann.clone())];
+    while let Some((v, ann)) = stack.pop() {
+        let ok = match ann.name.as_str() {
+            "Int" => matches!(v, Value::Int(_)),
+            "Float" => matches!(v, Value::Float(_)),
+            "Bool" => matches!(v, Value::Bool(_)),
+            "String" => matches!(v, Value::Str(_)),
+            "Unit" => matches!(v, Value::Unit),
+            tname if tname == "fn" || tname.starts_with(|c: char| c.is_ascii_lowercase()) => false,
+            tname => {
+                let Value::Ctor(c, args) = v else {
+                    return false;
+                };
+                let Some((owner, params, fields)) = info.ctors.get(c) else {
+                    return false;
+                };
+                if owner != tname || fields.len() != args.0.len() || params.len() != ann.args.len()
+                {
+                    return false;
+                }
+                // The type's parameters at this use are its arguments.
+                let env: HashMap<&str, &TypeAnn> = params
+                    .iter()
+                    .map(|p| p.as_str())
+                    .zip(ann.args.iter().map(|a| &a.node))
+                    .collect();
+                for (f, a) in fields.iter().zip(args.0.iter()) {
+                    stack.push((a, substitute(f, &env)));
+                }
+                true
             }
-            // The type's parameters at this use: its arguments, resolved through
-            // the enclosing environment.
-            let inner: HashMap<String, Option<TypeAnn>> = params
-                .iter()
-                .cloned()
-                .zip(ann.args.iter().map(|a| Some(resolve_ann(&a.node, env))))
-                .collect();
-            fields
-                .iter()
-                .zip(args.0.iter())
-                .all(|(f, a)| conforms(info, a, f, &inner))
+        };
+        if !ok {
+            return false;
         }
     }
+    true
 }
 
-/// Whether every constructor in `v` is declared, at its arity.
-fn known(info: &TypeInfo, v: &Value) -> bool {
-    match v {
-        Value::Ctor(c, args) => {
-            info.ctors.get(c).map(|(_, _, f)| f.len()) == Some(args.0.len())
-                && args.0.iter().all(|a| known(info, a))
-        }
-        _ => true,
-    }
-}
-
-/// An annotation with the environment's bound parameters substituted. An unbound
-/// one stays a parameter, which `conforms` then accepts as any data.
-fn resolve_ann(ann: &TypeAnn, env: &HashMap<String, Option<TypeAnn>>) -> TypeAnn {
-    if ann.args.is_empty() && ann.name.starts_with(|c: char| c.is_ascii_lowercase()) {
-        if let Some(Some(bound)) = env.get(&ann.name) {
-            return bound.clone();
+/// A field annotation with the type's parameters replaced by their arguments.
+fn substitute(ann: &TypeAnn, env: &HashMap<&str, &TypeAnn>) -> TypeAnn {
+    if ann.args.is_empty() {
+        if let Some(bound) = env.get(ann.name.as_str()) {
+            return (*bound).clone();
         }
         return ann.clone();
     }
     let mut out = ann.clone();
     for a in out.args.iter_mut() {
-        a.node = resolve_ann(&a.node, env);
+        a.node = substitute(&a.node, env);
     }
     out
 }
 
 fn render_ann(a: &TypeAnn) -> String {
-    if a.args.is_empty() {
+    let args: Vec<String> = a.args.iter().map(|x| render_ann(&x.node)).collect();
+    if a.name == "fn" && !args.is_empty() {
+        let (ps, r) = args.split_at(args.len() - 1);
+        return format!("fn({}) -> {}", ps.join(", "), r[0]);
+    }
+    if args.is_empty() {
         return a.name.clone();
     }
-    let args: Vec<String> = a.args.iter().map(|x| render_ann(&x.node)).collect();
     format!("{}({})", a.name, args.join(", "))
 }
 
@@ -237,25 +282,82 @@ impl Parser<'_> {
         self.s.get(self.i).copied()
     }
 
+    /// One value, constructors' arguments kept on an explicit stack.
     fn value(&mut self) -> Result<Value, &'static str> {
-        self.ws();
-        match self.peek() {
-            None => Err("nothing to read"),
-            Some(b'"') => self.string(),
-            Some(b'(') => {
-                self.i += 1;
+        let mut open: Vec<(String, Vec<Value>)> = Vec::new();
+        loop {
+            self.ws();
+            let mut v = match self.peek() {
+                None => return Err("nothing to read"),
+                Some(b'"') => self.string()?,
+                Some(c) if c == b'-' || c.is_ascii_digit() => {
+                    if self.s[self.i..].starts_with(b"-inf") {
+                        self.i += 4;
+                        Value::Float(f64::NEG_INFINITY)
+                    } else {
+                        self.number()?
+                    }
+                }
+                Some(b'i') if self.s[self.i..].starts_with(b"inf") => {
+                    self.i += 3;
+                    Value::Float(f64::INFINITY)
+                }
+                Some(c) if c.is_ascii_uppercase() => {
+                    let name = self.name()?;
+                    let save = self.i;
+                    self.ws();
+                    if self.peek() == Some(b'(') {
+                        self.i += 1;
+                        open.push((name, Vec::new()));
+                        continue;
+                    }
+                    self.i = save;
+                    match name.as_str() {
+                        "True" => Value::Bool(true),
+                        "False" => Value::Bool(false),
+                        "Unit" => Value::Unit,
+                        "NaN" => Value::Float(f64::NAN),
+                        _ => Value::Ctor(name, CtorArgs(Rc::new(Vec::new()))),
+                    }
+                }
+                Some(_) => return Err("an unexpected character"),
+            };
+            // Give the value to the constructor it is an argument of, closing
+            // every constructor whose `)` follows.
+            loop {
+                let Some((_, args)) = open.last_mut() else {
+                    return Ok(v);
+                };
+                args.push(v);
                 self.ws();
-                if self.peek() == Some(b')') {
-                    self.i += 1;
-                    Ok(Value::Unit)
-                } else {
-                    Err("`(` that is not `()`")
+                match self.peek() {
+                    Some(b',') => {
+                        self.i += 1;
+                        break;
+                    }
+                    Some(b')') => {
+                        self.i += 1;
+                        let (name, args) = open.pop().expect("an open constructor");
+                        v = Value::Ctor(name, CtorArgs(Rc::new(args)));
+                    }
+                    _ => return Err("a constructor's arguments not closed by `)`"),
                 }
             }
-            Some(c) if c == b'-' || c.is_ascii_digit() => self.number(),
-            Some(c) if c.is_ascii_uppercase() => self.ctor(),
-            Some(_) => Err("an unexpected character"),
         }
+    }
+
+    fn name(&mut self) -> Result<String, &'static str> {
+        let start = self.i;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphanumeric() || c == b'_' {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        std::str::from_utf8(&self.s[start..self.i])
+            .map(|n| n.to_string())
+            .map_err(|_| "a malformed name")
     }
 
     fn number(&mut self) -> Result<Value, &'static str> {
@@ -267,9 +369,7 @@ impl Parser<'_> {
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
                 self.i += 1;
-            } else if matches!(c, b'.' | b'e' | b'E')
-                || (matches!(c, b'+' | b'-') && matches!(self.s[self.i - 1], b'e' | b'E'))
-            {
+            } else if c == b'.' {
                 float = true;
                 self.i += 1;
             } else {
@@ -320,45 +420,5 @@ impl Parser<'_> {
         String::from_utf8(bytes)
             .map(Value::Str)
             .map_err(|_| "a string that is not UTF-8")
-    }
-
-    fn ctor(&mut self) -> Result<Value, &'static str> {
-        let start = self.i;
-        while let Some(c) = self.peek() {
-            if c.is_ascii_alphanumeric() || c == b'_' {
-                self.i += 1;
-            } else {
-                break;
-            }
-        }
-        let name = std::str::from_utf8(&self.s[start..self.i])
-            .map_err(|_| "a malformed name")?
-            .to_string();
-        match name.as_str() {
-            "True" => return Ok(Value::Bool(true)),
-            "False" => return Ok(Value::Bool(false)),
-            _ => {}
-        }
-        let save = self.i;
-        self.ws();
-        if self.peek() != Some(b'(') {
-            self.i = save;
-            return Ok(Value::Ctor(name, CtorArgs(Rc::new(Vec::new()))));
-        }
-        self.i += 1;
-        let mut args = Vec::new();
-        loop {
-            args.push(self.value()?);
-            self.ws();
-            match self.peek() {
-                Some(b',') => self.i += 1,
-                Some(b')') => {
-                    self.i += 1;
-                    break;
-                }
-                _ => return Err("a constructor's arguments not closed by `)`"),
-            }
-        }
-        Ok(Value::Ctor(name, CtorArgs(Rc::new(args))))
     }
 }

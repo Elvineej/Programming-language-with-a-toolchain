@@ -2252,10 +2252,22 @@ impl Infer {
         // Escaped resumes may re-enter the clause, whose effects -- the
         // operations it performs again included -- happen outside the handler.
         self.pending_clause_rows.pop();
+        let handled_now = self.resolve_row(&handled).tail;
         for &ca in &clause_ambs {
             let row = self.resolve_row(&EffectRow::open(ca));
             for (label, l) in row.labels.iter() {
                 let r = self.add_effect(clauses_row, label, l.args.clone(), l.span);
+                self.surface_conflict(r);
+            }
+            // A forwarding clause performs the handled tail too: an escaped
+            // resume that re-enters it does (the review's S1: such a lambda
+            // was typed pure, and its performs reached no handler).
+            if matches!(row.tail, RowTail::Open(_)) && row.tail == handled_now {
+                let tail = EffectRow {
+                    labels: BTreeMap::new(),
+                    tail: row.tail.clone(),
+                };
+                let r = self.add_row(clauses_row, &tail, span);
                 self.surface_conflict(r);
             }
         }
@@ -2411,36 +2423,51 @@ impl Infer {
         }
     }
 
-    /// Why `t` (resolved) is not data, or `None` if it is. `seen` breaks the
-    /// recursion of recursive types.
+    /// Why `t` (resolved) is not data, or `None` if it is: a declared type is
+    /// data when its arguments are and its declaration is (`decl_not_data`).
+    /// Checking the two apart terminates on non-regular types, whose arguments
+    /// grow under recursion (`Nest(a) { S(Nest(Opt(a))) }`; the review's B1).
     fn not_data(&self, t: &Ty, seen: &mut Vec<String>) -> Option<String> {
         match self.resolve(t) {
             Ty::Base(_) | Ty::Error => None,
             Ty::Fn(..) => Some("a function type".to_string()),
             Ty::Var(_) => Some("a type not known to be data".to_string()),
             Ty::Tuple(xs) => xs.iter().find_map(|x| self.not_data(x, seen)),
-            Ty::Con(n, args) => {
-                let key = format!("{n}{args:?}");
-                if seen.contains(&key) {
-                    return None;
-                }
-                seen.push(key);
-                let Some((params, ctors)) = self.adt_fields.get(&n).cloned() else {
-                    return Some(format!("the type `{n}`"));
-                };
-                let m: HashMap<u32, Ty> =
-                    params.iter().cloned().zip(args.iter().cloned()).collect();
-                let rm = HashMap::new();
-                for fields in &ctors {
-                    for f in fields {
-                        let f = subst_vars(f, &m, &rm);
-                        if let Some(why) = self.not_data(&f, seen) {
-                            return Some(why);
-                        }
-                    }
-                }
-                None
-            }
+            Ty::Con(n, args) => args
+                .iter()
+                .find_map(|a| self.not_data(a, seen))
+                .or_else(|| self.decl_not_data(&n, seen)),
+        }
+    }
+
+    /// Whether a declared type's fields are data, its parameters taken as data
+    /// (its arguments are checked where it is used).
+    fn decl_not_data(&self, name: &str, seen: &mut Vec<String>) -> Option<String> {
+        if seen.iter().any(|n| n == name) {
+            return None;
+        }
+        seen.push(name.to_string());
+        let Some((params, ctors)) = self.adt_fields.get(name).cloned() else {
+            return Some(format!("the type `{name}`"));
+        };
+        ctors
+            .iter()
+            .flatten()
+            .find_map(|f| self.shape_not_data(f, &params, seen))
+    }
+
+    /// `not_data` over a declaration's field type, where its parameters are data.
+    fn shape_not_data(&self, t: &Ty, params: &[u32], seen: &mut Vec<String>) -> Option<String> {
+        match t {
+            Ty::Base(_) | Ty::Error => None,
+            Ty::Fn(..) => Some("a function type".to_string()),
+            Ty::Var(v) if params.contains(v) => None,
+            Ty::Var(_) => Some("a type not known to be data".to_string()),
+            Ty::Tuple(xs) => xs.iter().find_map(|x| self.shape_not_data(x, params, seen)),
+            Ty::Con(n, args) => args
+                .iter()
+                .find_map(|a| self.shape_not_data(a, params, seen))
+                .or_else(|| self.decl_not_data(n, seen)),
         }
     }
 
@@ -2505,6 +2532,15 @@ impl Infer {
                 .collect::<Vec<_>>(),
         ) {
             if let RowTail::Open(v) = self.resolve_row(&EffectRow::open(c)).tail {
+                row_in_env.push(v);
+            }
+        }
+        // A row a `with any` handler handles, not yet checked for data (E0434
+        // runs when the top-level group is solved), stays monomorphic in a
+        // local `let`: generalized, its later instantiations were never
+        // checked (the review's S3: `IO` hidden from a pure function).
+        for site in &self.pending_generic {
+            if let RowTail::Open(v) = self.resolve_row(&site.tail).tail {
                 row_in_env.push(v);
             }
         }

@@ -14,7 +14,7 @@ the game with an eight-sided die: diverged, asked World.roll(8) where the record
 two rounds of the game: finished with entries left over
 the shop, recorded: 4
   Store.stock("tea") = Left(10)
-  Store.sell("tea", 3) = ()
+  Store.sell("tea", 3) = Unit
   Store.stock("cake") = Left(1)
-  Store.sell("cake", 1) = ()
+  Store.sell("cake", 1) = Unit
 the shop: replayed, 4

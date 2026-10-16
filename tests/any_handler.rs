@@ -361,3 +361,171 @@ fn a_forwarding_recorder_is_not_charged_with_its_callers_effects() {
     );
     assert!(errors(&bad).contains("E0434"), "{}", errors(&bad));
 }
+
+// ---- the review of 2026-10-16 (each red first) ------------------------------
+
+/// S1: an escaped `resume` in a forwarding clause runs the clause again, which
+/// performs the handled row: the lambda carries it (it was typed pure, and the
+/// performs reached no handler at run time).
+#[test]
+fn an_escaped_resume_carries_the_forwarded_row() {
+    let rec = "effect World { fn roll(s: Int) -> Int }\n\
+               fn rec(body) {\n\
+                 let run = handle { body() } with any {\n\
+                   op(o) -> { let v = op.perform(o)  fn(u: Int) { resume(v)(u) } }\n\
+                   return(x) -> fn(u: Int) { x }\n\
+                 }\n\
+                 run\n\
+               }\n";
+    let s = schemes(rec);
+    assert!(
+        s.contains("rec : forall a b. fn(fn() / {b} -> a) / {b} -> fn(Int) / {b} -> a"),
+        "{s}"
+    );
+    let outside = format!(
+        "{rec}pub fn main() -> Int {{\n\
+           let g = handle {{ rec(fn() {{ roll(1) + roll(2) }}) }} with {{ World.roll(s) -> resume(s) }}\n\
+           g(0)\n\
+         }}\n"
+    );
+    assert!(errors(&outside).contains("E0420"), "{}", errors(&outside));
+    let pure = format!(
+        "{rec}fn pure_call(g: fn(Int) / {{}} -> Int) / {{}} -> Int {{ g(0) }}\n\
+         pub fn main() -> Int {{\n\
+           handle {{ pure_call(rec(fn() {{ roll(1) }})) }} with {{ World.roll(s) -> resume(s) }}\n\
+         }}\n"
+    );
+    assert!(errors(&pure).contains("E04"), "{}", errors(&pure));
+}
+
+/// S2: an effect's type parameter is not known at run time, so `op.decode` cannot
+/// check an answer of that type: it refuses by name instead of letting a String
+/// in as an Int.
+#[test]
+fn decoding_at_an_effect_parameter_is_refused_by_name() {
+    let src = "effect St(s) { fn get() -> s }\n\
+               fn replay(body) { handle { body() } with any { op(o) -> resume(op.decode(o, \"\\\"hello\\\"\")) } }\n\
+               fn prog() / {St(Int)} -> Int { get() + 1 }\n\
+               pub fn main() { io.println(int.to_string(replay(fn() { prog() }))) }\n";
+    assert_eq!(errors(src), "");
+    let err = run_source("t.elya", src).expect_err("refused");
+    assert!(
+        err.contains("op.decode") && err.contains("parameter"),
+        "{err}"
+    );
+}
+
+/// S3: a `with any` handler inside a local `let`-generalized lambda is still
+/// checked at each use (the local scheme generalized its handled tail before the
+/// group-end check could mark it).
+#[test]
+fn a_local_generic_handler_is_checked_at_each_use() {
+    for (src, why) in [
+        (
+            "effect World { fn roll(s: Int) -> Int }\n\
+             fn quiet() / {} -> Int {\n\
+               let r = fn(b) { handle { b() } with any { op(o) -> resume(op.decode(o, \"4\")) } }\n\
+               let x = r(fn() { roll(6) })\n\
+               r(fn() { io.println(\"hidden\")  x })\n\
+             }\npub fn main() -> Int { quiet() }\n",
+            "IO through a local handler",
+        ),
+        (
+            "effect World { fn roll(s: Int) -> Int }\n\
+             fn replay(body) { handle { body() } with any { op(o) -> resume(op.decode(o, \"4\")) } }\n\
+             fn quiet() / {} -> Int {\n\
+               let r = fn(b) { replay(b) }\n\
+               let x = r(fn() { roll(6) })\n\
+               r(fn() { io.println(\"hidden\")  x })\n\
+             }\npub fn main() -> Int { quiet() }\n",
+            "IO through a local wrapper of a top-level replayer",
+        ),
+        (
+            "effect Mk { fn make() -> fn(Int) -> Int }\n\
+             fn f() -> Int {\n\
+               let r = fn(b) { handle { b() } with any { op(o) -> resume(op.decode(o, \"4\")) } }\n\
+               let z = r(fn() { 0 })\n\
+               let g = r(fn() { make() })\n\
+               g(1)\n\
+             }\npub fn main() -> Int { f() }\n",
+            "a function answer through a local handler",
+        ),
+    ] {
+        assert!(errors(src).contains("E0434"), "{why}: {}", errors(src));
+    }
+}
+
+/// B1: a non-regular (nested) type is data; the check terminates.
+#[test]
+fn a_nested_type_is_checked_without_looping() {
+    let src = "type Opt(a) { No, Yes(a) }\n\
+               type Nest(a) { Z(a), S(Nest(Opt(a))) }\n\
+               effect E { fn e() -> Nest(Int) }\n\
+               fn replay(body) { handle { body() } with any { op(o) -> resume(op.decode(o, \"S(Z(Yes(1)))\")) } }\n\
+               pub fn main() { io.println(match replay(fn() { e() }) { Z(n) -> \"z\"  S(m) -> \"s\" }) }\n";
+    assert_eq!(errors(src), "");
+    assert_eq!(run_source("t.elya", src).expect("runs"), "s\n");
+    // ... and one with a function inside, at depth, is still refused.
+    let bad = "type Opt(a) { No, Yes(a) }\n\
+               type Nest(a) { Z(a), S(Nest(Opt(a))) }\n\
+               effect E { fn e() -> Nest(fn(Int) -> Int) }\n\
+               fn replay(body) { handle { body() } with any { op(o) -> resume(op.decode(o, \"1\")) } }\n\
+               pub fn main() { io.println(match replay(fn() { e() }) { Z(n) -> \"z\"  S(m) -> \"s\" }) }\n";
+    assert!(errors(bad).contains("E0434"), "{}", errors(bad));
+}
+
+/// B2: encoding and decoding do not recurse on the host stack: a 100 000-cell
+/// list round-trips (lists of that length run everywhere else).
+#[test]
+fn a_long_list_round_trips() {
+    let src = "type L { Nil, Cons(Int, L) }\n\
+               effect Q { fn big(n: Int) -> L }\n\
+               fn build(n: Int, acc: L) -> L { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }\n\
+               fn len(l: L, a: Int) -> Int { match l { Nil -> a  Cons(x, r) -> len(r, a + 1) } }\n\
+               fn rt(body) {\n\
+                 handle { body() } with any {\n\
+                   op(o) -> { let v = op.perform(o)  resume(op.decode(o, op.encode(o, v))) }\n\
+                 }\n\
+               }\n\
+               pub fn main() {\n\
+                 let r = handle { rt(fn() { len(big(100000), 0) }) } with { Q.big(n) -> resume(build(n, Nil)) }\n\
+                 io.println(int.to_string(r))\n\
+               }\n";
+    assert_eq!(errors(src), "");
+    assert_eq!(run_source("t.elya", src).expect("runs"), "100000\n");
+}
+
+/// B3 and N1: floats encode as decimals (no exponent) and the three non-finite
+/// words round-trip; `Unit` is spelled as Elya spells it.
+#[test]
+fn floats_and_unit_round_trip() {
+    let src = "effect Q { fn f(x: Float) -> Float  fn u() -> Unit }\n\
+               fn rt(body) {\n\
+                 handle { body() } with any {\n\
+                   op(o) -> { let v = op.perform(o)  let e = op.encode(o, v)  io.println(e)  resume(op.decode(o, e)) }\n\
+                 }\n\
+               }\n\
+               pub fn main() {\n\
+                 let big = 10000000000000000000000000000000000000000.0\n\
+                 let inf = big *. big *. big *. big *. big *. big *. big *. big\n\
+                 let _ = handle { rt(fn() { let a = f(big)  let b = f(0.0 -. inf)  let c = f(1.0)  u() }) } with {\n\
+                   Q.f(x) -> resume(x)\n\
+                   Q.u() -> resume(Unit)\n\
+                 }\n\
+                 io.println(\"ok\")\n\
+               }\n";
+    assert_eq!(errors(src), "");
+    assert_eq!(
+        run_source("t.elya", src).expect("runs"),
+        "10000000000000000000000000000000000000000.0\n-inf\n1.0\nUnit\nok\n"
+    );
+}
+
+/// N3: two operation values compare by what they are.
+#[test]
+fn an_operation_equals_itself() {
+    let src = "effect World { fn roll(s: Int) -> Int }\n\
+               fn f(body) { handle { body() } with any { op(o) -> if o == o { resume(op.decode(o, \"2\")) } else { 0 } } }\n\
+               pub fn main() { io.println(int.to_string(f(fn() { roll(6) + 1 }))) }\n";
+    assert_eq!(run_source("t.elya", src).expect("runs"), "3\n");
+}

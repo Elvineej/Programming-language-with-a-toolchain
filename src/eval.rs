@@ -79,6 +79,19 @@ impl PartialEq for Value {
             (Unit, Unit) => true,
             (Fn(a), Fn(b)) => a == b,
             (Ctor(n1, a1), Ctor(n2, a2)) => n1 == n2 && a1 == a2,
+            // Two operations are equal when they are the same question.
+            (
+                Op {
+                    effect: e1,
+                    op: o1,
+                    args: a1,
+                },
+                Op {
+                    effect: e2,
+                    op: o2,
+                    args: a2,
+                },
+            ) => e1 == e2 && o1 == o2 && a1 == a2,
             _ => false,
         }
     }

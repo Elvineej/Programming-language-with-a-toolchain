@@ -1,6 +1,6 @@
 # Operation-generic handlers: a recorder for any effect (`with any`)
 
-**Status:** in progress (2026-10-16). HANDOFF step 1 (ROADMAP priority 3, the replay
+**Status:** done (2026-10-16), evaluator only. HANDOFF step 1 (ROADMAP priority 3, the replay
 step before the CLI flags). The design choices are Claude's under the maintainer's
 delegation (rule 2), recorded here.
 
@@ -114,7 +114,7 @@ a typed answer that can be logged and fed back. That is what this slice adds.
   needs each operation's name, arity and answer type for `show`/`decode`) is a later
   step.
 - **D7. Literal syntax is the encoding:** `42`, `-7`, `1.5`, `"a\"b"`, `True`, `False`,
-  `()`, `Cons(1, Nil)`. Constructor names are unique per module, so a literal describes
+  `Unit`, `Cons(1, Nil)`. Constructor names are unique per module, so a literal describes
   itself. `decode` checks it against the declared answer type, through constructors
   and their fields. A position that is an effect's type parameter accepts any data
   literal (the parameter is not known at run time).
@@ -132,3 +132,37 @@ a typed answer that can be logged and fed back. That is what this slice adds.
 
 Native: a refusal by name. The example: `examples/09_record_any.elya`, one generic
 `record` and `replay` used over two unrelated effects.
+
+## 3. Review (2026-10-16)
+
+An independent review found three soundness holes and three bugs, all fixed test-first
+(tests/any_handler.rs, "the review" section; each was red first):
+
+- **S1, effects.** An escaped `resume` in a FORWARDING clause re-enters the clause,
+  which performs the handled tail. The handle's clauses row took the clauses' labels
+  but not that tail, so the lambda was typed pure, and natively-unreachable performs
+  hit "internal: unhandled effect" in the evaluator. Now a clause whose tail is the
+  handled tail adds it to the clauses row.
+- **S2, values.** D7 let `op.decode` accept any data at an effect's own type
+  parameter, so `St(Int)`'s `get` could be answered `"hello"`. **D7 revised:** decoding
+  an answer whose type mentions an effect parameter is refused by name ("... mentions
+  the effect's parameter `s`, which is not known at run time"). Carrying the
+  instantiation into the operation value is the native step's job: it needs type
+  tables anyway.
+- **S3, E0434 bypassed.** A `with any` handler inside a local `let`-generalized lambda
+  was generalized before the group-end check could mark its tail, so later uses were
+  never checked (`IO` hidden from a `/ {}` function; a function answer decoded). Now a
+  row with a pending check is not generalized by a local `let`.
+- **B1.** `not_data` looped on a non-regular type (`Nest(a) { S(Nest(Opt(a))) }`). Now
+  a declared type is data when its arguments are and its declaration is (parameters
+  taken as data), each checked once.
+- **B2.** show, parse and check recursed on the host stack, so a 10 000-cell list
+  aborted. All four walks are iterative now; a 100 000-cell list round-trips.
+- **B3 and N1.** Floats are decimals without an exponent, plus `inf`, `-inf` and `NaN`,
+  which used not to decode. `Unit` is spelled `Unit` (it was `()`, which is not Elya).
+- Nits: the decode message prints `fn(A) -> R`; two operation values compare by
+  their question (`o == o` was False).
+- **R1, recorded under D8.** A generic recorder that forwards a `multi` operation
+  (`record` around `07_search`) fails by name at run time (E0425, "resumed more than
+  once"). The same holds today for any one-shot handler whose clause performs a
+  `multi` operation, so it is not specific to `with any`.
