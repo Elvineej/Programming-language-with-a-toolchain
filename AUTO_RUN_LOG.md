@@ -3,7 +3,13 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-16 12:30 UTC — IN PROGRESS (scheduled run, resumed session)
+## 2026-10-16 17:53 UTC — IN PROGRESS (scheduled run)
+
+- The 12:30 entry never marked DONE; its last commit (2b7ce18) is 14:33, over 3 hours
+  ago, so this run takes over at 2b7ce18. Next: HANDOFF step 1, deep non-tail recursion
+  natively.
+
+## 2026-10-16 12:30 UTC — ended without a DONE mark (taken over 2026-10-16 17:53)
 
 - The 2026-10-15 17:53 run's session resumed after its usage limit. The 05:53 run's last
   commit (0d1d0dc) is 07:55, over 3 hours ago, so this run takes over at 0d1d0dc.
