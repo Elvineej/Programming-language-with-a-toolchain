@@ -31,6 +31,14 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   compilation (named in the commit). Review: 1 finding (a widened row on the inner
   call), fixed test-first. Gate 1012 / 95.
 - Windows-gate debt added: 05f0676.
+- **Done: argument records past three parameters** (742a840, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-16-elya-argument-records-design.md`. **Decision (mine;
+  please review):** one rule for every kind (more than three parameters: two kept, the
+  rest in one record), not per-kind or win64-only spilling. **Changed expectations by
+  this decision:** five lib.rs arity-refusal tests now assert compilation. Review: 1
+  high finding (record keys), fixed test-first. Gate 1015 / 95.
+- Windows-gate debt added: 742a840 (**priority**: the point of the slice is win64's
+  tail-call cap).
 
 ## 2026-10-16 05:53 UTC — ended without a DONE mark (taken over 2026-10-16 12:30)
 
