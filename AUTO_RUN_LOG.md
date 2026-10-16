@@ -6,8 +6,29 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 ## 2026-10-16 17:53 UTC — IN PROGRESS (scheduled run)
 
 - The 12:30 entry never marked DONE; its last commit (2b7ce18) is 14:33, over 3 hours
-  ago, so this run takes over at 2b7ce18. Next: HANDOFF step 1, deep non-tail recursion
-  natively.
+  ago, so this run takes over at 2b7ce18. LLVM 18 dev headers installed via apt.
+  Baseline 1033 / 99.
+- **Done: deep non-tail recursion natively** (94ee05e, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-16-elya-native-stack-design.md`. Native programs run on
+  their own 1 GiB stack (`elya_start`); `len` over 1 000 000 and a non-tail resume over
+  1 000 000 run (they died with an unnamed SIGSEGV past about 130 000 frames); an overflow
+  is now `elya: native stack overflow: ...`, exit 1. Review: 2 medium + 2 low findings;
+  M1 and L1 fixed test-first. Gate 1039 / 99 (predicted 1039).
+  - **Decisions (mine; please review):** a FIXED 1 GiB stack (not sized from the
+    machine's memory, for reproducibility), `ELYA_STACK_MIB` overrides, no silent
+    fallback. **Consequence (review M2):** under `ulimit -v` below about 1 GiB, or strict
+    overcommit on a small machine, every native program stops with `elya: cannot
+    reserve a stack of 1024 MiB (ELYA_STACK_MIB sets a smaller one)`. If you prefer a
+    fallback or a smaller default, say so.
+  - Elya functions are now mangled `elya.<name>` (a function named `alloc`, `println` or
+    `start` failed to link against the runtime's own symbol).
+  - Existing native tests run their binaries with `ELYA_STACK_MIB=8` (the stack they were
+    written against), so tail-call regressions still overflow.
+- PR #23 was merged by the maintainer (2026-10-16 18:32, at ab791b6); a new draft PR is
+  open from `auto/elya`.
+- Windows-gate debt added: 94ee05e (**priority**: the Windows `elya_start` path --
+  CreateThread reservation, SetThreadStackGuarantee, the vectored handler -- has never
+  run).
 
 ## 2026-10-16 12:30 UTC — ended without a DONE mark (taken over 2026-10-16 17:53)
 
