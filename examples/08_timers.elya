@@ -119,9 +119,9 @@ fn stuck(q, st) {
   }
 }
 
-// Round robin over (id, step). `stalled` counts the tasks passed over since
-// the last one that made progress: once it covers the whole queue, every
-// task is stuck.
+// One turn of the poll loop: a timer whose deadline has passed wakes before
+// anything else runs, so a busy queue cannot starve a sleeper. (Asking the
+// clock every turn is what makes that true under a real clock.)
 fn run(q, st, stalled) {
   match st {
     Sched(timers, results, next) -> match q {
@@ -129,6 +129,23 @@ fn run(q, st, stalled) {
         Nil -> Finished(results)
         Cons(t, later) -> stuck(Nil, st)
       }
+      Cons(first, others) -> match timers {
+        Nil -> turn(q, st, stalled)
+        Cons(Timer(d, id, k), later) ->
+          if d <= now() { run(append(q, Pair(id, k(Unit))), Sched(later, results, next), 0) }
+          else { turn(q, st, stalled) }
+      }
+    }
+  }
+}
+
+// Round robin over (id, step). `stalled` counts the tasks passed over since
+// the last one that made progress: once it covers the whole queue, every
+// task is stuck.
+fn turn(q, st, stalled) {
+  match st {
+    Sched(timers, results, next) -> match q {
+      Nil -> run(q, st, stalled)
       Cons(Pair(id, s), rest) -> match s {
         Done(v) -> run(rest, Sched(timers, Cons(Pair(id, v), results), next), 0)
         Yielded(k) -> run(append(rest, Pair(id, k())), st, 0)
@@ -162,7 +179,7 @@ fn scope(body: fn() / {Async, Log} -> Int) / {Log, Clock} -> Int {
       None -> 0 - 1
     }
     Deadlock(stuck_ids) -> {
-      let _ = say("  deadlock: tasks" <> show_ids(stuck_ids) <> " wait on each other")
+      let _ = say("  deadlock: tasks" <> show_ids(stuck_ids) <> " can never finish")
       0 - 1
     }
   }
@@ -172,7 +189,7 @@ fn scope(body: fn() / {Async, Log} -> Int) / {Log, Clock} -> Int {
 
 // Time that moves only when the scheduler waits. A handler's answer can be a
 // function: here, of the current time.
-fn virtual_clock(body: fn() / {Clock, Log} -> Int) / {Log} -> Int {
+fn virtual_clock(body: fn() / {Clock, Log} -> a) / {Log} -> a {
   let go = handle { body() } with {
     Clock.now() -> fn(t: Int) { resume(t)(t) }
     Clock.wait_until(d) -> fn(t: Int) { if d > t { resume(Unit)(d) } else { resume(Unit)(t) } }
@@ -182,7 +199,7 @@ fn virtual_clock(body: fn() / {Clock, Log} -> Int) / {Log} -> Int {
 }
 
 // The machine's clock.
-fn real_clock(body: fn() / {Clock, Log} -> Int) / {Log, IO} -> Int {
+fn real_clock(body: fn() / {Clock, Log} -> a) / {Log, IO} -> a {
   handle { body() } with {
     Clock.now() -> resume(time.now_ms())
     Clock.wait_until(d) -> {
@@ -218,24 +235,34 @@ fn deadlocked() / {Async} -> Int {
   await(x) + await(y)
 }
 
-// The fetches in a scope, and the time they took.
-fn timed() / {Clock, Log} -> Int {
+// What the fetches answered, and the time they took.
+type Timed { Timed(Int, Int) }
+
+fn timed() / {Clock, Log} -> Timed {
   let t0 = now()
   let total = scope(fn() { fetches() })
-  total * 1000 + (now() - t0)
+  Timed(total, now() - t0)
 }
 
 pub fn main() -> Int {
   handle {
     let _ = say("virtual clock:")
-    let v = virtual_clock(fn() { timed() })
-    let _ = say("  60 ms of requests in " <> int.to_string(v % 1000) <> " virtual ms")
+    let v = match virtual_clock(fn() { timed() }) {
+      Timed(total, ms) -> {
+        let _ = say("  " <> int.to_string(total) <> " ms of requests in " <> int.to_string(ms) <> " virtual ms")
+        total * 100 + ms
+      }
+    }
     let _ = say("a deadlock:")
     let d = virtual_clock(fn() { scope(fn() { deadlocked() }) })
     let _ = say("real clock:")
-    let r = real_clock(fn() { timed() })
-    let _ = say(if r % 1000 >= 30 { "  at least 30 real ms" } else { "  too soon" })
-    v * 10 + d * (0 - 1) + r / 1000
+    let r = match real_clock(fn() { timed() }) {
+      Timed(total, ms) -> {
+        let _ = say(if ms >= 30 { "  at least 30 real ms" } else { "  too soon" })
+        total
+      }
+    }
+    v * 10 + d * (0 - 1) + r
   } with {
     Log.say(line) -> {
       io.println(line)

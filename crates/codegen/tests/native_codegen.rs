@@ -5063,11 +5063,11 @@ fn the_timers_example_runs_natively() {
         text,
         "virtual clock:\n  b answered (10 ms)\n  c answered (20 ms)\n  a answered (30 ms)\n\
          \x20 60 ms of requests in 30 virtual ms\na deadlock:\n\
-         \x20 deadlock: tasks 1 0 2 wait on each other\nreal clock:\n\
+         \x20 deadlock: tasks 1 0 2 can never finish\nreal clock:\n\
          \x20 b answered (10 ms)\n  c answered (20 ms)\n  a answered (30 ms)\n\
          \x20 at least 30 real ms\n"
     );
-    assert_eq!(value, "600361");
+    assert_eq!(value, "60361");
     assert_eq!(value, eval_main_int(src));
 }
 

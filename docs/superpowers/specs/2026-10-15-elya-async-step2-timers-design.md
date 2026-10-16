@@ -85,3 +85,28 @@ rewritten from 06's scheduler. Measured on the way:
   exit 124), already in the virtual part. The poll loop itself depends on the stall
   count: a body awaiting sleeping tasks is "stuck" until a timer fires.
 - **T3** was task 2's (`sleep_ms` returning at once).
+
+## 4. Review (2026-10-16)
+
+An independent review found no correctness bug, and these risks, fixed test-first:
+- **Starvation.** Timers were looked at only when every task was stuck, so a busy queue
+  starved a sleeper whose deadline had passed (a 1 ms sleeper woke after ~485 ms
+  behind 3000 yields). `run` now polls the earliest timer every turn, and `turn` is the
+  round robin. Test: `an_expired_timer_fires_while_other_tasks_run` (tests/timers.rs)
+  runs the example's scheduler under a `ticking` clock. Red first, with the predicted
+  order reversed ("spinner done" first). The red run is the control.
+- **Windows sleeps.** `Sleep` may return early and `GetTickCount64` moves in 10-16 ms
+  steps, so `elya_time_sleep_ms` now waits on the same clock until it has moved by `ms`.
+  This can't be built here (Windows-gate debt).
+- **A timing-dependent value.** The answer used to fold the real elapsed time into
+  `r / 1000`. `timed` now answers `Timed(total, ms)`; the clocks are generic in their
+  answer. The value is 60361 at any speed.
+- **Wording.** The deadlock line names every task that can never finish, not only a
+  cycle: "tasks 1 0 2 can never finish".
+
+Left as they are, by decision:
+- A deadline is taken when the scheduler dequeues the `Sleeping` step, up to one lap late
+  under a real clock. A task cannot read the clock (no `Clock` in its row), and one lap
+  is the scheduler's resolution anyway.
+- The evaluator's clock origin is set by the first time builtin; native's by the first
+  `now_ms`. Both are "an arbitrary start" (D3).

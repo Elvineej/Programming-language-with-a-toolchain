@@ -338,10 +338,16 @@ void elya_time_sleep_ms(int64_t ms) {
         return;
     }
 #ifdef _WIN32
-    while (ms > 0) {
-        DWORD part = ms > 0x7fffffff ? 0x7fffffff : (DWORD)ms;
-        Sleep(part);
-        ms -= part;
+    /* `Sleep` may return before its interval, and `GetTickCount64` moves in
+     * 10-16 ms steps, so wait on the clock `time.now_ms` reads until it has
+     * moved by `ms` (the 2026-10-16 review). */
+    int64_t end = elya_time_raw_ms() + ms;
+    for (;;) {
+        int64_t left = end - elya_time_raw_ms();
+        if (left <= 0) {
+            break;
+        }
+        Sleep(left > 0x7fffffff ? 0x7fffffff : (DWORD)left);
     }
 #else
     struct timespec req = {(time_t)(ms / 1000), (long)((ms % 1000) * 1000000L)};
