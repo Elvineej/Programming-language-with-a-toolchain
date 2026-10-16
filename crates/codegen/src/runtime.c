@@ -9,12 +9,18 @@
 #include <windows.h>
 #else
 #include <errno.h>
+#include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <sys/mman.h>
 #include <time.h>
 #endif
 
 /* The Elya native runtime: a stop-the-world, non-moving mark-sweep collector.
  * Single-threaded throughout — Elya has no native concurrency yet, so none of
- * this state needs synchronisation.
+ * this state needs synchronisation. (The program runs on a thread of its own,
+ * `elya_start`, but only one thread ever runs Elya code, and the main thread
+ * reads the collector's state only after joining it.)
  *
  * Object layout (5b-5 plan, pinned). `elya_alloc(words)` reserves `words + 2`
  * and returns a pointer to word 2, so the collector's prefix sits IN FRONT of
@@ -547,3 +553,178 @@ void *elya_cont_copy(void *cont, int64_t hlo, int64_t hhi) {
     free(vals);
     return fresh;
 }
+
+/* The program's own stack (spec 2026-10-16-elya-native-stack). `@main` calls
+ * `elya_start` with `@elya_entry`, which calls `main`'s function; it runs on a
+ * thread whose stack is a fixed, documented size (D1: 1 GiB, or ELYA_STACK_MIB,
+ * D2), reserved, not committed, so a shallow program pays nothing. Reaching its
+ * end is a NAMED failure, never a bare signal (D5). The collector never looks at
+ * the machine stack (its roots are the shadow stack), so it is unaffected. */
+#define ELYA_STACK_DEFAULT_MIB 1024
+#define ELYA_STACK_MAX_MIB 1048576
+
+typedef int64_t (*elya_entry_fn)(void);
+static elya_entry_fn elya_entry_ptr;
+static int64_t elya_entry_result;
+static int64_t elya_stack_mib = ELYA_STACK_DEFAULT_MIB;
+
+/* Output already written stays written (flushed first), then the one line,
+ * exit status 1 like every runtime trap. */
+static void elya_stack_overflowed(void) {
+    fflush(stdout);
+    fprintf(stderr, "elya: native stack overflow: recursion deeper than the %lld MiB stack\n",
+            (long long)elya_stack_mib);
+    fflush(stderr);
+    exit(1);
+}
+
+static void elya_stack_unavailable(void) {
+    fprintf(stderr, "elya: cannot reserve a stack of %lld MiB (ELYA_STACK_MIB sets a smaller one)\n",
+            (long long)elya_stack_mib);
+    exit(1);
+}
+
+/* D2: a whole number of MiB, 1 to ELYA_STACK_MAX_MIB, or the default when the
+ * variable is unset. Anything else stops here, before the program runs. */
+static int64_t elya_stack_size_mib(void) {
+    const char *s = getenv("ELYA_STACK_MIB");
+    if (!s) {
+        return ELYA_STACK_DEFAULT_MIB;
+    }
+    int64_t v = 0;
+    int ok = *s != '\0';
+    for (const char *p = s; ok && *p; p++) {
+        if (*p < '0' || *p > '9') {
+            ok = 0;
+        } else {
+            v = v * 10 + (*p - '0');
+            if (v > ELYA_STACK_MAX_MIB) {
+                ok = 0;
+            }
+        }
+    }
+    if (!ok || v < 1) {
+        fputs("elya: ELYA_STACK_MIB must be a whole number of MiB from 1 to 1048576\n", stderr);
+        exit(1);
+    }
+    return v;
+}
+
+#ifdef _WIN32
+/* Room for the handler to run on the overflowed thread. */
+static DWORD WINAPI elya_program_thread(LPVOID arg) {
+    (void)arg;
+    ULONG guarantee = 64 * 1024;
+    SetThreadStackGuarantee(&guarantee);
+    elya_entry_result = elya_entry_ptr();
+    return 0;
+}
+
+static LONG CALLBACK elya_overflow_handler(PEXCEPTION_POINTERS e) {
+    if (e->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
+        elya_stack_overflowed();
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+int64_t elya_start(elya_entry_fn entry) {
+    elya_stack_mib = elya_stack_size_mib();
+    elya_entry_ptr = entry;
+    AddVectoredExceptionHandler(1, elya_overflow_handler);
+    HANDLE t = CreateThread(NULL, (SIZE_T)elya_stack_mib << 20, elya_program_thread, NULL,
+                            STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!t) {
+        elya_stack_unavailable();
+    }
+    WaitForSingleObject(t, INFINITE);
+    CloseHandle(t);
+    return elya_entry_result;
+}
+#else
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+/* D5: 1 MiB of PROT_NONE below the stack, so no frame can step over it. */
+#define ELYA_GUARD_BYTES ((size_t)1 << 20)
+
+static char *elya_guard_lo;
+static char *elya_guard_hi;
+static sigjmp_buf elya_overflow_jump;
+static char elya_signal_stack[64 * 1024];
+
+/* On the alternate stack. A fault in the guard is the overflow: jump back to
+ * the thread's entry, whose stack is intact, and report from there. Any other
+ * fault is not ours to name: restore the default action and return, so the
+ * faulting instruction runs again and the process dies by the signal, as it
+ * always did. */
+static void elya_fault(int sig, siginfo_t *info, void *uc) {
+    (void)uc;
+    char *a = (char *)info->si_addr;
+    if (a >= elya_guard_lo && a < elya_guard_hi) {
+        siglongjmp(elya_overflow_jump, 1);
+    }
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    sigaction(sig, &dfl, NULL);
+    /* A signal SENT (kill, raise: si_code <= 0) has no instruction to run
+     * again; send it once more, now to the default action (the 2026-10-16
+     * review, L1). It is blocked while this handler runs, so it is delivered,
+     * and kills, as the handler returns. */
+    if (info->si_code <= 0) {
+        raise(sig);
+    }
+}
+
+static void *elya_program_thread(void *arg) {
+    (void)arg;
+    stack_t ss;
+    ss.ss_sp = elya_signal_stack;
+    ss.ss_size = sizeof elya_signal_stack;
+    ss.ss_flags = 0;
+    if (sigaltstack(&ss, NULL) != 0) {
+        elya_stack_unavailable();
+    }
+    if (sigsetjmp(elya_overflow_jump, 1)) {
+        elya_stack_overflowed();
+    }
+    elya_entry_result = elya_entry_ptr();
+    return NULL;
+}
+
+int64_t elya_start(elya_entry_fn entry) {
+    elya_stack_mib = elya_stack_size_mib();
+    elya_entry_ptr = entry;
+    size_t size = (size_t)elya_stack_mib << 20;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+    flags |= MAP_NORESERVE;
+#endif
+    char *base = (char *)mmap(NULL, size + ELYA_GUARD_BYTES, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (base == (char *)MAP_FAILED) {
+        elya_stack_unavailable();
+    }
+    if (mprotect(base, ELYA_GUARD_BYTES, PROT_NONE) != 0) {
+        elya_stack_unavailable();
+    }
+    elya_guard_lo = base;
+    elya_guard_hi = base + ELYA_GUARD_BYTES;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = elya_fault;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL); /* macOS reports a guard page as SIGBUS */
+    pthread_attr_t attr;
+    pthread_t t;
+    if (pthread_attr_init(&attr) != 0 || pthread_attr_setstack(&attr, base + ELYA_GUARD_BYTES, size) != 0 ||
+        pthread_create(&t, &attr, elya_program_thread, NULL) != 0) {
+        elya_stack_unavailable();
+    }
+    pthread_attr_destroy(&attr);
+    pthread_join(t, NULL);
+    return elya_entry_result;
+}
+#endif

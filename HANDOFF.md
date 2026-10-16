@@ -14,7 +14,8 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1033 passed, 99 suites. Since `main`, the runtime
+- Linux gate at the tip of `auto/elya`: 1039 passed, 99 suites. Native programs run on
+  their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions; `gc_mark` is unchanged (637 bytes of source).
 - Interactive sessions may also work on `auto/elya`. They use the same
@@ -312,18 +313,18 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   failing run; `--replay T` reproduces the run from it, stopping by name at a divergence
   or on unread entries. Evaluator only.
 
+- **Deep non-tail recursion natively** (2026-10-16, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-16-elya-native-stack-design.md`. The program runs on
+  its own stack (`elya_start` in runtime.c: 1 GiB reserved, a guard below it, a thread
+  that owns it; `ELYA_STACK_MIB` overrides), so `len` over 1 000 000 and a non-tail
+  resume over 1 000 000 run natively; overflowing it is the named `elya: native stack
+  overflow: ...`, exit 1. Elya functions are now mangled `elya.<name>` (a function named
+  `alloc`, `println` or `start` linked against the runtime's own symbol). Needs the
+  Windows gate.
+
 ## The next five steps
 
-### 1. Deep non-tail recursion natively
-
-Measured 2026-10-16: `fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }` over
-200 000 elements runs in the evaluator (its continuation is on the heap) and dies
-natively with SIGSEGV (the machine stack; fine under `ulimit -s unlimited`). Decide in a
-spec: a large dedicated stack for `main` (mmap with a guard page) plus a NAMED
-"native stack overflow" diagnostic from the guard page, or deeper changes (CPS for deep
-recursion). Measure the current depth limit first, on Linux and Windows.
-
-### 2. Structural equality
+### 1. Structural equality
 
 `==` on an ADT value, a tuple or a list is refused natively ("Eq on an unrepresentable
 operand type") and decided by the evaluator's own rules. Measure what the evaluator does
@@ -332,7 +333,7 @@ error on functions -- E04xx at check time rather than at run time), and compile 
 natively (a runtime walk guided by the descriptor table, or generated per-type
 equality functions after N7 part 2's instances).
 
-### 3. A differential sweep, again
+### 2. A differential sweep, again
 
 The 2026-10-15 sweep (about 700 programs: every corpus, example and probe through
 `elya run` and `elya build`) found the N7 instance-key miscompile and ranked the native
@@ -340,20 +341,29 @@ refusals. Re-run it at the tip: list every program the evaluator runs and native
 or gets wrong, rank the refusals by count, and turn the top one into the next step.
 Keep the sweep script under `scripts/` so the next run can repeat it.
 
-### 4. Unary minus and wrapping arithmetic natively
+### 3. Unary minus and wrapping arithmetic natively
 
 Also-open items since 2026-10-10: Core refuses unary minus ("Unary"), so every native
 example writes `0 - 1`; and hashes and generators need explicit wrapping arithmetic
 (`int.wrapping_mul` and friends) now that `Int` is checked. Measure which corpus programs
 use `-x`, add the lowering, and decide the wrapping builtins' names in a spec.
 
-### 5. Record and replay natively
+### 4. Record and replay natively
 
 `elya run --record/--replay` (Done) works in the evaluator only; a native binary asks
 the runtime's clock directly. Add the same trace to the runtime (an environment
 variable or flag read by the shim: `ELYA_RECORD=file` / `ELYA_REPLAY=file`), with the
 same format and the same named failures, and a differential test that a trace recorded
 by `elya run` replays natively and the reverse.
+
+### 5. Multi-shot resumes over a deep chain
+
+Found by the native-stack review (PARKED.md, 2026-10-16): a `with multi` handler whose
+clause resumes non-tail over a deep non-tail recursion (`nest(20000)`) runs out of
+memory natively, because every resume copies the whole captured chain
+(`elya_cont_copy`), O(d^2) frames in all. Measure the evaluator on the same program and
+the native growth by depth, then decide in a spec: share the chain's unchanged prefix
+(copy-on-write of handler frames only), or copy lazily as frames are re-entered.
 
 Also open, unscheduled: `with any` natively (per-operation name and
 type tables in the runtime, `op.decode` at an effect's parameter once the instantiation
@@ -369,5 +379,4 @@ of the soundness sweep (recursion through a handle body and through a lambda: do
 2026-10-15). A perform walks the handler chain, so a program whose handler stack really grows
 (a resume inside a fresh handle every iteration) pays O(depth) per perform; the evaluator
 is no faster there. Also: the Elya CEK machine's next versions (a parser for its terms, a step
-counter as an Elya effect); PIC/PIE linking (needs a Windows run), and a named diagnosis for
-a native stack overflow in tests other than A9.
+counter as an Elya effect); PIC/PIE linking (needs a Windows run).

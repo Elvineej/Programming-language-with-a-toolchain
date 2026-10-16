@@ -133,13 +133,14 @@ fn eq_operand_label(op: BinOp) -> &'static str {
 }
 
 /// Every Elya function gets this prefix (§4.1). Prefixing is injective, so no
-/// two Elya names collide, and no Elya name can collide with the three symbols
-/// this back end generates or imports: `@main` (the print shim), `@printf`
-/// (external), `@.fmt` (the format string). `main` mangles to `elya_main` —
-/// byte-identical to the name 5b-1 already hardcoded, so the shim is unchanged.
-/// An Elya function literally named `elya_main` mangles to `elya_elya_main`.
+/// two Elya names collide. The separator is a dot (the 2026-10-16 review, M1):
+/// with `elya_` an Elya function named `alloc`, `println` or `start` became
+/// the runtime's own C symbol and the link failed. No C identifier contains a
+/// dot, so no Elya name can collide with runtime.c (`elya_*`), with the
+/// symbols this back end generates (`@main`, `@elya_entry`, `@.fmt`) or with
+/// `@printf`. `main` mangles to `elya.main`.
 fn mangle(name: &str) -> String {
-    format!("elya_{name}")
+    format!("elya.{name}")
 }
 
 /// LLVM's `tailcc`. Value from llvm/IR/CallingConv.h: `Tail = 18`. EVERY
@@ -239,7 +240,7 @@ fn fn_type_of<'ctx>(
     }
 }
 
-/// `main` returns i64: `@elya_main`'s signature says so and the print shim's
+/// `main` returns i64: `@elya.main`'s signature says so and the print shim's
 /// format string is `%lld`. A `Bool`-bodied main is a representable value in an
 /// unrepresentable *place*, so it is refused at the module boundary rather than
 /// inside the fold — which is why this message stayed "non-Int value" when the
@@ -1853,7 +1854,7 @@ fn build_ctor_table(core: &CoreModule) -> HashMap<String, (usize, Vec<Ty>)> {
     out
 }
 
-/// Build the verified LLVM module for `core` into `ctx`: `@elya_main` lowering
+/// Build the verified LLVM module for `core` into `ctx`: `@elya.main` lowering
 /// the Core body, plus (Task 4) the printf declaration, format-string global,
 /// and `@main` shim. Returns the handle so `emit_ir` and `compile_module` share
 /// one construction path.
@@ -1939,7 +1940,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
 
     let main = find_main(core)?;
     // §5.5: `main` ALONE. The scope narrows from "every function" (which was
-    // trivially just `main` in N1) to "`main`", because `@elya_main`'s signature
+    // trivially just `main` in N1) to "`main`", because `@elya.main`'s signature
     // says i64 and the shim's format string is `%lld`. Applying this per
     // function would refuse every ordinary predicate — see `is_pos` in the
     // corpus — and is the most likely way to implement this section wrong.
@@ -1977,7 +1978,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
 
     // 5b-5: the collector's four symbols. All `ccc` for the same reason the
     // first two are — this is the C-ABI boundary. Task 3 calls all four:
-    // `elya_gc_init` hands over the descriptor table before `@elya_main` runs,
+    // `elya_gc_init` hands over the descriptor table before `@elya.main` runs,
     // the shadow-stack pair brackets every allocation, and the stats dump
     // closes the shim.
     let gc_init_ty = ctx.void_type().fn_type(&[ptrt.into(), i64t.into()], false);
@@ -2065,7 +2066,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
 
     // §3.5/§4: the print convention is ONE external symbol (printf) plus ONE
     // generated shim (@main). The shim stays `ccc` — it is the C entry point —
-    // and its call to @elya_main is an ordinary call.
+    // and its call to @elya.main is an ordinary call.
     let printf_ty = i32t.fn_type(&[ptrt.into(), i64t.into()], true);
     let printf = module.add_function("printf", printf_ty, None);
 
@@ -2098,10 +2099,27 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     desc_global.set_constant(true);
     desc_global.set_unnamed_addr(true);
 
+    let entry = module.add_function("elya_entry", i64t.fn_type(&[], false), None); // ccc
+    let entry_bb = ctx.append_basic_block(entry, "entry");
+    b.position_at_end(entry_bb);
+    let site = b.build_call(elya_main, &[], "v").map_err(internal)?;
+    // The wrapper itself is `ccc`, but @elya.main is `tailcc`, so THIS CALL
+    // SITE must say so too. A site whose convention disagrees with its callee's
+    // declaration is a miscompile, not a verifier error — LLVM will happily emit
+    // it. The call is not `musttail`: the conventions differ.
+    site.set_call_convention(TAILCC);
+    let main_value = site
+        .try_as_basic_value()
+        .left()
+        .ok_or_else(|| internal("elya_main did not return a value"))?;
+    b.build_return(Some(&main_value)).map_err(internal)?;
+    let start_ty = i64t.fn_type(&[ptrt.into()], false);
+    let start = module.add_function("elya_start", start_ty, None); // ccc
+
     let shim = module.add_function("main", i32t.fn_type(&[], false), None);
     let shim_entry = ctx.append_basic_block(shim, "entry");
     b.position_at_end(shim_entry);
-    // BEFORE @elya_main: the collector cannot interpret a single object until it
+    // BEFORE @elya.main: the collector cannot interpret a single object until it
     // has the table, so handing it over is the first thing the process does.
     b.build_call(
         gc_init,
@@ -2112,18 +2130,21 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         "",
     )
     .map_err(internal)?;
-    let site = b.build_call(elya_main, &[], "v").map_err(internal)?;
-    // The shim itself stays `ccc`, but @elya_main is now `tailcc`, so THIS CALL
-    // SITE must say so too. A site whose convention disagrees with its callee's
-    // declaration is a miscompile, not a verifier error — LLVM will happily emit
-    // it. "The shim survives untouched" (§2 Finding 4) means the shim is still
-    // `ccc` and its call is not `musttail`; it does NOT mean this line is
-    // unchanged.
-    site.set_call_convention(TAILCC);
-    let v = site
+    // The program runs on its own stack (spec 2026-10-16-elya-native-stack):
+    // `elya_start` (runtime.c) reserves it, runs `@elya_entry` on a thread that
+    // owns it, names an overflow of it, and hands back main's value here, on
+    // the process's main thread. `@elya_entry` exists because C cannot call a
+    // `tailcc` function: it is `ccc`, and its one call is to `main`'s function.
+    let v = b
+        .build_call(
+            start,
+            &[entry.as_global_value().as_pointer_value().into()],
+            "v",
+        )
+        .map_err(internal)?
         .try_as_basic_value()
         .left()
-        .ok_or_else(|| internal("elya_main did not return a value"))?;
+        .ok_or_else(|| internal("elya_start did not return a value"))?;
     b.build_call(printf, &[fmt.as_pointer_value().into(), v.into()], "p")
         .map_err(internal)?;
     // AFTER the answer, so a stats dump can never interleave with the value the
@@ -2189,6 +2210,9 @@ pub fn link(obj: &Path, exe: &Path) -> Result<(), CodegenError> {
     // codegen on every platform (PARKED.md).
     #[cfg(target_os = "linux")]
     cmd.arg("-no-pie");
+    // The program's own stack is a thread's (runtime.c `elya_start`).
+    #[cfg(unix)]
+    cmd.arg("-pthread");
     let out = cmd.output().map_err(CodegenError::Io)?;
     if !out.status.success() {
         return Err(CodegenError::Link {
