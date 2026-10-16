@@ -5617,3 +5617,87 @@ fn computed_callees_and_function_values_run_natively() {
 fn computed_callees_and_function_values_match_the_evaluator() {
     run_differential_corpus(CALLEES, "callees-diff");
 }
+
+// ---- Argument records past three parameters (2026-10-16) ----
+// Spec `docs/superpowers/specs/2026-10-16-elya-argument-records-design.md`.
+// Every program was refused natively by an arity cap; values are the
+// evaluator's.
+const ARITY: &[(&str, &str, &str)] = &[
+    (
+        "a1-six-parameters",
+        "fn six(a, b, c, d, e, f) { a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 }\n\
+         pub fn main() -> Int { six(1, 2, 3, 4, 5, 6) }\n",
+        "91",
+    ),
+    (
+        "a2-an-effectful-function-of-five",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn five(a, b, c, d, e) { lg(a) + b * 2 + c * 3 + d * 4 + e * 5 }\n\
+         pub fn main() -> Int { handle { five(1, 2, 3, 4, 5) } with { L.lg(x) -> resume(x * 100)  return(r) -> r } }\n",
+        "154",
+    ),
+    (
+        "a3-a-lambda-of-five",
+        "pub fn main() -> Int { let f = fn(a, b, c, d, e) { a - b + c - d + e * 10 }  f(1, 2, 3, 4, 5) }\n",
+        "48",
+    ),
+    (
+        "a4-an-effectful-lambda-of-four",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         pub fn main() -> Int { handle { let f = fn(a, b, c, d) { lg(a) + b + c + d }  f(1, 2, 3, 4) } with { L.lg(x) -> resume(x * 100)  return(r) -> r } }\n",
+        "109",
+    ),
+    (
+        "a5-an-operation-of-four",
+        "effect W { fn w(a: Int, b: Int, c: Int, d: Int) -> Int }\n\
+         pub fn main() -> Int { handle { w(1, 2, 3, 4) + 1 } with { W.w(a, b, c, d) -> resume(a * 1000 + b * 100 + c * 10 + d)  return(r) -> r } }\n",
+        "1235",
+    ),
+    (
+        "a6-a-six-parameter-loop-of-100000",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn go(l, a, b, c, d, acc) { match l { Nil -> acc + a + b + c + d  Cons(h, t) -> go(t, a + 1, b, c, d, acc + h) } }\n\
+         fn build(i, acc) { if i == 0 { acc } else { build(i - 1, Cons(i, acc)) } }\n\
+         pub fn main() -> Int { go(build(100000, Nil), 0, 1, 2, 3, 0) }\n",
+        "5000150006",
+    ),
+    (
+        "a7-a-five-parameter-lambda-as-an-argument",
+        "fn apply5(f, x) { f(x, x, x, x, x) }\n\
+         pub fn main() -> Int { apply5(fn(a, b, c, d, e) { a + b + c + d + e }, 3) }\n",
+        "15",
+    ),
+    // The review's finding: a function in a spilled position. The call keyed
+    // its record by the argument's type (an open row), the callee by its
+    // parameter's (closed): two records, "match failed" natively.
+    (
+        "r1-a-function-in-the-fourth-position",
+        "fn k(n, s, acc, f) { acc + f(s) }\n\
+         pub fn main() -> Int { k(3, 1, 0, fn(p) { p + 1 }) }\n",
+        "2",
+    ),
+    (
+        "r2-functions-in-a-spilled-tail-loop",
+        "fn loop(n, s, l, f, g, acc) { if n == 0 { acc + l } else { loop(n - 1, f(s), l, f, g, acc + g(s)) } }\n\
+         fn inc(x) { x + 1 }\n\
+         pub fn main() -> Int { loop(100000, 0, 7, inc, fn(x) { x * 2 }, 0) }\n",
+        "9999900007",
+    ),
+    (
+        "r3-an-effectful-function-in-the-fourth-position",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn k(n, s, acc, f) { acc + f(s) + n }\n\
+         pub fn main() -> Int { handle { k(3, 1, 0, fn(p) { lg(p) + 1 }) } with { L.lg(v) -> resume(v * 10)  return(r) -> r } }\n",
+        "14",
+    ),
+];
+
+#[test]
+fn long_parameter_lists_run_natively() {
+    run_value_corpus(ARITY, "arity");
+}
+
+#[test]
+fn long_parameter_lists_match_the_evaluator() {
+    run_differential_corpus(ARITY, "arity-diff");
+}

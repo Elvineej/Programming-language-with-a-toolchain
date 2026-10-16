@@ -25,6 +25,7 @@ mod cps_emit;
 mod mono;
 mod patterns;
 mod specialize;
+mod spill;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1857,19 +1858,6 @@ fn build_ctor_table(core: &CoreModule) -> HashMap<String, (usize, Vec<Ty>)> {
 /// and `@main` shim. Returns the handle so `emit_ir` and `compile_module` share
 /// one construction path.
 fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'ctx>, CodegenError> {
-    // §5.1, FIRST STATEMENT ON PURPOSE. The failure this prevents is LLVM's
-    // `report_fatal_error` for a win64 guaranteed tail call: no source span, no
-    // `Result`, the process simply dies. It must therefore be impossible for
-    // any emission to have begun when this fires — so it is a whole-module scan
-    // that runs before the module even exists. Tracked as obligation T1.
-    for f in &core.fns {
-        if f.params.len() > MAX_PARAMS {
-            return Err(CodegenError::Unsupported(
-                "function takes more than five parameters",
-            ));
-        }
-    }
-
     // N7 part 2: clone generic functions and locals per type instantiation,
     // so no type variable reaches the back end (spec 2026-10-15).
     // Computed callees are named and top-level functions used as values are
@@ -1886,7 +1874,25 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     // Nested and literal patterns become the flat matches, `if`s and `let`s
     // both emitters support (spec 2026-10-10-elya-native-pattern-compilation).
     let specialized = patterns::run(&specialized);
+    // Past three parameters, the rest travel in one argument record (spec
+    // 2026-10-16-elya-argument-records), so no kind exceeds its LLVM cap.
+    let specialized = spill::run(&specialized);
     let core = &specialized;
+
+    // §5.1, FIRST CHECK ON THE EMITTED CORE ON PURPOSE. The failure this
+    // prevents is LLVM's `report_fatal_error` for a win64 guaranteed tail
+    // call: no source span, no `Result`, the process simply dies. It must
+    // therefore be impossible for any emission to have begun when this fires
+    // — so it is a whole-module scan that runs before the module even exists.
+    // Tracked as obligation T1. Since argument records it is a guard: `spill`
+    // leaves at most three source parameters anywhere.
+    for f in &core.fns {
+        if f.params.len() > MAX_PARAMS {
+            return Err(CodegenError::Unsupported(
+                "function takes more than five parameters",
+            ));
+        }
+    }
 
     // The closure tags continue the constructor numbering, so `first_tag` is the
     // number of REAL descriptor rows — computed the same way the descriptor table
@@ -2480,7 +2486,10 @@ mod tests {
     /// `report_fatal_error` that kills the process with no source span. Refusing
     /// at five source parameters is what keeps that unreachable.
     #[test]
-    fn rejects_a_lambda_with_five_parameters() {
+    fn a_lambda_with_five_parameters_compiles() {
+        // Was `rejects_a_lambda_with_five_parameters`. Since argument records
+        // (2026-10-16) the last three travel in one record; expectation changed
+        // by that decision.
         let p = |n: &str| elya::core::CoreParam {
             name: n.to_string(),
             ty: Ty::Base(TyCon::Int),
@@ -2497,14 +2506,12 @@ mod tests {
                 Rc::new(int_lit(1)),
             ),
         };
-        let err = emit_ir(&main_fn(e)).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("lambda takes more than four parameters")
-            ),
-            "{err:?}"
-        );
+        let m = main_fn(CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Int),
+            kind: CoreKind::Let("f".into(), Rc::new(e), Rc::new(int_lit(1))),
+        });
+        emit_ir(&m).expect("a five-parameter lambda compiles");
     }
 
     #[test]
@@ -2576,28 +2583,22 @@ mod tests {
     // these violates the §3.4 fidelity rule. Silently mis-compiling would.
 
     #[test]
-    fn rejects_six_parameters_before_emission_begins() {
-        // §5.1. The most load-bearing refusal in the slice: past five
-        // parameters, a win64 guaranteed tail call hits `LLVM ERROR: Can't
-        // handle guaranteed tail call under win64 yet`, a `report_fatal_error`
-        // with no source span that kills the process outright. No `Result` can
-        // catch it, so the scan must complete before any emission starts.
-        let err = emit_ir(&core_of(
+    fn six_parameters_compile_and_no_kind_can_pass_its_cap() {
+        // §5.1. Was `rejects_six_parameters_before_emission_begins`: past five
+        // parameters a win64 guaranteed tail call is a `report_fatal_error`
+        // with no source span, so a whole-module scan refused the module before
+        // emission. Since argument records (2026-10-16) `spill` leaves at most
+        // `MAX_SOURCE_PARAMS` source parameters anywhere, and the scan stays
+        // as a guard; expectation changed by that decision. The invariant that
+        // makes the guard unreachable: the worst kind (an effectful lambda, or
+        // a clause: its closure or frame and its continuation) still fits.
+        emit_ir(&core_of(
             "fn six(a, b, c, d, e, f) { a + b + c + d + e + f }\n\
              pub fn main() { six(1, 2, 3, 4, 5, 6) }\n",
         ))
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("function takes more than five parameters")
-            ),
-            "{err:?}"
-        );
-        // Five is the boundary, and it is exercised, not only refused: the
-        // `five_params` corpus program compiles and runs in
-        // tests/native_codegen.rs.
+        .expect("six parameters compile");
         assert_eq!(MAX_PARAMS, 5);
+        const _: () = assert!(spill::MAX_SOURCE_PARAMS + 2 <= MAX_PARAMS);
     }
 
     #[test]
@@ -2616,10 +2617,6 @@ mod tests {
 
     const S_W: &str = "effect S { fn get() -> Int }\n\
                        fn w(b) { if b { get() } else { 2 } }\n";
-
-    fn refused(prog: &str) -> CodegenError {
-        emit_ir(&core_of(&format!("{S_W}{prog}"))).unwrap_err()
-    }
 
     // ---- 5b-8 Task 8 refusals (A2, and the clause arity cap) ---------------
 
@@ -2697,24 +2694,20 @@ mod tests {
     }
 
     #[test]
-    fn an_effect_operation_with_four_parameters_is_refused() {
-        // The clause takes the op's arguments, the continuation and the
-        // handler frame: 4 + 2 is past MAX_PARAMS, the measured win64 limit.
-        let err = emit_ir(&core_of(
+    fn an_effect_operation_with_four_parameters_compiles() {
+        // Was `an_effect_operation_with_four_parameters_is_refused`: the clause
+        // takes the op's arguments, the continuation and the handler frame, and
+        // 4 + 2 is past MAX_PARAMS. Since argument records (2026-10-16) the
+        // fourth argument travels in a record; expectation changed by that
+        // decision. The cap's refusal stays as a guard behind `spill`.
+        emit_ir(&core_of(
             "effect E { fn op(a: Int, b: Int, c: Int, d: Int) -> Int }\n\
              fn body() -> Int { op(1, 2, 3, 4) }\n\
              pub fn main() -> Int {\n\
              \x20 handle { body() } with { E.op(a, b, c, d) -> resume(a + d)  return(r) -> r }\n\
              }\n",
         ))
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("effect operation takes more than three parameters")
-            ),
-            "{err:?}"
-        );
+        .expect("a four-argument operation compiles");
     }
 
     #[test]
@@ -2782,47 +2775,37 @@ mod tests {
     }
 
     #[test]
-    fn an_effectful_lambda_compiles_and_four_parameters_are_refused_by_name() {
-        // 5b-9b (replaces `an_effectful_lambda_is_refused_by_name`, which pinned
-        // the refusal this slice lifts): the same program now compiles, and the
-        // one remaining refusal is the parameter cap -- the closure, the source
-        // parameters and the continuation must fit MAX_PARAMS.
+    fn an_effectful_lambda_compiles_with_four_parameters_too() {
+        // 5b-9b (replaces `an_effectful_lambda_is_refused_by_name`), and since
+        // argument records (2026-10-16) the four-parameter case compiles too:
+        // it was refused by name ("effectful lambda takes more than three
+        // parameters"); expectation changed by that decision.
         emit_ir(&core_of(&format!(
             "{S_W}pub fn main() -> Int {{\n\
              \x20 handle {{ let f = fn(x) {{ x + get() }}  f(1) }} with {{\n\
              \x20   S.get() -> resume(1)\n    return(r) -> r\n  }}\n}}\n"
         )))
         .expect("an effectful lambda compiles");
-        let err = refused(
-            "pub fn main() -> Int {\n\
-             \x20 handle { let f = fn(a, b, c, d) { a + b + c + d + get() }  f(1, 2, 3, 4) } with {\n\
-             \x20   S.get() -> resume(1)\n    return(r) -> r\n  }\n}\n",
-        );
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("effectful lambda takes more than three parameters")
-            ),
-            "{err:?}"
-        );
+        emit_ir(&core_of(&format!(
+            "{S_W}pub fn main() -> Int {{\n\
+             \x20 handle {{ let f = fn(a, b, c, d) {{ a + b + c + d + get() }}  f(1, 2, 3, 4) }} with {{\n\
+             \x20   S.get() -> resume(1)\n    return(r) -> r\n  }}\n}}\n"
+        )))
+        .expect("a four-parameter effectful lambda compiles");
     }
 
     #[test]
-    fn an_effectful_function_with_five_parameters_is_refused() {
-        // D14: the continuation is a sixth LLVM parameter, past MAX_PARAMS.
-        let err = refused(
-            "fn five(a, b, c, d, e) { a + b + c + d + e + get() }\n\
-             pub fn main() -> Int {\n\
-             \x20 handle { five(1, 2, 3, 4, 5) } with {\n\
-             \x20   S.get() -> resume(1)\n    return(r) -> r\n  }\n}\n",
-        );
-        assert!(
-            matches!(
-                err,
-                CodegenError::Unsupported("effectful function takes more than four parameters")
-            ),
-            "{err:?}"
-        );
+    fn an_effectful_function_with_five_parameters_compiles() {
+        // Was `an_effectful_function_with_five_parameters_is_refused` (D14: the
+        // continuation is a sixth LLVM parameter). Since argument records
+        // (2026-10-16) it compiles; expectation changed by that decision.
+        emit_ir(&core_of(&format!(
+            "{S_W}fn five(a, b, c, d, e) {{ a + b + c + d + e + get() }}\n\
+             pub fn main() -> Int {{\n\
+             \x20 handle {{ five(1, 2, 3, 4, 5) }} with {{\n\
+             \x20   S.get() -> resume(1)\n    return(r) -> r\n  }}\n}}\n"
+        )))
+        .expect("a five-parameter effectful function compiles");
     }
 
     #[test]

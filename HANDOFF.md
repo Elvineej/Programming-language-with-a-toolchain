@@ -14,7 +14,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1012 passed, 95 suites. Since `main`, the runtime
+- Linux gate at the tip of `auto/elya`: 1015 passed, 95 suites. Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions; `gc_mark` is unchanged (637 bytes of source).
 - Interactive sessions may also work on `auto/elya`. They use the same
@@ -300,25 +300,15 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   which N7 then specializes; the two most common native refusals of the 2026-10-15 sweep
   are gone.
 
+- **Argument records past three parameters** (2026-10-16, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-16-elya-argument-records-design.md`. Every function,
+  lambda, type, call, operation and clause with more than three parameters keeps two
+  and passes the rest in one synthesized record (`spill.rs`), so no kind can exceed its
+  win64 tail-call cap; every arity refusal is gone. Needs the Windows gate.
+
 ## The next five steps
 
-### 1. Native arity: more parameters than the win64 tail-call cap
-
-`MAX_PARAMS` (5 LLVM parameters) refuses an effectful function of five source
-parameters, a lambda of five, a direct function of six, and clauses of four. It is the
-measured win64 `musttail` limit (5b-3 §2). Real schedulers hit it:
-`examples/08_timers.elya`'s first `run(q, timers, results, next, stalled)` was refused,
-and the example now packs its state into one value.
-- **Likely shape:** past the cap, the trailing parameters travel in one heap block
-  (an argument record) built at the call and unpacked in the callee's entry. The
-  callee keeps the guaranteed tail call; the block is an allocation site, so it is
-  rooted like a closure.
-- **Decide in the spec:** spill always past the cap, or only on win64 (one convention
-  everywhere is simpler and is what the gate can test).
-- **Measure first:** how many corpus programs hit each of the four arity refusals.
-- The Windows gate must run it; note it as debt.
-
-### 2. Record and replay from the command line
+### 1. Record and replay from the command line
 
 ROADMAP priority 3's last step: `elya run --record trace.txt prog.elya` runs `main` under
 a `with any` recorder and writes its log, and `elya run --replay trace.txt` feeds it
@@ -332,7 +322,7 @@ back. A divergence stops by name, at the entry where it happened.
 - Evaluator first. Natively, `with any` needs per-operation type tables in the runtime
   (D6). That is a slice of its own, listed under "Also open".
 
-### 3. Deep non-tail recursion natively
+### 2. Deep non-tail recursion natively
 
 Measured 2026-10-16: `fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }` over
 200 000 elements runs in the evaluator (its continuation is on the heap) and dies
@@ -341,7 +331,7 @@ spec: a large dedicated stack for `main` (mmap with a guard page) plus a NAMED
 "native stack overflow" diagnostic from the guard page, or deeper changes (CPS for deep
 recursion). Measure the current depth limit first, on Linux and Windows.
 
-### 4. Structural equality
+### 3. Structural equality
 
 `==` on an ADT value, a tuple or a list is refused natively ("Eq on an unrepresentable
 operand type") and decided by the evaluator's own rules. Measure what the evaluator does
@@ -350,13 +340,20 @@ error on functions -- E04xx at check time rather than at run time), and compile 
 natively (a runtime walk guided by the descriptor table, or generated per-type
 equality functions after N7 part 2's instances).
 
-### 5. A differential sweep, again
+### 4. A differential sweep, again
 
 The 2026-10-15 sweep (about 700 programs: every corpus, example and probe through
 `elya run` and `elya build`) found the N7 instance-key miscompile and ranked the native
 refusals. Re-run it at the tip: list every program the evaluator runs and native refuses
 or gets wrong, rank the refusals by count, and turn the top one into the next step.
 Keep the sweep script under `scripts/` so the next run can repeat it.
+
+### 5. Unary minus and wrapping arithmetic natively
+
+Also-open items since 2026-10-10: Core refuses unary minus ("Unary"), so every native
+example writes `0 - 1`; and hashes and generators need explicit wrapping arithmetic
+(`int.wrapping_mul` and friends) now that `Int` is checked. Measure which corpus programs
+use `-x`, add the lowering, and decide the wrapping builtins' names in a spec.
 
 Also open, unscheduled: `with any` natively (per-operation name and
 type tables in the runtime, `op.decode` at an effect's parameter once the instantiation
