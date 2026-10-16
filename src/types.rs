@@ -160,6 +160,9 @@ struct ResumeCx {
     ret_amb: RowVar,
     /// The handled effect, which the resumed handler handles again.
     handled: Option<String>,
+    /// A `with any` handle (2026-10-16): the resumed handler handles every
+    /// effect of the body but `IO`, its row's tail included.
+    handles_all: bool,
     /// The lambda depth at the clause: a resume at a greater depth is inside a
     /// lambda, which may run after the clause has returned (it ESCAPES).
     lambda_depth: usize,
@@ -246,6 +249,10 @@ pub struct Infer {
     /// name in any annotation of one function (its signature, its `let`s and
     /// lambdas) is one shared unification variable.
     ann_vars: HashMap<String, Ty>,
+    /// The answer types of `with any` clauses (2026-10-16): rigid, one per
+    /// clause, as `Ty::Con` names that no declaration can spell. Each with its
+    /// clause's span, for E0435 when one escapes.
+    skolems: Vec<(String, Span)>,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -273,6 +280,7 @@ impl Infer {
             node_types: HashMap::new(),
             known_types: HashMap::new(),
             ann_vars: HashMap::new(),
+            skolems: Vec::new(),
             diags: Vec::new(),
         }
     }
@@ -1030,6 +1038,17 @@ fn write_ty(t: &Ty, names: &mut Names, out: &mut String) {
             }
             out.push(')');
         }
+        // An operation of a `with any` clause: `Op(t / {E})`, its answer type
+        // and the row performing it performs.
+        Ty::Con(n, args) if n == "$Op" && args.len() == 2 => {
+            out.push_str("Op(");
+            write_ty(&args[0], names, out);
+            if let Ty::Fn(_, row, _) = &args[1] {
+                out.push_str(" / ");
+                write_row(row, names, out);
+            }
+            out.push(')');
+        }
         Ty::Con(n, args) => {
             out.push_str(n);
             if !args.is_empty() {
@@ -1347,18 +1366,22 @@ impl Infer {
                         for p in self.param_tys.clone() {
                             free_row_vars(self, &p, &mut in_params);
                         }
-                        for (src, except) in [(cx.body_amb, cx.handled.clone()), (cx.ret_amb, None)]
-                        {
+                        for (src, except, all) in [
+                            (cx.body_amb, cx.handled.clone(), cx.handles_all),
+                            (cx.ret_amb, None, false),
+                        ] {
                             let now = self.resolve_row(&EffectRow::open(src));
                             for (label, l) in now.labels.iter() {
-                                if except.as_deref() == Some(label.as_str()) {
+                                if except.as_deref() == Some(label.as_str())
+                                    || (all && label != "IO")
+                                {
                                     continue;
                                 }
                                 let r = self.add_effect(amb, label, l.args.clone(), l.span);
                                 self.surface_conflict(r);
                             }
                             if let RowTail::Open(w) = now.tail {
-                                if in_params.contains(&w) {
+                                if in_params.contains(&w) && !all {
                                     let relay = EffectRow {
                                         labels: BTreeMap::new(),
                                         tail: RowTail::Open(w),
@@ -1616,6 +1639,47 @@ impl Infer {
                 );
                 return ret;
             }
+            // The builtins on an operation of a `with any` clause (2026-10-16,
+            // D4). `o : Op(t, fn() / H -> t)`: `op.perform` performs `H`.
+            if module == "op"
+                && matches!(
+                    name.as_str(),
+                    "name" | "show" | "perform" | "encode" | "decode"
+                )
+            {
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+                let t = self.fresh();
+                let h = self.fresh_row();
+                let op_ty = Ty::Con(
+                    "$Op".to_string(),
+                    vec![
+                        t.clone(),
+                        Ty::Fn(Vec::new(), EffectRow::open(h), Box::new(t.clone())),
+                    ],
+                );
+                let (params, ret) = match name.as_str() {
+                    "name" | "show" => (vec![op_ty], Ty::str()),
+                    "perform" => (vec![op_ty], t.clone()),
+                    "encode" => (vec![op_ty, t.clone()], Ty::str()),
+                    _ => (vec![op_ty, Ty::str()], t.clone()),
+                };
+                let row = if name == "perform" {
+                    EffectRow::open(h)
+                } else {
+                    EffectRow::pure()
+                };
+                let want = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(ret.clone()));
+                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
+                self.unify(&want, &got, span);
+                if name == "perform" {
+                    let performed = self.resolve_row(&EffectRow::open(h));
+                    let r = self.add_row(amb, &performed, span);
+                    self.surface_conflict(r);
+                }
+                self.node_types
+                    .insert(callee.span, Ty::Fn(params, row, Box::new(ret.clone())));
+                return ret;
+            }
             // `int.to_string : fn(Int) -> String`, pure (spec
             // 2026-10-15-elya-native-strings D1).
             if module == "int" && name == "to_string" {
@@ -1796,6 +1860,9 @@ impl Infer {
         env: &mut TyEnv,
         amb: RowVar,
     ) -> Ty {
+        if handler.any {
+            return self.infer_any_handle(body, handler, span, env, amb);
+        }
         let effect = self.handler_effect(handler);
         // Conformance (Slice 4d-1): `with multi` is legal only over a `multi`-
         // declared effect. Multi-resuming a one-shot effect is E0427. `is_multi`
@@ -1936,6 +2003,7 @@ impl Infer {
                 body_amb: amb_in,
                 ret_amb,
                 handled: effect.clone(),
+                handles_all: false,
                 lambda_depth: self.lambda_depth,
                 clauses_row,
             });
@@ -2018,6 +2086,203 @@ impl Infer {
             self.surface_conflict(r);
         }
         result
+    }
+
+    /// `handle e with any { op(o) -> c  return(x) -> r }` (2026-10-16, spec
+    /// `2026-10-16-elya-any-handlers-design.md`). Handles everything `e` performs
+    /// but `IO` (D2): the residual is `IO` alone, and the rest -- the body row's
+    /// labels and its tail -- is handled. `o : Op(t, fn() / H -> t)`, where `t` is
+    /// a rigid type of this clause (D3) and `H` the handled row: the function
+    /// type is how the row rides in the operation's type, so `op.perform(o)`
+    /// performs it wherever `o` goes (a function given `o` relays it).
+    fn infer_any_handle(
+        &mut self,
+        body: &Spanned<Expr>,
+        handler: &Handler,
+        span: Span,
+        env: &mut TyEnv,
+        amb: RowVar,
+    ) -> Ty {
+        let amb_in = self.fresh_row();
+        self.regions.push((amb_in, true));
+        let body_ty = self.infer_expr(body, env, amb_in);
+        self.regions.pop();
+
+        let result = self.fresh();
+        let ret_amb = self.fresh_row();
+        match &handler.ret {
+            Some(ret) => {
+                env.push();
+                env.insert(
+                    &ret.binder,
+                    Scheme {
+                        vars: Vec::new(),
+                        row_vars: Vec::new(),
+                        ty: body_ty.clone(),
+                    },
+                );
+                self.regions.push((ret_amb, false));
+                let ret_ty = self.infer_expr(&ret.body, env, ret_amb);
+                self.regions.pop();
+                self.unify(&ret_ty, &result, ret.body.span);
+                env.pop();
+            }
+            None => self.unify(&result, &body_ty, span),
+        }
+        self.flush_inclusions();
+        let scope_params = self.param_tys.clone();
+        self.close_unrelayed_residual(ret_amb, &scope_params);
+        {
+            let ret_row = self.resolve_row(&EffectRow::open(ret_amb));
+            let r = self.add_row(amb, &ret_row, span);
+            self.surface_conflict(r);
+        }
+        // The handled row: the body's, but `IO`.
+        let mut handled = self.resolve_row(&EffectRow::open(amb_in));
+        handled.labels.remove("IO");
+
+        let mut clause_ambs: Vec<RowVar> = Vec::new();
+        let clauses_row = self.fresh_row();
+        self.pending_clause_rows.push(clauses_row);
+        let mut new_skolems: Vec<(String, Span)> = Vec::new();
+        for c in &handler.clauses {
+            let clause = &c.node;
+            let sk_name = format!("'t{}", self.skolems.len() + 1);
+            self.skolems.push((sk_name.clone(), c.span));
+            new_skolems.push((sk_name.clone(), c.span));
+            let t = Ty::Con(sk_name, Vec::new());
+            let op_ty = Ty::Con(
+                "$Op".to_string(),
+                vec![
+                    t.clone(),
+                    Ty::Fn(Vec::new(), handled.clone(), Box::new(t.clone())),
+                ],
+            );
+            env.push();
+            for p in clause.params.iter() {
+                self.node_types.insert(p.span, op_ty.clone());
+                env.insert(
+                    &p.node.name,
+                    Scheme {
+                        vars: Vec::new(),
+                        row_vars: Vec::new(),
+                        ty: op_ty.clone(),
+                    },
+                );
+            }
+            let clause_amb = self.fresh_row();
+            clause_ambs.push(clause_amb);
+            self.resume_stack.push(ResumeCx {
+                arg: t,
+                result: result.clone(),
+                body_amb: amb_in,
+                ret_amb,
+                handled: None,
+                handles_all: true,
+                lambda_depth: self.lambda_depth,
+                clauses_row,
+            });
+            let mark = self.param_tys.len();
+            self.param_tys.push(op_ty.clone());
+            self.regions.push((clause_amb, false));
+            let clause_ty = self.infer_expr(&clause.body, env, clause_amb);
+            self.regions.pop();
+            self.flush_inclusions();
+            let scope_params = self.param_tys.clone();
+            self.close_unrelayed_residual(clause_amb, &scope_params);
+            self.param_tys.truncate(mark);
+            {
+                let row = self.resolve_row(&EffectRow::open(clause_amb));
+                let r = self.add_row(amb, &row, clause.body.span);
+                self.surface_conflict(r);
+            }
+            self.unify(&clause_ty, &result, clause.body.span);
+            self.resume_stack.pop();
+            env.pop();
+        }
+        // Escaped resumes may re-enter the clause, whose effects -- the
+        // operations it performs again included -- happen outside the handler.
+        self.pending_clause_rows.pop();
+        for &ca in &clause_ambs {
+            let row = self.resolve_row(&EffectRow::open(ca));
+            for (label, l) in row.labels.iter() {
+                let r = self.add_effect(clauses_row, label, l.args.clone(), l.span);
+                self.surface_conflict(r);
+            }
+        }
+        self.flush_inclusions();
+        let own_tail = self.resolve_row(&EffectRow::open(amb)).tail;
+        if self.resolve_row(&EffectRow::open(clauses_row)).tail != own_tail {
+            let scope_params = self.param_tys.clone();
+            self.close_unrelayed_residual(clauses_row, &scope_params);
+        }
+        // The residual: `IO`, never dispatched to a handler, if the body has it.
+        let body_row = self.resolve_row(&EffectRow::open(amb_in));
+        if let Some(io) = body_row.labels.get("IO") {
+            let r = self.add_effect(amb, "IO", io.args.clone(), io.span);
+            self.surface_conflict(r);
+        }
+        // E0435: an answer type stays in its clause.
+        for (sk, sp) in new_skolems {
+            self.check_skolem_escape(&sk, sp, &result, env, amb);
+        }
+        result
+    }
+
+    /// E0435 (2026-10-16): the rigid answer type `sk` of a `with any` clause in
+    /// the handle's result, in a binding outside the clause, or in the ambient
+    /// row's effect arguments. One run of the clause would meet another's.
+    fn check_skolem_escape(&mut self, sk: &str, span: Span, result: &Ty, env: &TyEnv, amb: RowVar) {
+        let mut where_: Option<String> = None;
+        if self.mentions_con(result, sk) {
+            where_ = Some("the handle's result type".to_string());
+        }
+        if where_.is_none() {
+            'outer: for scope in &env.scopes {
+                for (name, scheme) in scope {
+                    if self.mentions_con(&scheme.ty, sk) {
+                        where_ = Some(format!("`{name}`, bound outside the clause"));
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if where_.is_none() {
+            let row = self.resolve_row(&EffectRow::open(amb));
+            if row
+                .labels
+                .values()
+                .any(|l| l.args.iter().any(|a| self.mentions_con(a, sk)))
+            {
+                where_ = Some("an effect's type argument".to_string());
+            }
+        }
+        if let Some(w) = where_ {
+            self.diags.push(
+                Diagnostic::error("E0435", "an operation's answer type escapes its clause")
+                    .with_label(span, format!("the answer type of this clause reaches {w}"))
+                    .with_help(
+                        "a `with any` clause runs once per operation, at a different answer type each time; give an answer back with `resume`, or turn it into data with `op.encode`",
+                    ),
+            );
+        }
+    }
+
+    /// Whether the resolved `t` mentions the nominal type `name`, rows included.
+    fn mentions_con(&self, t: &Ty, name: &str) -> bool {
+        match self.resolve(t) {
+            Ty::Con(n, args) => n == name || args.iter().any(|a| self.mentions_con(a, name)),
+            Ty::Fn(ps, row, r) => {
+                ps.iter().any(|p| self.mentions_con(p, name))
+                    || self.mentions_con(&r, name)
+                    || row
+                        .labels
+                        .values()
+                        .any(|l| l.args.iter().any(|a| self.mentions_con(a, name)))
+            }
+            Ty::Tuple(xs) => xs.iter().any(|x| self.mentions_con(x, name)),
+            Ty::Var(_) | Ty::Base(_) | Ty::Error => false,
+        }
     }
 
     /// The single effect a handler covers — all clauses must agree. Clauses that

@@ -84,3 +84,109 @@ fn malformed_any_handlers_are_refused() {
     assert_eq!(errors(&ok), "");
     let _ = (WORLD, run_source);
 }
+
+/// A forwarding recorder and a replayer, both generic: the recorder relays the body's
+/// row (it performs every operation again), the replayer discharges it.
+const RECORD: &str = "fn record(body) {\n\
+  handle { body() } with any {\n\
+    op(o) -> { let v = op.perform(o)  resume(v) }\n\
+    return(x) -> x\n\
+  }\n\
+}\n\
+fn replay(body) {\n\
+  handle { body() } with any {\n\
+    op(o) -> resume(op.decode(o, \"4\"))\n\
+    return(x) -> x\n\
+  }\n\
+}\n";
+
+fn schemes(src: &str) -> String {
+    let (m, d) = parse_module(&Session::new(), src);
+    assert!(d.is_empty(), "parse: {d:?}");
+    let (ss, diags) = elya::types::infer_schemes(&Session::new(), &m);
+    assert!(diags.is_empty(), "type: {diags:?}");
+    let mut lines: Vec<String> = ss.into_iter().map(|(n, s)| format!("{n} : {s}")).collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+#[test]
+fn an_any_handler_relays_or_discharges_the_whole_row() {
+    let s = schemes(&format!("{WORLD}{RECORD}"));
+    assert!(
+        s.contains("record : forall a b. fn(fn() / {b} -> a) / {b} -> a"),
+        "{s}"
+    );
+    assert!(
+        s.contains("replay : forall a b. fn(fn() / {b} -> a) -> a"),
+        "{s}"
+    );
+    // The recorder still needs a World handler outside; the replayer does not.
+    let rec = format!(
+        "{WORLD}{RECORD}pub fn main() -> Int {{ handle {{ record(fn() {{ roll(6) }}) }} with {{ World.roll(s) -> resume(4) }} }}\n"
+    );
+    assert_eq!(errors(&rec), "");
+    let unhandled =
+        format!("{WORLD}{RECORD}pub fn main() -> Int {{ record(fn() {{ roll(6) }}) }}\n");
+    assert!(
+        errors(&unhandled).contains("E0420"),
+        "{}",
+        errors(&unhandled)
+    );
+    let rep = format!("{WORLD}{RECORD}fn pure() / {{}} -> Int {{ replay(fn() {{ roll(6) }}) }}\npub fn main() -> Int {{ pure() }}\n");
+    assert_eq!(errors(&rep), "");
+}
+
+#[test]
+fn io_is_never_handled_by_an_any_handler() {
+    // A concrete IO in the handled body stays in the residual: a pure function
+    // may not hold it.
+    let quiet = "fn quiet() / {} -> Int {\n\
+  handle { io.println(\"x\")  roll(6) } with any {\n\
+    op(o) -> resume(op.decode(o, \"4\"))\n\
+  }\n\
+}\npub fn main() -> Int { quiet() }\n";
+    let e = errors(&format!("{WORLD}{quiet}"));
+    assert!(e.contains("E0421") || e.contains("E0423"), "{e}");
+    let loud = quiet.replace("/ {} -> Int", "/ {IO} -> Int");
+    assert_eq!(errors(&format!("{WORLD}{loud}")), "");
+    // The same when the clause never resumes: the body's IO happened anyway.
+    let abort = quiet.replace("resume(op.decode(o, \"4\"))", "0");
+    let e = errors(&format!("{WORLD}{abort}"));
+    assert!(e.contains("E0421") || e.contains("E0423"), "{e}");
+}
+
+#[test]
+fn an_answer_type_cannot_escape_its_clause() {
+    for (src, why) in [
+        (
+            "fn leak(body) { handle { body() } with any { op(o) -> op.perform(o) } }\n",
+            "through the handle's result",
+        ),
+        (
+            "fn leak(body, seed) {\n  handle { body() } with any {\n    op(o) -> { let v = op.perform(o)  if 1 == 1 { resume(seed) } else { resume(v) } }\n  }\n}\n",
+            "through a binding from outside the clause",
+        ),
+        (
+            "fn leak(body) {\n  let run = handle { body() } with any {\n    op(o) -> fn(prev) { let v = op.perform(o)  resume(prev)(v) }\n    return(x) -> fn(prev) { x }\n  }\n  run\n}\n",
+            "through the state-passing shape's parameter",
+        ),
+    ] {
+        let e = errors(&format!("{WORLD}{src}pub fn main() {{ io.println(\"x\") }}\n"));
+        assert!(e.contains("E0435"), "{why}: {e}");
+    }
+}
+
+#[test]
+fn op_builtins_take_an_operation() {
+    let e = errors("pub fn main() { io.println(op.show(3)) }\n");
+    assert!(e.contains("E0400"), "{e}");
+    // A function given an operation relays the operation's row when it performs it.
+    let s = schemes(&format!(
+        "{WORLD}fn again(o) {{ op.perform(o) }}\nfn rec(body) {{ handle {{ body() }} with any {{ op(o) -> resume(again(o)) }} }}\n"
+    ));
+    assert!(
+        s.contains("rec : forall a b. fn(fn() / {b} -> a) / {b} -> a"),
+        "{s}"
+    );
+}
