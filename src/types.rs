@@ -286,6 +286,14 @@ pub struct Infer {
     /// Declared type -> its parameters' variables and each constructor's
     /// field types, for the data check.
     adt_fields: HashMap<String, AdtFields>,
+    /// Equality type variables (structural equality, 2026-10-16, D1): each
+    /// must become data, because a `==` compares values of it. Binding one
+    /// checks what it is bound to (marking variables in it); instantiating a
+    /// scheme that quantifies one marks the fresh copy.
+    /// Each with the span of the `==` that marked it, named in the error.
+    eq_vars: HashMap<u32, Span>,
+    /// The `==` sites already reported, so a site is blamed once.
+    eq_reported: HashSet<Span>,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -319,6 +327,8 @@ impl Infer {
             pending_generic: Vec::new(),
             cur_span: Span::EMPTY,
             adt_fields: HashMap::new(),
+            eq_vars: HashMap::new(),
+            eq_reported: HashSet::new(),
             diags: Vec::new(),
         }
     }
@@ -543,6 +553,66 @@ impl Infer {
             return;
         }
         self.subst[v as usize] = Some(t.clone());
+        if let Some(origin) = self.eq_vars.get(&v).copied() {
+            self.require_data(t, span, Some(origin));
+        }
+    }
+
+    /// E0436 (structural equality, D1): `t` is compared with `==`, so it must be
+    /// data. Checked eagerly: a variable in it is MARKED (`eq_vars`) and checked
+    /// again when it is bound, and wherever a scheme quantifying it is
+    /// instantiated, so a generic comparison is decided at its uses.
+    /// `origin`: the `==` that marked the variable being bound, or `None` at
+    /// the `==` itself.
+    fn require_data(&mut self, t: &Ty, span: Span, origin: Option<Span>) {
+        let marker = origin.unwrap_or(span);
+        if let Some(why) = self.eq_not_data(t, marker) {
+            if self.eq_reported.insert(span) {
+                let mut d =
+                    Diagnostic::error("E0436", "only data can be compared with `==` or `!=`");
+                d = match origin {
+                    None => d.with_label(span, format!("this compares {why}")),
+                    Some(o) => d
+                        .with_label(span, format!("this makes a comparison compare {why}"))
+                        .with_label(o, "the comparison it reaches"),
+                };
+                self.diags.push(
+                    d
+                        .with_help("data is `Int`, `Float`, `Bool`, `String`, `Unit` and declared types whose fields are data; a function has no equality (two functions that agree on every argument cannot be told apart by running them)"),
+                );
+            }
+        }
+    }
+
+    /// Why `t` is not data, or `None`; marks the variables in it (D1) with
+    /// the comparison `origin`.
+    fn eq_not_data(&mut self, t: &Ty, origin: Span) -> Option<String> {
+        match self.resolve(t) {
+            Ty::Base(_) | Ty::Error => None,
+            Ty::Var(v) => {
+                self.eq_vars.entry(v).or_insert(origin);
+                None
+            }
+            Ty::Fn(..) => Some("functions".to_string()),
+            Ty::Tuple(xs) => xs.iter().find_map(|x| self.eq_not_data(x, origin)),
+            // An operation caught by `with any` is data: E0434 requires every
+            // operation such a handler handles to take data. Its answer-type
+            // argument is an index, not a field (N3: two operations compare by
+            // what they are).
+            Ty::Con(n, _) if n == "$Op" => None,
+            Ty::Con(n, args) => {
+                let mut why = None;
+                for a in &args {
+                    if let Some(w) = self.eq_not_data(a, origin) {
+                        why.get_or_insert(w);
+                    }
+                }
+                why.or_else(|| {
+                    self.decl_not_data(&n, &mut Vec::new())
+                        .map(|w| format!("values of `{n}`, which holds {w}"))
+                })
+            }
+        }
     }
 
     pub fn unify(&mut self, a: &Ty, b: &Ty, span: Span) {
@@ -1211,6 +1281,11 @@ impl Infer {
             return s.ty.clone();
         }
         let mapping: HashMap<u32, Ty> = s.vars.iter().map(|v| (*v, self.fresh())).collect();
+        for (v, fresh) in &mapping {
+            if let (Some(origin), Ty::Var(f)) = (self.eq_vars.get(v).copied(), fresh) {
+                self.eq_vars.insert(*f, origin);
+            }
+        }
         let mut row_mapping: HashMap<RowVar, RowVar> = HashMap::new();
         for v in &s.row_vars {
             let fresh = if self.phantom.contains(v) {
@@ -1349,6 +1424,7 @@ impl Infer {
                 let rt = self.infer_expr(rhs, env, amb);
                 if matches!(op, BinOp::Eq | BinOp::Ne) {
                     self.unify(&lt, &rt, span);
+                    self.require_data(&lt, span, None);
                     Ty::bool()
                 } else {
                     let (l, r, res) = binop_type(*op);

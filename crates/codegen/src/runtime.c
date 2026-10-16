@@ -308,6 +308,73 @@ int64_t elya_str_eq(void *a, void *b) {
     return memcmp(&((int64_t *)a)[2], &((int64_t *)b)[2], (size_t)la) == 0;
 }
 
+/* `==` on data (spec 2026-10-16-elya-structural-equality, D3): 1 when `a` and
+ * `b` are structurally equal. The descriptor table says which fields are heap
+ * values (compared as values) and which are words (compared as words); a
+ * string compares its length and bytes. An explicit worklist of pairs, never
+ * recursion, so two long lists compare in flat host stack. Allocates nothing
+ * from the collector, so nothing needs rooting across it. The type checker
+ * (E0436) keeps functions and continuations out. */
+int64_t elya_eq(void *a, void *b, int64_t string_tag) {
+    int64_t **work = NULL;
+    int64_t top = 0, cap = 0;
+    int64_t equal = 1;
+#define EQ_PUSH(x, y)                                                                  \
+    do {                                                                               \
+        if (top + 2 > cap) {                                                           \
+            cap = cap ? cap * 2 : 64;                                                  \
+            int64_t **grown = (int64_t **)realloc(work, (size_t)cap * sizeof *work);   \
+            if (!grown) {                                                              \
+                fputs("elya: out of memory comparing values\n", stderr);               \
+                exit(1);                                                               \
+            }                                                                          \
+            work = grown;                                                              \
+        }                                                                              \
+        work[top++] = (int64_t *)(x);                                                  \
+        work[top++] = (int64_t *)(y);                                                  \
+    } while (0)
+    EQ_PUSH(a, b);
+    while (top > 0) {
+        int64_t *y = work[--top];
+        int64_t *x = work[--top];
+        /* No shortcut for one shared object: whether two values are shared
+         * must never decide `==` (a NaN field, once floats compile natively,
+         * is not equal to itself), and the evaluator takes none. */
+        if (!x || !y || x[0] != y[0]) {
+            equal = 0;
+            break;
+        }
+        int64_t tag = x[0];
+        if (tag == string_tag) {
+            if (x[1] != y[1] || memcmp(&x[2], &y[2], (size_t)x[1]) != 0) {
+                equal = 0;
+                break;
+            }
+            continue;
+        }
+        if (tag < 0 || tag >= gc_n_ctors) {
+            fputs("elya: ==: a value without a descriptor\n", stderr);
+            exit(1);
+        }
+        int64_t arity = gc_descriptors[2 * tag];
+        int64_t mask = gc_descriptors[2 * tag + 1];
+        for (int64_t f = 0; f < arity; f++) {
+            if ((mask >> f) & 1) {
+                EQ_PUSH((intptr_t)x[1 + f], (intptr_t)y[1 + f]);
+            } else if (x[1 + f] != y[1 + f]) {
+                equal = 0;
+                break;
+            }
+        }
+        if (!equal) {
+            break;
+        }
+    }
+#undef EQ_PUSH
+    free(work);
+    return equal;
+}
+
 /* `int.to_string` (D1): decimal, a leading '-' for a negative, INT64_MIN
  * included (20 characters at most). */
 void *elya_int_to_string(int64_t tag, int64_t n) {

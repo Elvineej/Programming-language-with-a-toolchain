@@ -465,6 +465,57 @@ pub(crate) fn string_prim<'ctx>(
     }
 }
 
+/// `==`/`!=` on a declared type (spec 2026-10-16-elya-structural-equality,
+/// D3): heap operands, compared by `elya_eq`'s walk. It allocates nothing.
+pub(crate) fn is_data_eq_prim(op: BinOp, args: &[CoreExpr]) -> bool {
+    matches!(op, BinOp::Eq | BinOp::Ne) && matches!(args[0].ty, Ty::Con(..))
+}
+
+/// `==`/`!=` on `Unit`: both operands are evaluated, the answer is constant.
+pub(crate) fn is_unit_eq_prim(op: BinOp, args: &[CoreExpr]) -> bool {
+    matches!(op, BinOp::Eq | BinOp::Ne) && matches!(args[0].ty, Ty::Base(TyCon::Unit))
+}
+
+pub(crate) fn unit_eq<'ctx>(ctx: &'ctx Context, op: BinOp) -> BasicValueEnum<'ctx> {
+    ctx.bool_type()
+        .const_int(u64::from(op == BinOp::Eq), false)
+        .into()
+}
+
+pub(crate) fn data_eq<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    op: BinOp,
+    l: inkwell::values::PointerValue<'ctx>,
+    r: inkwell::values::PointerValue<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    let w = b
+        .build_call(
+            lc.data_eq,
+            &[
+                l.into(),
+                r.into(),
+                i64t.const_int(lc.string_tag as u64, false).into(),
+            ],
+            "dataeq",
+        )
+        .map_err(internal)?
+        .try_as_basic_value()
+        .left()
+        .ok_or(CodegenError::Unsupported("elya_eq returned no value"))?
+        .into_int_value();
+    let pred = if op == BinOp::Eq {
+        IntPredicate::NE
+    } else {
+        IntPredicate::EQ
+    };
+    Ok(b.build_int_compare(pred, w, i64t.const_zero(), "dataeqb")
+        .map_err(internal)?
+        .into())
+}
+
 /// `int.to_string(n)`: a fresh string. Allocates: the caller roots.
 pub(crate) fn int_to_string<'ctx>(
     ctx: &'ctx Context,
@@ -1398,6 +1449,29 @@ fn lower_expr<'ctx>(
                 gc_unroot(b, lc, roots + usize::from(held))?;
                 return Ok(v);
             }
+            // Structural equality (2026-10-16): the left operand is rooted
+            // while the right one is lowered (it may allocate); the walk
+            // itself allocates nothing.
+            if is_data_eq_prim(*op, args) {
+                let l = lower_expr(ctx, func, b, lc, &args[0], env)?;
+                let held = gc_root(b, lc, l)?;
+                let r = lower_expr(ctx, func, b, lc, &args[1], env)?;
+                let v = data_eq(
+                    ctx,
+                    b,
+                    lc,
+                    *op,
+                    l.into_pointer_value(),
+                    r.into_pointer_value(),
+                )?;
+                gc_unroot(b, lc, usize::from(held))?;
+                return Ok(v);
+            }
+            if is_unit_eq_prim(*op, args) {
+                lower_expr(ctx, func, b, lc, &args[0], env)?;
+                lower_expr(ctx, func, b, lc, &args[1], env)?;
+                return Ok(unit_eq(ctx, *op));
+            }
             if matches!(op, BinOp::Eq | BinOp::Ne)
                 && !matches!(args[0].ty, Ty::Base(TyCon::Int) | Ty::Base(TyCon::Bool))
             {
@@ -1787,6 +1861,8 @@ struct LowerCtx<'a, 'ctx> {
     /// Native strings (2026-10-15): `<>`, `==` on strings, `int.to_string`.
     str_concat: FunctionValue<'ctx>,
     str_eq: FunctionValue<'ctx>,
+    /// `elya_eq`: structural equality on data (2026-10-16).
+    data_eq: FunctionValue<'ctx>,
     int_to_string: FunctionValue<'ctx>,
     /// Time (2026-10-15): `time.now_ms`, `time.sleep_ms`.
     time_now_ms: FunctionValue<'ctx>,
@@ -1965,6 +2041,8 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let str_concat = module.add_function("elya_str_concat", str_concat_ty, None); // ccc
     let str_eq_ty = i64t.fn_type(&[ptrt.into(), ptrt.into()], false);
     let str_eq = module.add_function("elya_str_eq", str_eq_ty, None); // ccc
+    let data_eq_ty = i64t.fn_type(&[ptrt.into(), ptrt.into(), i64t.into()], false);
+    let data_eq = module.add_function("elya_eq", data_eq_ty, None); // ccc
     let int_to_string_ty = ptrt.fn_type(&[i64t.into(), i64t.into()], false);
     let int_to_string = module.add_function("elya_int_to_string", int_to_string_ty, None); // ccc
     let time_now_ms_ty = i64t.fn_type(&[], false);
@@ -2021,6 +2099,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         str_lit,
         str_concat,
         str_eq,
+        data_eq,
         int_to_string,
         time_now_ms,
         time_sleep_ms,
@@ -2428,12 +2507,32 @@ mod tests {
         // are lowered, so the message names the operator (§3.3) rather than the
         // operand. Wrapped in an `if` because a Bool-bodied main is refused
         // earlier, by `require_int`, with a different message. (Until
-        // 2026-10-15 the operand here was a `String`; strings compare natively
-        // since, so an ADT keeps the allow-list guarded.)
-        let err = emit_ir(&core_of(
-            "type T { A, B }\npub fn main() -> Int { if A == B { 1 } else { 0 } }\n",
-        ))
-        .unwrap_err();
+        // 2026-10-15 the operand here was a `String`, until 2026-10-16 an ADT;
+        // both compare natively since, and no source program reaches the back
+        // end with any other operand type -- functions are E0436, `Float` is
+        // refused by Core -- so the guard is exercised on a hand-edited Core:
+        // `1 == 2` with its operands retyped as a tuple.)
+        let mut core = core_of("pub fn main() -> Int { if 1 == 2 { 1 } else { 0 } }\n");
+        fn retype(e: &mut CoreExpr) {
+            match &mut e.kind {
+                CoreKind::Prim(op, args) if *op == BinOp::Eq => {
+                    let mut xs: Vec<CoreExpr> = args.to_vec();
+                    for x in xs.iter_mut() {
+                        x.ty = Ty::Tuple(Vec::new());
+                    }
+                    *args = Rc::from(xs);
+                }
+                CoreKind::If(c, _, _) => retype(Rc::make_mut(c)),
+                _ => panic!("unexpected shape: {:?}", e.kind),
+            }
+        }
+        let main = core
+            .fns
+            .iter_mut()
+            .find(|f| f.name == "main")
+            .expect("main");
+        retype(&mut main.body);
+        let err = emit_ir(&core).unwrap_err();
         assert!(
             matches!(
                 err,

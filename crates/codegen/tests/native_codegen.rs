@@ -5948,3 +5948,85 @@ fn foreign_faults_still_kill_by_their_signal() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Structural equality natively (spec 2026-10-16-elya-structural-equality, D3):
+// `elya_eq` walks two values with a worklist guided by the descriptor table.
+//
+// Negative controls (each reverted, `git diff --quiet` confirmed):
+// - K2: `elya_eq` compares every field as a word (ignores `ptr_mask`) -> the
+//   rows comparing separately built heap fields differ (q2, q3, q5, q6, q7);
+//   q1, whose fields are words, still passes, as it should.
+// - K3: `elya_eq` skips the string case -> q3 and q5 differ.
+// ---------------------------------------------------------------------------
+
+const EQ_DECLS: &str = "type L { N, C(Int, L) }\n\
+type P { P(Int, Int) }\n\
+type Box(a) { Box(a) }\n\
+type S { S(String, L), T(Bool) }\n\
+fn same(a, b) { a == b }\n\
+fn build(n, acc) { if n == 0 { acc } else { build(n - 1, C(n, acc)) } }\n\
+fn b(x) { if x { 1 } else { 0 } }\n";
+
+const EQUALITY: &[(&str, &str, &str)] = &[
+    (
+        "q1-constructors",
+        "pub fn main() -> Int { b(P(1, 2) == P(1, 2)) * 10 + b(P(1, 2) == P(2, 1)) }\n",
+        "10",
+    ),
+    (
+        "q2-lists-ne",
+        "pub fn main() -> Int { b(C(1, N) != C(1, C(2, N))) * 10 + b(C(1, N) != C(1, N)) }\n",
+        "10",
+    ),
+    (
+        "q3-strings-in-fields",
+        "pub fn main() -> Int { let s = \"ab\" <> \"c\"  b(S(s, C(1, N)) == S(\"abc\", C(1, N))) * 100 + b(S(\"abd\", N) == S(\"abc\", N)) * 10 + b(T(True) == S(\"x\", N)) }\n",
+        "100",
+    ),
+    (
+        "q4-unit-and-nullary",
+        "pub fn main() -> Int { b(Unit == Unit) * 100 + b(N == N) * 10 + b(N == C(1, N)) }\n",
+        "110",
+    ),
+    (
+        "q5-generic-and-parametric",
+        "pub fn main() -> Int { b(same(Box(C(3, N)), Box(C(3, N)))) * 100 + b(same(4, 4)) * 10 + b(same(Box(\"x\"), Box(\"y\"))) }\n",
+        "110",
+    ),
+    (
+        "q6-in-a-handler-clause",
+        "effect Ask { fn ask(x: L) -> Bool }\n\
+         fn go(n) / {Ask} { if ask(build(n, N)) { 1 } else { 0 } }\n\
+         pub fn main() -> Int { handle { go(3) + go(2) * 10 } with { Ask.ask(l) -> resume(l == C(1, C(2, C(3, N))))  return(v) -> v } }\n",
+        "1",
+    ),
+    (
+        "q7-long-lists",
+        "pub fn main() -> Int { let x = build(200000, N)  let y = build(200000, N)  let z = build(200000, C(7, N))  b(x == y) * 10 + b(x == z) }\n",
+        "10",
+    ),
+];
+
+fn with_eq_decls() -> Vec<(&'static str, String, &'static str)> {
+    EQUALITY
+        .iter()
+        .map(|(t, s, w)| (*t, format!("{EQ_DECLS}{s}"), *w))
+        .collect()
+}
+
+#[test]
+fn structural_equality_runs_natively() {
+    let rows = with_eq_decls();
+    let corpus: Vec<(&str, &str, &str)> =
+        rows.iter().map(|(t, s, w)| (*t, s.as_str(), *w)).collect();
+    run_value_corpus(&corpus, "equality");
+}
+
+#[test]
+fn structural_equality_matches_the_evaluator() {
+    let rows = with_eq_decls();
+    let corpus: Vec<(&str, &str, &str)> =
+        rows.iter().map(|(t, s, w)| (*t, s.as_str(), *w)).collect();
+    run_differential_corpus(&corpus, "equality-diff");
+}

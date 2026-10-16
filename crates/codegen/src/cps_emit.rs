@@ -1272,6 +1272,21 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             gc_unroot(self.b, self.lc, roots)?;
             return Ok(v);
         }
+        // Structural equality (2026-10-16): the operands are already rooted
+        // (`operand`), and the walk allocates nothing.
+        if crate::is_data_eq_prim(op, args) {
+            return crate::data_eq(
+                self.ctx,
+                self.b,
+                self.lc,
+                op,
+                vals[0].into_pointer_value(),
+                vals[1].into_pointer_value(),
+            );
+        }
+        if crate::is_unit_eq_prim(op, args) {
+            return Ok(crate::unit_eq(self.ctx, op));
+        }
         if matches!(op, BinOp::Eq | BinOp::Ne)
             && !matches!(args[0].ty, Ty::Base(TyCon::Int) | Ty::Base(TyCon::Bool))
         {
