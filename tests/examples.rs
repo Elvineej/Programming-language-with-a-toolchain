@@ -57,3 +57,10 @@ fn timers() {
     // The real-clock part prints only what real time cannot change.
     insta::assert_snapshot!("08_timers", run_example("08_timers.elya"));
 }
+
+#[test]
+fn record_any() {
+    // One generic recorder and replayer (`with any` handlers) over two unrelated
+    // effects; a replay diverging by name; leftovers noticed (2026-10-16).
+    insta::assert_snapshot!("09_record_any", run_example("09_record_any.elya"));
+}

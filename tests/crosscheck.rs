@@ -16,13 +16,16 @@ fn both(src: &str) -> (String, String) {
 
 /// Examples that perform user effects, which the tree-walker oracle does not
 /// evaluate (it predates Slice 3c). Each is compared with the native backend
-/// in `crates/codegen/tests/native_codegen.rs` instead.
+/// in `crates/codegen/tests/native_codegen.rs` instead -- except
+/// `09_record_any.elya`, whose `with any` handlers are evaluator-only for now
+/// (refused natively by name; its snapshot in `tests/examples.rs` pins it).
 const EFFECTFUL_EXAMPLES: &[&str] = &[
     "04_async.elya",
     "05_replay.elya",
     "06_structured.elya",
     "07_search.elya",
     "08_timers.elya",
+    "09_record_any.elya",
 ];
 
 #[test]
