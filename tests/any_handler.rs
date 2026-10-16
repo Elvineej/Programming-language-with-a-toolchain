@@ -190,3 +190,54 @@ fn op_builtins_take_an_operation() {
         "{s}"
     );
 }
+
+const MAKE: &str = "effect Mk { fn make() -> fn(Int) -> Int }\n";
+
+#[test]
+fn handled_operations_must_be_data() {
+    // A function answer, at the handle itself and through a generic replayer.
+    let at_handle = format!(
+        "{MAKE}fn f() -> Int {{\n  let g = handle {{ make() }} with any {{ op(o) -> resume(op.decode(o, \"1\")) }}\n  g(1)\n}}\npub fn main() -> Int {{ f() }}\n"
+    );
+    assert!(
+        errors(&at_handle).contains("E0434"),
+        "{}",
+        errors(&at_handle)
+    );
+    let through =
+        format!("{MAKE}{RECORD}pub fn main() -> Int {{ replay(fn() {{ make() }})(1) }}\n");
+    assert!(errors(&through).contains("E0434"), "{}", errors(&through));
+    // Data answers are fine: declared types of data, at their arguments.
+    let ok = format!(
+        "type Opt(a) {{ No, Yes(a) }}\neffect Ask {{ fn ask(q: String) -> Opt(Int) }}\n{RECORD}\
+         pub fn main() -> Int {{ match replay(fn() {{ ask(\"n\") }}) {{ No -> 0  Yes(n) -> n }} }}\n"
+    );
+    assert_eq!(errors(&ok), "");
+    // A declared type with a function inside is not.
+    let boxed = format!(
+        "type Box {{ Box(fn(Int) -> Int) }}\neffect Ask {{ fn ask() -> Box }}\n{RECORD}\
+         pub fn main() -> Int {{ match replay(fn() {{ ask() }}) {{ Box(g) -> g(1) }} }}\n"
+    );
+    assert!(errors(&boxed).contains("E0434"), "{}", errors(&boxed));
+}
+
+#[test]
+fn io_reaching_a_generic_handler_is_e0434() {
+    // IO is never handled (D2), so a generic replayer may not be given it.
+    let src = format!(
+        "{WORLD}{RECORD}pub fn main() -> Int {{ replay(fn() {{ io.println(\"x\")  roll(6) }}) }}\n"
+    );
+    assert!(errors(&src).contains("E0434"), "{}", errors(&src));
+}
+
+#[test]
+fn a_generic_caller_is_checked_at_its_own_callers() {
+    let wrap = "fn wrap(body) { replay(body) }\n";
+    let ok =
+        format!("{WORLD}{MAKE}{RECORD}{wrap}pub fn main() -> Int {{ wrap(fn() {{ roll(6) }}) }}\n");
+    assert_eq!(errors(&ok), "");
+    let bad = format!(
+        "{WORLD}{MAKE}{RECORD}{wrap}pub fn main() -> Int {{ wrap(fn() {{ make() }})(1) }}\n"
+    );
+    assert!(errors(&bad).contains("E0434"), "{}", errors(&bad));
+}

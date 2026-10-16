@@ -172,6 +172,9 @@ struct ResumeCx {
     clauses_row: RowVar,
 }
 
+/// A declared type's parameter variables and each constructor's field types.
+type AdtFields = (Vec<u32>, Vec<Vec<Ty>>);
+
 pub struct Infer {
     subst: Vec<Option<Ty>>,
     row_subst: Vec<Option<EffectRow>>,
@@ -253,6 +256,20 @@ pub struct Infer {
     /// clause, as `Ty::Con` names that no declaration can spell. Each with its
     /// clause's span, for E0435 when one escapes.
     skolems: Vec<(String, Span)>,
+    /// E0434 (2026-10-16): row variables handled by a `with any` handler. A
+    /// scheme generalizing one queues every instantiation's copy for the data
+    /// check (which marks the copy's own tail in turn, if it is still open).
+    generic_rows: HashSet<RowVar>,
+    /// Rows a `with any` handler handles, with the span to blame: checked for
+    /// data (`check_generic_rows`) when their binding group is solved.
+    /// The flag: whether the site already put a concrete `IO` in its residual
+    /// (a handle does; an instantiated tail never can).
+    pending_generic: Vec<(EffectRow, Span, bool)>,
+    /// The span of the expression being inferred (an instantiation's site).
+    cur_span: Span,
+    /// Declared type -> its parameters' variables and each constructor's
+    /// field types, for the data check.
+    adt_fields: HashMap<String, AdtFields>,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -281,6 +298,10 @@ impl Infer {
             known_types: HashMap::new(),
             ann_vars: HashMap::new(),
             skolems: Vec::new(),
+            generic_rows: HashSet::new(),
+            pending_generic: Vec::new(),
+            cur_span: Span::EMPTY,
+            adt_fields: HashMap::new(),
             diags: Vec::new(),
         }
     }
@@ -1180,6 +1201,10 @@ impl Infer {
             } else {
                 self.fresh_row()
             };
+            if self.generic_rows.contains(v) {
+                self.pending_generic
+                    .push((EffectRow::open(fresh), self.cur_span, false));
+            }
             row_mapping.insert(*v, fresh);
         }
         subst_vars(&s.ty, &mapping, &row_mapping)
@@ -1253,6 +1278,7 @@ impl Infer {
     /// `infer_handle` — routes through here, so no node escapes recording. The
     /// final zonk pass runs once in `infer_all`, not at record-time.
     pub fn infer_expr(&mut self, e: &Spanned<Expr>, env: &mut TyEnv, amb: RowVar) -> Ty {
+        self.cur_span = e.span;
         let ty = self.infer_expr_inner(e, env, amb);
         self.node_types.insert(e.span, ty.clone());
         ty
@@ -2137,7 +2163,8 @@ impl Infer {
             let r = self.add_row(amb, &ret_row, span);
             self.surface_conflict(r);
         }
-        // The handled row: the body's, but `IO`.
+        // The handled row: the body's, but `IO`. Its labels and tail must be
+        // data (E0434), checked when the group is solved.
         let mut handled = self.resolve_row(&EffectRow::open(amb_in));
         handled.labels.remove("IO");
 
@@ -2218,10 +2245,13 @@ impl Infer {
         }
         // The residual: `IO`, never dispatched to a handler, if the body has it.
         let body_row = self.resolve_row(&EffectRow::open(amb_in));
+        let io_residual = body_row.labels.contains_key("IO");
         if let Some(io) = body_row.labels.get("IO") {
             let r = self.add_effect(amb, "IO", io.args.clone(), io.span);
             self.surface_conflict(r);
         }
+        self.pending_generic
+            .push((EffectRow::open(amb_in), span, io_residual));
         // E0435: an answer type stays in its clause.
         for (sk, sp) in new_skolems {
             self.check_skolem_escape(&sk, sp, &result, env, amb);
@@ -2282,6 +2312,105 @@ impl Infer {
             }
             Ty::Tuple(xs) => xs.iter().any(|x| self.mentions_con(x, name)),
             Ty::Var(_) | Ty::Base(_) | Ty::Error => false,
+        }
+    }
+
+    /// E0434 (2026-10-16, D5): every row a `with any` handler handles, queued
+    /// at the handle and at each instantiation of a scheme generalizing one, is
+    /// data: each label a user effect (never `IO`) whose operations take and
+    /// answer data at the label's arguments. A tail still open becomes a
+    /// generically handled variable, checked again wherever it is instantiated.
+    fn check_generic_rows(&mut self) {
+        for (row, span, io_residual) in std::mem::take(&mut self.pending_generic) {
+            let row = self.resolve_row(&row);
+            for (label, l) in &row.labels {
+                if label == "IO" {
+                    continue; // a concrete IO at the handle is the residual (D2)
+                }
+                let ops: Vec<(String, OpInfo)> = self
+                    .ops
+                    .iter()
+                    .filter(|(_, o)| &o.effect == label)
+                    .map(|(n, o)| (n.clone(), o.clone()))
+                    .collect();
+                let mut ops = ops;
+                ops.sort_by(|a, b| a.0.cmp(&b.0));
+                for (name, op) in ops {
+                    let m: HashMap<u32, Ty> = op
+                        .effect_params
+                        .iter()
+                        .cloned()
+                        .zip(l.args.iter().cloned())
+                        .collect();
+                    let rm = HashMap::new();
+                    let tys = op
+                        .params
+                        .iter()
+                        .chain(std::iter::once(&op.ret))
+                        .map(|t| subst_vars(t, &m, &rm));
+                    for t in tys.collect::<Vec<_>>() {
+                        if let Some(why) = self.not_data(&t, &mut Vec::new()) {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    "E0434",
+                                    "an effect handled by `with any` must be data",
+                                )
+                                .with_label(span, format!("`{label}.{name}` is handled here generically"))
+                                .with_help(format!(
+                                    "a `with any` handler shows, encodes and decodes every operation it handles, so their argument and answer types must be data (no functions); `{label}.{name}` has {why}"
+                                )),
+                            );
+                        }
+                    }
+                }
+            }
+            match row.tail {
+                RowTail::Open(v) => {
+                    // `IO` arriving through a tail would be handled: E0434 too.
+                    self.generic_rows.insert(v);
+                }
+                RowTail::Closed | RowTail::ErrorRow => {}
+            }
+            if row.labels.contains_key("IO") && !io_residual {
+                self.diags.push(
+                    Diagnostic::error("E0434", "`IO` cannot be handled by `with any`")
+                        .with_label(span, "the computation given to a `with any` handler performs `IO`")
+                        .with_help("`IO` is never dispatched to a handler, so a generic handler cannot record or replace it; handle a user effect instead"),
+                );
+            }
+        }
+    }
+
+    /// Why `t` (resolved) is not data, or `None` if it is. `seen` breaks the
+    /// recursion of recursive types.
+    fn not_data(&self, t: &Ty, seen: &mut Vec<String>) -> Option<String> {
+        match self.resolve(t) {
+            Ty::Base(_) | Ty::Error => None,
+            Ty::Fn(..) => Some("a function type".to_string()),
+            Ty::Var(_) => Some("a type not known to be data".to_string()),
+            Ty::Tuple(xs) => xs.iter().find_map(|x| self.not_data(x, seen)),
+            Ty::Con(n, args) => {
+                let key = format!("{n}{args:?}");
+                if seen.contains(&key) {
+                    return None;
+                }
+                seen.push(key);
+                let Some((params, ctors)) = self.adt_fields.get(&n).cloned() else {
+                    return Some(format!("the type `{n}`"));
+                };
+                let m: HashMap<u32, Ty> =
+                    params.iter().cloned().zip(args.iter().cloned()).collect();
+                let rm = HashMap::new();
+                for fields in &ctors {
+                    for f in fields {
+                        let f = subst_vars(f, &m, &rm);
+                        if let Some(why) = self.not_data(&f, seen) {
+                            return Some(why);
+                        }
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -2831,6 +2960,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                 .zip(param_vars.iter().cloned())
                 .collect();
             let result = Ty::Con(t.name.clone(), param_vars.clone());
+            let mut ctors: Vec<Vec<Ty>> = Vec::new();
             for v in &t.variants {
                 let vd = &v.node;
                 inf.ctor_arity.insert(vd.name.clone(), vd.fields.len());
@@ -2844,6 +2974,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                         &effect_arity,
                     ));
                 }
+                ctors.push(field_tys.clone());
                 let ty = if field_tys.is_empty() {
                     result.clone()
                 } else {
@@ -2858,6 +2989,8 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                     },
                 );
             }
+            inf.adt_fields
+                .insert(t.name.clone(), (var_ids.clone(), ctors));
         }
     }
 
@@ -3066,6 +3199,9 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             }
         }
         inf.phantom.clear();
+        // 2.8. E0434: what `with any` handlers handle is data. A tail still
+        //      open here is generalized: its instantiations are checked.
+        inf.check_generic_rows();
         // 3. generalize each member and re-insert its polytype for later groups.
         for &i in group {
             let f = fns[i];
