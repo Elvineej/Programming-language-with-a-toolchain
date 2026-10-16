@@ -18,6 +18,13 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   overflow; deep non-tail recursion natively is the new HANDOFF step 5. Review: 52
   probes, no finding. Gate 1001 / 93 (predicted 1001).
 - Windows-gate debt added: adb66f5.
+- **Done: failure as an effect and scope cancellation** (4e2ca0b, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-16-elya-failure-and-cancellation-design.md`.
+  **Decisions (mine; please review):** bottom as an empty type plus an empty match (no
+  new type rule); **new diagnostic E0209** for any name declared twice (functions,
+  types, constructors, effects were silent overwrites). `examples/10_failure.elya`.
+  Review: 1 finding (the duplicate names), fixed test-first. Gate 1010 / 95.
+- Windows-gate debt added: 4e2ca0b.
 
 ## 2026-10-16 05:53 UTC — ended without a DONE mark (taken over 2026-10-16 12:30)
 
