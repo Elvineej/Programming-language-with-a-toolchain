@@ -18,6 +18,7 @@
 //! `False && 1 / 0 == 0` fails on both sides. Short-circuiting is a front-end
 //! question, not a back-end one.
 
+mod anf;
 mod closure;
 mod cps;
 mod cps_emit;
@@ -1871,7 +1872,10 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
 
     // N7 part 2: clone generic functions and locals per type instantiation,
     // so no type variable reaches the back end (spec 2026-10-15).
-    let specialized = mono::run(core)?;
+    // Computed callees are named and top-level functions used as values are
+    // wrapped in closures, so every call below is by name (spec 2026-10-16).
+    let named = anf::run(core);
+    let specialized = mono::run(&named)?;
     // N7 part 1: monomorphize rows where a reference needs another convention,
     // and eta-expand upcasts, so every phase below sees types that say the
     // right convention. Pure Core-to-Core; nothing is emitted yet.
@@ -2848,26 +2852,19 @@ mod tests {
         // emitted only as clones, and nothing instantiates it: the module
         // compiles (this asserted the "unrepresentable type" refusal before).
         // An instantiated row-only variable is refused by its own name -- see
-        // `mono::tests::a_row_only_type_variable_is_refused_by_name`.
+        // `mono::tests::a_row_only_type_variable_is_instantiated_from_the_reference`.
         emit_ir(&core).expect("the uninstantiated generic `reader` is not emitted");
     }
 
     #[test]
-    fn rejects_a_computed_callee_specifically() {
-        // §5.3, witnessed by a program a user could actually write. The Pratt
-        // parser applies the postfix call loop to ANY atom and `(expr)` unwraps
-        // with no wrapper node, so this parses to `Call { callee: Lambda, .. }`
-        // and lowers to `App(Lambda, ..)` — it really does reach the back end.
-        //
-        // Order matters and is in our control: `build_elya_call` inspects the
-        // callee kind FIRST, so "computed callee" fires before the pre-existing
-        // `Lambda` arm of `lower_expr` is ever visited. If this test starts
-        // reporting `Unsupported("Lambda")`, that ordering has been inverted.
-        let err = emit_ir(&core_of("pub fn main() { (fn(x) { x + 1 })(3) }\n")).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("computed callee")),
-            "{err:?}"
-        );
+    fn a_computed_callee_compiles() {
+        // Was `rejects_a_computed_callee_specifically` (§5.3): `(fn(x) { x + 1
+        // })(3)` parses to `App(Lambda, ..)` and was refused by name. Since
+        // 2026-10-16 (`anf.rs`) a computed callee is let-bound first and called
+        // as a local closure; the emitters' "computed callee" refusal stays as
+        // the guard behind the pass. Expectation changed by that decision.
+        emit_ir(&core_of("pub fn main() { (fn(x) { x + 1 })(3) }\n"))
+            .expect("a named callee compiles");
     }
 
     #[test]
@@ -2900,23 +2897,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_function_name_in_value_position() {
-        // §5.4's companion. This IS legal Elya — typed_inference's surface4
-        // type-checks `let g = worker  g()` — so the program reaches the back
-        // end and gets its own message rather than the generic "unbound var",
-        // which would point a reader at name resolution instead of at this gap.
-        // N5 (closures) is what makes it representable.
-        //
-        // The `let` binding is lowered before its body, so this message fires
-        // first; the `f(1)` call never gets as far as `build_elya_call`.
-        let err = emit_ir(&core_of(
+    fn a_function_name_in_value_position_compiles() {
+        // Was `rejects_a_function_name_in_value_position` (§5.4's companion):
+        // `let f = add3` was refused by name. Since 2026-10-16 (`anf.rs`) a
+        // top-level function used as a value is wrapped in a closure with no
+        // captures; the emitters' "function used as a value" refusal stays as
+        // the guard behind the pass. Expectation changed by that decision.
+        emit_ir(&core_of(
             "fn add3(x) { x + 3 }\npub fn main() {\n  let f = add3\n  f(1)\n}\n",
         ))
-        .unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("function used as a value")),
-            "{err:?}"
-        );
+        .expect("a wrapped function value compiles");
     }
 
     #[test]

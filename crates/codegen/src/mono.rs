@@ -108,7 +108,7 @@ fn tv_in_op(t: &Ty, used: &BTreeMap<String, Vec<bool>>) -> bool {
 
 /// Matches a generic type against its instance, recording each type variable
 /// of the generic. Shapes that do not line up are skipped.
-fn match_tys(g: &Ty, i: &Ty, out: &mut TySubst) {
+pub(crate) fn match_tys(g: &Ty, i: &Ty, out: &mut TySubst) {
     match (g, i) {
         (Ty::Var(v), _) => {
             out.entry(*v).or_insert_with(|| i.clone());

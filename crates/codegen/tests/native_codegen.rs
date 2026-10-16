@@ -5515,3 +5515,105 @@ fn the_failure_example_runs_natively() {
     assert_eq!(value, "-123");
     assert_eq!(value, eval_main_int(src));
 }
+
+// ---- Computed callees and functions as values (2026-10-16) ----
+// Spec `docs/superpowers/specs/2026-10-16-elya-callees-and-function-values-design.md`.
+// Every program was refused natively ("computed callee" or "function used as a
+// value"); values are the evaluator's.
+const CALLEES: &[(&str, &str, &str)] = &[
+    (
+        "c1-computed-callees",
+        "fn compose(f, g) { fn(x) { g(f(x)) } }\n\
+         fn mk() { fn(y) { y * 2 } }\n\
+         pub fn main() -> Int { (compose(fn(a) { a + 1 }, fn(b) { b * 10 }))(4) + (mk())(1) }\n",
+        "52",
+    ),
+    (
+        // The callee before the argument: each `lg` appends its digit below the
+        // rest's, so the order is the number's last two digits (21).
+        "c4-the-callee-first",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn pick(n) { let _ = lg(1)  fn(x) { x + n } }\n\
+         fn arg(v) { let _ = lg(2)  v }\n\
+         pub fn main() -> Int { handle { (pick(1))(arg(2)) } with { L.lg(v) -> resume(0) * 10 + v  return(r) -> r } }\n",
+        "321",
+    ),
+    (
+        "c3-a-function-in-a-local",
+        "fn double(x) { x * 2 }\n\
+         fn apply(f, x) { f(x) }\n\
+         pub fn main() -> Int { let g = double  apply(g, 4) + g(1) }\n",
+        "10",
+    ),
+    (
+        "c5-a-function-in-a-field",
+        "type Box { B(fn(Int) -> Int) }\n\
+         fn inc(x) { x + 1 }\n\
+         fn open(b) { match b { B(f) -> f(41) } }\n\
+         pub fn main() -> Int { open(B(inc)) }\n",
+        "42",
+    ),
+    (
+        "c6-an-effectful-function-as-a-value",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn logd(x) { lg(x) + 1 }\n\
+         fn twice(f, x) { f(f(x)) }\n\
+         pub fn main() -> Int { handle { twice(logd, 5) } with { L.lg(v) -> resume(v * 2)  return(r) -> r } }\n",
+        "23",
+    ),
+    (
+        "c7-a-generic-function-as-a-value",
+        "fn id(x) { x }\n\
+         fn apply(f, x) { f(x) }\n\
+         pub fn main() -> Int { if apply(id, True) { apply(id, 7) } else { 0 } }\n",
+        "7",
+    ),
+    (
+        // A local shadowing a top-level name is the local's value, not wrapped.
+        "c8-a-shadowing-local",
+        "fn inc(x) { x + 1 }\n\
+         fn apply(f, x) { f(x) }\n\
+         pub fn main() -> Int { let inc = fn(x) { x + 100 }  apply(inc, 1) }\n",
+        "101",
+    ),
+    // The review's finding 1: a pure function passed where an effectful one is
+    // expected. The wrapper's inner call had the WIDENED type, so a direct
+    // function was called with the CPS convention ("calling convention
+    // disagrees with the callee").
+    (
+        "r1-a-pure-function-at-an-effectful-type",
+        "effect E { fn ask(n: Int) -> Int }\n\
+         fn inc(x) { x + 1 }\n\
+         fn apply(f, x) { f(x) }\n\
+         pub fn main() -> Int { handle { ask(3) + apply(inc, 0) } with { E.ask(n) -> resume(n * 10)  return(r) -> r } }\n",
+        "31",
+    ),
+    (
+        "r2-pure-and-effectful-values-to-one-function",
+        "effect L { fn lg(x: Int) -> Int }\n\
+         fn logd(x) { lg(x) + 1 }\n\
+         fn inc(x) { x + 1 }\n\
+         fn twice(f, x) { f(f(x)) }\n\
+         pub fn main() -> Int { handle { twice(logd, 5) + twice(inc, 0) } with { L.lg(v) -> resume(v * 2)  return(r) -> r } }\n",
+        "25",
+    ),
+    (
+        "r3-a-pure-function-in-an-effectful-field",
+        "effect E { fn ask(n: Int) -> Int }\n\
+         type Box { B(fn(Int) / {E} -> Int) }\n\
+         fn inc(x) { x + 1 }\n\
+         fn open(b) { match b { B(f) -> f(ask(1)) } }\n\
+         pub fn main() -> Int { handle { open(B(inc)) } with { E.ask(n) -> resume(n * 10)  return(r) -> r } }\n",
+        "11",
+    ),
+];
+
+#[test]
+fn computed_callees_and_function_values_run_natively() {
+    run_value_corpus(CALLEES, "callees");
+}
+
+#[test]
+fn computed_callees_and_function_values_match_the_evaluator() {
+    run_differential_corpus(CALLEES, "callees-diff");
+}
