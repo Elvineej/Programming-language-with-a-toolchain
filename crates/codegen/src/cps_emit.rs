@@ -1308,10 +1308,19 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
     fn builtin(
         &self,
         st: &St<'ctx>,
+        e: &CoreExpr,
         name: &str,
         vals: &[BasicValueEnum<'ctx>],
     ) -> R<BasicValueEnum<'ctx>> {
         match name {
+            // `with any` (spec 2026-10-17): allocates, so what this function
+            // still needs is rooted across it, the operand included.
+            "any.show" | "any.decode" | "any.fail" | "any.check" if vals.len() == 1 => {
+                let roots = self.root_live(st, vals)?;
+                let v = crate::any_builtin(self.ctx, self.b, self.lc, e, vals[0])?;
+                gc_unroot(self.b, self.lc, roots)?;
+                Ok(v)
+            }
             "io.println" => self.println(vals),
             "time.now_ms" | "time.sleep_ms" => {
                 crate::time_builtin(self.ctx, self.b, self.lc, name, vals)
@@ -1442,10 +1451,10 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                 if !crate::is_native_builtin(name) {
                     return Err(CodegenError::UnsupportedBuiltin(name.clone()));
                 }
-                let Some(vals) = self.operands(st, args)? else {
+                let Some(vals) = self.operands(st, builtin_operands(name, args))? else {
                     return Ok(None);
                 };
-                let v = self.builtin(st, name, &vals)?;
+                let v = self.builtin(st, e, name, &vals)?;
                 self.settle(st, before)?;
                 Ok(Some(v))
             }
@@ -2620,10 +2629,12 @@ fn emit_resume_fn<'ctx>(
                 if !crate::is_native_builtin(name) {
                     return Err(CodegenError::UnsupportedBuiltin(name.clone()));
                 }
-                let Some(vals) = resume_operands(&cx, &mut st, args, step.slot, cur)? else {
+                let Some(vals) =
+                    resume_operands(&cx, &mut st, builtin_operands(name, args), step.slot, cur)?
+                else {
                     return Ok(());
                 };
-                cur = cx.builtin(&st, name, &vals)?;
+                cur = cx.builtin(&st, a, name, &vals)?;
             }
             CoreKind::Ctor(name, fields) => {
                 let Some(vals) = resume_operands(&cx, &mut st, fields, step.slot, cur)? else {
@@ -2744,4 +2755,14 @@ fn resume_operands<'ctx>(
         }
     }
     Ok(Some(out))
+}
+
+/// The operands a builtin's call lowers: an `any.*` builtin's first only (the
+/// rest are the expansion's literals, read by `any_builtin`; spec 2026-10-17).
+fn builtin_operands<'e>(name: &str, args: &'e [CoreExpr]) -> &'e [CoreExpr] {
+    if name.starts_with("any.") && !args.is_empty() {
+        &args[..1]
+    } else {
+        args
+    }
 }

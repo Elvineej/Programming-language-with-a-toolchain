@@ -383,6 +383,614 @@ void *elya_int_to_string(int64_t tag, int64_t n) {
     return elya_str_lit(tag, buf, (int64_t)len);
 }
 
+/* ---- `with any` natively: literals (spec 2026-10-17-elya-native-any-handlers,
+ * D3/D4). The back end hands over a reflection table (`reflect.rs`): a node is
+ * an offset into `t`; `[0]` Int, `[1]` Bool, `[2]` Unit, `[3]` String, `[4]` a
+ * function, `[5, n, (tag, name_off, name_len, arity, field_node..) * n]` a
+ * declared type (source constructor names in `names`), `[6]` an instance no
+ * value of exists. Every walk keeps its own stack: a million-cell list neither
+ * recurses nor overflows. Failures carry the evaluator's words. */
+
+enum { ANY_INT, ANY_BOOL, ANY_UNIT, ANY_STRING, ANY_FN, ANY_ADT, ANY_UNBUILT };
+
+static void any_oom(void) {
+    fputs("elya: out of memory\n", stderr);
+    exit(1);
+}
+
+static void *any_grow(void *p, int64_t *cap, int64_t need, size_t elem) {
+    if (need <= *cap) {
+        return p;
+    }
+    int64_t c = *cap ? *cap : 16;
+    while (c < need) {
+        c *= 2;
+    }
+    void *q = realloc(p, (size_t)c * elem);
+    if (!q) {
+        any_oom();
+    }
+    *cap = c;
+    return q;
+}
+
+typedef struct {
+    char *p;
+    int64_t len, cap;
+} AnyBuf;
+
+static void any_put(AnyBuf *b, const char *s, int64_t n) {
+    b->p = (char *)any_grow(b->p, &b->cap, b->len + n + 1, 1);
+    memcpy(b->p + b->len, s, (size_t)n);
+    b->len += n;
+}
+
+static void any_puts(AnyBuf *b, const char *s) { any_put(b, s, (int64_t)strlen(s)); }
+
+/* The constructor entry of `tag` in the declared-type node `node`, or -1. */
+static int64_t any_ctor(const int64_t *t, int64_t node, int64_t tag) {
+    int64_t n = t[node + 1];
+    int64_t at = node + 2;
+    for (int64_t i = 0; i < n; i++) {
+        if (t[at] == tag) {
+            return at;
+        }
+        at += 4 + t[at + 3];
+    }
+    return -1;
+}
+
+static void any_internal(const char *what) {
+    fprintf(stderr, "elya: internal: %s\n", what);
+    exit(1);
+}
+
+/* `value` (a word of the type `node`) in literal syntax, as a fresh string.
+ * Reaching a function fails with `before` "a function" `after`. */
+void *elya_any_show(int64_t string_tag, const int64_t *t, const char *names, int64_t node,
+                    int64_t value, const char *before, const char *after) {
+    typedef struct {
+        int64_t node, value;
+        const char *text;
+    } Item;
+    Item *stack = NULL;
+    int64_t top = 0, cap = 0;
+    AnyBuf out = {0};
+    stack = (Item *)any_grow(stack, &cap, 1, sizeof(Item));
+    stack[top++] = (Item){node, value, NULL};
+    while (top > 0) {
+        Item it = stack[--top];
+        if (it.text) {
+            any_puts(&out, it.text);
+            continue;
+        }
+        char num[32];
+        switch (t[it.node]) {
+        case ANY_INT:
+            any_put(&out, num, snprintf(num, sizeof num, "%lld", (long long)it.value));
+            break;
+        case ANY_BOOL:
+            any_puts(&out, it.value ? "True" : "False");
+            break;
+        case ANY_UNIT:
+            any_puts(&out, "Unit");
+            break;
+        case ANY_STRING: {
+            int64_t *s = (int64_t *)(intptr_t)it.value;
+            int64_t len = s[1];
+            const unsigned char *bytes = (const unsigned char *)&s[2];
+            any_puts(&out, "\"");
+            for (int64_t i = 0; i < len; i++) {
+                switch (bytes[i]) {
+                case '"': any_puts(&out, "\\\""); break;
+                case '\\': any_puts(&out, "\\\\"); break;
+                case '\n': any_puts(&out, "\\n"); break;
+                case '\t': any_puts(&out, "\\t"); break;
+                case '\r': any_puts(&out, "\\r"); break;
+                default: any_put(&out, (const char *)&bytes[i], 1);
+                }
+            }
+            any_puts(&out, "\"");
+            break;
+        }
+        case ANY_FN:
+            fprintf(stderr, "elya: %sa function%s\n", before, after);
+            exit(1);
+        case ANY_ADT: {
+            int64_t *p = (int64_t *)(intptr_t)it.value;
+            int64_t c = any_ctor(t, it.node, p[0]);
+            if (c < 0) {
+                any_internal("op: a value without a descriptor");
+            }
+            any_put(&out, names + t[c + 1], t[c + 2]);
+            int64_t arity = t[c + 3];
+            if (arity > 0) {
+                any_puts(&out, "(");
+                stack = (Item *)any_grow(stack, &cap, top + 2 * arity + 1, sizeof(Item));
+                stack[top++] = (Item){0, 0, ")"};
+                for (int64_t i = arity - 1; i >= 0; i--) {
+                    stack[top++] = (Item){t[c + 4 + i], p[1 + i], NULL};
+                    if (i > 0) {
+                        stack[top++] = (Item){0, 0, ", "};
+                    }
+                }
+            }
+            break;
+        }
+        default:
+            any_internal("op: a value of a type with no instance");
+        }
+    }
+    free(stack);
+    void *s = elya_str_lit(string_tag, out.p ? out.p : "", out.len);
+    free(out.p);
+    return s;
+}
+
+/* `o == o` (the review's R2): an operation equals itself unless the comparison
+ * reaches a function in an argument, which stops the evaluator's `==` with
+ * these words. Walks `value` (a word of type `node`); allocates nothing. */
+int64_t elya_any_check(const int64_t *t, int64_t node, int64_t value) {
+    typedef struct {
+        int64_t node, value;
+    } Item;
+    Item *stack = NULL;
+    int64_t top = 0, cap = 0;
+    stack = (Item *)any_grow(stack, &cap, 1, sizeof(Item));
+    stack[top++] = (Item){node, value};
+    while (top > 0) {
+        Item it = stack[--top];
+        switch (t[it.node]) {
+        case ANY_FN:
+            fputs("elya: `==` reached a value that is not data (E0436 should have rejected it)\n",
+                  stderr);
+            exit(1);
+        case ANY_ADT: {
+            int64_t *p = (int64_t *)(intptr_t)it.value;
+            int64_t c = any_ctor(t, it.node, p[0]);
+            if (c < 0) {
+                any_internal("op: a value without a descriptor");
+            }
+            int64_t arity = t[c + 3];
+            stack = (Item *)any_grow(stack, &cap, top + arity, sizeof(Item));
+            for (int64_t i = 0; i < arity; i++) {
+                stack[top++] = (Item){t[c + 4 + i], p[1 + i]};
+            }
+            break;
+        }
+        case ANY_UNBUILT:
+            any_internal("op: a value of a type with no instance");
+            break;
+        default:
+            break;
+        }
+    }
+    free(stack);
+    return 1;
+}
+
+/* `op.decode`'s refusal of an answer at an effect's own parameter (D4). */
+void elya_any_fail(const char *msg) {
+    fprintf(stderr, "elya: %s\n", msg);
+    exit(1);
+}
+
+/* A parsed literal: the evaluator's `Value`s a literal can denote. */
+enum { LIT_INT, LIT_FLOAT, LIT_BOOL, LIT_UNIT, LIT_STR, LIT_CTOR };
+
+typedef struct {
+    int kind;
+    int64_t i;          /* Int, Bool */
+    char *s;            /* String bytes (malloc'd); a constructor's name (into the text) */
+    int64_t slen;
+    int64_t *kids;      /* a constructor's arguments, as indices */
+    int64_t nkids;
+} AnyLit;
+
+typedef struct {
+    const char *s;
+    int64_t i, n;
+    AnyLit *lits;
+    int64_t nlits, cap;
+} AnyParser;
+
+static int64_t any_new(AnyParser *p, AnyLit l) {
+    p->lits = (AnyLit *)any_grow(p->lits, &p->cap, p->nlits + 1, sizeof(AnyLit));
+    p->lits[p->nlits] = l;
+    return p->nlits++;
+}
+
+static int any_space(char c) {
+    /* Rust's `is_ascii_whitespace`: space, \t, \n, \x0C, \r. */
+    return c == ' ' || c == '\t' || c == '\n' || c == '\x0C' || c == '\r';
+}
+
+static void any_ws(AnyParser *p) {
+    while (p->i < p->n && any_space(p->s[p->i])) {
+        p->i++;
+    }
+}
+
+static int any_starts(AnyParser *p, const char *w) {
+    int64_t k = (int64_t)strlen(w);
+    return p->n - p->i >= k && memcmp(p->s + p->i, w, (size_t)k) == 0;
+}
+
+static int any_digit(char c) { return c >= '0' && c <= '9'; }
+
+static int any_alnum(char c) {
+    return any_digit(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+/* A decimal Int in range, as Rust's `i64::from_str` reads `[-]digits`. */
+static int any_int(const char *s, int64_t n, int64_t *out) {
+    int64_t k = 0;
+    int neg = 0;
+    if (k < n && s[k] == '-') {
+        neg = 1;
+        k++;
+    }
+    if (k == n) {
+        return 0;
+    }
+    uint64_t limit = neg ? (uint64_t)INT64_MAX + 1 : (uint64_t)INT64_MAX;
+    uint64_t v = 0;
+    for (; k < n; k++) {
+        uint64_t d = (uint64_t)(s[k] - '0');
+        if (v > (limit - d) / 10) {
+            return 0;
+        }
+        v = v * 10 + d;
+    }
+    *out = neg ? (int64_t)(0 - v) : (int64_t)v;
+    return 1;
+}
+
+/* The evaluator's literal parser (`literal.rs`), the same errors in the same
+ * order. Returns the literal's index, or -1 with `*err` set. */
+static int64_t any_parse(AnyParser *p, const char **err) {
+    typedef struct {
+        const char *name;
+        int64_t len;
+        int64_t *args;
+        int64_t nargs, cap;
+    } Open;
+    Open *open = NULL;
+    int64_t nopen = 0, ocap = 0;
+    int64_t v = -1;
+    for (;;) {
+        any_ws(p);
+        if (p->i >= p->n) {
+            *err = "nothing to read";
+            goto fail;
+        }
+        char c = p->s[p->i];
+        if (c == '"') {
+            p->i++;
+            char *bytes = NULL;
+            int64_t len = 0, bcap = 0;
+            for (;;) {
+                if (p->i >= p->n) {
+                    free(bytes);
+                    *err = "an unterminated string";
+                    goto fail;
+                }
+                char d = p->s[p->i];
+                if (d == '"') {
+                    p->i++;
+                    break;
+                }
+                if (d == '\\') {
+                    p->i++;
+                    if (p->i >= p->n) {
+                        free(bytes);
+                        *err = "an unterminated string";
+                        goto fail;
+                    }
+                    char e = p->s[p->i];
+                    char out;
+                    switch (e) {
+                    case '"': out = '"'; break;
+                    case '\\': out = '\\'; break;
+                    case 'n': out = '\n'; break;
+                    case 't': out = '\t'; break;
+                    case 'r': out = '\r'; break;
+                    default:
+                        free(bytes);
+                        *err = "an unknown escape";
+                        goto fail;
+                    }
+                    d = out;
+                }
+                bytes = (char *)any_grow(bytes, &bcap, len + 1, 1);
+                bytes[len++] = d;
+                p->i++;
+            }
+            /* The bytes between two quotes of UTF-8 text, with ASCII escapes
+             * replaced, are UTF-8: the evaluator's "not UTF-8" cannot occur. */
+            v = any_new(p, (AnyLit){LIT_STR, 0, bytes, len, NULL, 0});
+        } else if (c == '-' || any_digit(c)) {
+            if (any_starts(p, "-inf")) {
+                p->i += 4;
+                v = any_new(p, (AnyLit){LIT_FLOAT, 0, NULL, 0, NULL, 0});
+            } else {
+                int64_t start = p->i;
+                int dots = 0, digits = 0;
+                if (p->s[p->i] == '-') {
+                    p->i++;
+                }
+                while (p->i < p->n && (any_digit(p->s[p->i]) || p->s[p->i] == '.')) {
+                    if (p->s[p->i] == '.') {
+                        dots++;
+                    } else {
+                        digits++;
+                    }
+                    p->i++;
+                }
+                if (dots > 0) {
+                    /* Rust's `f64::from_str` on `[-][digits][.][digits]`: one point
+                     * and at least one digit. */
+                    if (dots != 1 || digits == 0) {
+                        *err = "a malformed number";
+                        goto fail;
+                    }
+                    v = any_new(p, (AnyLit){LIT_FLOAT, 0, NULL, 0, NULL, 0});
+                } else {
+                    int64_t n;
+                    if (!any_int(p->s + start, p->i - start, &n)) {
+                        *err = "a malformed or out-of-range integer";
+                        goto fail;
+                    }
+                    v = any_new(p, (AnyLit){LIT_INT, n, NULL, 0, NULL, 0});
+                }
+            }
+        } else if (c == 'i' && any_starts(p, "inf")) {
+            p->i += 3;
+            v = any_new(p, (AnyLit){LIT_FLOAT, 0, NULL, 0, NULL, 0});
+        } else if (c == 'n' && any_starts(p, "nan")) {
+            p->i += 3;
+            v = any_new(p, (AnyLit){LIT_FLOAT, 0, NULL, 0, NULL, 0});
+        } else if (c >= 'A' && c <= 'Z') {
+            int64_t start = p->i;
+            while (p->i < p->n && (any_alnum(p->s[p->i]) || p->s[p->i] == '_')) {
+                p->i++;
+            }
+            const char *name = p->s + start;
+            int64_t len = p->i - start;
+            int64_t save = p->i;
+            any_ws(p);
+            if (p->i < p->n && p->s[p->i] == '(') {
+                p->i++;
+                open = (Open *)any_grow(open, &ocap, nopen + 1, sizeof(Open));
+                open[nopen++] = (Open){name, len, NULL, 0, 0};
+                continue;
+            }
+            p->i = save;
+            if (len == 4 && memcmp(name, "True", 4) == 0) {
+                v = any_new(p, (AnyLit){LIT_BOOL, 1, NULL, 0, NULL, 0});
+            } else if (len == 5 && memcmp(name, "False", 5) == 0) {
+                v = any_new(p, (AnyLit){LIT_BOOL, 0, NULL, 0, NULL, 0});
+            } else if (len == 4 && memcmp(name, "Unit", 4) == 0) {
+                v = any_new(p, (AnyLit){LIT_UNIT, 0, NULL, 0, NULL, 0});
+            } else {
+                v = any_new(p, (AnyLit){LIT_CTOR, 0, (char *)name, len, NULL, 0});
+            }
+        } else {
+            *err = "an unexpected character";
+            goto fail;
+        }
+        /* Give the value to the constructor it is an argument of, closing every
+         * constructor whose `)` follows. */
+        for (;;) {
+            if (nopen == 0) {
+                free(open);
+                return v;
+            }
+            Open *o = &open[nopen - 1];
+            o->args = (int64_t *)any_grow(o->args, &o->cap, o->nargs + 1, sizeof(int64_t));
+            o->args[o->nargs++] = v;
+            any_ws(p);
+            if (p->i < p->n && p->s[p->i] == ',') {
+                p->i++;
+                break;
+            }
+            if (p->i < p->n && p->s[p->i] == ')') {
+                p->i++;
+                nopen--;
+                v = any_new(p, (AnyLit){LIT_CTOR, 0, (char *)o->name, o->len, o->args, o->nargs});
+                continue;
+            }
+            *err = "a constructor's arguments not closed by `)`";
+            goto fail;
+        }
+    }
+fail:
+    for (int64_t k = 0; k < nopen; k++) {
+        free(open[k].args);
+    }
+    free(open);
+    return -1;
+}
+
+static void any_free(AnyParser *p) {
+    for (int64_t k = 0; k < p->nlits; k++) {
+        if (p->lits[k].kind == LIT_STR) {
+            free(p->lits[k].s);
+        }
+        free(p->lits[k].kids);
+    }
+    free(p->lits);
+}
+
+/* Does literal `lit` denote a value of the type `node`? Iterative. */
+static int any_conforms(AnyParser *p, const int64_t *t, const char *names, int64_t lit,
+                        int64_t node, int64_t **centry) {
+    typedef struct {
+        int64_t lit, node;
+    } Pair;
+    Pair *work = NULL;
+    int64_t top = 0, cap = 0;
+    work = (Pair *)any_grow(work, &cap, 1, sizeof(Pair));
+    work[top++] = (Pair){lit, node};
+    int ok = 1;
+    while (ok && top > 0) {
+        Pair w = work[--top];
+        AnyLit *l = &p->lits[w.lit];
+        switch (t[w.node]) {
+        case ANY_INT: ok = l->kind == LIT_INT; break;
+        case ANY_BOOL: ok = l->kind == LIT_BOOL; break;
+        case ANY_UNIT: ok = l->kind == LIT_UNIT; break;
+        case ANY_STRING: ok = l->kind == LIT_STR; break;
+        case ANY_FN: ok = 0; break;
+        case ANY_ADT: {
+            ok = 0;
+            if (l->kind != LIT_CTOR) {
+                break;
+            }
+            int64_t n = t[w.node + 1];
+            int64_t at = w.node + 2;
+            for (int64_t k = 0; k < n; k++) {
+                if (t[at + 2] == l->slen && memcmp(names + t[at + 1], l->s, (size_t)l->slen) == 0) {
+                    if (t[at + 3] == l->nkids) {
+                        ok = 1;
+                        (*centry)[w.lit] = at;
+                        work = (Pair *)any_grow(work, &cap, top + l->nkids, sizeof(Pair));
+                        for (int64_t f = 0; f < l->nkids; f++) {
+                            work[top++] = (Pair){l->kids[f], t[at + 4 + f]};
+                        }
+                    }
+                    break;
+                }
+                at += 4 + t[at + 3];
+            }
+            break;
+        }
+        default:
+            any_internal("op.decode: a type with no instance");
+        }
+    }
+    free(work);
+    return ok;
+}
+
+static void any_decode_fail(const char *why1, const char *text, int64_t tlen, const char *why2,
+                            const char *opname) {
+    fprintf(stderr, "elya: op.decode: %s", why1);
+    fwrite(text, 1, (size_t)tlen, stderr);
+    fprintf(stderr, "%s, for an answer of `%s`\n", why2, opname);
+    exit(1);
+}
+
+/* `op.decode`: parse the whole text, then refuse input after the value, then
+ * check the literal against the type, then build it -- the evaluator's order,
+ * so the first failure named is the same. Every value built is rooted until
+ * its parent holds it. */
+int64_t elya_any_decode(int64_t string_tag, const int64_t *t, const char *names, int64_t node,
+                        void *text, const char *display, const char *opname) {
+    int64_t *ts = (int64_t *)text;
+    int64_t tlen = ts[1];
+    const char *src = (const char *)&ts[2];
+    AnyParser p = {src, 0, tlen, NULL, 0, 0};
+    const char *err = NULL;
+    int64_t root = any_parse(&p, &err);
+    if (root < 0) {
+        fprintf(stderr, "elya: op.decode: `");
+        fwrite(src, 1, (size_t)tlen, stderr);
+        fprintf(stderr, "` is not a literal (%s), for an answer of `%s`\n", err, opname);
+        exit(1);
+    }
+    any_ws(&p);
+    if (p.i != p.n) {
+        any_decode_fail("`", src, tlen, "` has input after its value", opname);
+    }
+    int64_t *centry = (int64_t *)calloc((size_t)(p.nlits ? p.nlits : 1), sizeof(int64_t));
+    if (!centry) {
+        any_oom();
+    }
+    if (!any_conforms(&p, t, names, root, node, &centry)) {
+        fprintf(stderr, "elya: op.decode: `");
+        fwrite(src, 1, (size_t)tlen, stderr);
+        fprintf(stderr, "` is not a value of type `%s`, for an answer of `%s`\n", display, opname);
+        exit(1);
+    }
+    /* Build, post-order. `done` holds built words; a heap one is also on the
+     * shadow stack, in the same order, until its parent is built. */
+    typedef struct {
+        int64_t lit, node;
+        int expanded;
+    } Step;
+    typedef struct {
+        int64_t word;
+        int heap;
+    } Done;
+    Step *steps = NULL;
+    Done *done = NULL;
+    int64_t ns = 0, scap = 0, nd = 0, dcap = 0;
+    steps = (Step *)any_grow(steps, &scap, 1, sizeof(Step));
+    steps[ns++] = (Step){root, node, 0};
+    while (ns > 0) {
+        Step *s = &steps[ns - 1];
+        AnyLit *l = &p.lits[s->lit];
+        int64_t kind = t[s->node];
+        if (kind == ANY_ADT && !s->expanded) {
+            s->expanded = 1;
+            int64_t at = centry[s->lit];
+            int64_t lit = s->lit;
+            steps = (Step *)any_grow(steps, &scap, ns + l->nkids, sizeof(Step));
+            for (int64_t f = l->nkids - 1; f >= 0; f--) {
+                steps[ns++] = (Step){p.lits[lit].kids[f], t[at + 4 + f], 0};
+            }
+            continue;
+        }
+        Done d = {0, 0};
+        switch (kind) {
+        case ANY_INT: d.word = l->i; break;
+        case ANY_BOOL: d.word = l->i ? 1 : 0; break;
+        case ANY_UNIT: d.word = 0; break;
+        case ANY_STRING:
+            d.word = (int64_t)(intptr_t)elya_str_lit(string_tag, l->s ? l->s : "", l->slen);
+            d.heap = 1;
+            break;
+        case ANY_ADT: {
+            int64_t at = centry[s->lit];
+            int64_t k = l->nkids;
+            int64_t *obj = (int64_t *)elya_alloc(1 + k);
+            obj[0] = t[at];
+            int pops = 0;
+            for (int64_t f = 0; f < k; f++) {
+                Done c = done[nd - k + f];
+                obj[1 + f] = c.word;
+                pops += c.heap;
+            }
+            nd -= k;
+            for (int q = 0; q < pops; q++) {
+                elya_gc_pop();
+            }
+            d.word = (int64_t)(intptr_t)obj;
+            d.heap = 1;
+            break;
+        }
+        default:
+            any_internal("op.decode: a type with no instance");
+        }
+        if (d.heap) {
+            elya_gc_push((void *)(intptr_t)d.word);
+        }
+        done = (Done *)any_grow(done, &dcap, nd + 1, sizeof(Done));
+        done[nd++] = d;
+        ns--;
+    }
+    int64_t result = done[0].word;
+    if (done[0].heap) {
+        elya_gc_pop();
+    }
+    free(steps);
+    free(done);
+    free(centry);
+    any_free(&p);
+    return result;
+}
+
 /* Time, the first I/O source (spec 2026-10-15-elya-async-step2-timers, D3).
  * `time.now_ms`: monotonic milliseconds since the first reading. `time.sleep_ms`:
  * a wait of at least `ms` (none when `ms <= 0`); an interrupted nanosleep goes on

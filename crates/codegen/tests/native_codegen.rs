@@ -853,6 +853,7 @@ fn a_failed_match_traps_with_a_named_error() {
     let core = CoreModule {
         generic_types: vec![],
         effect_params_used: Default::default(),
+        effects: Default::default(),
         types: vec![CoreType {
             name: "T".into(),
             ctors: vec![

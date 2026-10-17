@@ -14,7 +14,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1054 passed, 101 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1069 passed, 102 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions; `gc_mark` is unchanged (637 bytes of source).
@@ -339,27 +339,26 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   native gap (9 programs). Found and fixed: `elya build` panicked on a warning-only
   program.
 
+- **`with any` natively** (2026-10-17, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-17-elya-native-any-handlers-design.md`. After row
+  specialization a `with any` handle is expanded (`any.rs`) into a plain one with a
+  clause per handled operation, the clause copied at each answer type (generic helpers
+  called at it cloned too); `op.*` and `o == o` are rewritten over the clause's
+  parameters, so no operation value exists at run time (any other use of `o` is
+  refused by name). Literals are written and read by the runtime through a reflection
+  table, iteratively, with the evaluator's words for every failure.
+  `examples/09_record_any.elya` runs natively. Needs the Windows gate.
+
 ## The next five steps
 
-### 1. `with any` natively
-
-The top native gap of the 2026-10-16 sweep (9 programs). Operation-generic handlers
-(`examples/09_record_any.elya`) run in the evaluator only;
-`elya build` refuses them by name. Natively they need, per operation, its name and its
-parameter and answer types at run time (`op.show`, `op.decode`, `op.perform`), and
-`op.decode` needs the instantiation carried to the handler. Measure what 09 and the
-`any_handler` corpus need, decide in a spec how operation values are represented (a
-runtime table of operation descriptors keyed by the operation ids `cps_emit` already
-assigns), and compile them.
-
-### 2. Unary minus and wrapping arithmetic natively
+### 1. Unary minus and wrapping arithmetic natively
 
 Also-open items since 2026-10-10: Core refuses unary minus ("Unary"), so every native
 example writes `0 - 1`; and hashes and generators need explicit wrapping arithmetic
 (`int.wrapping_mul` and friends) now that `Int` is checked. Measure which corpus programs
 use `-x`, add the lowering, and decide the wrapping builtins' names in a spec.
 
-### 3. Record and replay natively
+### 2. Record and replay natively
 
 `elya run --record/--replay` (Done) works in the evaluator only; a native binary asks
 the runtime's clock directly. Add the same trace to the runtime (an environment
@@ -367,7 +366,7 @@ variable or flag read by the shim: `ELYA_RECORD=file` / `ELYA_REPLAY=file`), wit
 same format and the same named failures, and a differential test that a trace recorded
 by `elya run` replays natively and the reverse.
 
-### 4. Multi-shot resumes over a deep chain
+### 3. Multi-shot resumes over a deep chain
 
 Found by the native-stack review (PARKED.md, 2026-10-16): a `with multi` handler whose
 clause resumes non-tail over a deep non-tail recursion (`nest(20000)`) runs out of
@@ -376,7 +375,7 @@ memory natively, because every resume copies the whole captured chain
 the native growth by depth, then decide in a spec: share the chain's unchanged prefix
 (copy-on-write of handler frames only), or copy lazily as frames are re-entered.
 
-### 5. One wording for the one-shot trap, and the sweep's smaller gaps
+### 4. One wording for the one-shot trap, and the sweep's smaller gaps
 
 The sweep's four `both-fail-differently` programs: a second resume of a one-shot
 continuation is "continuation resumed more than once" in the evaluator and "a one-shot
@@ -384,6 +383,17 @@ continuation was resumed twice" natively. Decide one wording (spec), change both
 and the tests that assert either (a decision: call each out). Then the sweep's single
 refusals: a parametric constructor as a function value (`map(xs, Some)`), an
 effect-polymorphic closure through a `let` alias, `Float` in Core.
+
+### 5. Operation values as values natively
+
+`with any` natively (Done) refuses an operation value used other than by `op.*` or
+`==` (passed to a function, stored, returned: spec D2), and two evaluator behaviours
+stay native gaps: decoding a non-regular type (`too many type instances`) and
+decoding at an effect's own parameter (refused on both sides, the evaluator's S2).
+Measure what a recorder library would write (a `describe(o)` helper, a log of
+operations), then decide in a spec: clone functions over `Op(t)` per operation as the
+expansion clones clauses, or a run-time operation value; and whether both sides should
+decode at the instantiation (the evaluator would need it carried).
 
 Also open, unscheduled: `elya run --record/--replay` print a failing run's output to
 stderr with the diagnostic (plain `run` now keeps it on stdout); row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin

@@ -19,11 +19,13 @@
 //! question, not a back-end one.
 
 mod anf;
+mod any;
 mod closure;
 mod cps;
 mod cps_emit;
 mod mono;
 mod patterns;
+mod reflect;
 mod specialize;
 mod spill;
 
@@ -46,6 +48,7 @@ use inkwell::values::CallSiteValue;
 use inkwell::values::FunctionValue;
 use inkwell::values::IntValue;
 use inkwell::values::LLVMTailCallKind;
+use inkwell::values::PointerValue;
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
@@ -567,12 +570,173 @@ pub(crate) fn time_builtin<'ctx>(
     }
 }
 
-/// The builtins the native back end implements.
+/// The builtins the native back end implements. `any.*` are the `with any`
+/// expansion's (spec 2026-10-17), never written in source.
 pub(crate) fn is_native_builtin(name: &str) -> bool {
     matches!(
         name,
-        "io.println" | "int.to_string" | "time.now_ms" | "time.sleep_ms"
+        "io.println"
+            | "int.to_string"
+            | "time.now_ms"
+            | "time.sleep_ms"
+            | "any.show"
+            | "any.decode"
+            | "any.fail"
+            | "any.check"
     )
+}
+
+/// A NUL-terminated private constant, for the runtime's messages.
+fn c_string<'ctx>(ctx: &'ctx Context, lc: &LowerCtx<'_, 'ctx>, s: &str) -> PointerValue<'ctx> {
+    let i8t = ctx.i8_type();
+    let bytes: Vec<_> = s
+        .bytes()
+        .chain(std::iter::once(0))
+        .map(|c| i8t.const_int(c as u64, false))
+        .collect();
+    let arr = i8t.const_array(&bytes);
+    let g = lc
+        .module
+        .add_global(arr.get_type(), Some(AddressSpace::default()), "anymsg");
+    g.set_initializer(&arr);
+    g.set_constant(true);
+    g.set_linkage(Linkage::Private);
+    g.set_unnamed_addr(true);
+    g.as_pointer_value()
+}
+
+/// The `n`-th argument of a builtin, a string literal the expansion wrote.
+fn lit_arg(e: &CoreExpr, n: usize) -> Result<&str, CodegenError> {
+    match &e.kind {
+        CoreKind::Builtin(_, a) => match a.get(n).map(|x| &x.kind) {
+            Some(CoreKind::Lit(CoreLit::Str(s))) => Ok(s),
+            _ => Err(CodegenError::Unsupported(
+                "`any` builtin without its literal",
+            )),
+        },
+        _ => Err(CodegenError::Unsupported(
+            "`any` builtin without its literal",
+        )),
+    }
+}
+
+/// `any.show(v, before, after)`, `any.decode(s, display, op)`, `any.check(v)`
+/// and `any.fail(s, message)` (spec 2026-10-17 D3/D4) on the lowered first
+/// operand `v` (both emitters; only the first operand is lowered, the rest are
+/// the expansion's literals). Allocates: the caller roots what it still needs,
+/// `v` included.
+pub(crate) fn any_builtin<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    e: &CoreExpr,
+    v: BasicValueEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    let CoreKind::Builtin(name, args) = &e.kind else {
+        return Err(internal("any_builtin on a non-builtin"));
+    };
+    let tag = i64t.const_int(lc.string_tag as u64, false);
+    match name.as_str() {
+        "any.show" => {
+            let target = &args[0].ty;
+            let node = lc
+                .reflect
+                .node_of(target)
+                .ok_or_else(|| internal("any.show at a type the table lacks"))?;
+            let w = value_to_word(b, v, target, i64t)?;
+            b.build_call(
+                lc.any_show,
+                &[
+                    tag.into(),
+                    lc.any_table.into(),
+                    lc.any_names.into(),
+                    i64t.const_int(node as u64, false).into(),
+                    w.into(),
+                    c_string(ctx, lc, lit_arg(e, 1)?).into(),
+                    c_string(ctx, lc, lit_arg(e, 2)?).into(),
+                ],
+                "anyshow",
+            )
+            .map_err(internal)?
+            .try_as_basic_value()
+            .left()
+            .ok_or(CodegenError::Unsupported("elya_any_show returned no value"))
+        }
+        "any.decode" => {
+            let node = lc
+                .reflect
+                .node_of(&e.ty)
+                .ok_or_else(|| internal("any.decode at a type the table lacks"))?;
+            let w = b
+                .build_call(
+                    lc.any_decode,
+                    &[
+                        tag.into(),
+                        lc.any_table.into(),
+                        lc.any_names.into(),
+                        i64t.const_int(node as u64, false).into(),
+                        v.into(),
+                        c_string(ctx, lc, lit_arg(e, 1)?).into(),
+                        c_string(ctx, lc, lit_arg(e, 2)?).into(),
+                    ],
+                    "anydecode",
+                )
+                .map_err(internal)?
+                .try_as_basic_value()
+                .left()
+                .ok_or(CodegenError::Unsupported(
+                    "elya_any_decode returned no value",
+                ))?
+                .into_int_value();
+            word_to_value(
+                b,
+                w,
+                &e.ty,
+                ctx.bool_type(),
+                ctx.ptr_type(AddressSpace::default()),
+            )
+        }
+        "any.check" => {
+            let target = &args[0].ty;
+            let node = lc
+                .reflect
+                .node_of(target)
+                .ok_or_else(|| internal("any.check at a type the table lacks"))?;
+            let w = value_to_word(b, v, target, i64t)?;
+            let r = b
+                .build_call(
+                    lc.any_check,
+                    &[
+                        lc.any_table.into(),
+                        i64t.const_int(node as u64, false).into(),
+                        w.into(),
+                    ],
+                    "anycheck",
+                )
+                .map_err(internal)?
+                .try_as_basic_value()
+                .left()
+                .ok_or(CodegenError::Unsupported(
+                    "elya_any_check returned no value",
+                ))?
+                .into_int_value();
+            word_to_value(
+                b,
+                r,
+                &Ty::Base(TyCon::Bool),
+                ctx.bool_type(),
+                ctx.ptr_type(AddressSpace::default()),
+            )
+        }
+        "any.fail" => {
+            b.build_call(lc.any_fail, &[c_string(ctx, lc, lit_arg(e, 1)?).into()], "")
+                .map_err(internal)?;
+            // The runtime exits; a value of the node's type stands in.
+            Ok(repr_ty(ctx, &e.ty)?.const_zero())
+        }
+        _ => Err(CodegenError::UnsupportedBuiltin(name.clone())),
+    }
 }
 
 /// Is this `Prim` a string operation (`<>`, or `==`/`!=` on `String`s)?
@@ -1377,6 +1541,14 @@ fn lower_expr<'ctx>(
             }
             time_builtin(ctx, b, lc, builtin, &vals)
         }
+        CoreKind::Builtin(builtin, args) if builtin.starts_with("any.") && !args.is_empty() => {
+            let v = lower_expr(ctx, func, b, lc, &args[0], env)?;
+            let roots = gc_root_env(b, lc, env)?;
+            let own = usize::from(gc_root(b, lc, v)?);
+            let r = any_builtin(ctx, b, lc, e, v)?;
+            gc_unroot(b, lc, roots + own)?;
+            Ok(r)
+        }
         CoreKind::Builtin(builtin, args) if builtin == "int.to_string" && args.len() == 1 => {
             let n = lower_expr(ctx, func, b, lc, &args[0], env)?;
             let roots = gc_root_env(b, lc, env)?;
@@ -1912,6 +2084,15 @@ struct LowerCtx<'a, 'ctx> {
     /// Native multi-shot (spec D3): `elya_cont_copy(cont, hlo, hhi) -> cont'`
     /// (`ccc`), a fresh continuation over a copy of the captured frames.
     cont_copy: FunctionValue<'ctx>,
+    /// `with any` (spec 2026-10-17): the reflection table, its two globals, and
+    /// `elya_any_show`, `elya_any_decode`, `elya_any_fail` (`ccc`).
+    reflect: &'a reflect::Reflect,
+    any_table: PointerValue<'ctx>,
+    any_names: PointerValue<'ctx>,
+    any_show: FunctionValue<'ctx>,
+    any_decode: FunctionValue<'ctx>,
+    any_fail: FunctionValue<'ctx>,
+    any_check: FunctionValue<'ctx>,
 }
 
 /// Fold `core.types` into a flat constructor table: name -> (tag, field types).
@@ -1945,6 +2126,9 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     // and eta-expand upcasts, so every phase below sees types that say the
     // right convention. Pure Core-to-Core; nothing is emitted yet.
     let specialized = specialize::run(&specialized)?;
+    // `with any` handlers become plain ones, a clause per handled operation,
+    // now that the rows they handle are ground (spec 2026-10-17).
+    let specialized = any::run(&specialized)?;
     // N7 part 2: applied parametric types become ground instances, AFTER the
     // rows inside their arguments are substituted (spec 2026-10-15 §2).
     let specialized = mono::instantiate_types(&specialized)?;
@@ -2083,6 +2267,75 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let current_handler = module
         .add_global(ptrt, Some(AddressSpace::default()), "elya_current_handler")
         .as_pointer_value();
+    // `with any` (spec 2026-10-17 D3): the reflection table for the types
+    // `any.show` and `any.decode` are used at, and its runtime entry points.
+    let reflect = reflect::Reflect::of(core, &ctors)?;
+    let any_table = {
+        let words: Vec<_> = reflect
+            .words
+            .iter()
+            .map(|w| i64t.const_int(*w as u64, true))
+            .collect();
+        let arr = i64t.const_array(&words);
+        let g = module.add_global(
+            arr.get_type(),
+            Some(AddressSpace::default()),
+            "elya.any.types",
+        );
+        g.set_initializer(&arr);
+        g.set_constant(true);
+        g.set_linkage(Linkage::Private);
+        g.as_pointer_value()
+    };
+    let any_names = {
+        let bytes: Vec<_> = reflect
+            .names
+            .iter()
+            .copied()
+            .chain(std::iter::once(0))
+            .map(|c| i8t.const_int(c as u64, false))
+            .collect();
+        let arr = i8t.const_array(&bytes);
+        let g = module.add_global(
+            arr.get_type(),
+            Some(AddressSpace::default()),
+            "elya.any.names",
+        );
+        g.set_initializer(&arr);
+        g.set_constant(true);
+        g.set_linkage(Linkage::Private);
+        g.as_pointer_value()
+    };
+    let any_show_ty = ptrt.fn_type(
+        &[
+            i64t.into(),
+            ptrt.into(),
+            ptrt.into(),
+            i64t.into(),
+            i64t.into(),
+            ptrt.into(),
+            ptrt.into(),
+        ],
+        false,
+    );
+    let any_show = module.add_function("elya_any_show", any_show_ty, None); // ccc
+    let any_decode_ty = i64t.fn_type(
+        &[
+            i64t.into(),
+            ptrt.into(),
+            ptrt.into(),
+            i64t.into(),
+            ptrt.into(),
+            ptrt.into(),
+            ptrt.into(),
+        ],
+        false,
+    );
+    let any_decode = module.add_function("elya_any_decode", any_decode_ty, None); // ccc
+    let any_fail_ty = ctx.void_type().fn_type(&[ptrt.into()], false);
+    let any_fail = module.add_function("elya_any_fail", any_fail_ty, None); // ccc
+    let any_check_ty = i64t.fn_type(&[ptrt.into(), i64t.into(), i64t.into()], false);
+    let any_check = module.add_function("elya_any_check", any_check_ty, None); // ccc
     let op_ids = cps_emit::op_ids(core);
     let (resume_fns, handler_fns) =
         cps_emit::declare(ctx, &module, &nodes, &sites, &handlers, &op_ids)?;
@@ -2126,6 +2379,13 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         rem_zero,
         unhandled,
         cont_copy,
+        reflect: &reflect,
+        any_table,
+        any_names,
+        any_show,
+        any_decode,
+        any_fail,
+        any_check,
     };
     let b = ctx.create_builder();
     for f in &core.fns {
@@ -2335,6 +2595,7 @@ mod tests {
             types: Vec::new(),
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
+            effects: Default::default(),
         }
     }
 
@@ -2753,6 +3014,7 @@ mod tests {
                 ret: None,
                 is_multi_declared: multi,
                 multi,
+                any: false,
             })),
         }
     }
