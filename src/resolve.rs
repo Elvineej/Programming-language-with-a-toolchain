@@ -7,10 +7,51 @@ use crate::span::{Span, Spanned};
 use crate::Session;
 use std::collections::{HashMap, HashSet};
 
+/// The `int.*` builtins of two `Int`s (spec 2026-10-17-elya-unary-and-wrapping
+/// D2): wrapping arithmetic and bit operations. Their full names are `int.` and
+/// these.
+pub const INT_BINARY_BUILTINS: &[&str] = &[
+    "wrapping_add",
+    "wrapping_sub",
+    "wrapping_mul",
+    "and",
+    "or",
+    "xor",
+    "shl",
+    "shr",
+    "ushr",
+];
+
+/// How many arguments a builtin takes (every name in [`builtins`]).
+pub fn builtin_arity(full: &str) -> usize {
+    match full {
+        "time.now_ms" => 0,
+        "op.encode" | "op.decode" => 2,
+        f if f
+            .strip_prefix("int.")
+            .is_some_and(|n| INT_BINARY_BUILTINS.contains(&n)) =>
+        {
+            2
+        }
+        _ => 1,
+    }
+}
+
 pub fn builtins() -> &'static [&'static str] {
     &[
         "io.println",
         "int.to_string",
+        // Explicit wrapping and bit arithmetic (2026-10-17, spec
+        // 2026-10-17-elya-unary-and-wrapping D2).
+        "int.wrapping_add",
+        "int.wrapping_sub",
+        "int.wrapping_mul",
+        "int.and",
+        "int.or",
+        "int.xor",
+        "int.shl",
+        "int.shr",
+        "int.ushr",
         "time.now_ms",
         "time.sleep_ms",
         // On an operation `o` of a `with any` clause (2026-10-16).
@@ -396,11 +437,14 @@ impl Cx<'_> {
                             .with_label(span, "no such function"),
                     );
                 } else {
+                    // At the builtin's own arity (the 2026-10-17 review's L1:
+                    // `fn(x) { int.xor(x) }` was itself an arity error).
+                    let ps = ["a", "b"][..builtin_arity(&full)].join(", ");
                     self.diags.push(
                         Diagnostic::error("E0208", format!("builtin `{full}` used as a value"))
                             .with_label(span, "a builtin can only be called")
                             .with_help(format!(
-                                "to pass it on, wrap it in a function: `fn(x) {{ {full}(x) }}`"
+                                "to pass it on, wrap it in a function: `fn({ps}) {{ {full}({ps}) }}`"
                             )),
                     );
                 }

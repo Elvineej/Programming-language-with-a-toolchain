@@ -1325,6 +1325,17 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             "time.now_ms" | "time.sleep_ms" => {
                 crate::time_builtin(self.ctx, self.b, self.lc, name, vals)
             }
+            n if n.starts_with("int.") && n != "int.to_string" && vals.len() == 2 => {
+                crate::int_binary(
+                    self.ctx,
+                    self.func,
+                    self.b,
+                    self.lc,
+                    n,
+                    vals[0].into_int_value(),
+                    vals[1].into_int_value(),
+                )
+            }
             "int.to_string" if vals.len() == 1 => {
                 let roots = self.root_live(st, &[])?;
                 let v = crate::int_to_string(self.ctx, self.b, self.lc, vals[0])?;

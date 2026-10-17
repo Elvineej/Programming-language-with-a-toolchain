@@ -38,7 +38,7 @@ cargo run -p elya-cli --features codegen -- build prog.elya   # -> prog(.exe)
 Output defaults to the input stem plus the platform executable suffix; `-o <out>`
 overrides it. As of Slice 5b-7 the backend covers arithmetic, control flow,
 top-level functions, algebraic data types with `match`, closures, and text
-(`Int`, `Bool`, `String` and `Unit`; `let`, `+ - *`, the six comparisons, strict
+(`Int`, `Bool`, `String` and `Unit`; `let`, `+ - *`, unary `-` and `!`, the six comparisons, strict
 `&&`/`||`, `if`/`else`, calls to named functions of up to five parameters,
 monomorphic ADTs constructed then matched to extract an `Int`, non-recursive
 lambdas of up to four parameters that capture their enclosing locals, and string
@@ -46,7 +46,10 @@ literals written to stdout by `io.println`), so anything outside it is rejected 
 name rather than mis-compiled — the tree-walking `elya run` remains the full
 language. Strings are native too: `<>` concatenates, `==` and `!=` compare bytes,
 string literals can be matched, and `int.to_string(n)` turns a number into text, so
-a compiled program can print what it computes.
+a compiled program can print what it computes. `Int` arithmetic is checked (overflow
+fails by name); `int.wrapping_add`/`wrapping_sub`/`wrapping_mul`, `int.and`/`or`/`xor`
+and `int.shl`/`shr`/`ushr` are the explicit wrapping and bit operations, for hashes
+and generators.
 Tail calls are eliminated under a guarantee the LLVM verifier enforces, so
 mutually recursive functions recur to any depth in a compiled binary just as
 they do under `elya run` — and that holds through a closure call, which jumps

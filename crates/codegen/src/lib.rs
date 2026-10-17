@@ -583,7 +583,55 @@ pub(crate) fn is_native_builtin(name: &str) -> bool {
             | "any.decode"
             | "any.fail"
             | "any.check"
-    )
+    ) || name
+        .strip_prefix("int.")
+        .is_some_and(|n| elya::eval::INT_BINARY_BUILTINS.contains(&n))
+}
+
+/// `int.<name>(a, b)` (spec 2026-10-17-elya-unary-and-wrapping D3), both
+/// emitters: wrapping arithmetic is LLVM's plain `add`/`sub`/`mul`, bits are
+/// `and`/`or`/`xor`, and a shift's amount is checked against `0..=63` first,
+/// trapping through `elya_shift_range` with the evaluator's words. Allocates
+/// nothing.
+pub(crate) fn int_binary<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    name: &str,
+    x: IntValue<'ctx>,
+    y: IntValue<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let n = name.strip_prefix("int.").unwrap_or(name);
+    if matches!(n, "shl" | "shr" | "ushr") {
+        let i64t = ctx.i64_type();
+        let bad = b
+            .build_int_compare(IntPredicate::UGT, y, i64t.const_int(63, false), "shbad")
+            .map_err(internal)?;
+        let trap = ctx.append_basic_block(func, "shift_range");
+        let ok = ctx.append_basic_block(func, "shift_ok");
+        b.build_conditional_branch(bad, trap, ok)
+            .map_err(internal)?;
+        b.position_at_end(trap);
+        b.build_call(lc.shift_range, &[c_string(ctx, lc, n).into(), y.into()], "")
+            .map_err(internal)?;
+        b.build_unreachable().map_err(internal)?;
+        b.position_at_end(ok);
+    }
+    let v = match n {
+        "wrapping_add" => b.build_int_add(x, y, "wadd"),
+        "wrapping_sub" => b.build_int_sub(x, y, "wsub"),
+        "wrapping_mul" => b.build_int_mul(x, y, "wmul"),
+        "and" => b.build_and(x, y, "band"),
+        "or" => b.build_or(x, y, "bor"),
+        "xor" => b.build_xor(x, y, "bxor"),
+        "shl" => b.build_left_shift(x, y, "shl"),
+        "shr" => b.build_right_shift(x, y, true, "ashr"),
+        "ushr" => b.build_right_shift(x, y, false, "lshr"),
+        _ => return Err(CodegenError::UnsupportedBuiltin(name.to_string())),
+    }
+    .map_err(internal)?;
+    Ok(v.into())
 }
 
 /// A NUL-terminated private constant, for the runtime's messages.
@@ -1549,6 +1597,13 @@ fn lower_expr<'ctx>(
             gc_unroot(b, lc, roots + own)?;
             Ok(r)
         }
+        CoreKind::Builtin(builtin, args)
+            if builtin.starts_with("int.") && builtin != "int.to_string" && args.len() == 2 =>
+        {
+            let x = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
+            let y = lower_expr(ctx, func, b, lc, &args[1], env)?.into_int_value();
+            int_binary(ctx, func, b, lc, builtin, x, y)
+        }
         CoreKind::Builtin(builtin, args) if builtin == "int.to_string" && args.len() == 1 => {
             let n = lower_expr(ctx, func, b, lc, &args[0], env)?;
             let roots = gc_root_env(b, lc, env)?;
@@ -2093,6 +2148,9 @@ struct LowerCtx<'a, 'ctx> {
     any_decode: FunctionValue<'ctx>,
     any_fail: FunctionValue<'ctx>,
     any_check: FunctionValue<'ctx>,
+    /// `elya_shift_range(name, amount)` (`ccc`, exits): a shift amount outside
+    /// `0..=63` (spec 2026-10-17-elya-unary-and-wrapping D3).
+    shift_range: FunctionValue<'ctx>,
 }
 
 /// Fold `core.types` into a flat constructor table: name -> (tag, field types).
@@ -2336,6 +2394,8 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let any_fail = module.add_function("elya_any_fail", any_fail_ty, None); // ccc
     let any_check_ty = i64t.fn_type(&[ptrt.into(), i64t.into(), i64t.into()], false);
     let any_check = module.add_function("elya_any_check", any_check_ty, None); // ccc
+    let shift_range_ty = ctx.void_type().fn_type(&[ptrt.into(), i64t.into()], false);
+    let shift_range = module.add_function("elya_shift_range", shift_range_ty, None); // ccc
     let op_ids = cps_emit::op_ids(core);
     let (resume_fns, handler_fns) =
         cps_emit::declare(ctx, &module, &nodes, &sites, &handlers, &op_ids)?;
@@ -2386,6 +2446,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         any_decode,
         any_fail,
         any_check,
+        shift_range,
     };
     let b = ctx.create_builder();
     for f in &core.fns {

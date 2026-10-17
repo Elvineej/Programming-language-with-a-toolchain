@@ -1837,6 +1837,20 @@ impl Infer {
                 self.node_types.insert(callee.span, want);
                 return Ty::str();
             }
+            // Wrapping and bit arithmetic: `fn(Int, Int) -> Int`, pure (spec
+            // 2026-10-17-elya-unary-and-wrapping D2).
+            if module == "int" && crate::resolve::INT_BINARY_BUILTINS.contains(&name.as_str()) {
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+                let want = Ty::Fn(
+                    vec![Ty::int(), Ty::int()],
+                    EffectRow::pure(),
+                    Box::new(Ty::int()),
+                );
+                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::int()));
+                self.unify(&want, &got, span);
+                self.node_types.insert(callee.span, want);
+                return Ty::int();
+            }
             return Ty::Error; // unknown builtin is E0201 from resolution
         }
         // A constructor application: `Cons(h, t)`. Must be saturated (E0433).

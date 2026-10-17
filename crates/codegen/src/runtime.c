@@ -1081,6 +1081,13 @@ void elya_rem_zero(void) {
     exit(1);
 }
 
+/* A shift amount outside 0..=63 (spec 2026-10-17-elya-unary-and-wrapping D2):
+ * the evaluator's words. */
+void elya_shift_range(const char *name, int64_t n) {
+    fprintf(stderr, "elya: int.%s: a shift by %lld is outside 0..=63\n", name, (long long)n);
+    exit(1);
+}
+
 /* A perform whose handler has no clause for it. The type checker makes this
  * unreachable; a guard, never `unreachable`. */
 void elya_unhandled_effect(void) {

@@ -824,7 +824,26 @@ fn lower_expr(
         // of these occur in the 5a-2 corpus.
         Expr::Float(_) => return Err(LowerError::Unsupported("Float")),
         Expr::Qualified { .. } => return Err(LowerError::Unsupported("Qualified")),
-        Expr::Unary { .. } => return Err(LowerError::Unsupported("Unary")),
+        // Unary operators are what they mean (spec
+        // 2026-10-17-elya-unary-and-wrapping D1): `-e` is `0 - e`, which
+        // overflows exactly at `MIN`, as negation does, and `!e` is `e == False`.
+        Expr::Unary { op, expr } => {
+            let v = lower_expr(&expr.node, expr.span, table, cx)?;
+            let (bin, lit, lit_ty) = match op {
+                crate::ast::UnOp::Neg => (BinOp::Sub, CoreLit::Int(0), Ty::int()),
+                crate::ast::UnOp::Not => (BinOp::Eq, CoreLit::Bool(false), Ty::bool()),
+            };
+            let k = CoreExpr {
+                span,
+                ty: lit_ty,
+                kind: CoreKind::Lit(lit),
+            };
+            let args: Rc<[CoreExpr]> = match op {
+                crate::ast::UnOp::Neg => Rc::from([k, v]),
+                crate::ast::UnOp::Not => Rc::from([v, k]),
+            };
+            CoreKind::Prim(bin, args)
+        }
     };
     Ok(CoreExpr { span, ty, kind })
 }
