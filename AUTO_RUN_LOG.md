@@ -3,7 +3,12 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-16 17:53 UTC — IN PROGRESS (scheduled run)
+## 2026-10-17 01:53 UTC — IN PROGRESS (scheduled run)
+
+- The 2026-10-16 17:53 run never marked DONE; its last commit (7dc40b5) is 20:01, over
+  3 hours ago, so this run takes over at 7dc40b5.
+
+## 2026-10-16 17:53 UTC — ended without a DONE mark (taken over 2026-10-17 01:53)
 
 - The 12:30 entry never marked DONE; its last commit (2b7ce18) is 14:33, over 3 hours
   ago, so this run takes over at 2b7ce18. LLVM 18 dev headers installed via apt.
