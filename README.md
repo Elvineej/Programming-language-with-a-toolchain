@@ -185,6 +185,12 @@ replay: same score
 replay of the changed game: diverged at an 8-sided roll
 ```
 
+The host's own answers (`time.now_ms`, `time.sleep_ms`) are recorded from outside the
+program: `elya run --record t.trace prog.elya` writes them, `elya run --replay t.trace
+prog.elya` reproduces the run from them, and a compiled binary does the same under
+`ELYA_RECORD=t.trace ./prog` and `ELYA_REPLAY=t.trace ./prog`. The trace is the same
+text either way, so a run recorded natively replays in the evaluator and the reverse.
+
 ### Affine resources
 
 A type declared `linear` makes its values **affine** — usable at most once:

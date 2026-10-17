@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
@@ -1005,7 +1006,308 @@ static int64_t elya_time_raw_ms(void) {
 #endif
 }
 
-int64_t elya_time_now_ms(void) {
+/* ---- Record and replay natively (spec 2026-10-17-elya-native-record-replay).
+ * `ELYA_RECORD=<file>` writes the host's answers as the evaluator's trace,
+ * entry by entry (D4); `ELYA_REPLAY=<file>` answers from one, without waiting
+ * (D5). The format and every failure's words are the evaluator's
+ * (`src/lib.rs`, `src/eval.rs` `host_builtin`). */
+#define ELYA_TRACE_HEADER "elya trace 1"
+
+enum { TRACE_LIVE, TRACE_RECORD, TRACE_REPLAY };
+static int elya_trace_mode = TRACE_LIVE;
+static FILE *elya_trace_out;
+static const char *elya_trace_path;
+
+/* A piece of the trace text: bytes and a length (a NUL byte is a character, as
+ * in the evaluator's strings; the review's L1). */
+typedef struct {
+    const char *p;
+    int64_t n;
+} TraceStr;
+
+typedef struct {
+    TraceStr q, a;
+} TraceEntry;
+static TraceEntry *elya_trace_entries;
+static int64_t elya_trace_n, elya_trace_cap, elya_trace_next;
+
+/* The length of the whitespace character starting at `p` (before `e`), or 0:
+ * Rust's `char::is_whitespace`, which `str::trim` uses -- ASCII \t..\r and
+ * space, and U+0085, U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029, U+202F,
+ * U+205F, U+3000 in UTF-8 (the review's M2). */
+static int trace_ws_at(const unsigned char *p, const unsigned char *e) {
+    if (p >= e) {
+        return 0;
+    }
+    if (*p == ' ' || (*p >= '\t' && *p <= '\r')) {
+        return 1;
+    }
+    if (e - p >= 2 && p[0] == 0xC2 && (p[1] == 0x85 || p[1] == 0xA0)) {
+        return 2;
+    }
+    if (e - p >= 3) {
+        if (p[0] == 0xE1 && p[1] == 0x9A && p[2] == 0x80) {
+            return 3;
+        }
+        if (p[0] == 0xE2 && p[1] == 0x80 &&
+            ((p[2] >= 0x80 && p[2] <= 0x8A) || p[2] == 0xA8 || p[2] == 0xA9 || p[2] == 0xAF)) {
+            return 3;
+        }
+        if (p[0] == 0xE2 && p[1] == 0x81 && p[2] == 0x9F) {
+            return 3;
+        }
+        if (p[0] == 0xE3 && p[1] == 0x80 && p[2] == 0x80) {
+            return 3;
+        }
+    }
+    return 0;
+}
+
+static TraceStr trace_trim(const char *b, const char *e) {
+    const unsigned char *s = (const unsigned char *)b, *t = (const unsigned char *)e;
+    int k;
+    while ((k = trace_ws_at(s, t)) > 0) {
+        s += k;
+    }
+    for (;;) {
+        int cut = 0;
+        for (int len = 1; len <= 3 && t - s >= len; len++) {
+            if (trace_ws_at(t - len, t) == len) {
+                cut = len;
+                break;
+            }
+        }
+        if (!cut) {
+            break;
+        }
+        t -= cut;
+    }
+    return (TraceStr){(const char *)s, (int64_t)(t - s)};
+}
+
+static int trace_is(TraceStr s, const char *lit) {
+    int64_t n = (int64_t)strlen(lit);
+    return s.n == n && memcmp(s.p, lit, (size_t)n) == 0;
+}
+
+static void trace_put(TraceStr s) { fwrite(s.p, 1, (size_t)s.n, stderr); }
+
+static void trace_bad(const char *msg, int64_t line) {
+    if (line > 0) {
+        fprintf(stderr, "elya: trace line %lld: %s\n", (long long)line, msg);
+    } else {
+        fprintf(stderr, "elya: %s\n", msg);
+    }
+    exit(1);
+}
+
+/* Is [p, p+n) UTF-8, as Rust's `read_to_string` requires (the review's M3)? */
+static int trace_utf8(const unsigned char *p, int64_t n) {
+    int64_t i = 0;
+    while (i < n) {
+        unsigned char c = p[i];
+        int64_t len;
+        uint32_t cp;
+        if (c < 0x80) {
+            i++;
+            continue;
+        } else if (c >= 0xC2 && c <= 0xDF) {
+            len = 2;
+            cp = c & 0x1F;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            len = 3;
+            cp = c & 0x0F;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            len = 4;
+            cp = c & 0x07;
+        } else {
+            return 0;
+        }
+        if (n - i < len) {
+            return 0;
+        }
+        for (int64_t k = 1; k < len; k++) {
+            if ((p[i + k] & 0xC0) != 0x80) {
+                return 0;
+            }
+            cp = (cp << 6) | (p[i + k] & 0x3F);
+        }
+        if ((len == 3 && cp < 0x800) || (len == 4 && (cp < 0x10000 || cp > 0x10FFFF)) ||
+            (cp >= 0xD800 && cp <= 0xDFFF)) {
+            return 0;
+        }
+        i += len;
+    }
+    return 1;
+}
+
+/* Reads the trace as `run_source_replaying` does: a byte-order mark skipped,
+ * `lines()` (a trailing `\r` dropped), the header trimmed, blank lines
+ * skipped, the LAST ` = ` splitting a line, both sides trimmed. The entries
+ * point into `t`, which lives as long as the process. */
+static void trace_parse(const char *t, int64_t n) {
+    if (n >= 3 && (unsigned char)t[0] == 0xEF && (unsigned char)t[1] == 0xBB &&
+        (unsigned char)t[2] == 0xBF) {
+        t += 3;
+        n -= 3;
+    }
+    const char *end = t + n;
+    const char *line = t;
+    int64_t index = -1; /* -1: the header */
+    while (line < end) {
+        const char *nl = memchr(line, '\n', (size_t)(end - line));
+        const char *le = nl ? nl : end;
+        const char *next = nl ? nl + 1 : end;
+        if (le > line && le[-1] == '\r') {
+            le--;
+        }
+        if (index < 0) {
+            if (!trace_is(trace_trim(line, le), ELYA_TRACE_HEADER)) {
+                trace_bad("not a trace: the first line must be `" ELYA_TRACE_HEADER "`", 0);
+            }
+        } else if (trace_trim(line, le).n > 0) {
+            const char *split = NULL;
+            for (const char *p = line; p + 3 <= le; p++) {
+                if (p[0] == ' ' && p[1] == '=' && p[2] == ' ') {
+                    split = p;
+                }
+            }
+            if (!split) {
+                trace_bad("expected `question = answer`", index + 2);
+            }
+            elya_trace_entries = (TraceEntry *)any_grow(elya_trace_entries, &elya_trace_cap,
+                                                        elya_trace_n + 1, sizeof(TraceEntry));
+            elya_trace_entries[elya_trace_n++] =
+                (TraceEntry){trace_trim(line, split), trace_trim(split + 3, le)};
+        }
+        index++;
+        line = next;
+    }
+    if (index < 0) {
+        trace_bad("not a trace: the first line must be `" ELYA_TRACE_HEADER "`", 0);
+    }
+}
+
+/* A failed write of the trace (a full disk): the CLI's exit 2 (the review's M1). */
+static void trace_wrote(void) {
+    if (fflush(elya_trace_out) != 0 || ferror(elya_trace_out)) {
+        fprintf(stderr, "elya: cannot write the trace `%s`: %s\n", elya_trace_path, strerror(errno));
+        exit(2);
+    }
+}
+
+/* Before the program runs: the environment, the trace file (D1, D3). */
+static void elya_trace_init(void) {
+    const char *rec = getenv("ELYA_RECORD");
+    const char *rep = getenv("ELYA_REPLAY");
+    if (rec && rep) {
+        fputs("elya: ELYA_RECORD and ELYA_REPLAY cannot both be set\n", stderr);
+        exit(2);
+    }
+    if (rec) {
+        elya_trace_path = rec;
+        elya_trace_out = fopen(rec, "wb");
+        if (!elya_trace_out) {
+            fprintf(stderr, "elya: cannot write the trace `%s`: %s\n", rec, strerror(errno));
+            exit(2);
+        }
+        fputs(ELYA_TRACE_HEADER "\n", elya_trace_out);
+        trace_wrote();
+        elya_trace_mode = TRACE_RECORD;
+    } else if (rep) {
+        FILE *f = fopen(rep, "rb");
+        if (!f) {
+            fprintf(stderr, "elya: cannot read the trace `%s`: %s\n", rep, strerror(errno));
+            exit(2);
+        }
+        char *buf = NULL;
+        int64_t len = 0, cap = 0;
+        for (;;) {
+            buf = (char *)any_grow(buf, &cap, len + 4096, 1);
+            size_t got = fread(buf + len, 1, 4096, f);
+            len += (int64_t)got;
+            if (got < 4096) {
+                break;
+            }
+        }
+        if (ferror(f)) {
+            fprintf(stderr, "elya: cannot read the trace `%s`: %s\n", rep, strerror(errno));
+            exit(2);
+        }
+        fclose(f);
+        if (!trace_utf8((const unsigned char *)buf, len)) {
+            fprintf(stderr, "elya: cannot read the trace `%s`: stream did not contain valid UTF-8\n",
+                    rep);
+            exit(2);
+        }
+        trace_parse(buf ? buf : "", len);
+        elya_trace_mode = TRACE_REPLAY;
+    }
+}
+
+/* After `main` returns, before its value is printed: a replay must have asked
+ * everything (the evaluator's unread-entries error). */
+static void elya_trace_finish(void) {
+    if (elya_trace_mode == TRACE_REPLAY && elya_trace_next < elya_trace_n) {
+        int64_t left = elya_trace_n - elya_trace_next;
+        TraceEntry *e = &elya_trace_entries[elya_trace_next];
+        fflush(stdout);
+        fprintf(stderr, "elya: replay: `main` returned with %lld unread trace %s, from entry %lld (`",
+                (long long)left, left == 1 ? "entry" : "entries", (long long)elya_trace_next + 1);
+        trace_put(e->q);
+        fputs(" = ", stderr);
+        trace_put(e->a);
+        fputs("`): the run asked less than the recording\n", stderr);
+        exit(1);
+    }
+}
+
+/* The next replayed answer to `q`, or a named divergence. */
+static TraceStr trace_answer(const char *q) {
+    int64_t n = elya_trace_next + 1;
+    if (elya_trace_next >= elya_trace_n) {
+        fflush(stdout);
+        fprintf(stderr, "elya: replay diverged at entry %lld: the program asked `%s`, the trace has ended\n",
+                (long long)n, q);
+        exit(1);
+    }
+    TraceEntry *e = &elya_trace_entries[elya_trace_next];
+    if (!trace_is(e->q, q)) {
+        fflush(stdout);
+        fprintf(stderr, "elya: replay diverged at entry %lld: the program asked `%s`, the trace holds `",
+                (long long)n, q);
+        trace_put(e->q);
+        fputs("`\n", stderr);
+        exit(1);
+    }
+    elya_trace_next++;
+    return e->a;
+}
+
+static void trace_wrong_type(TraceStr a, const char *ty) {
+    fflush(stdout);
+    fprintf(stderr, "elya: replay entry %lld: `", (long long)elya_trace_next);
+    trace_put(a);
+    fprintf(stderr, "` is not an answer of type %s\n", ty);
+    exit(1);
+}
+
+/* An answer read as Rust's `i64::from_str` reads it: `[+-]digits`, in range. */
+static int trace_int(TraceStr a, int64_t *out) {
+    int64_t sign = (a.n > 0 && (a.p[0] == '+' || a.p[0] == '-')) ? 1 : 0;
+    if (a.n - sign == 0) {
+        return 0;
+    }
+    for (int64_t k = sign; k < a.n; k++) {
+        if (!any_digit(a.p[k])) {
+            return 0;
+        }
+    }
+    /* `any_int` reads `[-]digits`; a `+` is dropped first. */
+    return a.p[0] == '+' ? any_int(a.p + 1, a.n - 1, out) : any_int(a.p, a.n, out);
+}
+
+static int64_t elya_time_live_now_ms(void) {
     static int64_t start = -1;
     int64_t now = elya_time_raw_ms();
     if (start < 0) {
@@ -1014,7 +1316,43 @@ int64_t elya_time_now_ms(void) {
     return now - start;
 }
 
+int64_t elya_time_now_ms(void) {
+    if (elya_trace_mode == TRACE_REPLAY) {
+        TraceStr a = trace_answer("time.now_ms()");
+        int64_t v;
+        if (!trace_int(a, &v)) {
+            trace_wrong_type(a, "Int");
+        }
+        return v;
+    }
+    int64_t v = elya_time_live_now_ms();
+    if (elya_trace_mode == TRACE_RECORD) {
+        fprintf(elya_trace_out, "time.now_ms() = %lld\n", (long long)v);
+        trace_wrote();
+    }
+    return v;
+}
+
+static void elya_time_live_sleep_ms(int64_t ms);
+
 void elya_time_sleep_ms(int64_t ms) {
+    if (elya_trace_mode == TRACE_REPLAY) {
+        char q[64];
+        snprintf(q, sizeof q, "time.sleep_ms(%lld)", (long long)ms);
+        TraceStr a = trace_answer(q);
+        if (!trace_is(a, "Unit")) {
+            trace_wrong_type(a, "Unit");
+        }
+        return;
+    }
+    elya_time_live_sleep_ms(ms);
+    if (elya_trace_mode == TRACE_RECORD) {
+        fprintf(elya_trace_out, "time.sleep_ms(%lld) = Unit\n", (long long)ms);
+        trace_wrote();
+    }
+}
+
+static void elya_time_live_sleep_ms(int64_t ms) {
     if (ms <= 0) {
         return;
     }
@@ -1311,6 +1649,7 @@ static LONG CALLBACK elya_overflow_handler(PEXCEPTION_POINTERS e) {
 
 int64_t elya_start(elya_entry_fn entry) {
     elya_stack_mib = elya_stack_size_mib();
+    elya_trace_init();
     elya_entry_ptr = entry;
     AddVectoredExceptionHandler(1, elya_overflow_handler);
     HANDLE t = CreateThread(NULL, (SIZE_T)elya_stack_mib << 20, elya_program_thread, NULL,
@@ -1320,6 +1659,7 @@ int64_t elya_start(elya_entry_fn entry) {
     }
     WaitForSingleObject(t, INFINITE);
     CloseHandle(t);
+    elya_trace_finish();
     return elya_entry_result;
 }
 #else
@@ -1377,6 +1717,7 @@ static void *elya_program_thread(void *arg) {
 
 int64_t elya_start(elya_entry_fn entry) {
     elya_stack_mib = elya_stack_size_mib();
+    elya_trace_init();
     elya_entry_ptr = entry;
     size_t size = (size_t)elya_stack_mib << 20;
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
@@ -1407,6 +1748,7 @@ int64_t elya_start(elya_entry_fn entry) {
     }
     pthread_attr_destroy(&attr);
     pthread_join(t, NULL);
+    elya_trace_finish();
     return elya_entry_result;
 }
 #endif

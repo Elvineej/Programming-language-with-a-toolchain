@@ -14,7 +14,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1079 passed, 105 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1086 passed, 106 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions; `gc_mark` is unchanged (637 bytes of source).
@@ -356,17 +356,16 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   outside `0..=63` fails by name), in both evaluators and natively. Needs the Windows
   gate.
 
+- **Record and replay natively** (2026-10-17, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-17-elya-native-record-replay-design.md`. A native
+  binary records under `ELYA_RECORD=<file>` and replays under `ELYA_REPLAY=<file>`
+  (runtime.c), in the evaluator's trace format with its failures' words, so a trace
+  moves between `elya run --record/--replay` and native runs in both directions.
+  Needs the Windows gate.
+
 ## The next five steps
 
-### 1. Record and replay natively
-
-`elya run --record/--replay` (Done) works in the evaluator only; a native binary asks
-the runtime's clock directly. Add the same trace to the runtime (an environment
-variable or flag read by the shim: `ELYA_RECORD=file` / `ELYA_REPLAY=file`), with the
-same format and the same named failures, and a differential test that a trace recorded
-by `elya run` replays natively and the reverse.
-
-### 2. Multi-shot resumes over a deep chain
+### 1. Multi-shot resumes over a deep chain
 
 Found by the native-stack review (PARKED.md, 2026-10-16): a `with multi` handler whose
 clause resumes non-tail over a deep non-tail recursion (`nest(20000)`) runs out of
@@ -375,7 +374,7 @@ memory natively, because every resume copies the whole captured chain
 the native growth by depth, then decide in a spec: share the chain's unchanged prefix
 (copy-on-write of handler frames only), or copy lazily as frames are re-entered.
 
-### 3. One wording for the one-shot trap, and the sweep's smaller gaps
+### 2. One wording for the one-shot trap, and the sweep's smaller gaps
 
 The sweep's four `both-fail-differently` programs: a second resume of a one-shot
 continuation is "continuation resumed more than once" in the evaluator and "a one-shot
@@ -384,7 +383,7 @@ and the tests that assert either (a decision: call each out). Then the sweep's s
 refusals: a parametric constructor as a function value (`map(xs, Some)`), an
 effect-polymorphic closure through a `let` alias, `Float` in Core.
 
-### 4. Operation values as values natively
+### 3. Operation values as values natively
 
 `with any` natively (Done) refuses an operation value used other than by `op.*` or
 `==` (passed to a function, stored, returned: spec D2), and two evaluator behaviours
@@ -395,7 +394,7 @@ operations), then decide in a spec: clone functions over `Op(t)` per operation a
 expansion clones clauses, or a run-time operation value; and whether both sides should
 decode at the instantiation (the evaluator would need it carried).
 
-### 5. Literals at the edges, and a layout rule
+### 4. Literals at the edges, and a layout rule
 
 Two lexical gaps the 2026-10-17 review found: `MIN` cannot be written
 (`-9223372036854775808` is E0001 "not a valid Elya token"; an out-of-range literal
@@ -406,8 +405,15 @@ expression). Measure the corpus for both, then decide in a spec: a literal rule 
 negation, and a layout rule (an operator at the start of a line ends the statement
 before it, or is an error).
 
-Also open, unscheduled: `elya run --record/--replay` print a failing run's output to
-stderr with the diagnostic (plain `run` now keeps it on stdout); row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
+### 5. A failing traced run keeps its output on stdout
+
+`elya run --replay` drops what the program printed before a failure, and `--record`
+prints it to stderr with the diagnostic; plain `elya run` (since 2026-10-16) and a
+native binary (record or replay) keep it on stdout. Make the two trace modes do the
+same (`run_source_recording`/`run_source_replaying` return the output apart from the
+error), then a differential test of a failing replay's stdout across both sides.
+
+Also open, unscheduled: row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
 per platform, deferred by the timers spec D1); a user
 effect named `IO` is refused by Core ("effect IO"); Elya functions are mangled
 `elya.<name>`; the parser continues a call across a
