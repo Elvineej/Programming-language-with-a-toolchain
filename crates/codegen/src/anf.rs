@@ -224,6 +224,7 @@ impl Anf<'_> {
                     ret,
                     is_multi_declared: h.is_multi_declared,
                     multi: h.multi,
+                    any: h.any,
                 }))
             }
             CoreKind::Resume(v) => CoreKind::Resume(Rc::new(self.expr(v, locals))),
@@ -272,5 +273,6 @@ pub(crate) fn run(core: &CoreModule) -> CoreModule {
         types: core.types.clone(),
         generic_types: core.generic_types.clone(),
         effect_params_used: core.effect_params_used.clone(),
+        effects: core.effects.clone(),
     }
 }

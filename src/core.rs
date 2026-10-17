@@ -88,6 +88,36 @@ pub struct CoreHandle {
     /// a COPY of its captured frames; every other resume is one-shot, as in the
     /// evaluator (E0425), so a plain `with` over a `multi` effect is `false`.
     pub multi: bool,
+    /// `with any` (spec 2026-10-17-elya-native-any-handlers D6): the one clause
+    /// has an empty `effect` and `op`, and its one parameter, the operation, is
+    /// typed `$Op(t, fn() / H -> t)` with `H` the handled row. The back end
+    /// expands it into a plain handle (`any.rs`) once `H` is ground.
+    pub any: bool,
+}
+
+/// An effect declaration, for the back end's expansion of `with any` handlers
+/// (spec 2026-10-17-elya-native-any-handlers D6).
+#[derive(Clone, Debug)]
+pub struct CoreEffect {
+    pub name: String,
+    /// The number of type parameters; operation types mention them as
+    /// `Ty::Var(i)`, `i` the parameter's position.
+    pub params: usize,
+    pub multi: bool,
+    pub ops: Vec<CoreOp>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CoreOp {
+    pub name: String,
+    pub params: Vec<Ty>,
+    pub ret: Ty,
+    /// The declared answer annotation as the evaluator renders it in an
+    /// `op.decode` failure.
+    pub ret_display: String,
+    /// The effect parameter the declared answer mentions, if any: decoding such
+    /// an answer fails by name in the evaluator (its review's S2), natively too.
+    pub ret_mentions_param: Option<String>,
 }
 
 /// One `Effect.op(params) -> body` clause. `effect` is always the name the
@@ -201,6 +231,8 @@ pub struct CoreModule {
     /// mentions is phantom -- no value of its type passes through the effect --
     /// so the back end may default it when it is left unconstrained.
     pub effect_params_used: BTreeMap<String, Vec<bool>>,
+    /// Every effect declaration (spec 2026-10-17-elya-native-any-handlers D6).
+    pub effects: Rc<[CoreEffect]>,
 }
 
 /// Lowering failure. The deferred AST surface is a *typed boundary*, not a panic:
@@ -221,6 +253,7 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
     let mut types = Vec::new();
     let mut generic_types = Vec::new();
     let mut effect_params_used = BTreeMap::new();
+    let mut effects = Vec::new();
     for d in &module.decls {
         if let Decl::Type(t) = &d.node {
             // Collect every constructor name regardless of arity, so a constructor
@@ -283,6 +316,36 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
             }
         }
         if let Decl::Effect(e) = &d.node {
+            effects.push(CoreEffect {
+                name: e.name.clone(),
+                params: e.params.len(),
+                multi: e.is_multi,
+                ops: e
+                    .ops
+                    .iter()
+                    .map(|op| {
+                        let ret = &op.node.ret.node;
+                        CoreOp {
+                            name: op.node.name.clone(),
+                            params: op
+                                .node
+                                .param_tys
+                                .iter()
+                                .map(|t| ann_to_ty_in(&t.node, &e.params))
+                                .collect(),
+                            ret: ann_to_ty_in(ret, &e.params),
+                            ret_display: crate::literal::render_ann(ret),
+                            ret_mentions_param: e
+                                .params
+                                .iter()
+                                .find(|p| crate::literal::mentions(ret, p))
+                                .cloned(),
+                        }
+                    })
+                    .collect(),
+            });
+        }
+        if let Decl::Effect(e) = &d.node {
             // D1 / spec §9.2: codegen decides "does this row mention a
             // user-declared effect?" by asking `label != "IO"`. That read is
             // sound only while `IO` cannot be user-declared, so it is refused
@@ -338,6 +401,7 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
         types,
         generic_types,
         effect_params_used,
+        effects: effects.into(),
     })
 }
 
@@ -642,11 +706,50 @@ fn lower_expr(
         // that lookup returns is then unused.
         Expr::Block(b) => return lower_block(b, table, cx),
         Expr::Handle { body, handler } => {
-            // `with any` (2026-10-16, spec D6): the evaluator only, for now.
+            // `with any` (spec 2026-10-17-elya-native-any-handlers D6): one
+            // clause with no effect or operation name, marked; the back end
+            // expands it once the handled row is ground.
             if handler.any {
-                return Err(LowerError::Unsupported(
-                    "operation-generic handler (`with any`)",
-                ));
+                let b = lower_expr(&body.node, body.span, table, cx)?;
+                let mut clauses = Vec::with_capacity(handler.clauses.len());
+                for c in &handler.clauses {
+                    let mut ps = Vec::with_capacity(c.node.params.len());
+                    for p in &c.node.params {
+                        let ty = table
+                            .get(&p.span)
+                            .cloned()
+                            .ok_or(LowerError::Untyped(p.span))?;
+                        ps.push(CoreParam {
+                            name: p.node.name.clone(),
+                            ty,
+                        });
+                    }
+                    clauses.push(CoreClause {
+                        effect: String::new(),
+                        op: String::new(),
+                        params: ps.into(),
+                        body: Rc::new(lower_expr(&c.node.body.node, c.node.body.span, table, cx)?),
+                    });
+                }
+                let ret = match &handler.ret {
+                    Some(r) => Some(Rc::new(CoreReturn {
+                        binder: r.binder.clone(),
+                        body: Rc::new(lower_expr(&r.body.node, r.body.span, table, cx)?),
+                    })),
+                    None => None,
+                };
+                return Ok(CoreExpr {
+                    span,
+                    ty,
+                    kind: CoreKind::Handle(Rc::new(CoreHandle {
+                        body: Rc::new(b),
+                        clauses: clauses.into(),
+                        ret,
+                        is_multi_declared: false,
+                        multi: false,
+                        any: true,
+                    })),
+                });
             }
             // An unqualified clause (`op(..) -> ..`) means its op's effect (slice
             // 5c-1): op names are unique per module (E0202), and the evaluator
@@ -711,6 +814,7 @@ fn lower_expr(
                 ret,
                 is_multi_declared,
                 multi: handler.multi,
+                any: false,
             }))
         }
         Expr::Resume { arg } => {
@@ -720,7 +824,26 @@ fn lower_expr(
         // of these occur in the 5a-2 corpus.
         Expr::Float(_) => return Err(LowerError::Unsupported("Float")),
         Expr::Qualified { .. } => return Err(LowerError::Unsupported("Qualified")),
-        Expr::Unary { .. } => return Err(LowerError::Unsupported("Unary")),
+        // Unary operators are what they mean (spec
+        // 2026-10-17-elya-unary-and-wrapping D1): `-e` is `0 - e`, which
+        // overflows exactly at `MIN`, as negation does, and `!e` is `e == False`.
+        Expr::Unary { op, expr } => {
+            let v = lower_expr(&expr.node, expr.span, table, cx)?;
+            let (bin, lit, lit_ty) = match op {
+                crate::ast::UnOp::Neg => (BinOp::Sub, CoreLit::Int(0), Ty::int()),
+                crate::ast::UnOp::Not => (BinOp::Eq, CoreLit::Bool(false), Ty::bool()),
+            };
+            let k = CoreExpr {
+                span,
+                ty: lit_ty,
+                kind: CoreKind::Lit(lit),
+            };
+            let args: Rc<[CoreExpr]> = match op {
+                crate::ast::UnOp::Neg => Rc::from([k, v]),
+                crate::ast::UnOp::Not => Rc::from([v, k]),
+            };
+            CoreKind::Prim(bin, args)
+        }
     };
     Ok(CoreExpr { span, ty, kind })
 }

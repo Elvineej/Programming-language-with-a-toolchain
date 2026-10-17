@@ -145,7 +145,7 @@ pub(crate) fn match_tys(g: &Ty, i: &Ty, out: &mut TySubst) {
 }
 
 /// `t` with every type variable mapped by `f` (rows' label arguments too).
-fn map_vars(t: &Ty, f: &dyn Fn(u32) -> Option<Ty>) -> Ty {
+pub(crate) fn map_vars(t: &Ty, f: &dyn Fn(u32) -> Option<Ty>) -> Ty {
     match t {
         Ty::Var(v) => f(*v).unwrap_or_else(|| t.clone()),
         Ty::Fn(ps, row, r) => Ty::Fn(
@@ -159,7 +159,7 @@ fn map_vars(t: &Ty, f: &dyn Fn(u32) -> Option<Ty>) -> Ty {
     }
 }
 
-fn map_row(row: &EffectRow, f: &dyn Fn(&Ty) -> Ty) -> EffectRow {
+pub(crate) fn map_row(row: &EffectRow, f: &dyn Fn(&Ty) -> Ty) -> EffectRow {
     EffectRow {
         labels: row
             .labels
@@ -188,7 +188,7 @@ fn default_unit(t: &Ty) -> Ty {
 }
 
 /// Every type in `e` (node types, parameters, perform and clause types) mapped.
-fn map_expr(e: &CoreExpr, f: &dyn Fn(&Ty) -> Ty) -> CoreExpr {
+pub(crate) fn map_expr(e: &CoreExpr, f: &dyn Fn(&Ty) -> Ty) -> CoreExpr {
     let go = |c: &CoreExpr| Rc::new(map_expr(c, f));
     let all = |cs: &[CoreExpr]| -> Rc<[CoreExpr]> { cs.iter().map(|c| map_expr(c, f)).collect() };
     let params = |ps: &[CoreParam]| -> Rc<[CoreParam]> {
@@ -238,6 +238,7 @@ fn map_expr(e: &CoreExpr, f: &dyn Fn(&Ty) -> Ty) -> CoreExpr {
             }),
             is_multi_declared: h.is_multi_declared,
             multi: h.multi,
+            any: h.any,
         })),
         CoreKind::Resume(v) => CoreKind::Resume(go(v)),
         CoreKind::Perform(p) => CoreKind::Perform(Rc::new(CorePerform {
@@ -522,6 +523,7 @@ impl Mono<'_> {
                     ret,
                     is_multi_declared: h.is_multi_declared,
                     multi: h.multi,
+                    any: h.any,
                 }))
             }
             CoreKind::Resume(v) => CoreKind::Resume(Rc::new(self.rewrite(v, locals)?)),
@@ -751,6 +753,7 @@ pub(crate) fn run(core: &CoreModule) -> R<CoreModule> {
         types: core.types.clone(),
         generic_types: core.generic_types.clone(),
         effect_params_used: core.effect_params_used.clone(),
+        effects: core.effects.clone(),
     })
 }
 
@@ -856,6 +859,37 @@ impl Instances<'_> {
         Ok(())
     }
 
+    /// Builds every instance reachable from `t` through constructor fields
+    /// (spec 2026-10-17-elya-native-any-handlers D5). A non-regular type
+    /// reaches unboundedly many and stops at the instance budget, by name.
+    fn demand_closure(&mut self, t: &Ty, ground: &[CoreType]) -> R<()> {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut work = vec![t.clone()];
+        while let Some(t) = work.pop() {
+            let Ty::Con(n, a) = &t else { continue };
+            let mut key = String::new();
+            canon(&t, &mut None, &mut key);
+            if !seen.insert(key) {
+                continue;
+            }
+            if self.generic.contains_key(n) {
+                let k = self.number(n, a);
+                self.demand(k)?;
+                let g = self.generic[n.as_str()];
+                for c in g.ctors.clone() {
+                    if let Some(fields) = self.fields_at(n, a, &c.name) {
+                        work.extend(fields);
+                    }
+                }
+            } else if let Some(gt) = ground.iter().find(|g| g.name == *n) {
+                for c in &gt.ctors {
+                    work.extend(c.fields.iter().cloned());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A constructor's name at the (unrenamed) type `ty`, demanding the
     /// instance; a ground type's constructors keep their names.
     fn ctor_at(&mut self, ty: &Ty, ctor: &str) -> R<String> {
@@ -904,7 +938,14 @@ impl Instances<'_> {
             CoreKind::Lit(l) => CoreKind::Lit(l.clone()),
             CoreKind::Var(x) => CoreKind::Var(x.clone()),
             CoreKind::App(f, a) => CoreKind::App(go(f, self)?, self.all(a, ground)?),
-            CoreKind::Builtin(n, a) => CoreKind::Builtin(n.clone(), self.all(a, ground)?),
+            CoreKind::Builtin(n, a) => {
+                // A decode can build a value of any type its target reaches
+                // (spec 2026-10-17-elya-native-any-handlers D5).
+                if n == "any.decode" {
+                    self.demand_closure(&e.ty, ground)?;
+                }
+                CoreKind::Builtin(n.clone(), self.all(a, ground)?)
+            }
             CoreKind::Ctor(n, a) => {
                 let n2 = self.ctor_at(&e.ty, n)?;
                 CoreKind::Ctor(n2, self.all(a, ground)?)
@@ -948,6 +989,7 @@ impl Instances<'_> {
                     ret,
                     is_multi_declared: h.is_multi_declared,
                     multi: h.multi,
+                    any: h.any,
                 }))
             }
             CoreKind::Resume(v) => CoreKind::Resume(go(v, self)?),
@@ -1035,6 +1077,7 @@ pub(crate) fn instantiate_types(core: &CoreModule) -> R<CoreModule> {
         types,
         generic_types: Vec::new(),
         effect_params_used: core.effect_params_used.clone(),
+        effects: core.effects.clone(),
     })
 }
 

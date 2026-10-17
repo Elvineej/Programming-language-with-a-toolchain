@@ -14,7 +14,8 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1033 passed, 99 suites. Since `main`, the runtime
+- Linux gate at the tip of `auto/elya`: 1086 passed, 106 suites. Native programs run on
+  their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions; `gc_mark` is unchanged (637 bytes of source).
 - Interactive sessions may also work on `auto/elya`. They use the same
@@ -312,56 +313,110 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   failing run; `--replay T` reproduces the run from it, stopping by name at a divergence
   or on unread entries. Evaluator only.
 
+- **Deep non-tail recursion natively** (2026-10-16, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-16-elya-native-stack-design.md`. The program runs on
+  its own stack (`elya_start` in runtime.c: 1 GiB reserved, a guard below it, a thread
+  that owns it; `ELYA_STACK_MIB` overrides), so `len` over 1 000 000 and a non-tail
+  resume over 1 000 000 run natively; overflowing it is the named `elya: native stack
+  overflow: ...`, exit 1. Elya functions are now mangled `elya.<name>` (a function named
+  `alloc`, `println` or `start` linked against the runtime's own symbol). Needs the
+  Windows gate.
+
+- **Structural equality** (2026-10-16, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-16-elya-structural-equality-design.md`. `==`/`!=` are
+  defined on data only; comparing a function is the new E0436 at check time, through
+  equality type variables (a compared variable is marked and checked where it is bound or
+  instantiated). Equality is structural and iterative in the evaluator (long lists no
+  longer overflow the host stack) and natively (`elya_eq`, a worklist over the
+  descriptor table); `Unit` and every declared type compare natively.
+
+- **A repeatable differential sweep** (2026-10-16, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-16-elya-differential-sweep-design.md`.
+  `scripts/sweep.py` runs every program in the repository through `elya run --value`
+  (new: main's value as the native shim prints it) and natively, and classifies the
+  results; `elya run` now keeps output printed before a runtime error. At 9bb6f5d: 409
+  checked programs, 382 byte-identical, no disagreement or crash; `with any` is the top
+  native gap (9 programs). Found and fixed: `elya build` panicked on a warning-only
+  program.
+
+- **`with any` natively** (2026-10-17, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-17-elya-native-any-handlers-design.md`. After row
+  specialization a `with any` handle is expanded (`any.rs`) into a plain one with a
+  clause per handled operation, the clause copied at each answer type (generic helpers
+  called at it cloned too); `op.*` and `o == o` are rewritten over the clause's
+  parameters, so no operation value exists at run time (any other use of `o` is
+  refused by name). Literals are written and read by the runtime through a reflection
+  table, iteratively, with the evaluator's words for every failure.
+  `examples/09_record_any.elya` runs natively. Needs the Windows gate.
+
+- **Unary operators natively; wrapping and bit arithmetic** (2026-10-17, branch
+  `auto/elya`): spec `docs/superpowers/specs/2026-10-17-elya-unary-and-wrapping-design.md`.
+  `-e` and `!e` lower in Core as `0 - e` and `e == False`. New pure builtins
+  `int.wrapping_add/sub/mul`, `int.and/or/xor`, `int.shl/shr/ushr` (a shift amount
+  outside `0..=63` fails by name), in both evaluators and natively. Needs the Windows
+  gate.
+
+- **Record and replay natively** (2026-10-17, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-17-elya-native-record-replay-design.md`. A native
+  binary records under `ELYA_RECORD=<file>` and replays under `ELYA_REPLAY=<file>`
+  (runtime.c), in the evaluator's trace format with its failures' words, so a trace
+  moves between `elya run --record/--replay` and native runs in both directions.
+  Needs the Windows gate.
+
 ## The next five steps
 
-### 1. Deep non-tail recursion natively
+### 1. Multi-shot resumes over a deep chain
 
-Measured 2026-10-16: `fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }` over
-200 000 elements runs in the evaluator (its continuation is on the heap) and dies
-natively with SIGSEGV (the machine stack; fine under `ulimit -s unlimited`). Decide in a
-spec: a large dedicated stack for `main` (mmap with a guard page) plus a NAMED
-"native stack overflow" diagnostic from the guard page, or deeper changes (CPS for deep
-recursion). Measure the current depth limit first, on Linux and Windows.
+Found by the native-stack review (PARKED.md, 2026-10-16): a `with multi` handler whose
+clause resumes non-tail over a deep non-tail recursion (`nest(20000)`) runs out of
+memory natively, because every resume copies the whole captured chain
+(`elya_cont_copy`), O(d^2) frames in all. Measure the evaluator on the same program and
+the native growth by depth, then decide in a spec: share the chain's unchanged prefix
+(copy-on-write of handler frames only), or copy lazily as frames are re-entered.
 
-### 2. Structural equality
+### 2. One wording for the one-shot trap, and the sweep's smaller gaps
 
-`==` on an ADT value, a tuple or a list is refused natively ("Eq on an unrepresentable
-operand type") and decided by the evaluator's own rules. Measure what the evaluator does
-on ADTs and closures today, decide in a spec what `==` means (structural on data, an
-error on functions -- E04xx at check time rather than at run time), and compile it
-natively (a runtime walk guided by the descriptor table, or generated per-type
-equality functions after N7 part 2's instances).
+The sweep's four `both-fail-differently` programs: a second resume of a one-shot
+continuation is "continuation resumed more than once" in the evaluator and "a one-shot
+continuation was resumed twice" natively. Decide one wording (spec), change both sides
+and the tests that assert either (a decision: call each out). Then the sweep's single
+refusals: a parametric constructor as a function value (`map(xs, Some)`), an
+effect-polymorphic closure through a `let` alias, `Float` in Core.
 
-### 3. A differential sweep, again
+### 3. Operation values as values natively
 
-The 2026-10-15 sweep (about 700 programs: every corpus, example and probe through
-`elya run` and `elya build`) found the N7 instance-key miscompile and ranked the native
-refusals. Re-run it at the tip: list every program the evaluator runs and native refuses
-or gets wrong, rank the refusals by count, and turn the top one into the next step.
-Keep the sweep script under `scripts/` so the next run can repeat it.
+`with any` natively (Done) refuses an operation value used other than by `op.*` or
+`==` (passed to a function, stored, returned: spec D2), and two evaluator behaviours
+stay native gaps: decoding a non-regular type (`too many type instances`) and
+decoding at an effect's own parameter (refused on both sides, the evaluator's S2).
+Measure what a recorder library would write (a `describe(o)` helper, a log of
+operations), then decide in a spec: clone functions over `Op(t)` per operation as the
+expansion clones clauses, or a run-time operation value; and whether both sides should
+decode at the instantiation (the evaluator would need it carried).
 
-### 4. Unary minus and wrapping arithmetic natively
+### 4. Literals at the edges, and a layout rule
 
-Also-open items since 2026-10-10: Core refuses unary minus ("Unary"), so every native
-example writes `0 - 1`; and hashes and generators need explicit wrapping arithmetic
-(`int.wrapping_mul` and friends) now that `Int` is checked. Measure which corpus programs
-use `-x`, add the lowering, and decide the wrapping builtins' names in a spec.
+Two lexical gaps the 2026-10-17 review found: `MIN` cannot be written
+(`-9223372036854775808` is E0001 "not a valid Elya token"; an out-of-range literal
+deserves its own diagnostic, and `-` applied to the literal `9223372036854775808`
+could be accepted as `MIN`, as Rust does), and a line starting with `-` or `(`
+continues the previous expression (`let y = 4` then `-x * y` parses as one
+expression). Measure the corpus for both, then decide in a spec: a literal rule for
+negation, and a layout rule (an operator at the start of a line ends the statement
+before it, or is an error).
 
-### 5. Record and replay natively
+### 5. A failing traced run keeps its output on stdout
 
-`elya run --record/--replay` (Done) works in the evaluator only; a native binary asks
-the runtime's clock directly. Add the same trace to the runtime (an environment
-variable or flag read by the shim: `ELYA_RECORD=file` / `ELYA_REPLAY=file`), with the
-same format and the same named failures, and a differential test that a trace recorded
-by `elya run` replays natively and the reverse.
+`elya run --replay` drops what the program printed before a failure, and `--record`
+prints it to stderr with the diagnostic; plain `elya run` (since 2026-10-16) and a
+native binary (record or replay) keep it on stdout. Make the two trace modes do the
+same (`run_source_recording`/`run_source_replaying` return the output apart from the
+error), then a differential test of a failing replay's stdout across both sides.
 
-Also open, unscheduled: `with any` natively (per-operation name and
-type tables in the runtime, `op.decode` at an effect's parameter once the instantiation
-is carried); row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
-per platform, deferred by the timers spec D1); explicit wrapping arithmetic (`int.wrapping_mul` and friends, for
-hashes and generators) and unary minus natively (Core refuses "Unary"); the
-one-shot trap's words differ (evaluator "continuation resumed more than once", native
-"a one-shot continuation was resumed twice"); the parser continues a call across a
+Also open, unscheduled: row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
+per platform, deferred by the timers spec D1); a user
+effect named `IO` is refused by Core ("effect IO"); Elya functions are mangled
+`elya.<name>`; the parser continues a call across a
 newline (`f()` then a line starting `(` is `f()(...)`) -- a layout rule is a language
 decision; the roadmap's
 other priorities (record/replay handlers, then capabilities once modules exist); the rest
@@ -369,5 +424,4 @@ of the soundness sweep (recursion through a handle body and through a lambda: do
 2026-10-15). A perform walks the handler chain, so a program whose handler stack really grows
 (a resume inside a fresh handle every iteration) pays O(depth) per perform; the evaluator
 is no faster there. Also: the Elya CEK machine's next versions (a parser for its terms, a step
-counter as an Elya effect); PIC/PIE linking (needs a Windows run), and a named diagnosis for
-a native stack overflow in tests other than A9.
+counter as an Elya effect); PIC/PIE linking (needs a Windows run).

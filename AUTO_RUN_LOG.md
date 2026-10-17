@@ -3,11 +3,108 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-16 17:53 UTC — IN PROGRESS (scheduled run)
+## 2026-10-17 01:53 UTC — IN PROGRESS (scheduled run; still active at 04:25, see the last line of this entry)
+
+- The 2026-10-16 17:53 run never marked DONE; its last commit (7dc40b5) is 20:01, over
+  3 hours ago, so this run takes over at 7dc40b5.
+- LLVM 18 dev headers and libzstd-dev installed via apt. Baseline 1054 / 101.
+- **Done: `with any` natively** (1789c12, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-17-elya-native-any-handlers-design.md`. After row
+  specialization a `with any` handle is expanded into a plain handle, one clause per
+  handled operation at its answer type; literals through a runtime reflection table
+  with the evaluator's failure words. `examples/09_record_any.elya` runs natively.
+  Gate 1069 / 102 (predicted 1067 before the review; +2 review tests). Sweep: 700
+  programs, no disagreement or crash; of the 9 `with any` programs, 6 now agree and 3
+  are refused by name (2 `Float`, 1 non-regular type), as predicted.
+  - **Decisions (mine; please review):** expansion (monomorphizing the clause) rather
+    than a run-time operation value; an operation value used other than by `op.*` or
+    `==` is refused natively by name (no corpus program does it; HANDOFF step 5);
+    decoding at an effect's own parameter stays a failure natively too (parity with
+    the evaluator's S2, though natively the type is known).
+  - **Changed expectation by this decision:** tests/core_lowering.rs
+    `an_operation_generic_handler_is_refused_at_lowering` became
+    `an_operation_generic_handler_lowers_marked_any`.
+  - Review: 2 high (a generic helper at the answer type; `o == o` with a function in
+    an argument) + 1 medium, fixed test-first.
+  - `graphify` (CLAUDE.md) is not installed here and `graphify-out/` does not exist,
+    so no graph update was run.
+- Windows-gate debt added: 1789c12 (new runtime C: `elya_any_*`).
+- **Done: unary operators natively; wrapping and bit arithmetic** (a6905a5, HANDOFF
+  step 1). Spec `docs/superpowers/specs/2026-10-17-elya-unary-and-wrapping-design.md`.
+  `-e`/`!e` lower in Core as `0 - e`/`e == False`; new pure builtins
+  `int.wrapping_add/sub/mul`, `int.and/or/xor`, `int.shl/shr/ushr`. Gate 1079 / 105
+  (predicted 1077, +2 from the review's fix).
+  - **Decisions (mine; please review):** named builtins, not operators (`^`, `<<`,
+    `&`, `|`); Rust's names; an out-of-range shift amount fails by name rather than
+    being masked; no wrapping integer type.
+  - Review: 1 low finding fixed (E0208's help now wraps a builtin at its arity);
+    MIN not writable as a literal and the leading-`-` line continuation recorded as
+    HANDOFF step 5.
+  - Plan deviation: the native unary test was written after Core's lowering, so it
+    was not red first natively (its root counterpart was; K1 shows it has teeth).
+- Windows-gate debt added: a6905a5.
+- **Done: record and replay natively** (95f4680, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-17-elya-native-record-replay-design.md`.
+  `ELYA_RECORD=<file>` / `ELYA_REPLAY=<file>` on a native binary; the evaluator's
+  trace format and failure words, so traces move both ways between `elya run` and
+  native runs. Gate 1086 / 106 (predicted 1084, +2 review tests).
+  - **Decisions (mine; please review):** environment variables (not a build flag);
+    a malformed trace exits 1 and an unreadable/unwritable one exits 2, matching
+    the CLI.
+  - Review: 3 medium (unchecked writes, Unicode trim, non-UTF-8 traces) + 1 low
+    (NUL bytes), fixed test-first. Found (older): `--replay` drops a failing run's
+    output and `--record` puts it on stderr -- now HANDOFF step 5.
+- Windows-gate debt added: 95f4680 (runtime C; the Windows `elya_start` now calls
+  the trace init/finish too).
+- Still active at 04:25 UTC, on HANDOFF step 1 (multi-shot resumes over a deep chain).
+
+## 2026-10-16 17:53 UTC — ended without a DONE mark (taken over 2026-10-17 01:53)
 
 - The 12:30 entry never marked DONE; its last commit (2b7ce18) is 14:33, over 3 hours
-  ago, so this run takes over at 2b7ce18. Next: HANDOFF step 1, deep non-tail recursion
-  natively.
+  ago, so this run takes over at 2b7ce18. LLVM 18 dev headers installed via apt.
+  Baseline 1033 / 99.
+- **Done: deep non-tail recursion natively** (94ee05e, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-16-elya-native-stack-design.md`. Native programs run on
+  their own 1 GiB stack (`elya_start`); `len` over 1 000 000 and a non-tail resume over
+  1 000 000 run (they died with an unnamed SIGSEGV past about 130 000 frames); an overflow
+  is now `elya: native stack overflow: ...`, exit 1. Review: 2 medium + 2 low findings;
+  M1 and L1 fixed test-first. Gate 1039 / 99 (predicted 1039).
+  - **Decisions (mine; please review):** a FIXED 1 GiB stack (not sized from the
+    machine's memory, for reproducibility), `ELYA_STACK_MIB` overrides, no silent
+    fallback. **Consequence (review M2):** under `ulimit -v` below about 1 GiB, or strict
+    overcommit on a small machine, every native program stops with `elya: cannot
+    reserve a stack of 1024 MiB (ELYA_STACK_MIB sets a smaller one)`. If you prefer a
+    fallback or a smaller default, say so.
+  - Elya functions are now mangled `elya.<name>` (a function named `alloc`, `println` or
+    `start` failed to link against the runtime's own symbol).
+  - Existing native tests run their binaries with `ELYA_STACK_MIB=8` (the stack they were
+    written against), so tail-call regressions still overflow.
+- **Done: structural equality** (9bb6f5d, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-16-elya-structural-equality-design.md`. `==` on data
+  only; comparing functions is the **new diagnostic E0436** (via equality type
+  variables, SML-style); iterative in the evaluator, `elya_eq` natively. Review: 1 high
+  (two pre-existing tests broke) + 3 low, fixed. Gate 1049 / 101.
+  - **Decisions (mine; please review):** E0436 rather than identity equality or a
+    run-time error on functions; `with any` operation values are data (N3 kept);
+    phantom type parameters at function types are rejected.
+  - **Changed expectation by this decision:** lib.rs
+    `rejects_eq_on_an_unrepresentable_operand_type` now builds its operand by hand (the
+    ADT it used compiles); the expected refusal is unchanged.
+- Windows-gate debt added: 9bb6f5d.
+- **Done: a repeatable differential sweep** (9176644, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-16-elya-differential-sweep-design.md`.
+  `python3 scripts/sweep.py` (needs Python 3; not part of the gate). New CLI flag
+  **`elya run --value`** (decision: mine; prints main's value as a native binary does).
+  `elya run` now keeps output printed before a runtime error (was dropped). Result at
+  9bb6f5d: 409 checked programs, 382 identical, **no disagreement and no native crash**;
+  found and fixed `elya build` panicking (debug build) on warning-only programs. Top
+  native gap: `with any` (9 programs), now HANDOFF step 1. Gate 1054 / 101.
+- Windows-gate debt added: 9176644.
+- PR #23 was merged by the maintainer (2026-10-16 18:32, at ab791b6); a new draft PR is
+  open from `auto/elya`.
+- Windows-gate debt added: 94ee05e (**priority**: the Windows `elya_start` path --
+  CreateThread reservation, SetThreadStackGuarantee, the vectored handler -- has never
+  run).
 
 ## 2026-10-16 12:30 UTC — ended without a DONE mark (taken over 2026-10-16 17:53)
 

@@ -298,8 +298,8 @@ pub(crate) fn apply_binop(
         (MulF, Float(a), Float(b)) => Ok(Float(a * b)),
         (DivF, Float(a), Float(b)) => Ok(Float(a / b)),
         (Concat, Str(a), Str(b)) => Ok(Str(a + &b)),
-        (Eq, a, b) => Ok(Bool(a == b)),
-        (Ne, a, b) => Ok(Bool(a != b)),
+        (Eq, a, b) => structural_eq(&a, &b, span).map(Bool),
+        (Ne, a, b) => structural_eq(&a, &b, span).map(|e| Bool(!e)),
         (Lt, Int(a), Int(b)) => Ok(Bool(a < b)),
         (Le, Int(a), Int(b)) => Ok(Bool(a <= b)),
         (Gt, Int(a), Int(b)) => Ok(Bool(a > b)),
@@ -308,6 +308,108 @@ pub(crate) fn apply_binop(
         (Or, Bool(a), Bool(b)) => Ok(Bool(a || b)),
         _ => Err(rt(span, "type error in binary operator")),
     }
+}
+
+/// `==` on data (spec 2026-10-16-elya-structural-equality, D2): the same
+/// constructor and equal fields, strings by their bytes. An explicit worklist,
+/// never recursion: comparing two million-element lists recursed once per cell
+/// and overflowed the host stack. E0436 keeps functions and continuations
+/// out; one arriving anyway is an internal error by name.
+fn structural_eq(a: &Value, b: &Value, span: Span) -> Result<bool, RuntimeError> {
+    use Value::*;
+    let mut work: Vec<(&Value, &Value)> = vec![(a, b)];
+    while let Some((x, y)) = work.pop() {
+        match (x, y) {
+            (Int(p), Int(q)) => {
+                if p != q {
+                    return Ok(false);
+                }
+            }
+            (Float(p), Float(q)) => {
+                if p != q {
+                    return Ok(false);
+                }
+            }
+            (Str(p), Str(q)) => {
+                if p != q {
+                    return Ok(false);
+                }
+            }
+            (Bool(p), Bool(q)) => {
+                if p != q {
+                    return Ok(false);
+                }
+            }
+            (Unit, Unit) => {}
+            (Ctor(n1, a1), Ctor(n2, a2)) => {
+                if n1 != n2 || a1.0.len() != a2.0.len() {
+                    return Ok(false);
+                }
+                // No shortcut for a shared value: a `Float` NaN in it is not
+                // equal to itself, so sharing must not decide (the review).
+                work.extend(a1.0.iter().zip(a2.0.iter()));
+            }
+            // N3: two operations caught by `with any` compare by what they are
+            // (E0434 makes their arguments data).
+            (
+                Op {
+                    effect: e1,
+                    op: o1,
+                    args: a1,
+                },
+                Op {
+                    effect: e2,
+                    op: o2,
+                    args: a2,
+                },
+            ) => {
+                if e1 != e2 || o1 != o2 || a1.len() != a2.len() {
+                    return Ok(false);
+                }
+                work.extend(a1.iter().zip(a2.iter()));
+            }
+            _ => {
+                return Err(rt(
+                    span,
+                    "`==` reached a value that is not data (E0436 should have rejected it)",
+                ))
+            }
+        }
+    }
+    Ok(true)
+}
+
+pub use crate::resolve::INT_BINARY_BUILTINS;
+
+/// `int.<name>(a, b)`. A shift amount outside `0..=63` fails by name.
+pub(crate) fn int_binary(name: &str, args: &[Value], span: Span) -> Result<Value, RuntimeError> {
+    let [Value::Int(a), Value::Int(b)] = args else {
+        return Err(rt(span, format!("int.{name} expects two Ints")));
+    };
+    let (a, b) = (*a, *b);
+    let shift = |b: i64| -> Result<u32, RuntimeError> {
+        if (0..=63).contains(&b) {
+            Ok(b as u32)
+        } else {
+            Err(rt(
+                span,
+                format!("int.{name}: a shift by {b} is outside 0..=63"),
+            ))
+        }
+    };
+    let v = match name {
+        "wrapping_add" => a.wrapping_add(b),
+        "wrapping_sub" => a.wrapping_sub(b),
+        "wrapping_mul" => a.wrapping_mul(b),
+        "and" => a & b,
+        "or" => a | b,
+        "xor" => a ^ b,
+        "shl" => a << shift(b)?,
+        "shr" => a >> shift(b)?,
+        "ushr" => ((a as u64) >> shift(b)?) as i64,
+        _ => return Err(rt(span, format!("unknown builtin `int.{name}`"))),
+    };
+    Ok(Value::Int(v))
 }
 
 pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, RuntimeError> {
@@ -470,6 +572,13 @@ pub mod tree {
                         };
                         return Ok(Value::Str(n.to_string()));
                     }
+                    if module == "int" && super::INT_BINARY_BUILTINS.contains(&name.as_str()) {
+                        let mut vals = Vec::new();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        return super::int_binary(name, &vals, span);
+                    }
                     return Err(rt(span, format!("unknown builtin `{module}.{name}`")));
                 }
                 // Constructor application: `Cons(1, Nil)` builds a `Ctor` value.
@@ -607,6 +716,7 @@ pub mod cek {
     enum CalleeSlot {
         Pending,                                  // still evaluating the callee expression
         Builtin(&'static str),                    // e.g. "io.println"
+        IntBinary(&'static str),                  // `int.<name>` of two Ints
         Value(Value),                             // an evaluated callee (a Value::Fn)
         Operation { effect: String, op: String }, // a perform of an effect op
         Ctor { name: String },                    // a data-constructor application
@@ -1030,6 +1140,12 @@ pub mod cek {
                     }
                     Expr::Qualified { module, name } if module == "time" && name == "now_ms" => {
                         CalleeSlot::Builtin("time.now_ms")
+                    }
+                    Expr::Qualified { module, name } if module == "int" => {
+                        match super::INT_BINARY_BUILTINS.iter().position(|b| b == name) {
+                            Some(i) => CalleeSlot::IntBinary(super::INT_BINARY_BUILTINS[i]),
+                            None => return Err(rt(span, format!("unknown builtin `int.{name}`"))),
+                        }
                     }
                     Expr::Qualified { module, name } if module == "time" && name == "sleep_ms" => {
                         CalleeSlot::Builtin("time.sleep_ms")
@@ -1487,6 +1603,9 @@ pub mod cek {
             CalleeSlot::Builtin(b @ ("time.now_ms" | "time.sleep_ms")) => {
                 let v = super::host_builtin(interp, b, &args, span)?;
                 Ok(State::Return(v, k))
+            }
+            CalleeSlot::IntBinary(name) => {
+                Ok(State::Return(super::int_binary(name, &args, span)?, k))
             }
             CalleeSlot::Builtin("int.to_string") => {
                 let [Value::Int(n)] = &args[..] else {

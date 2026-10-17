@@ -19,11 +19,13 @@
 //! question, not a back-end one.
 
 mod anf;
+mod any;
 mod closure;
 mod cps;
 mod cps_emit;
 mod mono;
 mod patterns;
+mod reflect;
 mod specialize;
 mod spill;
 
@@ -46,6 +48,7 @@ use inkwell::values::CallSiteValue;
 use inkwell::values::FunctionValue;
 use inkwell::values::IntValue;
 use inkwell::values::LLVMTailCallKind;
+use inkwell::values::PointerValue;
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
@@ -133,13 +136,14 @@ fn eq_operand_label(op: BinOp) -> &'static str {
 }
 
 /// Every Elya function gets this prefix (§4.1). Prefixing is injective, so no
-/// two Elya names collide, and no Elya name can collide with the three symbols
-/// this back end generates or imports: `@main` (the print shim), `@printf`
-/// (external), `@.fmt` (the format string). `main` mangles to `elya_main` —
-/// byte-identical to the name 5b-1 already hardcoded, so the shim is unchanged.
-/// An Elya function literally named `elya_main` mangles to `elya_elya_main`.
+/// two Elya names collide. The separator is a dot (the 2026-10-16 review, M1):
+/// with `elya_` an Elya function named `alloc`, `println` or `start` became
+/// the runtime's own C symbol and the link failed. No C identifier contains a
+/// dot, so no Elya name can collide with runtime.c (`elya_*`), with the
+/// symbols this back end generates (`@main`, `@elya_entry`, `@.fmt`) or with
+/// `@printf`. `main` mangles to `elya.main`.
 fn mangle(name: &str) -> String {
-    format!("elya_{name}")
+    format!("elya.{name}")
 }
 
 /// LLVM's `tailcc`. Value from llvm/IR/CallingConv.h: `Tail = 18`. EVERY
@@ -239,7 +243,7 @@ fn fn_type_of<'ctx>(
     }
 }
 
-/// `main` returns i64: `@elya_main`'s signature says so and the print shim's
+/// `main` returns i64: `@elya.main`'s signature says so and the print shim's
 /// format string is `%lld`. A `Bool`-bodied main is a representable value in an
 /// unrepresentable *place*, so it is refused at the module boundary rather than
 /// inside the fold — which is why this message stayed "non-Int value" when the
@@ -464,6 +468,57 @@ pub(crate) fn string_prim<'ctx>(
     }
 }
 
+/// `==`/`!=` on a declared type (spec 2026-10-16-elya-structural-equality,
+/// D3): heap operands, compared by `elya_eq`'s walk. It allocates nothing.
+pub(crate) fn is_data_eq_prim(op: BinOp, args: &[CoreExpr]) -> bool {
+    matches!(op, BinOp::Eq | BinOp::Ne) && matches!(args[0].ty, Ty::Con(..))
+}
+
+/// `==`/`!=` on `Unit`: both operands are evaluated, the answer is constant.
+pub(crate) fn is_unit_eq_prim(op: BinOp, args: &[CoreExpr]) -> bool {
+    matches!(op, BinOp::Eq | BinOp::Ne) && matches!(args[0].ty, Ty::Base(TyCon::Unit))
+}
+
+pub(crate) fn unit_eq<'ctx>(ctx: &'ctx Context, op: BinOp) -> BasicValueEnum<'ctx> {
+    ctx.bool_type()
+        .const_int(u64::from(op == BinOp::Eq), false)
+        .into()
+}
+
+pub(crate) fn data_eq<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    op: BinOp,
+    l: inkwell::values::PointerValue<'ctx>,
+    r: inkwell::values::PointerValue<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    let w = b
+        .build_call(
+            lc.data_eq,
+            &[
+                l.into(),
+                r.into(),
+                i64t.const_int(lc.string_tag as u64, false).into(),
+            ],
+            "dataeq",
+        )
+        .map_err(internal)?
+        .try_as_basic_value()
+        .left()
+        .ok_or(CodegenError::Unsupported("elya_eq returned no value"))?
+        .into_int_value();
+    let pred = if op == BinOp::Eq {
+        IntPredicate::NE
+    } else {
+        IntPredicate::EQ
+    };
+    Ok(b.build_int_compare(pred, w, i64t.const_zero(), "dataeqb")
+        .map_err(internal)?
+        .into())
+}
+
 /// `int.to_string(n)`: a fresh string. Allocates: the caller roots.
 pub(crate) fn int_to_string<'ctx>(
     ctx: &'ctx Context,
@@ -515,12 +570,221 @@ pub(crate) fn time_builtin<'ctx>(
     }
 }
 
-/// The builtins the native back end implements.
+/// The builtins the native back end implements. `any.*` are the `with any`
+/// expansion's (spec 2026-10-17), never written in source.
 pub(crate) fn is_native_builtin(name: &str) -> bool {
     matches!(
         name,
-        "io.println" | "int.to_string" | "time.now_ms" | "time.sleep_ms"
-    )
+        "io.println"
+            | "int.to_string"
+            | "time.now_ms"
+            | "time.sleep_ms"
+            | "any.show"
+            | "any.decode"
+            | "any.fail"
+            | "any.check"
+    ) || name
+        .strip_prefix("int.")
+        .is_some_and(|n| elya::eval::INT_BINARY_BUILTINS.contains(&n))
+}
+
+/// `int.<name>(a, b)` (spec 2026-10-17-elya-unary-and-wrapping D3), both
+/// emitters: wrapping arithmetic is LLVM's plain `add`/`sub`/`mul`, bits are
+/// `and`/`or`/`xor`, and a shift's amount is checked against `0..=63` first,
+/// trapping through `elya_shift_range` with the evaluator's words. Allocates
+/// nothing.
+pub(crate) fn int_binary<'ctx>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    name: &str,
+    x: IntValue<'ctx>,
+    y: IntValue<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let n = name.strip_prefix("int.").unwrap_or(name);
+    if matches!(n, "shl" | "shr" | "ushr") {
+        let i64t = ctx.i64_type();
+        let bad = b
+            .build_int_compare(IntPredicate::UGT, y, i64t.const_int(63, false), "shbad")
+            .map_err(internal)?;
+        let trap = ctx.append_basic_block(func, "shift_range");
+        let ok = ctx.append_basic_block(func, "shift_ok");
+        b.build_conditional_branch(bad, trap, ok)
+            .map_err(internal)?;
+        b.position_at_end(trap);
+        b.build_call(lc.shift_range, &[c_string(ctx, lc, n).into(), y.into()], "")
+            .map_err(internal)?;
+        b.build_unreachable().map_err(internal)?;
+        b.position_at_end(ok);
+    }
+    let v = match n {
+        "wrapping_add" => b.build_int_add(x, y, "wadd"),
+        "wrapping_sub" => b.build_int_sub(x, y, "wsub"),
+        "wrapping_mul" => b.build_int_mul(x, y, "wmul"),
+        "and" => b.build_and(x, y, "band"),
+        "or" => b.build_or(x, y, "bor"),
+        "xor" => b.build_xor(x, y, "bxor"),
+        "shl" => b.build_left_shift(x, y, "shl"),
+        "shr" => b.build_right_shift(x, y, true, "ashr"),
+        "ushr" => b.build_right_shift(x, y, false, "lshr"),
+        _ => return Err(CodegenError::UnsupportedBuiltin(name.to_string())),
+    }
+    .map_err(internal)?;
+    Ok(v.into())
+}
+
+/// A NUL-terminated private constant, for the runtime's messages.
+fn c_string<'ctx>(ctx: &'ctx Context, lc: &LowerCtx<'_, 'ctx>, s: &str) -> PointerValue<'ctx> {
+    let i8t = ctx.i8_type();
+    let bytes: Vec<_> = s
+        .bytes()
+        .chain(std::iter::once(0))
+        .map(|c| i8t.const_int(c as u64, false))
+        .collect();
+    let arr = i8t.const_array(&bytes);
+    let g = lc
+        .module
+        .add_global(arr.get_type(), Some(AddressSpace::default()), "anymsg");
+    g.set_initializer(&arr);
+    g.set_constant(true);
+    g.set_linkage(Linkage::Private);
+    g.set_unnamed_addr(true);
+    g.as_pointer_value()
+}
+
+/// The `n`-th argument of a builtin, a string literal the expansion wrote.
+fn lit_arg(e: &CoreExpr, n: usize) -> Result<&str, CodegenError> {
+    match &e.kind {
+        CoreKind::Builtin(_, a) => match a.get(n).map(|x| &x.kind) {
+            Some(CoreKind::Lit(CoreLit::Str(s))) => Ok(s),
+            _ => Err(CodegenError::Unsupported(
+                "`any` builtin without its literal",
+            )),
+        },
+        _ => Err(CodegenError::Unsupported(
+            "`any` builtin without its literal",
+        )),
+    }
+}
+
+/// `any.show(v, before, after)`, `any.decode(s, display, op)`, `any.check(v)`
+/// and `any.fail(s, message)` (spec 2026-10-17 D3/D4) on the lowered first
+/// operand `v` (both emitters; only the first operand is lowered, the rest are
+/// the expansion's literals). Allocates: the caller roots what it still needs,
+/// `v` included.
+pub(crate) fn any_builtin<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    e: &CoreExpr,
+    v: BasicValueEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    let CoreKind::Builtin(name, args) = &e.kind else {
+        return Err(internal("any_builtin on a non-builtin"));
+    };
+    let tag = i64t.const_int(lc.string_tag as u64, false);
+    match name.as_str() {
+        "any.show" => {
+            let target = &args[0].ty;
+            let node = lc
+                .reflect
+                .node_of(target)
+                .ok_or_else(|| internal("any.show at a type the table lacks"))?;
+            let w = value_to_word(b, v, target, i64t)?;
+            b.build_call(
+                lc.any_show,
+                &[
+                    tag.into(),
+                    lc.any_table.into(),
+                    lc.any_names.into(),
+                    i64t.const_int(node as u64, false).into(),
+                    w.into(),
+                    c_string(ctx, lc, lit_arg(e, 1)?).into(),
+                    c_string(ctx, lc, lit_arg(e, 2)?).into(),
+                ],
+                "anyshow",
+            )
+            .map_err(internal)?
+            .try_as_basic_value()
+            .left()
+            .ok_or(CodegenError::Unsupported("elya_any_show returned no value"))
+        }
+        "any.decode" => {
+            let node = lc
+                .reflect
+                .node_of(&e.ty)
+                .ok_or_else(|| internal("any.decode at a type the table lacks"))?;
+            let w = b
+                .build_call(
+                    lc.any_decode,
+                    &[
+                        tag.into(),
+                        lc.any_table.into(),
+                        lc.any_names.into(),
+                        i64t.const_int(node as u64, false).into(),
+                        v.into(),
+                        c_string(ctx, lc, lit_arg(e, 1)?).into(),
+                        c_string(ctx, lc, lit_arg(e, 2)?).into(),
+                    ],
+                    "anydecode",
+                )
+                .map_err(internal)?
+                .try_as_basic_value()
+                .left()
+                .ok_or(CodegenError::Unsupported(
+                    "elya_any_decode returned no value",
+                ))?
+                .into_int_value();
+            word_to_value(
+                b,
+                w,
+                &e.ty,
+                ctx.bool_type(),
+                ctx.ptr_type(AddressSpace::default()),
+            )
+        }
+        "any.check" => {
+            let target = &args[0].ty;
+            let node = lc
+                .reflect
+                .node_of(target)
+                .ok_or_else(|| internal("any.check at a type the table lacks"))?;
+            let w = value_to_word(b, v, target, i64t)?;
+            let r = b
+                .build_call(
+                    lc.any_check,
+                    &[
+                        lc.any_table.into(),
+                        i64t.const_int(node as u64, false).into(),
+                        w.into(),
+                    ],
+                    "anycheck",
+                )
+                .map_err(internal)?
+                .try_as_basic_value()
+                .left()
+                .ok_or(CodegenError::Unsupported(
+                    "elya_any_check returned no value",
+                ))?
+                .into_int_value();
+            word_to_value(
+                b,
+                r,
+                &Ty::Base(TyCon::Bool),
+                ctx.bool_type(),
+                ctx.ptr_type(AddressSpace::default()),
+            )
+        }
+        "any.fail" => {
+            b.build_call(lc.any_fail, &[c_string(ctx, lc, lit_arg(e, 1)?).into()], "")
+                .map_err(internal)?;
+            // The runtime exits; a value of the node's type stands in.
+            Ok(repr_ty(ctx, &e.ty)?.const_zero())
+        }
+        _ => Err(CodegenError::UnsupportedBuiltin(name.clone())),
+    }
 }
 
 /// Is this `Prim` a string operation (`<>`, or `==`/`!=` on `String`s)?
@@ -1325,6 +1589,21 @@ fn lower_expr<'ctx>(
             }
             time_builtin(ctx, b, lc, builtin, &vals)
         }
+        CoreKind::Builtin(builtin, args) if builtin.starts_with("any.") && !args.is_empty() => {
+            let v = lower_expr(ctx, func, b, lc, &args[0], env)?;
+            let roots = gc_root_env(b, lc, env)?;
+            let own = usize::from(gc_root(b, lc, v)?);
+            let r = any_builtin(ctx, b, lc, e, v)?;
+            gc_unroot(b, lc, roots + own)?;
+            Ok(r)
+        }
+        CoreKind::Builtin(builtin, args)
+            if builtin.starts_with("int.") && builtin != "int.to_string" && args.len() == 2 =>
+        {
+            let x = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
+            let y = lower_expr(ctx, func, b, lc, &args[1], env)?.into_int_value();
+            int_binary(ctx, func, b, lc, builtin, x, y)
+        }
         CoreKind::Builtin(builtin, args) if builtin == "int.to_string" && args.len() == 1 => {
             let n = lower_expr(ctx, func, b, lc, &args[0], env)?;
             let roots = gc_root_env(b, lc, env)?;
@@ -1396,6 +1675,29 @@ fn lower_expr<'ctx>(
                 )?;
                 gc_unroot(b, lc, roots + usize::from(held))?;
                 return Ok(v);
+            }
+            // Structural equality (2026-10-16): the left operand is rooted
+            // while the right one is lowered (it may allocate); the walk
+            // itself allocates nothing.
+            if is_data_eq_prim(*op, args) {
+                let l = lower_expr(ctx, func, b, lc, &args[0], env)?;
+                let held = gc_root(b, lc, l)?;
+                let r = lower_expr(ctx, func, b, lc, &args[1], env)?;
+                let v = data_eq(
+                    ctx,
+                    b,
+                    lc,
+                    *op,
+                    l.into_pointer_value(),
+                    r.into_pointer_value(),
+                )?;
+                gc_unroot(b, lc, usize::from(held))?;
+                return Ok(v);
+            }
+            if is_unit_eq_prim(*op, args) {
+                lower_expr(ctx, func, b, lc, &args[0], env)?;
+                lower_expr(ctx, func, b, lc, &args[1], env)?;
+                return Ok(unit_eq(ctx, *op));
             }
             if matches!(op, BinOp::Eq | BinOp::Ne)
                 && !matches!(args[0].ty, Ty::Base(TyCon::Int) | Ty::Base(TyCon::Bool))
@@ -1786,6 +2088,8 @@ struct LowerCtx<'a, 'ctx> {
     /// Native strings (2026-10-15): `<>`, `==` on strings, `int.to_string`.
     str_concat: FunctionValue<'ctx>,
     str_eq: FunctionValue<'ctx>,
+    /// `elya_eq`: structural equality on data (2026-10-16).
+    data_eq: FunctionValue<'ctx>,
     int_to_string: FunctionValue<'ctx>,
     /// Time (2026-10-15): `time.now_ms`, `time.sleep_ms`.
     time_now_ms: FunctionValue<'ctx>,
@@ -1835,6 +2139,18 @@ struct LowerCtx<'a, 'ctx> {
     /// Native multi-shot (spec D3): `elya_cont_copy(cont, hlo, hhi) -> cont'`
     /// (`ccc`), a fresh continuation over a copy of the captured frames.
     cont_copy: FunctionValue<'ctx>,
+    /// `with any` (spec 2026-10-17): the reflection table, its two globals, and
+    /// `elya_any_show`, `elya_any_decode`, `elya_any_fail` (`ccc`).
+    reflect: &'a reflect::Reflect,
+    any_table: PointerValue<'ctx>,
+    any_names: PointerValue<'ctx>,
+    any_show: FunctionValue<'ctx>,
+    any_decode: FunctionValue<'ctx>,
+    any_fail: FunctionValue<'ctx>,
+    any_check: FunctionValue<'ctx>,
+    /// `elya_shift_range(name, amount)` (`ccc`, exits): a shift amount outside
+    /// `0..=63` (spec 2026-10-17-elya-unary-and-wrapping D3).
+    shift_range: FunctionValue<'ctx>,
 }
 
 /// Fold `core.types` into a flat constructor table: name -> (tag, field types).
@@ -1853,7 +2169,7 @@ fn build_ctor_table(core: &CoreModule) -> HashMap<String, (usize, Vec<Ty>)> {
     out
 }
 
-/// Build the verified LLVM module for `core` into `ctx`: `@elya_main` lowering
+/// Build the verified LLVM module for `core` into `ctx`: `@elya.main` lowering
 /// the Core body, plus (Task 4) the printf declaration, format-string global,
 /// and `@main` shim. Returns the handle so `emit_ir` and `compile_module` share
 /// one construction path.
@@ -1868,6 +2184,9 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     // and eta-expand upcasts, so every phase below sees types that say the
     // right convention. Pure Core-to-Core; nothing is emitted yet.
     let specialized = specialize::run(&specialized)?;
+    // `with any` handlers become plain ones, a clause per handled operation,
+    // now that the rows they handle are ground (spec 2026-10-17).
+    let specialized = any::run(&specialized)?;
     // N7 part 2: applied parametric types become ground instances, AFTER the
     // rows inside their arguments are substituted (spec 2026-10-15 §2).
     let specialized = mono::instantiate_types(&specialized)?;
@@ -1939,7 +2258,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
 
     let main = find_main(core)?;
     // §5.5: `main` ALONE. The scope narrows from "every function" (which was
-    // trivially just `main` in N1) to "`main`", because `@elya_main`'s signature
+    // trivially just `main` in N1) to "`main`", because `@elya.main`'s signature
     // says i64 and the shim's format string is `%lld`. Applying this per
     // function would refuse every ordinary predicate — see `is_pos` in the
     // corpus — and is the most likely way to implement this section wrong.
@@ -1964,6 +2283,8 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let str_concat = module.add_function("elya_str_concat", str_concat_ty, None); // ccc
     let str_eq_ty = i64t.fn_type(&[ptrt.into(), ptrt.into()], false);
     let str_eq = module.add_function("elya_str_eq", str_eq_ty, None); // ccc
+    let data_eq_ty = i64t.fn_type(&[ptrt.into(), ptrt.into(), i64t.into()], false);
+    let data_eq = module.add_function("elya_eq", data_eq_ty, None); // ccc
     let int_to_string_ty = ptrt.fn_type(&[i64t.into(), i64t.into()], false);
     let int_to_string = module.add_function("elya_int_to_string", int_to_string_ty, None); // ccc
     let time_now_ms_ty = i64t.fn_type(&[], false);
@@ -1977,7 +2298,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
 
     // 5b-5: the collector's four symbols. All `ccc` for the same reason the
     // first two are — this is the C-ABI boundary. Task 3 calls all four:
-    // `elya_gc_init` hands over the descriptor table before `@elya_main` runs,
+    // `elya_gc_init` hands over the descriptor table before `@elya.main` runs,
     // the shadow-stack pair brackets every allocation, and the stats dump
     // closes the shim.
     let gc_init_ty = ctx.void_type().fn_type(&[ptrt.into(), i64t.into()], false);
@@ -2004,6 +2325,77 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let current_handler = module
         .add_global(ptrt, Some(AddressSpace::default()), "elya_current_handler")
         .as_pointer_value();
+    // `with any` (spec 2026-10-17 D3): the reflection table for the types
+    // `any.show` and `any.decode` are used at, and its runtime entry points.
+    let reflect = reflect::Reflect::of(core, &ctors)?;
+    let any_table = {
+        let words: Vec<_> = reflect
+            .words
+            .iter()
+            .map(|w| i64t.const_int(*w as u64, true))
+            .collect();
+        let arr = i64t.const_array(&words);
+        let g = module.add_global(
+            arr.get_type(),
+            Some(AddressSpace::default()),
+            "elya.any.types",
+        );
+        g.set_initializer(&arr);
+        g.set_constant(true);
+        g.set_linkage(Linkage::Private);
+        g.as_pointer_value()
+    };
+    let any_names = {
+        let bytes: Vec<_> = reflect
+            .names
+            .iter()
+            .copied()
+            .chain(std::iter::once(0))
+            .map(|c| i8t.const_int(c as u64, false))
+            .collect();
+        let arr = i8t.const_array(&bytes);
+        let g = module.add_global(
+            arr.get_type(),
+            Some(AddressSpace::default()),
+            "elya.any.names",
+        );
+        g.set_initializer(&arr);
+        g.set_constant(true);
+        g.set_linkage(Linkage::Private);
+        g.as_pointer_value()
+    };
+    let any_show_ty = ptrt.fn_type(
+        &[
+            i64t.into(),
+            ptrt.into(),
+            ptrt.into(),
+            i64t.into(),
+            i64t.into(),
+            ptrt.into(),
+            ptrt.into(),
+        ],
+        false,
+    );
+    let any_show = module.add_function("elya_any_show", any_show_ty, None); // ccc
+    let any_decode_ty = i64t.fn_type(
+        &[
+            i64t.into(),
+            ptrt.into(),
+            ptrt.into(),
+            i64t.into(),
+            ptrt.into(),
+            ptrt.into(),
+            ptrt.into(),
+        ],
+        false,
+    );
+    let any_decode = module.add_function("elya_any_decode", any_decode_ty, None); // ccc
+    let any_fail_ty = ctx.void_type().fn_type(&[ptrt.into()], false);
+    let any_fail = module.add_function("elya_any_fail", any_fail_ty, None); // ccc
+    let any_check_ty = i64t.fn_type(&[ptrt.into(), i64t.into(), i64t.into()], false);
+    let any_check = module.add_function("elya_any_check", any_check_ty, None); // ccc
+    let shift_range_ty = ctx.void_type().fn_type(&[ptrt.into(), i64t.into()], false);
+    let shift_range = module.add_function("elya_shift_range", shift_range_ty, None); // ccc
     let op_ids = cps_emit::op_ids(core);
     let (resume_fns, handler_fns) =
         cps_emit::declare(ctx, &module, &nodes, &sites, &handlers, &op_ids)?;
@@ -2020,6 +2412,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         str_lit,
         str_concat,
         str_eq,
+        data_eq,
         int_to_string,
         time_now_ms,
         time_sleep_ms,
@@ -2046,6 +2439,14 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         rem_zero,
         unhandled,
         cont_copy,
+        reflect: &reflect,
+        any_table,
+        any_names,
+        any_show,
+        any_decode,
+        any_fail,
+        any_check,
+        shift_range,
     };
     let b = ctx.create_builder();
     for f in &core.fns {
@@ -2065,7 +2466,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
 
     // §3.5/§4: the print convention is ONE external symbol (printf) plus ONE
     // generated shim (@main). The shim stays `ccc` — it is the C entry point —
-    // and its call to @elya_main is an ordinary call.
+    // and its call to @elya.main is an ordinary call.
     let printf_ty = i32t.fn_type(&[ptrt.into(), i64t.into()], true);
     let printf = module.add_function("printf", printf_ty, None);
 
@@ -2098,10 +2499,27 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     desc_global.set_constant(true);
     desc_global.set_unnamed_addr(true);
 
+    let entry = module.add_function("elya_entry", i64t.fn_type(&[], false), None); // ccc
+    let entry_bb = ctx.append_basic_block(entry, "entry");
+    b.position_at_end(entry_bb);
+    let site = b.build_call(elya_main, &[], "v").map_err(internal)?;
+    // The wrapper itself is `ccc`, but @elya.main is `tailcc`, so THIS CALL
+    // SITE must say so too. A site whose convention disagrees with its callee's
+    // declaration is a miscompile, not a verifier error — LLVM will happily emit
+    // it. The call is not `musttail`: the conventions differ.
+    site.set_call_convention(TAILCC);
+    let main_value = site
+        .try_as_basic_value()
+        .left()
+        .ok_or_else(|| internal("elya_main did not return a value"))?;
+    b.build_return(Some(&main_value)).map_err(internal)?;
+    let start_ty = i64t.fn_type(&[ptrt.into()], false);
+    let start = module.add_function("elya_start", start_ty, None); // ccc
+
     let shim = module.add_function("main", i32t.fn_type(&[], false), None);
     let shim_entry = ctx.append_basic_block(shim, "entry");
     b.position_at_end(shim_entry);
-    // BEFORE @elya_main: the collector cannot interpret a single object until it
+    // BEFORE @elya.main: the collector cannot interpret a single object until it
     // has the table, so handing it over is the first thing the process does.
     b.build_call(
         gc_init,
@@ -2112,18 +2530,21 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         "",
     )
     .map_err(internal)?;
-    let site = b.build_call(elya_main, &[], "v").map_err(internal)?;
-    // The shim itself stays `ccc`, but @elya_main is now `tailcc`, so THIS CALL
-    // SITE must say so too. A site whose convention disagrees with its callee's
-    // declaration is a miscompile, not a verifier error — LLVM will happily emit
-    // it. "The shim survives untouched" (§2 Finding 4) means the shim is still
-    // `ccc` and its call is not `musttail`; it does NOT mean this line is
-    // unchanged.
-    site.set_call_convention(TAILCC);
-    let v = site
+    // The program runs on its own stack (spec 2026-10-16-elya-native-stack):
+    // `elya_start` (runtime.c) reserves it, runs `@elya_entry` on a thread that
+    // owns it, names an overflow of it, and hands back main's value here, on
+    // the process's main thread. `@elya_entry` exists because C cannot call a
+    // `tailcc` function: it is `ccc`, and its one call is to `main`'s function.
+    let v = b
+        .build_call(
+            start,
+            &[entry.as_global_value().as_pointer_value().into()],
+            "v",
+        )
+        .map_err(internal)?
         .try_as_basic_value()
         .left()
-        .ok_or_else(|| internal("elya_main did not return a value"))?;
+        .ok_or_else(|| internal("elya_start did not return a value"))?;
     b.build_call(printf, &[fmt.as_pointer_value().into(), v.into()], "p")
         .map_err(internal)?;
     // AFTER the answer, so a stats dump can never interleave with the value the
@@ -2189,6 +2610,9 @@ pub fn link(obj: &Path, exe: &Path) -> Result<(), CodegenError> {
     // codegen on every platform (PARKED.md).
     #[cfg(target_os = "linux")]
     cmd.arg("-no-pie");
+    // The program's own stack is a thread's (runtime.c `elya_start`).
+    #[cfg(unix)]
+    cmd.arg("-pthread");
     let out = cmd.output().map_err(CodegenError::Io)?;
     if !out.status.success() {
         return Err(CodegenError::Link {
@@ -2232,6 +2656,7 @@ mod tests {
             types: Vec::new(),
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
+            effects: Default::default(),
         }
     }
 
@@ -2404,12 +2829,32 @@ mod tests {
         // are lowered, so the message names the operator (§3.3) rather than the
         // operand. Wrapped in an `if` because a Bool-bodied main is refused
         // earlier, by `require_int`, with a different message. (Until
-        // 2026-10-15 the operand here was a `String`; strings compare natively
-        // since, so an ADT keeps the allow-list guarded.)
-        let err = emit_ir(&core_of(
-            "type T { A, B }\npub fn main() -> Int { if A == B { 1 } else { 0 } }\n",
-        ))
-        .unwrap_err();
+        // 2026-10-15 the operand here was a `String`, until 2026-10-16 an ADT;
+        // both compare natively since, and no source program reaches the back
+        // end with any other operand type -- functions are E0436, `Float` is
+        // refused by Core -- so the guard is exercised on a hand-edited Core:
+        // `1 == 2` with its operands retyped as a tuple.)
+        let mut core = core_of("pub fn main() -> Int { if 1 == 2 { 1 } else { 0 } }\n");
+        fn retype(e: &mut CoreExpr) {
+            match &mut e.kind {
+                CoreKind::Prim(op, args) if *op == BinOp::Eq => {
+                    let mut xs: Vec<CoreExpr> = args.to_vec();
+                    for x in xs.iter_mut() {
+                        x.ty = Ty::Tuple(Vec::new());
+                    }
+                    *args = Rc::from(xs);
+                }
+                CoreKind::If(c, _, _) => retype(Rc::make_mut(c)),
+                _ => panic!("unexpected shape: {:?}", e.kind),
+            }
+        }
+        let main = core
+            .fns
+            .iter_mut()
+            .find(|f| f.name == "main")
+            .expect("main");
+        retype(&mut main.body);
+        let err = emit_ir(&core).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2630,6 +3075,7 @@ mod tests {
                 ret: None,
                 is_multi_declared: multi,
                 multi,
+                any: false,
             })),
         }
     }

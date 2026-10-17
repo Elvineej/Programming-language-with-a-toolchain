@@ -24,6 +24,17 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// Runs a produced binary on the 8 MiB stack every test here was written
+/// against (the Linux main thread's default before the program got its own
+/// stack; spec 2026-10-16-elya-native-stack D3). A tail call that stops being
+/// eliminated therefore still overflows at a million steps -- now by name. Only
+/// the `DEEP` tests run on the default stack, through `Command::new`.
+fn native(exe: &Path) -> Command {
+    let mut c = Command::new(exe);
+    c.env("ELYA_STACK_MIB", "8");
+    c
+}
+
 #[test]
 fn toolchain_smoke() {
     // Task 1 (spec §9): the entire novel risk isolated before any Elya code —
@@ -110,7 +121,7 @@ fn toolchain_smoke() {
         String::from_utf8_lossy(&linked.stderr)
     );
 
-    let out = Command::new(&exe).output().expect("run produced binary");
+    let out = native(&exe).output().expect("run produced binary");
     assert!(out.status.success(), "binary exited {:?}", out.status);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3");
     assert!(
@@ -201,6 +212,12 @@ fn compile_and_link(core: &elya::core::CoreModule, dir: &Path, tag: &str) -> Pat
     exe
 }
 
+/// Since the program got its own stack (spec 2026-10-16-elya-native-stack), an
+/// overflow of it is exit status 1 and the line `elya: native stack overflow:
+/// ...` on stderr, which every assertion here prints; these two status checks
+/// still name an overflow that happens anywhere else (the runtime's own frames
+/// on the main thread).
+///
 /// Windows STATUS_STACK_OVERFLOW. Observing it from a corpus binary means one
 /// thing: a call that must have been eliminated was not. Inert on other
 /// platforms, where no exit code collides with it.
@@ -242,7 +259,7 @@ fn diagnose_crash(status: &std::process::ExitStatus, tag: &str) {
 
 /// The three required assertions per case (§5): exit status, stdout, empty stderr.
 fn assert_runs(exe: &Path, expected: &str) {
-    let out = Command::new(exe).output().expect("run produced binary");
+    let out = native(exe).output().expect("run produced binary");
     diagnose_stack_overflow(&out.status, &exe.display().to_string());
     assert!(out.status.success(), "binary exited {:?}", out.status);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), expected);
@@ -272,7 +289,7 @@ fn split_text_and_value(stdout: &str, tag: &str) -> (String, String) {
 }
 
 fn native_text_value(exe: &Path, tag: &str) -> (String, String) {
-    let out = Command::new(exe).output().expect("run produced binary");
+    let out = native(exe).output().expect("run produced binary");
     diagnose_stack_overflow(&out.status, tag);
     assert!(
         out.status.success(),
@@ -527,7 +544,7 @@ fn native_output_matches_the_evaluator_across_the_function_corpus() {
     for (tag, src, _) in FUNCTION_CORPUS {
         let core = lower_src(src);
         let exe = compile_and_link(&core, &dir, tag);
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
         assert!(
             out.status.success(),
@@ -621,7 +638,7 @@ fn native_output_matches_the_evaluator_across_the_control_flow_corpus() {
     for (tag, src, _) in CONTROL_FLOW_CORPUS {
         let core = lower_src(src);
         let exe = compile_and_link(&core, &dir, tag);
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
         assert!(
             out.status.success(),
@@ -646,7 +663,7 @@ fn the_differential_check_also_covers_the_arithmetic_corpus() {
     for (tag, src) in CORPUS {
         let core = lower_src(src);
         let exe = compile_and_link(&core, &dir, tag);
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
         assert!(
             out.status.success(),
@@ -733,7 +750,7 @@ fn native_output_matches_the_evaluator_across_the_tail_corpus() {
     for (tag, src, _) in TAIL_CORPUS {
         let core = lower_src(src);
         let exe = compile_and_link(&core, &dir, tag);
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
         assert!(
             out.status.success(),
@@ -790,7 +807,7 @@ fn native_output_matches_the_evaluator_across_the_adt_corpus() {
     for (tag, src, _) in ADT_CORPUS {
         let core = lower_src(src);
         let exe = compile_and_link(&core, &dir, tag);
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
         assert!(
             out.status.success(),
@@ -836,6 +853,7 @@ fn a_failed_match_traps_with_a_named_error() {
     let core = CoreModule {
         generic_types: vec![],
         effect_params_used: Default::default(),
+        effects: Default::default(),
         types: vec![CoreType {
             name: "T".into(),
             ctors: vec![
@@ -877,7 +895,7 @@ fn a_failed_match_traps_with_a_named_error() {
 
     let dir = temp_dir("trap");
     let exe = compile_and_link(&core, &dir, "trap");
-    let out = Command::new(&exe).output().expect("run produced binary");
+    let out = native(&exe).output().expect("run produced binary");
     assert!(
         !out.status.success(),
         "a failed match must exit non-zero, got {:?}",
@@ -909,7 +927,7 @@ struct GcStats {
 /// defined on — a check that trimmed and then re-added one would be asserting
 /// its own reconstruction rather than byte preservation.
 fn run_with_gc_stats_raw(exe: &Path, tag: &str) -> (String, GcStats) {
-    let out = Command::new(exe)
+    let out = native(exe)
         .env("ELY_GC_STATS", "1")
         .output()
         .expect("run produced binary");
@@ -1550,7 +1568,7 @@ fn the_7b3_handle_corpus_compiles_runs_and_prints_the_expected_answer() {
                 continue;
             }
         };
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
         let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !out.status.success() || got != *expected {
@@ -1578,7 +1596,7 @@ fn native_output_matches_the_evaluator_across_the_7b3_handle_corpus() {
                 continue;
             }
         };
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
         let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let want = eval_main_int(&src);
@@ -1782,7 +1800,7 @@ fn heap_values_live_across_cps_operands_survive_collections() {
                 continue;
             }
         };
-        let out = Command::new(&exe)
+        let out = native(&exe)
             .env("ELY_GC_STATS", "1")
             .output()
             .expect("run produced binary");
@@ -2163,7 +2181,7 @@ fn run_value_corpus(corpus: &[(&str, &str, &str)], dir_name: &str) {
                 continue;
             }
         };
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
         let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !out.status.success() || got != *expected {
@@ -2190,7 +2208,7 @@ fn run_differential_corpus(corpus: &[(&str, &str, &str)], dir_name: &str) {
                 continue;
             }
         };
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
         let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let want = eval_main_int(src);
@@ -2217,7 +2235,7 @@ fn run_deep(tag: &str, src: &str, want: &str) {
     let dir = temp_dir(tag);
     let core = lower_src(src);
     let exe = compile_and_link(&core, &dir, tag);
-    let out = Command::new(&exe).output().expect("run produced binary");
+    let out = native(&exe).output().expect("run produced binary");
     diagnose_crash(&out.status, tag);
     assert!(
         out.status.success(),
@@ -2475,7 +2493,7 @@ fn the_task8_handler_corpus_compiles_runs_and_prints_the_expected_answer() {
                 continue;
             }
         };
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
         let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !out.status.success() || got != *expected {
@@ -2503,7 +2521,7 @@ fn native_output_matches_the_evaluator_across_the_task8_handler_corpus() {
                 continue;
             }
         };
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
         let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let want = eval_main_int(src);
@@ -2629,7 +2647,7 @@ fn a_second_resume_traps_natively_and_errors_in_the_evaluator() {
     let dir = temp_dir("double-resume-8");
     let core = lower_src(src);
     let exe = compile_and_link(&core, &dir, "double");
-    let out = Command::new(&exe).output().expect("run produced binary");
+    let out = native(&exe).output().expect("run produced binary");
     assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -2695,7 +2713,7 @@ fn a_deep_non_tail_effectful_recursion_finds_its_handler_in_constant_time() {
     let dir = temp_dir("handler-lookup-8");
     let core = lower_src(src);
     let exe = compile_and_link(&core, &dir, "deeploop");
-    let mut child = Command::new(&exe)
+    let mut child = native(&exe)
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn");
@@ -2817,7 +2835,7 @@ fn the_handler_corpus_compiles_and_runs() {
                 continue;
             }
         };
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
         let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !out.status.success() || got != *expected {
@@ -2845,7 +2863,7 @@ fn native_output_matches_the_evaluator_across_the_handler_corpus() {
                 continue;
             }
         };
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
         let native = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let want = eval_main_int(src);
@@ -3099,7 +3117,7 @@ fn a_state_passing_tail_loop_is_bounded_natively_at_a_million() {
     let dir = temp_dir("state-tail-million");
     let core = lower_src(src);
     let exe = compile_and_link(&core, &dir, "state-tail-million");
-    let out = Command::new(&exe).output().expect("run produced binary");
+    let out = native(&exe).output().expect("run produced binary");
     diagnose_crash(&out.status, "state-tail-million");
     assert!(out.status.success(), "binary exited {:?}", out.status);
     let (text, _unit_word) =
@@ -3421,7 +3439,7 @@ fn a_leaking_handle_in_a_tail_loop_is_bounded_natively_at_a_million() {
     let dir = temp_dir("leaking-handle-million");
     let core = lower_src(src);
     let exe = compile_and_link(&core, &dir, "leaking-handle-million");
-    let out = Command::new(&exe).output().expect("run produced binary");
+    let out = native(&exe).output().expect("run produced binary");
     diagnose_crash(&out.status, "leaking-handle-million");
     assert!(out.status.success(), "binary exited {:?}", out.status);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3000002");
@@ -3548,7 +3566,7 @@ fn a_direct_closure_returned_where_an_effectful_one_is_expected_runs() {
 fn assert_native_matches(src: &str, want: &str, tag: &str) {
     let dir = temp_dir(tag);
     let exe = try_compile_and_link(&lower_src(src), &dir, tag).unwrap_or_else(|e| panic!("{e}"));
-    let out = Command::new(&exe).output().expect("run produced binary");
+    let out = native(&exe).output().expect("run produced binary");
     diagnose_stack_overflow(&out.status, tag);
     let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
     std::fs::remove_dir_all(&dir).ok();
@@ -4221,7 +4239,7 @@ fn a_plain_handler_over_a_multi_effect_is_one_shot_natively() {
         "the evaluator must refuse the second resume with E0425"
     );
     let exe = compile_and_link(&lower_src(twice), &dir, "twice");
-    let out = Command::new(&exe).output().expect("run produced binary");
+    let out = native(&exe).output().expect("run produced binary");
     assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -4252,7 +4270,7 @@ fn a_one_shot_continuation_saved_in_a_multi_shot_segment_fails_on_both_sides() {
     );
     let dir = temp_dir("multi-shared-one-shot");
     let exe = compile_and_link(&lower_src(src), &dir, "shared");
-    let out = Command::new(&exe).output().expect("run produced binary");
+    let out = native(&exe).output().expect("run produced binary");
     assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -4392,7 +4410,7 @@ fn integer_division_runs_natively() {
     let dir = temp_dir("int-division");
     for (tag, src, expected) in INT_DIVISION {
         let exe = compile_and_link(&lower_src(src), &dir, tag);
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_crash(&out.status, tag);
         assert!(out.status.success(), "{tag}: exited {:?}", out.status);
         let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -4438,7 +4456,7 @@ fn integer_traps_are_named_on_both_sides() {
             Ok((_, v)) => panic!("{tag}: the evaluator returned {v:?}"),
         }
         let exe = compile_and_link(&lower_src(&src), &dir, tag);
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(
             out.status.code(),
@@ -4595,7 +4613,7 @@ fn nested_and_literal_patterns_run_natively() {
     let dir = temp_dir("patterns");
     for (tag, src, expected) in PATTERNS {
         let exe = compile_and_link(&lower_src(src), &dir, tag);
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_crash(&out.status, tag);
         assert!(
             out.status.success(),
@@ -5082,7 +5100,7 @@ fn a_multi_shot_copy_of_100000_handler_frames() {
                pub fn main() -> Int { handle nest(100000) with multi { Flip.flip() -> resume(True) * 1000000 + resume(False) } }\n";
     let dir = temp_dir("deep-multi");
     let exe = compile_and_link(&lower_src(src), &dir, "deep-multi");
-    let out = Command::new(&exe).output().expect("runs");
+    let out = native(&exe).output().expect("runs");
     std::fs::remove_dir_all(&dir).ok();
     diagnose_crash(&out.status, "deep-multi");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "100001100002");
@@ -5225,7 +5243,7 @@ fn native_strings_match_the_evaluator() {
                 continue;
             }
         };
-        let out = Command::new(&exe).output().expect("run produced binary");
+        let out = native(&exe).output().expect("run produced binary");
         diagnose_stack_overflow(&out.status, tag);
         if !out.status.success() {
             failures.push(format!(
@@ -5432,7 +5450,7 @@ fn the_clock_advances_natively() {
         assert_eq!(eval_main_int(src), "1", "{tag}: the evaluator");
         match try_compile_and_link(&lower_src(src), &dir, tag) {
             Ok(exe) => {
-                let out = Command::new(&exe).output().expect("run produced binary");
+                let out = native(&exe).output().expect("run produced binary");
                 let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !out.status.success() || got != "1" {
                     failures.push(format!("{tag}: {:?} {got:?}", out.status));
@@ -5700,4 +5718,316 @@ fn long_parameter_lists_run_natively() {
 #[test]
 fn long_parameter_lists_match_the_evaluator() {
     run_differential_corpus(ARITY, "arity-diff");
+}
+
+// ---------------------------------------------------------------------------
+// Deep non-tail recursion natively (spec 2026-10-16-elya-native-stack). The
+// program runs on its own 1 GiB stack (`elya_start`), not the main thread's;
+// reaching its guard is a named failure. These tests use `Command::new`, so the
+// DEFAULT stack, and clear `ELYA_STACK_MIB` in case the harness has it set.
+//
+// Negative controls (each reverted, `git diff --quiet` confirmed):
+// - K1: the SIGSEGV handler treats every fault as foreign -> the named
+//   overflow test fails with signal 11 and no diagnostic.
+// - K2: `elya_start` calls its entry on the calling thread (no own stack) -> the DEEP rows fail with
+//   SIGSEGV (rc 139), as measured before the slice.
+// - K3: the runtime ignores `ELYA_STACK_MIB` -> the knob test fails (m2 runs
+//   under "8", and "0" / "lots" run instead of being refused).
+// ---------------------------------------------------------------------------
+
+const LEN_SRC: &str = "type List { Nil, Cons(Int, List) }\n\
+     fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }\n\
+     fn len(l) { match l { Nil -> 0  Cons(_, t) -> 1 + len(t) } }\n";
+
+fn deep_src(kind: &str, n: u64) -> String {
+    match kind {
+        "len" => format!("{LEN_SRC}pub fn main() -> Int {{ len(build({n}, Nil)) }}\n"),
+        "foldr" => format!(
+            "type List {{ Nil, Cons(Int, List) }}\n\
+             fn build(n, acc) {{ if n == 0 {{ acc }} else {{ build(n - 1, Cons(n, acc)) }} }}\n\
+             fn foldr(f, z, l) {{ match l {{ Nil -> z  Cons(h, t) -> f(h, foldr(f, z, t)) }} }}\n\
+             pub fn main() -> Int {{ foldr(fn(a, b) {{ a + b }}, 0, build({n}, Nil)) }}\n"
+        ),
+        "resume" => format!(
+            "effect Tick {{ fn tick() -> Unit }}\n\
+             fn go(n) / {{Tick}} {{ if n == 0 {{ 0 }} else {{ let _ = tick()  go(n - 1) }} }}\n\
+             pub fn main() -> Int {{ handle {{ go({n}) }} with {{ Tick.tick() -> {{ let r = resume(Unit)  r + 1 }} }} }}\n"
+        ),
+        other => panic!("no deep program {other}"),
+    }
+}
+
+fn run_default_stack(exe: &Path) -> std::process::Output {
+    Command::new(exe)
+        .env_remove("ELYA_STACK_MIB")
+        .output()
+        .expect("run produced binary")
+}
+
+fn run_with_stack(exe: &Path, mib: &str) -> std::process::Output {
+    Command::new(exe)
+        .env("ELYA_STACK_MIB", mib)
+        .output()
+        .expect("run produced binary")
+}
+
+#[test]
+fn deep_non_tail_recursion_runs_natively_a_million_deep() {
+    let dir = temp_dir("deep-million");
+    let mut failures = Vec::new();
+    for (kind, want) in [
+        ("len", "1000000"),
+        ("foldr", "500000500000"),
+        ("resume", "1000000"),
+    ] {
+        let core = lower_src(&deep_src(kind, 1_000_000));
+        let exe = compile_and_link(&core, &dir, kind);
+        let out = run_default_stack(&exe);
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        if !out.status.success() || got != want || !err.is_empty() {
+            failures.push(format!(
+                "{kind}: {:?} stdout={got:?} stderr={err:?}",
+                out.status
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn deep_non_tail_recursion_matches_the_evaluator() {
+    let dir = temp_dir("deep-diff");
+    let mut failures = Vec::new();
+    for kind in ["len", "foldr"] {
+        let src = deep_src(kind, 200_000);
+        let exe = compile_and_link(&lower_src(&src), &dir, kind);
+        let out = run_default_stack(&exe);
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let want = eval_main_int(&src);
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        if !out.status.success() || got != want || !err.is_empty() {
+            failures.push(format!(
+                "{kind}: {:?} native={got:?} evaluator={want} stderr={err:?}",
+                out.status
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        failures.is_empty(),
+        "native diverges from the evaluator: {failures:#?}"
+    );
+}
+
+const OVERFLOW_LINE: &str = "elya: native stack overflow: recursion deeper than the 8 MiB stack";
+
+#[test]
+fn a_native_stack_overflow_is_named() {
+    let dir = temp_dir("deep-overflow");
+    let src = "fn down(n) { 1 + down(n + 1) }\n\
+               pub fn main() -> Int { io.println(\"before\")  down(0) }\n";
+    let exe = compile_and_link(&lower_src(src), &dir, "down");
+    let out = run_with_stack(&exe, "8");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            out.status.signal(),
+            None,
+            "killed by a signal: {:?}",
+            out.status
+        );
+    }
+    assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "before\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim_end(),
+        OVERFLOW_LINE
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn elya_stack_mib_sets_the_stack_and_is_checked() {
+    let dir = temp_dir("deep-knob");
+    let exe = compile_and_link(&lower_src(&deep_src("len", 200_000)), &dir, "len");
+    // Under 8 MiB, 200 000 frames overflow (measured limit about 130 000), by name.
+    let small = run_with_stack(&exe, "8");
+    assert_eq!(small.status.code(), Some(1), "{:?}", small.status);
+    assert_eq!(
+        String::from_utf8_lossy(&small.stderr).trim_end(),
+        OVERFLOW_LINE
+    );
+    // Under the default they run.
+    let big = run_default_stack(&exe);
+    assert!(big.status.success(), "{:?}", big.status);
+    assert_eq!(String::from_utf8_lossy(&big.stdout).trim(), "200000");
+    // Anything but a whole number of MiB in range is refused before the program runs.
+    for bad in ["0", "lots", "8x", "-8", "1048577", ""] {
+        let out = run_with_stack(&exe, bad);
+        assert_eq!(out.status.code(), Some(1), "{bad:?}: {:?}", out.status);
+        assert!(out.stdout.is_empty(), "{bad:?}: the program ran");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr).trim_end(),
+            "elya: ELYA_STACK_MIB must be a whole number of MiB from 1 to 1048576",
+            "{bad:?}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The 2026-10-16 review (M1): every Elya function was mangled `elya_<name>`,
+/// the runtime's own namespace, so a function named like a runtime symbol
+/// (`alloc`, `println`, and the new `start`) failed to link. Elya functions
+/// are now `elya.<name>`, which no C symbol can be.
+#[test]
+fn elya_functions_may_be_named_like_runtime_symbols() {
+    let src = "fn alloc(x) { x + 1 }\n\
+               fn println(x) { x * 2 }\n\
+               fn start(x) { x - 3 }\n\
+               fn entry(x) { x + 10 }\n\
+               fn gc_push(x) { x }\n\
+               fn current_handler(x) { x }\n\
+               pub fn main() -> Int { entry(start(println(alloc(gc_push(current_handler(20)))))) }\n";
+    let dir = temp_dir("runtime-names");
+    let core = lower_src(src);
+    let exe = try_compile_and_link(&core, &dir, "names").expect("compiles and links");
+    assert_runs(&exe, "49");
+    assert_eq!(eval_main_int(src), "49");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The review (L1, L2): a fault outside the guard is not an overflow and still
+/// kills by its signal, with nothing on stderr -- including a SIGSEGV sent by
+/// `raise`/`kill`, which no faulting instruction re-raises. Driven by a C
+/// harness linked with the runtime, since no Elya program faults that way.
+#[cfg(unix)]
+#[test]
+fn foreign_faults_still_kill_by_their_signal() {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = temp_dir("foreign-faults");
+    let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime.c");
+    for (tag, body, sig) in [
+        ("null", "volatile int64_t *p = 0; return *p;", 11),
+        ("raised-segv", "raise(SIGSEGV); return 0;", 11),
+        ("raised-bus", "raise(SIGBUS); return 0;", 7),
+    ] {
+        let c = dir.join(format!("{tag}.c"));
+        std::fs::write(
+            &c,
+            format!(
+                "#include <stdint.h>\n#include <signal.h>\n\
+                 int64_t elya_start(int64_t (*)(void));\n\
+                 static int64_t entry(void) {{ {body} }}\n\
+                 int main(void) {{ return (int)elya_start(entry); }}\n"
+            ),
+        )
+        .expect("write harness");
+        let exe = dir.join(tag);
+        let linked = Command::new("clang")
+            .arg(&c)
+            .arg(&runtime)
+            .arg("-pthread")
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .expect("spawn clang");
+        assert!(
+            linked.status.success(),
+            "{tag}: {}",
+            String::from_utf8_lossy(&linked.stderr)
+        );
+        let out = Command::new(&exe).output().expect("run harness");
+        assert_eq!(out.status.signal(), Some(sig), "{tag}: {:?}", out.status);
+        assert!(
+            out.stderr.is_empty(),
+            "{tag}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Structural equality natively (spec 2026-10-16-elya-structural-equality, D3):
+// `elya_eq` walks two values with a worklist guided by the descriptor table.
+//
+// Negative controls (each reverted, `git diff --quiet` confirmed):
+// - K2: `elya_eq` compares every field as a word (ignores `ptr_mask`) -> the
+//   rows comparing separately built heap fields differ (q2, q3, q5, q6, q7);
+//   q1, whose fields are words, still passes, as it should.
+// - K3: `elya_eq` skips the string case -> q3 and q5 differ.
+// ---------------------------------------------------------------------------
+
+const EQ_DECLS: &str = "type L { N, C(Int, L) }\n\
+type P { P(Int, Int) }\n\
+type Box(a) { Box(a) }\n\
+type S { S(String, L), T(Bool) }\n\
+fn same(a, b) { a == b }\n\
+fn build(n, acc) { if n == 0 { acc } else { build(n - 1, C(n, acc)) } }\n\
+fn b(x) { if x { 1 } else { 0 } }\n";
+
+const EQUALITY: &[(&str, &str, &str)] = &[
+    (
+        "q1-constructors",
+        "pub fn main() -> Int { b(P(1, 2) == P(1, 2)) * 10 + b(P(1, 2) == P(2, 1)) }\n",
+        "10",
+    ),
+    (
+        "q2-lists-ne",
+        "pub fn main() -> Int { b(C(1, N) != C(1, C(2, N))) * 10 + b(C(1, N) != C(1, N)) }\n",
+        "10",
+    ),
+    (
+        "q3-strings-in-fields",
+        "pub fn main() -> Int { let s = \"ab\" <> \"c\"  b(S(s, C(1, N)) == S(\"abc\", C(1, N))) * 100 + b(S(\"abd\", N) == S(\"abc\", N)) * 10 + b(T(True) == S(\"x\", N)) }\n",
+        "100",
+    ),
+    (
+        "q4-unit-and-nullary",
+        "pub fn main() -> Int { b(Unit == Unit) * 100 + b(N == N) * 10 + b(N == C(1, N)) }\n",
+        "110",
+    ),
+    (
+        "q5-generic-and-parametric",
+        "pub fn main() -> Int { b(same(Box(C(3, N)), Box(C(3, N)))) * 100 + b(same(4, 4)) * 10 + b(same(Box(\"x\"), Box(\"y\"))) }\n",
+        "110",
+    ),
+    (
+        "q6-in-a-handler-clause",
+        "effect Ask { fn ask(x: L) -> Bool }\n\
+         fn go(n) / {Ask} { if ask(build(n, N)) { 1 } else { 0 } }\n\
+         pub fn main() -> Int { handle { go(3) + go(2) * 10 } with { Ask.ask(l) -> resume(l == C(1, C(2, C(3, N))))  return(v) -> v } }\n",
+        "1",
+    ),
+    (
+        "q7-long-lists",
+        "pub fn main() -> Int { let x = build(200000, N)  let y = build(200000, N)  let z = build(200000, C(7, N))  b(x == y) * 10 + b(x == z) }\n",
+        "10",
+    ),
+];
+
+fn with_eq_decls() -> Vec<(&'static str, String, &'static str)> {
+    EQUALITY
+        .iter()
+        .map(|(t, s, w)| (*t, format!("{EQ_DECLS}{s}"), *w))
+        .collect()
+}
+
+#[test]
+fn structural_equality_runs_natively() {
+    let rows = with_eq_decls();
+    let corpus: Vec<(&str, &str, &str)> =
+        rows.iter().map(|(t, s, w)| (*t, s.as_str(), *w)).collect();
+    run_value_corpus(&corpus, "equality");
+}
+
+#[test]
+fn structural_equality_matches_the_evaluator() {
+    let rows = with_eq_decls();
+    let corpus: Vec<(&str, &str, &str)> =
+        rows.iter().map(|(t, s, w)| (*t, s.as_str(), *w)).collect();
+    run_differential_corpus(&corpus, "equality-diff");
 }

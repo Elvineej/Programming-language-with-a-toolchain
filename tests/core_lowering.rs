@@ -884,10 +884,13 @@ fn parametric_declarations_are_recorded_in_generic_types() {
 }
 
 #[test]
-fn an_operation_generic_handler_is_refused_at_lowering() {
-    // `with any` (2026-10-16) runs in the evaluator only: natively, `op.show` and
-    // `op.decode` need each operation's name and declared types at run time.
-    // Refused by name (spec D6), not lowered as if it named an operation `op`.
+fn an_operation_generic_handler_lowers_marked_any() {
+    // `with any` (2026-10-16) was refused here by name (its spec D6). Since
+    // 2026-10-17 (spec `2026-10-17-elya-native-any-handlers-design.md` D6, a
+    // changed expectation) it lowers: one clause with no effect or operation
+    // name, its parameter typed `$Op(t, fn() / H -> t)`, the handle marked
+    // `any`, and the effect declarations carried in `CoreModule::effects`. The
+    // back end expands it once `H` is ground.
     let src = "effect W { fn roll(s: Int) -> Int }\n\
                fn replay(body) { handle { body() } with any { op(o) -> resume(op.decode(o, \"4\")) } }\n\
                pub fn main() -> Int { replay(fn() { roll(6) }) }\n";
@@ -895,10 +898,26 @@ fn an_operation_generic_handler_is_refused_at_lowering() {
     assert!(pd.is_empty(), "{pd:?}");
     let (diags, table) = infer_typed_table(&Session::new(), &m);
     assert!(diags.is_empty(), "{diags:?}");
+    let core = lower_module(&m, &table).expect("a `with any` handler lowers");
+    let replay = core.fns.iter().find(|f| f.name == "replay").unwrap();
+    let elya::core::CoreKind::Handle(h) = &replay.body.kind else {
+        panic!("{:?}", replay.body.kind)
+    };
+    assert!(h.any);
+    assert_eq!(h.clauses.len(), 1);
     assert_eq!(
-        lower_module(&m, &table).unwrap_err(),
-        elya::core::LowerError::Unsupported("operation-generic handler (`with any`)"),
+        (h.clauses[0].effect.as_str(), h.clauses[0].op.as_str()),
+        ("", "")
     );
+    assert!(
+        matches!(&h.clauses[0].params[0].ty, Ty::Con(n, a) if n == "$Op" && a.len() == 2),
+        "{:?}",
+        h.clauses[0].params[0].ty
+    );
+    let w = core.effects.iter().find(|e| e.name == "W").unwrap();
+    assert_eq!(w.ops.len(), 1);
+    assert_eq!(w.ops[0].params, vec![Ty::Base(TyCon::Int)]);
+    assert_eq!(w.ops[0].ret_display, "Int");
 }
 
 #[test]

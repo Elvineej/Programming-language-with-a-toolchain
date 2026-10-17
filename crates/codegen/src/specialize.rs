@@ -227,6 +227,7 @@ pub(crate) fn subst_expr(e: &CoreExpr, s: &RowSubst) -> CoreExpr {
             }),
             is_multi_declared: h.is_multi_declared,
             multi: h.multi,
+            any: h.any,
         })),
         CoreKind::Resume(v) => CoreKind::Resume(go(v)),
         CoreKind::Perform(p) => CoreKind::Perform(Rc::new(CorePerform {
@@ -411,6 +412,7 @@ impl<'a> Specializer<'a> {
                     ret,
                     is_multi_declared: h.is_multi_declared,
                     multi: h.multi,
+                    any: h.any,
                 }))
             }
             CoreKind::Resume(v) => CoreKind::Resume(Rc::new(self.rewrite(v, locals)?)),
@@ -546,6 +548,7 @@ pub(crate) fn specialize_rows(core: &CoreModule) -> R<CoreModule> {
         types: core.types.clone(),
         generic_types: core.generic_types.clone(),
         effect_params_used: core.effect_params_used.clone(),
+        effects: core.effects.clone(),
     })
 }
 
@@ -856,6 +859,7 @@ impl Adapter<'_> {
                     ret,
                     is_multi_declared: h.is_multi_declared,
                     multi: h.multi,
+                    any: h.any,
                 }))
             }
             CoreKind::Resume(v) => CoreKind::Resume(Rc::new(self.walk(v, locals)?)),
@@ -913,6 +917,7 @@ pub(crate) fn adapt_upcasts(core: &CoreModule) -> R<CoreModule> {
         types: core.types.clone(),
         generic_types: core.generic_types.clone(),
         effect_params_used: core.effect_params_used.clone(),
+        effects: core.effects.clone(),
     })
 }
 

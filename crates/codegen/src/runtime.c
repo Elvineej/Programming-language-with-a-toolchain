@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
@@ -9,12 +10,18 @@
 #include <windows.h>
 #else
 #include <errno.h>
+#include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <sys/mman.h>
 #include <time.h>
 #endif
 
 /* The Elya native runtime: a stop-the-world, non-moving mark-sweep collector.
  * Single-threaded throughout — Elya has no native concurrency yet, so none of
- * this state needs synchronisation.
+ * this state needs synchronisation. (The program runs on a thread of its own,
+ * `elya_start`, but only one thread ever runs Elya code, and the main thread
+ * reads the collector's state only after joining it.)
  *
  * Object layout (5b-5 plan, pinned). `elya_alloc(words)` reserves `words + 2`
  * and returns a pointer to word 2, so the collector's prefix sits IN FRONT of
@@ -302,12 +309,687 @@ int64_t elya_str_eq(void *a, void *b) {
     return memcmp(&((int64_t *)a)[2], &((int64_t *)b)[2], (size_t)la) == 0;
 }
 
+/* `==` on data (spec 2026-10-16-elya-structural-equality, D3): 1 when `a` and
+ * `b` are structurally equal. The descriptor table says which fields are heap
+ * values (compared as values) and which are words (compared as words); a
+ * string compares its length and bytes. An explicit worklist of pairs, never
+ * recursion, so two long lists compare in flat host stack. Allocates nothing
+ * from the collector, so nothing needs rooting across it. The type checker
+ * (E0436) keeps functions and continuations out. */
+int64_t elya_eq(void *a, void *b, int64_t string_tag) {
+    int64_t **work = NULL;
+    int64_t top = 0, cap = 0;
+    int64_t equal = 1;
+#define EQ_PUSH(x, y)                                                                  \
+    do {                                                                               \
+        if (top + 2 > cap) {                                                           \
+            cap = cap ? cap * 2 : 64;                                                  \
+            int64_t **grown = (int64_t **)realloc(work, (size_t)cap * sizeof *work);   \
+            if (!grown) {                                                              \
+                fputs("elya: out of memory comparing values\n", stderr);               \
+                exit(1);                                                               \
+            }                                                                          \
+            work = grown;                                                              \
+        }                                                                              \
+        work[top++] = (int64_t *)(x);                                                  \
+        work[top++] = (int64_t *)(y);                                                  \
+    } while (0)
+    EQ_PUSH(a, b);
+    while (top > 0) {
+        int64_t *y = work[--top];
+        int64_t *x = work[--top];
+        /* No shortcut for one shared object: whether two values are shared
+         * must never decide `==` (a NaN field, once floats compile natively,
+         * is not equal to itself), and the evaluator takes none. */
+        if (!x || !y || x[0] != y[0]) {
+            equal = 0;
+            break;
+        }
+        int64_t tag = x[0];
+        if (tag == string_tag) {
+            if (x[1] != y[1] || memcmp(&x[2], &y[2], (size_t)x[1]) != 0) {
+                equal = 0;
+                break;
+            }
+            continue;
+        }
+        if (tag < 0 || tag >= gc_n_ctors) {
+            fputs("elya: ==: a value without a descriptor\n", stderr);
+            exit(1);
+        }
+        int64_t arity = gc_descriptors[2 * tag];
+        int64_t mask = gc_descriptors[2 * tag + 1];
+        for (int64_t f = 0; f < arity; f++) {
+            if ((mask >> f) & 1) {
+                EQ_PUSH((intptr_t)x[1 + f], (intptr_t)y[1 + f]);
+            } else if (x[1 + f] != y[1 + f]) {
+                equal = 0;
+                break;
+            }
+        }
+        if (!equal) {
+            break;
+        }
+    }
+#undef EQ_PUSH
+    free(work);
+    return equal;
+}
+
 /* `int.to_string` (D1): decimal, a leading '-' for a negative, INT64_MIN
  * included (20 characters at most). */
 void *elya_int_to_string(int64_t tag, int64_t n) {
     char buf[32];
     int len = snprintf(buf, sizeof buf, "%lld", (long long)n);
     return elya_str_lit(tag, buf, (int64_t)len);
+}
+
+/* ---- `with any` natively: literals (spec 2026-10-17-elya-native-any-handlers,
+ * D3/D4). The back end hands over a reflection table (`reflect.rs`): a node is
+ * an offset into `t`; `[0]` Int, `[1]` Bool, `[2]` Unit, `[3]` String, `[4]` a
+ * function, `[5, n, (tag, name_off, name_len, arity, field_node..) * n]` a
+ * declared type (source constructor names in `names`), `[6]` an instance no
+ * value of exists. Every walk keeps its own stack: a million-cell list neither
+ * recurses nor overflows. Failures carry the evaluator's words. */
+
+enum { ANY_INT, ANY_BOOL, ANY_UNIT, ANY_STRING, ANY_FN, ANY_ADT, ANY_UNBUILT };
+
+static void any_oom(void) {
+    fputs("elya: out of memory\n", stderr);
+    exit(1);
+}
+
+static void *any_grow(void *p, int64_t *cap, int64_t need, size_t elem) {
+    if (need <= *cap) {
+        return p;
+    }
+    int64_t c = *cap ? *cap : 16;
+    while (c < need) {
+        c *= 2;
+    }
+    void *q = realloc(p, (size_t)c * elem);
+    if (!q) {
+        any_oom();
+    }
+    *cap = c;
+    return q;
+}
+
+typedef struct {
+    char *p;
+    int64_t len, cap;
+} AnyBuf;
+
+static void any_put(AnyBuf *b, const char *s, int64_t n) {
+    b->p = (char *)any_grow(b->p, &b->cap, b->len + n + 1, 1);
+    memcpy(b->p + b->len, s, (size_t)n);
+    b->len += n;
+}
+
+static void any_puts(AnyBuf *b, const char *s) { any_put(b, s, (int64_t)strlen(s)); }
+
+/* The constructor entry of `tag` in the declared-type node `node`, or -1. */
+static int64_t any_ctor(const int64_t *t, int64_t node, int64_t tag) {
+    int64_t n = t[node + 1];
+    int64_t at = node + 2;
+    for (int64_t i = 0; i < n; i++) {
+        if (t[at] == tag) {
+            return at;
+        }
+        at += 4 + t[at + 3];
+    }
+    return -1;
+}
+
+static void any_internal(const char *what) {
+    fprintf(stderr, "elya: internal: %s\n", what);
+    exit(1);
+}
+
+/* `value` (a word of the type `node`) in literal syntax, as a fresh string.
+ * Reaching a function fails with `before` "a function" `after`. */
+void *elya_any_show(int64_t string_tag, const int64_t *t, const char *names, int64_t node,
+                    int64_t value, const char *before, const char *after) {
+    typedef struct {
+        int64_t node, value;
+        const char *text;
+    } Item;
+    Item *stack = NULL;
+    int64_t top = 0, cap = 0;
+    AnyBuf out = {0};
+    stack = (Item *)any_grow(stack, &cap, 1, sizeof(Item));
+    stack[top++] = (Item){node, value, NULL};
+    while (top > 0) {
+        Item it = stack[--top];
+        if (it.text) {
+            any_puts(&out, it.text);
+            continue;
+        }
+        char num[32];
+        switch (t[it.node]) {
+        case ANY_INT:
+            any_put(&out, num, snprintf(num, sizeof num, "%lld", (long long)it.value));
+            break;
+        case ANY_BOOL:
+            any_puts(&out, it.value ? "True" : "False");
+            break;
+        case ANY_UNIT:
+            any_puts(&out, "Unit");
+            break;
+        case ANY_STRING: {
+            int64_t *s = (int64_t *)(intptr_t)it.value;
+            int64_t len = s[1];
+            const unsigned char *bytes = (const unsigned char *)&s[2];
+            any_puts(&out, "\"");
+            for (int64_t i = 0; i < len; i++) {
+                switch (bytes[i]) {
+                case '"': any_puts(&out, "\\\""); break;
+                case '\\': any_puts(&out, "\\\\"); break;
+                case '\n': any_puts(&out, "\\n"); break;
+                case '\t': any_puts(&out, "\\t"); break;
+                case '\r': any_puts(&out, "\\r"); break;
+                default: any_put(&out, (const char *)&bytes[i], 1);
+                }
+            }
+            any_puts(&out, "\"");
+            break;
+        }
+        case ANY_FN:
+            fprintf(stderr, "elya: %sa function%s\n", before, after);
+            exit(1);
+        case ANY_ADT: {
+            int64_t *p = (int64_t *)(intptr_t)it.value;
+            int64_t c = any_ctor(t, it.node, p[0]);
+            if (c < 0) {
+                any_internal("op: a value without a descriptor");
+            }
+            any_put(&out, names + t[c + 1], t[c + 2]);
+            int64_t arity = t[c + 3];
+            if (arity > 0) {
+                any_puts(&out, "(");
+                stack = (Item *)any_grow(stack, &cap, top + 2 * arity + 1, sizeof(Item));
+                stack[top++] = (Item){0, 0, ")"};
+                for (int64_t i = arity - 1; i >= 0; i--) {
+                    stack[top++] = (Item){t[c + 4 + i], p[1 + i], NULL};
+                    if (i > 0) {
+                        stack[top++] = (Item){0, 0, ", "};
+                    }
+                }
+            }
+            break;
+        }
+        default:
+            any_internal("op: a value of a type with no instance");
+        }
+    }
+    free(stack);
+    void *s = elya_str_lit(string_tag, out.p ? out.p : "", out.len);
+    free(out.p);
+    return s;
+}
+
+/* `o == o` (the review's R2): an operation equals itself unless the comparison
+ * reaches a function in an argument, which stops the evaluator's `==` with
+ * these words. Walks `value` (a word of type `node`); allocates nothing. */
+int64_t elya_any_check(const int64_t *t, int64_t node, int64_t value) {
+    typedef struct {
+        int64_t node, value;
+    } Item;
+    Item *stack = NULL;
+    int64_t top = 0, cap = 0;
+    stack = (Item *)any_grow(stack, &cap, 1, sizeof(Item));
+    stack[top++] = (Item){node, value};
+    while (top > 0) {
+        Item it = stack[--top];
+        switch (t[it.node]) {
+        case ANY_FN:
+            fputs("elya: `==` reached a value that is not data (E0436 should have rejected it)\n",
+                  stderr);
+            exit(1);
+        case ANY_ADT: {
+            int64_t *p = (int64_t *)(intptr_t)it.value;
+            int64_t c = any_ctor(t, it.node, p[0]);
+            if (c < 0) {
+                any_internal("op: a value without a descriptor");
+            }
+            int64_t arity = t[c + 3];
+            stack = (Item *)any_grow(stack, &cap, top + arity, sizeof(Item));
+            for (int64_t i = 0; i < arity; i++) {
+                stack[top++] = (Item){t[c + 4 + i], p[1 + i]};
+            }
+            break;
+        }
+        case ANY_UNBUILT:
+            any_internal("op: a value of a type with no instance");
+            break;
+        default:
+            break;
+        }
+    }
+    free(stack);
+    return 1;
+}
+
+/* `op.decode`'s refusal of an answer at an effect's own parameter (D4). */
+void elya_any_fail(const char *msg) {
+    fprintf(stderr, "elya: %s\n", msg);
+    exit(1);
+}
+
+/* A parsed literal: the evaluator's `Value`s a literal can denote. */
+enum { LIT_INT, LIT_FLOAT, LIT_BOOL, LIT_UNIT, LIT_STR, LIT_CTOR };
+
+typedef struct {
+    int kind;
+    int64_t i;          /* Int, Bool */
+    char *s;            /* String bytes (malloc'd); a constructor's name (into the text) */
+    int64_t slen;
+    int64_t *kids;      /* a constructor's arguments, as indices */
+    int64_t nkids;
+} AnyLit;
+
+typedef struct {
+    const char *s;
+    int64_t i, n;
+    AnyLit *lits;
+    int64_t nlits, cap;
+} AnyParser;
+
+static int64_t any_new(AnyParser *p, AnyLit l) {
+    p->lits = (AnyLit *)any_grow(p->lits, &p->cap, p->nlits + 1, sizeof(AnyLit));
+    p->lits[p->nlits] = l;
+    return p->nlits++;
+}
+
+static int any_space(char c) {
+    /* Rust's `is_ascii_whitespace`: space, \t, \n, \x0C, \r. */
+    return c == ' ' || c == '\t' || c == '\n' || c == '\x0C' || c == '\r';
+}
+
+static void any_ws(AnyParser *p) {
+    while (p->i < p->n && any_space(p->s[p->i])) {
+        p->i++;
+    }
+}
+
+static int any_starts(AnyParser *p, const char *w) {
+    int64_t k = (int64_t)strlen(w);
+    return p->n - p->i >= k && memcmp(p->s + p->i, w, (size_t)k) == 0;
+}
+
+static int any_digit(char c) { return c >= '0' && c <= '9'; }
+
+static int any_alnum(char c) {
+    return any_digit(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+/* A decimal Int in range, as Rust's `i64::from_str` reads `[-]digits`. */
+static int any_int(const char *s, int64_t n, int64_t *out) {
+    int64_t k = 0;
+    int neg = 0;
+    if (k < n && s[k] == '-') {
+        neg = 1;
+        k++;
+    }
+    if (k == n) {
+        return 0;
+    }
+    uint64_t limit = neg ? (uint64_t)INT64_MAX + 1 : (uint64_t)INT64_MAX;
+    uint64_t v = 0;
+    for (; k < n; k++) {
+        uint64_t d = (uint64_t)(s[k] - '0');
+        if (v > (limit - d) / 10) {
+            return 0;
+        }
+        v = v * 10 + d;
+    }
+    *out = neg ? (int64_t)(0 - v) : (int64_t)v;
+    return 1;
+}
+
+/* The evaluator's literal parser (`literal.rs`), the same errors in the same
+ * order. Returns the literal's index, or -1 with `*err` set. */
+static int64_t any_parse(AnyParser *p, const char **err) {
+    typedef struct {
+        const char *name;
+        int64_t len;
+        int64_t *args;
+        int64_t nargs, cap;
+    } Open;
+    Open *open = NULL;
+    int64_t nopen = 0, ocap = 0;
+    int64_t v = -1;
+    for (;;) {
+        any_ws(p);
+        if (p->i >= p->n) {
+            *err = "nothing to read";
+            goto fail;
+        }
+        char c = p->s[p->i];
+        if (c == '"') {
+            p->i++;
+            char *bytes = NULL;
+            int64_t len = 0, bcap = 0;
+            for (;;) {
+                if (p->i >= p->n) {
+                    free(bytes);
+                    *err = "an unterminated string";
+                    goto fail;
+                }
+                char d = p->s[p->i];
+                if (d == '"') {
+                    p->i++;
+                    break;
+                }
+                if (d == '\\') {
+                    p->i++;
+                    if (p->i >= p->n) {
+                        free(bytes);
+                        *err = "an unterminated string";
+                        goto fail;
+                    }
+                    char e = p->s[p->i];
+                    char out;
+                    switch (e) {
+                    case '"': out = '"'; break;
+                    case '\\': out = '\\'; break;
+                    case 'n': out = '\n'; break;
+                    case 't': out = '\t'; break;
+                    case 'r': out = '\r'; break;
+                    default:
+                        free(bytes);
+                        *err = "an unknown escape";
+                        goto fail;
+                    }
+                    d = out;
+                }
+                bytes = (char *)any_grow(bytes, &bcap, len + 1, 1);
+                bytes[len++] = d;
+                p->i++;
+            }
+            /* The bytes between two quotes of UTF-8 text, with ASCII escapes
+             * replaced, are UTF-8: the evaluator's "not UTF-8" cannot occur. */
+            v = any_new(p, (AnyLit){LIT_STR, 0, bytes, len, NULL, 0});
+        } else if (c == '-' || any_digit(c)) {
+            if (any_starts(p, "-inf")) {
+                p->i += 4;
+                v = any_new(p, (AnyLit){LIT_FLOAT, 0, NULL, 0, NULL, 0});
+            } else {
+                int64_t start = p->i;
+                int dots = 0, digits = 0;
+                if (p->s[p->i] == '-') {
+                    p->i++;
+                }
+                while (p->i < p->n && (any_digit(p->s[p->i]) || p->s[p->i] == '.')) {
+                    if (p->s[p->i] == '.') {
+                        dots++;
+                    } else {
+                        digits++;
+                    }
+                    p->i++;
+                }
+                if (dots > 0) {
+                    /* Rust's `f64::from_str` on `[-][digits][.][digits]`: one point
+                     * and at least one digit. */
+                    if (dots != 1 || digits == 0) {
+                        *err = "a malformed number";
+                        goto fail;
+                    }
+                    v = any_new(p, (AnyLit){LIT_FLOAT, 0, NULL, 0, NULL, 0});
+                } else {
+                    int64_t n;
+                    if (!any_int(p->s + start, p->i - start, &n)) {
+                        *err = "a malformed or out-of-range integer";
+                        goto fail;
+                    }
+                    v = any_new(p, (AnyLit){LIT_INT, n, NULL, 0, NULL, 0});
+                }
+            }
+        } else if (c == 'i' && any_starts(p, "inf")) {
+            p->i += 3;
+            v = any_new(p, (AnyLit){LIT_FLOAT, 0, NULL, 0, NULL, 0});
+        } else if (c == 'n' && any_starts(p, "nan")) {
+            p->i += 3;
+            v = any_new(p, (AnyLit){LIT_FLOAT, 0, NULL, 0, NULL, 0});
+        } else if (c >= 'A' && c <= 'Z') {
+            int64_t start = p->i;
+            while (p->i < p->n && (any_alnum(p->s[p->i]) || p->s[p->i] == '_')) {
+                p->i++;
+            }
+            const char *name = p->s + start;
+            int64_t len = p->i - start;
+            int64_t save = p->i;
+            any_ws(p);
+            if (p->i < p->n && p->s[p->i] == '(') {
+                p->i++;
+                open = (Open *)any_grow(open, &ocap, nopen + 1, sizeof(Open));
+                open[nopen++] = (Open){name, len, NULL, 0, 0};
+                continue;
+            }
+            p->i = save;
+            if (len == 4 && memcmp(name, "True", 4) == 0) {
+                v = any_new(p, (AnyLit){LIT_BOOL, 1, NULL, 0, NULL, 0});
+            } else if (len == 5 && memcmp(name, "False", 5) == 0) {
+                v = any_new(p, (AnyLit){LIT_BOOL, 0, NULL, 0, NULL, 0});
+            } else if (len == 4 && memcmp(name, "Unit", 4) == 0) {
+                v = any_new(p, (AnyLit){LIT_UNIT, 0, NULL, 0, NULL, 0});
+            } else {
+                v = any_new(p, (AnyLit){LIT_CTOR, 0, (char *)name, len, NULL, 0});
+            }
+        } else {
+            *err = "an unexpected character";
+            goto fail;
+        }
+        /* Give the value to the constructor it is an argument of, closing every
+         * constructor whose `)` follows. */
+        for (;;) {
+            if (nopen == 0) {
+                free(open);
+                return v;
+            }
+            Open *o = &open[nopen - 1];
+            o->args = (int64_t *)any_grow(o->args, &o->cap, o->nargs + 1, sizeof(int64_t));
+            o->args[o->nargs++] = v;
+            any_ws(p);
+            if (p->i < p->n && p->s[p->i] == ',') {
+                p->i++;
+                break;
+            }
+            if (p->i < p->n && p->s[p->i] == ')') {
+                p->i++;
+                nopen--;
+                v = any_new(p, (AnyLit){LIT_CTOR, 0, (char *)o->name, o->len, o->args, o->nargs});
+                continue;
+            }
+            *err = "a constructor's arguments not closed by `)`";
+            goto fail;
+        }
+    }
+fail:
+    for (int64_t k = 0; k < nopen; k++) {
+        free(open[k].args);
+    }
+    free(open);
+    return -1;
+}
+
+static void any_free(AnyParser *p) {
+    for (int64_t k = 0; k < p->nlits; k++) {
+        if (p->lits[k].kind == LIT_STR) {
+            free(p->lits[k].s);
+        }
+        free(p->lits[k].kids);
+    }
+    free(p->lits);
+}
+
+/* Does literal `lit` denote a value of the type `node`? Iterative. */
+static int any_conforms(AnyParser *p, const int64_t *t, const char *names, int64_t lit,
+                        int64_t node, int64_t **centry) {
+    typedef struct {
+        int64_t lit, node;
+    } Pair;
+    Pair *work = NULL;
+    int64_t top = 0, cap = 0;
+    work = (Pair *)any_grow(work, &cap, 1, sizeof(Pair));
+    work[top++] = (Pair){lit, node};
+    int ok = 1;
+    while (ok && top > 0) {
+        Pair w = work[--top];
+        AnyLit *l = &p->lits[w.lit];
+        switch (t[w.node]) {
+        case ANY_INT: ok = l->kind == LIT_INT; break;
+        case ANY_BOOL: ok = l->kind == LIT_BOOL; break;
+        case ANY_UNIT: ok = l->kind == LIT_UNIT; break;
+        case ANY_STRING: ok = l->kind == LIT_STR; break;
+        case ANY_FN: ok = 0; break;
+        case ANY_ADT: {
+            ok = 0;
+            if (l->kind != LIT_CTOR) {
+                break;
+            }
+            int64_t n = t[w.node + 1];
+            int64_t at = w.node + 2;
+            for (int64_t k = 0; k < n; k++) {
+                if (t[at + 2] == l->slen && memcmp(names + t[at + 1], l->s, (size_t)l->slen) == 0) {
+                    if (t[at + 3] == l->nkids) {
+                        ok = 1;
+                        (*centry)[w.lit] = at;
+                        work = (Pair *)any_grow(work, &cap, top + l->nkids, sizeof(Pair));
+                        for (int64_t f = 0; f < l->nkids; f++) {
+                            work[top++] = (Pair){l->kids[f], t[at + 4 + f]};
+                        }
+                    }
+                    break;
+                }
+                at += 4 + t[at + 3];
+            }
+            break;
+        }
+        default:
+            any_internal("op.decode: a type with no instance");
+        }
+    }
+    free(work);
+    return ok;
+}
+
+static void any_decode_fail(const char *why1, const char *text, int64_t tlen, const char *why2,
+                            const char *opname) {
+    fprintf(stderr, "elya: op.decode: %s", why1);
+    fwrite(text, 1, (size_t)tlen, stderr);
+    fprintf(stderr, "%s, for an answer of `%s`\n", why2, opname);
+    exit(1);
+}
+
+/* `op.decode`: parse the whole text, then refuse input after the value, then
+ * check the literal against the type, then build it -- the evaluator's order,
+ * so the first failure named is the same. Every value built is rooted until
+ * its parent holds it. */
+int64_t elya_any_decode(int64_t string_tag, const int64_t *t, const char *names, int64_t node,
+                        void *text, const char *display, const char *opname) {
+    int64_t *ts = (int64_t *)text;
+    int64_t tlen = ts[1];
+    const char *src = (const char *)&ts[2];
+    AnyParser p = {src, 0, tlen, NULL, 0, 0};
+    const char *err = NULL;
+    int64_t root = any_parse(&p, &err);
+    if (root < 0) {
+        fprintf(stderr, "elya: op.decode: `");
+        fwrite(src, 1, (size_t)tlen, stderr);
+        fprintf(stderr, "` is not a literal (%s), for an answer of `%s`\n", err, opname);
+        exit(1);
+    }
+    any_ws(&p);
+    if (p.i != p.n) {
+        any_decode_fail("`", src, tlen, "` has input after its value", opname);
+    }
+    int64_t *centry = (int64_t *)calloc((size_t)(p.nlits ? p.nlits : 1), sizeof(int64_t));
+    if (!centry) {
+        any_oom();
+    }
+    if (!any_conforms(&p, t, names, root, node, &centry)) {
+        fprintf(stderr, "elya: op.decode: `");
+        fwrite(src, 1, (size_t)tlen, stderr);
+        fprintf(stderr, "` is not a value of type `%s`, for an answer of `%s`\n", display, opname);
+        exit(1);
+    }
+    /* Build, post-order. `done` holds built words; a heap one is also on the
+     * shadow stack, in the same order, until its parent is built. */
+    typedef struct {
+        int64_t lit, node;
+        int expanded;
+    } Step;
+    typedef struct {
+        int64_t word;
+        int heap;
+    } Done;
+    Step *steps = NULL;
+    Done *done = NULL;
+    int64_t ns = 0, scap = 0, nd = 0, dcap = 0;
+    steps = (Step *)any_grow(steps, &scap, 1, sizeof(Step));
+    steps[ns++] = (Step){root, node, 0};
+    while (ns > 0) {
+        Step *s = &steps[ns - 1];
+        AnyLit *l = &p.lits[s->lit];
+        int64_t kind = t[s->node];
+        if (kind == ANY_ADT && !s->expanded) {
+            s->expanded = 1;
+            int64_t at = centry[s->lit];
+            int64_t lit = s->lit;
+            steps = (Step *)any_grow(steps, &scap, ns + l->nkids, sizeof(Step));
+            for (int64_t f = l->nkids - 1; f >= 0; f--) {
+                steps[ns++] = (Step){p.lits[lit].kids[f], t[at + 4 + f], 0};
+            }
+            continue;
+        }
+        Done d = {0, 0};
+        switch (kind) {
+        case ANY_INT: d.word = l->i; break;
+        case ANY_BOOL: d.word = l->i ? 1 : 0; break;
+        case ANY_UNIT: d.word = 0; break;
+        case ANY_STRING:
+            d.word = (int64_t)(intptr_t)elya_str_lit(string_tag, l->s ? l->s : "", l->slen);
+            d.heap = 1;
+            break;
+        case ANY_ADT: {
+            int64_t at = centry[s->lit];
+            int64_t k = l->nkids;
+            int64_t *obj = (int64_t *)elya_alloc(1 + k);
+            obj[0] = t[at];
+            int pops = 0;
+            for (int64_t f = 0; f < k; f++) {
+                Done c = done[nd - k + f];
+                obj[1 + f] = c.word;
+                pops += c.heap;
+            }
+            nd -= k;
+            for (int q = 0; q < pops; q++) {
+                elya_gc_pop();
+            }
+            d.word = (int64_t)(intptr_t)obj;
+            d.heap = 1;
+            break;
+        }
+        default:
+            any_internal("op.decode: a type with no instance");
+        }
+        if (d.heap) {
+            elya_gc_push((void *)(intptr_t)d.word);
+        }
+        done = (Done *)any_grow(done, &dcap, nd + 1, sizeof(Done));
+        done[nd++] = d;
+        ns--;
+    }
+    int64_t result = done[0].word;
+    if (done[0].heap) {
+        elya_gc_pop();
+    }
+    free(steps);
+    free(done);
+    free(centry);
+    any_free(&p);
+    return result;
 }
 
 /* Time, the first I/O source (spec 2026-10-15-elya-async-step2-timers, D3).
@@ -324,7 +1006,308 @@ static int64_t elya_time_raw_ms(void) {
 #endif
 }
 
-int64_t elya_time_now_ms(void) {
+/* ---- Record and replay natively (spec 2026-10-17-elya-native-record-replay).
+ * `ELYA_RECORD=<file>` writes the host's answers as the evaluator's trace,
+ * entry by entry (D4); `ELYA_REPLAY=<file>` answers from one, without waiting
+ * (D5). The format and every failure's words are the evaluator's
+ * (`src/lib.rs`, `src/eval.rs` `host_builtin`). */
+#define ELYA_TRACE_HEADER "elya trace 1"
+
+enum { TRACE_LIVE, TRACE_RECORD, TRACE_REPLAY };
+static int elya_trace_mode = TRACE_LIVE;
+static FILE *elya_trace_out;
+static const char *elya_trace_path;
+
+/* A piece of the trace text: bytes and a length (a NUL byte is a character, as
+ * in the evaluator's strings; the review's L1). */
+typedef struct {
+    const char *p;
+    int64_t n;
+} TraceStr;
+
+typedef struct {
+    TraceStr q, a;
+} TraceEntry;
+static TraceEntry *elya_trace_entries;
+static int64_t elya_trace_n, elya_trace_cap, elya_trace_next;
+
+/* The length of the whitespace character starting at `p` (before `e`), or 0:
+ * Rust's `char::is_whitespace`, which `str::trim` uses -- ASCII \t..\r and
+ * space, and U+0085, U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029, U+202F,
+ * U+205F, U+3000 in UTF-8 (the review's M2). */
+static int trace_ws_at(const unsigned char *p, const unsigned char *e) {
+    if (p >= e) {
+        return 0;
+    }
+    if (*p == ' ' || (*p >= '\t' && *p <= '\r')) {
+        return 1;
+    }
+    if (e - p >= 2 && p[0] == 0xC2 && (p[1] == 0x85 || p[1] == 0xA0)) {
+        return 2;
+    }
+    if (e - p >= 3) {
+        if (p[0] == 0xE1 && p[1] == 0x9A && p[2] == 0x80) {
+            return 3;
+        }
+        if (p[0] == 0xE2 && p[1] == 0x80 &&
+            ((p[2] >= 0x80 && p[2] <= 0x8A) || p[2] == 0xA8 || p[2] == 0xA9 || p[2] == 0xAF)) {
+            return 3;
+        }
+        if (p[0] == 0xE2 && p[1] == 0x81 && p[2] == 0x9F) {
+            return 3;
+        }
+        if (p[0] == 0xE3 && p[1] == 0x80 && p[2] == 0x80) {
+            return 3;
+        }
+    }
+    return 0;
+}
+
+static TraceStr trace_trim(const char *b, const char *e) {
+    const unsigned char *s = (const unsigned char *)b, *t = (const unsigned char *)e;
+    int k;
+    while ((k = trace_ws_at(s, t)) > 0) {
+        s += k;
+    }
+    for (;;) {
+        int cut = 0;
+        for (int len = 1; len <= 3 && t - s >= len; len++) {
+            if (trace_ws_at(t - len, t) == len) {
+                cut = len;
+                break;
+            }
+        }
+        if (!cut) {
+            break;
+        }
+        t -= cut;
+    }
+    return (TraceStr){(const char *)s, (int64_t)(t - s)};
+}
+
+static int trace_is(TraceStr s, const char *lit) {
+    int64_t n = (int64_t)strlen(lit);
+    return s.n == n && memcmp(s.p, lit, (size_t)n) == 0;
+}
+
+static void trace_put(TraceStr s) { fwrite(s.p, 1, (size_t)s.n, stderr); }
+
+static void trace_bad(const char *msg, int64_t line) {
+    if (line > 0) {
+        fprintf(stderr, "elya: trace line %lld: %s\n", (long long)line, msg);
+    } else {
+        fprintf(stderr, "elya: %s\n", msg);
+    }
+    exit(1);
+}
+
+/* Is [p, p+n) UTF-8, as Rust's `read_to_string` requires (the review's M3)? */
+static int trace_utf8(const unsigned char *p, int64_t n) {
+    int64_t i = 0;
+    while (i < n) {
+        unsigned char c = p[i];
+        int64_t len;
+        uint32_t cp;
+        if (c < 0x80) {
+            i++;
+            continue;
+        } else if (c >= 0xC2 && c <= 0xDF) {
+            len = 2;
+            cp = c & 0x1F;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            len = 3;
+            cp = c & 0x0F;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            len = 4;
+            cp = c & 0x07;
+        } else {
+            return 0;
+        }
+        if (n - i < len) {
+            return 0;
+        }
+        for (int64_t k = 1; k < len; k++) {
+            if ((p[i + k] & 0xC0) != 0x80) {
+                return 0;
+            }
+            cp = (cp << 6) | (p[i + k] & 0x3F);
+        }
+        if ((len == 3 && cp < 0x800) || (len == 4 && (cp < 0x10000 || cp > 0x10FFFF)) ||
+            (cp >= 0xD800 && cp <= 0xDFFF)) {
+            return 0;
+        }
+        i += len;
+    }
+    return 1;
+}
+
+/* Reads the trace as `run_source_replaying` does: a byte-order mark skipped,
+ * `lines()` (a trailing `\r` dropped), the header trimmed, blank lines
+ * skipped, the LAST ` = ` splitting a line, both sides trimmed. The entries
+ * point into `t`, which lives as long as the process. */
+static void trace_parse(const char *t, int64_t n) {
+    if (n >= 3 && (unsigned char)t[0] == 0xEF && (unsigned char)t[1] == 0xBB &&
+        (unsigned char)t[2] == 0xBF) {
+        t += 3;
+        n -= 3;
+    }
+    const char *end = t + n;
+    const char *line = t;
+    int64_t index = -1; /* -1: the header */
+    while (line < end) {
+        const char *nl = memchr(line, '\n', (size_t)(end - line));
+        const char *le = nl ? nl : end;
+        const char *next = nl ? nl + 1 : end;
+        if (le > line && le[-1] == '\r') {
+            le--;
+        }
+        if (index < 0) {
+            if (!trace_is(trace_trim(line, le), ELYA_TRACE_HEADER)) {
+                trace_bad("not a trace: the first line must be `" ELYA_TRACE_HEADER "`", 0);
+            }
+        } else if (trace_trim(line, le).n > 0) {
+            const char *split = NULL;
+            for (const char *p = line; p + 3 <= le; p++) {
+                if (p[0] == ' ' && p[1] == '=' && p[2] == ' ') {
+                    split = p;
+                }
+            }
+            if (!split) {
+                trace_bad("expected `question = answer`", index + 2);
+            }
+            elya_trace_entries = (TraceEntry *)any_grow(elya_trace_entries, &elya_trace_cap,
+                                                        elya_trace_n + 1, sizeof(TraceEntry));
+            elya_trace_entries[elya_trace_n++] =
+                (TraceEntry){trace_trim(line, split), trace_trim(split + 3, le)};
+        }
+        index++;
+        line = next;
+    }
+    if (index < 0) {
+        trace_bad("not a trace: the first line must be `" ELYA_TRACE_HEADER "`", 0);
+    }
+}
+
+/* A failed write of the trace (a full disk): the CLI's exit 2 (the review's M1). */
+static void trace_wrote(void) {
+    if (fflush(elya_trace_out) != 0 || ferror(elya_trace_out)) {
+        fprintf(stderr, "elya: cannot write the trace `%s`: %s\n", elya_trace_path, strerror(errno));
+        exit(2);
+    }
+}
+
+/* Before the program runs: the environment, the trace file (D1, D3). */
+static void elya_trace_init(void) {
+    const char *rec = getenv("ELYA_RECORD");
+    const char *rep = getenv("ELYA_REPLAY");
+    if (rec && rep) {
+        fputs("elya: ELYA_RECORD and ELYA_REPLAY cannot both be set\n", stderr);
+        exit(2);
+    }
+    if (rec) {
+        elya_trace_path = rec;
+        elya_trace_out = fopen(rec, "wb");
+        if (!elya_trace_out) {
+            fprintf(stderr, "elya: cannot write the trace `%s`: %s\n", rec, strerror(errno));
+            exit(2);
+        }
+        fputs(ELYA_TRACE_HEADER "\n", elya_trace_out);
+        trace_wrote();
+        elya_trace_mode = TRACE_RECORD;
+    } else if (rep) {
+        FILE *f = fopen(rep, "rb");
+        if (!f) {
+            fprintf(stderr, "elya: cannot read the trace `%s`: %s\n", rep, strerror(errno));
+            exit(2);
+        }
+        char *buf = NULL;
+        int64_t len = 0, cap = 0;
+        for (;;) {
+            buf = (char *)any_grow(buf, &cap, len + 4096, 1);
+            size_t got = fread(buf + len, 1, 4096, f);
+            len += (int64_t)got;
+            if (got < 4096) {
+                break;
+            }
+        }
+        if (ferror(f)) {
+            fprintf(stderr, "elya: cannot read the trace `%s`: %s\n", rep, strerror(errno));
+            exit(2);
+        }
+        fclose(f);
+        if (!trace_utf8((const unsigned char *)buf, len)) {
+            fprintf(stderr, "elya: cannot read the trace `%s`: stream did not contain valid UTF-8\n",
+                    rep);
+            exit(2);
+        }
+        trace_parse(buf ? buf : "", len);
+        elya_trace_mode = TRACE_REPLAY;
+    }
+}
+
+/* After `main` returns, before its value is printed: a replay must have asked
+ * everything (the evaluator's unread-entries error). */
+static void elya_trace_finish(void) {
+    if (elya_trace_mode == TRACE_REPLAY && elya_trace_next < elya_trace_n) {
+        int64_t left = elya_trace_n - elya_trace_next;
+        TraceEntry *e = &elya_trace_entries[elya_trace_next];
+        fflush(stdout);
+        fprintf(stderr, "elya: replay: `main` returned with %lld unread trace %s, from entry %lld (`",
+                (long long)left, left == 1 ? "entry" : "entries", (long long)elya_trace_next + 1);
+        trace_put(e->q);
+        fputs(" = ", stderr);
+        trace_put(e->a);
+        fputs("`): the run asked less than the recording\n", stderr);
+        exit(1);
+    }
+}
+
+/* The next replayed answer to `q`, or a named divergence. */
+static TraceStr trace_answer(const char *q) {
+    int64_t n = elya_trace_next + 1;
+    if (elya_trace_next >= elya_trace_n) {
+        fflush(stdout);
+        fprintf(stderr, "elya: replay diverged at entry %lld: the program asked `%s`, the trace has ended\n",
+                (long long)n, q);
+        exit(1);
+    }
+    TraceEntry *e = &elya_trace_entries[elya_trace_next];
+    if (!trace_is(e->q, q)) {
+        fflush(stdout);
+        fprintf(stderr, "elya: replay diverged at entry %lld: the program asked `%s`, the trace holds `",
+                (long long)n, q);
+        trace_put(e->q);
+        fputs("`\n", stderr);
+        exit(1);
+    }
+    elya_trace_next++;
+    return e->a;
+}
+
+static void trace_wrong_type(TraceStr a, const char *ty) {
+    fflush(stdout);
+    fprintf(stderr, "elya: replay entry %lld: `", (long long)elya_trace_next);
+    trace_put(a);
+    fprintf(stderr, "` is not an answer of type %s\n", ty);
+    exit(1);
+}
+
+/* An answer read as Rust's `i64::from_str` reads it: `[+-]digits`, in range. */
+static int trace_int(TraceStr a, int64_t *out) {
+    int64_t sign = (a.n > 0 && (a.p[0] == '+' || a.p[0] == '-')) ? 1 : 0;
+    if (a.n - sign == 0) {
+        return 0;
+    }
+    for (int64_t k = sign; k < a.n; k++) {
+        if (!any_digit(a.p[k])) {
+            return 0;
+        }
+    }
+    /* `any_int` reads `[-]digits`; a `+` is dropped first. */
+    return a.p[0] == '+' ? any_int(a.p + 1, a.n - 1, out) : any_int(a.p, a.n, out);
+}
+
+static int64_t elya_time_live_now_ms(void) {
     static int64_t start = -1;
     int64_t now = elya_time_raw_ms();
     if (start < 0) {
@@ -333,7 +1316,43 @@ int64_t elya_time_now_ms(void) {
     return now - start;
 }
 
+int64_t elya_time_now_ms(void) {
+    if (elya_trace_mode == TRACE_REPLAY) {
+        TraceStr a = trace_answer("time.now_ms()");
+        int64_t v;
+        if (!trace_int(a, &v)) {
+            trace_wrong_type(a, "Int");
+        }
+        return v;
+    }
+    int64_t v = elya_time_live_now_ms();
+    if (elya_trace_mode == TRACE_RECORD) {
+        fprintf(elya_trace_out, "time.now_ms() = %lld\n", (long long)v);
+        trace_wrote();
+    }
+    return v;
+}
+
+static void elya_time_live_sleep_ms(int64_t ms);
+
 void elya_time_sleep_ms(int64_t ms) {
+    if (elya_trace_mode == TRACE_REPLAY) {
+        char q[64];
+        snprintf(q, sizeof q, "time.sleep_ms(%lld)", (long long)ms);
+        TraceStr a = trace_answer(q);
+        if (!trace_is(a, "Unit")) {
+            trace_wrong_type(a, "Unit");
+        }
+        return;
+    }
+    elya_time_live_sleep_ms(ms);
+    if (elya_trace_mode == TRACE_RECORD) {
+        fprintf(elya_trace_out, "time.sleep_ms(%lld) = Unit\n", (long long)ms);
+        trace_wrote();
+    }
+}
+
+static void elya_time_live_sleep_ms(int64_t ms) {
     if (ms <= 0) {
         return;
     }
@@ -397,6 +1416,13 @@ void elya_div_zero(void) {
 
 void elya_rem_zero(void) {
     fputs("elya: remainder by zero\n", stderr);
+    exit(1);
+}
+
+/* A shift amount outside 0..=63 (spec 2026-10-17-elya-unary-and-wrapping D2):
+ * the evaluator's words. */
+void elya_shift_range(const char *name, int64_t n) {
+    fprintf(stderr, "elya: int.%s: a shift by %lld is outside 0..=63\n", name, (long long)n);
     exit(1);
 }
 
@@ -547,3 +1573,182 @@ void *elya_cont_copy(void *cont, int64_t hlo, int64_t hhi) {
     free(vals);
     return fresh;
 }
+
+/* The program's own stack (spec 2026-10-16-elya-native-stack). `@main` calls
+ * `elya_start` with `@elya_entry`, which calls `main`'s function; it runs on a
+ * thread whose stack is a fixed, documented size (D1: 1 GiB, or ELYA_STACK_MIB,
+ * D2), reserved, not committed, so a shallow program pays nothing. Reaching its
+ * end is a NAMED failure, never a bare signal (D5). The collector never looks at
+ * the machine stack (its roots are the shadow stack), so it is unaffected. */
+#define ELYA_STACK_DEFAULT_MIB 1024
+#define ELYA_STACK_MAX_MIB 1048576
+
+typedef int64_t (*elya_entry_fn)(void);
+static elya_entry_fn elya_entry_ptr;
+static int64_t elya_entry_result;
+static int64_t elya_stack_mib = ELYA_STACK_DEFAULT_MIB;
+
+/* Output already written stays written (flushed first), then the one line,
+ * exit status 1 like every runtime trap. */
+static void elya_stack_overflowed(void) {
+    fflush(stdout);
+    fprintf(stderr, "elya: native stack overflow: recursion deeper than the %lld MiB stack\n",
+            (long long)elya_stack_mib);
+    fflush(stderr);
+    exit(1);
+}
+
+static void elya_stack_unavailable(void) {
+    fprintf(stderr, "elya: cannot reserve a stack of %lld MiB (ELYA_STACK_MIB sets a smaller one)\n",
+            (long long)elya_stack_mib);
+    exit(1);
+}
+
+/* D2: a whole number of MiB, 1 to ELYA_STACK_MAX_MIB, or the default when the
+ * variable is unset. Anything else stops here, before the program runs. */
+static int64_t elya_stack_size_mib(void) {
+    const char *s = getenv("ELYA_STACK_MIB");
+    if (!s) {
+        return ELYA_STACK_DEFAULT_MIB;
+    }
+    int64_t v = 0;
+    int ok = *s != '\0';
+    for (const char *p = s; ok && *p; p++) {
+        if (*p < '0' || *p > '9') {
+            ok = 0;
+        } else {
+            v = v * 10 + (*p - '0');
+            if (v > ELYA_STACK_MAX_MIB) {
+                ok = 0;
+            }
+        }
+    }
+    if (!ok || v < 1) {
+        fputs("elya: ELYA_STACK_MIB must be a whole number of MiB from 1 to 1048576\n", stderr);
+        exit(1);
+    }
+    return v;
+}
+
+#ifdef _WIN32
+/* Room for the handler to run on the overflowed thread. */
+static DWORD WINAPI elya_program_thread(LPVOID arg) {
+    (void)arg;
+    ULONG guarantee = 64 * 1024;
+    SetThreadStackGuarantee(&guarantee);
+    elya_entry_result = elya_entry_ptr();
+    return 0;
+}
+
+static LONG CALLBACK elya_overflow_handler(PEXCEPTION_POINTERS e) {
+    if (e->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
+        elya_stack_overflowed();
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+int64_t elya_start(elya_entry_fn entry) {
+    elya_stack_mib = elya_stack_size_mib();
+    elya_trace_init();
+    elya_entry_ptr = entry;
+    AddVectoredExceptionHandler(1, elya_overflow_handler);
+    HANDLE t = CreateThread(NULL, (SIZE_T)elya_stack_mib << 20, elya_program_thread, NULL,
+                            STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!t) {
+        elya_stack_unavailable();
+    }
+    WaitForSingleObject(t, INFINITE);
+    CloseHandle(t);
+    elya_trace_finish();
+    return elya_entry_result;
+}
+#else
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+/* D5: 1 MiB of PROT_NONE below the stack, so no frame can step over it. */
+#define ELYA_GUARD_BYTES ((size_t)1 << 20)
+
+static char *elya_guard_lo;
+static char *elya_guard_hi;
+static sigjmp_buf elya_overflow_jump;
+static char elya_signal_stack[64 * 1024];
+
+/* On the alternate stack. A fault in the guard is the overflow: jump back to
+ * the thread's entry, whose stack is intact, and report from there. Any other
+ * fault is not ours to name: restore the default action and return, so the
+ * faulting instruction runs again and the process dies by the signal, as it
+ * always did. */
+static void elya_fault(int sig, siginfo_t *info, void *uc) {
+    (void)uc;
+    char *a = (char *)info->si_addr;
+    if (a >= elya_guard_lo && a < elya_guard_hi) {
+        siglongjmp(elya_overflow_jump, 1);
+    }
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    sigaction(sig, &dfl, NULL);
+    /* A signal SENT (kill, raise: si_code <= 0) has no instruction to run
+     * again; send it once more, now to the default action (the 2026-10-16
+     * review, L1). It is blocked while this handler runs, so it is delivered,
+     * and kills, as the handler returns. */
+    if (info->si_code <= 0) {
+        raise(sig);
+    }
+}
+
+static void *elya_program_thread(void *arg) {
+    (void)arg;
+    stack_t ss;
+    ss.ss_sp = elya_signal_stack;
+    ss.ss_size = sizeof elya_signal_stack;
+    ss.ss_flags = 0;
+    if (sigaltstack(&ss, NULL) != 0) {
+        elya_stack_unavailable();
+    }
+    if (sigsetjmp(elya_overflow_jump, 1)) {
+        elya_stack_overflowed();
+    }
+    elya_entry_result = elya_entry_ptr();
+    return NULL;
+}
+
+int64_t elya_start(elya_entry_fn entry) {
+    elya_stack_mib = elya_stack_size_mib();
+    elya_trace_init();
+    elya_entry_ptr = entry;
+    size_t size = (size_t)elya_stack_mib << 20;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+    flags |= MAP_NORESERVE;
+#endif
+    char *base = (char *)mmap(NULL, size + ELYA_GUARD_BYTES, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (base == (char *)MAP_FAILED) {
+        elya_stack_unavailable();
+    }
+    if (mprotect(base, ELYA_GUARD_BYTES, PROT_NONE) != 0) {
+        elya_stack_unavailable();
+    }
+    elya_guard_lo = base;
+    elya_guard_hi = base + ELYA_GUARD_BYTES;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = elya_fault;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL); /* macOS reports a guard page as SIGBUS */
+    pthread_attr_t attr;
+    pthread_t t;
+    if (pthread_attr_init(&attr) != 0 || pthread_attr_setstack(&attr, base + ELYA_GUARD_BYTES, size) != 0 ||
+        pthread_create(&t, &attr, elya_program_thread, NULL) != 0) {
+        elya_stack_unavailable();
+    }
+    pthread_attr_destroy(&attr);
+    pthread_join(t, NULL);
+    elya_trace_finish();
+    return elya_entry_result;
+}
+#endif

@@ -405,6 +405,7 @@ mod tests {
         let core = CoreModule {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
+            effects: Default::default(),
             fns: vec![CoreFn {
                 row: elya::types::EffectRow::pure(),
                 name: "main".to_string(),
@@ -438,6 +439,7 @@ mod tests {
         let core = CoreModule {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
+            effects: Default::default(),
             fns: vec![CoreFn {
                 row: elya::types::EffectRow::pure(),
                 name: "wrap".to_string(),
@@ -473,6 +475,7 @@ mod tests {
         let core = CoreModule {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
+            effects: Default::default(),
             fns: vec![CoreFn {
                 row: elya::types::EffectRow::pure(),
                 name: "id".to_string(),
@@ -522,6 +525,7 @@ mod tests {
         let core = CoreModule {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
+            effects: Default::default(),
             fns: vec![CoreFn {
                 row: elya::types::EffectRow::pure(),
                 name: "two".to_string(),
@@ -558,6 +562,7 @@ mod tests {
                 ret,
                 is_multi_declared: false,
                 multi: false,
+                any: false,
             })),
         )
     }
@@ -626,6 +631,7 @@ mod tests {
         let core = CoreModule {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
+            effects: Default::default(),
             fns: vec![CoreFn {
                 row: elya::types::EffectRow::pure(),
                 name: "h".to_string(),
@@ -677,6 +683,7 @@ mod tests {
         let core = CoreModule {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
+            effects: Default::default(),
             fns: vec![CoreFn {
                 row: elya::types::EffectRow::pure(),
                 name: "p".to_string(),
