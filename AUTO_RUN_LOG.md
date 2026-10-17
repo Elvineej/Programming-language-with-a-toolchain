@@ -7,6 +7,28 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 
 - The 2026-10-16 17:53 run never marked DONE; its last commit (7dc40b5) is 20:01, over
   3 hours ago, so this run takes over at 7dc40b5.
+- LLVM 18 dev headers and libzstd-dev installed via apt. Baseline 1054 / 101.
+- **Done: `with any` natively** (1789c12, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-17-elya-native-any-handlers-design.md`. After row
+  specialization a `with any` handle is expanded into a plain handle, one clause per
+  handled operation at its answer type; literals through a runtime reflection table
+  with the evaluator's failure words. `examples/09_record_any.elya` runs natively.
+  Gate 1069 / 102 (predicted 1067 before the review; +2 review tests). Sweep: 700
+  programs, no disagreement or crash; of the 9 `with any` programs, 6 now agree and 3
+  are refused by name (2 `Float`, 1 non-regular type), as predicted.
+  - **Decisions (mine; please review):** expansion (monomorphizing the clause) rather
+    than a run-time operation value; an operation value used other than by `op.*` or
+    `==` is refused natively by name (no corpus program does it; HANDOFF step 5);
+    decoding at an effect's own parameter stays a failure natively too (parity with
+    the evaluator's S2, though natively the type is known).
+  - **Changed expectation by this decision:** tests/core_lowering.rs
+    `an_operation_generic_handler_is_refused_at_lowering` became
+    `an_operation_generic_handler_lowers_marked_any`.
+  - Review: 2 high (a generic helper at the answer type; `o == o` with a function in
+    an argument) + 1 medium, fixed test-first.
+  - `graphify` (CLAUDE.md) is not installed here and `graphify-out/` does not exist,
+    so no graph update was run.
+- Windows-gate debt added: 1789c12 (new runtime C: `elya_any_*`).
 
 ## 2026-10-16 17:53 UTC — ended without a DONE mark (taken over 2026-10-17 01:53)
 
