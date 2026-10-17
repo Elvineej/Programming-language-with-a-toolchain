@@ -43,6 +43,19 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   - Plan deviation: the native unary test was written after Core's lowering, so it
     was not red first natively (its root counterpart was; K1 shows it has teeth).
 - Windows-gate debt added: a6905a5.
+- **Done: record and replay natively** (95f4680, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-17-elya-native-record-replay-design.md`.
+  `ELYA_RECORD=<file>` / `ELYA_REPLAY=<file>` on a native binary; the evaluator's
+  trace format and failure words, so traces move both ways between `elya run` and
+  native runs. Gate 1086 / 106 (predicted 1084, +2 review tests).
+  - **Decisions (mine; please review):** environment variables (not a build flag);
+    a malformed trace exits 1 and an unreadable/unwritable one exits 2, matching
+    the CLI.
+  - Review: 3 medium (unchecked writes, Unicode trim, non-UTF-8 traces) + 1 low
+    (NUL bytes), fixed test-first. Found (older): `--replay` drops a failing run's
+    output and `--record` puts it on stderr -- now HANDOFF step 5.
+- Windows-gate debt added: 95f4680 (runtime C; the Windows `elya_start` now calls
+  the trace init/finish too).
 
 ## 2026-10-16 17:53 UTC — ended without a DONE mark (taken over 2026-10-17 01:53)
 
