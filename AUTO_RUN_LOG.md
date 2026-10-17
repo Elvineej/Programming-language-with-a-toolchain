@@ -29,6 +29,20 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   - `graphify` (CLAUDE.md) is not installed here and `graphify-out/` does not exist,
     so no graph update was run.
 - Windows-gate debt added: 1789c12 (new runtime C: `elya_any_*`).
+- **Done: unary operators natively; wrapping and bit arithmetic** (a6905a5, HANDOFF
+  step 1). Spec `docs/superpowers/specs/2026-10-17-elya-unary-and-wrapping-design.md`.
+  `-e`/`!e` lower in Core as `0 - e`/`e == False`; new pure builtins
+  `int.wrapping_add/sub/mul`, `int.and/or/xor`, `int.shl/shr/ushr`. Gate 1079 / 105
+  (predicted 1077, +2 from the review's fix).
+  - **Decisions (mine; please review):** named builtins, not operators (`^`, `<<`,
+    `&`, `|`); Rust's names; an out-of-range shift amount fails by name rather than
+    being masked; no wrapping integer type.
+  - Review: 1 low finding fixed (E0208's help now wraps a builtin at its arity);
+    MIN not writable as a literal and the leading-`-` line continuation recorded as
+    HANDOFF step 5.
+  - Plan deviation: the native unary test was written after Core's lowering, so it
+    was not red first natively (its root counterpart was; K1 shows it has teeth).
+- Windows-gate debt added: a6905a5.
 
 ## 2026-10-16 17:53 UTC — ended without a DONE mark (taken over 2026-10-17 01:53)
 
