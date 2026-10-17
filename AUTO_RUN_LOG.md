@@ -3,7 +3,7 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-17 01:53 UTC — IN PROGRESS (scheduled run)
+## 2026-10-17 01:53 UTC — IN PROGRESS (scheduled run; still active at 04:25, see the last line of this entry)
 
 - The 2026-10-16 17:53 run never marked DONE; its last commit (7dc40b5) is 20:01, over
   3 hours ago, so this run takes over at 7dc40b5.
@@ -56,6 +56,7 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     output and `--record` puts it on stderr -- now HANDOFF step 5.
 - Windows-gate debt added: 95f4680 (runtime C; the Windows `elya_start` now calls
   the trace init/finish too).
+- Still active at 04:25 UTC, on HANDOFF step 1 (multi-shot resumes over a deep chain).
 
 ## 2026-10-16 17:53 UTC — ended without a DONE mark (taken over 2026-10-17 01:53)
 
