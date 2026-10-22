@@ -4,3 +4,8 @@
 # Stray local tooling dir (not part of Elya)
 /Continuous-Claude/
 /graphify-out/
+
+# unlazy skill (.claude/skills/unlazy): local pipeline state, hook state, local hook install
+/.unlazy/
+.unlazy-hook-state.json
+/.claude/settings.local.json
