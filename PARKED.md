@@ -388,7 +388,12 @@ sub-effecting at function-value joins (a pure function usable where `{T}` is exp
   supported yet"): they need a row story for type declarations.
 
 
-## Multi-shot with a non-tail resume over deep non-tail recursion exhausts memory (found 2026-10-16)
+## RESOLVED (auto/elya, 2026-10-22, spec `2026-10-22-elya-multi-shot-sharing-design.md`): multi-shot with a non-tail resume over deep non-tail recursion exhausts memory (found 2026-10-16)
+
+A handle's body now ends at a shared end frame, so a multi-shot resume shares every site
+frame and copies only the handler frames on the perform's path. The program below runs
+natively in 0.01 s at 20 000 deep (`the_parked_deep_multi_shot_program_runs_natively`);
+its live set is linear (`a_deep_multi_shot_chain_is_shared_not_copied`). Original report:
 
 Found by the native-stack review, on `HEAD` before that slice too:
 

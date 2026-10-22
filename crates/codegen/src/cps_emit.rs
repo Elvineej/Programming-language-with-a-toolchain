@@ -441,6 +441,60 @@ pub(crate) struct HandlerFns<'ctx> {
     pub(crate) table: PointerValue<'ctx>,
 }
 
+/// The end frame's code (spec 2026-10-22-elya-multi-shot-sharing D1),
+/// `elya_rt_handle_end : (i64 value, ptr frame) -> i64`, `tailcc`. Every
+/// handle's body is a region whose continuation is the end frame (runtime.c
+/// `elya_handle_end_block`), not its own handler frame, so no site frame points
+/// at a handler frame and a multi-shot resume shares every site frame. Reaching
+/// it continues in the CURRENT handler's code (its return clause) with that
+/// frame: at the end of a handle's body the current handler is always the
+/// handle's own frame (install makes it current; an inner handle's clauses and
+/// return clause run with its `parent` current; a resume restores the
+/// perform's `innermost`). One indirect `musttail`; the value passes through.
+pub(crate) fn emit_handle_end<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+    b: &Builder<'ctx>,
+    current_handler: PointerValue<'ctx>,
+) -> R<FunctionValue<'ctx>> {
+    let i64t = ctx.i64_type();
+    let ptrt = ctx.ptr_type(AddressSpace::default());
+    let code_ty = i64t.fn_type(&[i64t.into(), ptrt.into()], false);
+    let f = module.add_function(
+        "elya_rt_handle_end",
+        code_ty,
+        Some(inkwell::module::Linkage::Internal),
+    );
+    f.set_call_conventions(TAILCC);
+    let entry = ctx.append_basic_block(f, "entry");
+    b.position_at_end(entry);
+    let v = f
+        .get_nth_param(0)
+        .ok_or_else(|| internal("the end frame's code has no value parameter"))?;
+    let h = b
+        .build_load(ptrt, current_handler, "h")
+        .map_err(internal)?
+        .into_pointer_value();
+    let slot =
+        unsafe { b.build_gep(i64t, h, &[i64t.const_int(1, false)], "cw") }.map_err(internal)?;
+    let cw = b
+        .build_load(i64t, slot, "c")
+        .map_err(internal)?
+        .into_int_value();
+    let code = b.build_int_to_ptr(cw, ptrt, "code").map_err(internal)?;
+    let site = b
+        .build_indirect_call(code_ty, code, &[v.into(), h.into()], "ret")
+        .map_err(internal)?;
+    site.set_call_convention(TAILCC);
+    site.set_tail_call_kind(LLVMTailCallKind::LLVMTailCallKindMustTail);
+    let r = site
+        .try_as_basic_value()
+        .left()
+        .ok_or(CodegenError::Unsupported("call returned no value"))?;
+    b.build_return(Some(&r)).map_err(internal)?;
+    Ok(f)
+}
+
 /// One resumption function per continuation site (calls and, since Task 8,
 /// performs), and per handle its body, return clause, clause functions and
 /// static clause table.
@@ -2079,7 +2133,10 @@ pub(crate) fn emit_sites_and_handlers<'ctx>(
             return Err(internal("a handler key names a non-handle node"));
         };
         // Body: `(ptr frame) -> i64`, a CPS region whose continuation is the
-        // handler frame itself.
+        // END frame, not the handler frame (spec 2026-10-22-elya-multi-shot-
+        // sharing D1): reaching it continues in the current handler -- this
+        // frame -- so no site frame of the body points at a handler frame. The
+        // frame is still where the body's saved bindings come from.
         let entry = ctx.append_basic_block(body_fn, "entry");
         b.position_at_end(entry);
         let hf = body_fn
@@ -2092,7 +2149,11 @@ pub(crate) fn emit_sites_and_handlers<'ctx>(
             b,
             lc,
         };
-        let mut st = St::new(hf);
+        let end = b
+            .build_load(cx.ptrt(), lc.handle_end, "end")
+            .map_err(internal)?
+            .into_pointer_value();
+        let mut st = St::new(end);
         load_saved(&cx, &mut st, hf, &h.saved, HANDLER_SAVED)?;
         st.depth = h.depth;
         st.rebuild_env();

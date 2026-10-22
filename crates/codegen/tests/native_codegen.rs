@@ -919,6 +919,10 @@ struct GcStats {
     /// Visible words still live at the end of the LAST collection — the LEVEL,
     /// where `freed` and `words_since_gc` are flows (5b-6 §11, obligation T7).
     live: i64,
+    /// Collections that ran inside a multi-shot copy (`elya_cont_copy`), when
+    /// the runtime reports them (spec 2026-10-22-elya-multi-shot-sharing, the
+    /// review's note 1).
+    mid_copy: Option<i64>,
 }
 
 /// Run `exe` with statistics enabled, returning its RAW stdout and the
@@ -953,6 +957,13 @@ fn run_with_gc_stats_raw(exe: &Path, tag: &str) -> (String, GcStats) {
         collections: field("collections="),
         freed: field("freed="),
         live: field("live="),
+        mid_copy: line
+            .split_whitespace()
+            .find_map(|f| f.strip_prefix("mid_copy="))
+            .map(|v| {
+                v.parse()
+                    .unwrap_or_else(|e| panic!("{tag}: `mid_copy=` is not a number: {e}"))
+            }),
     };
     (String::from_utf8_lossy(&out.stdout).to_string(), stats)
 }
@@ -4204,6 +4215,18 @@ const MULTI_SHOT: &[(&str, &str, &str)] = &[
          pub fn main() -> Int { handle nest(1000) with multi { Flip.flip() -> resume(True) * 1000000 + resume(False) } }\n",
         "1001001002",
     ),
+    (
+        // Spec 2026-10-22-elya-multi-shot-sharing D2: a copy is the handler path,
+        // so this is the shape whose copies are long -- 301 handler frames, copied
+        // twice per run, 100 runs. The mid-copy collection test runs it (m11's
+        // copies are one frame since D2, and it no longer collects at all).
+        "m13-handler-chain-loop",
+        "effect multi Flip { fn flip() -> Bool }\neffect S { fn get() -> Int }\n\
+         fn nest(n) { if n == 0 { if flip() { 1 } else { 2 } } else { handle { nest(n - 1) + get() } with { S.get() -> resume(1)  return(r) -> r } } }\n\
+         fn go(i, acc) { if i == 0 { acc } else { go(i - 1, acc + handle nest(300) with multi { Flip.flip() -> resume(True) + resume(False) }) } }\n\
+         pub fn main() -> Int { go(100, 0) }\n",
+        "60300",
+    ),
 ];
 
 #[test]
@@ -4349,19 +4372,147 @@ fn a_multi_shot_loops_live_set_stays_bounded() {
 }
 
 /// Spec D3: the copy allocates, so a collection can run in the middle of one.
-/// m11 copies 300-frame chains 80 times and must collect; the answer must
-/// still be the evaluator's.
+/// m13 copies 301-frame handler paths 200 times and must collect; the answer
+/// must still be the evaluator's. (Until 2026-10-22 this ran m11, whose
+/// 300-frame chain was copied whole; since multi-shot sharing D2 m11's copies
+/// are one frame and it never collects.)
 #[test]
 fn copies_survive_a_collection_mid_copy() {
     let (_, src, want) = MULTI_SHOT
         .iter()
-        .find(|(t, _, _)| *t == "m11-deep-chain")
-        .expect("m11 in the corpus");
+        .find(|(t, _, _)| *t == "m13-handler-chain-loop")
+        .expect("m13 in the corpus");
     let dir = temp_dir("multi-gc");
     let exe = compile_and_link(&lower_src(src), &dir, "multi-gc");
     let (stdout, stats) = run_with_gc_stats(&exe, "multi-gc");
     assert!(stats.collections > 0, "no collection ran: {stats:?}");
+    // The claim itself, not only a collection somewhere (the review's note 1):
+    // measured 6 of m13's 16 collections inside a copy.
+    let mid = stats
+        .mid_copy
+        .unwrap_or_else(|| panic!("the runtime reports no `mid_copy=`: {stats:?}"));
+    assert!(mid > 0, "no collection ran inside a copy: {stats:?}");
     assert_eq!(&stdout, want);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// PARKED.md's program (2026-10-16): a `with multi` clause that resumes NON-tail,
+/// over a non-tail recursion that performs at every level. Spec
+/// `2026-10-22-elya-multi-shot-sharing-design.md`.
+fn deep_multi_src(n: i64) -> String {
+    format!(
+        "effect multi Flip {{ fn flip() -> Bool }}\n\
+         fn nest(n) {{ if n == 0 {{ 0 }} else {{ let b = flip()  if b {{ 1 + nest(n - 1) }} else {{ nest(n - 1) }} }} }}\n\
+         pub fn main() -> Int {{ handle nest({n}) with multi {{ Flip.flip() -> 0 + resume(True) }} }}\n"
+    )
+}
+
+/// Spec D2: a multi-shot resume shares the captured chain and copies only the
+/// handler frames on its path, so the PARKED program's live set is linear in
+/// its depth. Copying the whole chain kept a copy of `i` frames alive at level
+/// `i` (§0: 65 126 164 words at N = 8 000, x4 per doubling).
+#[test]
+fn a_deep_multi_shot_chain_is_shared_not_copied() {
+    let dir = temp_dir("multi-shared-chain");
+    for n in [8_000i64, 16_000] {
+        let tag = format!("multi-shared-{n}");
+        let exe = compile_and_link(&lower_src(&deep_multi_src(n)), &dir, &tag);
+        let (stdout, stats) = run_with_gc_stats(&exe, &tag);
+        assert_eq!(stdout, n.to_string(), "{tag}");
+        assert!(stats.collections > 0, "{tag}: no collection ran: {stats:?}");
+        assert!(
+            stats.live < 64 * n,
+            "{tag}: the live set must be linear in the depth (under 64 words a level): {stats:?}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Spec D2 under a CPS `with multi` handle (it leaks `S`, so its resume is a
+/// `musttail` jump, not a nesting call). Nothing keeps the originals alive here,
+/// so the old copy showed as garbage, not as live words: blocks freed grew x4
+/// per doubling (§0's CPS row: 8 017 989 at N = 4 000).
+#[test]
+fn a_deep_cps_multi_shot_chain_is_shared_not_copied() {
+    let dir = temp_dir("multi-shared-cps");
+    for n in [2_000i64, 4_000] {
+        let src = format!(
+            "effect multi Flip {{ fn flip() -> Bool }}\n\
+             effect S {{ fn get() -> Int }}\n\
+             fn nest(n) {{ if n == 0 {{ 0 }} else {{ let b = flip()  if b {{ get() + nest(n - 1) }} else {{ nest(n - 1) }} }} }}\n\
+             fn run(n) {{ handle nest(n) with multi {{ Flip.flip() -> 0 + resume(True) }} }}\n\
+             pub fn main() -> Int {{ handle run({n}) with {{ S.get() -> resume(1) }} }}\n"
+        );
+        let tag = format!("multi-shared-cps-{n}");
+        let exe = compile_and_link(&lower_src(&src), &dir, &tag);
+        let (stdout, stats) = run_with_gc_stats(&exe, &tag);
+        assert_eq!(stdout, n.to_string(), "{tag}");
+        assert!(
+            stats.freed < 64 * n,
+            "{tag}: the blocks a run frees must be linear in the depth (under 64 a level): {stats:?}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// PARKED.md's program at the depth it was found at: `elya: out of memory`
+/// natively (§0, under a 4 GiB address-space limit), 0.29 s in the evaluator.
+/// On the program's default stack, like the `DEEP` tests.
+#[test]
+fn the_parked_deep_multi_shot_program_runs_natively() {
+    let src = deep_multi_src(20_000);
+    let session = Session::new();
+    let (m, pd) = parse_module(&session, &src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let (_, eval) = elya::eval::run_module_value(&m).expect("the evaluator runs it");
+    assert_eq!(format!("{eval:?}"), "Int(20000)");
+    let dir = temp_dir("multi-parked");
+    let exe = compile_and_link(&lower_src(&src), &dir, "parked");
+    let out = Command::new(&exe).output().expect("run produced binary");
+    assert!(
+        out.status.success(),
+        "{:?}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "20000\n");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Spec D3: a handle's body no longer reaches its handler frame through
+/// `next` (D1), so a frame that is current and saved nowhere else must be kept
+/// by the collector's root for the current handler. Each body allocates 6-word
+/// blocks, the size of a handler frame with one saved binding, so a freed frame
+/// is reused under its own body and its return clause would run garbage. A
+/// direct handle and a CPS one (it leaks `S`). A guard: before D1 the chain kept
+/// the frame alive, so its red is control K4 (no root).
+#[test]
+fn a_handler_frame_reachable_only_as_current_survives_collections() {
+    let dir = temp_dir("current-handler-root");
+    let churn = "type B { B(Int, Int, Int, Int, Int) }\n\
+                 effect E { fn e() -> Int }\n\
+                 effect S { fn get() -> Int }\n\
+                 fn churn(n, acc) { if n == 0 { acc } else { match B(n, n, n, n, n) { B(a, _, _, _, _) -> churn(n - 1, acc + a % 2) } } }\n";
+    for (tag, main, want) in [
+        (
+            "direct",
+            "fn work(s) { handle { churn(300000, 0) } with { E.e() -> resume(0)  return(r) -> r + s } }\n\
+             pub fn main() -> Int { work(7) }\n",
+            "150007",
+        ),
+        (
+            "cps",
+            "fn work(s) { handle { let x = get()  churn(300000, x) } with { E.e() -> resume(0)  return(r) -> r + s } }\n\
+             pub fn main() -> Int { handle work(7) with { S.get() -> resume(1) } }\n",
+            "150008",
+        ),
+    ] {
+        let src = format!("{churn}{main}");
+        let exe = compile_and_link(&lower_src(&src), &dir, tag);
+        let (stdout, stats) = run_with_gc_stats(&exe, tag);
+        assert!(stats.collections > 0, "{tag}: no collection ran: {stats:?}");
+        assert_eq!(stdout, want, "{tag}");
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 

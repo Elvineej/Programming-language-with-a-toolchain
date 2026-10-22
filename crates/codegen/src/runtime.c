@@ -64,6 +64,12 @@ static int64_t gc_shadow_top = 0, gc_shadow_cap = 0;
  * answers "how much is still reachable", which is the one place a
  * refcounting/tracing divergence could ever show up (5b-6 §11, obligation T7). */
 static int64_t gc_allocated = 0, gc_collections = 0, gc_freed = 0, gc_live = 0;
+/* Collections that ran inside a multi-shot copy (elya_cont_copy sets the
+ * flag), reported as `mid_copy=` (a name without `collections=` in it, which
+ * a test reads as a substring) with the other counters: a test asserts the copy really is
+ * interrupted (spec 2026-10-22-elya-multi-shot-sharing, the review's note 1). */
+static int64_t gc_copy_collections = 0;
+static int gc_in_cont_copy = 0;
 
 typedef struct Block {
     intptr_t meta; /* (size << 1) | mark, where size counts VISIBLE words */
@@ -219,8 +225,19 @@ static void gc_sweep(void) {
     }
 }
 
+/* Defined with the handler protocol below. */
+extern void *elya_current_handler;
+
 static void gc_collect(void) {
     gc_collections++;
+    /* The current handler is a root (spec 2026-10-22-elya-multi-shot-sharing
+     * D3): a handle's body ends at the shared end frame, not at its handler
+     * frame, so the running chain no longer reaches the frame that is current.
+     * Grayed here, before the shadow stack, so gc_mark itself is unchanged. */
+    gc_gray_push(elya_current_handler);
+    if (gc_in_cont_copy) {
+        gc_copy_collections++;
+    }
     gc_mark();
     gc_sweep();
     gc_allocated = 0;
@@ -1389,10 +1406,36 @@ void elya_match_fail(void) {
  * slice 5b-10 the innermost handler: a perform walks handler frames' traced
  * `parent` words from here, and a clause or return clause runs with its
  * frame's `parent` current, paired with that frame's `next` (or the native
- * return of a direct handle) as its continuation. Not a GC root: whenever it
- * is read, it is reachable from the live continuation through `next` and
- * `parent`. Single-threaded, like the runtime. */
+ * return of a direct handle) as its continuation. A GC root since
+ * 2026-10-22 (multi-shot sharing D3, grayed by gc_collect): a handle's body
+ * ends at the end frame below, so the running chain does not reach the frame
+ * that is current. Single-threaded, like the runtime. */
 void *elya_current_handler = 0;
+
+/* The end frame (spec 2026-10-22-elya-multi-shot-sharing D1): every handle's
+ * body is a region whose continuation is THIS frame, not its own handler
+ * frame. Its code (`elya_rt_handle_end`, generated: C cannot `musttail` a
+ * `tailcc` function) continues in the CURRENT handler's code -- at the end of
+ * a handle's body that handler is always the handle's own frame. So no site
+ * frame points at a handler frame, and a multi-shot resume can share every
+ * site frame of its chain.
+ *
+ * A static block shaped like a heap one (header, then `[tag][code]`): its mark
+ * bit is set and it is never on gc_all_blocks, so marking it stops at once and
+ * the sweep never frees it. Its tag is no constructor's, so nothing reads past
+ * the code word. The code word is set at start-up by elya_handle_end_init,
+ * which the generated `main` calls after elya_gc_init: the runtime refers to
+ * no generated symbol, so a C harness can link it alone. */
+static struct {
+    Block header;
+    int64_t words[2];
+} elya_handle_end_block = {{(2 << 1) | GC_MARK_BIT, NULL}, {-1, 0}};
+
+void *elya_handle_end = &elya_handle_end_block.words[0];
+
+void elya_handle_end_init(void *code) {
+    elya_handle_end_block.words[1] = (int64_t)(intptr_t)code;
+}
 
 /* 5b-8 D13: one-shot is enforced natively. A second resume stops here -- a
  * named message and a non-zero exit, never a re-run. */
@@ -1439,9 +1482,10 @@ void elya_unhandled_effect(void) {
 void elya_gc_report(void) {
     if (getenv("ELY_GC_STATS")) {
         fprintf(stderr,
-                "elya-gc: collections=%lld freed=%lld live=%lld words_since_gc=%lld\n",
+                "elya-gc: collections=%lld freed=%lld live=%lld words_since_gc=%lld "
+                "mid_copy=%lld\n",
                 (long long)gc_collections, (long long)gc_freed, (long long)gc_live,
-                (long long)gc_allocated);
+                (long long)gc_allocated, (long long)gc_copy_collections);
     }
 }
 
@@ -1458,35 +1502,38 @@ void elya_println(void *s) {
     fputc('\n', stdout);
 }
 
-/* Native multi-shot (spec 2026-10-10, D2-D4). A resume of a `with multi`
- * handle re-enters a COPY of its captured frames, so the original chain is
- * never run and any number of later resumes see it exactly as captured. Site
- * frames are never written after allocation, but handler frames are: every
- * resume rewrites its frame's `next` and `parent` (5b-10), including the
- * frames of handles INSIDE the captured segment. So the whole chain from `k`
- * through `next` (word 2) to the answering frame `h` is copied, each copy's
- * `next` relinked to the next copy, and the `parent` (word 4) of every copied
- * handler frame -- recognised by tag, `[hlo, hhi)` -- that points into the
- * segment redirected to the corresponding copy, as is the continuation's
- * `innermost`. Copies are shallow (D4): saved values are shared, as the
- * evaluator shares them. Returns a fresh continuation object
- * `[tag][k'][h'][innermost']`. The caller has rooted what it still needs;
- * the continuation and every copy are rooted here while the copy allocates. */
+/* Native multi-shot (spec 2026-10-10, D1/D4; copy rule revised by spec
+ * 2026-10-22-elya-multi-shot-sharing D2). A resume of a `with multi` handle
+ * re-enters the captured chain as a fresh run. Site frames are never written
+ * after allocation, so every run SHARES them: the chain `k` itself is the new
+ * continuation's chain. Handler frames are written (every resume rewrites its
+ * frame's `next` and `parent`, 5b-10), and the ones a run re-enters are exactly
+ * the perform's path: from `innermost` (word 3) through `parent` (word 4) to
+ * the answering frame `h` (word 2). Those are copied, each copy's `parent`
+ * relinked to the next copy (the last one is re-installed by the resume, as
+ * before). No site frame points at a handler frame (D1: a handle's body ends
+ * at the end frame), so nothing else needs relinking. Copies are shallow
+ * (2026-10-10 D4): saved values are shared, as the evaluator shares them.
+ * Returns a fresh continuation object `[tag][k][h'][innermost']`. Cost: the
+ * handlers on the path, not the frames on the chain. The caller has rooted
+ * what it still needs; the continuation and every copy are rooted here while
+ * the copy allocates. */
 static void elya_chain_broken(void) {
-    fputs("elya: resume: a continuation's frame chain does not reach its handler\n", stderr);
+    fputs("elya: resume: a continuation's handler chain does not reach its handler\n", stderr);
     exit(1);
 }
 
-#define CONT_NEXT 2
 #define CONT_PARENT 4
 
 void *elya_cont_copy(void *cont, int64_t hlo, int64_t hhi) {
     int64_t *c = (int64_t *)cont;
-    int64_t *k = (int64_t *)(intptr_t)c[1];
     int64_t *h = (int64_t *)(intptr_t)c[2];
+    int64_t *inner = (int64_t *)(intptr_t)c[3];
     int64_t n = 0;
-    for (int64_t *f = k;; f = (int64_t *)(intptr_t)f[CONT_NEXT]) {
-        if (!f) {
+    /* Defence in depth: the path holds handler frames only (recognised by tag,
+     * `[hlo, hhi)`) and ends at `h`; anything else is a broken protocol, named. */
+    for (int64_t *f = inner;; f = (int64_t *)(intptr_t)f[CONT_PARENT]) {
+        if (!f || f[0] < hlo || f[0] >= hhi) {
             elya_chain_broken();
         }
         n++;
@@ -1494,83 +1541,35 @@ void *elya_cont_copy(void *cont, int64_t hlo, int64_t hhi) {
             break;
         }
     }
-    int64_t **orig = (int64_t **)malloc((size_t)n * sizeof(int64_t *));
     int64_t **copy = (int64_t **)malloc((size_t)n * sizeof(int64_t *));
-    /* Open addressing, original frame address -> its index: a `parent` or
-     * `innermost` is mapped in O(1), so a chain with many handler frames does
-     * not copy in quadratic time. */
-    int64_t cap = 16;
-    while (cap < 2 * n) {
-        cap *= 2;
-    }
-    int64_t **keys = (int64_t **)calloc((size_t)cap, sizeof(int64_t *));
-    int64_t *vals = (int64_t *)malloc((size_t)cap * sizeof(int64_t));
-    if (!orig || !copy || !keys || !vals) {
+    if (!copy) {
         fputs("elya: out of memory copying a continuation\n", stderr);
         exit(1);
     }
-    int64_t i = 0;
-    for (int64_t *f = k; i < n; f = (int64_t *)(intptr_t)f[CONT_NEXT]) {
-        orig[i] = f;
-        uint64_t s = ((uint64_t)(uintptr_t)f >> 3) & (uint64_t)(cap - 1);
-        while (keys[s]) {
-            s = (s + 1) & (uint64_t)(cap - 1);
-        }
-        keys[s] = f;
-        vals[s] = i;
-        i++;
-    }
     elya_gc_push(cont);
-    for (i = 0; i < n; i++) {
-        int64_t words = (int64_t)(gc_block_of(orig[i])->meta >> 1);
+    gc_in_cont_copy = 1;
+    int64_t i = 0;
+    for (int64_t *f = inner; i < n; f = (int64_t *)(intptr_t)f[CONT_PARENT]) {
+        int64_t words = (int64_t)(gc_block_of(f)->meta >> 1);
         int64_t *p = (int64_t *)elya_alloc(words);
-        memcpy(p, orig[i], (size_t)words * 8);
+        memcpy(p, f, (size_t)words * 8);
         copy[i] = p;
         elya_gc_push(p);
+        i++;
     }
-#define LOOKUP(ptr, out)                                                        \
-    do {                                                                        \
-        int64_t *q_ = (ptr);                                                    \
-        (out) = -1;                                                             \
-        if (q_) {                                                               \
-            uint64_t s_ = ((uint64_t)(uintptr_t)q_ >> 3) & (uint64_t)(cap - 1); \
-            while (keys[s_]) {                                                  \
-                if (keys[s_] == q_) {                                           \
-                    (out) = vals[s_];                                           \
-                    break;                                                      \
-                }                                                               \
-                s_ = (s_ + 1) & (uint64_t)(cap - 1);                            \
-            }                                                                   \
-        }                                                                       \
-    } while (0)
-    for (i = 0; i < n; i++) {
-        if (i + 1 < n) {
-            copy[i][CONT_NEXT] = (int64_t)(intptr_t)copy[i + 1];
-        }
-        int64_t tag = copy[i][0];
-        if (tag >= hlo && tag < hhi) {
-            int64_t j;
-            LOOKUP((int64_t *)(intptr_t)copy[i][CONT_PARENT], j);
-            if (j >= 0) {
-                copy[i][CONT_PARENT] = (int64_t)(intptr_t)copy[j];
-            }
-        }
+    for (i = 0; i + 1 < n; i++) {
+        copy[i][CONT_PARENT] = (int64_t)(intptr_t)copy[i + 1];
     }
     int64_t *fresh = (int64_t *)elya_alloc(4);
     fresh[0] = c[0];
-    fresh[1] = (int64_t)(intptr_t)copy[0];
+    fresh[1] = c[1];
     fresh[2] = (int64_t)(intptr_t)copy[n - 1];
-    int64_t j;
-    LOOKUP((int64_t *)(intptr_t)c[3], j);
-    fresh[3] = j >= 0 ? (int64_t)(intptr_t)copy[j] : c[3];
-#undef LOOKUP
+    fresh[3] = (int64_t)(intptr_t)copy[0];
+    gc_in_cont_copy = 0;
     for (i = 0; i <= n; i++) {
         elya_gc_pop();
     }
-    free(orig);
     free(copy);
-    free(keys);
-    free(vals);
     return fresh;
 }
 

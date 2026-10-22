@@ -2129,6 +2129,10 @@ struct LowerCtx<'a, 'ctx> {
     /// Task 8 runtime: the address of `elya_current_handler`, and
     /// `elya_resume_twice`, `elya_unhandled_effect` (both `ccc`).
     current_handler: inkwell::values::PointerValue<'ctx>,
+    /// The address of `elya_handle_end` (runtime.c), which holds the end
+    /// frame every handle's body continues to (spec
+    /// 2026-10-22-elya-multi-shot-sharing D1).
+    handle_end: inkwell::values::PointerValue<'ctx>,
     resume_twice: FunctionValue<'ctx>,
     unhandled: FunctionValue<'ctx>,
     /// Checked `Int` arithmetic's traps (`ccc`, they exit):
@@ -2325,6 +2329,16 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let current_handler = module
         .add_global(ptrt, Some(AddressSpace::default()), "elya_current_handler")
         .as_pointer_value();
+    // The end frame (spec 2026-10-22-elya-multi-shot-sharing D1): runtime.c
+    // defines the block and `elya_handle_end`, its address; its code is
+    // generated here and handed over by `main` through `elya_handle_end_init`
+    // (`ccc`).
+    let handle_end = module
+        .add_global(ptrt, Some(AddressSpace::default()), "elya_handle_end")
+        .as_pointer_value();
+    let handle_end_init_ty = ctx.void_type().fn_type(&[ptrt.into()], false);
+    let handle_end_init = module.add_function("elya_handle_end_init", handle_end_init_ty, None);
+
     // `with any` (spec 2026-10-17 D3): the reflection table for the types
     // `any.show` and `any.decode` are used at, and its runtime entry points.
     let reflect = reflect::Reflect::of(core, &ctors)?;
@@ -2433,6 +2447,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         handler_fns: &handler_fns,
         op_ids: &op_ids,
         current_handler,
+        handle_end,
         resume_twice,
         int_overflow,
         div_zero,
@@ -2449,6 +2464,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         shift_range,
     };
     let b = ctx.create_builder();
+    let handle_end_code = cps_emit::emit_handle_end(ctx, &module, &b, current_handler)?;
     for f in &core.fns {
         if cps_fns.contains(&f.name) {
             cps_emit::emit_cps_fn(ctx, &b, &lc, f)?;
@@ -2527,6 +2543,14 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
             desc_global.as_pointer_value().into(),
             i64t.const_int(n_ctors, false).into(),
         ],
+        "",
+    )
+    .map_err(internal)?;
+    // The end frame's code, before any handle can run (spec
+    // 2026-10-22-elya-multi-shot-sharing D3).
+    b.build_call(
+        handle_end_init,
+        &[handle_end_code.as_global_value().as_pointer_value().into()],
         "",
     )
     .map_err(internal)?;
