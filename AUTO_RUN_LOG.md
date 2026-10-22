@@ -3,13 +3,15 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-22 15:22 UTC — IN PROGRESS (interactive session, at the maintainer's "Start next task")
+## 2026-10-22 21:50 UTC — IN PROGRESS (interactive session, at the maintainer's "Start next task"; started 15:22, re-dated 21:50)
 
 - The 2026-10-17 01:53 entry never marked DONE; its last commit (7ac69a6) is 10-17 04:19,
   days ago. Every scheduled run since has stopped on the usage limit at start. This
   session takes over at 7ac69a6; it re-dates this entry before it is 3 hours old while
   still working, and marks it DONE or hands it over before it stops.
 - Working on: HANDOFF step 1, multi-shot resumes over a deep chain.
+- 21:50: still active. The slice is built and gated (1090 / 106, predicted 1090) but not
+  committed yet: its independent review stopped on the usage limit and is being resumed.
 
 ## 2026-10-17 01:53 UTC — ended without a DONE mark (taken over 2026-10-22 15:22)
 
