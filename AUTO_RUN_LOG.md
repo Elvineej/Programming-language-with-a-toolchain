@@ -3,6 +3,11 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
+## 2026-10-22 22:35 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue until u reach the limit")
+
+- Took the lock at ebc2635. Baseline 1090 / 106. Starting HANDOFF step 1 (one wording
+  for the one-shot trap, and the sweep's smaller gaps).
+
 ## 2026-10-22 15:22 UTC — DONE at 22:12 (interactive session, at the maintainer's "Start next task")
 
 - The 2026-10-17 01:53 entry never marked DONE; its last commit (7ac69a6) is 10-17 04:19.
