@@ -3,15 +3,35 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-22 21:50 UTC — IN PROGRESS (interactive session, at the maintainer's "Start next task"; started 15:22, re-dated 21:50)
+## 2026-10-22 15:22 UTC — DONE at 22:12 (interactive session, at the maintainer's "Start next task")
 
-- The 2026-10-17 01:53 entry never marked DONE; its last commit (7ac69a6) is 10-17 04:19,
-  days ago. Every scheduled run since has stopped on the usage limit at start. This
-  session takes over at 7ac69a6; it re-dates this entry before it is 3 hours old while
-  still working, and marks it DONE or hands it over before it stops.
-- Working on: HANDOFF step 1, multi-shot resumes over a deep chain.
-- 21:50: still active. The slice is built and gated (1090 / 106, predicted 1090) but not
-  committed yet: its independent review stopped on the usage limit and is being resumed.
+- The 2026-10-17 01:53 entry never marked DONE; its last commit (7ac69a6) is 10-17 04:19.
+  Every scheduled run since stopped on the usage limit at start. This session took over
+  at 7ac69a6 (lock b2ec3cf, heartbeat cfe3021). LLVM 18 was already installed.
+  Baseline 1086 / 106.
+- **Done: multi-shot resumes share the captured chain** (e78ace6, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-22-elya-multi-shot-sharing-design.md`, plan
+  `docs/superpowers/plans/2026-10-22-elya-multi-shot-sharing.md`.
+  - A handle's body continues to one shared end frame, not to its handler frame. A
+    multi-shot resume copies only the handler frames on the perform's path, and the
+    current handler is a collector root.
+  - PARKED's `nest(20000)` went from out of memory to 0.01 s; 100 000 deep runs in
+    0.07 s (the evaluator 1.2 s).
+  - Gate 1090 / 106 (predicted 1090). Controls K1-K4 each failed distinctly.
+  - **Decisions (mine; please review):** the end frame and a handler-only copy (rather
+    than copying the chain and un-rooting the clause's continuation, or copying lazily);
+    the current handler as a GC root.
+  - **Changed test, by this decision:** `copies_survive_a_collection_mid_copy` ran m11,
+    which no longer collects. It runs a new corpus row, m13, and since the review
+    asserts a collection INSIDE a copy (`mid_copy=`, a new ELY_GC_STATS field).
+  - Review: no high or medium finding (2 525 random programs, the sweep and the
+    corpora under a collect-every-few-allocations runtime). Three low notes fixed.
+  - Sweeps: `scripts/sweep.py` (735) and the session's 763 found no disagreement. The
+    4 both-fail-differently are the one-shot wording (now step 1).
+- Windows-gate debt added: e78ace6 (runtime C: the end block, `elya_handle_end_init`,
+  `elya_cont_copy`, `gc_collect`'s root and `mid_copy`; the generated end frame).
+- HANDOFF: step 1 moved to Done; new step 5, "Modules, part 1". Next: HANDOFF step 1,
+  one wording for the one-shot trap.
 
 ## 2026-10-17 01:53 UTC — ended without a DONE mark (taken over 2026-10-22 15:22)
 

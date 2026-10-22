@@ -3,7 +3,7 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-16, a scheduled run on `auto/elya`)
+## State at handoff (updated 2026-10-22, an interactive session on `auto/elya`)
 
 - `main` has everything through #22 (the 2026-10-09/10 auto-runs: N7 part 1 through
   exact replay).
@@ -14,10 +14,11 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1086 passed, 106 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1090 passed, 106 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
-  functions; `gc_mark` is unchanged (637 bytes of source).
+  functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
+  current handler as a root); `gc_mark` is unchanged (637 bytes of source).
 - Interactive sessions may also work on `auto/elya`. They use the same
   `AUTO_RUN_LOG.md` lock: an IN PROGRESS entry under 3 hours old makes a scheduled run
   exit.
@@ -363,18 +364,18 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   moves between `elya run --record/--replay` and native runs in both directions.
   Needs the Windows gate.
 
+- **Multi-shot resumes share the captured chain** (2026-10-22, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-22-elya-multi-shot-sharing-design.md`. A handle's body
+  now continues to one shared end frame (`elya_rt_handle_end` continues in the current
+  handler), so no site frame points at a handler frame. A multi-shot resume shares the
+  whole chain and copies only the handler frames on the perform's path, and the current
+  handler is a collector root. PARKED's `nest(20000)` (out of memory) runs in 0.01 s;
+  100 000 deep in 0.07 s (the evaluator 1.2 s). `copies_survive_a_collection_mid_copy`
+  moved from m11 to a new row m13 (m11 no longer collects). Needs the Windows gate.
+
 ## The next five steps
 
-### 1. Multi-shot resumes over a deep chain
-
-Found by the native-stack review (PARKED.md, 2026-10-16): a `with multi` handler whose
-clause resumes non-tail over a deep non-tail recursion (`nest(20000)`) runs out of
-memory natively, because every resume copies the whole captured chain
-(`elya_cont_copy`), O(d^2) frames in all. Measure the evaluator on the same program and
-the native growth by depth, then decide in a spec: share the chain's unchanged prefix
-(copy-on-write of handler frames only), or copy lazily as frames are re-entered.
-
-### 2. One wording for the one-shot trap, and the sweep's smaller gaps
+### 1. One wording for the one-shot trap, and the sweep's smaller gaps
 
 The sweep's four `both-fail-differently` programs: a second resume of a one-shot
 continuation is "continuation resumed more than once" in the evaluator and "a one-shot
@@ -383,7 +384,7 @@ and the tests that assert either (a decision: call each out). Then the sweep's s
 refusals: a parametric constructor as a function value (`map(xs, Some)`), an
 effect-polymorphic closure through a `let` alias, `Float` in Core.
 
-### 3. Operation values as values natively
+### 2. Operation values as values natively
 
 `with any` natively (Done) refuses an operation value used other than by `op.*` or
 `==` (passed to a function, stored, returned: spec D2), and two evaluator behaviours
@@ -394,7 +395,7 @@ operations), then decide in a spec: clone functions over `Op(t)` per operation a
 expansion clones clauses, or a run-time operation value; and whether both sides should
 decode at the instantiation (the evaluator would need it carried).
 
-### 4. Literals at the edges, and a layout rule
+### 3. Literals at the edges, and a layout rule
 
 Two lexical gaps the 2026-10-17 review found: `MIN` cannot be written
 (`-9223372036854775808` is E0001 "not a valid Elya token"; an out-of-range literal
@@ -405,13 +406,31 @@ expression). Measure the corpus for both, then decide in a spec: a literal rule 
 negation, and a layout rule (an operator at the start of a line ends the statement
 before it, or is an error).
 
-### 5. A failing traced run keeps its output on stdout
+### 4. A failing traced run keeps its output on stdout
 
 `elya run --replay` drops what the program printed before a failure, and `--record`
 prints it to stderr with the diagnostic; plain `elya run` (since 2026-10-16) and a
 native binary (record or replay) keep it on stdout. Make the two trace modes do the
 same (`run_source_recording`/`run_source_replaying` return the output apart from the
 error), then a differential test of a failing replay's stdout across both sides.
+
+### 5. Modules, part 1: a program in more than one file
+
+ROADMAP priority 2 (capabilities per dependency) needs modules first. Today every
+program is one file and `elya check|run|build` take one path. `import a/b` (with an
+optional alias) parses -- `examples/01_hello.elya` opens with `import elya/io` -- and
+so does `pub` on any function, but nothing after the parser reads either
+(`ast::Module::imports`, `ast::FnDecl::is_pub`). Measure first how the resolver, the
+checker and Core name things today, and what a two-file version of an example would
+need. Then decide in a spec:
+- what `import` means and how its path resolves (a file next to the importing one?),
+  and what `import elya/io` becomes (ignored today; `io.println` is a builtin);
+- what a module exports (`pub` on functions, types and effects?);
+- qualified (`json.parse`) or unqualified names;
+- how Core and codegen see the program (one merged `CoreModule` is the smallest step).
+
+Leave the effect allow-list at the import boundary to part 2, but choose the syntax so
+it has a place to go.
 
 Also open, unscheduled: row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
 per platform, deferred by the timers spec D1); a user
