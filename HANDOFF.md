@@ -5,8 +5,9 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 
 ## State at handoff (updated 2026-10-22, an interactive session on `auto/elya`)
 
-- `main` has everything through #22 (the 2026-10-09/10 auto-runs: N7 part 1 through
-  exact replay).
+- `main` has everything through #23 (merged 2026-10-16 at ab791b6: N7 part 2 through
+  argument records and `elya run --record/--replay`). Draft PR #24 carries `auto/elya`
+  since (the native stack onward).
 - Scheduled auto-runs work on branch `auto/elya` (one draft PR to `main`) and log in
   `AUTO_RUN_LOG.md`; the maintainer reviews on GitHub.
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
