@@ -3,6 +3,10 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
+## 2026-10-23 17:53 UTC — IN PROGRESS (scheduled run, FULL mode)
+
+- Took the lock; the 10:50 entry is DONE.
+
 ## 2026-10-23 10:50 UTC — DONE at 11:50 (scheduled run, LIGHT mode: four tasks)
 
 - The 03:38 entry's last commit is 1f1e677 (05:00 UTC), over three hours old: taken
