@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1144 passed, 110 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1184 passed, 113 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
@@ -446,27 +446,20 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   stderr, as `elya run` and native binaries do (`record_source`, `replay_source`);
   a differential test against the native binary in `build_cli.rs`.
 
+- **Modules, part 1: a program in more than one file** (2026-10-23, branch
+  `auto/elya`, a scheduled run, c7bb82b): spec
+  `docs/superpowers/specs/2026-10-23-elya-modules-part-1-design.md`.
+  - `import a/b [as c]` is `a/b.elya` next to the program; functions cross files only
+    qualified (`b.f`, `pub` exported); types, constructors, effects and operations
+    stay unqualified, program-unique, visible where imported. E0600-E0606.
+  - One merged module (an imported `f` is `a.b.f`); spans per file; the CLI reads the
+    files; `*_with` library entry points take a reader.
+  - `import a/b / {E}` is reserved syntax, E0606 until part 2.
+  - Needs the Windows gate (symbols with `.` from module paths).
+
 ## The next five steps
 
-### 1. Modules, part 1: a program in more than one file
-
-ROADMAP priority 2 (capabilities per dependency) needs modules first. Today every
-program is one file and `elya check|run|build` take one path. `import a/b` (with an
-optional alias) parses -- `examples/01_hello.elya` opens with `import elya/io` -- and
-so does `pub` on any function, but nothing after the parser reads either
-(`ast::Module::imports`, `ast::FnDecl::is_pub`). Measure first how the resolver, the
-checker and Core name things today, and what a two-file version of an example would
-need. Then decide in a spec:
-- what `import` means and how its path resolves (a file next to the importing one?),
-  and what `import elya/io` becomes (ignored today; `io.println` is a builtin);
-- what a module exports (`pub` on functions, types and effects?);
-- qualified (`json.parse`) or unqualified names;
-- how Core and codegen see the program (one merged `CoreModule` is the smallest step).
-
-Leave the effect allow-list at the import boundary to part 2, but choose the syntax so
-it has a place to go.
-
-### 2. `Float` natively
+### 1. `Float` natively
 
 The evaluator has `Float`:
 - literals, `+. -. *. /.`, the comparisons and `-x`;
@@ -487,7 +480,7 @@ spec:
 - decoding;
 - whether a `float.to_string` builtin belongs in the same step.
 
-### 3. Decoding at an effect's own parameter, on both sides
+### 2. Decoding at an effect's own parameter, on both sides
 
 `op.decode` of an answer whose type is an effect's parameter (`St(s)`'s
 `fn get() -> s`) is refused on both sides by name (the evaluator's S2; native D4 of
@@ -500,7 +493,7 @@ and native's operation type already holds them. The stricter alternative is to k
 the refusal and report it in `elya check` (a static error at the `with
 any` handle when a handled operation's answer mentions a parameter).
 
-### 4. A row variable inside data in a function's own result, natively
+### 3. A row variable inside data in a function's own result, natively
 
 A native wrong value the 2026-10-23 review found (older than it). A top-level
 function whose own result has a row variable INSIDE DATA
@@ -513,7 +506,7 @@ then decide in a spec whether `match_tys` binds row tails or the wrapper coerces
 data by its type; if neither fits soon, refuse the shape by name natively so no
 wrong value is left.
 
-### 5. Parser error recovery inside a body
+### 4. Parser error recovery inside a body
 
 `recover_to_decl` (src/parse.rs) skips to the next `fn`, `pub`, `import`, `effect` or
 `type`, and a lambda's `fn` counts, so after a parse error inside a function body
@@ -524,6 +517,23 @@ a bad pattern, a bad clause), then decide in a spec: recover to the next stateme
 in a block (a newline at brace depth, now that D4 of 2026-10-23 makes lines
 meaningful) and to the next top-level declaration at column 0, and keep a
 declaration whose body failed as a known name so its callers are not reported.
+
+Found by the modules review (older): a truncated declaration at the end of a file
+(`pub fn g(`, or a body ending `{ x +`) passes `check` and is silently DROPPED: a
+parse that runs out of tokens must be an error. Also a label after non-ASCII text is
+dropped by the renderer (byte offsets passed where `ariadne` counts characters), and
+E0209 across files labels only the second declaration.
+
+### 5. Modules, part 2: the effect allow-list at the import
+
+ROADMAP priority 2. `import a/b / {E, F}` parses and is E0606 today (part 1 D6).
+Measure what a module's public functions perform (their rows after inference, and
+what reaches them through closures and handlers they install), then decide in a
+spec: the check (every effect a module's code can perform, unhandled inside it, is
+in the importer's list, or the import is refused by name), what an import without
+a list grants (everything, for compatibility, or nothing: the stricter choice),
+whether builtins (`io`, `time`) count as effects to grant (`IO` is an effect row
+today), and transitivity (a module's own imports are bounded by its grant).
 E0434 rejects a direct inner `with any` over `Hold(Opt(Op))` but accepts the same
 handler through a generic function (the 2026-10-23 review's F4). A helper taking an
 operation costs a clone per operation and helper (refused past the budget, 256).
