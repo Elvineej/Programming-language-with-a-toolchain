@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1198 passed, 117 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1199 passed, 117 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
@@ -487,22 +487,16 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
     version overflowed the compiler's stack).
   - Needs nothing special on Windows (Core passes only).
 
+- **A wrapped function's row shared with a parameter** (2026-10-23, branch
+  `auto/elya`, a scheduled run, 4a0aeb1): spec
+  `docs/superpowers/specs/2026-10-23-elya-wrapper-parameter-rows-design.md`.
+  `anf`'s wrapper binds a parameter's row variables from the use's parameters,
+  and the result's own parameter positions before its results; six measured
+  programs and two from the review printed a pointer natively. Core pass only.
+
 ## The next five steps
 
-### 1. A wrapped function whose own result shares a row with a parameter
-
-A native wrong value the 2026-10-23 upcasts-through-data review found (F2, older
-than that slice). `fn mko(k: fn() -> Int) -> fn() -> fn() -> Int { fn() { k } }`
-used as a value at `fn(fn() / {E} -> Int) -> fn() / {E} -> fn() / {E} -> Int`
-prints a pointer natively, 16 in the evaluator; also with an `Option(...)`
-result and through `let g: T = mko`. `anf::inner_type`'s D1 binds only own-result
-row variables that no parameter mentions, so here the use's result types the
-call. Measure the family (one and two layers, data, the parameter used and
-unused), then decide in a spec: bind such a variable from the use's PARAMETER
-position (the reference instantiates it there; `specialize` clones `mko`), or
-refuse the shape by name, so no wrong value is left.
-
-### 2. Parser error recovery inside a body
+### 1. Parser error recovery inside a body
 
 `recover_to_decl` (src/parse.rs) skips to the next `fn`, `pub`, `import`, `effect` or
 `type`, and a lambda's `fn` counts, so after a parse error inside a function body
@@ -520,7 +514,7 @@ parse that runs out of tokens must be an error. Also a label after non-ASCII tex
 dropped by the renderer (byte offsets passed where `ariadne` counts characters), and
 E0209 across files labels only the second declaration.
 
-### 3. Modules, part 2: the effect allow-list at the import
+### 2. Modules, part 2: the effect allow-list at the import
 
 ROADMAP priority 2. `import a/b / {E, F}` parses and is E0606 today (part 1 D6).
 Measure what a module's public functions perform (their rows after inference, and
@@ -531,7 +525,7 @@ a list grants (everything, for compatibility, or nothing: the stricter choice),
 whether builtins (`io`, `time`) count as effects to grant (`IO` is an effect row
 today), and transitivity (a module's own imports are bounded by its grant).
 
-### 4. `Float`, part 2: comparisons, negation and conversions
+### 3. `Float`, part 2: comparisons, negation and conversions
 
 Floats run natively since 6baf595, but `<`, `<=`, `>`, `>=` are `Int` only, `-x`
 on a float expression is E0400 (only a literal folds its sign), and nothing
@@ -543,7 +537,7 @@ comparison false); `-.x` or `-` on floats; `float.of_int` (exact or rounded),
 `float.truncate`/`round` to `Int` (failing by name outside `Int`'s range and on
 NaN, as checked arithmetic does). Both sides, differential tests on the edges.
 
-### 5. Record and replay as an Elya library
+### 4. Record and replay as an Elya library
 
 ROADMAP priority 3. `examples/09_record_any.elya` shows a recorder written with
 `with any`; the host-level trace (`elya run --record`, `ELYA_RECORD`) covers only
@@ -553,6 +547,16 @@ failure words on divergence, their cost per operation natively), then decide in 
 spec whether a standard module (`import elya/replay`, now that modules exist)
 ships them, and in what trace format (the host trace's `question = answer`
 lines, so one replayer reads both).
+
+### 5. Aliases that rebind their target: rename instead of keeping the `let`
+
+`anf`'s alias rule (spec 2026-10-22 D3) keeps `let x = y` when the body binds
+`y` again, so the alias stays a local whose uses at a user effect are refused
+natively ("effect-polymorphic function used at a user effect"): 18 programs of
+the 2026-10-23 review fuzzer. Measure them first (which are rebinding, which
+are other shapes), then decide in a spec whether renaming the inner binder
+(capture-avoiding substitution) lets them run, with differential tests and a
+control that brings the refusal back.
 
 ## Also open, unscheduled
 

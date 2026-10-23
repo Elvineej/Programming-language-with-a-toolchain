@@ -22,7 +22,14 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     than refuse or make data invariant in the checker; D4's size rule.
   - Found (older): the wrapper still prints a pointer when the own result's row
     variable is also a parameter's (the review's F2): new HANDOFF step 1.
-- Working on: HANDOFF step 1 (the wrapper's parameter-shared row).
+- **Done: a wrapped function's row shared with a parameter** (HANDOFF step 1).
+  Spec+plan ddbfbe8, fix 4a0aeb1. The wrapper binds a parameter's row variables
+  from the use's parameters (D1), and walks the result's own parameters first
+  (D2, the review's older finding). Gate 1199 / 117 as predicted; K4 distinct;
+  review sweep 916 programs, 0 differ, no class changed.
+  - **Decision (mine; please review):** bind rather than refuse.
+- New HANDOFF step 5: aliases that rebind their target (rename, not keep).
+- Working on: HANDOFF step 1 (parser error recovery inside a body).
 
 ## 2026-10-23 17:53 UTC — IN PROGRESS (scheduled run, FULL mode)
 
