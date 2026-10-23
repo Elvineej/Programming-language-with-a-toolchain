@@ -119,6 +119,14 @@ fn write(v: &Value, out: &mut String) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// A float's literal text: [`write_float`]'s, as a `String` (`float.to_string`,
+/// spec 2026-10-23-elya-float-natively D5).
+pub fn float_text(f: f64) -> String {
+    let mut s = String::new();
+    write_float(f, &mut s);
+    s
+}
+
 /// A decimal with a point and no exponent (Rust's shortest round-trip `Display`),
 /// or `inf`, `-inf`, `nan`.
 fn write_float(f: f64, out: &mut String) {

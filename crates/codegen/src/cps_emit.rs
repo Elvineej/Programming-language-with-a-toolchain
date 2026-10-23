@@ -1341,6 +1341,15 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
         if crate::is_unit_eq_prim(op, args) {
             return Ok(crate::unit_eq(self.ctx, op));
         }
+        if crate::is_float_prim(op, args) {
+            return crate::float_prim(
+                self.ctx,
+                self.b,
+                op,
+                vals[0].into_int_value(),
+                vals[1].into_int_value(),
+            );
+        }
         if matches!(op, BinOp::Eq | BinOp::Ne)
             && !matches!(args[0].ty, Ty::Base(TyCon::Int) | Ty::Base(TyCon::Bool))
         {
@@ -1393,6 +1402,12 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             "int.to_string" if vals.len() == 1 => {
                 let roots = self.root_live(st, &[])?;
                 let v = crate::int_to_string(self.ctx, self.b, self.lc, vals[0])?;
+                gc_unroot(self.b, self.lc, roots)?;
+                Ok(v)
+            }
+            "float.to_string" if vals.len() == 1 => {
+                let roots = self.root_live(st, &[])?;
+                let v = crate::float_to_string(self.ctx, self.b, self.lc, vals[0])?;
                 gc_unroot(self.b, self.lc, roots)?;
                 Ok(v)
             }

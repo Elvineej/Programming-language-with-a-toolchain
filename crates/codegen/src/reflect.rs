@@ -5,7 +5,8 @@
 //! types their constructors' fields reach. A flat `i64` array the runtime walks
 //! (`elya_any_show`, `elya_any_decode` in `runtime.c`); a node is an offset:
 //!
-//! - `[KIND_INT]`, `[KIND_BOOL]`, `[KIND_UNIT]`, `[KIND_STRING]`, `[KIND_FN]`;
+//! - `[KIND_INT]`, `[KIND_BOOL]`, `[KIND_UNIT]`, `[KIND_STRING]`, `[KIND_FN]`,
+//!   `[KIND_FLOAT]`;
 //! - `[KIND_ADT, n, (tag, name_off, name_len, arity, field_node * arity) * n]`,
 //!   the names in a separate byte blob, each the constructor's SOURCE name (an
 //!   instance `Cons.mono.3` is written `Cons`);
@@ -29,6 +30,8 @@ pub(crate) const KIND_STRING: i64 = 3;
 pub(crate) const KIND_FN: i64 = 4;
 pub(crate) const KIND_ADT: i64 = 5;
 pub(crate) const KIND_UNBUILT: i64 = 6;
+/// A float: its bits (spec 2026-10-23-elya-float-natively D3, D4).
+pub(crate) const KIND_FLOAT: i64 = 7;
 
 #[derive(Default)]
 pub(crate) struct Reflect {
@@ -76,6 +79,7 @@ impl Reflect {
         self.index.insert(key(t), at);
         match t {
             Ty::Base(TyCon::Int) => self.words.push(KIND_INT),
+            Ty::Base(TyCon::Float) => self.words.push(KIND_FLOAT),
             Ty::Base(TyCon::Bool) => self.words.push(KIND_BOOL),
             Ty::Base(TyCon::Unit) => self.words.push(KIND_UNIT),
             Ty::Base(TyCon::Str) => self.words.push(KIND_STRING),

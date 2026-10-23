@@ -572,6 +572,16 @@ pub mod tree {
                         };
                         return Ok(Value::Str(n.to_string()));
                     }
+                    if module == "float" && name == "to_string" {
+                        let mut vals = Vec::new();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        let [Value::Float(x)] = &vals[..] else {
+                            return Err(rt(span, "float.to_string expects a single Float"));
+                        };
+                        return Ok(Value::Str(crate::literal::float_text(*x)));
+                    }
                     if module == "int" && super::INT_BINARY_BUILTINS.contains(&name.as_str()) {
                         let mut vals = Vec::new();
                         for a in args.iter() {
@@ -1138,6 +1148,11 @@ pub mod cek {
                     Expr::Qualified { module, name } if module == "int" && name == "to_string" => {
                         CalleeSlot::Builtin("int.to_string")
                     }
+                    Expr::Qualified { module, name }
+                        if module == "float" && name == "to_string" =>
+                    {
+                        CalleeSlot::Builtin("float.to_string")
+                    }
                     Expr::Qualified { module, name } if module == "time" && name == "now_ms" => {
                         CalleeSlot::Builtin("time.now_ms")
                     }
@@ -1615,6 +1630,12 @@ pub mod cek {
                     return Err(rt(span, "int.to_string expects a single Int"));
                 };
                 Ok(State::Return(Value::Str(n.to_string()), k))
+            }
+            CalleeSlot::Builtin("float.to_string") => {
+                let [Value::Float(x)] = &args[..] else {
+                    return Err(rt(span, "float.to_string expects a single Float"));
+                };
+                Ok(State::Return(Value::Str(crate::literal::float_text(*x)), k))
             }
             CalleeSlot::Builtin(b) if b.starts_with("op.") => {
                 let Some(Value::Op {

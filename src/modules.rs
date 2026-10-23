@@ -29,7 +29,7 @@ pub struct Program {
 pub type Reader<'a> = dyn FnMut(&str) -> Option<(String, String)> + 'a;
 
 /// The builtin modules: `m.f` names a builtin there, and `elya/<m>` imports one.
-const BUILTIN_MODULES: &[&str] = &["io", "int", "time", "op"];
+const BUILTIN_MODULES: &[&str] = &["io", "int", "float", "time", "op"];
 
 /// One file of the program.
 struct Unit {

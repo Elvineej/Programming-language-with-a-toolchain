@@ -1,6 +1,6 @@
 # `Float` natively
 
-**Status:** in progress (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF
+**Status:** done (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF
 step 1. The design choices are Claude's under the maintainer's delegation (rule 2),
 recorded here.
 
@@ -80,6 +80,9 @@ programs refused for it. The runtime's literal parser already scans a float
 - **D5. `float.to_string(x) -> String`, on both sides,** pure, writing exactly the
   literal text (so a float is observable without `with any`). `int.to_string`'s
   sibling; arity 1.
+  - `float` joins the builtin modules: `import elya/float` is accepted, and a user
+    module imported under the name `float` is E0604 (modules part 1 D2), as for
+    `int`.
   - *Not in this step, recorded as open:* comparisons on floats, unary minus on a
     float expression, conversions between `Int` and `Float`.
 
@@ -97,3 +100,39 @@ programs refused for it. The runtime's literal parser already scans a float
 - Negative controls (in `native_float.rs`'s header): equality inside data by bits
   (D2), the neighbour step of the printer off (D3, the harness must find a
   difference), `elya_any_check` ignoring NaN (D2).
+
+## 3. Results
+
+Gate: **1193 passed, 116 suites**, as predicted. The seven planned tests were red
+first as predicted (E0201 twice; `Unsupported("Float")` four times; the harness
+did not link). Controls K1-K3 are in `native_float.rs`'s header, each failing one
+distinct test; K2 showed the neighbour step is needed (45 values next to a power
+of two).
+
+Found on the way, by the harness: `%.*e` rounds a tie half to even, while Rust's
+shortest form rounds it half up (2^-25 is `0.0000000298023223876953125` and
+writes `...95313`; 58 of the first run's values). The printer now rounds each
+candidate from the exact decimal expansion (`%.780e`), half up.
+
+Also changed by D2: `o == o` over an operation (`any.rs`'s `op_eq`) checks its
+arguments last first and stops at the first difference, as the evaluator's walk
+does (a NaN can now be that difference; before, every argument was checked).
+
+### The review (2026-10-23)
+
+An independent review found no defect. It ran its own printer harness on 475,036
+further values (random short decimals, integers, every m*2^k including ties and
+all subnormals, powers of ten +-2 ulp, 9...9 x 10^e carries; also under ASan and
+UBSan), about 40 decode inputs (accepted and rejected, with the same words), floats
+through generic functions, closures, mixed data, CPS frames, multi-shot resumes and
+return clauses, equality at type variables, `o == o` with NaN and function
+arguments in both orders, and a collection over 200,000 floats whose bits look like
+heap addresses. Two notes, recorded: the AST's debug printer writes `1.0` as `1`
+(older); the printer's `%.780e` and `strtod` are exact on glibc, and the Windows
+gate must confirm the UCRT.
+
+Sweep (`scripts/sweep.py`, 886 programs): 490 same, no disagreement; the 3 `Float`
+build errors are gone.
+
+Windows: `runtime.c` changed (`elya_float_text`, `elya_float_to_string`,
+`elya_eq_init` and `elya_eq`'s float fields, `with any` floats).

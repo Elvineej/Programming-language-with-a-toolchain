@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <math.h>
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
@@ -105,6 +106,17 @@ enum { GC_THRESHOLD_WORDS = 1 << 16 };
 static int64_t *gc_payload(Block *b) { return (int64_t *)(b + 1); }
 
 static Block *gc_block_of(void *payload) { return (Block *)((int64_t *)payload - 2); }
+
+/* One float mask per declared constructor tag: bit i set iff field i is a
+ * `Float` (spec 2026-10-23-elya-float-natively D2). Read by `elya_eq` only; the
+ * collector's rows and `gc_mark` do not change. */
+static const int64_t *eq_float_masks = NULL;
+static int64_t eq_n_masks = 0;
+
+void elya_eq_init(const int64_t *masks, int64_t n) {
+    eq_float_masks = masks;
+    eq_n_masks = n;
+}
 
 void elya_gc_init(const int64_t *descriptors, int64_t n_ctors) {
     gc_descriptors = (int64_t *)descriptors;
@@ -339,8 +351,9 @@ int64_t elya_str_eq(void *a, void *b) {
  * where the evaluator's walk would reach it (spec
  * 2026-10-23-elya-operation-values-natively, the review's F1). */
 int64_t elya_eq(void *a, void *b, int64_t string_tag, int64_t first_closure_tag) {
-    /* Triples: the two words and whether they are heap values (1) or plain
-     * words (0). Fields are pushed in order and popped last first, the
+    /* Triples: the two words and whether they are heap values (1), plain
+     * words (0) or floats (2, compared as doubles: a NaN is unequal to itself
+     * and -0.0 equals 0.0, spec 2026-10-23-elya-float-natively D2). Fields are pushed in order and popped last first, the
      * evaluator's order, so the first difference or function reached is the
      * evaluator's too (a word field no longer decides before its later heap
      * siblings are walked: the review's F1). */
@@ -367,6 +380,16 @@ int64_t elya_eq(void *a, void *b, int64_t string_tag, int64_t first_closure_tag)
         int64_t heap = work[--top];
         int64_t yw = work[--top];
         int64_t xw = work[--top];
+        if (heap == 2) {
+            double xd, yd;
+            memcpy(&xd, &xw, sizeof xd);
+            memcpy(&yd, &yw, sizeof yd);
+            if (!(xd == yd)) {
+                equal = 0;
+                break;
+            }
+            continue;
+        }
         if (!heap) {
             if (xw != yw) {
                 equal = 0;
@@ -406,8 +429,9 @@ int64_t elya_eq(void *a, void *b, int64_t string_tag, int64_t first_closure_tag)
         }
         int64_t arity = gc_descriptors[2 * tag];
         int64_t mask = gc_descriptors[2 * tag + 1];
+        int64_t fmask = tag < eq_n_masks ? eq_float_masks[tag] : 0;
         for (int64_t f = 0; f < arity; f++) {
-            EQ_PUSH(x[1 + f], y[1 + f], (mask >> f) & 1);
+            EQ_PUSH(x[1 + f], y[1 + f], ((mask >> f) & 1) ? 1 : (((fmask >> f) & 1) ? 2 : 0));
         }
     }
 #undef EQ_PUSH
@@ -423,6 +447,151 @@ void *elya_int_to_string(int64_t tag, int64_t n) {
     return elya_str_lit(tag, buf, (int64_t)len);
 }
 
+/* ---- Floats (spec 2026-10-23-elya-float-natively D3): the literal text. -----
+ *
+ * The shortest digit string that reads back to the same double, the closest
+ * such string when several are equally short, written as a plain decimal (no
+ * exponent), `.0` when integral; `inf`, `-inf`, `nan` (a NaN's sign is dropped).
+ * That is the evaluator's text, Rust's `Display` plus `.0`. For each length p
+ * from 1 to 17 the correctly rounded p-digit string (`%.*e`) is tried first:
+ * if any p-digit string reads back, it does unless x sits next to a power of
+ * two, where the gap below is half the gap above and the closest string can
+ * fall outside; then the one candidate on the other side, the closest string's
+ * neighbour in the last digit, is tried. */
+
+/* Does D (n digits, a decimal point after the first) times 10^e read back as x? */
+static int float_reads_back(const char *d, int n, int e, double x) {
+    char buf[64];
+    int k = 0;
+    buf[k++] = d[0];
+    buf[k++] = '.';
+    for (int i = 1; i < n; i++) {
+        buf[k++] = d[i];
+    }
+    k += snprintf(buf + k, sizeof buf - (size_t)k, "e%d", e);
+    return strtod(buf, NULL) == x;
+}
+
+/* Writes `bits`' literal text to `out` (room for 1100 bytes); returns its length. */
+int64_t elya_float_text(int64_t bits, char *out) {
+    double x;
+    memcpy(&x, &bits, sizeof x);
+    if (isnan(x)) {
+        memcpy(out, "nan", 3);
+        return 3;
+    }
+    int64_t k = 0;
+    if (signbit(x)) {
+        out[k++] = '-';
+        x = -x;
+    }
+    if (isinf(x)) {
+        memcpy(out + k, "inf", 3);
+        return k + 3;
+    }
+    if (x == 0.0) {
+        memcpy(out + k, "0.0", 3);
+        return k + 3;
+    }
+    /* The exact decimal expansion (a double has at most 767 significant
+     * digits), then each length's candidate rounded from it half UP, as Rust
+     * rounds a tie (2^-25 is ...953125 and writes ...95313, where `%.*e`'s
+     * half-even would give ...95312). */
+    char ex[800];
+    snprintf(ex, sizeof ex, "%.780e", x);
+    char all[790];
+    int na = 0;
+    const char *c = ex;
+    for (; *c && *c != 'e'; c++) {
+        if (*c >= '0' && *c <= '9') {
+            all[na++] = *c;
+        }
+    }
+    int e0 = atoi(c + 1);
+    char d[24];
+    int n = 0, e = 0;
+    for (int p = 1; p <= 17 && n == 0; p++) {
+        uint64_t v = 0;
+        for (int i = 0; i < p; i++) {
+            v = v * 10 + (uint64_t)(all[i] - '0');
+        }
+        /* Below, at, or above x: the digits after the first p. */
+        int up = all[p] >= '5';
+        int exact = 1;
+        for (int i = p; i < na; i++) {
+            if (all[i] != '0') {
+                exact = 0;
+                break;
+            }
+        }
+        if (up) {
+            v += 1;
+        }
+        for (int attempt = 0; attempt < 2 && n == 0; attempt++) {
+            if (attempt == 1) {
+                /* The neighbour on the far side of x from the closest string. */
+                if (exact) {
+                    break;
+                }
+                if (up) {
+                    v -= 1; /* the truncated string: below x */
+                } else {
+                    v += 1; /* one above the truncated string: above x */
+                }
+            }
+            char nd[24];
+            int nm = snprintf(nd, sizeof nd, "%llu", (unsigned long long)v);
+            /* A carry (999 -> 1000) moves the exponent. */
+            int ne = e0 + (nm - p);
+            if (v != 0 && float_reads_back(nd, nm, ne, x)) {
+                memcpy(d, nd, (size_t)nm);
+                n = nm;
+                e = ne;
+            }
+        }
+    }
+    if (n == 0) {
+        /* 17 digits always read back; unreachable. */
+        n = 1;
+        d[0] = '0';
+    }
+    while (n > 1 && d[n - 1] == '0') {
+        n--;
+    }
+    /* Plain decimal: the value is d[0].d[1..n] * 10^e. */
+    if (e >= n - 1) {
+        memcpy(out + k, d, (size_t)n);
+        k += n;
+        for (int i = 0; i < e - (n - 1); i++) {
+            out[k++] = '0';
+        }
+        memcpy(out + k, ".0", 2);
+        k += 2;
+    } else if (e >= 0) {
+        memcpy(out + k, d, (size_t)(e + 1));
+        k += e + 1;
+        out[k++] = '.';
+        memcpy(out + k, d + e + 1, (size_t)(n - e - 1));
+        k += n - e - 1;
+    } else {
+        out[k++] = '0';
+        out[k++] = '.';
+        for (int i = 0; i < -e - 1; i++) {
+            out[k++] = '0';
+        }
+        memcpy(out + k, d, (size_t)n);
+        k += n;
+    }
+    return k;
+}
+
+/* `float.to_string` (D5): the literal text, as a fresh string. */
+void *elya_float_to_string(int64_t tag, int64_t bits) {
+    char buf[1100];
+    int64_t len = elya_float_text(bits, buf);
+    return elya_str_lit(tag, buf, len);
+}
+
 /* ---- `with any` natively: literals (spec 2026-10-17-elya-native-any-handlers,
  * D3/D4). The back end hands over a reflection table (`reflect.rs`): a node is
  * an offset into `t`; `[0]` Int, `[1]` Bool, `[2]` Unit, `[3]` String, `[4]` a
@@ -431,7 +600,7 @@ void *elya_int_to_string(int64_t tag, int64_t n) {
  * value of exists. Every walk keeps its own stack: a million-cell list neither
  * recurses nor overflows. Failures carry the evaluator's words. */
 
-enum { ANY_INT, ANY_BOOL, ANY_UNIT, ANY_STRING, ANY_FN, ANY_ADT, ANY_UNBUILT };
+enum { ANY_INT, ANY_BOOL, ANY_UNIT, ANY_STRING, ANY_FN, ANY_ADT, ANY_UNBUILT, ANY_FLOAT };
 
 static void any_oom(void) {
     fputs("elya: out of memory\n", stderr);
@@ -509,6 +678,11 @@ void *elya_any_show(int64_t string_tag, const int64_t *t, const char *names, int
         case ANY_INT:
             any_put(&out, num, snprintf(num, sizeof num, "%lld", (long long)it.value));
             break;
+        case ANY_FLOAT: {
+            char fbuf[1100];
+            any_put(&out, fbuf, elya_float_text(it.value, fbuf));
+            break;
+        }
         case ANY_BOOL:
             any_puts(&out, it.value ? "True" : "False");
             break;
@@ -601,6 +775,17 @@ int64_t elya_any_check(const int64_t *t, int64_t node, int64_t value) {
         case ANY_UNBUILT:
             any_internal("op: a value of a type with no instance");
             break;
+        case ANY_FLOAT: {
+            /* A NaN is unequal to itself: the evaluator's `==` stops there,
+             * false (spec 2026-10-23-elya-float-natively D2). */
+            double v;
+            memcpy(&v, &it.value, sizeof v);
+            if (isnan(v)) {
+                free(stack);
+                return 0;
+            }
+            break;
+        }
         default:
             break;
         }
@@ -620,7 +805,7 @@ enum { LIT_INT, LIT_FLOAT, LIT_BOOL, LIT_UNIT, LIT_STR, LIT_CTOR };
 
 typedef struct {
     int kind;
-    int64_t i;          /* Int, Bool */
+    int64_t i;          /* Int, Bool; a Float's bits */
     char *s;            /* String bytes (malloc'd); a constructor's name (into the text) */
     int64_t slen;
     int64_t *kids;      /* a constructor's arguments, as indices */
@@ -752,7 +937,10 @@ static int64_t any_parse(AnyParser *p, const char **err) {
         } else if (c == '-' || any_digit(c)) {
             if (any_starts(p, "-inf")) {
                 p->i += 4;
-                v = any_new(p, (AnyLit){LIT_FLOAT, 0, NULL, 0, NULL, 0});
+                double ninf = -INFINITY;
+                int64_t nb;
+                memcpy(&nb, &ninf, sizeof nb);
+                v = any_new(p, (AnyLit){LIT_FLOAT, nb, NULL, 0, NULL, 0});
             } else {
                 int64_t start = p->i;
                 int dots = 0, digits = 0;
@@ -774,7 +962,25 @@ static int64_t any_parse(AnyParser *p, const char **err) {
                         *err = "a malformed number";
                         goto fail;
                     }
-                    v = any_new(p, (AnyLit){LIT_FLOAT, 0, NULL, 0, NULL, 0});
+                    /* `strtod` rounds correctly, as Rust's `from_str` (D4). */
+                    char nbuf[512];
+                    char *big = NULL;
+                    int64_t len = p->i - start;
+                    char *at = nbuf;
+                    if (len + 1 > (int64_t)sizeof nbuf) {
+                        big = (char *)malloc((size_t)len + 1);
+                        if (!big) {
+                            any_oom();
+                        }
+                        at = big;
+                    }
+                    memcpy(at, p->s + start, (size_t)len);
+                    at[len] = 0;
+                    double fv = strtod(at, NULL);
+                    free(big);
+                    int64_t fb;
+                    memcpy(&fb, &fv, sizeof fb);
+                    v = any_new(p, (AnyLit){LIT_FLOAT, fb, NULL, 0, NULL, 0});
                 } else {
                     int64_t n;
                     if (!any_int(p->s + start, p->i - start, &n)) {
@@ -786,10 +992,16 @@ static int64_t any_parse(AnyParser *p, const char **err) {
             }
         } else if (c == 'i' && any_starts(p, "inf")) {
             p->i += 3;
-            v = any_new(p, (AnyLit){LIT_FLOAT, 0, NULL, 0, NULL, 0});
+            double pinf = INFINITY;
+            int64_t pb;
+            memcpy(&pb, &pinf, sizeof pb);
+            v = any_new(p, (AnyLit){LIT_FLOAT, pb, NULL, 0, NULL, 0});
         } else if (c == 'n' && any_starts(p, "nan")) {
             p->i += 3;
-            v = any_new(p, (AnyLit){LIT_FLOAT, 0, NULL, 0, NULL, 0});
+            double qnan = NAN;
+            int64_t qb;
+            memcpy(&qb, &qnan, sizeof qb);
+            v = any_new(p, (AnyLit){LIT_FLOAT, qb, NULL, 0, NULL, 0});
         } else if (c >= 'A' && c <= 'Z') {
             int64_t start = p->i;
             while (p->i < p->n && (any_alnum(p->s[p->i]) || p->s[p->i] == '_')) {
@@ -878,6 +1090,7 @@ static int any_conforms(AnyParser *p, const int64_t *t, const char *names, int64
         AnyLit *l = &p->lits[w.lit];
         switch (t[w.node]) {
         case ANY_INT: ok = l->kind == LIT_INT; break;
+        case ANY_FLOAT: ok = l->kind == LIT_FLOAT; break;
         case ANY_BOOL: ok = l->kind == LIT_BOOL; break;
         case ANY_UNIT: ok = l->kind == LIT_UNIT; break;
         case ANY_STRING: ok = l->kind == LIT_STR; break;
@@ -985,6 +1198,7 @@ int64_t elya_any_decode(int64_t string_tag, const int64_t *t, const char *names,
         Done d = {0, 0};
         switch (kind) {
         case ANY_INT: d.word = l->i; break;
+        case ANY_FLOAT: d.word = l->i; break;
         case ANY_BOOL: d.word = l->i ? 1 : 0; break;
         case ANY_UNIT: d.word = 0; break;
         case ANY_STRING:

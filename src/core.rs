@@ -162,6 +162,9 @@ pub enum CorePat {
 #[derive(Clone, Debug)]
 pub enum CoreLit {
     Int(i64),
+    /// A float's IEEE-754 bits (spec 2026-10-23-elya-float-natively D1): `-0.0`
+    /// and every NaN payload are kept exactly.
+    Float(u64),
     Bool(bool),
     Str(String),
     Unit,
@@ -539,6 +542,7 @@ fn lower_expr(
     let ty = table.get(&span).cloned().ok_or(LowerError::Untyped(span))?;
     let kind = match e {
         Expr::Int(n) => CoreKind::Lit(CoreLit::Int(*n)),
+        Expr::Float(x) => CoreKind::Lit(CoreLit::Float(x.to_bits())),
         Expr::Bool(b) => CoreKind::Lit(CoreLit::Bool(*b)),
         Expr::Str(v) => CoreKind::Lit(CoreLit::Str(v.clone())),
         Expr::Unit => CoreKind::Lit(CoreLit::Unit),
@@ -823,7 +827,6 @@ fn lower_expr(
         }
         // The deferred surface (spec §4, §11): a typed boundary, not a panic. None
         // of these occur in the 5a-2 corpus.
-        Expr::Float(_) => return Err(LowerError::Unsupported("Float")),
         Expr::Qualified { .. } => return Err(LowerError::Unsupported("Qualified")),
         // Unary operators are what they mean (spec
         // 2026-10-17-elya-unary-and-wrapping D1): `-e` is `0 - e`, which
@@ -1072,6 +1075,7 @@ fn pretty_pat(p: &CorePat, s: &mut String) {
 fn push_lit(l: &CoreLit, s: &mut String) {
     match l {
         CoreLit::Int(n) => s.push_str(&n.to_string()),
+        CoreLit::Float(b) => s.push_str(&crate::literal::float_text(f64::from_bits(*b))),
         CoreLit::Bool(b) => s.push_str(if *b { "True" } else { "False" }),
         CoreLit::Str(v) => s.push_str(&format!("{v:?}")),
         CoreLit::Unit => s.push_str("Unit"),

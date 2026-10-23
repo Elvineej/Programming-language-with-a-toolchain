@@ -41,6 +41,8 @@ pub fn builtins() -> &'static [&'static str] {
     &[
         "io.println",
         "int.to_string",
+        // A float's literal text (2026-10-23, spec 2026-10-23-elya-float-natively D5).
+        "float.to_string",
         // Explicit wrapping and bit arithmetic (2026-10-17, spec
         // 2026-10-17-elya-unary-and-wrapping D2).
         "int.wrapping_add",

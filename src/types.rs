@@ -1829,9 +1829,16 @@ impl Infer {
             }
             // `int.to_string : fn(Int) -> String`, pure (spec
             // 2026-10-15-elya-native-strings D1).
-            if module == "int" && name == "to_string" {
+            // `float.to_string : fn(Float) -> String`, pure (spec
+            // 2026-10-23-elya-float-natively D5).
+            if (module == "int" || module == "float") && name == "to_string" {
                 let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
-                let want = Ty::Fn(vec![Ty::int()], EffectRow::pure(), Box::new(Ty::str()));
+                let num = if module == "int" {
+                    Ty::int()
+                } else {
+                    Ty::float()
+                };
+                let want = Ty::Fn(vec![num], EffectRow::pure(), Box::new(Ty::str()));
                 let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::str()));
                 self.unify(&want, &got, span);
                 self.node_types.insert(callee.span, want);

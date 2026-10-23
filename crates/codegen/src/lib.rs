@@ -212,6 +212,9 @@ fn repr_ty<'ctx>(ctx: &'ctx Context, ty: &Ty) -> Result<BasicTypeEnum<'ctx>, Cod
         // immediate i64 zero, never dereferenced, never traced, never rooted.
         Ty::Base(TyCon::Str) => Ok(ctx.ptr_type(AddressSpace::default()).into()),
         Ty::Base(TyCon::Unit) => Ok(ctx.i64_type().into()),
+        // A float is its IEEE-754 bits in an untraced word (spec
+        // 2026-10-23-elya-float-natively D1).
+        Ty::Base(TyCon::Float) => Ok(ctx.i64_type().into()),
         _ => Err(CodegenError::Unsupported("unrepresentable type")),
     }
 }
@@ -474,6 +477,79 @@ pub(crate) fn is_data_eq_prim(op: BinOp, args: &[CoreExpr]) -> bool {
     matches!(op, BinOp::Eq | BinOp::Ne) && matches!(args[0].ty, Ty::Con(..))
 }
 
+/// `+. -. *. /.`, and `==`/`!=` on two floats (spec 2026-10-23-elya-float-natively
+/// D1, D2): operands are words holding IEEE-754 bits.
+pub(crate) fn is_float_prim(op: BinOp, args: &[CoreExpr]) -> bool {
+    matches!(op, BinOp::AddF | BinOp::SubF | BinOp::MulF | BinOp::DivF)
+        || (matches!(op, BinOp::Eq | BinOp::Ne) && matches!(args[0].ty, Ty::Base(TyCon::Float)))
+}
+
+/// A float operation on two words: bitcast to `double`, IEEE arithmetic (no
+/// failure: `1.0 /. 0.0` is `inf`, as in the evaluator), bitcast back; `==` is
+/// `fcmp oeq` and `!=` is `fcmp une`, so a NaN is unequal to itself and `-0.0`
+/// equals `0.0`.
+pub(crate) fn float_prim<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    op: BinOp,
+    l: IntValue<'ctx>,
+    r: IntValue<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let f64t = ctx.f64_type();
+    let x = b
+        .build_bit_cast(l, f64t, "fl")
+        .map_err(internal)?
+        .into_float_value();
+    let y = b
+        .build_bit_cast(r, f64t, "fr")
+        .map_err(internal)?
+        .into_float_value();
+    let v = match op {
+        BinOp::AddF => b.build_float_add(x, y, "fadd").map_err(internal)?,
+        BinOp::SubF => b.build_float_sub(x, y, "fsub").map_err(internal)?,
+        BinOp::MulF => b.build_float_mul(x, y, "fmul").map_err(internal)?,
+        BinOp::DivF => b.build_float_div(x, y, "fdiv").map_err(internal)?,
+        BinOp::Eq | BinOp::Ne => {
+            let pred = if op == BinOp::Eq {
+                inkwell::FloatPredicate::OEQ
+            } else {
+                inkwell::FloatPredicate::UNE
+            };
+            return b
+                .build_float_compare(pred, x, y, "fcmp")
+                .map(Into::into)
+                .map_err(internal);
+        }
+        other => return Err(CodegenError::Unsupported(op_label(other))),
+    };
+    b.build_bit_cast(v, ctx.i64_type(), "fw").map_err(internal)
+}
+
+/// `float.to_string` on a lowered word: a runtime call that allocates the
+/// string (callers root what they need across it).
+pub(crate) fn float_to_string<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    x: BasicValueEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    b.build_call(
+        lc.float_to_string,
+        &[
+            i64t.const_int(lc.string_tag as u64, false).into(),
+            x.into_int_value().into(),
+        ],
+        "ftos",
+    )
+    .map_err(internal)?
+    .try_as_basic_value()
+    .left()
+    .ok_or(CodegenError::Unsupported(
+        "elya_float_to_string returned no value",
+    ))
+}
+
 /// `==`/`!=` on `Unit`: both operands are evaluated, the answer is constant.
 pub(crate) fn is_unit_eq_prim(op: BinOp, args: &[CoreExpr]) -> bool {
     matches!(op, BinOp::Eq | BinOp::Ne) && matches!(args[0].ty, Ty::Base(TyCon::Unit))
@@ -578,6 +654,7 @@ pub(crate) fn is_native_builtin(name: &str) -> bool {
         name,
         "io.println"
             | "int.to_string"
+            | "float.to_string"
             | "time.now_ms"
             | "time.sleep_ms"
             | "any.show"
@@ -833,6 +910,7 @@ fn value_to_word<'ctx>(
     match ty {
         Ty::Base(TyCon::Int) => Ok(v.into_int_value()),
         Ty::Base(TyCon::Unit) => Ok(v.into_int_value()),
+        Ty::Base(TyCon::Float) => Ok(v.into_int_value()),
         Ty::Base(TyCon::Bool) => b
             .build_int_z_extend(v.into_int_value(), i64t, "zw")
             .map_err(internal),
@@ -853,6 +931,7 @@ fn word_to_value<'ctx>(
     match ty {
         Ty::Base(TyCon::Int) => Ok(w.into()),
         Ty::Base(TyCon::Unit) => Ok(w.into()),
+        Ty::Base(TyCon::Float) => Ok(w.into()),
         Ty::Base(TyCon::Bool) => b
             .build_int_truncate(w, boolt, "bt")
             .map(Into::into)
@@ -1538,6 +1617,7 @@ fn lower_expr<'ctx>(
         CoreKind::Lit(CoreLit::Int(n)) => {
             Ok(node_ty.into_int_type().const_int(*n as u64, true).into())
         }
+        CoreKind::Lit(CoreLit::Float(bits)) => Ok(ctx.i64_type().const_int(*bits, false).into()),
         CoreKind::Lit(CoreLit::Bool(v)) => Ok(node_ty
             .into_int_type()
             .const_int(u64::from(*v), false)
@@ -1609,6 +1689,13 @@ fn lower_expr<'ctx>(
             let n = lower_expr(ctx, func, b, lc, &args[0], env)?;
             let roots = gc_root_env(b, lc, env)?;
             let v = int_to_string(ctx, b, lc, n)?;
+            gc_unroot(b, lc, roots)?;
+            Ok(v)
+        }
+        CoreKind::Builtin(builtin, args) if builtin == "float.to_string" && args.len() == 1 => {
+            let x = lower_expr(ctx, func, b, lc, &args[0], env)?;
+            let roots = gc_root_env(b, lc, env)?;
+            let v = float_to_string(ctx, b, lc, x)?;
             gc_unroot(b, lc, roots)?;
             Ok(v)
         }
@@ -1699,6 +1786,11 @@ fn lower_expr<'ctx>(
                 lower_expr(ctx, func, b, lc, &args[0], env)?;
                 lower_expr(ctx, func, b, lc, &args[1], env)?;
                 return Ok(unit_eq(ctx, *op));
+            }
+            if is_float_prim(*op, args) {
+                let l = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
+                let r = lower_expr(ctx, func, b, lc, &args[1], env)?.into_int_value();
+                return float_prim(ctx, b, *op, l, r);
             }
             if matches!(op, BinOp::Eq | BinOp::Ne)
                 && !matches!(args[0].ty, Ty::Base(TyCon::Int) | Ty::Base(TyCon::Bool))
@@ -2092,6 +2184,8 @@ struct LowerCtx<'a, 'ctx> {
     /// `elya_eq`: structural equality on data (2026-10-16).
     data_eq: FunctionValue<'ctx>,
     int_to_string: FunctionValue<'ctx>,
+    /// `float.to_string` (2026-10-23).
+    float_to_string: FunctionValue<'ctx>,
     /// Time (2026-10-15): `time.now_ms`, `time.sleep_ms`.
     time_now_ms: FunctionValue<'ctx>,
     time_sleep_ms: FunctionValue<'ctx>,
@@ -2295,6 +2389,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let data_eq = module.add_function("elya_eq", data_eq_ty, None); // ccc
     let int_to_string_ty = ptrt.fn_type(&[i64t.into(), i64t.into()], false);
     let int_to_string = module.add_function("elya_int_to_string", int_to_string_ty, None); // ccc
+    let float_to_string = module.add_function("elya_float_to_string", int_to_string_ty, None); // ccc
     let time_now_ms_ty = i64t.fn_type(&[], false);
     let time_now_ms = module.add_function("elya_time_now_ms", time_now_ms_ty, None); // ccc
     let time_sleep_ms_ty = ctx.void_type().fn_type(&[i64t.into()], false);
@@ -2311,6 +2406,9 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     // closes the shim.
     let gc_init_ty = ctx.void_type().fn_type(&[ptrt.into(), i64t.into()], false);
     let gc_init = module.add_function("elya_gc_init", gc_init_ty, None); // ccc
+                                                                         // `elya_eq_init`: the float masks `elya_eq` reads (spec
+                                                                         // 2026-10-23-elya-float-natively D2), the same shape.
+    let eq_init = module.add_function("elya_eq_init", gc_init_ty, None); // ccc
     let gc_push_ty = ctx.void_type().fn_type(&[ptrt.into()], false);
     let gc_push = module.add_function("elya_gc_push", gc_push_ty, None); // ccc
     let gc_pop_ty = ctx.void_type().fn_type(&[], false);
@@ -2432,6 +2530,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         str_eq,
         data_eq,
         int_to_string,
+        float_to_string,
         time_now_ms,
         time_sleep_ms,
         println,
@@ -2519,6 +2618,38 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     desc_global.set_initializer(&desc_const);
     desc_global.set_constant(true);
     desc_global.set_unnamed_addr(true);
+    // One float mask per declared constructor, in tag order (D2); never empty, so
+    // the global always has an address.
+    let mut float_masks: Vec<u64> = core
+        .types
+        .iter()
+        .flat_map(|t| t.ctors.iter())
+        .map(|c| {
+            c.fields
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| matches!(f, Ty::Base(TyCon::Float)))
+                .fold(0u64, |m, (i, _)| m | (1 << i))
+        })
+        .collect();
+    let n_masks = float_masks.len() as u64;
+    if float_masks.is_empty() {
+        float_masks.push(0);
+    }
+    let masks_const = i64t.const_array(
+        &float_masks
+            .iter()
+            .map(|&m| i64t.const_int(m, false))
+            .collect::<Vec<_>>(),
+    );
+    let masks_global = module.add_global(
+        masks_const.get_type(),
+        Some(AddressSpace::default()),
+        ".eq_float",
+    );
+    masks_global.set_initializer(&masks_const);
+    masks_global.set_constant(true);
+    masks_global.set_unnamed_addr(true);
 
     let entry = module.add_function("elya_entry", i64t.fn_type(&[], false), None); // ccc
     let entry_bb = ctx.append_basic_block(entry, "entry");
@@ -2547,6 +2678,15 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         &[
             desc_global.as_pointer_value().into(),
             i64t.const_int(n_ctors, false).into(),
+        ],
+        "",
+    )
+    .map_err(internal)?;
+    b.build_call(
+        eq_init,
+        &[
+            masks_global.as_pointer_value().into(),
+            i64t.const_int(n_masks, false).into(),
         ],
         "",
     )

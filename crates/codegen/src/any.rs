@@ -1009,6 +1009,10 @@ fn builtin(sp: Span, ty: &Ty, n: &str, rest: &[CoreExpr], at: &OpAt) -> R<CoreEx
 /// (the review's R2): each argument is checked for one at run time.
 fn op_eq(sp: Span, op: BinOp, at: &OpAt) -> CoreExpr {
     let bool_ty = Ty::Base(TyCon::Bool);
+    // The evaluator's walk takes the LAST argument first and stops at the first
+    // difference (a NaN, which is unequal to itself: spec
+    // 2026-10-23-elya-float-natively D2) or function: `if check(an) { if
+    // check(an-1) { ... True } else { False } } else { False }`.
     let mut acc = node(sp, bool_ty.clone(), CoreKind::Lit(CoreLit::Bool(true)));
     for a in &at.args {
         let check = node(
@@ -1016,10 +1020,11 @@ fn op_eq(sp: Span, op: BinOp, at: &OpAt) -> CoreExpr {
             bool_ty.clone(),
             CoreKind::Builtin("any.check".to_string(), Rc::from([var(sp, a)])),
         );
+        let no = node(sp, bool_ty.clone(), CoreKind::Lit(CoreLit::Bool(false)));
         acc = node(
             sp,
             bool_ty.clone(),
-            CoreKind::Prim(BinOp::And, Rc::from([acc, check])),
+            CoreKind::If(Rc::new(check), Rc::new(acc), Rc::new(no)),
         );
     }
     match op {
