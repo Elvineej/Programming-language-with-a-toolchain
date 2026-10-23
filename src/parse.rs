@@ -9,16 +9,103 @@ use std::rc::Rc;
 
 struct Parser<'a> {
     tokens: &'a [Token],
+    /// The source, for the layout rule: whether a newline separates two tokens.
+    text: &'a str,
     pos: usize,
     diags: Vec<Diagnostic>,
+    /// Inside braces (a block, `match` arms, a handler's clauses) a newline before
+    /// an infix operator or a call's `(` ends the expression; inside parentheses it
+    /// is whitespace (spec 2026-10-23-elya-literals-and-layout D4).
+    braces: bool,
 }
 
+/// `Int`'s largest magnitude: `9223372036854775807`, or `9223372036854775808`
+/// under a folded `-`.
+const INT_MAX_MAGNITUDE: u128 = i64::MAX as u128;
+
 impl<'a> Parser<'a> {
-    fn new(tokens: &'a [Token]) -> Parser<'a> {
+    fn new(tokens: &'a [Token], text: &'a str) -> Parser<'a> {
         Parser {
             tokens,
+            text,
             pos: 0,
             diags: Vec::new(),
+            braces: true,
+        }
+    }
+
+    /// Run `f` with the layout rule on (`true`, braces) or off (parentheses),
+    /// restoring the enclosing setting after, on every path.
+    fn with_braces<T>(&mut self, on: bool, f: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = self.braces;
+        self.braces = on;
+        let r = f(self);
+        self.braces = outer;
+        r
+    }
+
+    /// Whether a newline separates the token at `pos` from the one before it
+    /// (comments between them included).
+    fn newline_before(&self, pos: usize) -> bool {
+        if pos == 0 || pos >= self.tokens.len() {
+            return false;
+        }
+        let from = self.tokens[pos - 1].span.end as usize;
+        let to = self.tokens[pos].span.start as usize;
+        self.text
+            .get(from..to)
+            .is_some_and(|gap| gap.contains('\n'))
+    }
+
+    /// A `-` at `pos` written against the token after it (`-x`, `-1`): the prefix
+    /// style, which starts a statement at a line's start.
+    fn glued_minus(&self, pos: usize) -> bool {
+        match (self.tokens.get(pos), self.tokens.get(pos + 1)) {
+            (Some(m), Some(next)) => m.kind == TokenKind::Minus && m.span.end == next.span.start,
+            _ => false,
+        }
+    }
+
+    /// E0101 at the operator starting this line (D4).
+    fn layout_error(&mut self) {
+        let at = self.peek_span();
+        let text = self
+            .text
+            .get(at.start as usize..at.end as usize)
+            .unwrap_or("");
+        self.diags.push(
+            Diagnostic::error(
+                "E0101",
+                "an operator at the start of a line does not continue the line before",
+            )
+            .with_label(at, "starts a line")
+            .with_help(format!(
+                "end the line before with `{text}`, or put the whole expression in parentheses"
+            )),
+        );
+    }
+
+    /// An integer literal's value: its magnitude, negated when a `-` was folded into
+    /// it, or E0002 when it does not fit in `Int` (D2). Parsing goes on after the
+    /// error, at 0, so one bad literal is one diagnostic.
+    fn int_literal(&mut self, negative: bool, magnitude: u128, span: Span) -> i64 {
+        let limit = if negative {
+            INT_MAX_MAGNITUDE + 1
+        } else {
+            INT_MAX_MAGNITUDE
+        };
+        if magnitude > limit {
+            self.diags.push(
+                Diagnostic::error("E0002", "integer literal out of range")
+                    .with_label(span, "does not fit in `Int`")
+                    .with_help("`Int` is 64-bit: from -9223372036854775808 to 9223372036854775807"),
+            );
+            return 0;
+        }
+        if negative {
+            (magnitude as i128).wrapping_neg() as i64
+        } else {
+            magnitude as i64
         }
     }
 
@@ -62,8 +149,11 @@ impl<'a> Parser<'a> {
         let mut lhs = self.atom()?;
         // `cloned()` frees the immutable borrow so the body can mutate `self`.
         while let Some(kind) = self.peek().cloned() {
-            // postfix call: `expr(...)`
+            // postfix call: `expr(...)`; in braces, not across a newline (D4).
             if kind == TokenKind::LParen {
+                if self.braces && self.newline_before(self.pos) {
+                    break;
+                }
                 lhs = self.finish_call(lhs)?;
                 continue;
             }
@@ -72,6 +162,15 @@ impl<'a> Parser<'a> {
             };
             if l_bp < min_bp {
                 break;
+            }
+            // In braces an infix operator does not continue across a newline (D4):
+            // a glued `-` starts the next statement, any other operator is E0101.
+            if self.braces && self.newline_before(self.pos) {
+                if self.glued_minus(self.pos) {
+                    break;
+                }
+                self.layout_error();
+                return None;
             }
             self.bump(); // operator
             let rhs = self.expr(r_bp)?;
@@ -91,16 +190,18 @@ impl<'a> Parser<'a> {
     fn finish_call(&mut self, callee: Spanned<Expr>) -> Option<Spanned<Expr>> {
         let start = callee.span;
         self.bump(); // '('
-        let mut args = Vec::new();
-        if self.peek() != Some(&TokenKind::RParen) {
-            loop {
-                let arg = self.expr(0)?;
-                args.push(arg);
-                if !self.eat(&TokenKind::Comma) {
-                    break;
+        let args = self.with_braces(false, |p| {
+            let mut args = Vec::new();
+            if p.peek() != Some(&TokenKind::RParen) {
+                loop {
+                    args.push(p.expr(0)?);
+                    if !p.eat(&TokenKind::Comma) {
+                        break;
+                    }
                 }
             }
-        }
+            Some(args)
+        })?;
         let end = self.peek_span();
         if !self.eat(&TokenKind::RParen) {
             self.error(end, "expected `)` to close call");
@@ -123,8 +224,9 @@ impl<'a> Parser<'a> {
             TokenKind::KwFn => self.lambda_expr(),
             TokenKind::KwMatch => self.match_expr(),
             TokenKind::LBrace => self.block_expr(),
-            TokenKind::Int(n) => {
+            TokenKind::Int(m) => {
                 self.bump();
+                let n = self.int_literal(false, m, span);
                 Some(spanned(Expr::Int(n), span))
             }
             TokenKind::Float(x) => {
@@ -149,6 +251,20 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Minus => {
                 self.bump();
+                // A `-` directly before a numeric literal is part of it (D1).
+                let lit = self.peek_span();
+                match self.peek().cloned() {
+                    Some(TokenKind::Int(m)) => {
+                        self.bump();
+                        let n = self.int_literal(true, m, span.merge(lit));
+                        return Some(spanned(Expr::Int(n), span.merge(lit)));
+                    }
+                    Some(TokenKind::Float(x)) => {
+                        self.bump();
+                        return Some(spanned(Expr::Float(-x), span.merge(lit)));
+                    }
+                    _ => {}
+                }
                 let e = self.expr(100)?;
                 let s = span.merge(e.span);
                 Some(spanned(
@@ -173,7 +289,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LParen => {
                 self.bump();
-                let e = self.expr(0)?;
+                let e = self.with_braces(false, |p| p.expr(0))?;
                 let end = self.peek_span();
                 if !self.eat(&TokenKind::RParen) {
                     self.error(end, "expected `)`");
@@ -188,7 +304,7 @@ impl<'a> Parser<'a> {
                     self.error(self.peek_span(), "expected `(` after `resume`");
                     return None;
                 }
-                let arg = self.expr(0)?;
+                let arg = self.with_braces(false, |p| p.expr(0))?;
                 let end = self.peek_span();
                 if !self.eat(&TokenKind::RParen) {
                     self.error(end, "expected `)`");
@@ -514,9 +630,13 @@ impl<'a> Parser<'a> {
             return None;
         }
         let mut arms = Vec::new();
-        while self.peek().is_some() && self.peek() != Some(&TokenKind::RBrace) {
-            arms.push(self.match_arm()?);
-        }
+        // The arms are braces (D4); the scrutinee is in the enclosing setting.
+        self.with_braces(true, |p| {
+            while p.peek().is_some() && p.peek() != Some(&TokenKind::RBrace) {
+                arms.push(p.match_arm()?);
+            }
+            Some(())
+        })?;
         let end = self.peek_span();
         if !self.eat(&TokenKind::RBrace) {
             self.error(self.peek_span(), "expected `}`");
@@ -585,9 +705,27 @@ impl<'a> Parser<'a> {
                 Some(spanned(p, span))
             }
             // Literal patterns.
-            TokenKind::Int(n) => {
+            TokenKind::Int(m) => {
                 self.bump();
+                let n = self.int_literal(false, m, span);
                 Some(spanned(Pattern::Lit(PatLit::Int(n)), span))
+            }
+            // A negative literal (D3): the `-` folded into the number, as in
+            // expressions.
+            TokenKind::Minus => {
+                self.bump();
+                let lit = self.peek_span();
+                match self.peek().cloned() {
+                    Some(TokenKind::Int(m)) => {
+                        self.bump();
+                        let n = self.int_literal(true, m, span.merge(lit));
+                        Some(spanned(Pattern::Lit(PatLit::Int(n)), span.merge(lit)))
+                    }
+                    _ => {
+                        self.error(lit, "expected an integer after `-` in a pattern");
+                        None
+                    }
+                }
             }
             TokenKind::Str(s) => {
                 self.bump();
@@ -811,58 +949,70 @@ impl<'a> Parser<'a> {
             self.error(self.peek_span(), "expected `{`");
             return None;
         }
-        let mut clauses: Vec<Spanned<OpClause>> = Vec::new();
-        let mut ret = None;
-        while self.peek().is_some() && self.peek() != Some(&TokenKind::RBrace) {
-            if self.peek() == Some(&TokenKind::KwReturn) {
-                self.bump(); // return
-                if !self.eat(&TokenKind::LParen) {
-                    self.error(self.peek_span(), "expected `(`");
+        // The clauses are braces (D4); the body before `with` is in the enclosing
+        // setting.
+        let (clauses, ret) = self.with_braces(true, |p| {
+            let mut clauses: Vec<Spanned<OpClause>> = Vec::new();
+            let mut ret = None;
+            while p.peek().is_some() && p.peek() != Some(&TokenKind::RBrace) {
+                // A clause body is no statement list: a `-` starting a line after a
+                // clause cannot begin a statement here, so it is E0101 (the review's
+                // R4).
+                if p.peek() == Some(&TokenKind::Minus) && p.newline_before(p.pos) {
+                    p.layout_error();
                     return None;
                 }
-                let binder = match self.peek()?.clone() {
-                    TokenKind::Lower(n) => {
-                        self.bump();
-                        n
-                    }
-                    _ => {
-                        self.error(self.peek_span(), "expected binder");
+                if p.peek() == Some(&TokenKind::KwReturn) {
+                    p.bump(); // return
+                    if !p.eat(&TokenKind::LParen) {
+                        p.error(p.peek_span(), "expected `(`");
                         return None;
                     }
-                };
-                if !self.eat(&TokenKind::RParen) {
-                    self.error(self.peek_span(), "expected `)`");
-                    return None;
-                }
-                if !self.eat(&TokenKind::Arrow) {
-                    self.error(self.peek_span(), "expected `->`");
-                    return None;
-                }
-                let body_r = self.expr(0)?;
-                ret = Some(ReturnClause {
-                    binder,
-                    body: Rc::new(body_r),
-                });
-            } else {
-                let c = self.op_clause()?;
-                if any {
-                    let ok =
-                        c.node.effect.is_none() && c.node.op == "op" && c.node.params.len() == 1;
-                    if !ok {
-                        self.error(
-                            c.span,
-                            "a `with any` handler has one operation clause, `op(o)`, and a `return` clause",
-                        );
+                    let binder = match p.peek()?.clone() {
+                        TokenKind::Lower(n) => {
+                            p.bump();
+                            n
+                        }
+                        _ => {
+                            p.error(p.peek_span(), "expected binder");
+                            return None;
+                        }
+                    };
+                    if !p.eat(&TokenKind::RParen) {
+                        p.error(p.peek_span(), "expected `)`");
                         return None;
                     }
-                    if !clauses.is_empty() {
-                        self.error(c.span, "a `with any` handler has one `op(o)` clause");
+                    if !p.eat(&TokenKind::Arrow) {
+                        p.error(p.peek_span(), "expected `->`");
                         return None;
                     }
+                    let body_r = p.expr(0)?;
+                    ret = Some(ReturnClause {
+                        binder,
+                        body: Rc::new(body_r),
+                    });
+                } else {
+                    let c = p.op_clause()?;
+                    if any {
+                        let ok =
+                            c.node.effect.is_none() && c.node.op == "op" && c.node.params.len() == 1;
+                        if !ok {
+                            p.error(
+                                c.span,
+                                "a `with any` handler has one operation clause, `op(o)`, and a `return` clause",
+                            );
+                            return None;
+                        }
+                        if !clauses.is_empty() {
+                            p.error(c.span, "a `with any` handler has one `op(o)` clause");
+                            return None;
+                        }
+                    }
+                    clauses.push(c);
                 }
-                clauses.push(c);
             }
-        }
+            Some((clauses, ret))
+        })?;
         let end = self.peek_span();
         if any && clauses.is_empty() {
             self.error(end, "a `with any` handler needs its `op(o)` clause");
@@ -1104,6 +1254,10 @@ impl<'a> Parser<'a> {
     }
 
     fn block(&mut self) -> Option<Spanned<Block>> {
+        self.with_braces(true, |p| p.block_inner())
+    }
+
+    fn block_inner(&mut self) -> Option<Spanned<Block>> {
         let start = self.peek_span();
         if !self.eat(&TokenKind::LBrace) {
             self.error(start, "expected `{`");
@@ -1113,11 +1267,10 @@ impl<'a> Parser<'a> {
         let mut tail = None;
         while self.peek().is_some() && self.peek() != Some(&TokenKind::RBrace) {
             if self.peek() == Some(&TokenKind::KwLet) {
-                if let Some(s) = self.let_stmt() {
-                    stmts.push(s);
-                } else {
-                    break;
-                }
+                // A bad `let` fails the block, as a bad expression does: breaking
+                // here left its `}` uneaten, and the module level then reported the
+                // rest a second time (the review's R2).
+                stmts.push(self.let_stmt()?);
             } else {
                 let e = self.expr(0)?;
                 if self.peek() == Some(&TokenKind::RBrace) {
@@ -1240,7 +1393,7 @@ fn infix_bp(kind: &TokenKind) -> Option<(u8, u8, BinOp)> {
 /// Test/convenience entry: parse a single expression from source text.
 pub fn parse_expr_str(session: &Session, text: &str) -> (Option<Spanned<Expr>>, Vec<Diagnostic>) {
     let (tokens, mut diags) = lex(session, text);
-    let mut p = Parser::new(&tokens);
+    let mut p = Parser::new(&tokens, text);
     let e = p.expr(0);
     diags.append(&mut p.diags);
     (e, diags)
@@ -1248,7 +1401,7 @@ pub fn parse_expr_str(session: &Session, text: &str) -> (Option<Spanned<Expr>>, 
 
 pub fn parse_module(session: &Session, text: &str) -> (Module, Vec<Diagnostic>) {
     let (tokens, mut diags) = lex(session, text);
-    let mut p = Parser::new(&tokens);
+    let mut p = Parser::new(&tokens, text);
     let m = p.module();
     diags.append(&mut p.diags);
     (m, diags)

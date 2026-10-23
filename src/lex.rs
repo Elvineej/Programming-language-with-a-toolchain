@@ -10,8 +10,11 @@ use logos::Logos;
 #[logos(skip r"//[^\n]*")]
 #[logos(skip r"/\*([^*]|\*[^/])*\*/")]
 pub enum TokenKind {
-    #[regex(r"[0-9][0-9_]*", |lex| lex.slice().replace('_', "").parse().ok())]
-    Int(i64),
+    /// An integer literal's magnitude, saturated: the range check is the parser's
+    /// (E0002), since `-9223372036854775808` is in range and `9223372036854775808`
+    /// alone is not (spec 2026-10-23-elya-literals-and-layout D2).
+    #[regex(r"[0-9][0-9_]*", |lex| lex.slice().replace('_', "").parse::<u128>().unwrap_or(u128::MAX))]
+    Int(u128),
     #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*", |lex| lex.slice().replace('_', "").parse().ok())]
     Float(f64),
     #[regex(r#""([^"\\]|\\.)*""#, |lex| unescape(lex.slice()))]

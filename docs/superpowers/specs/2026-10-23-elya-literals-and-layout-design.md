@@ -1,6 +1,6 @@
 # Literals at the edges, and a layout rule
 
-**Status:** in progress (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF
+**Status:** done (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF
 step 1. The design choices are Claude's under the maintainer's delegation (rule 2),
 recorded here.
 
@@ -45,9 +45,13 @@ Elya's own data-literal syntax (`op.show`, `op.encode`, `op.decode`, spec
   (`Expr::Int(-n)`), whatever the whitespace between them, as the data-literal
   syntax already does. So `-9223372036854775808` is `MIN`, and the source
   language and `op.show` write numbers the same way.
-  - Float literals fold the same way (`-1.5` is `Expr::Float(-1.5)`); `-x` on a
-    float already meant IEEE negation, so the value is the same, `-0.0`
-    included.
+  - Float literals fold the same way (`-1.5` is `Expr::Float(-1.5)`), so a
+    negative float can be written at all. *Corrected by the review (R1):* unary `-`
+    is typed `Int -> Int` (spec 2026-10-17 D1), so `-1.5` was a type error before
+    and is accepted now, while `-(1.5)` and `-x` on a `Float` stay E0400: negating
+    a float expression is `0.0 -. x`, as the float operators are their own. The
+    asymmetry is accepted: `-1.5` is a literal, not an operation, and it is what
+    `op.show` writes.
   - Folding does not change any value: `-n` was `0 - n` in Core (spec 2026-10-17
     D1), equal to the literal for every `n` in range. `-(-n)` and `-(n)` stay
     unary (a parenthesised literal is not directly after the `-`).
@@ -84,7 +88,10 @@ Elya's own data-literal syntax (`op.show`, `op.encode`, `op.decode`, spec
     line before with `<op>`, or put the whole expression in parentheses".
   - Inside `( ... )` (a parenthesised expression, call arguments, `resume(...)`)
     newlines are whitespace again, so `(x` newline `- 1)` still continues (l6); a
-    block inside parentheses is braces again.
+    block inside parentheses is braces again. A `match` scrutinee and a `handle`
+    body keep the enclosing setting; only the arms and the clauses are braces.
+  - A handler's clauses are no statements: a `-` starting a line after a clause is
+    E0101 there, glued or not.
   - *Why the whitespace after `-` matters:* without it, `a` newline `- b` (a
     continuation written in the leading-operator style) would silently become two
     statements, `a` and `-b`. With it, the binary style is an error that says how
@@ -117,3 +124,45 @@ Elya's own data-literal syntax (`op.show`, `op.encode`, `op.decode`, spec
 - Negative controls (recorded in the test files' headers): the fold off in
   expressions (D1), the range check one too wide (D2), the layout check off (D4),
   the whitespace test after `-` off (D4), each failing a distinct test.
+
+## 3. Results
+
+Gate: **1139 passed, 110 suites** (predicted 1131 before the review; the review
+added four root tests, eight in both configurations). The nine planned tests were
+red first as predicted (E0001; E0001; E0100 "expected a pattern"; E0200; l3 checked
+clean; only the block row of `continuations_that_stay`, E0200; `- 5` unary; the two
+native tests at the front end). Controls K1-K4 are in `literals_layout.rs`'s
+header; each failed distinctly (E0002 on MIN; `9223372036854775808` checked clean;
+E0200 and no E0101; E0101 on l1).
+
+### The review (2026-10-23)
+
+An independent review built the old and the new CLI and compared `elya check` on
+all 27 `.elya` files (identical), ran MIN arithmetic, `-0`, `- -5`, underscores,
+50-digit literals, CRLF, comments between lines and nested parentheses on both
+sides: no wrong value, panic or disagreement. Findings, fixed test-first
+(`literals_layout.rs`, "the review"):
+
+- **R1, medium: the float fold's reason was wrong** (see D1). Pinned by
+  `a_negative_float_is_a_literal_and_float_negation_stays_an_error`; the spec
+  text is corrected.
+- **R2, low: an E0101 in a `let` was reported twice** (a second E0100 at the same
+  operator). `block` broke out of its loop on a failed `let`, leaving its `}`
+  uneaten, so the module level read the rest. A failed `let` now fails the block,
+  as a failed expression does (older; `let y = *` cascaded the same way).
+- **R3, low: inside parentheses a `match` scrutinee and a `handle` body used the
+  braces rule** (`(match 1` newline `+ 1 { ... })` was E0101, 5 before). The
+  setting now switches only around the arms and the clauses.
+- **R4, low: a `-` starting a line in a handler** gave "expected `Effect.op`
+  clause"; it is E0101 now.
+- Not defects, as designed: a block comment holding a newline ends a line; a
+  spaced `- 5` folds in a pattern too. Older, recorded in HANDOFF: `recover_to_decl`
+  stops at a lambda's `fn`, so errors after a parse error in a body cascade.
+
+Sweep (`scripts/sweep.py`, 836 programs, after the review's fixes): 482 same, no
+disagreement and no `both-fail-differently`; one `differ-timing` (a program that
+reads the clock, noise); the 5 refusals, 3 `Float` build errors and the timeout
+are the known gaps.
+
+No change to `runtime.c` or codegen: the Windows gate needs nothing beyond the
+usual run.
