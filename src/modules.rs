@@ -722,9 +722,12 @@ impl<'u> Rewriter<'u> {
                     body: Rc::new(body),
                 }
             }
-            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Unit => {
-                e.node.clone()
-            }
+            Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Str(_)
+            | Expr::Bool(_)
+            | Expr::Unit
+            | Expr::Error => e.node.clone(),
         };
         Spanned { node, span }
     }

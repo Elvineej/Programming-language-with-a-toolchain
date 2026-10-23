@@ -406,7 +406,12 @@ impl Cx<'_> {
 
     fn check_expr(&mut self, e: &Expr, span: Span, scope: &mut Vec<HashSet<String>>) {
         match e {
-            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Unit => {}
+            Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Str(_)
+            | Expr::Bool(_)
+            | Expr::Unit
+            | Expr::Error => {}
             Expr::Var(name) => {
                 self.check_name(name, span, scope);
                 // E0206 (slice 5c-3): an operation may only be called. Named

@@ -1,6 +1,6 @@
 # Parser error recovery inside a body
 
-**Status:** in progress (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF
+**Status:** done (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF
 step 1. The design choices are Claude's under the maintainer's delegation (rule
 2), recorded here.
 
@@ -55,13 +55,21 @@ Causes:
   - *Rejected:* recovering only to the next declaration at column 0, keeping
     the function as a stub. It still hides p7's `zz`.
 - **D3. A declaration whose header fails is still a known name.** When `fn`
-  and its name were read, the declaration is kept as a stub (the parameters
-  read so far, a body of `Expr::Error`), so callers are not reported (p5).
+  and its name were read, the declaration is kept as a stub (no parameters, a
+  body of `Expr::Error`; resolve does not count arguments), so callers are not reported (p5).
   Inference never runs on it (D2's reason).
-- **D4. Module-level recovery stops at a `fn` only at the start of a line in
-  column 0** (a top-level declaration), and at `pub`, `import`, `effect` or
-  `type` anywhere as before: a lambda's `fn` no longer resumes the parse in
-  the middle of a body.
+- **D4. A `fn` starts a declaration only when a name follows it** (`fn f(`);
+  a lambda's `fn` is followed by `(`. Module-level recovery stops there and at
+  `pub`, `import`, `effect` or `type`; so does D2's skip at a line's start, and
+  a block meeting one at a line's start ends with "expected `}`".
+  - *Rejected:* a `fn` in column 0, the first version. The test suite's own
+    programs are written in Rust strings whose continuation lines lose their
+    indentation, so a lambda in column 0 is ordinary (a `sub_effecting` program
+    broke on it); the token after `fn` decides without any layout.
+- **D2's skip does not stop at a line-start token that cannot begin a
+  statement** (an operator). The E0101 layout error stops at a line-start `+`;
+  stopping there again would report the `+` a second time (`literals_layout`'s
+  R2 test caught it).
 - *Not in this step* (left in HANDOFF): a label after non-ASCII text (byte
   offsets where `ariadne` counts characters); E0209 across files labelling only
   the second declaration.
@@ -85,3 +93,31 @@ plus a recovered lambda body and a valid program with a column-0 `fn` after a
 mistake (D4). Negative controls: D2 off (statements fail their block again):
 p1-p4 and p7 report the cascade E0200s; D4 off: a lambda `fn` after a mistake
 gives a second E0100; D1 off: p6 checks clean.
+
+## 3. Outcome and review
+
+Gate 1207 / 119 as predicted; then 1209 / 119 with the review's test. Controls
+(in the test file's header): K1 D2 off loses the later real errors; K2 D4 off
+adds an E0100 at a lambda's `fn`; K3 D1 off lets p5 check clean.
+
+The independent review ran 1083 programs (every example and every program
+string in the test suites) through `check` and `run --value` on both builds:
+no valid program changed. About 10 000 mutants: no hang, panic or label
+outside the file, and nothing newly accepted. Findings, fixed test-first
+(`the_end_of_the_file_is_reported_once`):
+
+- F1: `linear` did not start a declaration (follow-on errors after a body
+  missing its `}`).
+- F2: each brace still open at the end of the file reported "expected `}`"
+  again; one `close_brace` now serves blocks, arms, handlers, effects, types and
+  effect rows, and reports the end of the file once. A handler's and an effect
+  row's `}` were not checked at all.
+- F4: a truncated `type` passed `check` (older).
+
+Left as they are (minor, recorded): an `if` without `else` before a block's
+end gives "expected `else`" and "expected `}`" at one span; an unterminated
+string gives E0001 and "unexpected end of file"; a lambda body missing its `}`
+takes in the next line (a use of the lambda's own name there is E0200); after
+an unclosed `(` or `[` the skip runs to its close, so a real error inside is
+not reported. Deep nesting (5000 brackets) overflows the parser's stack on
+both builds (older).

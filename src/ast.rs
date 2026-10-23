@@ -222,6 +222,10 @@ pub enum Expr {
         params: Vec<Spanned<Param>>,
         body: Rc<Spanned<Block>>,
     },
+    /// A statement the parser could not read (spec
+    /// 2026-10-23-elya-parser-recovery D2). Only in a module with a parse error,
+    /// on which inference, evaluation and lowering never run.
+    Error,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -371,6 +375,7 @@ fn pretty_expr(e: &Expr, s: &mut String) {
         Expr::Str(v) => s.push_str(&format!("{v:?}")),
         Expr::Bool(b) => s.push_str(if *b { "True" } else { "False" }),
         Expr::Unit => s.push_str("Unit"),
+        Expr::Error => s.push_str("<error>"),
         Expr::Var(name) => s.push_str(name),
         Expr::Qualified { module, name } => s.push_str(&format!("{module}.{name}")),
         Expr::Call { callee, args } => {

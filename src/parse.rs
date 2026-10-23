@@ -20,6 +20,9 @@ struct Parser<'a> {
     /// an infix operator or a call's `(` ends the expression; inside parentheses it
     /// is whitespace (spec 2026-10-23-elya-literals-and-layout D4).
     braces: bool,
+    /// "unexpected end of file" was reported: the missing `}`s after it are not
+    /// reported again (spec 2026-10-23-elya-parser-recovery D1).
+    eof_reported: bool,
 }
 
 /// `Int`'s largest magnitude: `9223372036854775807`, or `9223372036854775808`
@@ -35,6 +38,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             diags: Vec::new(),
             braces: true,
+            eof_reported: false,
         }
     }
 
@@ -150,6 +154,121 @@ impl<'a> Parser<'a> {
     fn error(&mut self, span: Span, msg: impl Into<String>) {
         self.diags
             .push(Diagnostic::error("E0100", msg).with_label(span, "here"));
+    }
+
+    /// D1: a parse that ran out of tokens without saying so is E0100 "unexpected
+    /// end of file", once.
+    fn eof_error(&mut self) {
+        if self.eof_reported {
+            return;
+        }
+        self.eof_reported = true;
+        let at = self.peek_span();
+        self.diags.push(
+            Diagnostic::error("E0100", "unexpected end of file")
+                .with_label(at, "the file ends here"),
+        );
+    }
+
+    /// A closing `}`: eaten, or E0100 "expected `}`" -- at the end of the file
+    /// once, however many braces are still open there (D1; the review's F2).
+    fn close_brace(&mut self) -> bool {
+        let end = self.peek_span();
+        if self.eat(&TokenKind::RBrace) {
+            return true;
+        }
+        if self.peek().is_none() {
+            if !self.eof_reported {
+                self.eof_reported = true;
+                self.error(end, "expected `}`");
+            }
+        } else {
+            self.error(end, "expected `}`");
+        }
+        false
+    }
+
+    /// D4: a token that starts a top-level declaration: `pub`, `import`,
+    /// `effect`, `type` or `linear` (the review's F1), or `fn` followed by a name (a lambda's `fn` is
+    /// followed by `(`).
+    fn starts_decl(&self, pos: usize) -> bool {
+        match self.tokens.get(pos).map(|t| &t.kind) {
+            Some(TokenKind::KwPub)
+            | Some(TokenKind::KwImport)
+            | Some(TokenKind::KwEffect)
+            | Some(TokenKind::KwType)
+            | Some(TokenKind::KwLinear) => true,
+            Some(TokenKind::KwFn) => matches!(
+                self.tokens.get(pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Lower(_))
+            ),
+            _ => false,
+        }
+    }
+
+    /// D2: after a statement failed (it began at token `start`), skip to where
+    /// the next one begins: a token that starts a line and can start a statement
+    /// (not an operator: E0101's `+` is part of the bad statement), with no
+    /// bracket opened since `start` left open; a line-start `let` when no `{` is left open; the
+    /// block's own `}` (not consumed); a declaration at a line's start; or the
+    /// end of the file. An unclosed `(` or `[` is dropped by the `}` that closes
+    /// the brace around it.
+    fn skip_statement(&mut self, start: usize) {
+        let mut open: Vec<TokenKind> = Vec::new();
+        let push_or_pop = |open: &mut Vec<TokenKind>, k: &TokenKind| -> bool {
+            match k {
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => {
+                    open.push(k.clone());
+                    true
+                }
+                TokenKind::RParen | TokenKind::RBracket => {
+                    let want = if *k == TokenKind::RParen {
+                        TokenKind::LParen
+                    } else {
+                        TokenKind::LBracket
+                    };
+                    if open.last() == Some(&want) {
+                        open.pop();
+                    }
+                    true
+                }
+                TokenKind::RBrace => {
+                    // Close up to and including the innermost `{`; with none open
+                    // it is the block's own `}`.
+                    match open.iter().rposition(|o| *o == TokenKind::LBrace) {
+                        Some(i) => {
+                            open.truncate(i);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                _ => true,
+            }
+        };
+        for i in start..self.pos {
+            let k = self.tokens[i].kind.clone();
+            push_or_pop(&mut open, &k);
+        }
+        let mut first = self.pos == start;
+        while let Some(k) = self.peek().cloned() {
+            if !first {
+                let line_start = self.newline_before(self.pos);
+                if line_start
+                    && ((open.is_empty() && can_start_statement(&k)) || self.starts_decl(self.pos))
+                {
+                    return;
+                }
+                if line_start && k == TokenKind::KwLet && !open.contains(&TokenKind::LBrace) {
+                    return;
+                }
+            }
+            first = false;
+            if !push_or_pop(&mut open, &k) {
+                return; // the block's `}`
+            }
+            self.bump();
+        }
     }
 
     // ---- Expressions (Pratt) ----
@@ -366,19 +485,60 @@ impl<'a> Parser<'a> {
         let mut decls = Vec::new();
         while self.peek().is_some() {
             let before = self.pos;
+            let reported = self.diags.len();
             match self.peek() {
                 Some(TokenKind::KwImport) => {
                     if let Some(i) = self.import() {
                         imports.push(i);
                     } else {
+                        if self.diags.len() == reported {
+                            self.eof_error();
+                        }
                         self.recover_to_decl();
                     }
                 }
                 Some(TokenKind::KwPub) | Some(TokenKind::KwFn) => {
+                    let start = self.peek_span();
                     let is_pub = self.eat(&TokenKind::KwPub);
+                    let name = match (
+                        self.tokens.get(self.pos).map(|t| &t.kind),
+                        self.tokens.get(self.pos + 1),
+                    ) {
+                        (Some(TokenKind::KwFn), Some(t)) => match &t.kind {
+                            TokenKind::Lower(n) => Some(spanned(n.clone(), t.span)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
                     if let Some(d) = self.fn_decl(is_pub) {
                         decls.push(d);
                     } else {
+                        if self.diags.len() == reported {
+                            self.eof_error();
+                        }
+                        // D3: a function whose header failed is still a known
+                        // name, so its callers are not reported. Inference never
+                        // runs on a module with a parse error.
+                        if let Some(name) = name {
+                            let span = start.merge(name.span);
+                            decls.push(spanned(
+                                Decl::Fn(FnDecl {
+                                    is_pub,
+                                    name: name.node,
+                                    params: Vec::new(),
+                                    effect_row: None,
+                                    ret_ann: None,
+                                    body: Rc::new(spanned(
+                                        Block {
+                                            stmts: Rc::new([]),
+                                            tail: Some(Rc::new(spanned(Expr::Error, span))),
+                                        },
+                                        span,
+                                    )),
+                                }),
+                                span,
+                            ));
+                        }
                         self.recover_to_decl();
                     }
                 }
@@ -386,6 +546,9 @@ impl<'a> Parser<'a> {
                     if let Some(e) = self.effect_decl() {
                         decls.push(e);
                     } else {
+                        if self.diags.len() == reported {
+                            self.eof_error();
+                        }
                         self.recover_to_decl();
                     }
                 }
@@ -393,6 +556,10 @@ impl<'a> Parser<'a> {
                     if let Some(t) = self.type_decl() {
                         decls.push(t);
                     } else {
+                        // D1, missed by the first version (the review's F4).
+                        if self.diags.len() == reported {
+                            self.eof_error();
+                        }
                         self.recover_to_decl();
                     }
                 }
@@ -462,7 +629,10 @@ impl<'a> Parser<'a> {
             ops.push(op);
         }
         let end = self.peek_span();
-        self.eat(&TokenKind::RBrace);
+        // D1: it was accepted unchecked, also at the end of the file.
+        if !self.close_brace() {
+            return None;
+        }
         Some(spanned(
             Decl::Effect(EffectDecl {
                 name,
@@ -536,8 +706,7 @@ impl<'a> Parser<'a> {
             }
         }
         let end = self.peek_span();
-        if !self.eat(&TokenKind::RBrace) {
-            self.error(self.peek_span(), "expected `}`");
+        if !self.close_brace() {
             return None;
         }
         Some(spanned(
@@ -648,8 +817,7 @@ impl<'a> Parser<'a> {
             Some(())
         })?;
         let end = self.peek_span();
-        if !self.eat(&TokenKind::RBrace) {
-            self.error(self.peek_span(), "expected `}`");
+        if !self.close_brace() {
             return None;
         }
         Some(spanned(
@@ -1028,7 +1196,9 @@ impl<'a> Parser<'a> {
             self.error(end, "a `with any` handler needs its `op(o)` clause");
             return None;
         }
-        self.eat(&TokenKind::RBrace);
+        if !self.close_brace() {
+            return None;
+        }
         Some(spanned(
             Expr::Handle {
                 body: Rc::new(body),
@@ -1288,7 +1458,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        self.eat(&TokenKind::RBrace);
+        self.close_brace();
         names
     }
 
@@ -1317,23 +1487,56 @@ impl<'a> Parser<'a> {
         let mut stmts = Vec::new();
         let mut tail = None;
         while self.peek().is_some() && self.peek() != Some(&TokenKind::RBrace) {
+            // A declaration at a line's start: this block's `}` is missing (D1).
+            if self.newline_before(self.pos) && self.starts_decl(self.pos) {
+                break;
+            }
+            let at = self.pos;
+            let first = self.peek_span();
+            let reported = self.diags.len();
             if self.peek() == Some(&TokenKind::KwLet) {
-                // A bad `let` fails the block, as a bad expression does: breaking
-                // here left its `}` uneaten, and the module level then reported the
-                // rest a second time (the review's R2).
-                stmts.push(self.let_stmt()?);
+                // D2: a bad `let` is one error; its name, when read, stays bound.
+                let name = match self.tokens.get(at + 1).map(|t| &t.kind) {
+                    Some(TokenKind::Lower(n)) => Some(n.clone()),
+                    _ => None,
+                };
+                match self.let_stmt() {
+                    Some(st) => stmts.push(st),
+                    None => {
+                        let span = self.recover_statement(at, reported, first);
+                        let error = spanned(Expr::Error, span);
+                        stmts.push(spanned(
+                            match name {
+                                Some(name) => Stmt::Let {
+                                    name,
+                                    ann: None,
+                                    value: error,
+                                },
+                                None => Stmt::Expr(error),
+                            },
+                            span,
+                        ));
+                    }
+                }
             } else {
-                let e = self.expr(0)?;
-                if self.peek() == Some(&TokenKind::RBrace) {
-                    tail = Some(e);
-                } else {
-                    let span = e.span;
-                    stmts.push(spanned(Stmt::Expr(e), span));
+                match self.expr(0) {
+                    Some(e) => {
+                        if self.peek() == Some(&TokenKind::RBrace) {
+                            tail = Some(e);
+                        } else {
+                            let span = e.span;
+                            stmts.push(spanned(Stmt::Expr(e), span));
+                        }
+                    }
+                    None => {
+                        let span = self.recover_statement(at, reported, first);
+                        stmts.push(spanned(Stmt::Expr(spanned(Expr::Error, span)), span));
+                    }
                 }
             }
         }
         let end = self.peek_span();
-        self.eat(&TokenKind::RBrace);
+        self.close_brace();
         Some(spanned(
             Block {
                 stmts: stmts.into(),
@@ -1391,27 +1594,61 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    /// D2: a statement that began at token `at` failed; report the end of the
+    /// file if nothing was said, skip to the next statement, and return the
+    /// span the error node covers.
+    fn recover_statement(&mut self, at: usize, reported: usize, first: Span) -> Span {
+        if self.diags.len() == reported && self.peek().is_none() {
+            self.eof_error();
+        }
+        self.skip_statement(at);
+        let last = self.pos.max(at + 1).min(self.tokens.len()) - 1;
+        match self.tokens.get(last) {
+            Some(t) if self.pos > at => first.merge(t.span),
+            _ => first,
+        }
+    }
+
     fn block_expr(&mut self) -> Option<Spanned<Expr>> {
         let b = self.block()?;
         Some(spanned(Expr::Block(b.node), b.span))
     }
 
     fn recover_to_decl(&mut self) {
-        // Synchronize: skip tokens until a declaration keyword or EOF.
-        while let Some(k) = self.peek() {
-            if matches!(
-                k,
-                TokenKind::KwFn
-                    | TokenKind::KwPub
-                    | TokenKind::KwImport
-                    | TokenKind::KwEffect
-                    | TokenKind::KwType
-            ) {
+        // Synchronize: skip tokens until a declaration (D4: a `fn` only when a
+        // name follows it) or EOF.
+        while self.peek().is_some() {
+            if self.starts_decl(self.pos) {
                 return;
             }
             self.bump();
         }
     }
+}
+
+/// D2: a token a statement can begin with (an expression's first token, or `let`).
+fn can_start_statement(k: &TokenKind) -> bool {
+    use TokenKind as T;
+    matches!(
+        k,
+        T::Int(_)
+            | T::Float(_)
+            | T::Str(_)
+            | T::True
+            | T::False
+            | T::Unit
+            | T::Lower(_)
+            | T::Upper(_)
+            | T::KwLet
+            | T::KwIf
+            | T::KwMatch
+            | T::KwHandle
+            | T::KwFn
+            | T::LParen
+            | T::LBrace
+            | T::Minus
+            | T::Bang
+    )
 }
 
 /// Binding powers: (left_bp, right_bp, op). Higher binds tighter.

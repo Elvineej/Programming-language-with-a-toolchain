@@ -500,6 +500,8 @@ pub mod tree {
             Expr::Str(s) => Ok(Value::Str(s.clone())),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Unit => Ok(Value::Unit),
+            // Only in a module with a parse error, which is never run.
+            Expr::Error => Err(rt(span, "a statement that did not parse")),
             Expr::Var(name) => {
                 if let Some(v) = env.get(name) {
                     Ok(v)
@@ -1080,6 +1082,7 @@ pub mod cek {
             Expr::Str(s) => State::Return(Value::Str(s.clone()), k),
             Expr::Bool(b) => State::Return(Value::Bool(*b), k),
             Expr::Unit => State::Return(Value::Unit, k),
+            Expr::Error => return Err(rt(span, "a statement that did not parse")),
             Expr::Var(name) => {
                 let v = if let Some(v) = env.get(name) {
                     v

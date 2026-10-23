@@ -546,6 +546,8 @@ fn lower_expr(
         Expr::Bool(b) => CoreKind::Lit(CoreLit::Bool(*b)),
         Expr::Str(v) => CoreKind::Lit(CoreLit::Str(v.clone())),
         Expr::Unit => CoreKind::Lit(CoreLit::Unit),
+        // Only in a module with a parse error, which is never lowered.
+        Expr::Error => return Err(LowerError::Unsupported("a statement that did not parse")),
         Expr::Var(x) => {
             // A bare constructor name is construction of a nullary ctor (5b-4
             // §3.2), distinct from a variable reference.

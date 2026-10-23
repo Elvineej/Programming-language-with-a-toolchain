@@ -1392,6 +1392,8 @@ impl Infer {
             Expr::Str(_) => Ty::str(),
             Expr::Bool(_) => Ty::bool(),
             Expr::Unit => Ty::unit(),
+            // Poison: only in a module with a parse error (never inferred).
+            Expr::Error => Ty::Error,
             Expr::Var(name) => {
                 // A bare constructor is a first-class function value (Slice 4b-1):
                 // its scheme is already an arrow (`Some : ∀a. (a) -> Option(a)`), so
@@ -3510,6 +3512,7 @@ fn collect_refs_expr(e: &Expr, acc: &mut Vec<String>) {
         | Expr::Str(_)
         | Expr::Bool(_)
         | Expr::Unit
+        | Expr::Error
         | Expr::Qualified { .. } => {}
     }
 }

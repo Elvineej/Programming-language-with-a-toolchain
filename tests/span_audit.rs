@@ -34,7 +34,8 @@ fn collect_expr(e: &Spanned<Expr>, out: &mut Vec<Span>) {
         | Expr::Bool(_)
         | Expr::Unit
         | Expr::Var(_)
-        | Expr::Qualified { .. } => {}
+        | Expr::Qualified { .. }
+        | Expr::Error => {}
         Expr::Call { callee, args } => {
             collect_expr(callee, out);
             for a in args.iter() {

@@ -19,3 +19,10 @@ suite is counted in both configurations, +2).
 ## Task 2: D1, D3, D4 (`parse.rs`)
 ## Task 3: D2 (`ast.rs` `Expr::Error`, `parse.rs`, and every match on `Expr`)
 ## Task 4: gate, controls, review
+
+## Outcome
+
+Red as predicted (the cascade, p6 clean). Green at 1207 / 119 as predicted.
+The first `fn`-in-column-0 rule broke `sub_effecting` (test sources lose their
+indentation): replaced by "a name follows `fn`". The review's three findings
+added one test: 1209 / 119.
