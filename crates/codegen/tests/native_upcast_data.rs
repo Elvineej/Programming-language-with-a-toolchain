@@ -12,6 +12,8 @@
 //!   ("direct function used where an effectful one is expected"): D3's guard.
 //! - K3, D2 and D3 off: the same test fails at let_lam with "match failed (no
 //!   arm matched)" natively where the evaluator prints 16.
+//! - K4, the parameter pass of spec 2026-10-23-elya-wrapper-parameter-rows D1
+//!   off: `wrapped_results_sharing_a_parameter_row_agree` fails on f2, a pointer.
 
 use elya::core::lower_module;
 use elya::parse::parse_module;
@@ -255,4 +257,26 @@ fn a_non_regular_type_is_refused_by_name() {
          }}\n"
     );
     assert_eq!(agree(&deep, "deep8").end, Ok("16".into()));
+}
+
+/// Spec 2026-10-23-elya-wrapper-parameter-rows (the upcasts-through-data
+/// review's F2): the wrapped function's own result shares a row variable with a
+/// parameter; it is bound from the use's parameter.
+#[test]
+fn wrapped_results_sharing_a_parameter_row_agree() {
+    let programs: [(&str, &str); 10] = [
+        ("res_param", "effect E { fn e() -> Int }\nfn mk(k: fn() -> Int) -> fn(fn() -> Int) -> fn() -> Int { fn(j) { k } }\nfn use(g: fn(fn() / {E} -> Int) -> fn(fn() -> Int) / {E} -> fn() / {E} -> Int) / {E} -> Int { g(fn() { e() + 15 })(fn() { 3 })() }\npub fn main() -> Int { handle { use(mk) } with { E.e() -> resume(1) } }\n"),
+        ("res_param2", "effect E { fn e() -> Int }\nfn mk(k: fn() -> Int) -> fn() -> fn(fn() -> Int) -> fn() -> Int { fn() { fn(j) { k } } }\nfn use(g: fn(fn() / {E} -> Int) -> fn() / {E} -> fn(fn() -> Int) / {E} -> fn() / {E} -> Int) / {E} -> Int { g(fn() { e() + 15 })()(fn() { 3 })() }\npub fn main() -> Int { handle { use(mk) } with { E.e() -> resume(1) } }\n"),
+        ("f2", "effect E { fn e() -> Int }\nfn mko(k: fn() -> Int) -> fn() -> fn() -> Int { fn() { k } }\nfn use(g: fn(fn() / {E} -> Int) -> fn() / {E} -> fn() / {E} -> Int) / {E} -> Int { g(fn() { 15 })()() + e() }\npub fn main() -> Int { handle { use(mko) } with { E.e() -> resume(1) } }\n"),
+        ("effarg", "effect E { fn e() -> Int }\nfn mko(k: fn() -> Int) -> fn() -> fn() -> Int { fn() { k } }\nfn use(g: fn(fn() / {E} -> Int) -> fn() / {E} -> fn() / {E} -> Int) / {E} -> Int { g(fn() { e() + 15 })()() }\npub fn main() -> Int { handle { use(mko) } with { E.e() -> resume(1) } }\n"),
+        ("s8", "effect E { fn e() -> Int }\nfn mko(k: fn() -> Int) -> fn() -> fn() -> Int { fn() { k } }\nfn use(g: fn(fn() / {E} -> Int) -> fn() -> fn() / {E} -> Int) / {E} -> Int { g(fn() { 15 })()() + e() }\npub fn main() -> Int { handle { use(mko) } with { E.e() -> resume(1) } }\n"),
+        ("r8", "effect E { fn e() -> Int }\ntype Option(a) { None, Some(a) }\nfn mko(k: fn() -> Int) -> fn() -> Option(fn() -> Int) { fn() { Some(k) } }\nfn use(g: fn(fn() / {E} -> Int) -> fn() / {E} -> Option(fn() / {E} -> Int)) / {E} -> Int { match g(fn() { 15 })() { Some(k) -> k() + e()  None -> 0 } }\npub fn main() -> Int { handle { use(mko) } with { E.e() -> resume(1) } }\n"),
+        ("s3", "effect E { fn e() -> Int }\ntype Option(a) { None, Some(a) }\nfn mko(k: fn() -> Int) -> fn() -> Option(fn() -> Int) { fn() { Some(k) } }\nfn use(g: fn(fn() / {E} -> Int) -> fn() -> Option(fn() / {E} -> Int)) / {E} -> Int { match g(fn() { 15 })() { Some(k) -> k() + e()  None -> 0 } }\npub fn main() -> Int { handle { use(mko) } with { E.e() -> resume(1) } }\n"),
+        ("s4", "effect E { fn e() -> Int }\ntype Option(a) { None, Some(a) }\nfn mko(k: fn() -> Int) -> fn() -> Option(fn() -> Int) { fn() { Some(k) } }\npub fn main() -> Int { let g: fn(fn() / {E} -> Int) -> fn() / {E} -> Option(fn() / {E} -> Int) = mko\n handle { match g(fn() { 15 })() { Some(k) -> k() + e()  None -> 0 } } with { E.e() -> resume(1) } }\n"),
+        ("one", "effect E { fn e() -> Int }\nfn mko(k: fn() -> Int) -> fn() -> Int { k }\nfn use(g: fn(fn() / {E} -> Int) -> fn() / {E} -> Int) / {E} -> Int { g(fn() { 15 })() + e() }\npub fn main() -> Int { handle { use(mko) } with { E.e() -> resume(1) } }\n"),
+        ("unused", "effect E { fn e() -> Int }\nfn mko(k: fn() -> Int) -> fn() -> fn() -> Int { fn() { fn() { 15 } } }\nfn use(g: fn(fn() / {E} -> Int) -> fn() / {E} -> fn() / {E} -> Int) / {E} -> Int { g(fn() { 15 })()() + e() }\npub fn main() -> Int { handle { use(mko) } with { E.e() -> resume(1) } }\n"),
+    ];
+    for (tag, src) in programs {
+        assert_eq!(agree(src, tag).end, Ok("16".into()), "{tag}");
+    }
 }

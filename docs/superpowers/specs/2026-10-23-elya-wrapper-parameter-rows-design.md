@@ -1,6 +1,6 @@
 # A wrapped function's row shared with a parameter, natively
 
-**Status:** in progress (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF
+**Status:** done (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF
 step 1 (the review of upcasts through data, F2). The design choices are Claude's
 under the maintainer's delegation (rule 2), recorded here.
 
@@ -51,7 +51,37 @@ its own result IS the parameter's type; `unused` because `r` is free there.
   - *Rejected:* binding from the result position first. A result layer may be
     an upcast (wider than the instantiation); a parameter layer never is.
 
-## 2. Evidence (planned)
+- **D2. The result pass walks the result's own parameters too, first** (added
+  after the review). A row variable only in a parameter position of the own
+  result (`fn mk(k: fn() -> Int) -> fn(fn() -> Int) -> fn() -> Int`) is this
+  use's alone; it stayed unbound, so the own result was unground and the use's
+  type typed the call: a pointer (older, the base agreed). Bound from the use's
+  parameter at that position, that parameter agrees with the use exactly (the
+  adapter coerces results, never parameters); a variable also in a later result
+  position takes the first binding and the result layer is coerced.
+
+## 2. Evidence
+
+`wrapped_results_sharing_a_parameter_row_agree` in
+`crates/codegen/tests/native_upcast_data.rs`: the eight programs of §0 and the
+review's two result-parameter programs (`res_param`, `res_param2`), all 16.
+Controls in the file's header: K4 (the parameter pass off: f2, a pointer). D2's
+control is its own red run: both `res_param` programs printed a pointer before.
+
+Gate: 1199 / 117 as predicted.
+
+## 3. Review
+
+The independent review built the diff and a base, ran 35 probes (nested
+parameter rows, argument records with two effects, data results, open use
+rows and clones, a closed own row that performs, `with any`, `let`
+annotations, recursion) and a sweep: 916 programs, 0 differ, every shared
+program the same class as the base. A variable shared by two parameters at
+different rows is E0423 in the checker, so the first binding is safe. Its one
+finding (older) is D2.
+
+## (planned evidence, as written before the code)
+
 
 `crates/codegen/tests/native_upcast_data.rs` gains
 `wrapped_results_sharing_a_parameter_row_agree`: f2, effarg, s8, r8, s3, s4,

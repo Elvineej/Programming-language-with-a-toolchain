@@ -82,21 +82,44 @@ fn inner_type(f: &CoreFn, use_ty: &Ty) -> Ty {
         _ => f.row.clone(),
     };
     let own_ret = crate::mono::apply(&f.body.ty, &tys);
+    // Spec 2026-10-23-elya-wrapper-parameter-rows D1: a row variable a
+    // parameter mentions is instantiated at the use's PARAMETER at the same
+    // position (sub-effecting widens results and data, never a parameter), so
+    // it is bound from there first, through every position of the parameter
+    // types -- the instantiation `specialize` clones `f` for.
+    let mut own_row_vars = Vec::new();
+    row_vars(
+        &Ty::Fn(Vec::new(), f.row.clone(), Box::new(Ty::Base(TyCon::Unit))),
+        &mut own_row_vars,
+    );
+    let mut binds = crate::specialize::RowSubst::new();
+    if f.params.len() == ups.len() {
+        for (p, u) in f.params.iter().zip(ups.iter()) {
+            bind_tails(
+                &crate::mono::apply(&p.ty, &tys),
+                u,
+                &own_row_vars,
+                true,
+                &mut binds,
+            );
+        }
+    }
     // D1 (spec 2026-10-23-elya-row-tails-in-data): a row variable of the own
     // result that no parameter and not the own row mentions is instantiated by
     // this use alone, so it takes the use's row at the same position (a
     // closed one; `specialize` clones `f` for it). A CLOSED row of the own
     // result stays: that layer is a real upcast, which the coercion reaches.
-    let mut fixed = Vec::new();
+    // A parameter's variable the pass above left unbound stays unbound.
+    // The result's own parameter positions are walked too, before its results
+    // (the parameter-rows spec D2, the review's finding): a free variable
+    // there is this use's alone; bound from the use's parameter, that
+    // parameter agrees with the use exactly (the adapter cannot coerce a
+    // parameter), where binding it from a widened result first would not.
+    let mut fixed = own_row_vars;
     for p in f.params.iter() {
         row_vars(&p.ty, &mut fixed);
     }
-    row_vars(
-        &Ty::Fn(Vec::new(), f.row.clone(), Box::new(Ty::Base(TyCon::Unit))),
-        &mut fixed,
-    );
-    let mut binds = crate::specialize::RowSubst::new();
-    bind_tails(&own_ret, uret, &fixed, &mut binds);
+    bind_tails(&own_ret, uret, &fixed, true, &mut binds);
     let own_ret = crate::specialize::subst_ty(&own_ret, &binds);
     let ret = if is_ground(&own_ret) {
         own_ret
@@ -124,15 +147,17 @@ fn row_vars(t: &Ty, out: &mut Vec<elya::types::RowVar>) {
     }
 }
 
-/// D1: walks the own result `own` and the use's result `used` together
-/// through results and data arguments (never parameters); an open tail of
-/// `own` not in `fixed`, where `used` has a CLOSED row, is bound to the use's
+/// D1: walks `own` and the use's `used` together through results and data
+/// arguments, and through parameters too when `params` (a parameter's type,
+/// matched against the use's parameter); an open tail of `own` not in `fixed`
+/// and not bound yet, where `used` has a CLOSED row, is bound to the use's
 /// labels beyond its own. An open row in the use (inside row-polymorphic code)
 /// binds nothing, so the result stays unground and the use's type is kept.
 fn bind_tails(
     own: &Ty,
     used: &Ty,
     fixed: &[elya::types::RowVar],
+    params: bool,
     out: &mut crate::specialize::RowSubst,
 ) {
     match (own, used) {
@@ -148,16 +173,21 @@ fn bind_tails(
                     out.insert(v, extra);
                 }
             }
-            bind_tails(or, ur, fixed, out);
+            if params {
+                for (o, u) in op.iter().zip(up.iter()) {
+                    bind_tails(o, u, fixed, params, out);
+                }
+            }
+            bind_tails(or, ur, fixed, params, out);
         }
         (Ty::Con(on, oa), Ty::Con(un, ua)) if on == un && oa.len() == ua.len() => {
             for (o, u) in oa.iter().zip(ua.iter()) {
-                bind_tails(o, u, fixed, out);
+                bind_tails(o, u, fixed, params, out);
             }
         }
         (Ty::Tuple(oa), Ty::Tuple(ua)) if oa.len() == ua.len() => {
             for (o, u) in oa.iter().zip(ua.iter()) {
-                bind_tails(o, u, fixed, out);
+                bind_tails(o, u, fixed, params, out);
             }
         }
         _ => {}

@@ -20,3 +20,9 @@ result; parameters' unbound variables stay fixed.
 ## Task 3: gate, control, review
 
 `sh scripts/check.sh` at 1199 / 117; the control; a review.
+
+## Outcome
+
+Red as predicted (f2, a pointer); green at 1199 / 117 as predicted; K4
+distinct. The review's older finding became D2, two more programs in the same
+test (count unchanged).
