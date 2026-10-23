@@ -39,7 +39,17 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     and refused (E0606) until part 2; builtins still need no import.
   - Found (older, now in HANDOFF step 4): a truncated declaration at the end of a file
     (`pub fn g(`) passes `check` and is silently dropped.
-- Working on: HANDOFF step 1 (`Float` natively).
+- **Done: `Float` natively, and `float.to_string`** (HANDOFF step 1). Spec c77d2a2,
+  plan 97b8244, implementation 6baf595, HANDOFF 2e01a0f. Floats are their bits in an
+  untraced word; IEEE equality also inside data (float masks per tag) and in
+  `o == o`; a C printer proven against Rust on 200,000 random values (it found that
+  `%.*e` rounds ties to even where Rust rounds half up); decode by `strtod`. Gate
+  1193 / 116 as predicted; review found no defect; sweep: the 3 Float build errors
+  are now `same`.
+  - **Decisions (mine; please review):** unboxed bits (not boxed floats); a separate
+    float-mask table for `elya_eq` (gc rows unchanged); `float.to_string` added;
+    comparisons/conversions deferred (new HANDOFF step 5).
+- Working on: HANDOFF step 1 (decoding at an effect's own parameter).
 
 ## 2026-10-23 10:50 UTC — DONE at 11:50 (scheduled run, LIGHT mode: four tasks)
 
