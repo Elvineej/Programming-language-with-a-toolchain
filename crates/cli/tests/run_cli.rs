@@ -147,3 +147,61 @@ fn elya_run_value_prints_main_as_a_native_binary_does() {
     assert_eq!(String::from_utf8_lossy(&failing.stdout), "b\n");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- A failing traced run keeps its output on stdout (2026-10-23, spec
+// `2026-10-23-elya-traced-run-output-design.md` D1) ------------------------------
+//
+// Negative control (reverted, `cmp` against a saved copy): `trace_cmd` printing the
+// output inside the error on failure (the old shape) fails both tests below with
+// an empty stdout.
+
+const FAILS: &str =
+    "pub fn main() -> Int { let t = time.now_ms()  let z = t - t  io.println(\"x\")  10 / z }\n";
+const ASKS: &str = "pub fn main() -> Int { io.println(\"y\")  let t = time.now_ms()  t }\n";
+
+fn elya_run(args: &[&std::ffi::OsStr]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_elya"))
+        .arg("run")
+        .args(args)
+        .output()
+        .expect("spawn elya run")
+}
+
+#[test]
+fn a_failing_recorded_run_keeps_its_output_on_stdout() {
+    let dir = scratch("rec-fail");
+    let prog = dir.join("f.elya");
+    std::fs::write(&prog, FAILS).expect("write program");
+    let trace = dir.join("f.trace");
+    let out = elya_run(&["--record".as_ref(), trace.as_os_str(), prog.as_os_str()]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x\n");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("division by zero"), "{err}");
+    assert!(!err.starts_with('x'), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_failing_replayed_run_keeps_its_output_on_stdout() {
+    let dir = scratch("rep-fail");
+    let prog = dir.join("f.elya");
+    std::fs::write(&prog, FAILS).expect("write program");
+    let trace = dir.join("f.trace");
+    let rec = elya_run(&["--record".as_ref(), trace.as_os_str(), prog.as_os_str()]);
+    assert_eq!(rec.status.code(), Some(1), "{rec:?}");
+    let rep = elya_run(&["--replay".as_ref(), trace.as_os_str(), prog.as_os_str()]);
+    assert_eq!(rep.status.code(), Some(1), "{rep:?}");
+    assert_eq!(String::from_utf8_lossy(&rep.stdout), "x\n");
+    assert!(String::from_utf8_lossy(&rep.stderr).contains("division by zero"));
+    // A divergence: the text before it stays too.
+    let asks = dir.join("g.elya");
+    std::fs::write(&asks, ASKS).expect("write program");
+    let short = dir.join("short.trace");
+    std::fs::write(&short, "elya trace 1\n").expect("write trace");
+    let div = elya_run(&["--replay".as_ref(), short.as_os_str(), asks.as_os_str()]);
+    assert_eq!(div.status.code(), Some(1), "{div:?}");
+    assert_eq!(String::from_utf8_lossy(&div.stdout), "y\n");
+    assert!(String::from_utf8_lossy(&div.stderr).contains("replay diverged"));
+    std::fs::remove_dir_all(&dir).ok();
+}

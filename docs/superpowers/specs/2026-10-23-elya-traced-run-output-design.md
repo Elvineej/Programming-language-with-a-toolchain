@@ -1,6 +1,6 @@
 # A failing traced run keeps its output on stdout
 
-**Status:** in progress (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF
+**Status:** done (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF
 step 1. The design choices are Claude's under the maintainer's delegation (rule 2),
 recorded here.
 
@@ -54,3 +54,20 @@ the program's text from the error. Plain `elya run` was fixed the same way on
   replay, and a successful replay.
 - Negative control: the CLI's trace path printing the old way (the output inside
   the error) fails both `run_cli.rs` tests.
+
+## 3. Results
+
+Gate: **1144 passed, 110 suites**, as predicted. The three tests were red first
+(stdout empty where `x` was expected). The control failed both `run_cli.rs` tests.
+
+The review built the old CLI, the new one and native binaries and compared them
+byte for byte: the old wrappers behave exactly as before (`tests/trace.rs`,
+`native_trace.rs` unchanged and green); a failing record's old stderr is the new
+stdout followed by the new stderr; successful runs, front-end errors, bad and
+unreadable traces are unchanged; the CLI and the native binary now agree on stdout
+and exit code for every failing record and replay tried (divergence, leftover
+entries, a bad answer, overflow). No defect found. Remaining differences are older
+and by design: the native value line on success; a non-`Int` main has no native
+build; very deep recursion is a native stack overflow while the evaluator runs on.
+The traces the CLI and a binary write are not compared byte for byte (their clock
+answers differ); the replay step does feed the CLI's trace to the binary.

@@ -73,32 +73,47 @@ pub fn run_source_outcome(name: &str, text: &str) -> RunOutcome {
     let sm = SourceMap::new(name, text);
     let (module, diags) = front_end(&session, text);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
-        return RunOutcome {
-            output: String::new(),
-            value: None,
-            error: Some(rendered),
-        };
+        return RunOutcome::refused(rendered);
     }
     let (interp, result) = eval::run_module_keeping(&module, eval::World::Live);
-    let output = interp.output().to_string();
-    match result {
-        Ok(v) => RunOutcome {
-            output,
-            value: Some(match v {
-                eval::Value::Int(n) => Ok(n),
-                eval::Value::Unit => Ok(0),
-                _ => Err(
-                    "main's value is not an `Int` or `Unit`, so it has no native value line"
-                        .to_string(),
-                ),
-            }),
-            error: None,
-        },
-        Err(e) => RunOutcome {
-            output,
+    RunOutcome::of(interp.output().to_string(), result, &sm)
+}
+
+impl RunOutcome {
+    /// Nothing ran: the front end, or the trace, refused.
+    fn refused(error: String) -> RunOutcome {
+        RunOutcome {
+            output: String::new(),
             value: None,
-            error: Some(render(&[e.diag], &sm)),
-        },
+            error: Some(error),
+        }
+    }
+
+    /// A run's outcome: its output, kept whether it succeeded or failed.
+    fn of(
+        output: String,
+        result: Result<eval::Value, eval::RuntimeError>,
+        sm: &SourceMap,
+    ) -> RunOutcome {
+        match result {
+            Ok(v) => RunOutcome {
+                output,
+                value: Some(match v {
+                    eval::Value::Int(n) => Ok(n),
+                    eval::Value::Unit => Ok(0),
+                    _ => Err(
+                        "main's value is not an `Int` or `Unit`, so it has no native value line"
+                            .to_string(),
+                    ),
+                }),
+                error: None,
+            },
+            Err(e) => RunOutcome {
+                output,
+                value: None,
+                error: Some(render(&[e.diag], sm)),
+            },
+        }
     }
 }
 
@@ -107,14 +122,15 @@ const TRACE_HEADER: &str = "elya trace 1";
 
 /// Runs live and writes down every answer the host gave. The trace is
 /// returned whether the run succeeds or fails (a failing run is the one most
-/// worth replaying): `(trace, Ok(output))` or `(trace, Err(diagnostics))`; a
-/// program that does not pass the front end has no trace (`None`).
-pub fn run_source_recording(name: &str, text: &str) -> (Option<String>, Result<String, String>) {
+/// worth replaying); a program that does not pass the front end has no trace
+/// (`None`). The outcome keeps the program's output apart from its error (spec
+/// 2026-10-23-elya-traced-run-output D1).
+pub fn record_source(name: &str, text: &str) -> (Option<String>, RunOutcome) {
     let session = Session::new();
     let sm = SourceMap::new(name, text);
     let (module, diags) = front_end(&session, text);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
-        return (None, Err(rendered));
+        return (None, RunOutcome::refused(rendered));
     }
     let (interp, result) = eval::run_module_keeping(&module, eval::World::Record(Vec::new()));
     let mut trace = format!("{TRACE_HEADER}\n");
@@ -123,21 +139,30 @@ pub fn run_source_recording(name: &str, text: &str) -> (Option<String>, Result<S
             trace.push_str(&format!("{q} = {a}\n"));
         }
     }
-    let out = match result {
-        Ok(_) => Ok(interp.output().to_string()),
-        Err(e) => Err(format!("{}{}", interp.output(), render(&[e.diag], &sm))),
-    };
-    (Some(trace), out)
+    let output = interp.output().to_string();
+    (Some(trace), RunOutcome::of(output, result, &sm))
 }
 
-/// Runs with the host answered from `trace` (the text `run_source_recording`
+/// [`record_source`] as `(trace, Ok(output))` or `(trace, Err(output and
+/// diagnostics))`, the shape the trace tests compare against.
+pub fn run_source_recording(name: &str, text: &str) -> (Option<String>, Result<String, String>) {
+    let (trace, o) = record_source(name, text);
+    let out = match o.error {
+        None => Ok(o.output),
+        Some(e) => Err(format!("{}{e}", o.output)),
+    };
+    (trace, out)
+}
+
+/// Runs with the host answered from `trace` (the text [`record_source`]
 /// writes); a divergence or a leftover entry is a runtime error. Lines are
-/// read with surrounding whitespace (and a leading byte-order mark) ignored.
-pub fn run_source_replaying(name: &str, text: &str, trace: &str) -> Result<String, String> {
+/// read with surrounding whitespace (and a leading byte-order mark) ignored. A
+/// trace that cannot be read runs nothing.
+pub fn replay_source(name: &str, text: &str, trace: &str) -> RunOutcome {
     let trace = trace.strip_prefix('\u{feff}').unwrap_or(trace);
     let mut lines = trace.lines();
     if lines.next().map(str::trim) != Some(TRACE_HEADER) {
-        return Err(format!(
+        return RunOutcome::refused(format!(
             "error: not a trace: the first line must be `{TRACE_HEADER}`\n"
         ));
     }
@@ -150,7 +175,7 @@ pub fn run_source_replaying(name: &str, text: &str, trace: &str) -> Result<Strin
         // question's arguments may contain one. A String answer would need
         // a quoted-aware split (spec §2).
         let Some((q, a)) = line.rsplit_once(" = ") else {
-            return Err(format!(
+            return RunOutcome::refused(format!(
                 "error: trace line {}: expected `question = answer`\n",
                 i + 2
             ));
@@ -161,11 +186,20 @@ pub fn run_source_replaying(name: &str, text: &str, trace: &str) -> Result<Strin
     let sm = SourceMap::new(name, text);
     let (module, diags) = front_end(&session, text);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
-        return Err(rendered);
+        return RunOutcome::refused(rendered);
     }
-    match eval::run_module_in(&module, eval::World::Replay { entries, next: 0 }) {
-        Ok((interp, _)) => Ok(interp.output().to_string()),
-        Err(e) => Err(render(&[e.diag], &sm)),
+    let (interp, result) =
+        eval::run_module_keeping(&module, eval::World::Replay { entries, next: 0 });
+    RunOutcome::of(interp.output().to_string(), result, &sm)
+}
+
+/// [`replay_source`] as `Ok(output)` or `Err(diagnostics)` (the output of a
+/// failing replay is not in the error), the shape the trace tests compare against.
+pub fn run_source_replaying(name: &str, text: &str, trace: &str) -> Result<String, String> {
+    let o = replay_source(name, text, trace);
+    match o.error {
+        None => Ok(o.output),
+        Some(e) => Err(e),
     }
 }
 

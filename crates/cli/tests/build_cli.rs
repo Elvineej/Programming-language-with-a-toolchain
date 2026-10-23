@@ -155,3 +155,78 @@ fn a_program_with_only_warnings_builds() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "tick\ndone\n0\n");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Spec 2026-10-23-elya-traced-run-output D1: a traced run prints on stdout what
+/// the native binary prints, and exits alike, failing or not.
+#[test]
+fn a_traced_run_prints_what_the_native_binary_prints() {
+    let dir = temp_dir("traced");
+    let fails = "pub fn main() -> Int { let t = time.now_ms()  let z = t - t  io.println(\"x\")  10 / z }\n";
+    let asks = "pub fn main() -> Int { io.println(\"y\")  let t = time.now_ms()  t }\n";
+    let mut exes = Vec::new();
+    for (name, src) in [("f", fails), ("g", asks)] {
+        let prog = dir.join(format!("{name}.elya"));
+        std::fs::write(&prog, src).unwrap();
+        let exe = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        elya_build(&[prog.as_os_str(), "-o".as_ref(), exe.as_os_str()]);
+        exes.push((prog, exe));
+    }
+    let cli = |flag: &str, trace: &Path, prog: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_elya"))
+            .arg("run")
+            .arg(flag)
+            .arg(trace)
+            .arg(prog)
+            .output()
+            .expect("spawn elya run")
+    };
+    let native = |var: &str, trace: &Path, exe: &Path| {
+        Command::new(exe)
+            .env(var, trace)
+            .output()
+            .expect("run the binary")
+    };
+    let same = |what: &str, c: &std::process::Output, n: &std::process::Output| {
+        assert_eq!(c.status.code(), n.status.code(), "{what}: {c:?} {n:?}");
+        // The native binary ends a successful run with main's value line.
+        let n_out = String::from_utf8_lossy(&n.stdout).into_owned();
+        let n_text = if n.status.success() {
+            n_out
+                .trim_end_matches('\n')
+                .rsplit_once('\n')
+                .map_or(String::new(), |(t, _)| format!("{t}\n"))
+        } else {
+            n_out
+        };
+        assert_eq!(String::from_utf8_lossy(&c.stdout), n_text, "{what}");
+    };
+    let (f, f_exe) = &exes[0];
+    let (g, g_exe) = &exes[1];
+    let t_cli = dir.join("cli.trace");
+    let t_nat = dir.join("native.trace");
+    same(
+        "a failing record",
+        &cli("--record", &t_cli, f),
+        &native("ELYA_RECORD", &t_nat, f_exe),
+    );
+    same(
+        "its replay",
+        &cli("--replay", &t_cli, f),
+        &native("ELYA_REPLAY", &t_cli, f_exe),
+    );
+    let short = dir.join("short.trace");
+    std::fs::write(&short, "elya trace 1\n").unwrap();
+    same(
+        "a diverging replay",
+        &cli("--replay", &short, g),
+        &native("ELYA_REPLAY", &short, g_exe),
+    );
+    let full = dir.join("full.trace");
+    std::fs::write(&full, "elya trace 1\ntime.now_ms() = 7\n").unwrap();
+    same(
+        "a successful replay",
+        &cli("--replay", &full, g),
+        &native("ELYA_REPLAY", &full, g_exe),
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

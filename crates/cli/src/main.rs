@@ -219,8 +219,10 @@ fn trace_cmd(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = if flag == "--record" {
-        let (log, out) = elya::run_source_recording(path, &text);
+    // Spec 2026-10-23-elya-traced-run-output D1: the program's output on stdout,
+    // failing or not, then the error on stderr, as `elya run` and a native binary.
+    let o = if flag == "--record" {
+        let (log, o) = elya::record_source(path, &text);
         // Written even when the run fails: that run is the one to replay.
         if let Some(log) = log {
             if let Err(e) = std::fs::write(trace, log) {
@@ -228,23 +230,23 @@ fn trace_cmd(args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
-        out
+        o
     } else {
         match std::fs::read_to_string(trace) {
-            Ok(log) => elya::run_source_replaying(path, &text, &log),
+            Ok(log) => elya::replay_source(path, &text, &log),
             Err(e) => {
                 eprintln!("error: cannot read {trace}: {e}");
                 return ExitCode::from(2);
             }
         }
     };
-    match result {
-        Ok(out) => {
+    print!("{}", o.output);
+    match o.error {
+        None => {
             surface_warnings(path, &text);
-            print!("{out}");
             ExitCode::SUCCESS
         }
-        Err(diags) => {
+        Some(diags) => {
             eprint!("{diags}");
             ExitCode::FAILURE
         }
