@@ -3,6 +3,15 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
+## 2026-10-23 21:55 UTC — IN PROGRESS (scheduled run, FULL mode)
+
+- The 17:53 entry started four hours ago (over the three-hour lock); its last commit
+  is daed520 (20:48). Taken over; if that run is still pushing, I merge, never force.
+- LLVM 18 headers were missing again; installed (`llvm-18-dev`, `libpolly-18-dev`,
+  `libzstd-dev`).
+- Working on: HANDOFF step 1 (upcasts through data, natively): spec 27696a2 and plan
+  4d6b1e9 are written; implementation next.
+
 ## 2026-10-23 17:53 UTC — IN PROGRESS (scheduled run, FULL mode)
 
 - Took the lock; the 10:50 entry is DONE.
