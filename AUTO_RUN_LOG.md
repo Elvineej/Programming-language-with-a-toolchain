@@ -6,6 +6,21 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 ## 2026-10-23 17:53 UTC — IN PROGRESS (scheduled run, FULL mode)
 
 - Took the lock; the 10:50 entry is DONE.
+- LLVM 18 headers were missing again; installed (`llvm-18-dev`, `libpolly-18-dev`,
+  `libzstd-dev`). Baseline 1115 / 107.
+- **Done: literals at the edges, and a layout rule** (HANDOFF step 1). Spec 7d7606f,
+  plan c190e49, implementation 5058cda, HANDOFF 2714d82.
+  - MIN is a literal (`-` folds into a numeric literal), E0002 for out-of-range
+    literals, negative literal patterns, and in braces a newline ends an expression
+    before an infix operator or a call's `(` (E0101 for an operator starting a line).
+  - Gate 1139 / 110 (predicted 1131; the review added four tests). K1-K4 distinct.
+    Sweep 836 programs, no disagreement.
+  - **Decisions (mine; please review):** the fold also for floats (`-1.5` type-checks
+    though `-x` on a Float stays E0400); the whitespace after a line-start `-` decides
+    prefix (new statement) vs binary (E0101); newlines are whitespace inside parentheses.
+  - **Behaviour change:** a line starting with `+`, `*`, ... that used to continue the
+    line before is E0101. No corpus program does this; no test expectation changed.
+- Working on: HANDOFF step 1 (a failing traced run keeps its output on stdout).
 
 ## 2026-10-23 10:50 UTC — DONE at 11:50 (scheduled run, LIGHT mode: four tasks)
 
