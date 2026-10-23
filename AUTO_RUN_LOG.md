@@ -31,7 +31,20 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   - It also found two native wrong values that were already there before this slice,
     now HANDOFF step 1: a local shadowing a top-level function, used in a lambda (2004
     for 1007); and a wrapped function's result upcast (5 for 15).
-- Windows-gate debt: 670c842 (with the earlier list).
+- **Done: lambdas capture by scope; a wrapped function's result is coerced** (dfb8a5c, HANDOFF
+  step 1, the review's native wrong values). Spec
+  `docs/superpowers/specs/2026-10-23-elya-scope-captures-and-wrapper-results-design.md`.
+  - Closure conversion decides captures by scope: 2004 for 1007 before, and compiler
+    panics.
+  - `anf`'s wrapper binds a function's own result so `specialize` coerces an upcast:
+    5 for 15 before, and a pointer.
+  - Gate 1106 / 106 as predicted.
+  - The review's fuzzers on the earlier seeds: 7 build failures and 97 refusals went
+    to 0 and 18.
+  - The second review found one more older wrong value (a wrapper in a
+    row-polymorphic function), fixed. One is still open, in HANDOFF: a row
+    variable inside data in a function's own result.
+- Windows-gate debt: 670c842 and dfb8a5c (with the earlier list).
 
 ## 2026-10-22 15:22 UTC — DONE at 22:12 (interactive session, at the maintainer's "Start next task")
 

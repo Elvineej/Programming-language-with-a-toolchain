@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1100 passed, 106 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1106 passed, 106 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
@@ -396,36 +396,23 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
       which now rebinds the alias's target so the guard stays pinned.
   - Needs the Windows gate.
 
+- **Lambdas capture by scope; a wrapped function's result is coerced** (2026-10-23,
+  branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-23-elya-scope-captures-and-wrapper-results-design.md`.
+  Two native wrong values the previous slice's review found, both older than it:
+  - Closure conversion decides a lambda's captures by the scope around it. Before,
+    a local that shadows a top-level function the same function also calls was
+    dropped: the top-level function ran (2004 for 1007), or the compiler panicked.
+  - `anf`'s wrapper of a top-level function calls it at its own result and lets
+    `specialize` coerce an upcast result: 5 for 15 before, and a pointer for two
+    layers.
+  - The review's fuzzers on the same seeds went from 7 build failures and 97 refusals
+    to none and 18.
+  - Needs the Windows gate.
+
 ## The next five steps
 
-### 1. Two native wrong values: a shadowed top-level name, and a wrapped function's result
-
-The 2026-10-23 review of the one-shot-words slice found both on the build BEFORE it.
-The slice narrowed its alias rule around them; they need fixing properly.
-- **A local that shadows a top-level function, used free in a lambda or a handle
-  body, runs the top-level function.**
-  - `fn inc(x) { x + 1000 }` then `let inc = fn(z) { z * 2 }  let f = fn(q) { inc(q) }`:
-    native 2004, the evaluator 1007.
-  - Some shapes panic the compiler in inkwell instead ("Found PointerValue ...
-    expected the IntValue variant"), and some fuzzed programs fail LLVM
-    verification.
-  - The suspected cause, from the review: closure conversion (`closure.rs:216,235`)
-    and the lifted handle bodies treat a name as module-level whenever a top-level
-    function has it, instead of resolving it by scope.
-  - The reproducing programs are in the 2026-10-22 spec §3 (re-derive them from it:
-    the scratchpad does not travel).
-- **Rule 2's wrapper does not coerce a result-layer upcast.**
-  - `fn mk() -> fn() -> Int { fn() { 5 } }` passed where
-    `fn() -> fn() / {E} -> Int` is expected (`ap2(mk)`): native 5, the evaluator 15.
-  - `inner_type` (`anf.rs`) corrects only the outer row, and the upcast adapter
-    (`specialize.rs`) tracks local binders only.
-
-Measure each with a corpus that writes every binder kind (let, parameter, pattern,
-clause parameter, return binder) and every place an upcast can happen. Fix by scope,
-not by name, then re-run a fuzzer like the review's: aliases, shadowing,
-constructors, multi-shot, every native result against the evaluator.
-
-### 2. Operation values as values natively
+### 1. Operation values as values natively
 
 `with any` natively (Done) refuses an operation value used other than by `op.*` or
 `==` (passed to a function, stored, returned: spec D2; a bare alias `let p = o` runs
@@ -437,7 +424,7 @@ operations), then decide in a spec: clone functions over `Op(t)` per operation a
 expansion clones clauses, or a run-time operation value; and whether both sides should
 decode at the instantiation (the evaluator would need it carried).
 
-### 3. Literals at the edges, and a layout rule
+### 2. Literals at the edges, and a layout rule
 
 Two lexical gaps the 2026-10-17 review found: `MIN` cannot be written
 (`-9223372036854775808` is E0001 "not a valid Elya token"; an out-of-range literal
@@ -448,7 +435,7 @@ expression). Measure the corpus for both, then decide in a spec: a literal rule 
 negation, and a layout rule (an operator at the start of a line ends the statement
 before it, or is an error).
 
-### 4. A failing traced run keeps its output on stdout
+### 3. A failing traced run keeps its output on stdout
 
 `elya run --replay` drops what the program printed before a failure, and `--record`
 prints it to stderr with the diagnostic; plain `elya run` (since 2026-10-16) and a
@@ -456,7 +443,7 @@ native binary (record or replay) keep it on stdout. Make the two trace modes do 
 same (`run_source_recording`/`run_source_replaying` return the output apart from the
 error), then a differential test of a failing replay's stdout across both sides.
 
-### 5. Modules, part 1: a program in more than one file
+### 4. Modules, part 1: a program in more than one file
 
 ROADMAP priority 2 (capabilities per dependency) needs modules first. Today every
 program is one file and `elya check|run|build` take one path. `import a/b` (with an
@@ -474,12 +461,37 @@ need. Then decide in a spec:
 Leave the effect allow-list at the import boundary to part 2, but choose the syntax so
 it has a place to go.
 
-Also open, unscheduled: `Float` natively (the evaluator has literals,
-`+. -. *. /.`, the comparisons, `-x`, NaN-aware `==` and `with any` encoding; Core
-refuses the literal, 3 sweep programs). Measure exactly what the evaluator writes for a
-float first (`10000000000000000000000000000000000000000.0` for `1e40`, `-inf`), then
-decide the word representation, a C printer that matches Rust's `f64` output on edge
-values, and decoding. Also row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
+### 5. `Float` natively
+
+The evaluator has `Float`:
+- literals, `+. -. *. /.`, the comparisons and `-x`;
+- `==` (a NaN is unequal to itself, also inside a declared type);
+- `with any` encoding and decoding.
+
+Core refuses the literal: 3 sweep programs, 2 in `any_handler.rs` and 1 in
+`structural_eq.rs`. A float is observable only through `op.encode`/`op.show`, `==` and
+the comparisons: no builtin turns one into a `String`, and `--value` refuses a
+non-`Int` main.
+
+Measure exactly what the evaluator writes for a float first. Measured once:
+`10000000000000000000000000000000000000000.0` for `1e40`, and `-inf`. Then decide in a
+spec:
+- the word representation (the IEEE bits in an untraced word?);
+- a C printer that matches Rust's `f64` output, on edge values: NaN, both infinities,
+  `-0.0`, subnormals, `0.1 +. 0.2`, and `2^53` and beyond;
+- decoding;
+- whether a `float.to_string` builtin belongs in the same step.
+
+Also open, unscheduled: a native wrong value the 2026-10-23 review found, older than
+it. A top-level function whose own result has a row variable INSIDE DATA
+(`fn mko() -> fn() -> Option(fn() -> Int)`), used where
+`fn() -> fn() / {E} -> Option(fn() / {E} -> Int)` is expected, prints a pointer for
+15. `mono::match_tys` never binds a row tail, so `anf`'s wrapper never sees a ground
+own result (spec 2026-10-23-elya-scope-captures-and-wrapper-results §3 F2).
+`anf`'s alias rule keeps the `let` when the body rebinds the
+alias's target. Renaming the inner binder instead would let the rest of the review
+fuzzer's refusals run (18 programs, "effect-polymorphic function used at a user
+effect"). Also row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
 per platform, deferred by the timers spec D1); Elya functions are mangled
 `elya.<name>`; the parser continues a call across a
 newline (`f()` then a line starting `(` is `f()(...)`) -- a layout rule is a language
