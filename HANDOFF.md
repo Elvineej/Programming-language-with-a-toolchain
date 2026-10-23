@@ -3,7 +3,7 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-22, an interactive session on `auto/elya`)
+## State at handoff (updated 2026-10-23, a scheduled run on `auto/elya`)
 
 - `main` has everything through #23 (merged 2026-10-16 at ab791b6: N7 part 2 through
   argument records and `elya run --record/--replay`). Draft PR #24 carries `auto/elya`
@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1115 passed, 107 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1139 passed, 110 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
@@ -427,20 +427,21 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
     `what_is_not_compiled_is_refused_by_name` (they run now).
   - Needs the Windows gate (`runtime.c`).
 
+- **Literals at the edges, and a layout rule** (2026-10-23, branch `auto/elya`, a
+  scheduled run, 5058cda): spec
+  `docs/superpowers/specs/2026-10-23-elya-literals-and-layout-design.md`.
+  - `-` directly before a numeric literal is part of it: `-9223372036854775808` is
+    MIN; an out-of-range integer literal is E0002; negative literals are patterns.
+  - In braces a newline before an infix operator or a call's `(` ends the
+    expression: a glued `-x` or `(` starts a statement, any other operator starting
+    a line is E0101; in parentheses newlines are whitespace.
+  - The review: a doubled diagnostic after a bad `let`, a `match` scrutinee inside
+    parentheses, `-` in handler clauses, the float fold's stated reason; all fixed.
+  - Parser only: the Windows gate needs nothing special.
+
 ## The next five steps
 
-### 1. Literals at the edges, and a layout rule
-
-Two lexical gaps the 2026-10-17 review found: `MIN` cannot be written
-(`-9223372036854775808` is E0001 "not a valid Elya token"; an out-of-range literal
-deserves its own diagnostic, and `-` applied to the literal `9223372036854775808`
-could be accepted as `MIN`, as Rust does), and a line starting with `-` or `(`
-continues the previous expression (`let y = 4` then `-x * y` parses as one
-expression). Measure the corpus for both, then decide in a spec: a literal rule for
-negation, and a layout rule (an operator at the start of a line ends the statement
-before it, or is an error).
-
-### 2. A failing traced run keeps its output on stdout
+### 1. A failing traced run keeps its output on stdout
 
 `elya run --replay` drops what the program printed before a failure, and `--record`
 prints it to stderr with the diagnostic; plain `elya run` (since 2026-10-16) and a
@@ -448,7 +449,7 @@ native binary (record or replay) keep it on stdout. Make the two trace modes do 
 same (`run_source_recording`/`run_source_replaying` return the output apart from the
 error), then a differential test of a failing replay's stdout across both sides.
 
-### 3. Modules, part 1: a program in more than one file
+### 2. Modules, part 1: a program in more than one file
 
 ROADMAP priority 2 (capabilities per dependency) needs modules first. Today every
 program is one file and `elya check|run|build` take one path. `import a/b` (with an
@@ -466,7 +467,7 @@ need. Then decide in a spec:
 Leave the effect allow-list at the import boundary to part 2, but choose the syntax so
 it has a place to go.
 
-### 4. `Float` natively
+### 3. `Float` natively
 
 The evaluator has `Float`:
 - literals, `+. -. *. /.`, the comparisons and `-x`;
@@ -487,7 +488,7 @@ spec:
 - decoding;
 - whether a `float.to_string` builtin belongs in the same step.
 
-### 5. Decoding at an effect's own parameter, on both sides
+### 4. Decoding at an effect's own parameter, on both sides
 
 `op.decode` of an answer whose type is an effect's parameter (`St(s)`'s
 `fn get() -> s`) is refused on both sides by name (the evaluator's S2; native D4 of
@@ -500,12 +501,21 @@ and native's operation type already holds them. The stricter alternative is to k
 the refusal and report it in `elya check` (a static error at the `with
 any` handle when a handled operation's answer mentions a parameter).
 
-Also open, unscheduled: a native wrong value the 2026-10-23 review found, older than
-it. A top-level function whose own result has a row variable INSIDE DATA
+### 5. A row variable inside data in a function's own result, natively
+
+A native wrong value the 2026-10-23 review found (older than it). A top-level
+function whose own result has a row variable INSIDE DATA
 (`fn mko() -> fn() -> Option(fn() -> Int)`), used where
 `fn() -> fn() / {E} -> Option(fn() / {E} -> Int)` is expected, prints a pointer for
 15. `mono::match_tys` never binds a row tail, so `anf`'s wrapper never sees a ground
-own result (spec 2026-10-23-elya-scope-captures-and-wrapper-results §3 F2).
+own result (spec 2026-10-23-elya-scope-captures-and-wrapper-results §3 F2). Measure
+the family first (data of functions, nested data, generic data at a user effect),
+then decide in a spec whether `match_tys` binds row tails or the wrapper coerces
+data by its type; if neither fits soon, refuse the shape by name natively so no
+wrong value is left.
+
+Also open, unscheduled: `recover_to_decl` stops at a lambda's `fn`, so errors after
+a parse error inside a body cascade (the 2026-10-23 literals review).
 E0434 rejects a direct inner `with any` over `Hold(Opt(Op))` but accepts the same
 handler through a generic function (the 2026-10-23 review's F4). A helper taking an
 operation costs a clone per operation and helper (refused past the budget, 256).
@@ -514,9 +524,7 @@ alias's target. Renaming the inner binder instead would let the rest of the revi
 fuzzer's refusals run (18 programs, "effect-polymorphic function used at a user
 effect"). Also row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
 per platform, deferred by the timers spec D1); Elya functions are mangled
-`elya.<name>`; the parser continues a call across a
-newline (`f()` then a line starting `(` is `f()(...)`) -- a layout rule is a language
-decision; the roadmap's
+`elya.<name>`; the roadmap's
 other priorities (record/replay handlers, then capabilities once modules exist); the rest
 of the soundness sweep (recursion through a handle body and through a lambda: done
 2026-10-15). A perform walks the handler chain, so a program whose handler stack really grows
