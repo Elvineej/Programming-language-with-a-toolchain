@@ -204,3 +204,33 @@ fn a3_polymorphic_effects_are_refused_nowhere_in_the_front_end() {
         st.types
     );
 }
+
+#[test]
+fn a_user_effect_named_io_is_refused() {
+    // Spec 2026-10-22 D4: `IO` is the built-in effect (`io.*` performs it, and a
+    // handler never dispatches it), so a user declaration of the name is E0209 at
+    // resolve, on both sides. Before, the checker accepted it and a clause
+    // `IO.write` handled the user's operation while `io.println` printed past it.
+    let src = "effect IO { fn write(s: String) -> Unit }\n\
+               pub fn main() -> Int { 0 }\n";
+    let s = Session::new();
+    let (m, pd) = parse_module(&s, src);
+    assert!(pd.is_empty(), "parse: {pd:?}");
+    let d = resolve::check(&s, &m);
+    assert_eq!(
+        d.iter().map(|d| d.code.as_str()).collect::<Vec<_>>(),
+        ["E0209"],
+        "{d:?}"
+    );
+    assert_eq!(d[0].message, "effect `IO` is built in");
+    assert!(
+        d[0].helps.iter().any(|h| h.contains("rename this effect")),
+        "{:?}",
+        d[0].helps
+    );
+    assert!(elya::check_source("io.elya", src).is_err());
+    // Negative control: the name, not the declaration. `Io` is an ordinary effect.
+    let other = "effect Io { fn write(s: String) -> Unit }\n\
+                 pub fn main() -> Int { 0 }\n";
+    assert!(elya::check_source("io2.elya", other).is_ok());
+}

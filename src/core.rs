@@ -348,8 +348,9 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
         if let Decl::Effect(e) = &d.node {
             // D1 / spec §9.2: codegen decides "does this row mention a
             // user-declared effect?" by asking `label != "IO"`. That read is
-            // sound only while `IO` cannot be user-declared, so it is refused
-            // here — the last pass that still sees the declaration.
+            // sound only while `IO` cannot be user-declared. Resolve refuses
+            // the declaration (E0209, spec 2026-10-22 D4); this is the guard
+            // behind it, the last pass that still sees the declaration.
             if e.name == "IO" {
                 return Err(LowerError::Unsupported("effect IO"));
             }

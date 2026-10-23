@@ -440,7 +440,9 @@ fn a_user_declared_io_effect_is_refused_at_lowering() {
     // `IO` is the one effect label codegen treats as built in (Task 7a reads the
     // partition off `label != "IO"`). A user-declared `IO` makes that read
     // ambiguous, so lowering — the last pass that still sees `Decl::Effect` —
-    // refuses it by name.
+    // refuses it by name. Since 2026-10-22 resolve refuses it first (E0209,
+    // `effect_syntax.rs`); this pins the guard behind it, which lowers past the
+    // diagnostics.
     let src = "effect IO { fn write(s: String) -> Unit }\n\
                pub fn main() -> Int { 0 }\n";
     let (m, _pd) = parse_module(&Session::new(), src);

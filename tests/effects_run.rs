@@ -123,6 +123,16 @@ fn resuming_twice_in_a_one_shot_handler_is_e0425() {
                }\n";
     let err = run_err(src);
     assert!(err.contains("E0425"), "expected E0425, got: {err}");
+    // The native trap's words (spec 2026-10-22 D1), and a label that is right
+    // for an effect not declared `multi` (`with multi` alone is E0427 there).
+    assert!(
+        err.contains("a one-shot continuation was resumed twice"),
+        "the message: {err}"
+    );
+    assert!(
+        err.contains("only a `with multi` handler of an `effect multi` resumes more than once"),
+        "the label: {err}"
+    );
 }
 
 #[test]

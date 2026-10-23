@@ -512,3 +512,18 @@ fn comparing_an_operation_reaches_its_arguments() {
     assert_eq!(got.text, "same\n", "{got:?}");
     assert!(got.end.is_err(), "{got:?}");
 }
+
+/// An alias of the operation (`let p = o`) was "operation value used other than
+/// by op.* or ==" until 2026-10-22: `anf` substitutes an alias of a variable
+/// (spec 2026-10-22-elya-one-shot-words-and-sweep-gaps D3), so `op.perform(p)`
+/// is `op.perform(o)` before the expansion sees it. Found by the gate: the
+/// refusal's own unit test stored `o` that way.
+#[test]
+fn an_aliased_operation_value_runs_natively() {
+    let src = "effect W { fn roll(s: Int) -> Int }\n\
+        fn rec(body) { handle { body() } with any { op(o) -> { let p = o  let q = p  io.println(op.show(q))  resume(op.perform(p)) } } }\n\
+        pub fn main() -> Int { handle { rec(fn() { roll(6) + roll(2) }) } with { W.roll(s) -> resume(s * 10) } }\n";
+    let got = agree(src, "alias");
+    assert_eq!(got.text, "W.roll(6)\nW.roll(2)\n");
+    assert_eq!(got.end, Ok("80".to_string()));
+}

@@ -122,6 +122,16 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
             }
             Decl::Effect(e) => {
                 dup("effect", &e.name, d.span, &mut dup_diags);
+                // Spec 2026-10-22 D4: the language declared `IO` first. A
+                // handler never dispatches it, and every back-end pass reads
+                // "a user effect" as a label other than `IO`.
+                if e.name == "IO" {
+                    dup_diags.push(
+                        Diagnostic::error("E0209", "effect `IO` is built in")
+                            .with_label(d.span, "the built-in effect already has this name")
+                            .with_help("rename this effect: `IO` is the effect `io.*` performs"),
+                    );
+                }
                 effect_names.insert(e.name.clone());
                 for op in &e.ops {
                     let name = &op.node.name;

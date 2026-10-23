@@ -1438,9 +1438,10 @@ void elya_handle_end_init(void *code) {
 }
 
 /* 5b-8 D13: one-shot is enforced natively. A second resume stops here -- a
- * named message and a non-zero exit, never a re-run. */
+ * named message and a non-zero exit, never a re-run. The evaluator's E0425
+ * words (spec 2026-10-22 D1). */
 void elya_resume_twice(void) {
-    fputs("elya: resume: a one-shot continuation was resumed twice\n", stderr);
+    fputs("elya: a one-shot continuation was resumed twice\n", stderr);
     exit(1);
 }
 

@@ -1392,10 +1392,13 @@ pub mod cek {
         if !rd.handler.multi {
             if rd.consumed.get() {
                 return Err(RuntimeError {
-                    diag: Diagnostic::error("E0425", "continuation resumed more than once")
+                    // The native trap's words (spec 2026-10-22 D1). The label
+                    // names both halves: `with multi` alone is E0427 over an
+                    // effect not declared `multi`.
+                    diag: Diagnostic::error("E0425", "a one-shot continuation was resumed twice")
                         .with_label(
                             span,
-                            "this handler is one-shot — use `with multi` for multi-shot",
+                            "this handler is one-shot: only a `with multi` handler of an `effect multi` resumes more than once",
                         ),
                 });
             }

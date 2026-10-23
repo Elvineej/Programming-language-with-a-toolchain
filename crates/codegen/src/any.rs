@@ -834,8 +834,12 @@ mod tests {
 
     #[test]
     fn an_operation_value_used_as_a_value_is_refused() {
+        // The first clause stored `o` by a bare alias (`let p = o`) until
+        // 2026-10-22: `anf` now substitutes an alias (spec
+        // 2026-10-22-elya-one-shot-words-and-sweep-gaps D3), so that runs (a
+        // `native_any.rs` row). An `if` that answers `o` still stores it.
         for clause in [
-            "op(o) -> { let p = o  resume(op.perform(p)) }",
+            "op(o) -> { let p = if True { o } else { o }  resume(op.perform(p)) }",
             "op(o) -> { let f = fn(x: Int) { o }  io.println(op.show(f(1)))  resume(op.perform(o)) }",
         ] {
             let src = format!(

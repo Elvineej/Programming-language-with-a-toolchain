@@ -2662,7 +2662,7 @@ fn a_second_resume_traps_natively_and_errors_in_the_evaluator() {
     assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("elya: resume: a one-shot continuation was resumed twice"),
+        stderr.contains("elya: a one-shot continuation was resumed twice"),
         "stderr should name the trap, got: {stderr}"
     );
     assert!(
@@ -3942,13 +3942,19 @@ fn the_conventions_review_corpus_matches_the_evaluator() {
 /// closure called with the CPS convention -- natively it hung where the
 /// evaluator printed 8. The deep callee guard refuses it by name: the
 /// result layer is an instantiation of `mk`'s open row at {S}.
+///
+/// Since 2026-10-22 `anf` substitutes the alias (spec
+/// 2026-10-22-elya-one-shot-words-and-sweep-gaps D3), so that program runs
+/// (the `ALIASES` row w1). A changed test, by that decision: the alias is kept
+/// only when its body rebinds `mk`, which still meets the guard, so this
+/// program rebinds it.
 #[test]
 fn an_alias_of_a_generic_local_used_at_a_user_effect_is_refused_by_name() {
     let src = "effect S { fn get() -> Int }\n\
                pub fn main() -> Int {\n\
                \x20 let mk = fn(n) { fn(g) { g() + n } }\n\
                \x20 let mk2 = mk\n\
-               \x20 let k = mk2(1)\n\
+               \x20 let k = { let mk = 0  mk2(1 + mk) }\n\
                \x20 handle { k(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
                }\n";
     assert_eq!(eval_main_int(src), "8");
@@ -4266,7 +4272,7 @@ fn a_plain_handler_over_a_multi_effect_is_one_shot_natively() {
     assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("elya: resume: a one-shot continuation was resumed twice"),
+        stderr.contains("elya: a one-shot continuation was resumed twice"),
         "stderr should name the trap, got: {stderr}"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -4297,7 +4303,7 @@ fn a_one_shot_continuation_saved_in_a_multi_shot_segment_fails_on_both_sides() {
     assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("elya: resume: a one-shot continuation was resumed twice"),
+        stderr.contains("elya: a one-shot continuation was resumed twice"),
         "stderr should name the trap, got: {stderr}"
     );
     assert!(
@@ -6181,4 +6187,489 @@ fn structural_equality_matches_the_evaluator() {
     let corpus: Vec<(&str, &str, &str)> =
         rows.iter().map(|(t, s, w)| (*t, s.as_str(), *w)).collect();
     run_differential_corpus(&corpus, "equality-diff");
+}
+
+// ---- The sweep's smaller gaps (2026-10-22) ----
+// Spec `docs/superpowers/specs/2026-10-22-elya-one-shot-words-and-sweep-gaps-design.md`.
+//
+// Negative controls (each reverted, `cmp` after):
+// - K1, `anf` rule 3 off: the 13 CTOR_VALUES rows fail as before, the seven
+//   monomorphic ones by SIGSEGV.
+// - K2, rule 4 without its capture check: the `anf` capture test fails, and the
+//   compiler panics in inkwell on w6 (an `Int` called).
+// - K3, rule 4 off: w1-w4 are refused by name again.
+// - K4, the evaluator's old label: `effects_run.rs`'s E0425 test fails.
+
+/// D1: the sweep's four `both-fail-differently` programs. A second resume of a
+/// one-shot continuation fails in the same words on both sides: the native
+/// line after `elya: ` is the evaluator diagnostic's message, the sweep's rule
+/// for "the same failure".
+const ONE_SHOT_TRAPS: &[(&str, &str)] = &[
+    (
+        "o1-a-one-shot-effect",
+        "effect S { fn get() -> Int }\n\
+         fn body() -> Int { get() }\n\
+         pub fn main() -> Int { handle { body() } with { S.get() -> resume(1) + resume(2)  return(r) -> r } }\n",
+    ),
+    (
+        "o2-a-multi-effect-under-a-plain-with",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn choose() { if flip() { 1 } else { 2 } }\n\
+         pub fn main() -> Int { handle choose() with { Flip.flip() -> resume(True) + resume(False) } }\n",
+    ),
+    (
+        "o3-a-one-shot-saved-in-a-multi-shot-segment",
+        "effect multi Flip { fn flip() -> Bool }\n\
+         effect Ask { fn ask() -> Int }\n\
+         fn inner() {\n\
+         \x20 handle { let x = ask()  x + 1 } with { Ask.ask() -> if flip() { resume(5) } else { resume(6) } }\n\
+         }\n\
+         pub fn main() -> Int { handle inner() with multi { Flip.flip() -> resume(True) * 1000 + resume(False) } }\n",
+    ),
+    (
+        "o4-after-a-discarded-first-resume",
+        "effect Twice {\n\
+         \x20 fn t() -> Int\n\
+         }\n\
+         fn body() { t() }\n\
+         pub fn main() {\n\
+         \x20 let _ = handle body() with { Twice.t() -> { let _ = resume(1)  resume(2) } }\n\
+         \x20 io.println(\"unreached\")\n\
+         }\n",
+    ),
+];
+
+#[test]
+fn the_one_shot_trap_says_the_same_words_on_both_sides() {
+    let dir = temp_dir("one-shot-words");
+    let mut failures = Vec::new();
+    for (tag, src) in ONE_SHOT_TRAPS {
+        let session = Session::new();
+        let (m, pd) = parse_module(&session, src);
+        assert!(pd.is_empty(), "{tag}: parse: {pd:?}");
+        let msg = match elya::eval::run_module_value(&m) {
+            Err(e) if e.diag.code == "E0425" => e.diag.message.clone(),
+            Err(e) => panic!("{tag}: the evaluator must fail with E0425, got {e:?}"),
+            Ok((_, v)) => panic!("{tag}: the evaluator must fail, got {v:?}"),
+        };
+        let exe = compile_and_link(&lower_src(src), &dir, tag);
+        let out = native(&exe).output().expect("run produced binary");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let line = stderr
+            .lines()
+            .find_map(|l| l.strip_prefix("elya: "))
+            .unwrap_or("");
+        if out.status.code() != Some(1)
+            || line != msg
+            || msg != "a one-shot continuation was resumed twice"
+            || !out.stdout.is_empty()
+        {
+            failures.push(format!(
+                "{tag}: native {:?} {line:?}, evaluator {msg:?}",
+                out.status
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// D2: a constructor with fields used as a function value. Before, a
+/// monomorphic one was a field-less construction typed as a function (a call
+/// jumped through its tag word: SIGSEGV, v1-v3, v8-v10, v13) and a parametric
+/// one missed the instance table ("parametric ADT", v4-v7, v11, v12). The
+/// values are the evaluator's, measured first.
+const CTOR_VALUES: &[(&str, &str, &str)] = &[
+    (
+        "v1-a-constructor-through-a-let",
+        "type W { Wrap(Int) }\n\
+         pub fn main() -> Int { let f = Wrap  match f(5) { Wrap(h) -> h } }\n",
+        "5",
+    ),
+    (
+        "v2-a-constructor-as-an-argument",
+        "type W { Wrap(Int) }\n\
+         fn ap(f, x) { f(x) }\n\
+         pub fn main() -> Int { match ap(Wrap, 5) { Wrap(h) -> h } }\n",
+        "5",
+    ),
+    (
+        "v3-map-with-a-constructor",
+        "type W { Wrap(Int) }\n\
+         type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn map(xs, f) { match xs { Nil -> Nil  Cons(h, t) -> Cons(f(h), map(t, f)) } }\n\
+         fn sum(xs) { match xs { Nil -> 0  Cons(Wrap(h), t) -> h + sum(t) } }\n\
+         pub fn main() -> Int { sum(map(Cons(1, Cons(2, Nil)), Wrap)) }\n",
+        "3",
+    ),
+    (
+        "v4-map-with-some",
+        "type Option(a) { None, Some(a) }\n\
+         type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn map(xs, f) { match xs { Nil -> Nil  Cons(h, t) -> Cons(f(h), map(t, f)) } }\n\
+         fn sum(xs) { match xs { Nil -> 0  Cons(Some(h), t) -> h + sum(t)  Cons(None, t) -> sum(t) } }\n\
+         pub fn main() -> Int { sum(map(Cons(1, Cons(2, Nil)), Some)) }\n",
+        "3",
+    ),
+    (
+        "v5-some-through-a-let",
+        "type Option(a) { None, Some(a) }\n\
+         pub fn main() -> Int { let f = Some  match f(3) { Some(x) -> x  None -> 0 } }\n",
+        "3",
+    ),
+    (
+        "v6-a-two-field-generic-constructor",
+        "type Pair(a, b) { P(a, b) }\n\
+         fn ap2(f, x, y) { f(x, y) }\n\
+         pub fn main() -> Int { match ap2(P, 3, True) { P(x, b) -> if b { x } else { 0 } } }\n",
+        "3",
+    ),
+    (
+        "v7-cons-as-a-fold-step",
+        "type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn foldr(f, z, l) { match l { Nil -> z  Cons(h, t) -> f(h, foldr(f, z, t)) } }\n\
+         fn range(a, b) { if a >= b { Nil } else { Cons(a, range(a + 1, b)) } }\n\
+         fn sum(l) { match l { Nil -> 0  Cons(h, t) -> h + sum(t) } }\n\
+         pub fn main() -> Int { sum(foldr(Cons, Nil, range(0, 100))) }\n",
+        "4950",
+    ),
+    (
+        "v8-a-constructor-captured-by-a-closure",
+        "type W { Wrap(Int) }\n\
+         pub fn main() -> Int {\n\
+         \x20 let w = Wrap\n\
+         \x20 let mk = fn(n) { w(n * 2) }\n\
+         \x20 match mk(21) { Wrap(h) -> h }\n\
+         }\n",
+        "42",
+    ),
+    (
+        "v9-a-constructor-under-a-handle",
+        "type W { Wrap(Int) }\n\
+         effect L { fn lg(x: Int) -> Int }\n\
+         fn ap(f, x) { f(lg(x)) }\n\
+         pub fn main() -> Int { handle { match ap(Wrap, 4) { Wrap(h) -> h } } with { L.lg(v) -> resume(v + 1)  return(r) -> r * 10 } }\n",
+        "50",
+    ),
+    (
+        "v10-a-constructor-joined-with-an-effectful-lambda",
+        "type W { Wrap(Int) }\n\
+         effect L { fn lg(x: Int) -> Int }\n\
+         fn ap(f, x) { f(x) }\n\
+         fn pick(c) { if c { Wrap } else { fn(n) { Wrap(lg(n)) } } }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { match ap(pick(True), 4) { Wrap(a) -> match ap(pick(False), 4) { Wrap(b) -> a * 100 + b } } } with { L.lg(v) -> resume(v + 1)  return(r) -> r }\n\
+         }\n",
+        "405",
+    ),
+    (
+        "v11-some-of-some",
+        "type Option(a) { None, Some(a) }\n\
+         type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn map(xs, f) { match xs { Nil -> Nil  Cons(h, t) -> Cons(f(h), map(t, f)) } }\n\
+         fn sum(xs) { match xs { Nil -> 0  Cons(Some(Some(h)), t) -> h + sum(t)  Cons(_, t) -> sum(t) } }\n\
+         pub fn main() -> Int { sum(map(map(Cons(1, Cons(2, Cons(3, Nil))), Some), Some)) }\n",
+        "6",
+    ),
+    (
+        "v12-five-thousand-somes",
+        "type Option(a) { None, Some(a) }\n\
+         type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn map(xs, f) { match xs { Nil -> Nil  Cons(h, t) -> Cons(f(h), map(t, f)) } }\n\
+         fn range(a, b) { if a >= b { Nil } else { Cons(a, range(a + 1, b)) } }\n\
+         fn sum(xs) { match xs { Nil -> 0  Cons(Some(h), t) -> h + sum(t)  Cons(None, t) -> sum(t) } }\n\
+         pub fn main() -> Int { sum(map(range(0, 5000), Some)) }\n",
+        "12497500",
+    ),
+    (
+        "v13-a-two-field-constructor",
+        "type P { P(Int, Int) }\n\
+         fn ap2(f, x, y) { f(x, y) }\n\
+         pub fn main() -> Int { let mk = P  match ap2(mk, 3, 4) { P(a, b) -> a * 10 + b } }\n",
+        "34",
+    ),
+];
+
+#[test]
+fn constructors_used_as_values_run_natively() {
+    run_value_corpus(CTOR_VALUES, "ctor-values");
+}
+
+#[test]
+fn constructors_used_as_values_match_the_evaluator() {
+    run_differential_corpus(CTOR_VALUES, "ctor-values-diff");
+}
+
+/// D3: an alias of a variable (`let mk2 = mk`). An alias of an effect-polymorphic
+/// local, or an alias of an alias, used at a user effect was refused by name
+/// ("effect-polymorphic function used at a user effect", w1-w4): the alias's own
+/// binding referenced its target at the general row, so nothing was cloned at
+/// the row its uses need. w5-w8 already ran; they guard the substitution (w6:
+/// the target rebound under the alias, so the `let` is kept).
+///
+/// w9-w21 are the review's (2026-10-23), each right natively before the slice
+/// and wrong or refused with the first version of rule 4:
+/// - w9-w13: an upcast at or after the alias (5 for 15; refusals);
+/// - w14-w21: an alias of a local that shadows a top-level function (2004 for
+///   1007, a compiler panic in w16 and w21), where closure conversion resolves
+///   the renamed name to the top-level function.
+///
+/// Rule 4 now renames only an alias of a row-polymorphic local whose name no
+/// top-level function has.
+const ALIASES: &[(&str, &str, &str)] = &[
+    (
+        "w1-an-alias-of-a-row-polymorphic-local",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 let mk = fn(n) { fn(g) { g() + n } }\n\
+         \x20 let mk2 = mk\n\
+         \x20 let k = mk2(1)\n\
+         \x20 handle { k(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "8",
+    ),
+    (
+        "w2-two-aliases-at-two-rows",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 let ap = fn(g) { g() + 1 }\n\
+         \x20 let ap2 = ap\n\
+         \x20 let ap3 = ap2\n\
+         \x20 let a = ap3(fn() { 5 })\n\
+         \x20 let b = handle { ap3(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         \x20 a * 100 + b\n\
+         }\n",
+        "608",
+    ),
+    (
+        "w3-an-alias-of-an-alias-of-a-top-level-function",
+        "effect S { fn get() -> Int }\n\
+         fn twice(g) { g() + g() }\n\
+         pub fn main() -> Int {\n\
+         \x20 let t = twice\n\
+         \x20 let t2 = t\n\
+         \x20 handle { t2(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "14",
+    ),
+    (
+        "w4-an-alias-inside-a-lambda",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 let ap = fn(g) { g() + 1 }\n\
+         \x20 let run = fn(h) { let a = ap  a(h) }\n\
+         \x20 handle { run(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "8",
+    ),
+    (
+        "w5-a-type-only-alias",
+        "pub fn main() -> Int { let id = fn(x) { x }  let id2 = id  id2(1) + (if id2(True) { 10 } else { 0 }) }\n",
+        "11",
+    ),
+    (
+        "w6-an-alias-whose-target-is-rebound",
+        "pub fn main() -> Int {\n\
+         \x20 let ap = fn(g) { g() + 1 }\n\
+         \x20 let ap2 = ap\n\
+         \x20 let r = { let ap = 5  ap2(fn() { ap }) }\n\
+         \x20 r\n\
+         }\n",
+        "6",
+    ),
+    (
+        "w7-one-alias-at-two-effects",
+        "effect S { fn get() -> Int }\n\
+         effect T { fn tick() -> Int }\n\
+         fn twice(g) { g() + g() }\n\
+         pub fn main() -> Int {\n\
+         \x20 let t = twice\n\
+         \x20 let a = handle { t(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         \x20 let b = handle { t(fn() { tick() }) } with { T.tick() -> resume(100)  return(r) -> r }\n\
+         \x20 a + b + t(fn() { 1 })\n\
+         }\n",
+        "216",
+    ),
+    (
+        "w8-an-alias-of-a-parameter",
+        "effect S { fn get() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 let ap = fn(g) { g() + 1 }\n\
+         \x20 let k = fn(f) { let f2 = f  f2(fn() { get() }) }\n\
+         \x20 handle { k(ap) } with { S.get() -> resume(7)  return(r) -> r }\n\
+         }\n",
+        "8",
+    ),
+    (
+        "w9-an-alias-of-a-top-level-function-then-an-annotated-upcast",
+        "effect E { fn e() -> Int }\n\
+         fn mk() -> fn() -> Int { fn() { 5 } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let m = mk\n\
+         \x20 let q: fn() -> fn() / {E} -> Int = m\n\
+         \x20 handle { let r = q()  r() + e() } with { E.e() -> resume(10) }\n\
+         }\n",
+        "15",
+    ),
+    (
+        "w10-an-alias-of-a-top-level-function-then-an-upcast-by-a-join",
+        "effect E { fn e() -> Int }\n\
+         fn mk() -> fn() -> Int { fn() { 5 } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let m = mk\n\
+         \x20 let g = if True { m() } else { fn() { e() } }\n\
+         \x20 handle { g() + e() } with { E.e() -> resume(10) }\n\
+         }\n",
+        "15",
+    ),
+    (
+        "w11-alias-upcasts-throughout-main",
+        "effect E { fn e() -> Int }\n\
+         fn mk(n: Int) -> fn() -> Int { fn() { n } }\n\
+         fn pick(c: Bool) -> Int {\n\
+         \x20 let m = mk\n\
+         \x20 let g = if c { m(5) } else { fn() { e() } }\n\
+         \x20 g() + 1\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { pick(True) * 100 + pick(False) } with { E.e() -> resume(10) }\n\
+         }\n",
+        "611",
+    ),
+    (
+        "w12-an-annotated-upcast-alias-of-a-local",
+        "effect E { fn e() -> Int }\n\
+         pub fn main() -> Int {\n\
+         \x20 let p: fn(Int) -> Int = fn(x) { x + 1 }\n\
+         \x20 let f: fn(Int) / {E} -> Int = p\n\
+         \x20 handle { f(1) + e() } with { E.e() -> resume(10) }\n\
+         }\n",
+        "12",
+    ),
+    (
+        "w13-an-annotated-upcast-alias-of-a-top-level-function",
+        "effect E { fn e() -> Int }\n\
+         fn inc(x: Int) -> Int { x + 1 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let f: fn(Int) / {E} -> Int = inc\n\
+         \x20 handle { f(1) + e() } with { E.e() -> resume(10) }\n\
+         }\n",
+        "12",
+    ),
+    (
+        "w14-an-alias-of-a-local-that-shadows-a-top-level-function",
+        "fn inc(x) { x + 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = inc(1)\n\
+         \x20 let inc = fn(z) { z * 2 }\n\
+         \x20 let g = inc\n\
+         \x20 let f = fn(q) { g(q) }\n\
+         \x20 a + f(3)\n\
+         }\n",
+        "1007",
+    ),
+    (
+        "w15-an-alias-of-a-return-binder-that-shadows",
+        "type W { Wrap(Int) }\n\
+         fn unw(w) { match w { Wrap(v) -> v } }\n\
+         fn inc(x) { x + 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = inc(1)\n\
+         \x20 match Wrap(5) { Wrap(inc) -> { let g = inc  let f = fn(q) { g + q }  a + f(3) } }\n\
+         }\n",
+        "1009",
+    ),
+    (
+        "w16-an-alias-of-a-shadowing-local-in-a-handle",
+        "effect S { fn get() -> Int }\n\
+         fn ap(g, x) { g(x) }\n\
+         fn mk(n) { fn(g) { g() + n } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = mk(1)(fn() { 1 })\n\
+         \x20 a + handle { let mk = fn(z) { z * 2 + 1 }  let x = mk  if True { 0 } else { ap(x, 2) } } with { S.get() -> resume(3) }\n\
+         }\n",
+        "2",
+    ),
+    (
+        "w17-an-alias-of-a-lambda-parameter-that-shadows",
+        "fn inc(x) { x + 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = inc(1)\n\
+         \x20 let run = fn(inc) { let g = inc  let f = fn(q) { g(q) }  f(3) }\n\
+         \x20 a + run(fn(z) { z * 2 })\n\
+         }\n",
+        "1007",
+    ),
+    (
+        "w18-an-alias-of-a-pattern-binder-that-shadows",
+        "type B { B(fn(Int) -> Int) }\n\
+         fn inc(x) { x + 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = inc(1)\n\
+         \x20 match B(fn(z) { z * 2 }) { B(inc) -> { let g = inc  let f = fn(q) { g(q) }  a + f(3) } }\n\
+         }\n",
+        "1007",
+    ),
+    (
+        "w19-an-alias-of-a-clause-parameter-that-shadows",
+        "effect Ask { fn ask(f: fn(Int) -> Int) -> Int }\n\
+         fn inc(x) { x + 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = inc(1)\n\
+         \x20 handle { ask(fn(z) { z * 2 }) } with { Ask.ask(inc) -> { let g = inc  let f = fn(q) { g(q) }  resume(a + f(3)) } }\n\
+         }\n",
+        "1007",
+    ),
+    (
+        "w20-an-alias-of-a-local-shadowing-twice",
+        "fn twice(g) { g() + g() }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = twice(fn() { 1 })\n\
+         \x20 let twice = fn(g) { g() * 100 }\n\
+         \x20 let t = twice\n\
+         \x20 let h = fn() { t(fn() { 2 }) }\n\
+         \x20 a + h()\n\
+         }\n",
+        "202",
+    ),
+    (
+        "w21-the-fuzzed-seed-1017",
+        "effect S { fn get() -> Int }\n\
+         effect multi C { fn ch() -> Bool }\n\
+         type W { Wrap(Int) }\n\
+         type P2 { P2(Int, Int) }\n\
+         type Q4 { Q4(Int, Int, Int, Int) }\n\
+         type Q5 { Q5(Int, Int, Int, Int, Int) }\n\
+         type Option(a) { None, Some(a) }\n\
+         type List(a) { Nil, Cons(a, List(a)) }\n\
+         type Pair(a, b) { Pr(a, b) }\n\
+         fn inc(x) { x + 1 }\n\
+         fn dbl(x: Int) -> Int { x * 2 }\n\
+         fn ap(g, x) { g(x) }\n\
+         fn twice(g) { g() + g() }\n\
+         fn mk(n) { fn(g) { g() + n } }\n\
+         fn unw(w) { match w { Wrap(v) -> v } }\n\
+         fn unp(p) { match p { P2(a, b) -> a * 3 + b } }\n\
+         fn unq(q) { match q { Q4(a, b, c, d) -> a + b * 2 + c * 3 + d * 4 } }\n\
+         fn unq5(q) { match q { Q5(a, b, c, d, e) -> a + b + c + d + e * 5 } }\n\
+         fn uns(o) { match o { None -> 0  Some(v) -> v } }\n\
+         fn sum(l) { match l { Nil -> 0  Cons(h, t) -> (h + sum(t)) % 1000 } }\n\
+         fn map(l, f) { match l { Nil -> Nil  Cons(h, t) -> Cons(f(h), map(t, f)) } }\n\
+         fn ap4(f, a, b, c, d) { f(a, b, c, d) }\n\
+         pub fn main() -> Int {\n\
+         \x20 let base0 = inc(1) + dbl(1) + twice(fn() { 1 }) + mk(1)(fn() { 1 }) + ap(inc, 1) + unw(Wrap(1))\n\
+         \x20 base0 + handle { handle { uns(Some({ let g = { let mk = fn(z) { z * 2 + 1 }  let x = mk  if if unp(P2(1, 7)) > 4 { 0 + ((7) * 3 + (4)) % 1000 } else { ap(x, 2) } > 4 { 0 + (fn(g) { g() * 3 })(fn() { { let ap = 1  ap } }) } else { { let y = inc  let k = y  0 + ((1) * 3 + (6)) % 1000 } } }  { let ap = ap(inc, mk(inc(g))(fn() { if ch() { 8 } else { g } }))  if if { let h = 9  ap } > 4 { { let x = Q4  ap } } else { mk(g)(fn() { 1 }) } > 4 { inc(if ap > 4 { 7 } else { 1 }) } else { g } } })) } with { S.get() -> resume(3) } } with multi { C.ch() -> (resume(True) + resume(False)) % 1000 }\n\
+         }\n",
+        "27",
+    ),
+];
+
+#[test]
+fn aliases_run_natively() {
+    run_value_corpus(ALIASES, "aliases");
+}
+
+#[test]
+fn aliases_match_the_evaluator() {
+    run_differential_corpus(ALIASES, "aliases-diff");
 }
