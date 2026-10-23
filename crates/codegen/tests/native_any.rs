@@ -442,10 +442,13 @@ fn nested_and_local_any_handlers() {
 
 #[test]
 fn what_is_not_compiled_is_refused_by_name() {
-    // An operation value given to a function (spec D2).
+    // An operation value a function RETURNS (spec D2). Until 2026-10-23 this
+    // was one GIVEN to a function (`describe(o)`), which now compiles: the
+    // function is cloned per operation (spec 2026-10-23-elya-operation-arguments
+    // D1; `helpers_over_an_operation_agree`). A changed test, by that decision.
     let src = "effect W { fn roll(s: Int) -> Int }\n\
-        fn describe(o) { op.show(o) }\n\
-        fn rec(body) { handle { body() } with any { op(o) -> { io.println(describe(o))  resume(op.perform(o)) } } }\n\
+        fn id(x) { x }\n\
+        fn rec(body) { handle { body() } with any { op(o) -> { io.println(op.show(id(o)))  resume(op.perform(o)) } } }\n\
         pub fn main() -> Int { handle { rec(fn() { roll(6) }) } with { W.roll(s) -> resume(s) } }\n";
     let e = refusal(src);
     assert!(
@@ -526,4 +529,217 @@ fn an_aliased_operation_value_runs_natively() {
     let got = agree(src, "alias");
     assert_eq!(got.text, "W.roll(6)\nW.roll(2)\n");
     assert_eq!(got.end, Ok("80".to_string()));
+}
+
+// ---- Operation values passed to functions (2026-10-23) ----
+// Spec `docs/superpowers/specs/2026-10-23-elya-operation-arguments-design.md`.
+
+/// D1: a top-level function called with the operation is cloned per operation.
+/// Each program was refused natively, "operation value used other than by op.*
+/// or ==" (spec §0): a helper that describes (p1), a helper calling a helper
+/// (q1), a recursive helper (q2), one that performs, shows and encodes (q3), one
+/// that compares (q4), one generic in another parameter (q6), and one that
+/// decodes (q8).
+#[test]
+fn helpers_over_an_operation_agree() {
+    for (tag, src) in [
+        (
+            "p1",
+            "effect W { fn roll(s: Int) -> Int  fn put(s: String) -> Unit }\n\
+            fn describe(o) { op.name(o) <> \" = \" <> op.show(o) }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { io.println(describe(o))  resume(op.perform(o)) } } }\n\
+            pub fn main() -> Int { handle { rec(fn() { put(\"a\")  roll(6) + roll(2) }) } with { W.roll(s) -> resume(s * 10)  W.put(s) -> resume(Unit) } }\n",
+        ),
+        (
+            "q1",
+            "effect W { fn roll(s: Int) -> Int  fn put(s: String) -> Unit  fn none() -> Bool }\n\
+            fn inner(o) { op.name(o) }\n\
+            fn outer(o, n) { inner(o) <> \"#\" <> int.to_string(n) }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { io.println(outer(o, 7))  resume(op.perform(o)) } } }\n\
+            pub fn main() -> Int { handle { rec(fn() { put(\"a\")  let b = none()  roll(6) + roll(2) + (if b { 1 } else { 0 }) }) } with { W.roll(s) -> resume(s * 10)  W.put(s) -> resume(Unit)  W.none() -> resume(True) } }\n",
+        ),
+        (
+            "q2",
+            "effect W { fn roll(s: Int) -> Int  fn put(s: String) -> Unit  fn none() -> Bool }\n\
+            fn rep(o, n) { if n == 0 { \"\" } else { op.name(o) <> rep(o, n - 1) } }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { io.println(rep(o, 2))  resume(op.perform(o)) } } }\n\
+            pub fn main() -> Int { handle { rec(fn() { put(\"a\")  let b = none()  roll(6) + roll(2) + (if b { 1 } else { 0 }) }) } with { W.roll(s) -> resume(s * 10)  W.put(s) -> resume(Unit)  W.none() -> resume(True) } }\n",
+        ),
+        (
+            "q3",
+            "effect W { fn roll(s: Int) -> Int  fn put(s: String) -> Unit  fn none() -> Bool }\n\
+            fn logged(o) { let v = op.perform(o)  io.println(op.show(o) <> \" = \" <> op.encode(o, v))  v }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> resume(logged(o)) } }\n\
+            pub fn main() -> Int { handle { rec(fn() { put(\"a\")  let b = none()  roll(6) + roll(2) + (if b { 1 } else { 0 }) }) } with { W.roll(s) -> resume(s * 10)  W.put(s) -> resume(Unit)  W.none() -> resume(True) } }\n",
+        ),
+        (
+            "q4",
+            "effect W { fn roll(s: Int) -> Int  fn put(s: String) -> Unit  fn none() -> Bool }\n\
+            fn same(o) { o == o }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { io.println(if same(o) { \"same\" } else { \"no\" })  resume(op.perform(o)) } } }\n\
+            pub fn main() -> Int { handle { rec(fn() { put(\"a\")  let b = none()  roll(6) + roll(2) + (if b { 1 } else { 0 }) }) } with { W.roll(s) -> resume(s * 10)  W.put(s) -> resume(Unit)  W.none() -> resume(True) } }\n",
+        ),
+        (
+            "q6",
+            "effect W { fn roll(s: Int) -> Int  fn put(s: String) -> Unit  fn none() -> Bool }\n\
+            fn tagged(o, t) { let v = op.perform(o)  let _ = t  v }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> resume(tagged(o, True)) } }\n\
+            pub fn main() -> Int { handle { rec(fn() { put(\"a\")  let b = none()  roll(6) + roll(2) + (if b { 1 } else { 0 }) }) } with { W.roll(s) -> resume(s * 10)  W.put(s) -> resume(Unit)  W.none() -> resume(True) } }\n",
+        ),
+        (
+            "q8",
+            "effect W { fn roll(s: Int) -> Int  fn put(s: String) -> Unit  fn none() -> Bool }\n\
+            fn redo(o) { let v = op.perform(o)  op.decode(o, op.encode(o, v)) }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> resume(redo(o)) } }\n\
+            pub fn main() -> Int { handle { rec(fn() { put(\"a\")  let b = none()  roll(6) + roll(2) + (if b { 1 } else { 0 }) }) } with { W.roll(s) -> resume(s * 10)  W.put(s) -> resume(Unit)  W.none() -> resume(True) } }\n",
+        ),
+    ] {
+        agree(src, tag);
+    }
+}
+
+/// D1, composed: a nested `with any` clause passes both operations, its own
+/// and the outer clause's, to one helper. The inner expansion clones it for
+/// `p`, and the outer for `o`.
+#[test]
+fn a_nested_clause_passes_both_operations() {
+    let src = "effect W { fn roll(s: Int) -> Int  fn put(s: String) -> Unit  fn none() -> Bool }\n\
+         fn both(a, b) { op.name(a) <> \"/\" <> op.name(b) }\n\
+         fn rec(body) { handle { body() } with any { op(o) -> { let r = handle { op.perform(o) } with any { op(p) -> { io.println(both(o, p))  resume(op.perform(p)) } }  resume(r) } } }\n\
+         pub fn main() -> Int { handle { rec(fn() { put(\"a\")  let b = none()  roll(6) + roll(2) + (if b { 1 } else { 0 }) }) } with { W.roll(s) -> resume(s * 10)  W.put(s) -> resume(Unit)  W.none() -> resume(True) } }\n";
+    let got = agree(src, "both");
+    assert!(got.text.starts_with("W.put/W.put\n"), "{got:?}");
+}
+
+/// D2: what stays refused, by the same name. A helper that returns the
+/// operation (p2), the operation stored in data (p5), a local lambda called with
+/// it (q5), and the operation passed twice to one call (q9). Green before D1 and
+/// after it: the guard on the clones' own rewrite.
+#[test]
+fn an_operation_returned_stored_or_passed_twice_is_refused() {
+    for (tag, src) in [
+        (
+            "p2",
+            "effect W { fn roll(s: Int) -> Int  fn put(s: String) -> Unit }\n\
+            fn id(x) { x }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> resume(op.perform(id(o))) } }\n\
+            pub fn main() -> Int { handle { rec(fn() { put(\"a\")  roll(6) + roll(2) }) } with { W.roll(s) -> resume(s * 10)  W.put(s) -> resume(Unit) } }\n",
+        ),
+        (
+            "p5",
+            "effect W { fn roll(s: Int) -> Int  fn put(s: String) -> Unit }\n\
+            type Entry(a) { E(a, String) }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { let e = E(o, \"x\")  match e { E(p, s) -> resume(op.perform(p)) } } } }\n\
+            pub fn main() -> Int { handle { rec(fn() { put(\"a\")  roll(6) + roll(2) }) } with { W.roll(s) -> resume(s * 10)  W.put(s) -> resume(Unit) } }\n",
+        ),
+        (
+            "q5",
+            "effect W { fn roll(s: Int) -> Int  fn put(s: String) -> Unit  fn none() -> Bool }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { let d = fn(x) { op.name(x) }  io.println(d(o))  resume(op.perform(o)) } } }\n\
+            pub fn main() -> Int { handle { rec(fn() { put(\"a\")  let b = none()  roll(6) + roll(2) + (if b { 1 } else { 0 }) }) } with { W.roll(s) -> resume(s * 10)  W.put(s) -> resume(Unit)  W.none() -> resume(True) } }\n",
+        ),
+        (
+            "q9",
+            "effect W { fn roll(s: Int) -> Int  fn put(s: String) -> Unit  fn none() -> Bool }\n\
+            fn two(a, b) { op.name(a) <> op.name(b) }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { io.println(two(o, o))  resume(op.perform(o)) } } }\n\
+            pub fn main() -> Int { handle { rec(fn() { put(\"a\")  let b = none()  roll(6) + roll(2) + (if b { 1 } else { 0 }) }) } with { W.roll(s) -> resume(s * 10)  W.put(s) -> resume(Unit)  W.none() -> resume(True) } }\n",
+        ),
+    ] {
+        let err = refusal(src);
+        assert!(
+            err.contains("operation value used other than by op.* or =="),
+            "{tag}: {err}"
+        );
+    }
+}
+
+/// The review of this slice (2026-10-23, its F1 and F2): a nested clause passes
+/// its operation to a helper that ALSO uses a value of the outer operation's
+/// answer type. The inner expansion's clone kept the outer rigid answer type,
+/// which nothing substituted: "internal: op: a value of a type with no
+/// instance" at run time (m1, d01, d03, d04), compiler panics (m2, m6), or a
+/// clone dropped while still called (m3, d02, d05, d07). An operation clone now
+/// carries its source's rigid answer types, so the outer expansion clones it
+/// again at the outer answer, in one request-ordered worklist.
+#[test]
+fn nested_clauses_pass_operations_to_helpers_over_the_outer_answer() {
+    for (tag, src) in [
+        (
+            "m1",
+            "effect S { fn a() -> String }\n\
+            fn both(x, y) { let v = op.perform(x)  op.name(y) <> \" \" <> op.encode(x, v) }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { let r = handle { op.perform(o) } with any { op(p) -> { io.println(both(o, p))  resume(op.perform(p)) } }  resume(r) } } }\n\
+            pub fn main() -> Int { let s = handle { rec(fn() { a() }) } with { S.a() -> resume(\"A\") }  io.println(s)  7 }\n",
+        ),
+        (
+            "m2",
+            "effect S { fn a() -> Int }\n\
+            fn both(x, y) { let v = op.perform(x)  op.name(y) <> \" \" <> op.encode(x, v) }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { let r = handle { op.perform(o) } with any { op(p) -> { io.println(both(o, p))  resume(op.perform(p)) } }  resume(r) } } }\n\
+            pub fn main() -> Int { handle { rec(fn() { a() }) } with { S.a() -> resume(7) } }\n",
+        ),
+        (
+            "m3",
+            "effect S { fn a() -> Int }\n\
+            fn g(y, v) { let _ = v  op.name(y) }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { let x = op.perform(o)  let r = handle { op.perform(o) } with any { op(p) -> { io.println(g(p, x))  resume(op.perform(p)) } }  let _ = r  resume(x) } } }\n\
+            pub fn main() -> Int { handle { rec(fn() { a() }) } with { S.a() -> resume(7) } }\n",
+        ),
+        (
+            "m6",
+            "type Opt(a) { No, Yes(a) }\n\
+            effect S { fn a() -> Int }\n\
+            fn both(x, y) { let v = op.perform(x)  let b = Yes(v)  match b { Yes(_) -> op.name(y) <> \" yes\"  No -> op.name(y) <> \" no\" } }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { let r = handle { op.perform(o) } with any { op(p) -> { io.println(both(o, p))  resume(op.perform(p)) } }  resume(r) } } }\n\
+            pub fn main() -> Int { handle { rec(fn() { a() }) } with { S.a() -> resume(7) } }\n",
+        ),
+        (
+            "d01",
+            "effect S { fn a(x: Int) -> String  fn b() -> String }\n\
+            fn both(a, b) { let v = op.perform(a)  op.name(b) <> \":\" <> op.encode(a, v) }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { let r = handle { op.perform(o) } with any { op(p) -> { io.println(both(o, p))  resume(op.perform(p)) } }  resume(r) } } }\n\
+            pub fn main() -> Int { let s = handle { rec(fn() { a(1) <> b() }) } with { S.a(x) -> resume(\"A\" <> int.to_string(x))  S.b() -> resume(\"B\") }  io.println(s)  7 }\n",
+        ),
+        (
+            "d02",
+            "effect S { fn a(x: Int) -> String  fn b() -> String }\n\
+            fn both(a, b) { let v = op.perform(a)  io.println(op.name(b))  v }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { let r = handle { op.perform(o) } with any { op(p) -> { let w = both(o, p)  let _ = w  resume(op.perform(p)) } }  resume(r) } } }\n\
+            pub fn main() -> Int { let s = handle { rec(fn() { a(1) <> b() }) } with { S.a(x) -> resume(\"A\" <> int.to_string(x))  S.b() -> resume(\"B\") }  io.println(s)  7 }\n",
+        ),
+        (
+            "d03",
+            "type P { P(Int, Int) }\n\
+            effect S { fn a(x: Int) -> String  fn c() -> P }\n\
+            fn both(a, b) { let v = op.perform(a)  op.name(b) <> \":\" <> op.encode(a, v) <> \":\" <> op.encode(a, op.decode(a, op.encode(a, v))) }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { let r = handle { op.perform(o) } with any { op(p) -> { io.println(both(o, p))  resume(op.perform(p)) } }  resume(r) } } }\n\
+            pub fn main() -> Int { let s = handle { rec(fn() { match c() { P(x, y) -> a(x + y) } }) } with { S.a(x) -> resume(\"A\" <> int.to_string(x))  S.c() -> resume(P(3, 4)) }  io.println(s)  7 }\n",
+        ),
+        (
+            "d04",
+            "effect S { fn a(x: Int) -> String  fn b() -> String }\n\
+            fn both(a, b) { let v = op.perform(a)  op.name(b) <> \":\" <> op.encode(a, v) }\n\
+            fn h(o) { handle { op.perform(o) } with any { op(p) -> { io.println(both(o, p))  resume(op.perform(p)) } } }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> resume(h(o)) } }\n\
+            pub fn main() -> Int { let s = handle { rec(fn() { a(1) <> b() }) } with { S.a(x) -> resume(\"A\" <> int.to_string(x))  S.b() -> resume(\"B\") }  io.println(s)  7 }\n",
+        ),
+        (
+            "d05",
+            "effect W { fn roll(s: Int) -> Int  fn put(s: String) -> Unit  fn none() -> Bool }\n\
+            fn both(a, b) { let v = op.perform(a)  let _ = op.name(b)  v }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { let r = handle { op.perform(o) } with any { op(p) -> { let w = both(o, p)  let _ = w  resume(op.perform(p)) } }  resume(r) } } }\n\
+            pub fn main() -> Int { handle { rec(fn() { put(\"a\")  let b = none()  roll(6) + roll(2) + (if b { 1 } else { 0 }) }) } with { W.roll(s) -> resume(s * 10)  W.put(s) -> resume(Unit)  W.none() -> resume(True) } }\n",
+        ),
+        (
+            "d07",
+            "type P { P(Int, Int) }\n\
+            effect S { fn c(n: Int) -> P }\n\
+            fn both(a, b) { let v = op.perform(a)  let _ = op.name(b)  v }\n\
+            fn rec(body) { handle { body() } with any { op(o) -> { let r = handle { op.perform(o) } with any { op(p) -> { let w = both(o, p)  let _ = w  resume(op.perform(p)) } }  resume(r) } } }\n\
+            pub fn main() -> Int { let s = handle { rec(fn() { match c(1) { P(x, y) -> x + y } }) } with { S.c(n) -> resume(P(n, 4)) }  s }\n",
+        ),
+    ] {
+        agree(src, tag);
+    }
 }

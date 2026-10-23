@@ -10,13 +10,17 @@
 //!   rigid answer type replaced by the operation's.
 //! - **D2.** The operation value is gone: in a copy the operation is known, so
 //!   `op.*` and `==` on the binder are rewritten over the clause's parameters.
-//!   Any other use of the binder is refused by name.
+//!   A top-level function called with the binder is cloned per operation, its
+//!   parameter replaced by the operation's arguments and its body rewritten the
+//!   same way (spec 2026-10-23-elya-operation-arguments D1). Any other use of
+//!   the binder is refused by name.
 //! - **D7.** The expansion is one-shot; `is_multi_declared` is stamped from the
 //!   handled operations' declarations.
 //!
 //! Deliberately LLVM-free: the unit tests below never construct a `Context`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use elya::ast::BinOp;
@@ -43,14 +47,16 @@ pub(crate) fn run(core: &CoreModule) -> R<CoreModule> {
     let mut cx = Cx {
         effects: core.effects.iter().map(|e| (e.name.clone(), e)).collect(),
         fresh: 0,
-        rigid_fns: core
-            .fns
-            .iter()
-            .map(|f| (f.name.clone(), fn_rigids(f)))
-            .filter(|(_, r)| !r.is_empty())
-            .collect(),
-        clones: HashMap::new(),
-        queue: Vec::new(),
+        ops: RefCell::new(Sink {
+            tops: core.fns.iter().map(|f| f.name.clone()).collect(),
+            rigid_fns: core
+                .fns
+                .iter()
+                .map(|f| (f.name.clone(), fn_rigids(f)))
+                .filter(|(_, r)| !r.is_empty())
+                .collect(),
+            ..Sink::default()
+        }),
     };
     let mut fns = Vec::with_capacity(core.fns.len());
     for f in &core.fns {
@@ -63,12 +69,35 @@ pub(crate) fn run(core: &CoreModule) -> R<CoreModule> {
     }
     // The review's R1: a generic function `mono::run` cloned at a rigid answer
     // type is cloned again per operation, at that operation's answer type, as
-    // the clause is. Requests are served in order, so a clone's source exists.
+    // the clause is. An operation clone (spec 2026-10-23 D1) is a second kind
+    // of request. Both are served in ONE list, in request order: a clone's name
+    // appears in code only after it was requested, and its source's request came
+    // before that, so a clone's source always exists when it is built (the
+    // review of 2026-10-23: an operation clone at an inner clause can need an
+    // outer rigid clone of itself).
     let mut done: Vec<CoreFn> = Vec::new();
     let mut i = 0;
-    while i < cx.queue.len() {
-        let (src, rigid, answer, name) = cx.queue[i].clone();
+    loop {
+        let work = cx.ops.borrow().work.get(i).cloned();
+        let Some(work) = work else {
+            break;
+        };
         i += 1;
+        let (src, rigid, answer, name) = match work {
+            Work::Op(src, pos, at, name) => {
+                let f = fns
+                    .iter()
+                    .chain(done.iter())
+                    .find(|f| f.name == src)
+                    .cloned()
+                    .ok_or(CodegenError::Unsupported(
+                        "callee is not a top-level function",
+                    ))?;
+                done.push(cx.op_clone(&f, pos, &at, name)?);
+                continue;
+            }
+            Work::Rigid(src, rigid, answer, name) => (src, rigid, answer, name),
+        };
         let f = fns
             .iter()
             .chain(done.iter())
@@ -107,8 +136,10 @@ pub(crate) fn run(core: &CoreModule) -> R<CoreModule> {
     }
     fns.extend(done);
     // What is still at a rigid type is unreachable: every reference to it was
-    // redirected (a rigid type never leaves its clause, E0435).
-    fns.retain(|f| fn_rigids(f).is_empty());
+    // redirected (a rigid type never leaves its clause, E0435). So is a function
+    // that still takes an operation: every call that passed one now calls its
+    // clone, and any other use of the operation was refused.
+    fns.retain(|f| fn_rigids(f).is_empty() && !f.params.iter().any(|p| is_op_ty(&p.ty)));
     Ok(CoreModule {
         fns,
         types: core.types.clone(),
@@ -158,15 +189,79 @@ struct Cx<'a> {
     effects: HashMap<String, &'a CoreEffect>,
     /// Numbers the clause parameters the expansion introduces.
     fresh: usize,
-    /// Functions at rigid answer types, and which (R1).
+    /// Every clone requested, both kinds (R1 and spec 2026-10-23 D1).
+    ops: RefCell<Sink<'a>>,
+}
+
+/// One clone to build.
+#[derive(Clone)]
+enum Work<'a> {
+    /// R1: `(source, rigid, answer, name)`.
+    Rigid(String, String, Ty, String),
+    /// D1 of 2026-10-23: `(source, position, operation, name)`.
+    Op(String, usize, OpAt<'a>, String),
+}
+
+/// A clone key: the source, the parameter the operation is passed in, and the
+/// operation (its name, answer and label).
+type OpKey = (String, usize, String, String, String);
+
+/// The clones requested so far, and what redirecting to them needs.
+#[derive(Default)]
+struct Sink<'a> {
+    /// Every top-level function, clones included.
+    tops: HashSet<String>,
+    /// Functions at rigid answer types, and which (R1). An operation clone
+    /// inherits its source's: it is still at the outer clause's answer type.
     rigid_fns: HashMap<String, BTreeSet<String>>,
-    /// `(function, rigid, answer)` -> its clone's name (R1).
+    /// `(function, rigid, answer)` -> its R1 clone's name.
     clones: HashMap<(String, String, String), String>,
-    /// Clones to build: `(source, rigid, answer, name)`.
-    queue: Vec<(String, String, Ty, String)>,
+    /// Operation clones, by `OpKey`.
+    memo: HashMap<OpKey, String>,
+    /// Both kinds, in request order.
+    work: Vec<Work<'a>>,
+    /// Numbers R1 clones.
+    fresh: usize,
+    /// Numbers operation clones.
+    ops: usize,
+}
+
+impl<'a> Sink<'a> {
+    /// The clone of `f` with the operation `at` in parameter `pos`, requested
+    /// on first use.
+    fn request(&mut self, f: &str, pos: usize, at: &OpAt<'a>) -> R<String> {
+        let key = (
+            f.to_string(),
+            pos,
+            at.named.clone(),
+            format!("{:?}", at.answer),
+            format!("{:?}", at.label.args),
+        );
+        if let Some(n) = self.memo.get(&key) {
+            return Ok(n.clone());
+        }
+        self.ops += 1;
+        let name = format!("{f}.op.{}", self.ops);
+        self.memo.insert(key, name.clone());
+        self.tops.insert(name.clone());
+        let mut rigids = self.rigid_fns.get(f).cloned().unwrap_or_default();
+        for a in &at.args {
+            ty_rigids(&a.ty, &mut rigids);
+        }
+        if !rigids.is_empty() {
+            self.rigid_fns.insert(name.clone(), rigids);
+        }
+        self.work
+            .push(Work::Op(f.to_string(), pos, at.clone(), name.clone()));
+        if self.work.len() > crate::mono::MAX_TYPE_CLONES {
+            return Err(CodegenError::Unsupported("too many function clones"));
+        }
+        Ok(name)
+    }
 }
 
 /// One operation, as a clause copy knows it.
+#[derive(Clone)]
 struct OpAt<'a> {
     /// `E.op`.
     named: String,
@@ -265,32 +360,34 @@ impl<'a> Cx<'a> {
 
     /// R1: every reference to a function at `rigid` goes to its clone at
     /// `answer`, requested on first use.
-    fn redirect(&mut self, e: &CoreExpr, rigid: &str, answer: &Ty) -> R<CoreExpr> {
+    fn redirect(&self, e: &CoreExpr, rigid: &str, answer: &Ty) -> R<CoreExpr> {
         let mut err = None;
         let out = map_vars_named(e, &mut |x: &str| {
-            let rs = self.rigid_fns.get(x)?;
+            let mut s = self.ops.borrow_mut();
+            let rs = s.rigid_fns.get(x)?.clone();
             if !rs.contains(rigid) {
                 return None;
             }
             let key = (x.to_string(), rigid.to_string(), format!("{answer:?}"));
-            if let Some(n) = self.clones.get(&key) {
+            if let Some(n) = s.clones.get(&key) {
                 return Some(n.clone());
             }
-            self.fresh += 1;
-            let name = format!("{x}.any.{}", self.fresh);
-            let mut left = rs.clone();
+            s.fresh += 1;
+            let name = format!("{x}.any.{}", s.fresh);
+            let mut left = rs;
             left.remove(rigid);
             if !left.is_empty() {
-                self.rigid_fns.insert(name.clone(), left);
+                s.rigid_fns.insert(name.clone(), left);
             }
-            self.clones.insert(key, name.clone());
-            self.queue.push((
+            s.clones.insert(key, name.clone());
+            s.tops.insert(name.clone());
+            s.work.push(Work::Rigid(
                 x.to_string(),
                 rigid.to_string(),
                 answer.clone(),
                 name.clone(),
             ));
-            if self.queue.len() > crate::mono::MAX_TYPE_CLONES {
+            if s.work.len() > crate::mono::MAX_TYPE_CLONES {
                 err = Some(CodegenError::Unsupported("too many function clones"));
             }
             Some(name)
@@ -299,6 +396,39 @@ impl<'a> Cx<'a> {
             Some(e) => Err(e),
             None => Ok(out),
         }
+    }
+
+    /// Spec 2026-10-23 D1: `f` with its parameter `pos` replaced by the
+    /// operation's arguments, its body rewritten at the operation.
+    fn op_clone(&self, f: &CoreFn, pos: usize, at: &OpAt<'a>, name: String) -> R<CoreFn> {
+        let o = f.params[pos].name.clone();
+        let args: Vec<CoreParam> = at
+            .args
+            .iter()
+            .enumerate()
+            .map(|(k, a)| CoreParam {
+                name: format!("{name}.arg.{k}"),
+                ty: a.ty.clone(),
+            })
+            .collect();
+        let mut params: Vec<CoreParam> = Vec::new();
+        for (k, p) in f.params.iter().enumerate() {
+            if k == pos {
+                params.extend(args.iter().cloned());
+            } else {
+                params.push(p.clone());
+            }
+        }
+        let here = OpAt { args, ..at.clone() };
+        let mut shadow = binder_names(&f.body);
+        shadow.extend(f.params.iter().map(|p| p.name.clone()));
+        let body = rewrite(&f.body, &o, &here, &self.ops, &shadow)?;
+        Ok(CoreFn {
+            name,
+            params: params.into(),
+            body,
+            row: f.row.clone(),
+        })
     }
 
     /// D1: the plain handle an `any` handle stands for.
@@ -356,7 +486,8 @@ impl<'a> Cx<'a> {
                 };
                 let typed = map_expr(&clause.body, &|t| replace_con(t, &rigid, &at.answer));
                 let typed = self.redirect(&typed, &rigid, &at.answer)?;
-                let body = rewrite(&typed, &binder.name, &at)?;
+                let shadow = binder_names(&typed);
+                let body = rewrite(&typed, &binder.name, &at, &self.ops, &shadow)?;
                 clauses.push(CoreClause {
                     effect: label.clone(),
                     op: decl.name.clone(),
@@ -517,11 +648,22 @@ fn concat(span: Span, a: CoreExpr, b: CoreExpr) -> CoreExpr {
 }
 
 /// D2: `e` with every use of the binder `o` rewritten for the operation `at`.
-fn rewrite(e: &CoreExpr, o: &str, at: &OpAt) -> R<CoreExpr> {
+///
+/// A call of a top-level function `f` (not shadowed in this body) with `o` in
+/// exactly one argument becomes a call of `f`'s clone at this operation, with
+/// the operation's arguments in that position (spec 2026-10-23 D1).
+fn rewrite<'a>(
+    e: &CoreExpr,
+    o: &str,
+    at: &OpAt<'a>,
+    sink: &RefCell<Sink<'a>>,
+    shadow: &HashSet<String>,
+) -> R<CoreExpr> {
     let sp = e.span;
-    let go = |c: &CoreExpr| -> R<Rc<CoreExpr>> { Ok(Rc::new(rewrite(c, o, at)?)) };
-    let all =
-        |cs: &[CoreExpr]| -> R<Rc<[CoreExpr]>> { cs.iter().map(|c| rewrite(c, o, at)).collect() };
+    let go = |c: &CoreExpr| -> R<Rc<CoreExpr>> { Ok(Rc::new(rewrite(c, o, at, sink, shadow)?)) };
+    let all = |cs: &[CoreExpr]| -> R<Rc<[CoreExpr]>> {
+        cs.iter().map(|c| rewrite(c, o, at, sink, shadow)).collect()
+    };
     let is_o = |c: &CoreExpr| matches!(&c.kind, CoreKind::Var(x) if x == o);
     let kind = match &e.kind {
         CoreKind::Var(x) if x == o => return Err(CodegenError::Unsupported(OP_VALUE_REFUSAL)),
@@ -535,7 +677,35 @@ fn rewrite(e: &CoreExpr, o: &str, at: &OpAt) -> R<CoreExpr> {
         {
             return Ok(op_eq(sp, *op, at));
         }
-        CoreKind::App(f, a) => CoreKind::App(go(f)?, all(a)?),
+        CoreKind::App(f, a) => {
+            let at_o: Vec<usize> = (0..a.len()).filter(|&k| is_o(&a[k])).collect();
+            match (&f.kind, &at_o[..], &f.ty) {
+                (CoreKind::Var(name), [pos], Ty::Fn(ps, row, ret))
+                    if !shadow.contains(name) && sink.borrow().tops.contains(name) =>
+                {
+                    let pos = *pos;
+                    let clone = sink.borrow_mut().request(name, pos, at)?;
+                    let mut args = Vec::with_capacity(a.len() + at.args.len());
+                    let mut tys = Vec::with_capacity(ps.len() + at.args.len());
+                    for (k, x) in a.iter().enumerate() {
+                        if k == pos {
+                            args.extend(at.args.iter().map(|p| var(sp, p)));
+                            tys.extend(at.args.iter().map(|p| p.ty.clone()));
+                        } else {
+                            args.push(rewrite(x, o, at, sink, shadow)?);
+                            tys.push(ps[k].clone());
+                        }
+                    }
+                    let callee = node(
+                        f.span,
+                        Ty::Fn(tys, row.clone(), ret.clone()),
+                        CoreKind::Var(clone),
+                    );
+                    CoreKind::App(Rc::new(callee), args.into())
+                }
+                _ => CoreKind::App(go(f)?, all(a)?),
+            }
+        }
         CoreKind::Builtin(n, a) => CoreKind::Builtin(n.clone(), all(a)?),
         CoreKind::Ctor(n, a) => CoreKind::Ctor(n.clone(), all(a)?),
         CoreKind::Prim(p, a) => CoreKind::Prim(*p, all(a)?),
@@ -558,7 +728,7 @@ fn rewrite(e: &CoreExpr, o: &str, at: &OpAt) -> R<CoreExpr> {
                 let body = if binds(&a.pat, o) {
                     a.body.clone()
                 } else {
-                    rewrite(&a.body, o, at)?
+                    rewrite(&a.body, o, at, sink, shadow)?
                 };
                 out.push(CoreArm {
                     pat: a.pat.clone(),
@@ -611,6 +781,66 @@ fn rewrite(e: &CoreExpr, o: &str, at: &OpAt) -> R<CoreExpr> {
         })),
     };
     Ok(node(sp, e.ty.clone(), kind))
+}
+
+/// `$Op(..)`: a `with any` operation's type, at any answer.
+fn is_op_ty(t: &Ty) -> bool {
+    matches!(t, Ty::Con(n, _) if n == "$Op")
+}
+
+/// Every name a binder in `e` introduces: a call of one of these names may be a
+/// local closure, never redirected to a clone.
+fn binder_names(e: &CoreExpr) -> HashSet<String> {
+    fn walk(e: &CoreExpr, out: &mut HashSet<String>) {
+        let all = |cs: &[CoreExpr], out: &mut HashSet<String>| cs.iter().for_each(|c| walk(c, out));
+        match &e.kind {
+            CoreKind::Lit(_) | CoreKind::Var(_) => {}
+            CoreKind::App(f, a) => {
+                walk(f, out);
+                all(a, out);
+            }
+            CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => all(a, out),
+            CoreKind::Lambda(ps, b) => {
+                out.extend(ps.iter().map(|p| p.name.clone()));
+                walk(b, out);
+            }
+            CoreKind::Let(x, v, b) => {
+                out.insert(x.clone());
+                walk(v, out);
+                walk(b, out);
+            }
+            CoreKind::If(c, t, f) => {
+                walk(c, out);
+                walk(t, out);
+                walk(f, out);
+            }
+            CoreKind::Match(sc, arms) => {
+                walk(sc, out);
+                for a in arms.iter() {
+                    let mut names = Vec::new();
+                    crate::closure::pat_binders(&a.pat, &mut names);
+                    out.extend(names);
+                    walk(&a.body, out);
+                }
+            }
+            CoreKind::Handle(h) => {
+                walk(&h.body, out);
+                for c in h.clauses.iter() {
+                    out.extend(c.params.iter().map(|p| p.name.clone()));
+                    walk(&c.body, out);
+                }
+                if let Some(r) = &h.ret {
+                    out.insert(r.binder.clone());
+                    walk(&r.body, out);
+                }
+            }
+            CoreKind::Resume(v) => walk(v, out),
+            CoreKind::Perform(p) => all(&p.args, out),
+        }
+    }
+    let mut out = HashSet::new();
+    walk(e, &mut out);
+    out
 }
 
 fn binds(p: &CorePat, o: &str) -> bool {
@@ -852,5 +1082,62 @@ mod tests {
                 other => panic!("{clause}: {:?}", other.map(|_| ())),
             }
         }
+    }
+
+    fn calls(e: &CoreExpr, name: &str) -> bool {
+        let any = |cs: &[CoreExpr]| cs.iter().any(|c| calls(c, name));
+        match &e.kind {
+            CoreKind::App(f, a) => {
+                matches!(&f.kind, CoreKind::Var(x) if x == name) || calls(f, name) || any(a)
+            }
+            CoreKind::Lit(_) | CoreKind::Var(_) => false,
+            CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => any(a),
+            CoreKind::Lambda(_, b) | CoreKind::Resume(b) => calls(b, name),
+            CoreKind::Let(_, v, b) => calls(v, name) || calls(b, name),
+            CoreKind::If(c, t, f) => calls(c, name) || calls(t, name) || calls(f, name),
+            CoreKind::Match(sc, arms) => {
+                calls(sc, name) || arms.iter().any(|a| calls(&a.body, name))
+            }
+            CoreKind::Handle(h) => {
+                calls(&h.body, name)
+                    || h.clauses.iter().any(|c| calls(&c.body, name))
+                    || h.ret.as_ref().is_some_and(|r| calls(&r.body, name))
+            }
+            CoreKind::Perform(pf) => any(&pf.args),
+        }
+    }
+
+    /// Spec 2026-10-23-elya-operation-arguments D1: a recursive helper over the
+    /// operation is one clone per handled operation, each calling itself, and no
+    /// function left takes an operation.
+    #[test]
+    fn a_recursive_helper_is_cloned_once_per_operation() {
+        let m = expanded(
+            "effect W { fn roll(s: Int) -> Int  fn put(s: String) -> Unit  fn none() -> Bool }\n\
+             fn rep(o, n) { if n == 0 { \"\" } else { op.name(o) <> rep(o, n - 1) } }\n\
+             fn rec(body) { handle { body() } with any { op(o) -> { io.println(rep(o, 2))  resume(op.perform(o)) } } }\n\
+             pub fn main() -> Int { handle { rec(fn() { put(\"a\")  let b = none()  roll(6) + (if b { 1 } else { 0 }) }) } with { W.roll(s) -> resume(s)  W.put(s) -> resume(Unit)  W.none() -> resume(True) } }\n",
+        )
+        .expect("expands");
+        let reps: Vec<&CoreFn> = m.fns.iter().filter(|f| f.name.starts_with("rep")).collect();
+        assert_eq!(
+            reps.len(),
+            3,
+            "{:?}",
+            reps.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        for f in &reps {
+            assert!(calls(&f.body, &f.name), "{} does not call itself", f.name);
+        }
+        let mut takes_op = BTreeSet::new();
+        for f in &m.fns {
+            if f.params.iter().any(|p| is_op_ty(&p.ty)) {
+                takes_op.insert(f.name.clone());
+            }
+        }
+        assert!(
+            takes_op.is_empty(),
+            "still taking an operation: {takes_op:?}"
+        );
     }
 }
