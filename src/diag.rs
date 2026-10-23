@@ -1,7 +1,7 @@
 //! Structured diagnostics and human-readable rendering.
 
 use crate::span::{SourceMap, Span};
-use ariadne::{Color, Label as AriadneLabel, Report, ReportKind, Source};
+use ariadne::{sources, Color, Label as AriadneLabel, Report, ReportKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -65,19 +65,35 @@ impl Diagnostic {
 /// this output; this is for humans.
 pub fn render(diags: &[Diagnostic], src: &SourceMap) -> String {
     let mut buf = Vec::new();
-    let id = src.name();
+    // Each label in its own file, at its offset within that file (modules part 1
+    // D5); a single-file program has one file at base 0.
+    let at = |offset: u32| {
+        let (name, _, base) = src.file_of(offset);
+        (name.to_string(), (offset - base) as usize)
+    };
+    // Built once: every file's text, by name.
+    let mut cache = sources(
+        src.files()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect::<Vec<_>>(),
+    );
     for d in diags {
         let kind = match d.severity {
             Severity::Error => ReportKind::Error,
             Severity::Warning => ReportKind::Warning,
         };
-        let offset = d.labels.first().map(|l| l.span.start as usize).unwrap_or(0);
+        let (id, offset) = match d.labels.first() {
+            Some(l) => at(l.span.start),
+            None => (src.name().to_string(), 0),
+        };
         let mut report = Report::build(kind, id, offset)
             .with_code(&d.code)
             .with_message(&d.message);
         for l in &d.labels {
+            let (file, start) = at(l.span.start);
+            let len = l.span.end.saturating_sub(l.span.start) as usize;
             report = report.with_label(
-                AriadneLabel::new((id, l.span.start as usize..l.span.end as usize))
+                AriadneLabel::new((file, start..start + len))
                     .with_message(&l.message)
                     .with_color(Color::Red),
             );
@@ -85,9 +101,7 @@ pub fn render(diags: &[Diagnostic], src: &SourceMap) -> String {
         for h in &d.helps {
             report = report.with_help(h);
         }
-        let _ = report
-            .finish()
-            .write((id, Source::from(src.text())), &mut buf);
+        let _ = report.finish().write(&mut cache, &mut buf);
     }
     String::from_utf8_lossy(&buf).into_owned()
 }

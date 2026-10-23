@@ -1,6 +1,6 @@
 # Modules, part 1: a program in more than one file
 
-**Status:** in progress (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF
+**Status:** done (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF
 step 1. The design choices are Claude's under the maintainer's delegation (rule 2),
 recorded here. ROADMAP priority 2 (capabilities per dependency) needs this first;
 the effect allow-list at the import boundary is part 2.
@@ -128,3 +128,54 @@ How names work after the parser (read from the code):
 - Negative controls (in `modules.rs`'s header): the rename skipping shadowing (a
   local named like a module function), visibility off (E0605 never), the `pub`
   check off, the span base at 0 for every file (diagnostics in the wrong file).
+
+## 3. Results
+
+Gate: **1184 passed, 113 suites** (predicted 1174 before the review; the review
+added five root tests, ten in both configurations). The thirteen `modules.rs`
+tests were red first against a stub `load` (the root alone) as the plan
+predicted; the CLI tests were red against the previous `main.rs` (E0600: the
+text entry points read no file). Controls K1-K4 are in `modules.rs`'s header,
+each failing one distinct test.
+
+### The review (2026-10-23)
+
+An independent review built the old and new CLI and compared `check`, `run`,
+`run --value` and `build` on every example and UI program (byte-identical), and
+ran about 25 multi-file cases on both sides (shadowing by every binder kind,
+recursion, generic and effect-polymorphic functions across files, user modules
+named `io` or `time` under an alias, diamonds, `with any` across files, record and
+replay, runtime errors and warnings drawn in the module's file). Findings, fixed
+test-first (`modules.rs`, "the review"):
+
+- **R1, medium-high: one owner map for four name spaces.** A root type `Ping`
+  and a module's effect `Ping` (or a constructor `Box` and a type `Box`) gave a
+  false E0605. Owners are keyed by kind now; each use looks in its own kind.
+- **R2, medium: E0205 was bypassed in a module.** Its function named like an
+  operation was renamed (`util.ask`) out of resolve's sight, and its calls then
+  called the function instead of performing: 84 where the root gives E0205. The
+  merge checks every module's function names against the operations.
+- **R3, low-medium: a second E0201 after E0600, E0601, E0602 or E0603.** E0602
+  now continues with the (existing) function; E0603 and references through a
+  failed import are recorded, and resolve's diagnostic on the same span dropped.
+- **R4, low (older cause): an error at a module's end of file lost its place**
+  (the parser's end-of-file span was offset 0, the root's first byte). It is the
+  file's own end now.
+- **R5, low: messages.** `import elya/io as x` is E0604 ("keeps its name `io`");
+  a root type used from a module says the root cannot be imported (the old help
+  suggested `import main`, a cycle).
+- Also fixed: `render` builds its source cache once, not per diagnostic; a root
+  file without `.elya` is no module path (it could be mistaken for `prog.elya`);
+  an import's span covers its effect list.
+- Not fixed, recorded in HANDOFF: E0209 across files labels only the second
+  declaration; an unreadable module file is reported as missing. Older, outside
+  this slice: a truncated declaration at the end of a file (`pub fn g(`) passes
+  `check` and is dropped; a label after non-ASCII text is dropped by the renderer
+  (byte offsets where `ariadne` counts characters).
+
+The sweep is unchanged by construction (no corpus program imports a user module;
+`a_single_file_program_is_unchanged` pins the module for every example).
+
+Windows: the native symbols of module functions contain `.` (`elya.util.twice`),
+like the compiler's own (`.lambda.N`); the Windows gate should confirm the linker
+accepts them.

@@ -11,6 +11,9 @@ struct Parser<'a> {
     tokens: &'a [Token],
     /// The source, for the layout rule: whether a newline separates two tokens.
     text: &'a str,
+    /// The file's first offset in the program's span space (modules part 1 D5):
+    /// spans are `base + offset in text`.
+    base: u32,
     pos: usize,
     diags: Vec<Diagnostic>,
     /// Inside braces (a block, `match` arms, a handler's clauses) a newline before
@@ -24,10 +27,11 @@ struct Parser<'a> {
 const INT_MAX_MAGNITUDE: u128 = i64::MAX as u128;
 
 impl<'a> Parser<'a> {
-    fn new(tokens: &'a [Token], text: &'a str) -> Parser<'a> {
+    fn new(tokens: &'a [Token], text: &'a str, base: u32) -> Parser<'a> {
         Parser {
             tokens,
             text,
+            base,
             pos: 0,
             diags: Vec::new(),
             braces: true,
@@ -50,11 +54,16 @@ impl<'a> Parser<'a> {
         if pos == 0 || pos >= self.tokens.len() {
             return false;
         }
-        let from = self.tokens[pos - 1].span.end as usize;
-        let to = self.tokens[pos].span.start as usize;
-        self.text
-            .get(from..to)
-            .is_some_and(|gap| gap.contains('\n'))
+        let from = self.tokens[pos - 1].span.end;
+        let to = self.tokens[pos].span.start;
+        self.source(from, to).is_some_and(|gap| gap.contains('\n'))
+    }
+
+    /// The source text between two span offsets of this file.
+    fn source(&self, from: u32, to: u32) -> Option<&'a str> {
+        let from = from.checked_sub(self.base)? as usize;
+        let to = to.checked_sub(self.base)? as usize;
+        self.text.get(from..to)
     }
 
     /// A `-` at `pos` written against the token after it (`-x`, `-1`): the prefix
@@ -69,10 +78,7 @@ impl<'a> Parser<'a> {
     /// E0101 at the operator starting this line (D4).
     fn layout_error(&mut self) {
         let at = self.peek_span();
-        let text = self
-            .text
-            .get(at.start as usize..at.end as usize)
-            .unwrap_or("");
+        let text = self.source(at.start, at.end).unwrap_or("");
         self.diags.push(
             Diagnostic::error(
                 "E0101",
@@ -114,10 +120,14 @@ impl<'a> Parser<'a> {
     }
 
     fn peek_span(&self) -> Span {
+        // At the end of the file: an empty span there, in this file (it was
+        // offset 0, which in a program of several files is the root's first
+        // byte; the modules review's R4).
+        let eof = self.base + self.text.len() as u32;
         self.tokens
             .get(self.pos)
             .map(|t| t.span)
-            .unwrap_or(Span::EMPTY)
+            .unwrap_or(Span::new(eof, eof))
     }
 
     fn bump(&mut self) -> Option<&Token> {
@@ -1112,24 +1122,65 @@ impl<'a> Parser<'a> {
         let start = self.peek_span();
         self.bump(); // import
         let mut path = Vec::new();
+        let mut end;
         loop {
             let seg_span = self.peek_span();
             match self.peek()?.clone() {
                 TokenKind::Lower(seg) => {
                     self.bump();
                     path.push(seg);
+                    end = seg_span;
                 }
                 _ => {
                     self.error(seg_span, "expected module path segment");
                     return None;
                 }
             }
-            if !self.eat(&TokenKind::Slash) {
+            // `/ {` starts the effect allow-list, not another segment.
+            let list_next = matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::LBrace)
+            );
+            if self.peek() != Some(&TokenKind::Slash) || list_next {
                 break;
             }
+            self.bump(); // '/'
         }
-        let end = self.peek_span();
-        Some(spanned(Import { path, alias: None }, start.merge(end)))
+        // `as` is contextual: a keyword only here (modules part 1 D2).
+        let mut alias = None;
+        if matches!(self.peek(), Some(TokenKind::Lower(n)) if n == "as") {
+            self.bump();
+            let at = self.peek_span();
+            match self.peek().cloned() {
+                Some(TokenKind::Lower(n)) => {
+                    self.bump();
+                    alias = Some(n);
+                    end = at;
+                }
+                _ => {
+                    self.error(at, "expected a name after `as`");
+                    return None;
+                }
+            }
+        }
+        let mut effects = None;
+        if self.eat(&TokenKind::Slash) {
+            let list_start = self.peek_span();
+            let row = self.effect_row();
+            end = end.merge(list_start);
+            if let Some(last) = row.last() {
+                end = end.merge(last.span);
+            }
+            effects = Some(row);
+        }
+        Some(spanned(
+            Import {
+                path,
+                alias,
+                effects,
+            },
+            start.merge(end),
+        ))
     }
 
     fn fn_decl(&mut self, is_pub: bool) -> Option<Spanned<Decl>> {
@@ -1393,15 +1444,21 @@ fn infix_bp(kind: &TokenKind) -> Option<(u8, u8, BinOp)> {
 /// Test/convenience entry: parse a single expression from source text.
 pub fn parse_expr_str(session: &Session, text: &str) -> (Option<Spanned<Expr>>, Vec<Diagnostic>) {
     let (tokens, mut diags) = lex(session, text);
-    let mut p = Parser::new(&tokens, text);
+    let mut p = Parser::new(&tokens, text, 0);
     let e = p.expr(0);
     diags.append(&mut p.diags);
     (e, diags)
 }
 
 pub fn parse_module(session: &Session, text: &str) -> (Module, Vec<Diagnostic>) {
-    let (tokens, mut diags) = lex(session, text);
-    let mut p = Parser::new(&tokens, text);
+    parse_module_at(session, text, 0)
+}
+
+/// [`parse_module`] for a file whose spans start at `base` in the program's span
+/// space (modules part 1 D5).
+pub fn parse_module_at(session: &Session, text: &str, base: u32) -> (Module, Vec<Diagnostic>) {
+    let (tokens, mut diags) = crate::lex::lex_at(session, text, base);
+    let mut p = Parser::new(&tokens, text, base);
     let m = p.module();
     diags.append(&mut p.diags);
     (m, diags)

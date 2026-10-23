@@ -1,5 +1,20 @@
 use std::process::ExitCode;
 
+/// Reads the program's imports from disk: module `a/b` is the file `a/b.elya` in
+/// the program's directory (spec 2026-10-23-elya-modules-part-1 D1, D7).
+fn files(program: &str) -> impl FnMut(&str) -> Option<(String, String)> {
+    let dir = std::path::Path::new(program)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    move |module: &str| {
+        let file = dir.join(format!("{module}.elya"));
+        std::fs::read_to_string(&file)
+            .ok()
+            .map(|text| (file.display().to_string(), text))
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -44,7 +59,7 @@ fn cmd(args: &[String], run: bool) -> ExitCode {
     };
     if run {
         // D1: the output a failing run produced is printed before its error.
-        let o = elya::run_source_outcome(path, &text);
+        let o = elya::run_source_outcome_with(path, &text, &mut files(path));
         print!("{}", o.output);
         match o.error {
             None => {
@@ -57,7 +72,7 @@ fn cmd(args: &[String], run: bool) -> ExitCode {
             }
         }
     } else {
-        match elya::check_source(path, &text) {
+        match elya::check_source_with(path, &text, &mut files(path)) {
             Ok(()) => {
                 surface_warnings(path, &text);
                 println!("ok");
@@ -86,7 +101,7 @@ fn value_cmd(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let o = elya::run_source_outcome(path, &text);
+    let o = elya::run_source_outcome_with(path, &text, &mut files(path));
     print!("{}", o.output);
     if let Some(diags) = o.error {
         eprint!("{diags}");
@@ -109,7 +124,7 @@ fn value_cmd(args: &[String]) -> ExitCode {
 /// On a successful compile, render any non-fatal warnings (e.g. `E0426`,
 /// `E0431`) to stderr so the lint still reaches the user.
 fn surface_warnings(path: &str, text: &str) {
-    if let Some(warns) = elya::warnings(path, text) {
+    if let Some(warns) = elya::warnings_with(path, text, &mut files(path)) {
         eprint!("{warns}");
     }
 }
@@ -141,20 +156,17 @@ fn build_cmd(args: &[String]) -> ExitCode {
     };
 
     // Front end first: a program that does not `check` never reaches codegen.
-    if let Err(diags) = elya::check_source(path, &text) {
+    if let Err(diags) = elya::check_source_with(path, &text, &mut files(path)) {
         eprint!("{diags}");
         return ExitCode::FAILURE;
     }
     surface_warnings(path, &text);
 
-    // `check_source` has already passed, so parse and inference cannot fail here;
-    // the backend needs the typed table, which the convenience API does not return.
+    // The check has passed, so loading and inference cannot fail here; the
+    // backend needs the merged module and the typed table, which the convenience
+    // API does not return.
     let session = elya::Session::new();
-    let (module, pd) = elya::parse::parse_module(&session, &text);
-    debug_assert!(
-        pd.is_empty(),
-        "check_source passed but parse failed: {pd:?}"
-    );
+    let (module, _, _) = elya::front_end_with(path, &text, &mut files(path));
     let (diags, table) = elya::types::infer_typed_table(&session, &module);
     // Warnings (E0426, E0431) are expected here: `check_source` passed them
     // through (the 2026-10-16 sweep found this asserting no diagnostics at all).
@@ -222,7 +234,7 @@ fn trace_cmd(args: &[String]) -> ExitCode {
     // Spec 2026-10-23-elya-traced-run-output D1: the program's output on stdout,
     // failing or not, then the error on stderr, as `elya run` and a native binary.
     let o = if flag == "--record" {
-        let (log, o) = elya::record_source(path, &text);
+        let (log, o) = elya::record_source_with(path, &text, &mut files(path));
         // Written even when the run fails: that run is the one to replay.
         if let Some(log) = log {
             if let Err(e) = std::fs::write(trace, log) {
@@ -233,7 +245,7 @@ fn trace_cmd(args: &[String]) -> ExitCode {
         o
     } else {
         match std::fs::read_to_string(trace) {
-            Ok(log) => elya::replay_source(path, &text, &log),
+            Ok(log) => elya::replay_source_with(path, &text, &log, &mut files(path)),
             Err(e) => {
                 eprintln!("error: cannot read {trace}: {e}");
                 return ExitCode::from(2);

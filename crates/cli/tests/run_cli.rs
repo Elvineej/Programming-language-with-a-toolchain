@@ -205,3 +205,40 @@ fn a_failing_replayed_run_keeps_its_output_on_stdout() {
     assert!(String::from_utf8_lossy(&div.stderr).contains("replay diverged"));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Modules part 1 (2026-10-23, spec `2026-10-23-elya-modules-part-1-design.md`
+/// D1, D7): the CLI reads a program's imports from the files next to it.
+#[test]
+fn elya_run_reads_imported_files() {
+    let dir = scratch("modules");
+    std::fs::create_dir_all(dir.join("lib")).expect("lib dir");
+    std::fs::write(
+        dir.join("lib/util.elya"),
+        "pub fn twice(x: Int) -> Int { x * 2 }\n",
+    )
+    .expect("write module");
+    let prog = dir.join("main.elya");
+    std::fs::write(
+        &prog,
+        "import lib/util\npub fn main() { io.println(int.to_string(util.twice(21))) }\n",
+    )
+    .expect("write program");
+    let run = elya_run(&[prog.as_os_str()]);
+    assert!(run.status.success(), "{run:?}");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "42\n");
+    // A broken module is reported in its own file.
+    std::fs::write(
+        dir.join("lib/util.elya"),
+        "pub fn twice(x: Int) -> Int { True }\n",
+    )
+    .expect("write module");
+    let check = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .arg("check")
+        .arg(&prog)
+        .output()
+        .expect("spawn elya check");
+    assert_eq!(check.status.code(), Some(1), "{check:?}");
+    let err = String::from_utf8_lossy(&check.stderr);
+    assert!(err.contains("util.elya:1:"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}

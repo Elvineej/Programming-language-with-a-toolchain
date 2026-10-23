@@ -8,6 +8,7 @@ pub mod eval;
 pub mod exhaust;
 pub mod lex;
 pub mod literal;
+pub mod modules;
 pub mod parse;
 pub mod resolve;
 pub mod span;
@@ -26,28 +27,46 @@ impl Session {
     }
 }
 
-/// The front-end passes (parse → resolve → infer → exhaustiveness), returning the
-/// module and all diagnostics. Exhaustiveness runs only on an error-free program;
-/// warnings never block a later pass.
-fn front_end(session: &Session, text: &str) -> (ast::Module, Vec<Diagnostic>) {
-    let (module, mut diags) = parse::parse_module(session, text);
-    diags.extend(resolve::check(session, &module));
+/// Reads no file: the text entry points see one file, and a user import there is
+/// E0600 (spec 2026-10-23-elya-modules-part-1 D7).
+fn no_files(_: &str) -> Option<(String, String)> {
+    None
+}
+
+/// The front-end passes over a whole program (load and merge the modules, then
+/// resolve → infer → exhaustiveness), returning the merged module, all
+/// diagnostics and the program's sources. The root and the modules it imports are
+/// read by `read` (spec 2026-10-23-elya-modules-part-1 D7). Exhaustiveness runs
+/// only on an error-free program; warnings never block a later pass.
+pub fn front_end_with(
+    name: &str,
+    text: &str,
+    read: &mut modules::Reader,
+) -> (ast::Module, Vec<Diagnostic>, SourceMap) {
+    let session = Session::new();
+    let (program, mut diags) = modules::load(&session, name, text, read);
+    let module = program.module;
+    // A name a module diagnostic already refused is not reported again (the
+    // modules review's R3: E0201 "unknown builtin" after E0600 or E0603).
+    diags.extend(resolve::check(&session, &module).into_iter().filter(|d| {
+        !d.labels
+            .first()
+            .is_some_and(|l| program.refused.contains(&l.span))
+    }));
     if diags.is_empty() {
-        let (idiags, affine_sites) = types::infer_with_sites(session, &module);
+        let (idiags, affine_sites) = types::infer_with_sites(&session, &module);
         diags.extend(idiags);
         if !diags.iter().any(|d| d.severity == Severity::Error) {
             diags.extend(exhaust::check(&module));
             diags.extend(affine::check(&module, &affine_sites));
         }
     }
-    (module, diags)
+    (module, diags, program.sources)
 }
 
 /// Full pipeline: returns program output, or rendered diagnostics on failure.
 pub fn run_source(name: &str, text: &str) -> Result<String, String> {
-    let session = Session::new();
-    let sm = SourceMap::new(name, text);
-    let (module, diags) = front_end(&session, text);
+    let (module, diags, sm) = front_end_with(name, text, &mut no_files);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
         return Err(rendered);
     }
@@ -69,9 +88,12 @@ pub struct RunOutcome {
 }
 
 pub fn run_source_outcome(name: &str, text: &str) -> RunOutcome {
-    let session = Session::new();
-    let sm = SourceMap::new(name, text);
-    let (module, diags) = front_end(&session, text);
+    run_source_outcome_with(name, text, &mut no_files)
+}
+
+/// [`run_source_outcome`] over a whole program (modules part 1 D7).
+pub fn run_source_outcome_with(name: &str, text: &str, read: &mut modules::Reader) -> RunOutcome {
+    let (module, diags, sm) = front_end_with(name, text, read);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
         return RunOutcome::refused(rendered);
     }
@@ -126,9 +148,16 @@ const TRACE_HEADER: &str = "elya trace 1";
 /// (`None`). The outcome keeps the program's output apart from its error (spec
 /// 2026-10-23-elya-traced-run-output D1).
 pub fn record_source(name: &str, text: &str) -> (Option<String>, RunOutcome) {
-    let session = Session::new();
-    let sm = SourceMap::new(name, text);
-    let (module, diags) = front_end(&session, text);
+    record_source_with(name, text, &mut no_files)
+}
+
+/// [`record_source`] over a whole program (modules part 1 D7).
+pub fn record_source_with(
+    name: &str,
+    text: &str,
+    read: &mut modules::Reader,
+) -> (Option<String>, RunOutcome) {
+    let (module, diags, sm) = front_end_with(name, text, read);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
         return (None, RunOutcome::refused(rendered));
     }
@@ -159,6 +188,16 @@ pub fn run_source_recording(name: &str, text: &str) -> (Option<String>, Result<S
 /// read with surrounding whitespace (and a leading byte-order mark) ignored. A
 /// trace that cannot be read runs nothing.
 pub fn replay_source(name: &str, text: &str, trace: &str) -> RunOutcome {
+    replay_source_with(name, text, trace, &mut no_files)
+}
+
+/// [`replay_source`] over a whole program (modules part 1 D7).
+pub fn replay_source_with(
+    name: &str,
+    text: &str,
+    trace: &str,
+    read: &mut modules::Reader,
+) -> RunOutcome {
     let trace = trace.strip_prefix('\u{feff}').unwrap_or(trace);
     let mut lines = trace.lines();
     if lines.next().map(str::trim) != Some(TRACE_HEADER) {
@@ -182,9 +221,7 @@ pub fn replay_source(name: &str, text: &str, trace: &str) -> RunOutcome {
         };
         entries.push((q.trim().to_string(), a.trim().to_string()));
     }
-    let session = Session::new();
-    let sm = SourceMap::new(name, text);
-    let (module, diags) = front_end(&session, text);
+    let (module, diags, sm) = front_end_with(name, text, read);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
         return RunOutcome::refused(rendered);
     }
@@ -205,9 +242,12 @@ pub fn run_source_replaying(name: &str, text: &str, trace: &str) -> Result<Strin
 
 /// Front-end only (no execution).
 pub fn check_source(name: &str, text: &str) -> Result<(), String> {
-    let session = Session::new();
-    let sm = SourceMap::new(name, text);
-    let (_module, diags) = front_end(&session, text);
+    check_source_with(name, text, &mut no_files)
+}
+
+/// [`check_source`] over a whole program (modules part 1 D7).
+pub fn check_source_with(name: &str, text: &str, read: &mut modules::Reader) -> Result<(), String> {
+    let (_module, diags, sm) = front_end_with(name, text, read);
     match fail_if_errors(&diags, &sm) {
         Some(rendered) => Err(rendered),
         None => Ok(()),
@@ -218,9 +258,12 @@ pub fn check_source(name: &str, text: &str) -> Result<(), String> {
 /// CLI surfaces these on a *successful* compile (the spec §11 obligation) so an
 /// `E0426`/`E0431` lint reaches the user even though it does not fail the build.
 pub fn warnings(name: &str, text: &str) -> Option<String> {
-    let session = Session::new();
-    let sm = SourceMap::new(name, text);
-    let (_module, diags) = front_end(&session, text);
+    warnings_with(name, text, &mut no_files)
+}
+
+/// [`warnings`] over a whole program (modules part 1 D7).
+pub fn warnings_with(name: &str, text: &str, read: &mut modules::Reader) -> Option<String> {
+    let (_module, diags, sm) = front_end_with(name, text, read);
     let warns: Vec<Diagnostic> = diags
         .into_iter()
         .filter(|d| d.severity == Severity::Warning)

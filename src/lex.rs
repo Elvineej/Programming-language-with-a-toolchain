@@ -169,13 +169,19 @@ pub struct Token {
     pub span: Span,
 }
 
-pub fn lex(_session: &Session, text: &str) -> (Vec<Token>, Vec<Diagnostic>) {
+pub fn lex(session: &Session, text: &str) -> (Vec<Token>, Vec<Diagnostic>) {
+    lex_at(session, text, 0)
+}
+
+/// [`lex`] with every span shifted by `base` (a file's first offset in the
+/// program's span space, modules part 1 D5).
+pub fn lex_at(_session: &Session, text: &str, base: u32) -> (Vec<Token>, Vec<Diagnostic>) {
     let mut tokens = Vec::new();
     let mut diags = Vec::new();
     let mut lexer = TokenKind::lexer(text);
     while let Some(result) = lexer.next() {
         let range = lexer.span();
-        let span = Span::new(range.start as u32, range.end as u32);
+        let span = Span::new(base + range.start as u32, base + range.end as u32);
         match result {
             Ok(kind) => tokens.push(Token { kind, span }),
             Err(()) => diags.push(

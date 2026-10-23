@@ -230,3 +230,32 @@ fn a_traced_run_prints_what_the_native_binary_prints() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Modules part 1 (spec `2026-10-23-elya-modules-part-1-design.md` D7): `elya
+/// build` reads a program's imports, and the binary prints what `elya run` does.
+#[test]
+fn elya_build_reads_imported_files() {
+    let dir = temp_dir("modules");
+    std::fs::write(
+        dir.join("util.elya"),
+        "fn helper() -> Int { 2 }\npub fn twice(x: Int) -> Int { x * helper() }\n",
+    )
+    .unwrap();
+    let prog = dir.join("main.elya");
+    std::fs::write(
+        &prog,
+        "import util\nfn helper() -> Int { 1 }\npub fn main() -> Int { io.println(\"go\")  util.twice(20) + helper() }\n",
+    )
+    .unwrap();
+    let exe = dir.join(format!("main{}", std::env::consts::EXE_SUFFIX));
+    elya_build(&[prog.as_os_str(), "-o".as_ref(), exe.as_os_str()]);
+    let native = Command::new(&exe).output().expect("run the binary");
+    assert!(native.status.success(), "{native:?}");
+    assert_eq!(String::from_utf8_lossy(&native.stdout), "go\n41\n");
+    let run = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .args(["run".as_ref(), "--value".as_ref(), prog.as_os_str()])
+        .output()
+        .expect("spawn elya run --value");
+    assert_eq!(run.stdout, native.stdout);
+    std::fs::remove_dir_all(&dir).ok();
+}
