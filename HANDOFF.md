@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1193 passed, 116 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1198 passed, 117 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
@@ -475,20 +475,32 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   sides; a static check would be partial. Runtime type witnesses are the recorded
   way forward, with modules part 2.
 
+- **Upcasts through data, natively** (2026-10-23, branch `auto/elya`, scheduled
+  runs): spec `docs/superpowers/specs/2026-10-23-elya-row-tails-in-data-design.md`.
+  - A pure closure inside data used where data of an effectful one is expected:
+    natively a pointer or "match failed" before (five measured programs).
+  - D1: `anf`'s wrapper binds the own result's free row variables from the use.
+  - D2: `specialize` rebuilds the data (`$coerce.T.k`, one pure function per
+    pair of instances, a match per constructor, fields coerced).
+  - D3: `conv_eq` compares data names, so the guard names what D2 misses.
+  - D4 (the review's F1): a non-regular type is refused by name (the first
+    version overflowed the compiler's stack).
+  - Needs nothing special on Windows (Core passes only).
+
 ## The next five steps
 
-### 1. A row variable inside data in a function's own result, natively
+### 1. A wrapped function whose own result shares a row with a parameter
 
-A native wrong value the 2026-10-23 review found (older than it). A top-level
-function whose own result has a row variable INSIDE DATA
-(`fn mko() -> fn() -> Option(fn() -> Int)`), used where
-`fn() -> fn() / {E} -> Option(fn() / {E} -> Int)` is expected, prints a pointer for
-15. `mono::match_tys` never binds a row tail, so `anf`'s wrapper never sees a ground
-own result (spec 2026-10-23-elya-scope-captures-and-wrapper-results §3 F2). Measure
-the family first (data of functions, nested data, generic data at a user effect),
-then decide in a spec whether `match_tys` binds row tails or the wrapper coerces
-data by its type; if neither fits soon, refuse the shape by name natively so no
-wrong value is left.
+A native wrong value the 2026-10-23 upcasts-through-data review found (F2, older
+than that slice). `fn mko(k: fn() -> Int) -> fn() -> fn() -> Int { fn() { k } }`
+used as a value at `fn(fn() / {E} -> Int) -> fn() / {E} -> fn() / {E} -> Int`
+prints a pointer natively, 16 in the evaluator; also with an `Option(...)`
+result and through `let g: T = mko`. `anf::inner_type`'s D1 binds only own-result
+row variables that no parameter mentions, so here the use's result types the
+call. Measure the family (one and two layers, data, the parameter used and
+unused), then decide in a spec: bind such a variable from the use's PARAMETER
+position (the reference instantiates it there; `specialize` clones `mko`), or
+refuse the shape by name, so no wrong value is left.
 
 ### 2. Parser error recovery inside a body
 
