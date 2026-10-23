@@ -332,37 +332,67 @@ int64_t elya_str_eq(void *a, void *b) {
  * string compares its length and bytes. An explicit worklist of pairs, never
  * recursion, so two long lists compare in flat host stack. Allocates nothing
  * from the collector, so nothing needs rooting across it. The type checker
- * (E0436) keeps functions and continuations out. */
-int64_t elya_eq(void *a, void *b, int64_t string_tag) {
-    int64_t **work = NULL;
+ * (E0436) keeps functions and continuations out of declared data, but not
+ * out of an operation's arguments (an operation value is data to the checker,
+ * and its arguments are checked at run time): a closure, a tag in
+ * [first_closure_tag, string_tag), stops the walk with the evaluator's words
+ * where the evaluator's walk would reach it (spec
+ * 2026-10-23-elya-operation-values-natively, the review's F1). */
+int64_t elya_eq(void *a, void *b, int64_t string_tag, int64_t first_closure_tag) {
+    /* Triples: the two words and whether they are heap values (1) or plain
+     * words (0). Fields are pushed in order and popped last first, the
+     * evaluator's order, so the first difference or function reached is the
+     * evaluator's too (a word field no longer decides before its later heap
+     * siblings are walked: the review's F1). */
+    int64_t *work = NULL;
     int64_t top = 0, cap = 0;
     int64_t equal = 1;
-#define EQ_PUSH(x, y)                                                                  \
+#define EQ_PUSH(x, y, heap)                                                            \
     do {                                                                               \
-        if (top + 2 > cap) {                                                           \
-            cap = cap ? cap * 2 : 64;                                                  \
-            int64_t **grown = (int64_t **)realloc(work, (size_t)cap * sizeof *work);   \
+        if (top + 3 > cap) {                                                           \
+            cap = cap ? cap * 2 : 96;                                                  \
+            int64_t *grown = (int64_t *)realloc(work, (size_t)cap * sizeof *work);     \
             if (!grown) {                                                              \
                 fputs("elya: out of memory comparing values\n", stderr);               \
                 exit(1);                                                               \
             }                                                                          \
             work = grown;                                                              \
         }                                                                              \
-        work[top++] = (int64_t *)(x);                                                  \
-        work[top++] = (int64_t *)(y);                                                  \
+        work[top++] = (int64_t)(x);                                                    \
+        work[top++] = (int64_t)(y);                                                    \
+        work[top++] = (heap);                                                          \
     } while (0)
-    EQ_PUSH(a, b);
+    EQ_PUSH((intptr_t)a, (intptr_t)b, 1);
     while (top > 0) {
-        int64_t *y = work[--top];
-        int64_t *x = work[--top];
+        int64_t heap = work[--top];
+        int64_t yw = work[--top];
+        int64_t xw = work[--top];
+        if (!heap) {
+            if (xw != yw) {
+                equal = 0;
+                break;
+            }
+            continue;
+        }
+        int64_t *x = (int64_t *)(intptr_t)xw;
+        int64_t *y = (int64_t *)(intptr_t)yw;
         /* No shortcut for one shared object: whether two values are shared
          * must never decide `==` (a NaN field, once floats compile natively,
          * is not equal to itself), and the evaluator takes none. */
-        if (!x || !y || x[0] != y[0]) {
+        if (!x || !y) {
             equal = 0;
             break;
         }
         int64_t tag = x[0];
+        if (tag >= first_closure_tag && tag < string_tag) {
+            fputs("elya: `==` reached a value that is not data (E0436 should have rejected it)\n",
+                  stderr);
+            exit(1);
+        }
+        if (x[0] != y[0]) {
+            equal = 0;
+            break;
+        }
         if (tag == string_tag) {
             if (x[1] != y[1] || memcmp(&x[2], &y[2], (size_t)x[1]) != 0) {
                 equal = 0;
@@ -377,15 +407,7 @@ int64_t elya_eq(void *a, void *b, int64_t string_tag) {
         int64_t arity = gc_descriptors[2 * tag];
         int64_t mask = gc_descriptors[2 * tag + 1];
         for (int64_t f = 0; f < arity; f++) {
-            if ((mask >> f) & 1) {
-                EQ_PUSH((intptr_t)x[1 + f], (intptr_t)y[1 + f]);
-            } else if (x[1 + f] != y[1 + f]) {
-                equal = 0;
-                break;
-            }
-        }
-        if (!equal) {
-            break;
+            EQ_PUSH(x[1 + f], y[1 + f], (mask >> f) & 1);
         }
     }
 #undef EQ_PUSH

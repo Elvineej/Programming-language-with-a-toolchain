@@ -52,3 +52,8 @@ first row).
   bound in reverse: test 1's `op.show` of a two-argument operation differs), K3 (no
   rewrite in clones: tests 1-6 fail at build, "op builtin" on a non-operation) each fail
   a distinct test.
+
+## Outcome
+
+Gate 1115 / 107: the six planned tests (1112 as predicted), then three from the
+review (spec §3).

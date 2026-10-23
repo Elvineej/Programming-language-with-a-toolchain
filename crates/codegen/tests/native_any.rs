@@ -442,16 +442,9 @@ fn nested_and_local_any_handlers() {
 
 #[test]
 fn what_is_not_compiled_is_refused_by_name() {
-    // An operation value given to a function (spec D2).
-    let src = "effect W { fn roll(s: Int) -> Int }\n\
-        fn describe(o) { op.show(o) }\n\
-        fn rec(body) { handle { body() } with any { op(o) -> { io.println(describe(o))  resume(op.perform(o)) } } }\n\
-        pub fn main() -> Int { handle { rec(fn() { roll(6) }) } with { W.roll(s) -> resume(s) } }\n";
-    let e = refusal(src);
-    assert!(
-        e.contains("operation value used other than by op.* or =="),
-        "{e}"
-    );
+    // An operation value given to a function was refused here (spec D2) until
+    // 2026-10-23; it runs now, a row of `native_op_values.rs` (spec
+    // 2026-10-23-elya-operation-values-natively D3).
     // A decode at a non-regular type has no finite set of instances (spec D5).
     let src = "type Opt(a) { No, Yes(a) }\n\
         type Nest(a) { Z(a), S(Nest(Opt(a))) }\n\

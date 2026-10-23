@@ -8,9 +8,12 @@
 //! - **D1.** The handle becomes a plain one with a clause per operation of every
 //!   handled label but `IO`; each clause is a copy of the generic clause with the
 //!   rigid answer type replaced by the operation's.
-//! - **D2.** The operation value is gone: in a copy the operation is known, so
-//!   `op.*` and `==` on the binder are rewritten over the clause's parameters.
-//!   Any other use of the binder is refused by name.
+//! - **D2, revised 2026-10-23** (spec
+//!   `2026-10-23-elya-operation-values-natively-design.md`): in a copy the
+//!   operation is known, so `o` is a value of a synthesized one-constructor type
+//!   per operation instance, holding its arguments. Functions over it are cloned
+//!   per operation, and `op.*` and `==` on any value of such a type are rewritten
+//!   over its fields, wherever they occur.
 //! - **D7.** The expansion is one-shot; `is_multi_declared` is stamped from the
 //!   handled operations' declarations.
 //!
@@ -21,8 +24,8 @@ use std::rc::Rc;
 
 use elya::ast::BinOp;
 use elya::core::{
-    CoreArm, CoreClause, CoreEffect, CoreExpr, CoreFn, CoreHandle, CoreKind, CoreLit, CoreModule,
-    CoreOp, CoreParam, CorePat, CorePerform, CoreReturn,
+    CoreArm, CoreClause, CoreCtor, CoreEffect, CoreExpr, CoreFn, CoreHandle, CoreKind, CoreLit,
+    CoreModule, CoreOp, CoreParam, CorePat, CorePerform, CoreReturn, CoreType,
 };
 use elya::span::Span;
 use elya::types::{EffectLabel, EffectRow, RowTail, Ty, TyCon};
@@ -35,9 +38,6 @@ type R<T> = Result<T, CodegenError>;
 /// The builtin effect, never dispatched to a handler (the earlier spec's D2).
 const BUILTIN_EFFECT: &str = "IO";
 
-/// The refusal of D2, by name.
-pub(crate) const OP_VALUE_REFUSAL: &str = "operation value used other than by op.* or ==";
-
 /// Runs the pass over every function.
 pub(crate) fn run(core: &CoreModule) -> R<CoreModule> {
     let mut cx = Cx {
@@ -49,8 +49,16 @@ pub(crate) fn run(core: &CoreModule) -> R<CoreModule> {
             .map(|f| (f.name.clone(), fn_rigids(f)))
             .filter(|(_, r)| !r.is_empty())
             .collect(),
+        op_fns: core
+            .fns
+            .iter()
+            .flat_map(|f| fn_op_rigids(f).into_iter().map(|r| (f.name.clone(), r)))
+            .collect(),
         clones: HashMap::new(),
         queue: Vec::new(),
+        op_names: HashMap::new(),
+        op_info: HashMap::new(),
+        op_types: Vec::new(),
     };
     let mut fns = Vec::with_capacity(core.fns.len());
     for f in &core.fns {
@@ -67,7 +75,7 @@ pub(crate) fn run(core: &CoreModule) -> R<CoreModule> {
     let mut done: Vec<CoreFn> = Vec::new();
     let mut i = 0;
     while i < cx.queue.len() {
-        let (src, rigid, answer, name) = cx.queue[i].clone();
+        let (src, rigid, answer, op_ty, name) = cx.queue[i].clone();
         i += 1;
         let f = fns
             .iter()
@@ -77,7 +85,10 @@ pub(crate) fn run(core: &CoreModule) -> R<CoreModule> {
             .ok_or(CodegenError::Unsupported(
                 "callee is not a top-level function",
             ))?;
-        let ty = |t: &Ty| replace_con(t, &rigid, &answer);
+        // The review's F3: an operation type made inside `f` (a `with any` in it,
+        // already expanded) that mentions `rigid` is made again at `answer`.
+        let renamed = cx.reinstance(&rigid, &op_ty, &answer)?;
+        let ty = |t: &Ty| rename_tys(&subst_op(t, &rigid, &op_ty, &answer), &renamed);
         let row = match ty(&Ty::Fn(
             Vec::new(),
             f.row.clone(),
@@ -87,7 +98,8 @@ pub(crate) fn run(core: &CoreModule) -> R<CoreModule> {
             _ => f.row.clone(),
         };
         let body = map_expr(&f.body, &ty);
-        let body = cx.redirect(&body, &rigid, &answer)?;
+        let body = map_vars_named(&body, &mut |x: &str| renamed.get(x).cloned());
+        let body = cx.redirect(&body, &rigid, &op_ty, &answer)?;
         done.push(CoreFn {
             name,
             params: f
@@ -109,9 +121,37 @@ pub(crate) fn run(core: &CoreModule) -> R<CoreModule> {
     // What is still at a rigid type is unreachable: every reference to it was
     // redirected (a rigid type never leaves its clause, E0435).
     fns.retain(|f| fn_rigids(f).is_empty());
+    // D3 (2026-10-23): `op.*` and `==` on an operation value, in a clause copy or
+    // in a clone, are rewritten over the value's fields.
+    let mut out = Vec::with_capacity(fns.len());
+    for f in &fns {
+        out.push(CoreFn {
+            name: f.name.clone(),
+            params: f.params.clone(),
+            body: cx.ops(&f.body)?,
+            row: f.row.clone(),
+        });
+    }
+    let fns = out;
+    let mut types = core.types.clone();
+    // An operation type at a rigid answer type belonged to a dropped function.
+    types.extend(
+        cx.op_types
+            .iter()
+            .filter(|t| {
+                let mut r = BTreeSet::new();
+                t.ctors[0].fields.iter().for_each(|f| ty_rigids(f, &mut r));
+                if let Some(i) = cx.op_info.get(&t.name) {
+                    ty_rigids(&i.answer, &mut r);
+                    i.label.args.iter().for_each(|a| ty_rigids(a, &mut r));
+                }
+                r.is_empty()
+            })
+            .cloned(),
+    );
     Ok(CoreModule {
         fns,
-        types: core.types.clone(),
+        types,
         generic_types: core.generic_types.clone(),
         effect_params_used: core.effect_params_used.clone(),
         effects: core.effects.clone(),
@@ -139,6 +179,57 @@ fn ty_rigids(t: &Ty, out: &mut BTreeSet<String>) {
     }
 }
 
+/// The rigid answer types whose OPERATION (`$Op(rigid, _)`) a function's
+/// signature mentions: such a function is cloned per operation (spec D2); one
+/// that sees only the answer type is cloned per answer type (the review's F2).
+fn fn_op_rigids(f: &CoreFn) -> BTreeSet<String> {
+    fn go(t: &Ty, out: &mut BTreeSet<String>) {
+        match t {
+            Ty::Con(n, a) => {
+                if n == "$Op" {
+                    if let Some(Ty::Con(r, none)) = a.first() {
+                        if none.is_empty() {
+                            out.insert(r.clone());
+                        }
+                    }
+                }
+                a.iter().for_each(|x| go(x, out));
+            }
+            Ty::Fn(ps, row, r) => {
+                ps.iter().for_each(|p| go(p, out));
+                for l in row.labels.values() {
+                    l.args.iter().for_each(|a| go(a, out));
+                }
+                go(r, out);
+            }
+            Ty::Tuple(a) => a.iter().for_each(|x| go(x, out)),
+            _ => {}
+        }
+    }
+    let mut out = BTreeSet::new();
+    f.params.iter().for_each(|p| go(&p.ty, &mut out));
+    go(&f.body.ty, &mut out);
+    out
+}
+
+/// `t` with each operation type named in `map` renamed.
+fn rename_tys(t: &Ty, map: &HashMap<String, String>) -> Ty {
+    match t {
+        Ty::Con(n, a) if a.is_empty() => match map.get(n) {
+            Some(m) => Ty::Con(m.clone(), Vec::new()),
+            None => t.clone(),
+        },
+        Ty::Con(n, a) => Ty::Con(n.clone(), a.iter().map(|x| rename_tys(x, map)).collect()),
+        Ty::Fn(ps, row, r) => Ty::Fn(
+            ps.iter().map(|p| rename_tys(p, map)).collect(),
+            crate::mono::map_row(row, &|a| rename_tys(a, map)),
+            Box::new(rename_tys(r, map)),
+        ),
+        Ty::Tuple(a) => Ty::Tuple(a.iter().map(|x| rename_tys(x, map)).collect()),
+        other => other.clone(),
+    }
+}
+
 /// The rigid answer types a function's SIGNATURE mentions: a clone `mono::run`
 /// made at one. (A function whose body holds a `with any` clause mentions its
 /// rigid inside, never in its signature, E0435.)
@@ -160,10 +251,31 @@ struct Cx<'a> {
     fresh: usize,
     /// Functions at rigid answer types, and which (R1).
     rigid_fns: HashMap<String, BTreeSet<String>>,
-    /// `(function, rigid, answer)` -> its clone's name (R1).
+    /// `(function, rigid)` pairs whose signature takes the rigid's operation.
+    op_fns: BTreeSet<(String, String)>,
+    /// `(function, rigid, operation type)` -> its clone's name (R1; keyed by the
+    /// operation since 2026-10-23, D2).
     clones: HashMap<(String, String, String), String>,
-    /// Clones to build: `(source, rigid, answer, name)`.
-    queue: Vec<(String, String, Ty, String)>,
+    /// Clones to build: `(source, rigid, answer, operation type, name)`.
+    queue: Vec<(String, String, Ty, Ty, String)>,
+    /// `(E.op, the label instance)` -> its operation type's name (D1).
+    op_names: HashMap<(String, String), String>,
+    /// An operation type's name -> the operation it holds.
+    op_info: HashMap<String, OpInfo>,
+    /// The synthesized operation types, in creation order.
+    op_types: Vec<CoreType>,
+}
+
+/// What an operation type (D1) stands for.
+#[derive(Clone)]
+struct OpInfo {
+    effect: String,
+    /// The operation's index in its effect's declaration.
+    index: usize,
+    label: EffectLabel,
+    answer: Ty,
+    /// The operation's parameter types at the instance: the type's fields.
+    fields: Vec<Ty>,
 }
 
 /// One operation, as a clause copy knows it.
@@ -263,16 +375,22 @@ impl<'a> Cx<'a> {
         Ok(out.into())
     }
 
-    /// R1: every reference to a function at `rigid` goes to its clone at
-    /// `answer`, requested on first use.
-    fn redirect(&mut self, e: &CoreExpr, rigid: &str, answer: &Ty) -> R<CoreExpr> {
+    /// R1: every reference to a function at `rigid` goes to its clone for the
+    /// operation `op_ty` (answering `answer`), requested on first use.
+    fn redirect(&mut self, e: &CoreExpr, rigid: &str, op_ty: &Ty, answer: &Ty) -> R<CoreExpr> {
         let mut err = None;
         let out = map_vars_named(e, &mut |x: &str| {
             let rs = self.rigid_fns.get(x)?;
             if !rs.contains(rigid) {
                 return None;
             }
-            let key = (x.to_string(), rigid.to_string(), format!("{answer:?}"));
+            // D2, narrowed by the review's F2: per operation only when the
+            // function takes it.
+            let key = if self.op_fns.contains(&(x.to_string(), rigid.to_string())) {
+                (x.to_string(), rigid.to_string(), format!("{op_ty:?}"))
+            } else {
+                (x.to_string(), rigid.to_string(), format!("{answer:?}"))
+            };
             if let Some(n) = self.clones.get(&key) {
                 return Some(n.clone());
             }
@@ -280,6 +398,11 @@ impl<'a> Cx<'a> {
             let name = format!("{x}.any.{}", self.fresh);
             let mut left = rs.clone();
             left.remove(rigid);
+            for r in &left {
+                if self.op_fns.contains(&(x.to_string(), r.clone())) {
+                    self.op_fns.insert((name.clone(), r.clone()));
+                }
+            }
             if !left.is_empty() {
                 self.rigid_fns.insert(name.clone(), left);
             }
@@ -288,6 +411,7 @@ impl<'a> Cx<'a> {
                 x.to_string(),
                 rigid.to_string(),
                 answer.clone(),
+                op_ty.clone(),
                 name.clone(),
             ));
             if self.queue.len() > crate::mono::MAX_TYPE_CLONES {
@@ -334,7 +458,7 @@ impl<'a> Cx<'a> {
                 .enumerate()
                 .map(|(i, a)| (i as u32, a.clone()))
                 .collect();
-            for decl in &eff.ops {
+            for (index, decl) in eff.ops.iter().enumerate() {
                 let args: Vec<CoreParam> = decl
                     .params
                     .iter()
@@ -346,17 +470,32 @@ impl<'a> Cx<'a> {
                         }
                     })
                     .collect();
-                let at = OpAt {
-                    named: format!("{label}.{}", decl.name),
-                    effect: label.clone(),
+                let answer = apply(&decl.ret, &s);
+                let op_ty = self.op_type(
+                    label,
+                    lab,
+                    index,
                     decl,
-                    args: args.clone(),
-                    answer: apply(&decl.ret, &s),
-                    label: lab.clone(),
+                    args.iter().map(|a| a.ty.clone()).collect(),
+                    &answer,
+                )?;
+                let typed = map_expr(&clause.body, &|t| subst_op(t, &rigid, &op_ty, &answer));
+                let typed = self.redirect(&typed, &rigid, &op_ty, &answer)?;
+                // D1: the copy opens by making its operation a value.
+                let Ty::Con(ctor, _) = &op_ty else {
+                    unreachable!("an operation type is a constructor")
                 };
-                let typed = map_expr(&clause.body, &|t| replace_con(t, &rigid, &at.answer));
-                let typed = self.redirect(&typed, &rigid, &at.answer)?;
-                let body = rewrite(&typed, &binder.name, &at)?;
+                let sp = typed.span;
+                let made = node(
+                    sp,
+                    op_ty.clone(),
+                    CoreKind::Ctor(ctor.clone(), args.iter().map(|a| var(sp, a)).collect()),
+                );
+                let body = node(
+                    sp,
+                    typed.ty.clone(),
+                    CoreKind::Let(binder.name.clone(), Rc::new(made), Rc::new(typed)),
+                );
                 clauses.push(CoreClause {
                     effect: label.clone(),
                     op: decl.name.clone(),
@@ -376,9 +515,253 @@ impl<'a> Cx<'a> {
     }
 }
 
-/// `e` with each `Var(x)` renamed where `f(x)` says. Only top-level clone names
-/// are renamed (they contain dots, which no local name can), so binders need no
-/// tracking.
+impl<'a> Cx<'a> {
+    /// D1: the operation type of `E.op` at the label instance `lab`, made on
+    /// first use.
+    fn op_type(
+        &mut self,
+        label: &str,
+        lab: &EffectLabel,
+        index: usize,
+        decl: &CoreOp,
+        fields: Vec<Ty>,
+        answer: &Ty,
+    ) -> R<Ty> {
+        let named = format!("{label}.{}", decl.name);
+        let key = (named.clone(), format!("{lab:?}"));
+        if let Some(n) = self.op_names.get(&key) {
+            return Ok(Ty::Con(n.clone(), Vec::new()));
+        }
+        let name = format!("$Op.{named}.{}", self.op_types.len());
+        self.op_types.push(CoreType {
+            name: name.clone(),
+            ctors: vec![CoreCtor {
+                name: name.clone(),
+                fields: fields.clone(),
+            }],
+        });
+        self.op_info.insert(
+            name.clone(),
+            OpInfo {
+                effect: label.to_string(),
+                index,
+                label: lab.clone(),
+                answer: answer.clone(),
+                fields,
+            },
+        );
+        self.op_names.insert(key, name.clone());
+        Ok(Ty::Con(name, Vec::new()))
+    }
+
+    /// F3: every operation type mentioning `rigid`, made again with `rigid` at
+    /// `answer` (and its operation at `op_ty`): old name -> new name.
+    fn reinstance(&mut self, rigid: &str, op_ty: &Ty, answer: &Ty) -> R<HashMap<String, String>> {
+        let mut map: HashMap<String, String> = HashMap::new();
+        let names: Vec<String> = self.op_types.iter().map(|t| t.name.clone()).collect();
+        for n in names {
+            let info = self.op_info[&n].clone();
+            let mut r = BTreeSet::new();
+            info.fields.iter().for_each(|f| ty_rigids(f, &mut r));
+            ty_rigids(&info.answer, &mut r);
+            info.label.args.iter().for_each(|a| ty_rigids(a, &mut r));
+            if !r.contains(rigid) {
+                continue;
+            }
+            let ty = |t: &Ty| rename_tys(&subst_op(t, rigid, op_ty, answer), &map);
+            let label = EffectLabel {
+                args: info.label.args.iter().map(ty).collect(),
+                ..info.label.clone()
+            };
+            let eff = *self
+                .effects
+                .get(&info.effect)
+                .ok_or(CodegenError::Unsupported(
+                    "`with any` over an undeclared effect",
+                ))?;
+            let decl = &eff.ops[info.index];
+            let effect = info.effect.clone();
+            let made = self.op_type(
+                &effect,
+                &label,
+                info.index,
+                decl,
+                info.fields.iter().map(ty).collect(),
+                &ty(&info.answer),
+            )?;
+            if let Ty::Con(m, _) = made {
+                map.insert(n, m);
+            }
+        }
+        Ok(map)
+    }
+
+    /// The operation an operation-typed expression holds, if it is one.
+    fn info_of(&self, e: &CoreExpr) -> Option<(String, OpInfo)> {
+        let Ty::Con(n, a) = &e.ty else { return None };
+        if !a.is_empty() {
+            return None;
+        }
+        self.op_info.get(n).map(|i| (n.clone(), i.clone()))
+    }
+
+    /// `match v { C(f1, .., fn) -> k(OpAt over f1..fn) }`.
+    fn open(
+        &mut self,
+        v: CoreExpr,
+        name: &str,
+        info: &OpInfo,
+        ty: &Ty,
+        k: &mut dyn FnMut(&mut Self, &OpAt) -> R<CoreExpr>,
+    ) -> R<CoreExpr> {
+        let sp = v.span;
+        let eff = *self
+            .effects
+            .get(&info.effect)
+            .ok_or(CodegenError::Unsupported(
+                "`with any` over an undeclared effect",
+            ))?;
+        let decl = &eff.ops[info.index];
+        let args: Vec<CoreParam> = info
+            .fields
+            .iter()
+            .map(|t| {
+                self.fresh += 1;
+                CoreParam {
+                    name: format!("any.field.{}", self.fresh),
+                    ty: t.clone(),
+                }
+            })
+            .collect();
+        let at = OpAt {
+            named: format!("{}.{}", info.effect, decl.name),
+            effect: info.effect.clone(),
+            decl,
+            args: args.clone(),
+            answer: info.answer.clone(),
+            label: info.label.clone(),
+        };
+        let body = k(self, &at)?;
+        let pat = CorePat::Ctor(
+            name.to_string(),
+            args.iter().map(|a| CorePat::Var(a.name.clone())).collect(),
+        );
+        Ok(node(
+            sp,
+            ty.clone(),
+            CoreKind::Match(Rc::new(v), Rc::from([CoreArm { pat, body }])),
+        ))
+    }
+
+    /// D3: `e` with every `op.*` and `==`/`!=` on an operation value rewritten
+    /// over the value's fields.
+    fn ops(&mut self, e: &CoreExpr) -> R<CoreExpr> {
+        let sp = e.span;
+        let kind = match &e.kind {
+            CoreKind::Builtin(n, a) if n.starts_with("op.") && !a.is_empty() => {
+                let Some((name, info)) = self.info_of(&a[0]) else {
+                    return Err(CodegenError::Unsupported(
+                        "op builtin on a value that is not an operation",
+                    ));
+                };
+                let subject = self.ops(&a[0])?;
+                let rest = self.all_ops(&a[1..])?;
+                return self.open(subject, &name, &info, &e.ty, &mut |_, at| {
+                    builtin(sp, &e.ty, n, &rest, at)
+                });
+            }
+            CoreKind::Prim(op @ (BinOp::Eq | BinOp::Ne), a)
+                if a.len() == 2 && self.info_of(&a[0]).is_some() =>
+            {
+                let (name, info) = self.info_of(&a[0]).expect("checked");
+                let l = self.ops(&a[0])?;
+                let r = self.ops(&a[1])?;
+                let op = *op;
+                let ty = e.ty.clone();
+                // Both operands are opened, in order; they hold one operation
+                // with one set of arguments (spec D3), so the left one's are
+                // walked.
+                return self.open(l, &name, &info, &ty, &mut |cx, at| {
+                    let cmp = op_eq(sp, op, at);
+                    let info2 = info.clone();
+                    let r2 = r.clone();
+                    let ty2 = ty.clone();
+                    cx.open(r2, &name, &info2, &ty2, &mut |_, _| Ok(cmp.clone()))
+                });
+            }
+            CoreKind::Lit(_) | CoreKind::Var(_) => e.kind.clone(),
+            CoreKind::App(f, a) => CoreKind::App(Rc::new(self.ops(f)?), self.all_ops(a)?),
+            CoreKind::Builtin(n, a) => CoreKind::Builtin(n.clone(), self.all_ops(a)?),
+            CoreKind::Ctor(n, a) => CoreKind::Ctor(n.clone(), self.all_ops(a)?),
+            CoreKind::Prim(p, a) => CoreKind::Prim(*p, self.all_ops(a)?),
+            CoreKind::Lambda(ps, b) => CoreKind::Lambda(ps.clone(), Rc::new(self.ops(b)?)),
+            CoreKind::Let(x, v, b) => {
+                CoreKind::Let(x.clone(), Rc::new(self.ops(v)?), Rc::new(self.ops(b)?))
+            }
+            CoreKind::If(c, t, f) => CoreKind::If(
+                Rc::new(self.ops(c)?),
+                Rc::new(self.ops(t)?),
+                Rc::new(self.ops(f)?),
+            ),
+            CoreKind::Match(s, arms) => {
+                let mut out = Vec::with_capacity(arms.len());
+                for a in arms.iter() {
+                    out.push(CoreArm {
+                        pat: a.pat.clone(),
+                        body: self.ops(&a.body)?,
+                    });
+                }
+                CoreKind::Match(Rc::new(self.ops(s)?), out.into())
+            }
+            CoreKind::Handle(h) => {
+                let mut clauses = Vec::with_capacity(h.clauses.len());
+                for c in h.clauses.iter() {
+                    clauses.push(CoreClause {
+                        effect: c.effect.clone(),
+                        op: c.op.clone(),
+                        params: c.params.clone(),
+                        body: Rc::new(self.ops(&c.body)?),
+                    });
+                }
+                let ret = match &h.ret {
+                    Some(r) => Some(Rc::new(CoreReturn {
+                        binder: r.binder.clone(),
+                        body: Rc::new(self.ops(&r.body)?),
+                    })),
+                    None => None,
+                };
+                CoreKind::Handle(Rc::new(CoreHandle {
+                    body: Rc::new(self.ops(&h.body)?),
+                    clauses: clauses.into(),
+                    ret,
+                    is_multi_declared: h.is_multi_declared,
+                    multi: h.multi,
+                    any: h.any,
+                }))
+            }
+            CoreKind::Resume(v) => CoreKind::Resume(Rc::new(self.ops(v)?)),
+            CoreKind::Perform(p) => CoreKind::Perform(Rc::new(CorePerform {
+                effect: p.effect.clone(),
+                op: p.op.clone(),
+                op_ty: p.op_ty.clone(),
+                args: self.all_ops(&p.args)?,
+            })),
+        };
+        Ok(node(sp, e.ty.clone(), kind))
+    }
+
+    fn all_ops(&mut self, cs: &[CoreExpr]) -> R<Rc<[CoreExpr]>> {
+        let mut out = Vec::with_capacity(cs.len());
+        for c in cs {
+            out.push(self.ops(c)?);
+        }
+        Ok(out.into())
+    }
+}
+
+/// `e` with each `Var(x)` and constructor renamed where `f(x)` says. Only
+/// top-level clone names and operation types' constructors are renamed (they
+/// contain dots, which no local name can), so binders need no tracking.
 fn map_vars_named(e: &CoreExpr, f: &mut dyn FnMut(&str) -> Option<String>) -> CoreExpr {
     let go = |c: &CoreExpr, f: &mut dyn FnMut(&str) -> Option<String>| map_vars_named(c, f);
     let kind = match &e.kind {
@@ -393,7 +776,10 @@ fn map_vars_named(e: &CoreExpr, f: &mut dyn FnMut(&str) -> Option<String>) -> Co
         CoreKind::Builtin(n, a) => {
             CoreKind::Builtin(n.clone(), a.iter().map(|x| go(x, f)).collect())
         }
-        CoreKind::Ctor(n, a) => CoreKind::Ctor(n.clone(), a.iter().map(|x| go(x, f)).collect()),
+        CoreKind::Ctor(n, a) => CoreKind::Ctor(
+            f(n).unwrap_or_else(|| n.clone()),
+            a.iter().map(|x| go(x, f)).collect(),
+        ),
         CoreKind::Prim(o, a) => CoreKind::Prim(*o, a.iter().map(|x| go(x, f)).collect()),
         CoreKind::Lambda(ps, b) => CoreKind::Lambda(ps.clone(), Rc::new(go(b, f))),
         CoreKind::Let(x, v, b) => CoreKind::Let(x.clone(), Rc::new(go(v, f)), Rc::new(go(b, f))),
@@ -461,20 +847,38 @@ fn op_type(t: &Ty) -> Option<(String, EffectRow)> {
     Some((rigid.clone(), row.clone()))
 }
 
-/// `t` with the rigid type `name` replaced by `with` (rows' arguments too).
-fn replace_con(t: &Ty, name: &str, with: &Ty) -> Ty {
+/// `t` in a clause copy (D1): the clause's operation type `$Op(rigid, _)` is
+/// `op_ty`, then `rigid` is `answer`.
+fn subst_op(t: &Ty, rigid: &str, op_ty: &Ty, answer: &Ty) -> Ty {
     match t {
-        Ty::Con(n, a) if n == name && a.is_empty() => with.clone(),
+        Ty::Con(n, a) if n == "$Op" => match &a[..] {
+            [Ty::Con(r, none), _] if r == rigid && none.is_empty() => op_ty.clone(),
+            _ => Ty::Con(
+                n.clone(),
+                a.iter()
+                    .map(|x| subst_op(x, rigid, op_ty, answer))
+                    .collect(),
+            ),
+        },
+        Ty::Con(n, a) if n == rigid && a.is_empty() => answer.clone(),
         Ty::Con(n, a) => Ty::Con(
             n.clone(),
-            a.iter().map(|x| replace_con(x, name, with)).collect(),
+            a.iter()
+                .map(|x| subst_op(x, rigid, op_ty, answer))
+                .collect(),
         ),
         Ty::Fn(ps, row, r) => Ty::Fn(
-            ps.iter().map(|p| replace_con(p, name, with)).collect(),
-            crate::mono::map_row(row, &|a| replace_con(a, name, with)),
-            Box::new(replace_con(r, name, with)),
+            ps.iter()
+                .map(|p| subst_op(p, rigid, op_ty, answer))
+                .collect(),
+            crate::mono::map_row(row, &|a| subst_op(a, rigid, op_ty, answer)),
+            Box::new(subst_op(r, rigid, op_ty, answer)),
         ),
-        Ty::Tuple(a) => Ty::Tuple(a.iter().map(|x| replace_con(x, name, with)).collect()),
+        Ty::Tuple(a) => Ty::Tuple(
+            a.iter()
+                .map(|x| subst_op(x, rigid, op_ty, answer))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -514,111 +918,6 @@ fn concat(span: Span, a: CoreExpr, b: CoreExpr) -> CoreExpr {
         Ty::Base(TyCon::Str),
         CoreKind::Prim(BinOp::Concat, Rc::from([a, b])),
     )
-}
-
-/// D2: `e` with every use of the binder `o` rewritten for the operation `at`.
-fn rewrite(e: &CoreExpr, o: &str, at: &OpAt) -> R<CoreExpr> {
-    let sp = e.span;
-    let go = |c: &CoreExpr| -> R<Rc<CoreExpr>> { Ok(Rc::new(rewrite(c, o, at)?)) };
-    let all =
-        |cs: &[CoreExpr]| -> R<Rc<[CoreExpr]>> { cs.iter().map(|c| rewrite(c, o, at)).collect() };
-    let is_o = |c: &CoreExpr| matches!(&c.kind, CoreKind::Var(x) if x == o);
-    let kind = match &e.kind {
-        CoreKind::Var(x) if x == o => return Err(CodegenError::Unsupported(OP_VALUE_REFUSAL)),
-        CoreKind::Lit(_) | CoreKind::Var(_) => e.kind.clone(),
-        CoreKind::Builtin(n, a) if n.starts_with("op.") && a.first().is_some_and(is_o) => {
-            let rest = all(&a[1..])?;
-            return builtin(sp, &e.ty, n, &rest, at);
-        }
-        CoreKind::Prim(op @ (BinOp::Eq | BinOp::Ne), a)
-            if a.len() == 2 && is_o(&a[0]) && is_o(&a[1]) =>
-        {
-            return Ok(op_eq(sp, *op, at));
-        }
-        CoreKind::App(f, a) => CoreKind::App(go(f)?, all(a)?),
-        CoreKind::Builtin(n, a) => CoreKind::Builtin(n.clone(), all(a)?),
-        CoreKind::Ctor(n, a) => CoreKind::Ctor(n.clone(), all(a)?),
-        CoreKind::Prim(p, a) => CoreKind::Prim(*p, all(a)?),
-        CoreKind::Lambda(ps, b) => {
-            let body = if ps.iter().any(|p| p.name == o) {
-                b.clone()
-            } else {
-                go(b)?
-            };
-            CoreKind::Lambda(ps.clone(), body)
-        }
-        CoreKind::Let(x, v, b) => {
-            let body = if x == o { b.clone() } else { go(b)? };
-            CoreKind::Let(x.clone(), go(v)?, body)
-        }
-        CoreKind::If(c, t, f) => CoreKind::If(go(c)?, go(t)?, go(f)?),
-        CoreKind::Match(s, arms) => {
-            let mut out = Vec::with_capacity(arms.len());
-            for a in arms.iter() {
-                let body = if binds(&a.pat, o) {
-                    a.body.clone()
-                } else {
-                    rewrite(&a.body, o, at)?
-                };
-                out.push(CoreArm {
-                    pat: a.pat.clone(),
-                    body,
-                });
-            }
-            CoreKind::Match(go(s)?, out.into())
-        }
-        CoreKind::Handle(h) => {
-            let mut clauses = Vec::with_capacity(h.clauses.len());
-            for c in h.clauses.iter() {
-                let body = if c.params.iter().any(|p| p.name == o) {
-                    c.body.clone()
-                } else {
-                    go(&c.body)?
-                };
-                clauses.push(CoreClause {
-                    effect: c.effect.clone(),
-                    op: c.op.clone(),
-                    params: c.params.clone(),
-                    body,
-                });
-            }
-            let ret = match &h.ret {
-                Some(r) => Some(Rc::new(CoreReturn {
-                    binder: r.binder.clone(),
-                    body: if r.binder == o {
-                        r.body.clone()
-                    } else {
-                        go(&r.body)?
-                    },
-                })),
-                None => None,
-            };
-            CoreKind::Handle(Rc::new(CoreHandle {
-                body: go(&h.body)?,
-                clauses: clauses.into(),
-                ret,
-                is_multi_declared: h.is_multi_declared,
-                multi: h.multi,
-                any: h.any,
-            }))
-        }
-        CoreKind::Resume(v) => CoreKind::Resume(go(v)?),
-        CoreKind::Perform(p) => CoreKind::Perform(Rc::new(CorePerform {
-            effect: p.effect.clone(),
-            op: p.op.clone(),
-            op_ty: p.op_ty.clone(),
-            args: all(&p.args)?,
-        })),
-    };
-    Ok(node(sp, e.ty.clone(), kind))
-}
-
-fn binds(p: &CorePat, o: &str) -> bool {
-    match p {
-        CorePat::Var(x) => x == o,
-        CorePat::Ctor(_, subs) => subs.iter().any(|s| binds(s, o)),
-        CorePat::Wild | CorePat::Lit(_) => false,
-    }
 }
 
 /// `op.<n>(o, rest..)` for the operation `at`, at the node type `ty`.
@@ -833,24 +1132,28 @@ mod tests {
     }
 
     #[test]
-    fn an_operation_value_used_as_a_value_is_refused() {
-        // The first clause stored `o` by a bare alias (`let p = o`) until
-        // 2026-10-22: `anf` now substitutes an alias (spec
-        // 2026-10-22-elya-one-shot-words-and-sweep-gaps D3), so that runs (a
-        // `native_any.rs` row). An `if` that answers `o` still stores it.
+    fn an_operation_value_used_as_a_value_expands() {
+        // Refused by name ("operation value used other than by op.* or ==")
+        // until 2026-10-23: `o` is now a value of an operation type per
+        // operation (spec 2026-10-23-elya-operation-values-natively D1, D3).
         for clause in [
             "op(o) -> { let p = if True { o } else { o }  resume(op.perform(p)) }",
             "op(o) -> { let f = fn(x: Int) { o }  io.println(op.show(f(1)))  resume(op.perform(o)) }",
         ] {
             let src = format!(
-                "effect W {{ fn roll(s: Int) -> Int }}\n\
+                "effect W {{ fn roll(s: Int) -> Int  fn now() -> Int }}\n\
                  fn rec(body) {{ handle {{ body() }} with any {{ {clause} }} }}\n\
-                 pub fn main() -> Int {{ handle {{ rec(fn() {{ roll(6) }}) }} with {{ W.roll(s) -> resume(s) }} }}\n"
+                 pub fn main() -> Int {{ handle {{ rec(fn() {{ roll(6) + now() }}) }} with {{ W.roll(s) -> resume(s)  W.now() -> resume(1) }} }}\n"
             );
-            match expanded(&src) {
-                Err(CodegenError::Unsupported(m)) => assert_eq!(m, OP_VALUE_REFUSAL, "{clause}"),
-                other => panic!("{clause}: {:?}", other.map(|_| ())),
-            }
+            let m = expanded(&src).unwrap_or_else(|e| panic!("{clause}: {e:?}"));
+            let mut ops: Vec<String> = m
+                .types
+                .iter()
+                .filter(|t| t.name.starts_with("$Op."))
+                .map(|t| format!("{}/{}", t.name, t.ctors[0].fields.len()))
+                .collect();
+            ops.sort();
+            assert_eq!(ops, ["$Op.W.now.1/0", "$Op.W.roll.0/1"], "{clause}");
         }
     }
 }

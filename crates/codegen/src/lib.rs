@@ -501,6 +501,7 @@ pub(crate) fn data_eq<'ctx>(
                 l.into(),
                 r.into(),
                 i64t.const_int(lc.string_tag as u64, false).into(),
+                i64t.const_int(lc.first_closure_tag as u64, false).into(),
             ],
             "dataeq",
         )
@@ -2096,6 +2097,9 @@ struct LowerCtx<'a, 'ctx> {
     time_sleep_ms: FunctionValue<'ctx>,
     println: FunctionValue<'ctx>,
     string_tag: usize,
+    /// The first closure tag (closures follow the real constructors), for
+    /// `elya_eq`'s stop at a function (2026-10-23).
+    first_closure_tag: usize,
     fail: FunctionValue<'ctx>,
     /// The shadow-stack pair, now live. Every allocation site is dominated by a
     /// push of the enclosing frame's heap bindings, so at the moment
@@ -2287,7 +2291,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let str_concat = module.add_function("elya_str_concat", str_concat_ty, None); // ccc
     let str_eq_ty = i64t.fn_type(&[ptrt.into(), ptrt.into()], false);
     let str_eq = module.add_function("elya_str_eq", str_eq_ty, None); // ccc
-    let data_eq_ty = i64t.fn_type(&[ptrt.into(), ptrt.into(), i64t.into()], false);
+    let data_eq_ty = i64t.fn_type(&[ptrt.into(), ptrt.into(), i64t.into(), i64t.into()], false);
     let data_eq = module.add_function("elya_eq", data_eq_ty, None); // ccc
     let int_to_string_ty = ptrt.fn_type(&[i64t.into(), i64t.into()], false);
     let int_to_string = module.add_function("elya_int_to_string", int_to_string_ty, None); // ccc
@@ -2432,6 +2436,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         time_sleep_ms,
         println,
         string_tag,
+        first_closure_tag: n_real_ctors,
         fail,
         gc_push,
         gc_pop,

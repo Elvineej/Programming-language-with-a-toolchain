@@ -1,6 +1,6 @@
 # Operation values as values, natively
 
-**Status:** in progress (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF step 1.
+**Status:** done (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF step 1.
 The design choices are Claude's under the maintainer's delegation (rule 2), recorded
 here. Builds on `2026-10-17-elya-native-any-handlers-design.md` (D1-D7, R1-R3).
 
@@ -91,4 +91,38 @@ clause's rigid answer type `t`, and so `Op(t)`, inside the clause.
 
 ## 3. Results
 
-(Filled in when the slice closes.)
+Gate: **1115 passed, 107 suites** (predicted 1112 before the review; the review
+added three native tests). The six planned tests were red first with the predicted
+refusal. Controls K1-K3 are recorded in `native_op_values.rs`'s header; each failed
+distinctly (`match failed`, an inkwell panic, `unsupported builtin`).
+
+### The review (2026-10-23)
+
+An independent review ran 31 differential programs (helpers at `St(Int)` and
+`St(Bool)`, recursive helpers over lists of operations, returned closures, nested
+handlers, decode in helpers, local `let` handlers). Findings, fixed test-first
+(`native_op_values.rs`, "the review"; each red first):
+
+- **F1, high, a new wrong value.** `==` on data AROUND an operation
+  (`Yes(o) == Yes(o)`, `Cons(o, Nil) != Cons(o, Nil)`) reached `elya_eq`, which
+  compared a closure in the operation's arguments as a heap block: `eq` where the
+  evaluator fails. **Fix:** `elya_eq` stops at a closure tag with the evaluator's
+  words, and walks fields in the evaluator's order (pushed in order, popped last
+  first; a word field no longer decides before its later heap siblings). Outside
+  operations E0436 keeps functions out of compared data, so nothing else changes.
+- **F2, medium, a regression.** D2 keyed EVERY rigid clone by operation, so 30
+  operations through a nine-helper chain over the answer only passed the clone
+  budget (it built at 95e1e08). **D2 narrowed:** a function is cloned per operation
+  only when its signature takes `$Op(rigid, _)`; one that sees only the answer type
+  is cloned per answer type, as before. A helper that does take `o` costs operations
+  times helpers, refused by name past the budget (the review's `budget.elya`: 270).
+- **F3, medium, a regression.** A `with any` inside a function cloned at an outer
+  clause's rigid (`spy` handling `Hold(t)`) made its operation types at the rigid,
+  which the first version refused. **Fix:** a clone re-makes every operation type
+  that mentions its rigid, at the clone's answer, and renames its constructors;
+  operation types left at a rigid belong to dropped functions and are not emitted.
+- **F4, low, not of this slice:** E0434 rejects a direct inner `with any` over
+  `Hold(Opt(Op))` but accepts the same handler through a generic function. Recorded
+  in HANDOFF.
+
+Windows: `runtime.c`'s `elya_eq` changed (a fourth parameter, the walk's order).
