@@ -12,6 +12,7 @@
 //!   that differ, all next to a power of two (`0060000000000000` first).
 //! - K3, `elya_any_check` ignoring a NaN: `with_any_shows_encodes_and_decodes_floats`
 //!   (`o == o` is `same` natively, `differs` in the evaluator).
+//!
 //! Found on the way: `%.*e` rounds a tie half to even, Rust's shortest form half
 //! up (2^-25 writes `...95313`); the printer rounds from the exact expansion.
 use elya::core::lower_module;
