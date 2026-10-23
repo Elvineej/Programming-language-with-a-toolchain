@@ -467,22 +467,17 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   - `float.to_string` on both sides.
   - Needs the Windows gate (`runtime.c`; `%.780e` exactness and `strtod` on UCRT).
 
+- **Decoding at an effect's own parameter: decided, the refusal stays** (2026-10-23,
+  a scheduled run): spec
+  `docs/superpowers/specs/2026-10-23-elya-decode-at-a-parameter-design.md`. The
+  evaluator has no instance inside effect-polymorphic code and native clauses are
+  per instance, not per site, so decoding at the instance cannot agree on both
+  sides; a static check would be partial. Runtime type witnesses are the recorded
+  way forward, with modules part 2.
+
 ## The next five steps
 
-### 1. Decoding at an effect's own parameter, on both sides
-
-`op.decode` of an answer whose type is an effect's parameter (`St(s)`'s
-`fn get() -> s`) is refused on both sides by name (the evaluator's S2; native D4 of
-2026-10-17 and of 2026-10-23). Natively the instance is known after specialization;
-the evaluator's `Value::Op` does not carry it. Measure what a replayer over a
-parametric effect (`St(Int)`, a generic `Cell(a)`) loses today, then decide in a spec
-whether both sides decode at the instantiation: the evaluator would carry the
-label's argument types in the operation value (from the perform site's typed table),
-and native's operation type already holds them. The stricter alternative is to keep
-the refusal and report it in `elya check` (a static error at the `with
-any` handle when a handled operation's answer mentions a parameter).
-
-### 2. A row variable inside data in a function's own result, natively
+### 1. A row variable inside data in a function's own result, natively
 
 A native wrong value the 2026-10-23 review found (older than it). A top-level
 function whose own result has a row variable INSIDE DATA
@@ -495,7 +490,7 @@ then decide in a spec whether `match_tys` binds row tails or the wrapper coerces
 data by its type; if neither fits soon, refuse the shape by name natively so no
 wrong value is left.
 
-### 3. Parser error recovery inside a body
+### 2. Parser error recovery inside a body
 
 `recover_to_decl` (src/parse.rs) skips to the next `fn`, `pub`, `import`, `effect` or
 `type`, and a lambda's `fn` counts, so after a parse error inside a function body
@@ -513,7 +508,7 @@ parse that runs out of tokens must be an error. Also a label after non-ASCII tex
 dropped by the renderer (byte offsets passed where `ariadne` counts characters), and
 E0209 across files labels only the second declaration.
 
-### 4. Modules, part 2: the effect allow-list at the import
+### 3. Modules, part 2: the effect allow-list at the import
 
 ROADMAP priority 2. `import a/b / {E, F}` parses and is E0606 today (part 1 D6).
 Measure what a module's public functions perform (their rows after inference, and
@@ -524,7 +519,7 @@ a list grants (everything, for compatibility, or nothing: the stricter choice),
 whether builtins (`io`, `time`) count as effects to grant (`IO` is an effect row
 today), and transitivity (a module's own imports are bounded by its grant).
 
-### 5. `Float`, part 2: comparisons, negation and conversions
+### 4. `Float`, part 2: comparisons, negation and conversions
 
 Floats run natively since 6baf595, but `<`, `<=`, `>`, `>=` are `Int` only, `-x`
 on a float expression is E0400 (only a literal folds its sign), and nothing
@@ -535,6 +530,17 @@ separate operators, like `+.`); IEEE comparison semantics with NaN (every
 comparison false); `-.x` or `-` on floats; `float.of_int` (exact or rounded),
 `float.truncate`/`round` to `Int` (failing by name outside `Int`'s range and on
 NaN, as checked arithmetic does). Both sides, differential tests on the edges.
+
+### 5. Record and replay as an Elya library
+
+ROADMAP priority 3. `examples/09_record_any.elya` shows a recorder written with
+`with any`; the host-level trace (`elya run --record`, `ELYA_RECORD`) covers only
+`time.*`. Measure what a test author needs to record a program's own effects and
+replay them in a test (a recorder and a replayer over a list of answers, their
+failure words on divergence, their cost per operation natively), then decide in a
+spec whether a standard module (`import elya/replay`, now that modules exist)
+ships them, and in what trace format (the host trace's `question = answer`
+lines, so one replayer reads both).
 
 ## Also open, unscheduled
 
