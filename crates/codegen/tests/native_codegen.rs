@@ -6673,3 +6673,233 @@ fn aliases_run_natively() {
 fn aliases_match_the_evaluator() {
     run_differential_corpus(ALIASES, "aliases-diff");
 }
+
+// ---- Captures by scope, and a wrapped function's result (2026-10-23) ----
+// Spec `docs/superpowers/specs/2026-10-23-elya-scope-captures-and-wrapper-results-design.md`.
+
+/// D1: a local that shadows a top-level function, where the top-level name is
+/// ALSO used free in the same function (`inc(1)` before `let inc = ..`). Closure
+/// conversion left every such name out of a lambda's captures: h1 and h4 gave
+/// 2004 (the top-level `inc` ran), h8 and h9 were refused, q1 and p0 panicked the
+/// compiler. The other rows already agreed and guard the rule.
+const SHADOWED_TOP_LEVEL: &[(&str, &str, &str)] = &[
+    (
+        "h1-a-shadowing-let-captured-by-a-lambda",
+        "fn inc(x) { x + 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = inc(1)\n\
+         \x20 let inc = fn(z) { z * 2 }\n\
+         \x20 let f = fn(q) { inc(q) }\n\
+         \x20 a + f(3)\n\
+         }\n",
+        "1007",
+    ),
+    (
+        "h2-a-shadowing-parameter",
+        "fn inc(x) { x + 1000 }\n\
+         fn run(inc) { let f = fn(q) { inc(q) }  f(3) }\n\
+         pub fn main() -> Int { inc(1) + run(fn(z) { z * 2 }) }\n",
+        "1007",
+    ),
+    (
+        "h3-a-shadowing-parameter-also-called-directly",
+        "fn inc(x) { x + 1000 }\n\
+         fn run(inc) { let a = inc(1)  let f = fn(q) { inc(q) }  a + f(3) }\n\
+         pub fn main() -> Int { run(fn(z) { z * 2 }) }\n",
+        "8",
+    ),
+    (
+        "h4-a-shadowing-pattern-binder-captured",
+        "type B { B(fn(Int) -> Int) }\n\
+         fn inc(x) { x + 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = inc(1)\n\
+         \x20 match B(fn(z) { z * 2 }) { B(inc) -> { let f = fn(q) { inc(q) }  a + f(3) } }\n\
+         }\n",
+        "1007",
+    ),
+    (
+        "h5-a-shadowing-let-in-a-handle-body",
+        "effect S { fn get() -> Int }\n\
+         fn inc(x) { x + 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = inc(1)\n\
+         \x20 let inc = fn(z) { z * 2 }\n\
+         \x20 a + handle { inc(get()) } with { S.get() -> resume(3) }\n\
+         }\n",
+        "1007",
+    ),
+    (
+        "h6-a-shadowing-let-in-a-clause",
+        "effect S { fn get() -> Int }\n\
+         fn inc(x) { x + 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = inc(1)\n\
+         \x20 let inc = fn(z) { z * 2 }\n\
+         \x20 a + handle { get() } with { S.get() -> resume(inc(3)) }\n\
+         }\n",
+        "1007",
+    ),
+    (
+        "h7-a-shadowing-let-in-a-return-clause",
+        "effect S { fn get() -> Int }\n\
+         fn inc(x) { x + 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = inc(1)\n\
+         \x20 let inc = fn(z) { z * 2 }\n\
+         \x20 a + handle { get() } with { S.get() -> resume(3)  return(r) -> inc(r) }\n\
+         }\n",
+        "1007",
+    ),
+    (
+        "h8-a-shadowing-clause-parameter-captured",
+        "effect S { fn get(n: Int) -> Int }\n\
+         fn inc(x) { x + 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = inc(1)\n\
+         \x20 a + handle { get(3) } with { S.get(inc) -> { let f = fn(q) { inc + q }  resume(f(0)) } }\n\
+         }\n",
+        "1004",
+    ),
+    (
+        "h9-a-shadowing-int-captured",
+        "fn inc(x) { x + 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = inc(1)\n\
+         \x20 let inc = 7\n\
+         \x20 let f = fn(q) { inc + q }\n\
+         \x20 a + f(3)\n\
+         }\n",
+        "1011",
+    ),
+    (
+        "h10-a-shadowing-let-with-no-free-use",
+        "fn inc(x) { x + 1000 }\n\
+         pub fn main() -> Int {\n\
+         \x20 let inc = fn(z) { z * 2 }\n\
+         \x20 let f = fn(q) { inc(q) }\n\
+         \x20 f(3)\n\
+         }\n",
+        "6",
+    ),
+    (
+        "q1-a-shadowing-let-passed-to-map-in-a-handle",
+        "effect S { fn get() -> Int }\n\
+         type W { Wrap(Int) }\n\
+         type List(a) { Nil, Cons(a, List(a)) }\n\
+         fn inc(x) { x + 1 }\n\
+         fn unw(w) { match w { Wrap(v) -> v } }\n\
+         fn sum(l) { match l { Nil -> 0  Cons(h, t) -> (h + sum(t)) % 1000 } }\n\
+         fn map(l, f) { match l { Nil -> Nil  Cons(h, t) -> Cons(f(h), map(t, f)) } }\n\
+         pub fn main() -> Int {\n\
+         \x20 let a = inc(1)\n\
+         \x20 a + handle { let inc = fn(z) { Wrap(z + 7) }  sum(map(map(Cons(3, Nil), inc), unw)) + get() } with { S.get() -> resume(3) }\n\
+         }\n",
+        "15",
+    ),
+    (
+        "p0-a-shadowing-chain-in-a-handle",
+        "effect S { fn get() -> Int }\n\
+         fn mk(n) { fn(g) { g() + n } }\n\
+         pub fn main() -> Int { handle { let mk = mk  let mk = fn(z) { z * 2 + 1 }  0 + (fn(g, z) { g(z) + 1 })(mk, 3) } with { S.get() -> resume(3) } }\n",
+        "8",
+    ),
+];
+
+#[test]
+fn shadowed_top_level_names_run_natively() {
+    run_value_corpus(SHADOWED_TOP_LEVEL, "shadowed-top-level");
+}
+
+#[test]
+fn shadowed_top_level_names_match_the_evaluator() {
+    run_differential_corpus(SHADOWED_TOP_LEVEL, "shadowed-top-level-diff");
+}
+
+/// D2: a top-level function wrapped as a value (`anf` rule 2) at a type whose
+/// RESULT is upcast. The wrapper's inner call was typed with the use's result,
+/// an effectful closure, while the function returns a direct one: u1-u3 gave 5,
+/// u4 a pointer, u5 3. u6 (a local lambda) already agreed. u7 and u8 are the
+/// review's: the wrapper is inside a row-polymorphic function, so at `anf` time
+/// the use's result has an open row (5 for 15, 1505 for 1515).
+const WRAPPER_RESULTS: &[(&str, &str, &str)] = &[
+    (
+        "u1-a-wrapped-result-at-a-parameter",
+        "effect E { fn e() -> Int }\n\
+         fn mk() -> fn() -> Int { fn() { 5 } }\n\
+         fn ap2(f: fn() -> fn() / {E} -> Int) -> Int { let r = f()  r() + e() }\n\
+         pub fn main() -> Int {\n\
+         \x20 handle { ap2(mk) } with { E.e() -> resume(10) }\n\
+         }\n",
+        "15",
+    ),
+    (
+        "u2-a-wrapped-result-joined-by-an-if",
+        "effect E { fn e() -> Int }\n\
+         fn mk() -> fn() -> Int { fn() { 5 } }\n\
+         fn pick(c) { if c { mk } else { fn() { fn() { e() } } } }\n\
+         pub fn main() -> Int { handle { let r = pick(True)()  let s = pick(False)()  r() * 100 + s() } with { E.e() -> resume(10) } }\n",
+        "510",
+    ),
+    (
+        "u3-a-wrapped-result-in-a-field",
+        "effect E { fn e() -> Int }\n\
+         type B { B(fn() -> fn() / {E} -> Int) }\n\
+         fn mk() -> fn() -> Int { fn() { 5 } }\n\
+         fn open(b) { match b { B(f) -> { let r = f()  r() + e() } } }\n\
+         pub fn main() -> Int { handle { open(B(mk)) } with { E.e() -> resume(10) } }\n",
+        "15",
+    ),
+    (
+        "u4-two-wrapped-result-layers",
+        "effect E { fn e() -> Int }\n\
+         fn mk() -> fn() -> fn() -> Int { fn() { fn() { 5 } } }\n\
+         fn ap(f: fn() -> fn() -> fn() / {E} -> Int) -> Int { let r = f()  let s = r()  s() + e() }\n\
+         pub fn main() -> Int { handle { ap(mk) } with { E.e() -> resume(10) } }\n",
+        "15",
+    ),
+    (
+        "u5-a-wrapped-result-with-a-parameter",
+        "effect E { fn e() -> Int }\n\
+         fn mk(n) -> fn(Int) -> Int { fn(x) { x + n } }\n\
+         fn ap(f: fn(Int) -> fn(Int) / {E} -> Int) -> Int { let r = f(1)  r(2) + e() }\n\
+         pub fn main() -> Int { handle { ap(mk) } with { E.e() -> resume(10) } }\n",
+        "13",
+    ),
+    (
+        "u6-the-same-through-a-local-lambda",
+        "effect E { fn e() -> Int }\n\
+         fn mk() -> fn() -> Int { fn() { 5 } }\n\
+         fn ap2(f: fn() -> fn() / {E} -> Int) -> Int { let r = f()  r() + e() }\n\
+         pub fn main() -> Int { let m = fn() { mk() }  handle { ap2(m) } with { E.e() -> resume(10) } }\n",
+        "15",
+    ),
+    (
+        "u7-a-wrapper-inside-a-row-polymorphic-function",
+        "effect E { fn e() -> Int }\n\
+         fn mk() -> fn() -> Int { fn() { 5 } }\n\
+         fn call2(f, g) { let r = f()  r() + g() }\n\
+         fn wrap_it(g) { call2(mk, g) }\n\
+         pub fn main() -> Int { handle { wrap_it(fn() { e() }) } with { E.e() -> resume(10) } }\n",
+        "15",
+    ),
+    (
+        "u8-the-same-at-two-rows",
+        "effect E { fn e() -> Int }\n\
+         fn mk() -> fn() -> Int { fn() { 5 } }\n\
+         fn call2(f, g) { let r = f()  r() + g() }\n\
+         fn wrap_it(g) { call2(mk, g) }\n\
+         pub fn main() -> Int { wrap_it(fn() { 10 }) * 100 + handle { wrap_it(fn() { e() }) } with { E.e() -> resume(10) } }\n",
+        "1515",
+    ),
+];
+
+#[test]
+fn wrapped_function_results_run_natively() {
+    run_value_corpus(WRAPPER_RESULTS, "wrapper-results");
+}
+
+#[test]
+fn wrapped_function_results_match_the_evaluator() {
+    run_differential_corpus(WRAPPER_RESULTS, "wrapper-results-diff");
+}

@@ -12,7 +12,10 @@
 //!    top-level function (not shadowed by a local) outside callee position
 //!    becomes `fn(a1, .., an) { f(a1, .., an) }` at the variable's type: a
 //!    closure with no captures. Its inner call is an ordinary reference, so N7
-//!    specializes it like any other (types and rows).
+//!    specializes it like any other (types and rows). When `f`'s own result
+//!    differs from the use's (an upcast), it is
+//!    `fn(a1, .., an) { let r = f(a1, .., an)  r }`, so `specialize` coerces `r`
+//!    (spec 2026-10-23-elya-scope-captures-and-wrapper-results D2).
 //! 3. **A constructor used as a value is wrapped** (spec
 //!    2026-10-22-elya-one-shot-words-and-sweep-gaps D2). Core lowers a bare
 //!    constructor name to a field-less `Ctor`; one with fields, typed as a
@@ -49,6 +52,12 @@ struct Anf<'a> {
 /// finding 1). An OPEN own row relays a parameter's row, and the reference's
 /// own type already says what that relay is at this use (part 1 clones `f`
 /// from it), so the use's type is kept.
+///
+/// The RESULT, too, is `f`'s own at this instantiation when it is ground
+/// (spec 2026-10-23-elya-scope-captures-and-wrapper-results D2): the use's
+/// result may be an upcast (`mk` returns `fn() -> Int`, used where
+/// `fn() -> fn() / {E} -> Int` is expected), and a call typed with it jumped
+/// into a direct closure with the effectful convention (5 for 15).
 fn inner_type(f: &CoreFn, use_ty: &Ty) -> Ty {
     let Ty::Fn(ups, _, uret) = use_ty else {
         return use_ty.clone();
@@ -72,7 +81,28 @@ fn inner_type(f: &CoreFn, use_ty: &Ty) -> Ty {
         Ty::Fn(_, r, _) => r,
         _ => f.row.clone(),
     };
-    Ty::Fn(ups.clone(), own, uret.clone())
+    let own_ret = crate::mono::apply(&f.body.ty, &tys);
+    let ret = if is_ground(&own_ret) {
+        own_ret
+    } else {
+        (**uret).clone()
+    };
+    Ty::Fn(ups.clone(), own, Box::new(ret))
+}
+
+/// No type variable and no open row anywhere in `t`.
+fn is_ground(t: &Ty) -> bool {
+    match t {
+        Ty::Var(_) | Ty::Error => false,
+        Ty::Base(_) => true,
+        Ty::Fn(ps, row, r) => {
+            row.tail == RowTail::Closed
+                && row.labels.values().all(|l| l.args.iter().all(is_ground))
+                && ps.iter().all(is_ground)
+                && is_ground(r)
+        }
+        Ty::Con(_, a) | Ty::Tuple(a) => a.iter().all(is_ground),
+    }
 }
 
 impl Anf<'_> {
@@ -87,12 +117,42 @@ impl Anf<'_> {
         if !matches!(e.ty, Ty::Fn(..)) {
             return None;
         }
+        let inner = inner_type(self.top[f], &e.ty);
+        let (Ty::Fn(_, _, own_ret), Ty::Fn(_, _, use_ret)) = (&inner, &e.ty) else {
+            return None;
+        };
+        let (own_ret, use_ret) = ((**own_ret).clone(), (**use_ret).clone());
         let callee = CoreExpr {
             span: e.span,
-            ty: inner_type(self.top[f], &e.ty),
+            ty: inner.clone(),
             kind: CoreKind::Var(f.to_string()),
         };
-        self.eta(e, |args| CoreKind::App(Rc::new(callee), args))
+        // Equal types, not equal conventions: inside a row-polymorphic
+        // function the use's result can still have an open row here (counted
+        // as direct), and `specialize` closes it later (the review's u7: 5 for
+        // 15). A `let` that turns out not to be needed coerces nothing.
+        if own_ret == use_ret {
+            return self.eta(e, |args| CoreKind::App(Rc::new(callee), args));
+        }
+        // D2: the call at `f`'s own result, bound, and the binder used at the
+        // use's result: a value use `specialize` coerces (its upcast adapter).
+        let r = self.fresh("eta.result");
+        let span = e.span;
+        self.eta(e, |args| {
+            CoreKind::Let(
+                r.clone(),
+                Rc::new(CoreExpr {
+                    span,
+                    ty: own_ret,
+                    kind: CoreKind::App(Rc::new(callee), args),
+                }),
+                Rc::new(CoreExpr {
+                    span,
+                    ty: use_ret,
+                    kind: CoreKind::Var(r),
+                }),
+            )
+        })
     }
 
     /// Rule 3: constructor `c` used as a value at `e`'s function type.
@@ -144,10 +204,11 @@ impl Anf<'_> {
     /// - `y` is a LOCAL. An alias of a top-level function stays a local, so
     ///   rule 2 wraps the function once, at the binding, and the upcast adapter
     ///   still sees a local binder at every later upcast (5 for 15 otherwise);
-    /// - no top-level function is named `y`. Closure conversion reads a name
-    ///   free in a lambda or a handle as the top-level function of that name
-    ///   whenever one exists, so planting a shadowing `y` inside one changes
-    ///   which function runs (2004 for 1007, compiler panics);
+    /// - no top-level function is named `y`. When this rule was written,
+    ///   closure conversion read a name free in a lambda as the top-level
+    ///   function of that name whenever one existed, so planting a shadowing
+    ///   `y` inside one changed which function ran (2004 for 1007). Captures are
+    ///   decided by scope since 2026-10-23; the condition stays, conservatively;
     /// - `y`'s type at the binding has an open row (or is an operation): the
     ///   row-polymorphic alias the rule is for. A closed row may be an
     ///   annotated upcast, which `specialize` coerces at the binding but not at
@@ -587,5 +648,32 @@ mod tests {
             alias_let(&rebound),
             "the alias was substituted under a rebinding of its target"
         );
+    }
+
+    /// Spec 2026-10-23 D2: `mk` returns a DIRECT closure, used where
+    /// `fn() -> fn() / {E} -> Int` is expected. The wrapper's inner call is typed
+    /// at `mk`'s own result, and a `let` makes it a binder `specialize` coerces.
+    #[test]
+    fn a_wrappers_inner_call_has_the_functions_own_result() {
+        let out = run(&core_of(
+            "effect E { fn e() -> Int }\n\
+             fn mk() -> fn() -> Int { fn() { 5 } }\n\
+             fn ap2(f: fn() -> fn() / {E} -> Int) -> Int { let r = f()  r() + e() }\n\
+             pub fn main() -> Int { handle { ap2(mk) } with { E.e() -> resume(10) } }\n",
+        ));
+        let pure_result = |t: &Ty| matches!(t, Ty::Fn(_, row, _) if row.labels.is_empty());
+        let bound = main_nodes(&out).iter().any(|n| match &n.kind {
+            CoreKind::Lambda(_, b) => match &b.kind {
+                CoreKind::Let(x, v, body) => {
+                    matches!(&v.kind, CoreKind::App(f, _) if matches!(&f.kind, CoreKind::Var(m) if m == "mk"))
+                        && pure_result(&v.ty)
+                        && matches!(&body.kind, CoreKind::Var(y) if y == x)
+                        && !pure_result(&body.ty)
+                }
+                _ => false,
+            },
+            _ => false,
+        });
+        assert!(bound, "no wrapper binding `mk()` at its own result");
     }
 }
