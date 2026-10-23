@@ -9,8 +9,20 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   is daed520 (20:48). Taken over; if that run is still pushing, I merge, never force.
 - LLVM 18 headers were missing again; installed (`llvm-18-dev`, `libpolly-18-dev`,
   `libzstd-dev`).
-- Working on: HANDOFF step 1 (upcasts through data, natively): spec 27696a2 and plan
-  4d6b1e9 are written; implementation next.
+- Baseline 1193 / 116.
+- **Done: upcasts through data, natively** (HANDOFF step 1). Spec 27696a2, plan
+  4d6b1e9 (the 17:53 run), implementation 09d8681, HANDOFF 1b0c7f8. A pure closure
+  inside data used at an effectful type: natively a pointer or "match failed"
+  before. The wrapper binds its own result's free row variables from the use (D1);
+  the data is rebuilt by a generated `$coerce.T.k` (D2); the guard compares data
+  names (D3); a non-regular type is refused by name (D4, the review's F1: the first
+  version overflowed the compiler's stack). Gate 1198 / 117 (predicted 1197; the
+  review added one test). K1-K3 distinct. Review sweep: 886 programs, no change.
+  - **Decisions (mine; please review):** rebuild data (a copy per upcast) rather
+    than refuse or make data invariant in the checker; D4's size rule.
+  - Found (older): the wrapper still prints a pointer when the own result's row
+    variable is also a parameter's (the review's F2): new HANDOFF step 1.
+- Working on: HANDOFF step 1 (the wrapper's parameter-shared row).
 
 ## 2026-10-23 17:53 UTC — IN PROGRESS (scheduled run, FULL mode)
 
