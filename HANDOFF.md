@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1184 passed, 113 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1193 passed, 116 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
@@ -457,30 +457,19 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   - `import a/b / {E}` is reserved syntax, E0606 until part 2.
   - Needs the Windows gate (symbols with `.` from module paths).
 
+- **`Float` natively, and `float.to_string`** (2026-10-23, branch `auto/elya`, a
+  scheduled run, 6baf595): spec
+  `docs/superpowers/specs/2026-10-23-elya-float-natively-design.md`.
+  - A float is its bits in an untraced word; IEEE arithmetic and equality, also
+    inside data (a float mask per tag, `elya_eq_init`) and in `o == o`.
+  - `elya_float_text` writes the evaluator's text (shortest, closest, ties half up,
+    no exponent), proven against Rust on 200,000 random values; decode by `strtod`.
+  - `float.to_string` on both sides.
+  - Needs the Windows gate (`runtime.c`; `%.780e` exactness and `strtod` on UCRT).
+
 ## The next five steps
 
-### 1. `Float` natively
-
-The evaluator has `Float`:
-- literals, `+. -. *. /.`, the comparisons and `-x`;
-- `==` (a NaN is unequal to itself, also inside a declared type);
-- `with any` encoding and decoding.
-
-Core refuses the literal: 3 sweep programs, 2 in `any_handler.rs` and 1 in
-`structural_eq.rs`. A float is observable only through `op.encode`/`op.show`, `==` and
-the comparisons: no builtin turns one into a `String`, and `--value` refuses a
-non-`Int` main.
-
-Measure exactly what the evaluator writes for a float first. Measured once:
-`10000000000000000000000000000000000000000.0` for `1e40`, and `-inf`. Then decide in a
-spec:
-- the word representation (the IEEE bits in an untraced word?);
-- a C printer that matches Rust's `f64` output, on edge values: NaN, both infinities,
-  `-0.0`, subnormals, `0.1 +. 0.2`, and `2^53` and beyond;
-- decoding;
-- whether a `float.to_string` builtin belongs in the same step.
-
-### 2. Decoding at an effect's own parameter, on both sides
+### 1. Decoding at an effect's own parameter, on both sides
 
 `op.decode` of an answer whose type is an effect's parameter (`St(s)`'s
 `fn get() -> s`) is refused on both sides by name (the evaluator's S2; native D4 of
@@ -493,7 +482,7 @@ and native's operation type already holds them. The stricter alternative is to k
 the refusal and report it in `elya check` (a static error at the `with
 any` handle when a handled operation's answer mentions a parameter).
 
-### 3. A row variable inside data in a function's own result, natively
+### 2. A row variable inside data in a function's own result, natively
 
 A native wrong value the 2026-10-23 review found (older than it). A top-level
 function whose own result has a row variable INSIDE DATA
@@ -506,7 +495,7 @@ then decide in a spec whether `match_tys` binds row tails or the wrapper coerces
 data by its type; if neither fits soon, refuse the shape by name natively so no
 wrong value is left.
 
-### 4. Parser error recovery inside a body
+### 3. Parser error recovery inside a body
 
 `recover_to_decl` (src/parse.rs) skips to the next `fn`, `pub`, `import`, `effect` or
 `type`, and a lambda's `fn` counts, so after a parse error inside a function body
@@ -524,7 +513,7 @@ parse that runs out of tokens must be an error. Also a label after non-ASCII tex
 dropped by the renderer (byte offsets passed where `ariadne` counts characters), and
 E0209 across files labels only the second declaration.
 
-### 5. Modules, part 2: the effect allow-list at the import
+### 4. Modules, part 2: the effect allow-list at the import
 
 ROADMAP priority 2. `import a/b / {E, F}` parses and is E0606 today (part 1 D6).
 Measure what a module's public functions perform (their rows after inference, and
@@ -534,6 +523,21 @@ in the importer's list, or the import is refused by name), what an import withou
 a list grants (everything, for compatibility, or nothing: the stricter choice),
 whether builtins (`io`, `time`) count as effects to grant (`IO` is an effect row
 today), and transitivity (a module's own imports are bounded by its grant).
+
+### 5. `Float`, part 2: comparisons, negation and conversions
+
+Floats run natively since 6baf595, but `<`, `<=`, `>`, `>=` are `Int` only, `-x`
+on a float expression is E0400 (only a literal folds its sign), and nothing
+converts between `Int` and `Float`. Measure what a numeric program needs (a mean,
+a square root by Newton's method, a fixed-point loop), then decide in a spec:
+`<.`-style operators or overloading the comparisons by type (the stricter choice is
+separate operators, like `+.`); IEEE comparison semantics with NaN (every
+comparison false); `-.x` or `-` on floats; `float.of_int` (exact or rounded),
+`float.truncate`/`round` to `Int` (failing by name outside `Int`'s range and on
+NaN, as checked arithmetic does). Both sides, differential tests on the edges.
+
+## Also open, unscheduled
+
 E0434 rejects a direct inner `with any` over `Hold(Opt(Op))` but accepts the same
 handler through a generic function (the 2026-10-23 review's F4). A helper taking an
 operation costs a clone per operation and helper (refused past the budget, 256).
