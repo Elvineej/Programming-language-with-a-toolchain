@@ -25,7 +25,21 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   now print the program's text on stdout and the error on stderr, as native does.
   Gate 1144 / 110 as predicted; the review found no defect.
 - New HANDOFF step 5: parser error recovery inside a body.
-- Working on: HANDOFF step 1 (modules, part 1).
+- **Done: modules, part 1** (HANDOFF step 1). Spec fac887f, plan 93b6c74,
+  implementation c7bb82b, HANDOFF db49fd1. `import a/b [as c]` reads `a/b.elya` next to
+  the program; qualified function calls (`b.f`, `pub` exported); type-level names stay
+  unqualified, program-unique, visible where imported; E0600-E0606; one merged module;
+  the CLI reads the files. Gate 1184 / 113 (predicted 1174; the review added five
+  tests: separate name spaces in the visibility check, E0205 inside modules, duplicate
+  E0201s, an end-of-file span, two messages).
+  - **Decisions (mine; please review):** paths relative to the root program's
+    directory (not the importing file); qualified functions only; unqualified,
+    program-unique types/effects (so `op.show` and traces need no format change),
+    visible only through a direct import; no `pub type`; `import a/b / {E}` reserved
+    and refused (E0606) until part 2; builtins still need no import.
+  - Found (older, now in HANDOFF step 4): a truncated declaration at the end of a file
+    (`pub fn g(`) passes `check` and is silently dropped.
+- Working on: HANDOFF step 1 (`Float` natively).
 
 ## 2026-10-23 10:50 UTC — DONE at 11:50 (scheduled run, LIGHT mode: four tasks)
 
