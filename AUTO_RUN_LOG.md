@@ -3,7 +3,7 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-23 10:50 UTC — DONE at 12:45 (scheduled run, LIGHT mode: four tasks)
+## 2026-10-23 10:50 UTC — DONE at 11:50 (scheduled run, LIGHT mode: four tasks)
 
 - The 03:38 entry's last commit is 1f1e677 (05:00 UTC), over three hours old: taken
   over (lock 95e1e08). LLVM 18's headers and `libzstd-dev` were missing; installed
