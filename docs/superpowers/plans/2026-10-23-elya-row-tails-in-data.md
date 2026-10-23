@@ -34,3 +34,11 @@ own row do not mention take the use's rows (`bind_tails`).
 ## Task 4: gate, controls, review, sweep
 
 `sh scripts/check.sh` at 1197 / 117; the three controls; a review; the sweep.
+
+## Outcome
+
+- Task 1: four red tests as predicted (a pointer; "match failed" for the rest).
+  The long list needed a generic builder (`rep`) to keep its closures' rows
+  closed; an annotated builder's open result tail made it no upcast at all.
+- Tasks 2-3: green, 1197 / 117 as predicted. Controls K1-K3 distinct.
+- Task 4: the review's F1 added D4 and one test: 1198 / 117.

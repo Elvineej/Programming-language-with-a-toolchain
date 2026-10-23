@@ -1,6 +1,6 @@
 # Upcasts through data, natively
 
-**Status:** in progress (2026-10-23, branch `auto/elya`, a scheduled run). HANDOFF
+**Status:** done (2026-10-23, branch `auto/elya`, scheduled runs). HANDOFF
 step 1 ("a row variable inside data in a function's own result"). The design
 choices are Claude's under the maintainer's delegation (rule 2), recorded here.
 
@@ -77,13 +77,59 @@ top-level function's clone, or inference unifying a `let` value with its use).
   compares names as well as arguments, so a disagreement D2 misses is refused by
   name instead of matching the wrong tags.
 
-## 2. Evidence (planned)
+- **D4. A non-regular type is refused by name** (added after the review's F1).
+  A type whose field is the type itself at a bigger instance
+  (`type N(a) { Z(a), S(N(Option(a))) }`) would need a rebuild function per
+  instance, without end: the first version overflowed the compiler's stack.
+  A rebuild of `T` asked for at an instance bigger (in type nodes) than one of
+  `T` still being built is refused, "upcast through a non-regular data type".
+  Only finitely many instances stay at or below a size, so every endless chain
+  reaches the refusal, and a regular type never does (its rebuilds of `T` are
+  at the same instance, a cache hit, or smaller ones).
+  - *Rejected:* a fixed nesting budget. It refuses deep but regular data
+    (`Option` eight deep runs) and states no reason.
+  - *Rejected:* a run-time generic rebuild (walking the value by its
+    descriptor). The native data has no type arguments at run time.
 
-- `crates/codegen/tests/native_upcast_data.rs` (execution, differential): r1,
-  top_val, let_lam, list, nest, plus a list of a million closures upcast once
-  (the copy is iterative enough natively: the 1 GiB stack), a value path upcast
-  (`let v: Option(fn() / {E} -> Int) = mk()` style), and an upcast of data
-  holding data holding a function.
-- Negative controls (in its header): D1 off (r1 prints a pointer again), D2's
-  data case off (let_lam is refused by name, since D3 now catches it: the
-  control shows the guard works), D3 off with D2 off (match failed).
+## 2. Evidence
+
+`crates/codegen/tests/native_upcast_data.rs`, five tests, all execution and
+differential against the evaluator:
+
+- `wrapped_results_inside_data_agree`: r1 (15) and top_val (16; `mk2` returns
+  the top-level `mk`, passed as a value).
+- `call_results_upcast_through_data_agree`: let_lam, list, nest, and `deep` (a
+  generic type whose fields are another generic type; output before the
+  upcast keeps its place).
+- `a_long_list_is_upcast_once`: 300 000 closures, built by a generic `rep`,
+  upcast once (600001). The evaluator dominates the time; the review ran
+  3 000 000 natively.
+- `bound_values_upcast_through_data_agree`: the annotated value path, and a
+  bound value captured by a lambda and used twice.
+- `a_non_regular_type_is_refused_by_name` (D4), with `Option` eight deep
+  running.
+
+Negative controls (in the file's header): K1 D1 off, r1 prints a pointer; K2
+D2's data case off, let_lam is refused by name (D3's guard works); K3 D2 and
+D3 off, "match failed".
+
+Gate: 1197 / 117 as predicted after task 3; 1198 / 117 with D4's test.
+
+## 3. Review
+
+An independent review built the diff and probed ~40 programs (mutually
+recursive generic types, several parameters, `with any`, multi-shot, upcast
+data as operation arguments and resume values, captures, row-polymorphic
+callers, zero-constructor types, Float and String fields). Sweep: 886 shared
+programs, the same class for every one before and after.
+
+- **F1** (fixed test-first, D4): a non-regular type overflowed the compiler's
+  stack (HEAD: "match failed").
+- **F2** (older, unchanged by this slice; now HANDOFF step 1): the wrapper
+  still answers a pointer when a row variable of the own result also appears
+  in a PARAMETER (`fn mko(k: fn() -> Int) -> fn() -> fn() -> Int { fn() { k } }`
+  used at `fn(fn() / {E} -> Int) -> fn() / {E} -> fn() / {E} -> Int`: 16 in
+  the evaluator). D1 leaves such a variable unbound on purpose (a parameter
+  binds it); the call is typed with the use's result instead.
+- Refused by name, acceptable: a function field mentioning the type variable
+  in a parameter position ("upcast in a parameter position").

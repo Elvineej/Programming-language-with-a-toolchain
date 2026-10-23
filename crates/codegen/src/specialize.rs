@@ -583,7 +583,13 @@ pub(crate) fn conv_eq(a: &Ty, b: &Ty) -> bool {
                 && pa.iter().zip(pb.iter()).all(|(x, y)| conv_eq(x, y))
                 && conv_eq(ra, rb)
         }
-        (Ty::Con(_, xa), Ty::Con(_, xb)) | (Ty::Tuple(xa), Ty::Tuple(xb)) => {
+        // D3 (spec 2026-10-23-elya-row-tails-in-data): after
+        // `mono::instantiate_types` both sides are argument-less instances, so
+        // the NAME is what says the convention of the fields.
+        (Ty::Con(na, xa), Ty::Con(nb, xb)) => {
+            na == nb && xa.len() == xb.len() && xa.iter().zip(xb.iter()).all(|(x, y)| conv_eq(x, y))
+        }
+        (Ty::Tuple(xa), Ty::Tuple(xb)) => {
             xa.len() == xb.len() && xa.iter().zip(xb.iter()).all(|(x, y)| conv_eq(x, y))
         }
         _ => true,
@@ -591,9 +597,11 @@ pub(crate) fn conv_eq(a: &Ty, b: &Ty) -> bool {
 }
 
 /// Can `coerce` turn a value of type `from` into one of type `to`: is every
-/// disagreement in a covariant layer, never in a parameter or under a data
-/// constructor? A disagreement that is an INSTANTIATION of an open row (an
-/// alias of a generic local) is left to the guard, which names it.
+/// disagreement in a covariant layer, never in a parameter? A data type's
+/// arguments are covariant here (D2: the data is rebuilt; a parameter of a
+/// function field is refused by name when the rebuild is made). A
+/// disagreement that is an INSTANTIATION of an open row (an alias of a generic
+/// local) is left to the guard, which names it.
 fn coercible(from: &Ty, to: &Ty) -> bool {
     if conv_eq(from, to) {
         return true;
@@ -607,7 +615,49 @@ fn coercible(from: &Ty, to: &Ty) -> bool {
                 && fp.iter().zip(tp.iter()).all(|(x, y)| conv_eq(x, y))
                 && coercible(fr, tr)
         }
+        (Ty::Con(fn_, fa), Ty::Con(tn, ta)) => {
+            fn_ == tn
+                && fa.len() == ta.len()
+                && fa.iter().zip(ta.iter()).all(|(x, y)| coercible(x, y))
+        }
         _ => false,
+    }
+}
+
+/// A canonical text for a type: label names and arguments, no spans (the key
+/// of a generated `$coerce` function).
+fn ty_key(t: &Ty) -> String {
+    match t {
+        Ty::Fn(ps, row, r) => {
+            let mut k = String::from("fn(");
+            for p in ps {
+                k.push_str(&ty_key(p));
+                k.push(',');
+            }
+            k.push_str(")/{");
+            for (name, lab) in &row.labels {
+                k.push_str(name);
+                k.push('(');
+                for a in &lab.args {
+                    k.push_str(&ty_key(a));
+                    k.push(',');
+                }
+                k.push_str("),");
+            }
+            match &row.tail {
+                RowTail::Closed => {}
+                other => k.push_str(&format!("|{other:?}")),
+            }
+            k.push_str("}->");
+            k.push_str(&ty_key(r));
+            k
+        }
+        Ty::Con(n, a) => format!(
+            "{n}[{}]",
+            a.iter().map(ty_key).collect::<Vec<_>>().join(",")
+        ),
+        Ty::Tuple(a) => format!("({})", a.iter().map(ty_key).collect::<Vec<_>>().join(",")),
+        other => format!("{other:?}"),
     }
 }
 
@@ -656,6 +706,31 @@ struct Adapter<'t> {
     counter: usize,
     types: &'t [CoreType],
     generic: &'t [CoreGenericType],
+    /// D2: `ty_key(from) -> ty_key(to)` to the generated `$coerce` function's
+    /// name; inserted BEFORE its body is built, so a recursive field calls it.
+    coercions: HashMap<String, String>,
+    /// The generated `$coerce` functions, appended to the module.
+    made: Vec<CoreFn>,
+    /// The rebuilds whose bodies are being built: (type name, size of `from`).
+    building: Vec<(String, usize)>,
+}
+
+/// The number of nodes in a type: what a non-regular type's rebuilds grow.
+fn ty_size(t: &Ty) -> usize {
+    match t {
+        Ty::Fn(ps, row, r) => {
+            1 + ps.iter().map(ty_size).sum::<usize>()
+                + row
+                    .labels
+                    .values()
+                    .flat_map(|l| l.args.iter())
+                    .map(ty_size)
+                    .sum::<usize>()
+                + ty_size(r)
+        }
+        Ty::Con(_, a) | Ty::Tuple(a) => 1 + a.iter().map(ty_size).sum::<usize>(),
+        _ => 1,
+    }
 }
 
 impl Adapter<'_> {
@@ -669,6 +744,21 @@ impl Adapter<'_> {
     fn coerce(&mut self, e: CoreExpr, from: &Ty, to: &Ty) -> R<CoreExpr> {
         if conv_eq(from, to) {
             return Ok(e);
+        }
+        if let (Ty::Con(fname, _), Ty::Con(tname, _)) = (from, to) {
+            if fname == tname {
+                let f = self.data_coercion(fname, from, to, e.span)?;
+                let callee = CoreExpr {
+                    span: e.span,
+                    ty: Ty::Fn(vec![from.clone()], EffectRow::pure(), Box::new(to.clone())),
+                    kind: CoreKind::Var(f),
+                };
+                return Ok(CoreExpr {
+                    span: e.span,
+                    ty: to.clone(),
+                    kind: CoreKind::App(Rc::new(callee), Rc::new([e])),
+                });
+            }
         }
         let (Ty::Fn(fp, _, fr), Ty::Fn(tp, _, tr)) = (from, to) else {
             return Err(CodegenError::Unsupported(
@@ -724,6 +814,106 @@ impl Adapter<'_> {
             ty: to.clone(),
             kind: CoreKind::Lambda(params.into(), Rc::new(body)),
         })
+    }
+
+    /// D2: the pure function that rebuilds a value of `from` (a parametric
+    /// type `name`) as one of `to`, the same type at arguments that differ in
+    /// convention: a match on every constructor, rebuilt with each field
+    /// coerced (a function field by the adapter lambda, a data field by its
+    /// own `$coerce`, a recursive field by this one). Made once per pair.
+    fn data_coercion(
+        &mut self,
+        name: &str,
+        from: &Ty,
+        to: &Ty,
+        span: elya::span::Span,
+    ) -> R<String> {
+        let key = format!("{}->{}", ty_key(from), ty_key(to));
+        if let Some(f) = self.coercions.get(&key) {
+            return Ok(f.clone());
+        }
+        let Some(decl) = self.generic.iter().find(|g| g.name == name) else {
+            return Err(CodegenError::Unsupported(
+                "upcast through a data constructor",
+            ));
+        };
+        // A rebuild of `name` asked for at a BIGGER instance while one of
+        // `name` is being built: a non-regular type (`S(N(Option(a)))`), whose
+        // rebuilds never end (the review's F1: the compiler's stack
+        // overflowed). Finitely many keys stay at or below any size, so every
+        // endless chain gets here.
+        let size = ty_size(from);
+        if self.building.iter().any(|(n, s)| n == name && *s < size) {
+            return Err(CodegenError::Unsupported(
+                "upcast through a non-regular data type",
+            ));
+        }
+        let ctors: Vec<String> = decl.ctors.iter().map(|c| c.name.clone()).collect();
+        self.counter += 1;
+        let fname = format!("$coerce.{name}.{}", self.counter);
+        self.coercions.insert(key, fname.clone());
+        let x = format!("{fname}.x");
+        let scrut = CoreExpr {
+            span,
+            ty: from.clone(),
+            kind: CoreKind::Var(x.clone()),
+        };
+        self.building.push((name.to_string(), size));
+        let arms = self.coercion_arms(&fname, &ctors, from, to, span);
+        self.building.pop();
+        let arms = arms?;
+        self.made.push(CoreFn {
+            name: fname.clone(),
+            params: Rc::new([CoreParam {
+                name: x,
+                ty: from.clone(),
+            }]),
+            body: CoreExpr {
+                span,
+                ty: to.clone(),
+                kind: CoreKind::Match(Rc::new(scrut), arms.into()),
+            },
+            row: EffectRow::pure(),
+        });
+        Ok(fname)
+    }
+
+    /// One arm per constructor: match it, rebuild it with each field coerced.
+    fn coercion_arms(
+        &mut self,
+        fname: &str,
+        ctors: &[String],
+        from: &Ty,
+        to: &Ty,
+        span: elya::span::Span,
+    ) -> R<Vec<elya::core::CoreArm>> {
+        let mut arms = Vec::with_capacity(ctors.len());
+        for c in ctors {
+            let fa = crate::mono::generic_fields(self.generic, from, c).unwrap_or_default();
+            let fb = crate::mono::generic_fields(self.generic, to, c).unwrap_or_default();
+            let names: Vec<String> = (0..fa.len()).map(|i| format!("{fname}.{c}.{i}")).collect();
+            let mut fields = Vec::with_capacity(fa.len());
+            for ((n, a), b) in names.iter().zip(fa.iter()).zip(fb.iter()) {
+                let v = CoreExpr {
+                    span,
+                    ty: a.clone(),
+                    kind: CoreKind::Var(n.clone()),
+                };
+                fields.push(self.coerce(v, a, b)?);
+            }
+            arms.push(elya::core::CoreArm {
+                pat: CorePat::Ctor(
+                    c.clone(),
+                    names.iter().map(|n| CorePat::Var(n.clone())).collect(),
+                ),
+                body: CoreExpr {
+                    span,
+                    ty: to.clone(),
+                    kind: CoreKind::Ctor(c.clone(), fields.into()),
+                },
+            });
+        }
+        Ok(arms)
     }
 
     /// Walks with every tracked binder's type (the binders
@@ -896,6 +1086,9 @@ pub(crate) fn adapt_upcasts(core: &CoreModule) -> R<CoreModule> {
         counter: 0,
         types: &core.types,
         generic: &core.generic_types,
+        coercions: HashMap::new(),
+        made: Vec::new(),
+        building: Vec::new(),
     };
     let mut fns = Vec::with_capacity(core.fns.len());
     for f in &core.fns {
@@ -912,6 +1105,7 @@ pub(crate) fn adapt_upcasts(core: &CoreModule) -> R<CoreModule> {
             row: f.row.clone(),
         });
     }
+    fns.append(&mut ad.made);
     Ok(CoreModule {
         fns,
         types: core.types.clone(),

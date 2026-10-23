@@ -82,12 +82,86 @@ fn inner_type(f: &CoreFn, use_ty: &Ty) -> Ty {
         _ => f.row.clone(),
     };
     let own_ret = crate::mono::apply(&f.body.ty, &tys);
+    // D1 (spec 2026-10-23-elya-row-tails-in-data): a row variable of the own
+    // result that no parameter and not the own row mentions is instantiated by
+    // this use alone, so it takes the use's row at the same position (a
+    // closed one; `specialize` clones `f` for it). A CLOSED row of the own
+    // result stays: that layer is a real upcast, which the coercion reaches.
+    let mut fixed = Vec::new();
+    for p in f.params.iter() {
+        row_vars(&p.ty, &mut fixed);
+    }
+    row_vars(
+        &Ty::Fn(Vec::new(), f.row.clone(), Box::new(Ty::Base(TyCon::Unit))),
+        &mut fixed,
+    );
+    let mut binds = crate::specialize::RowSubst::new();
+    bind_tails(&own_ret, uret, &fixed, &mut binds);
+    let own_ret = crate::specialize::subst_ty(&own_ret, &binds);
     let ret = if is_ground(&own_ret) {
         own_ret
     } else {
         (**uret).clone()
     };
     Ty::Fn(ups.clone(), own, Box::new(ret))
+}
+
+/// Every open row variable in `t`.
+fn row_vars(t: &Ty, out: &mut Vec<elya::types::RowVar>) {
+    match t {
+        Ty::Fn(ps, row, r) => {
+            if let RowTail::Open(v) = row.tail {
+                out.push(v);
+            }
+            for l in row.labels.values() {
+                l.args.iter().for_each(|a| row_vars(a, out));
+            }
+            ps.iter().for_each(|p| row_vars(p, out));
+            row_vars(r, out);
+        }
+        Ty::Con(_, a) | Ty::Tuple(a) => a.iter().for_each(|x| row_vars(x, out)),
+        _ => {}
+    }
+}
+
+/// D1: walks the own result `own` and the use's result `used` together
+/// through results and data arguments (never parameters); an open tail of
+/// `own` not in `fixed`, where `used` has a CLOSED row, is bound to the use's
+/// labels beyond its own. An open row in the use (inside row-polymorphic code)
+/// binds nothing, so the result stays unground and the use's type is kept.
+fn bind_tails(
+    own: &Ty,
+    used: &Ty,
+    fixed: &[elya::types::RowVar],
+    out: &mut crate::specialize::RowSubst,
+) {
+    match (own, used) {
+        (Ty::Fn(op, orow, or), Ty::Fn(up, urow, ur)) if op.len() == up.len() => {
+            if let RowTail::Open(v) = orow.tail {
+                if !fixed.contains(&v) && urow.tail == RowTail::Closed && !out.contains_key(&v) {
+                    let extra = urow
+                        .labels
+                        .iter()
+                        .filter(|(l, _)| !orow.labels.contains_key(*l))
+                        .map(|(l, lab)| (l.clone(), lab.clone()))
+                        .collect();
+                    out.insert(v, extra);
+                }
+            }
+            bind_tails(or, ur, fixed, out);
+        }
+        (Ty::Con(on, oa), Ty::Con(un, ua)) if on == un && oa.len() == ua.len() => {
+            for (o, u) in oa.iter().zip(ua.iter()) {
+                bind_tails(o, u, fixed, out);
+            }
+        }
+        (Ty::Tuple(oa), Ty::Tuple(ua)) if oa.len() == ua.len() => {
+            for (o, u) in oa.iter().zip(ua.iter()) {
+                bind_tails(o, u, fixed, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// No type variable and no open row anywhere in `t`.
