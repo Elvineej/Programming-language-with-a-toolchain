@@ -41,7 +41,20 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     handlers and effect rows (they were unchecked).
 - New HANDOFF step 5: diagnostics at the edges (non-ASCII labels, E0209 across
   files, deep nesting overflow, a double report).
-- Working on: HANDOFF step 1 (modules part 2: the effect allow-list at the import).
+- **Done: modules part 2, the effect allow-list at the import** (HANDOFF step 1).
+  Spec+plan a291b15, implementation 48d5c8f. An import grants exactly its
+  list; none grants nothing; E0606/E0607/E0608. Gate 1221 / 119 (predicted 1217;
+  the review added two tests). K5-K6 distinct. The review found three soundness
+  holes (closures leaving through `resume`, an operation's argument, `St(s)`);
+  fixed test-first by walking label arguments and operation signatures.
+  - **Decisions (mine; please review):** the strict default (no list = nothing);
+    capability = positive positions of `pub` types (a callback's effects are the
+    caller's); `IO` and user effects alike; builtins still need no import, and a
+    list on `elya/io` is refused.
+  - **Changed tests:** `an_allow_list_is_e0606` (expectation, by D2); two programs
+    gained `/ {Log}` (expectations unchanged).
+- New HANDOFF step 5: capabilities part 3 (attenuation; builtins behind an import).
+- Working on: HANDOFF step 1 (`Float`, part 2).
 
 ## 2026-10-23 17:53 UTC — IN PROGRESS (scheduled run, FULL mode)
 

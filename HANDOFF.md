@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1209 passed, 119 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1221 passed, 119 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
@@ -503,20 +503,18 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   pass `check`); `fn` starts a declaration only before a name. One mistake is
   one diagnostic: no E0200 cascade, later real errors still reported.
 
+- **Modules, part 2: the effect allow-list at the import** (2026-10-24, branch
+  `auto/elya`, a scheduled run, 48d5c8f): spec
+  `docs/superpowers/specs/2026-10-24-elya-modules-part-2-design.md`.
+  `import a/b / {IO, Net}` grants exactly that; no list grants nothing. A
+  module's capability is the effect labels at positive positions of its `pub`
+  functions' inferred types, through data fields, label arguments and operation
+  signatures (the review found three holes there). E0606 (not granted), E0607
+  (unknown or repeated name), E0608 (a list on a standard module).
+
 ## The next five steps
 
-### 1. Modules, part 2: the effect allow-list at the import
-
-ROADMAP priority 2. `import a/b / {E, F}` parses and is E0606 today (part 1 D6).
-Measure what a module's public functions perform (their rows after inference, and
-what reaches them through closures and handlers they install), then decide in a
-spec: the check (every effect a module's code can perform, unhandled inside it, is
-in the importer's list, or the import is refused by name), what an import without
-a list grants (everything, for compatibility, or nothing: the stricter choice),
-whether builtins (`io`, `time`) count as effects to grant (`IO` is an effect row
-today), and transitivity (a module's own imports are bounded by its grant).
-
-### 2. `Float`, part 2: comparisons, negation and conversions
+### 1. `Float`, part 2: comparisons, negation and conversions
 
 Floats run natively since 6baf595, but `<`, `<=`, `>`, `>=` are `Int` only, `-x`
 on a float expression is E0400 (only a literal folds its sign), and nothing
@@ -528,7 +526,7 @@ comparison false); `-.x` or `-` on floats; `float.of_int` (exact or rounded),
 `float.truncate`/`round` to `Int` (failing by name outside `Int`'s range and on
 NaN, as checked arithmetic does). Both sides, differential tests on the edges.
 
-### 3. Record and replay as an Elya library
+### 2. Record and replay as an Elya library
 
 ROADMAP priority 3. `examples/09_record_any.elya` shows a recorder written with
 `with any`; the host-level trace (`elya run --record`, `ELYA_RECORD`) covers only
@@ -539,7 +537,7 @@ spec whether a standard module (`import elya/replay`, now that modules exist)
 ships them, and in what trace format (the host trace's `question = answer`
 lines, so one replayer reads both).
 
-### 4. Aliases that rebind their target: rename instead of keeping the `let`
+### 3. Aliases that rebind their target: rename instead of keeping the `let`
 
 `anf`'s alias rule (spec 2026-10-22 D3) keeps `let x = y` when the body binds
 `y` again, so the alias stays a local whose uses at a user effect are refused
@@ -549,7 +547,7 @@ are other shapes), then decide in a spec whether renaming the inner binder
 (capture-avoiding substitution) lets them run, with differential tests and a
 control that brings the refusal back.
 
-### 5. Diagnostics at the edges
+### 4. Diagnostics at the edges
 
 Left by the parser-recovery slice (spec 2026-10-23-elya-parser-recovery §3):
 a label after non-ASCII text is dropped by the renderer (byte offsets passed
@@ -559,6 +557,19 @@ declaration; 5000 nested brackets overflow the parser's host stack (both
 end reports twice at one span. Measure each, then decide in a spec: character
 offsets in the renderer, a nesting limit with a named error (or an explicit
 stack), and the double report.
+
+### 5. Capabilities, part 3: attenuation, and builtins behind an import
+
+ROADMAP priority 2's last part. Modules part 2 (spec 2026-10-24) checks what an
+import grants; the root holds every capability and builtins need no import.
+Measure what a program needs to give a dependency LESS than a builtin (a clock
+that only answers a fixed time, a printer that prefixes or counts lines), then
+decide in a spec: an attenuating handler written in Elya over a user effect
+(`Clock`, `Out`) that the root grants instead of `IO`, shipped as a standard
+module; and whether `io`/`time` should need `import elya/io` in a module (not
+the root), so a module's source says it touches the host. Also recorded by the
+part-2 review: data of a type with an `IO` field passed through a module needs
+the grant (a type cannot say who built a value).
 
 ## Also open, unscheduled
 
