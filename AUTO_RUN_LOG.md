@@ -29,7 +29,19 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   review sweep 916 programs, 0 differ, no class changed.
   - **Decision (mine; please review):** bind rather than refuse.
 - New HANDOFF step 5: aliases that rebind their target (rename, not keep).
-- Working on: HANDOFF step 1 (parser error recovery inside a body).
+- **Done: parser error recovery inside a body** (HANDOFF step 1). Spec+plan 9a08e3a,
+  implementation f4777d0. A failed statement is `Expr::Error` (new AST node) and
+  parsing resumes at the next statement; a header failure keeps a stub; the end of
+  the file is an error (p6 used to pass `check`). Gate 1209 / 119 (predicted 1207;
+  the review added one test). Review: 1083 valid programs unchanged, ~10 000
+  mutants, no hang or panic, nothing newly accepted.
+  - **Decisions (mine; please review):** statement-level recovery with an error
+    node; `fn` is a declaration only before a name (column 0 was tried first and
+    broke a test whose source loses its indentation); a stricter `}` check on
+    handlers and effect rows (they were unchecked).
+- New HANDOFF step 5: diagnostics at the edges (non-ASCII labels, E0209 across
+  files, deep nesting overflow, a double report).
+- Working on: HANDOFF step 1 (modules part 2: the effect allow-list at the import).
 
 ## 2026-10-23 17:53 UTC — IN PROGRESS (scheduled run, FULL mode)
 

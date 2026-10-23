@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1199 passed, 117 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1209 passed, 119 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
@@ -494,27 +494,18 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   and the result's own parameter positions before its results; six measured
   programs and two from the review printed a pointer natively. Core pass only.
 
+- **Parser error recovery inside a body** (2026-10-23, branch `auto/elya`, a
+  scheduled run, f4777d0): spec
+  `docs/superpowers/specs/2026-10-23-elya-parser-recovery-design.md`. A failed
+  statement is `Expr::Error` and parsing resumes at the next one (a bad `let`
+  keeps its name); a function whose header fails stays a known name; the end of
+  the file inside a declaration is an error (a truncated declaration used to
+  pass `check`); `fn` starts a declaration only before a name. One mistake is
+  one diagnostic: no E0200 cascade, later real errors still reported.
+
 ## The next five steps
 
-### 1. Parser error recovery inside a body
-
-`recover_to_decl` (src/parse.rs) skips to the next `fn`, `pub`, `import`, `effect` or
-`type`, and a lambda's `fn` counts, so after a parse error inside a function body
-the rest is parsed from the middle of an expression; a handler's parse error drops
-the whole function, so every call to it is a second error (E0200). Measure the
-diagnostics a set of one-mistake programs gives today (a missing `)`, a bad `let`,
-a bad pattern, a bad clause), then decide in a spec: recover to the next statement
-in a block (a newline at brace depth, now that D4 of 2026-10-23 makes lines
-meaningful) and to the next top-level declaration at column 0, and keep a
-declaration whose body failed as a known name so its callers are not reported.
-
-Found by the modules review (older): a truncated declaration at the end of a file
-(`pub fn g(`, or a body ending `{ x +`) passes `check` and is silently DROPPED: a
-parse that runs out of tokens must be an error. Also a label after non-ASCII text is
-dropped by the renderer (byte offsets passed where `ariadne` counts characters), and
-E0209 across files labels only the second declaration.
-
-### 2. Modules, part 2: the effect allow-list at the import
+### 1. Modules, part 2: the effect allow-list at the import
 
 ROADMAP priority 2. `import a/b / {E, F}` parses and is E0606 today (part 1 D6).
 Measure what a module's public functions perform (their rows after inference, and
@@ -525,7 +516,7 @@ a list grants (everything, for compatibility, or nothing: the stricter choice),
 whether builtins (`io`, `time`) count as effects to grant (`IO` is an effect row
 today), and transitivity (a module's own imports are bounded by its grant).
 
-### 3. `Float`, part 2: comparisons, negation and conversions
+### 2. `Float`, part 2: comparisons, negation and conversions
 
 Floats run natively since 6baf595, but `<`, `<=`, `>`, `>=` are `Int` only, `-x`
 on a float expression is E0400 (only a literal folds its sign), and nothing
@@ -537,7 +528,7 @@ comparison false); `-.x` or `-` on floats; `float.of_int` (exact or rounded),
 `float.truncate`/`round` to `Int` (failing by name outside `Int`'s range and on
 NaN, as checked arithmetic does). Both sides, differential tests on the edges.
 
-### 4. Record and replay as an Elya library
+### 3. Record and replay as an Elya library
 
 ROADMAP priority 3. `examples/09_record_any.elya` shows a recorder written with
 `with any`; the host-level trace (`elya run --record`, `ELYA_RECORD`) covers only
@@ -548,7 +539,7 @@ spec whether a standard module (`import elya/replay`, now that modules exist)
 ships them, and in what trace format (the host trace's `question = answer`
 lines, so one replayer reads both).
 
-### 5. Aliases that rebind their target: rename instead of keeping the `let`
+### 4. Aliases that rebind their target: rename instead of keeping the `let`
 
 `anf`'s alias rule (spec 2026-10-22 D3) keeps `let x = y` when the body binds
 `y` again, so the alias stays a local whose uses at a user effect are refused
@@ -557,6 +548,17 @@ the 2026-10-23 review fuzzer. Measure them first (which are rebinding, which
 are other shapes), then decide in a spec whether renaming the inner binder
 (capture-avoiding substitution) lets them run, with differential tests and a
 control that brings the refusal back.
+
+### 5. Diagnostics at the edges
+
+Left by the parser-recovery slice (spec 2026-10-23-elya-parser-recovery §3):
+a label after non-ASCII text is dropped by the renderer (byte offsets passed
+where `ariadne` counts characters); E0209 across files labels only the second
+declaration; 5000 nested brackets overflow the parser's host stack (both
+`check` and `run` die, no diagnostic); an `if` without `else` before a block's
+end reports twice at one span. Measure each, then decide in a spec: character
+offsets in the renderer, a nesting limit with a named error (or an explicit
+stack), and the double report.
 
 ## Also open, unscheduled
 
