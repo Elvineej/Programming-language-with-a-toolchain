@@ -3,11 +3,38 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-23 10:50 UTC — IN PROGRESS (scheduled run, LIGHT mode: at most five tasks)
+## 2026-10-23 10:50 UTC — DONE at 12:45 (scheduled run, LIGHT mode: four tasks)
 
-- The 03:38 entry's last commit is 1f1e677 (05:00 UTC), over three hours old: taken over.
-  Its own entry is marked ended below. Next: HANDOFF step 1, operation values as values
-  natively.
+- The 03:38 entry's last commit is 1f1e677 (05:00 UTC), over three hours old: taken
+  over (lock 95e1e08). LLVM 18's headers and `libzstd-dev` were missing; installed
+  (`llvm-18-dev`, `libpolly-18-dev`, `libzstd-dev`). Baseline 1106 / 106.
+- **Done: operation values as values natively** (HANDOFF step 1).
+  - Spec b4772c1, plan ff5d055, implementation dce886a:
+    `docs/superpowers/specs/2026-10-23-elya-operation-values-natively-design.md`.
+  - A `with any` clause's `o` is a value of a synthesized type per operation
+    (its arguments as fields). It can be given to helpers, stored, captured,
+    returned and compared natively; each of those was refused before.
+  - Gate 1115 / 107 (plan predicted 1112; the review added three tests). Controls
+    K1-K3 each failed distinctly. Sweep: 810 programs, no disagreement.
+  - The review found one new wrong value: `==` on data around an operation
+    answered `eq` where the evaluator fails. It also found two regressions: the
+    clone budget, and a nested recorder at an outer answer type. All three were
+    fixed test-first. The fix for the first changes `runtime.c`'s `elya_eq` (a
+    fourth parameter; fields walked in the evaluator's order).
+  - **Decisions (mine; please review):**
+    - a per-operation type and per-operation clones, rather than a run-time
+      operation value;
+    - S2 decoding at an effect's parameter stays refused on both sides (now
+      HANDOFF step 5).
+  - **Changed tests, by these decisions:**
+    - `any.rs`'s `an_operation_value_used_as_a_value_is_refused`, which now expands;
+    - the `describe(o)` half of `what_is_not_compiled_is_refused_by_name`, which
+      runs now.
+- HANDOFF: step 1 moved to Done; new step 5, decoding at an effect's own parameter.
+  Next: HANDOFF step 1, literals at the edges and a layout rule.
+- `graphify` is not installed here, so `graphify update .` was not run.
+- Windows-gate debt: dce886a (runtime C: `elya_eq`), with the earlier list
+  (670c842, dfb8a5c, e78ace6, ...).
 
 ## 2026-10-23 03:38 UTC — ended without a DONE mark at 05:00, taken over 10:50 (interactive session, at the maintainer's "Continue until u reach the limit"; re-dated)
 

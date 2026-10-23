@@ -125,4 +125,8 @@ handlers, decode in helpers, local `let` handlers). Findings, fixed test-first
   `Hold(Opt(Op))` but accepts the same handler through a generic function. Recorded
   in HANDOFF.
 
+Sweep (`scripts/sweep.py`, 810 programs): 464 same, no disagreement and no
+`both-fail-differently`; the 5 refusals and 3 `Float` build errors are the known
+gaps (HANDOFF).
+
 Windows: `runtime.c`'s `elya_eq` changed (a fourth parameter, the walk's order).
