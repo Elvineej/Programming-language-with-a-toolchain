@@ -14,8 +14,8 @@ pub struct Import {
     pub path: Vec<String>,
     /// `import a/b as c` (modules part 1 D2).
     pub alias: Option<String>,
-    /// `import a/b / {E, F}`: the effect allow-list, parsed and refused until
-    /// modules part 2 (D6, E0606).
+    /// `import a/b / {E, F}`: the effect allow-list (modules part 2, spec
+    /// 2026-10-24): what the module may perform for its importer.
     pub effects: Option<Vec<Spanned<String>>>,
 }
 

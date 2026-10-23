@@ -1,6 +1,6 @@
 # Modules, part 2: the effect allow-list at the import
 
-**Status:** in progress (2026-10-24, branch `auto/elya`, a scheduled run). HANDOFF
+**Status:** done (2026-10-24, branch `auto/elya`, a scheduled run). HANDOFF
 step 1, ROADMAP priority 2 (capabilities per dependency). The design choices are
 Claude's under the maintainer's delegation (rule 2), recorded here.
 
@@ -87,3 +87,39 @@ declaration (an unwritten declaration row is empty).
    `elya/io`.
 Negative controls: polarity ignored (every label counted): test 2's handler
 library is E0606; the check off: test 1's m1 runs.
+
+## 3. Outcome and review
+
+Red as predicted. Two existing programs gained `/ {Log}` (their module performs
+`Log`): `types_and_effects_cross_an_import` and native_modules' "effects"; their
+expectations are unchanged. `an_allow_list_is_e0606` changed expectation by D2
+(a list is checked now, and may grant more than is used). Controls K5 and K6 in
+`tests/modules.rs`'s header.
+
+The independent review found three soundness holes of one kind, fixed
+test-first (`closures_through_operations_are_the_module_s`): a closure the
+module makes left through an effect, unseen.
+
+- **S1:** a module's handler resumed the importer's body with a closure that
+  prints; the effect was only in the callback's row (negative).
+- **S2:** an operation's argument was a closure that prints; the import granted
+  only the operation's effect.
+- **S3:** an effect label's type argument (`St(fn() / {IO} -> Int)`) carried it.
+
+So D1 now also walks, for every label in any row: its type arguments at both
+polarities (an effect's arguments flow both ways), and its operations'
+declared signatures. A label at a positive position (the module performs it):
+the operations' parameters positive (the module supplies them), the answers
+negative. A label at a negative position (the module may handle it): the
+answers positive (the module resumes with them), the parameters negative. Each
+type and effect is walked once per polarity.
+
+Also from the review: the help named the module by its path's last segment;
+it now names it as the importing file does (its alias).
+`the_help_names_the_function_through_the_alias`.
+
+Recorded, not changed: a module whose `pub` function returns data of a type
+with an `IO` function field needs `IO` granted even when it only passes the
+importer's own value along (`pub fn first(x: Job, y: Job) -> Job { x }`): by
+D1 it could build such a value itself, and a type cannot say who made a value.
+The generic `pub fn first(x, y) { x }` needs nothing.

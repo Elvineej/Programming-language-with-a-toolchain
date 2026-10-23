@@ -11,6 +11,13 @@
 //! - K3, the `pub` check off: `private_and_unknown_functions_are_e0602_and_e0603`.
 //! - K4, every file parsed at span base 0: `a_diagnostic_names_its_file` (the error
 //!   is drawn in the root file).
+//!
+//! Modules part 2 (spec `docs/superpowers/specs/2026-10-24-elya-modules-part-2-design.md`):
+//! - K5, polarity ignored (every label counted): `a_callback_s_effect_is_not_the_module_s`
+//!   (the handler library `sand` is E0606 for `Net`). Rerun after the review's fix
+//!   (labels in `Interface::label`): the same failure.
+//! - K6, the grant check off: `an_import_grants_only_its_list`,
+//!   `a_callback_s_effect_is_not_the_module_s` and `grants_are_transitive` (no E0606).
 
 use elya::Session;
 
@@ -163,7 +170,9 @@ fn types_and_effects_cross_an_import() {
          effect Log { fn say(line: String) -> Unit }\n\
          pub fn find(n: Int) / {Log} -> Opt(Int) {\n  say(\"looking\")\n  if n > 0 { Yes(n) } else { No }\n}\n",
     )];
-    let root = "import util\n\
+    // `/ {Log}`: `find` performs `Log` (modules part 2 D2; the import had no
+    // list before part 2 -- a CHANGED PROGRAM, the expectation unchanged).
+    let root = "import util / {Log}\n\
                 fn get(o: Opt(Int)) -> Int { match o { Yes(n) -> n  No -> 0 } }\n\
                 pub fn main() -> Int {\n\
                   handle {\n\
@@ -221,15 +230,15 @@ fn a_diagnostic_names_its_file() {
     assert!(!e.contains("main.elya"), "{e}");
 }
 
+/// Part 1 refused every list (E0606 "not checked yet"); part 2 checks it (spec
+/// 2026-10-24-elya-modules-part-2 D2): a list may grant more than the module
+/// uses. CHANGED EXPECTATION, by that decision.
 #[test]
 fn an_allow_list_is_e0606() {
     let files = [("util", UTIL)];
     let root = "import util / {IO}\npub fn main() -> Int { util.twice(1) }\n";
-    has(
-        &errors(root, &files),
-        "E0606",
-        "an import's effect list is not checked yet",
-    );
+    assert_eq!(errors(root, &files), "");
+    assert_eq!(run(root, &files).1, 2);
 }
 
 #[test]
@@ -331,4 +340,199 @@ fn messages_name_the_real_problem() {
     let e = errors(root, &files);
     has(&e, "E0605", "the root program");
     assert!(!e.contains("add `import main`"), "{e}");
+}
+
+// ---- modules, part 2: the effect allow-list (spec 2026-10-24) -------------
+
+const STEAL: &str =
+    "pub fn parse(s: String) -> Int { let t = time.now_ms()  io.println(\"phoning home\")  3 }\n";
+const NET: &str =
+    "effect Net { fn get(u: String) -> Int }\npub fn fetch() -> Int { get(\"x\") + 1 }\n";
+
+#[test]
+fn an_import_grants_only_its_list() {
+    let files = [("steal", STEAL)];
+    let m1 = "import steal\npub fn main() -> Int { steal.parse(\"{}\") }\n";
+    has(
+        &errors(m1, &files),
+        "E0606",
+        "module `steal` can perform `IO`, which this import does not grant",
+    );
+    let granted = "import steal / {IO}\npub fn main() -> Int { steal.parse(\"{}\") }\n";
+    assert_eq!(run(granted, &files), ("phoning home\n".to_string(), 3));
+    // A returned closure that prints is the module's I/O too.
+    let files = [(
+        "mk",
+        "pub fn later() -> fn() -> Int { fn() { io.println(\"later\")  7 } }\n",
+    )];
+    let m3 = "import mk\npub fn main() -> Int { let f = mk.later()  f() }\n";
+    has(&errors(m3, &files), "E0606", "can perform `IO`");
+    // A user effect is a capability like `IO`.
+    let files = [("net", NET)];
+    let m4 = "import net\npub fn main() -> Int { handle { net.fetch() } with { Net.get(u) -> resume(41) } }\n";
+    has(&errors(m4, &files), "E0606", "can perform `Net`");
+    let m4ok = "import net / {Net}\npub fn main() -> Int { handle { net.fetch() } with { Net.get(u) -> resume(41) } }\n";
+    assert_eq!(run(m4ok, &files).1, 42);
+    // Handled inside the module: nothing escapes, nothing to grant.
+    let files = [(
+        "quiet",
+        "effect Net { fn get(u: String) -> Int }\nfn fetch() -> Int { get(\"x\") + 1 }\n\
+         pub fn sandboxed() -> Int { handle { fetch() } with { Net.get(u) -> resume(41) } }\n",
+    )];
+    let m5 = "import quiet\npub fn main() -> Int { quiet.sandboxed() }\n";
+    assert_eq!(run(m5, &files).1, 42);
+}
+
+#[test]
+fn a_callback_s_effect_is_not_the_module_s() {
+    // A handler library receives a closure performing `Net`: the caller's.
+    let files = [(
+        "sand",
+        "effect Net { fn get(u: String) -> Int }\n\
+         pub fn sandbox(body: fn() / {Net} -> Int) -> Int { handle { body() } with { Net.get(u) -> resume(5) } }\n",
+    )];
+    let root =
+        "import sand\npub fn main() -> Int { sand.sandbox(fn() { get(\"a\") + get(\"b\") }) }\n";
+    assert_eq!(run(root, &files).1, 10);
+    // A library handing its callback a closure that prints: its own I/O.
+    let files = [(
+        "cb",
+        "pub fn with_log(k: fn(fn(String) -> Int) -> Int) -> Int { k(fn(s) { io.println(s)  1 }) }\n",
+    )];
+    let root = "import cb\npub fn main() -> Int { cb.with_log(fn(log) { log(\"x\") }) }\n";
+    has(&errors(root, &files), "E0606", "can perform `IO`");
+    // Data holding a closure that prints, returned: its own I/O.
+    let files = [(
+        "boxed",
+        "type Box { Box(fn() / {IO} -> Int) }\n\
+         pub fn make() -> Box { Box(fn() { io.println(\"boxed\")  1 }) }\n",
+    )];
+    let root = "import boxed\npub fn main() -> Int { match boxed.make() { Box(f) -> f() } }\n";
+    has(&errors(root, &files), "E0606", "can perform `IO`");
+}
+
+#[test]
+fn grants_are_transitive() {
+    // `lib` is granted `IO` by its own import and lets it escape: the root must
+    // grant it to `lib`.
+    let files = [
+        ("steal", STEAL),
+        (
+            "lib",
+            "import steal / {IO}\npub fn go() -> Int { steal.parse(\"x\") + 1 }\n",
+        ),
+    ];
+    let root = "import lib\npub fn main() -> Int { lib.go() }\n";
+    has(
+        &errors(root, &files),
+        "E0606",
+        "module `lib` can perform `IO`",
+    );
+    let root_ok = "import lib / {IO}\npub fn main() -> Int { lib.go() }\n";
+    assert_eq!(run(root_ok, &files).1, 4);
+    // `lib` importing `steal` without the grant: `lib`'s own import is refused.
+    let files = [
+        ("steal", STEAL),
+        (
+            "lib",
+            "import steal\npub fn go() -> Int { steal.parse(\"x\") + 1 }\n",
+        ),
+    ];
+    let root = "import lib / {IO}\npub fn main() -> Int { lib.go() }\n";
+    has(
+        &errors(root, &files),
+        "E0606",
+        "module `steal` can perform `IO`",
+    );
+    // `lib` handling `net`'s effect inside: a pure interface, nothing to grant.
+    let files = [
+        ("net", NET),
+        (
+            "lib",
+            "import net / {Net}\npub fn go() -> Int { handle { net.fetch() } with { Net.get(u) -> resume(1) } }\n",
+        ),
+    ];
+    let root = "import lib\npub fn main() -> Int { lib.go() }\n";
+    assert_eq!(run(root, &files).1, 2);
+}
+
+#[test]
+fn the_list_names_visible_effects() {
+    let files = [("util", UTIL)];
+    has(
+        &errors(
+            "import util / {Nope}\npub fn main() -> Int { util.twice(1) }\n",
+            &files,
+        ),
+        "E0607",
+        "no effect `Nope` here",
+    );
+    has(
+        &errors(
+            "import util / {IO, IO}\npub fn main() -> Int { util.twice(1) }\n",
+            &files,
+        ),
+        "E0607",
+        "`IO` is listed twice",
+    );
+    has(
+        &errors(
+            "import elya/io / {IO}\npub fn main() -> Int { 1 }\n",
+            &files,
+        ),
+        "E0608",
+        "a standard module takes no effect list",
+    );
+    // An effect declared in the importing file, or in a module it imports, is
+    // visible.
+    let files = [("net", NET)];
+    let root = "import net / {Net}\neffect Mine { fn m() -> Int }\nimport net as n2 / {Mine}\n\
+                pub fn main() -> Int { handle { net.fetch() } with { Net.get(u) -> resume(1) } }\n";
+    let e = errors(root, &files);
+    assert!(!e.contains("E0607"), "{e}");
+}
+
+/// The review's S1-S3: a closure the module makes can leave through an
+/// effect's operations or a label's type arguments; each is the module's
+/// capability (spec 2026-10-24 D1, operations and label arguments).
+#[test]
+fn closures_through_operations_are_the_module_s() {
+    // S1: the module's handler resumes the importer's body with a closure that
+    // prints; `Ask` is only in the callback's row.
+    let files = [(
+        "m",
+        "effect Ask { fn ask() -> fn() / {IO} -> Int }\n\
+         pub fn sandbox(body) { handle { body() } with { Ask.ask() -> resume(fn() { io.println(\"pwned\")  1 }) } }\n",
+    )];
+    let root = "import m\npub fn main() -> Int { m.sandbox(fn() { let f = ask()  f() }) }\n";
+    has(&errors(root, &files), "E0606", "can perform `IO`");
+    // S2: an operation's argument is a closure that prints.
+    let files = [(
+        "m",
+        "effect Give { fn give(f: fn() / {IO} -> Int) -> Int }\n\
+         pub fn go() -> Int { give(fn() { io.println(\"pwned\")  1 }) }\n",
+    )];
+    let root = "import m / {Give}\npub fn main() -> Int { handle { m.go() } with { Give.give(f) -> resume(f()) } }\n";
+    has(&errors(root, &files), "E0606", "can perform `IO`");
+    let ok = "import m / {Give, IO}\npub fn main() -> Int { handle { m.go() } with { Give.give(f) -> resume(f()) } }\n";
+    assert_eq!(run(ok, &files), ("pwned\n".to_string(), 1));
+    // S3: a label's type argument carries it.
+    let files = [(
+        "m",
+        "effect St(s) { fn get() -> s  fn put(x: s) -> Unit }\n\
+         pub fn go() { put(fn() { io.println(\"pwned\")  1 })  0 }\n",
+    )];
+    let root = "import m / {St}\npub fn main() -> Int {\n\
+                let k = handle { m.go() } with { St.get() -> fn(s) { resume(s)(s) }  St.put(x) -> fn(s) { resume(Unit)(x) }  return(v) -> fn(s) { s() + v } }\n\
+                k(fn() { 0 })\n}\n";
+    has(&errors(root, &files), "E0606", "can perform `IO`");
+}
+
+/// The review's quality finding: the help names the function as the importing
+/// file writes it (through its alias).
+#[test]
+fn the_help_names_the_function_through_the_alias() {
+    let files = [("a/b", "pub fn go() -> Int { io.println(\"x\")  1 }\n")];
+    let root = "import a/b as c\npub fn main() -> Int { c.go() }\n";
+    has(&errors(root, &files), "E0606", "`c.go` performs it");
 }

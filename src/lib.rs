@@ -54,11 +54,13 @@ pub fn front_end_with(
             .is_some_and(|l| program.refused.contains(&l.span))
     }));
     if diags.is_empty() {
-        let (idiags, affine_sites) = types::infer_with_sites(&session, &module);
+        let (idiags, affine_sites, fns) = types::infer_with_interfaces(&session, &module);
         diags.extend(idiags);
         if !diags.iter().any(|d| d.severity == Severity::Error) {
             diags.extend(exhaust::check(&module));
             diags.extend(affine::check(&module, &affine_sites));
+            // Modules part 2: what each import grants (spec 2026-10-24).
+            diags.extend(modules::check_grants(&program.grants, &module, &fns));
         }
     }
     (module, diags, program.sources)

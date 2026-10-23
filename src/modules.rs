@@ -7,6 +7,12 @@
 //! `a.b.f`, its unshadowed references are renamed with it, and `b.f` in an
 //! importer becomes a reference to `a.b.f`. Types, constructors, effects and
 //! operations keep their names and must be visible through an import (D3).
+//!
+//! Part 2 (spec 2026-10-24): an import grants exactly its effect list
+//! (`import a/b / {IO}`; none is `{}`), checked after inference by
+//! [`check_grants`] against the effects at positive positions of the module's
+//! `pub` functions' types (E0606); E0607 for a list naming an effect the file
+//! cannot see, E0608 for a list on a standard module.
 
 use crate::ast::*;
 use crate::diag::Diagnostic;
@@ -23,6 +29,22 @@ pub struct Program {
     /// later pass's diagnostic on the same span is a duplicate of it (the
     /// modules review's R3).
     pub refused: HashSet<Span>,
+    /// Every user import and what it grants (modules part 2, spec 2026-10-24):
+    /// checked after inference by [`check_grants`].
+    pub grants: Vec<Grant>,
+}
+
+/// One import of a user module: its span, its effect list (empty when none is
+/// written: D2), the module's path, and the merged names of its `pub`
+/// functions, each with its source name.
+pub struct Grant {
+    pub span: Span,
+    /// The name the importing file calls the module by (its alias, or the
+    /// path's last segment).
+    pub name: String,
+    pub list: Vec<Spanned<String>>,
+    pub target: String,
+    pub exports: Vec<(String, String)>,
 }
 
 /// Reads a module path (`a/b`) to its file's name and text, or `None`.
@@ -82,18 +104,19 @@ impl<'r, 'a> Loader<'r, 'a> {
         for imp in &module.imports {
             let span = imp.span;
             let target = imp.node.path.join("/");
-            if let Some(effects) = &imp.node.effects {
-                let at = effects.first().map_or(span, |e| e.span);
-                self.diags.push(
-                    Diagnostic::error(
-                        "E0606",
-                        "an import's effect list is not checked yet (modules part 2)",
-                    )
-                    .with_label(at, "an effect allow-list")
-                    .with_help("remove the list: part 1 does not check what a module performs"),
-                );
-            }
             if imp.node.path.first().map(String::as_str) == Some("elya") {
+                // Part 2 D5: builtins are in scope without an import, and the
+                // root holds every capability.
+                if let Some(effects) = &imp.node.effects {
+                    let at = effects.first().map_or(span, |e| e.span);
+                    self.diags.push(
+                        Diagnostic::error("E0608", "a standard module takes no effect list")
+                            .with_label(at, "an effect allow-list")
+                            .with_help(format!(
+                                "write `import {target}`: the program itself holds every capability"
+                            )),
+                    );
+                }
                 let std_ok = imp.node.path.len() == 2
                     && BUILTIN_MODULES.contains(&imp.node.path[1].as_str());
                 if std_ok && imp.node.alias.is_some() {
@@ -232,15 +255,270 @@ pub fn load(
     // `units` is in post-order: every module after the ones it imports, the root
     // last.
     let mut refused = HashSet::new();
+    let grants = grants(&units, &mut diags);
     let module = merge(units, &mut diags, &mut refused);
     (
         Program {
             module,
             sources,
             refused,
+            grants,
         },
         diags,
     )
+}
+
+/// Part 2: every loaded user import with its list and the target's exports;
+/// and E0607 for a listed name that is not `IO` or an effect visible in the
+/// importing file (D4), or that is listed twice.
+fn grants(units: &[Unit], diags: &mut Vec<Diagnostic>) -> Vec<Grant> {
+    let index: HashMap<&str, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.path.as_str(), i))
+        .collect();
+    let mut effect_owner: HashMap<&str, usize> = HashMap::new();
+    for (i, u) in units.iter().enumerate() {
+        for d in &u.module.decls {
+            if let Decl::Effect(e) = &d.node {
+                effect_owner.entry(e.name.as_str()).or_insert(i);
+            }
+        }
+    }
+    let root = units.len() - 1;
+    let mut out = Vec::new();
+    for (me, u) in units.iter().enumerate() {
+        for imp in &u.module.imports {
+            let target = imp.node.path.join("/");
+            if imp.node.path.first().map(String::as_str) == Some("elya") {
+                continue;
+            }
+            let list = imp.node.effects.clone().unwrap_or_default();
+            let mut seen = HashSet::new();
+            for e in &list {
+                if !seen.insert(e.node.clone()) {
+                    diags.push(
+                        Diagnostic::error("E0607", format!("`{}` is listed twice", e.node))
+                            .with_label(e.span, "a second time"),
+                    );
+                    continue;
+                }
+                let visible = e.node == "IO"
+                    || effect_owner
+                        .get(e.node.as_str())
+                        .is_some_and(|&o| o == me || u.imports.contains(&units[o].path));
+                if !visible {
+                    diags.push(
+                        Diagnostic::error("E0607", format!("no effect `{}` here", e.node))
+                            .with_label(e.span, "not `IO` or an effect this file can see")
+                            .with_help(
+                                "an effect is visible where it is declared and in the files that import its module",
+                            ),
+                    );
+                }
+            }
+            // Only a module that loaded (a failed one is reported already).
+            let Some(&t) = index.get(target.as_str()) else {
+                continue;
+            };
+            if !u.imports.contains(&target) || t == root {
+                continue;
+            }
+            let exports = units[t]
+                .module
+                .decls
+                .iter()
+                .filter_map(|d| match &d.node {
+                    Decl::Fn(f) if f.is_pub => Some((f.name.clone(), mangle(&target, &f.name))),
+                    _ => None,
+                })
+                .collect();
+            out.push(Grant {
+                span: imp.span,
+                name: imp
+                    .node
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| imp.node.path.last().cloned().unwrap_or_default()),
+                list,
+                target,
+                exports,
+            });
+        }
+    }
+    out
+}
+
+/// Part 2 D1-D3, after inference: each import's module may expose, positively
+/// in its `pub` functions' types, only the effects its list grants; else E0606
+/// per (import, effect).
+pub fn check_grants(
+    grants: &[Grant],
+    module: &Module,
+    fns: &HashMap<String, crate::types::Ty>,
+) -> Vec<Diagnostic> {
+    let types: HashMap<&str, &TypeDecl> = module
+        .decls
+        .iter()
+        .filter_map(|d| match &d.node {
+            Decl::Type(t) => Some((t.name.as_str(), t)),
+            _ => None,
+        })
+        .collect();
+    let effects: HashMap<&str, &EffectDecl> = module
+        .decls
+        .iter()
+        .filter_map(|d| match &d.node {
+            Decl::Effect(e) => Some((e.name.as_str(), e)),
+            _ => None,
+        })
+        .collect();
+    let mut diags = Vec::new();
+    for g in grants {
+        // effect -> the first `pub` function exposing it, in declaration order.
+        let mut exposed: Vec<(String, String)> = Vec::new();
+        for (name, merged) in &g.exports {
+            let Some(t) = fns.get(merged) else {
+                continue;
+            };
+            let mut walk = Interface {
+                types: types.clone(),
+                effects: effects.clone(),
+                seen: HashSet::new(),
+                out: Vec::new(),
+            };
+            walk.ty(t, true);
+            for l in walk.out {
+                if !exposed.iter().any(|(e, _)| *e == l) {
+                    exposed.push((l, name.clone()));
+                }
+            }
+        }
+        for (effect, via) in exposed {
+            if g.list.iter().any(|e| e.node == effect) {
+                continue;
+            }
+            diags.push(
+                Diagnostic::error(
+                    "E0606",
+                    format!(
+                        "module `{}` can perform `{effect}`, which this import does not grant",
+                        g.target
+                    ),
+                )
+                .with_label(g.span, format!("grants no `{effect}`"))
+                .with_help(format!(
+                    "`{}.{via}` performs it, or hands it out; grant it with `/ {{{effect}}}` after the path if this module may",
+                    g.name
+                )),
+            );
+        }
+    }
+    diags
+}
+
+/// D1: collects the effect labels at positive positions of types, through
+/// data's declared fields, effect labels' type arguments and effects'
+/// operation signatures (the review's S1-S3: a closure the module makes can
+/// leave through any of them).
+struct Interface<'m> {
+    types: HashMap<&'m str, &'m TypeDecl>,
+    effects: HashMap<&'m str, &'m EffectDecl>,
+    /// (declared type or effect, polarity) already walked.
+    seen: HashSet<(String, bool)>,
+    out: Vec<String>,
+}
+
+impl Interface<'_> {
+    /// A function's own row and result keep `positive`, its parameters flip it;
+    /// data keeps it, through its arguments and declared fields.
+    fn ty(&mut self, t: &crate::types::Ty, positive: bool) {
+        use crate::types::Ty;
+        match t {
+            Ty::Fn(ps, row, r) => {
+                for (l, lab) in &row.labels {
+                    self.label(l, positive);
+                    // An effect's arguments flow both ways (`St(s)`: `put` and
+                    // `get`).
+                    for a in &lab.args {
+                        self.ty(a, true);
+                        self.ty(a, false);
+                    }
+                }
+                for p in ps {
+                    self.ty(p, !positive);
+                }
+                self.ty(r, positive);
+            }
+            Ty::Con(n, args) => {
+                for a in args {
+                    self.ty(a, positive);
+                }
+                self.declared(n, positive);
+            }
+            Ty::Tuple(args) => {
+                for a in args {
+                    self.ty(a, positive);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Label `l` in a row at `positive`: counted when positive (the module
+    /// performs it). Either way its operations carry values: performing it, the
+    /// module supplies the arguments and receives the answers; handling it (a
+    /// callback's row, negative), it supplies the answers.
+    fn label(&mut self, l: &str, positive: bool) {
+        if positive && !self.out.iter().any(|x| x == l) {
+            self.out.push(l.to_string());
+        }
+        let Some(e) = self.effects.get(l).copied() else {
+            return;
+        };
+        if !self.seen.insert((format!("effect {l}"), positive)) {
+            return;
+        }
+        for op in &e.ops {
+            for p in &op.node.param_tys {
+                self.ann(&p.node, positive);
+            }
+            self.ann(&op.node.ret.node, !positive);
+        }
+    }
+
+    /// The labels written in data type `name`'s declared fields, at `positive`.
+    fn declared(&mut self, name: &str, positive: bool) {
+        let Some(t) = self.types.get(name).copied() else {
+            return;
+        };
+        if !self.seen.insert((format!("type {name}"), positive)) {
+            return;
+        }
+        for v in &t.variants {
+            for f in &v.node.fields {
+                self.ann(&f.node, positive);
+            }
+        }
+    }
+
+    fn ann(&mut self, a: &TypeAnn, positive: bool) {
+        if a.name == "fn" {
+            for l in a.row.iter().flatten() {
+                self.label(&l.node, positive);
+            }
+            let n = a.args.len();
+            for (i, x) in a.args.iter().enumerate() {
+                let p = if i + 1 == n { positive } else { !positive };
+                self.ann(&x.node, p);
+            }
+        } else {
+            for x in &a.args {
+                self.ann(&x.node, positive);
+            }
+            self.declared(&a.name, positive);
+        }
+    }
 }
 
 /// What every file declares: its functions (and whether each is `pub`), and the

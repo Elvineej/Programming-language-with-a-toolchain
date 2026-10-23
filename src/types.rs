@@ -3055,7 +3055,7 @@ pub fn infer_schemes(
     _session: &Session,
     module: &Module,
 ) -> (Vec<(String, String)>, Vec<Diagnostic>) {
-    let (schemes, diags, _sites, _typed) = infer_all(module, false);
+    let (schemes, diags, _sites, _typed, _fns) = infer_all(module, false);
     (schemes, diags)
 }
 
@@ -3063,8 +3063,18 @@ pub fn infer_schemes(
 /// params have a `linear`-declared type. The one bounded reach the `affine::check`
 /// pass consumes; the affine *logic* lives entirely in that pass.
 pub fn infer_with_sites(_session: &Session, module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
-    let (_schemes, diags, sites, _typed) = infer_all(module, false);
+    let (_schemes, diags, sites, _typed, _fns) = infer_all(module, false);
     (diags, sites)
+}
+
+/// [`infer_with_sites`] plus every top-level function's generalized type, by
+/// name: a module's interface (spec 2026-10-24-elya-modules-part-2 D1).
+pub fn infer_with_interfaces(
+    _session: &Session,
+    module: &Module,
+) -> (Vec<Diagnostic>, HashSet<Span>, HashMap<String, Ty>) {
+    let (_schemes, diags, sites, _typed, fns) = infer_all(module, false);
+    (diags, sites, fns)
 }
 
 /// Inference plus the per-node type table (Slice 5a-1): every expression node's
@@ -3075,7 +3085,7 @@ pub fn infer_with_types(
     _session: &Session,
     module: &Module,
 ) -> (Vec<Diagnostic>, BTreeMap<Span, String>) {
-    let (_schemes, diags, _sites, typed) = infer_all(module, true);
+    let (_schemes, diags, _sites, typed, _fns) = infer_all(module, true);
     let mut names = Names::default();
     let mut rendered: BTreeMap<Span, String> = BTreeMap::new();
     for (span, ty) in &typed {
@@ -3094,7 +3104,7 @@ pub fn infer_typed_table(
     _session: &Session,
     module: &Module,
 ) -> (Vec<Diagnostic>, BTreeMap<Span, Ty>) {
-    let (_schemes, diags, _sites, typed) = infer_all(module, true);
+    let (_schemes, diags, _sites, typed, _fns) = infer_all(module, true);
     (diags, typed)
 }
 
@@ -3107,6 +3117,7 @@ type InferAllOut = (
     Vec<Diagnostic>,
     HashSet<Span>,
     BTreeMap<Span, Ty>,
+    HashMap<String, Ty>,
 );
 
 /// Type every top-level function, processing mutually-recursive groups (SCCs of
@@ -3281,6 +3292,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
     let groups = tarjan_scc(&edges); // callees before callers (reverse topological)
 
     let mut schemes_out: Vec<(String, String)> = Vec::new();
+    let mut fn_types: Vec<(String, Ty)> = Vec::new();
 
     for group in &groups {
         // 1. fresh monotype per member (with a fresh open ambient row), in scope
@@ -3432,8 +3444,13 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             let scheme = generalize_toplevel(&mut inf, &fnty, &env, group, &fns);
             env.insert(&f.name, scheme.clone());
             schemes_out.push((f.name.clone(), display_scheme(&inf, &scheme)));
+            fn_types.push((f.name.clone(), scheme.ty.clone()));
         }
     }
+    let fn_types: HashMap<String, Ty> = fn_types
+        .into_iter()
+        .map(|(n, t)| (n, inf.resolve(&t)))
+        .collect();
 
     // Record-then-zonk (spec §3): resolve every recorded node type ONCE here,
     // after all SCC groups are solved — never at record-time. Skipped unless a
@@ -3446,7 +3463,13 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
     } else {
         BTreeMap::new()
     };
-    (schemes_out, inf.diags, inf.affine_sites, node_types)
+    (
+        schemes_out,
+        inf.diags,
+        inf.affine_sites,
+        node_types,
+        fn_types,
+    )
 }
 
 fn collect_refs(b: &Block, acc: &mut Vec<String>) {

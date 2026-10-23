@@ -23,3 +23,9 @@ E0607/E0608; `check_grants` after inference walks each target's `pub` types by
 polarity (D1) and reports E0606.
 
 ## Task 4: gate, controls, review
+
+## Outcome
+
+Red as predicted; green at 1217 / 119 as predicted. The review's soundness
+holes S1-S3 and the alias help added two tests: 1221 / 119. Two existing
+programs gained `/ {Log}` (spec §3).

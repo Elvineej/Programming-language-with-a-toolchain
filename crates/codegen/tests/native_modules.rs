@@ -72,8 +72,10 @@ fn modules_agree() {
         )],
         "names",
     );
+    // `/ {Log}`: `find` performs `Log` (modules part 2 D2, 2026-10-24; a CHANGED
+    // PROGRAM, the expectation unchanged).
     agree(
-        "import util\n\
+        "import util / {Log}\n\
          fn get(o: Opt(Int)) -> Int { match o { Yes(n) -> n  No -> 0 } }\n\
          pub fn main() -> Int {\n\
            handle { get(util.find(7)) } with { Log.say(line) -> { io.println(line)  resume(Unit) } }\n\
