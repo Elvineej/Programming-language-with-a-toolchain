@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1139 passed, 110 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1144 passed, 110 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
@@ -439,17 +439,16 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
     parentheses, `-` in handler clauses, the float fold's stated reason; all fixed.
   - Parser only: the Windows gate needs nothing special.
 
+- **A failing traced run keeps its output on stdout** (2026-10-23, branch
+  `auto/elya`, a scheduled run, 8a72c45): spec
+  `docs/superpowers/specs/2026-10-23-elya-traced-run-output-design.md`.
+  `elya run --record|--replay` print the program's output on stdout and the error on
+  stderr, as `elya run` and native binaries do (`record_source`, `replay_source`);
+  a differential test against the native binary in `build_cli.rs`.
+
 ## The next five steps
 
-### 1. A failing traced run keeps its output on stdout
-
-`elya run --replay` drops what the program printed before a failure, and `--record`
-prints it to stderr with the diagnostic; plain `elya run` (since 2026-10-16) and a
-native binary (record or replay) keep it on stdout. Make the two trace modes do the
-same (`run_source_recording`/`run_source_replaying` return the output apart from the
-error), then a differential test of a failing replay's stdout across both sides.
-
-### 2. Modules, part 1: a program in more than one file
+### 1. Modules, part 1: a program in more than one file
 
 ROADMAP priority 2 (capabilities per dependency) needs modules first. Today every
 program is one file and `elya check|run|build` take one path. `import a/b` (with an
@@ -467,7 +466,7 @@ need. Then decide in a spec:
 Leave the effect allow-list at the import boundary to part 2, but choose the syntax so
 it has a place to go.
 
-### 3. `Float` natively
+### 2. `Float` natively
 
 The evaluator has `Float`:
 - literals, `+. -. *. /.`, the comparisons and `-x`;
@@ -488,7 +487,7 @@ spec:
 - decoding;
 - whether a `float.to_string` builtin belongs in the same step.
 
-### 4. Decoding at an effect's own parameter, on both sides
+### 3. Decoding at an effect's own parameter, on both sides
 
 `op.decode` of an answer whose type is an effect's parameter (`St(s)`'s
 `fn get() -> s`) is refused on both sides by name (the evaluator's S2; native D4 of
@@ -501,7 +500,7 @@ and native's operation type already holds them. The stricter alternative is to k
 the refusal and report it in `elya check` (a static error at the `with
 any` handle when a handled operation's answer mentions a parameter).
 
-### 5. A row variable inside data in a function's own result, natively
+### 4. A row variable inside data in a function's own result, natively
 
 A native wrong value the 2026-10-23 review found (older than it). A top-level
 function whose own result has a row variable INSIDE DATA
@@ -514,8 +513,17 @@ then decide in a spec whether `match_tys` binds row tails or the wrapper coerces
 data by its type; if neither fits soon, refuse the shape by name natively so no
 wrong value is left.
 
-Also open, unscheduled: `recover_to_decl` stops at a lambda's `fn`, so errors after
-a parse error inside a body cascade (the 2026-10-23 literals review).
+### 5. Parser error recovery inside a body
+
+`recover_to_decl` (src/parse.rs) skips to the next `fn`, `pub`, `import`, `effect` or
+`type`, and a lambda's `fn` counts, so after a parse error inside a function body
+the rest is parsed from the middle of an expression; a handler's parse error drops
+the whole function, so every call to it is a second error (E0200). Measure the
+diagnostics a set of one-mistake programs gives today (a missing `)`, a bad `let`,
+a bad pattern, a bad clause), then decide in a spec: recover to the next statement
+in a block (a newline at brace depth, now that D4 of 2026-10-23 makes lines
+meaningful) and to the next top-level declaration at column 0, and keep a
+declaration whose body failed as a known name so its callers are not reported.
 E0434 rejects a direct inner `with any` over `Hold(Opt(Op))` but accepts the same
 handler through a generic function (the 2026-10-23 review's F4). A helper taking an
 operation costs a clone per operation and helper (refused past the budget, 256).
