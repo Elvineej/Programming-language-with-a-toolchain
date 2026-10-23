@@ -20,7 +20,12 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     prefix (new statement) vs binary (E0101); newlines are whitespace inside parentheses.
   - **Behaviour change:** a line starting with `+`, `*`, ... that used to continue the
     line before is E0101. No corpus program does this; no test expectation changed.
-- Working on: HANDOFF step 1 (a failing traced run keeps its output on stdout).
+- **Done: a failing traced run keeps its output on stdout** (HANDOFF step 1). Spec
+  5037e19, plan 51f2937, fix 8a72c45, HANDOFF d33f241. `elya run --record|--replay`
+  now print the program's text on stdout and the error on stderr, as native does.
+  Gate 1144 / 110 as predicted; the review found no defect.
+- New HANDOFF step 5: parser error recovery inside a body.
+- Working on: HANDOFF step 1 (modules, part 1).
 
 ## 2026-10-23 10:50 UTC — DONE at 11:50 (scheduled run, LIGHT mode: four tasks)
 
