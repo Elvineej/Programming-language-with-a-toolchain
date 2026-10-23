@@ -410,19 +410,43 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
     to none and 18.
   - Needs the Windows gate.
 
+- **Operation values passed to functions natively** (2026-10-23, branch `auto/elya`,
+  part 1 of step 1): spec `docs/superpowers/specs/2026-10-23-elya-operation-arguments-design.md`.
+  - In a `with any` expansion, a top-level function called with the clause's
+    operation is cloned per operation. The parameter is replaced by the operation's
+    arguments, and the body is rewritten as a clause is.
+  - Recursive helpers, helpers calling helpers, and nested clauses passing both
+    operations all run. Clones of both kinds come from one request-ordered list.
+  - Changed test: `what_is_not_compiled_is_refused_by_name`'s first program (a
+    function given the operation now runs; a function returning it is still refused).
+  - Needs the Windows gate.
+
 ## The next five steps
 
 ### 1. Operation values as values natively
 
-`with any` natively (Done) refuses an operation value used other than by `op.*` or
-`==` (passed to a function, stored, returned: spec D2; a bare alias `let p = o` runs
-since 2026-10-22, because `anf` substitutes it), and two evaluator behaviours
-stay native gaps: decoding a non-regular type (`too many type instances`) and
-decoding at an effect's own parameter (refused on both sides, the evaluator's S2).
-Measure what a recorder library would write (a `describe(o)` helper, a log of
-operations), then decide in a spec: clone functions over `Op(t)` per operation as the
-expansion clones clauses, or a run-time operation value; and whether both sides should
-decode at the instantiation (the evaluator would need it carried).
+Part 1 is Done (2026-10-23, spec `2026-10-23-elya-operation-arguments-design.md`): a
+top-level function called with the operation is cloned per operation, recursion and
+nested clauses included. What is left:
+- **Still refused by name:**
+  - a helper that RETURNS the operation (`op.perform(id(o))`);
+  - the operation stored in data (`E(o, "x")`);
+  - a local lambda called with it (`let d = fn(x) { op.name(x) }  d(o)`);
+  - the operation passed twice to one call (`f(o, o)`).
+
+  Each would need the operation to exist at run time, or a closure cloned per
+  operation. Measure whether a recorder library needs them before deciding.
+- **A helper that performs the operation inside its own handler** (the review's F3)
+  is refused, "calling convention disagrees with the callee", while the same code in
+  the clause runs.
+  - The helper's type puts the handled effect into the `with any` row, so a clone is
+    made for that effect's operations too.
+  - That clone is direct code, but its call keeps the source call site's CPS type.
+- **Two decode gaps:**
+  - decoding a non-regular type, refused natively (`too many type instances`);
+  - decoding at an effect's own parameter, which fails on both sides (the
+    evaluator's S2). Decide whether both sides should decode at the instantiation;
+    the evaluator would need it carried.
 
 ### 2. Literals at the edges, and a layout rule
 
