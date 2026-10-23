@@ -3,10 +3,13 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-22 22:35 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue until u reach the limit")
+## 2026-10-23 03:38 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue until u reach the limit"; re-dated)
 
-- Took the lock at ebc2635. Baseline 1090 / 106. Starting HANDOFF step 1 (one wording
-  for the one-shot trap, and the sweep's smaller gaps).
+- Took the lock at ebc2635 on 2026-10-22 22:35 UTC. Baseline 1090 / 106. Working on
+  HANDOFF step 1 (one wording for the one-shot trap, and the sweep's smaller gaps).
+- Paused at the usage limit at about 00:00 UTC, as the maintainer asked (a four-hour
+  pause, then one more round). Resumed 03:36 UTC; the slice's gate (1100 / 106) and
+  the sweep are done, the review is resuming.
 
 ## 2026-10-22 15:22 UTC — DONE at 22:12 (interactive session, at the maintainer's "Start next task")
 
