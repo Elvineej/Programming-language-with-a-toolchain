@@ -3,7 +3,13 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-23 03:38 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue until u reach the limit"; re-dated)
+## 2026-10-23 10:50 UTC — IN PROGRESS (scheduled run, LIGHT mode: at most five tasks)
+
+- The 03:38 entry's last commit is 1f1e677 (05:00 UTC), over three hours old: taken over.
+  Its own entry is marked ended below. Next: HANDOFF step 1, operation values as values
+  natively.
+
+## 2026-10-23 03:38 UTC — ended without a DONE mark at 05:00, taken over 10:50 (interactive session, at the maintainer's "Continue until u reach the limit"; re-dated)
 
 - Took the lock at ebc2635 on 2026-10-22 22:35 UTC. Baseline 1090 / 106. Working on
   HANDOFF step 1 (one wording for the one-shot trap, and the sweep's smaller gaps).
