@@ -8,8 +8,30 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 - Took the lock at ebc2635 on 2026-10-22 22:35 UTC. Baseline 1090 / 106. Working on
   HANDOFF step 1 (one wording for the one-shot trap, and the sweep's smaller gaps).
 - Paused at the usage limit at about 00:00 UTC, as the maintainer asked (a four-hour
-  pause, then one more round). Resumed 03:36 UTC; the slice's gate (1100 / 106) and
-  the sweep are done, the review is resuming.
+  pause, then one more round). Resumed 03:36 UTC.
+- **Done: one wording for the one-shot trap; constructors and aliases as values
+  natively** (670c842, HANDOFF step 1). Spec
+  `docs/superpowers/specs/2026-10-22-elya-one-shot-words-and-sweep-gaps-design.md`.
+  - **Decisions (mine; please review):**
+    - "a one-shot continuation was resumed twice" on both sides, with a corrected
+      evaluator label;
+    - `anf` wraps a constructor used as a value (it SEGFAULTED natively), and
+      substitutes an alias of a row-polymorphic local;
+    - a user `effect IO` is E0209;
+    - `Float` natively is deferred (HANDOFF's open list).
+  - **Changed tests, by these decisions:** the native trap's words (three tests);
+    `an_operation_value_used_as_a_value_is_refused`'s first clause (a bare alias, which
+    now runs); `an_alias_of_a_generic_local_used_at_a_user_effect_is_refused_by_name`'s
+    program (it rebinds the target, so its guard stays pinned).
+  - Gate 1100 / 106 (predicted 1099; one new test for a consequence the gate found).
+    Sweep: 771 programs, no `both-fail-differently`, no disagreement.
+  - The review found three regressions in the first alias rule: wrong values, compiler
+    panics and new refusals. All were fixed before the commit by narrowing the rule,
+    and each is a corpus row now.
+  - It also found two native wrong values that were already there before this slice,
+    now HANDOFF step 1: a local shadowing a top-level function, used in a lambda (2004
+    for 1007); and a wrapped function's result upcast (5 for 15).
+- Windows-gate debt: 670c842 (with the earlier list).
 
 ## 2026-10-22 15:22 UTC — DONE at 22:12 (interactive session, at the maintainer's "Start next task")
 

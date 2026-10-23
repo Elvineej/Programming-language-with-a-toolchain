@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1090 passed, 106 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1100 passed, 106 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
@@ -374,21 +374,62 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   100 000 deep in 0.07 s (the evaluator 1.2 s). `copies_survive_a_collection_mid_copy`
   moved from m11 to a new row m13 (m11 no longer collects). Needs the Windows gate.
 
+- **One wording for the one-shot trap; constructors and aliases as values natively**
+  (2026-10-22, branch `auto/elya`): spec
+  `docs/superpowers/specs/2026-10-22-elya-one-shot-words-and-sweep-gaps-design.md`.
+  - A second resume of a one-shot continuation is "a one-shot continuation was
+    resumed twice" on both sides. The evaluator's label is corrected: a `with multi`
+    handler of an `effect multi`.
+  - `anf` wraps a constructor used as a value in a closure. Natively a monomorphic
+    one SEGFAULTED (`ap(Wrap, 5)`), and a parametric one was refused.
+  - `anf` also substitutes an alias (`let mk2 = mk`) of a row-polymorphic local, or of
+    a `with any` operation. So those aliases now run.
+    - Not substituted: an alias of a top-level function, of a name a top-level function
+      shares, or of a closed-row type, and any alias whose body rebinds the target.
+    - The review found each of those exclusions by a wrong value (spec §3).
+  - A user effect named `IO` is E0209 at resolve.
+  - Changed expectations:
+    - the native trap's words in three tests;
+    - the first clause of `an_operation_value_used_as_a_value_is_refused`, a bare
+      alias, which now runs;
+    - the program of `an_alias_of_a_generic_local_used_at_a_user_effect_is_refused_by_name`,
+      which now rebinds the alias's target so the guard stays pinned.
+  - Needs the Windows gate.
+
 ## The next five steps
 
-### 1. One wording for the one-shot trap, and the sweep's smaller gaps
+### 1. Two native wrong values: a shadowed top-level name, and a wrapped function's result
 
-The sweep's four `both-fail-differently` programs: a second resume of a one-shot
-continuation is "continuation resumed more than once" in the evaluator and "a one-shot
-continuation was resumed twice" natively. Decide one wording (spec), change both sides
-and the tests that assert either (a decision: call each out). Then the sweep's single
-refusals: a parametric constructor as a function value (`map(xs, Some)`), an
-effect-polymorphic closure through a `let` alias, `Float` in Core.
+The 2026-10-23 review of the one-shot-words slice found both on the build BEFORE it.
+The slice narrowed its alias rule around them; they need fixing properly.
+- **A local that shadows a top-level function, used free in a lambda or a handle
+  body, runs the top-level function.**
+  - `fn inc(x) { x + 1000 }` then `let inc = fn(z) { z * 2 }  let f = fn(q) { inc(q) }`:
+    native 2004, the evaluator 1007.
+  - Some shapes panic the compiler in inkwell instead ("Found PointerValue ...
+    expected the IntValue variant"), and some fuzzed programs fail LLVM
+    verification.
+  - The suspected cause, from the review: closure conversion (`closure.rs:216,235`)
+    and the lifted handle bodies treat a name as module-level whenever a top-level
+    function has it, instead of resolving it by scope.
+  - The reproducing programs are in the 2026-10-22 spec §3 (re-derive them from it:
+    the scratchpad does not travel).
+- **Rule 2's wrapper does not coerce a result-layer upcast.**
+  - `fn mk() -> fn() -> Int { fn() { 5 } }` passed where
+    `fn() -> fn() / {E} -> Int` is expected (`ap2(mk)`): native 5, the evaluator 15.
+  - `inner_type` (`anf.rs`) corrects only the outer row, and the upcast adapter
+    (`specialize.rs`) tracks local binders only.
+
+Measure each with a corpus that writes every binder kind (let, parameter, pattern,
+clause parameter, return binder) and every place an upcast can happen. Fix by scope,
+not by name, then re-run a fuzzer like the review's: aliases, shadowing,
+constructors, multi-shot, every native result against the evaluator.
 
 ### 2. Operation values as values natively
 
 `with any` natively (Done) refuses an operation value used other than by `op.*` or
-`==` (passed to a function, stored, returned: spec D2), and two evaluator behaviours
+`==` (passed to a function, stored, returned: spec D2; a bare alias `let p = o` runs
+since 2026-10-22, because `anf` substitutes it), and two evaluator behaviours
 stay native gaps: decoding a non-regular type (`too many type instances`) and
 decoding at an effect's own parameter (refused on both sides, the evaluator's S2).
 Measure what a recorder library would write (a `describe(o)` helper, a log of
@@ -433,9 +474,13 @@ need. Then decide in a spec:
 Leave the effect allow-list at the import boundary to part 2, but choose the syntax so
 it has a place to go.
 
-Also open, unscheduled: row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
-per platform, deferred by the timers spec D1); a user
-effect named `IO` is refused by Core ("effect IO"); Elya functions are mangled
+Also open, unscheduled: `Float` natively (the evaluator has literals,
+`+. -. *. /.`, the comparisons, `-x`, NaN-aware `==` and `with any` encoding; Core
+refuses the literal, 3 sweep programs). Measure exactly what the evaluator writes for a
+float first (`10000000000000000000000000000000000000000.0` for `1e40`, `-inf`), then
+decide the word representation, a C printer that matches Rust's `f64` output on edge
+values, and decoding. Also row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
+per platform, deferred by the timers spec D1); Elya functions are mangled
 `elya.<name>`; the parser continues a call across a
 newline (`f()` then a line starting `(` is `f()(...)`) -- a layout rule is a language
 decision; the roadmap's
