@@ -304,6 +304,11 @@ pub(crate) fn apply_binop(
         (Le, Int(a), Int(b)) => Ok(Bool(a <= b)),
         (Gt, Int(a), Int(b)) => Ok(Bool(a > b)),
         (Ge, Int(a), Int(b)) => Ok(Bool(a >= b)),
+        // IEEE ordered: false with a NaN (spec 2026-10-24-elya-float-part-2 D1).
+        (LtF, Float(a), Float(b)) => Ok(Bool(a < b)),
+        (LeF, Float(a), Float(b)) => Ok(Bool(a <= b)),
+        (GtF, Float(a), Float(b)) => Ok(Bool(a > b)),
+        (GeF, Float(a), Float(b)) => Ok(Bool(a >= b)),
         (And, Bool(a), Bool(b)) => Ok(Bool(a && b)),
         (Or, Bool(a), Bool(b)) => Ok(Bool(a || b)),
         _ => Err(rt(span, "type error in binary operator")),
@@ -412,6 +417,42 @@ pub(crate) fn int_binary(name: &str, args: &[Value], span: Span) -> Result<Value
     Ok(Value::Int(v))
 }
 
+/// `float.<name>(x)` (spec 2026-10-24-elya-float-part-2 D3, D4): `of_int`
+/// rounds to nearest (ties to even); `truncate` and `round` (halves away from
+/// zero) fail by name on NaN and outside `Int`'s range.
+pub(crate) fn float_conversion(
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, RuntimeError> {
+    match (name, args) {
+        ("of_int", [Value::Int(n)]) => Ok(Value::Float(*n as f64)),
+        ("truncate" | "round", [Value::Float(x)]) => {
+            if x.is_nan() {
+                return Err(rt(span, format!("float.{name}: NaN has no Int value")));
+            }
+            let t = if name == "round" {
+                x.round()
+            } else {
+                x.trunc()
+            };
+            // [-2^63, 2^63): both bounds are exact floats.
+            if (-9223372036854775808.0..9223372036854775808.0).contains(&t) {
+                Ok(Value::Int(t as i64))
+            } else {
+                Err(rt(
+                    span,
+                    format!(
+                        "float.{name}: {} is outside Int's range",
+                        crate::literal::float_text(*x)
+                    ),
+                ))
+            }
+        }
+        _ => Err(rt(span, format!("float.{name}: a wrong argument"))),
+    }
+}
+
 pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, RuntimeError> {
     match (op, v) {
         (UnOp::Neg, Value::Int(n)) => n
@@ -420,6 +461,7 @@ pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Runtim
             .ok_or_else(|| overflow(span)),
         (UnOp::Neg, Value::Float(x)) => Ok(Value::Float(-x)),
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+        (UnOp::NegF, Value::Float(x)) => Ok(Value::Float(-x)),
         _ => Err(rt(span, "type error in unary operator")),
     }
 }
@@ -584,6 +626,15 @@ pub mod tree {
                         };
                         return Ok(Value::Str(crate::literal::float_text(*x)));
                     }
+                    if module == "float"
+                        && crate::resolve::FLOAT_CONVERSIONS.contains(&name.as_str())
+                    {
+                        let mut vals = Vec::new();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        return super::float_conversion(name, &vals, span);
+                    }
                     if module == "int" && super::INT_BINARY_BUILTINS.contains(&name.as_str()) {
                         let mut vals = Vec::new();
                         for a in args.iter() {
@@ -729,6 +780,7 @@ pub mod cek {
         Pending,                                  // still evaluating the callee expression
         Builtin(&'static str),                    // e.g. "io.println"
         IntBinary(&'static str),                  // `int.<name>` of two Ints
+        FloatConversion(&'static str),            // `float.<name>` conversions
         Value(Value),                             // an evaluated callee (a Value::Fn)
         Operation { effect: String, op: String }, // a perform of an effect op
         Ctor { name: String },                    // a data-constructor application
@@ -1158,6 +1210,22 @@ pub mod cek {
                     }
                     Expr::Qualified { module, name } if module == "time" && name == "now_ms" => {
                         CalleeSlot::Builtin("time.now_ms")
+                    }
+                    Expr::Qualified { module, name }
+                        if module == "float"
+                            && crate::resolve::FLOAT_CONVERSIONS.contains(&name.as_str()) =>
+                    {
+                        match crate::resolve::FLOAT_CONVERSIONS
+                            .iter()
+                            .position(|b| b == name)
+                        {
+                            Some(i) => {
+                                CalleeSlot::FloatConversion(crate::resolve::FLOAT_CONVERSIONS[i])
+                            }
+                            None => {
+                                return Err(rt(span, format!("unknown builtin `float.{name}`")))
+                            }
+                        }
                     }
                     Expr::Qualified { module, name } if module == "int" => {
                         match super::INT_BINARY_BUILTINS.iter().position(|b| b == name) {
@@ -1628,6 +1696,10 @@ pub mod cek {
             CalleeSlot::IntBinary(name) => {
                 Ok(State::Return(super::int_binary(name, &args, span)?, k))
             }
+            CalleeSlot::FloatConversion(name) => Ok(State::Return(
+                super::float_conversion(name, &args, span)?,
+                k,
+            )),
             CalleeSlot::Builtin("int.to_string") => {
                 let [Value::Int(n)] = &args[..] else {
                     return Err(rt(span, "int.to_string expects a single Int"));

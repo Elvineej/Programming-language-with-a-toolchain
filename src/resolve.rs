@@ -22,6 +22,10 @@ pub const INT_BINARY_BUILTINS: &[&str] = &[
     "ushr",
 ];
 
+/// The `float.*` conversions (spec 2026-10-24-elya-float-part-2 D3, D4):
+/// `of_int : fn(Int) -> Float`, `truncate` and `round : fn(Float) -> Int`.
+pub const FLOAT_CONVERSIONS: &[&str] = &["of_int", "truncate", "round"];
+
 /// How many arguments a builtin takes (every name in [`builtins`]).
 pub fn builtin_arity(full: &str) -> usize {
     match full {
@@ -43,6 +47,10 @@ pub fn builtins() -> &'static [&'static str] {
         "int.to_string",
         // A float's literal text (2026-10-23, spec 2026-10-23-elya-float-natively D5).
         "float.to_string",
+        // Conversions (2026-10-24, spec 2026-10-24-elya-float-part-2 D3, D4).
+        "float.of_int",
+        "float.truncate",
+        "float.round",
         // Explicit wrapping and bit arithmetic (2026-10-17, spec
         // 2026-10-17-elya-unary-and-wrapping D2).
         "int.wrapping_add",

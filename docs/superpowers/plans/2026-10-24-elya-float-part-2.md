@@ -11,3 +11,7 @@ Prediction: **1229 passed, 121 suites** (+8).
 ## Task 2: front end (lexer, parser, types, resolve, core, evaluator)
 ## Task 3: native (both emitters; `elya_float_to_int` in runtime.c)
 ## Task 4: gate, controls, review
+
+## Outcome
+
+Red as predicted; green at 1229 / 121 as predicted; the review found no defect.

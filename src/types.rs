@@ -1268,6 +1268,7 @@ fn binop_type(op: BinOp) -> (Ty, Ty, Ty) {
         Add | Sub | Mul | Div | Rem => (Ty::int(), Ty::int(), Ty::int()),
         AddF | SubF | MulF | DivF => (Ty::float(), Ty::float(), Ty::float()),
         Lt | Le | Gt | Ge => (Ty::int(), Ty::int(), Ty::bool()),
+        LtF | LeF | GtF | GeF => (Ty::float(), Ty::float(), Ty::bool()),
         Concat => (Ty::str(), Ty::str(), Ty::str()),
         And | Or => (Ty::bool(), Ty::bool(), Ty::bool()),
         // Eq/Ne handled specially in infer_expr (both operands share a fresh var).
@@ -1417,6 +1418,7 @@ impl Infer {
                 let (operand, result) = match op {
                     UnOp::Neg => (Ty::int(), Ty::int()),
                     UnOp::Not => (Ty::bool(), Ty::bool()),
+                    UnOp::NegF => (Ty::float(), Ty::float()),
                 };
                 self.unify(&t, &operand, span);
                 result
@@ -1845,6 +1847,22 @@ impl Infer {
                 self.unify(&want, &got, span);
                 self.node_types.insert(callee.span, want);
                 return Ty::str();
+            }
+            // `float.of_int : fn(Int) -> Float`, `float.truncate`/`round :
+            // fn(Float) -> Int`, pure (spec 2026-10-24-elya-float-part-2 D3, D4;
+            // a failure is not an effect, as with checked `Int` arithmetic).
+            if module == "float" && crate::resolve::FLOAT_CONVERSIONS.contains(&name.as_str()) {
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+                let (from, to) = if name == "of_int" {
+                    (Ty::int(), Ty::float())
+                } else {
+                    (Ty::float(), Ty::int())
+                };
+                let want = Ty::Fn(vec![from], EffectRow::pure(), Box::new(to.clone()));
+                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(to.clone()));
+                self.unify(&want, &got, span);
+                self.node_types.insert(callee.span, want);
+                return to;
             }
             // Wrapping and bit arithmetic: `fn(Int, Int) -> Int`, pure (spec
             // 2026-10-17-elya-unary-and-wrapping D2).

@@ -78,6 +78,15 @@ pub enum TokenKind {
     StarDot,
     #[token("/.")]
     SlashDot,
+    // Float comparisons (spec 2026-10-24-elya-float-part-2 D1).
+    #[token("<.")]
+    LtDot,
+    #[token("<=.")]
+    LeDot,
+    #[token(">.")]
+    GtDot,
+    #[token(">=.")]
+    GeDot,
     #[token("==")]
     EqEq,
     #[token("!=")]

@@ -74,7 +74,11 @@ impl<'a> Parser<'a> {
     /// style, which starts a statement at a line's start.
     fn glued_minus(&self, pos: usize) -> bool {
         match (self.tokens.get(pos), self.tokens.get(pos + 1)) {
-            (Some(m), Some(next)) => m.kind == TokenKind::Minus && m.span.end == next.span.start,
+            // `-.` too (spec 2026-10-24-elya-float-part-2 D2).
+            (Some(m), Some(next)) => {
+                matches!(m.kind, TokenKind::Minus | TokenKind::MinusDot)
+                    && m.span.end == next.span.start
+            }
             _ => false,
         }
     }
@@ -399,6 +403,19 @@ impl<'a> Parser<'a> {
                 Some(spanned(
                     Expr::Unary {
                         op: UnOp::Neg,
+                        expr: Rc::new(e),
+                    },
+                    s,
+                ))
+            }
+            // `-.e` (spec 2026-10-24-elya-float-part-2 D2).
+            TokenKind::MinusDot => {
+                self.bump();
+                let e = self.expr(100)?;
+                let s = span.merge(e.span);
+                Some(spanned(
+                    Expr::Unary {
+                        op: UnOp::NegF,
                         expr: Rc::new(e),
                     },
                     s,
@@ -1647,6 +1664,7 @@ fn can_start_statement(k: &TokenKind) -> bool {
             | T::LParen
             | T::LBrace
             | T::Minus
+            | T::MinusDot
             | T::Bang
     )
 }
@@ -1663,6 +1681,10 @@ fn infix_bp(kind: &TokenKind) -> Option<(u8, u8, BinOp)> {
         T::Le => (30, 31, BinOp::Le),
         T::Gt => (30, 31, BinOp::Gt),
         T::Ge => (30, 31, BinOp::Ge),
+        T::LtDot => (30, 31, BinOp::LtF),
+        T::LeDot => (30, 31, BinOp::LeF),
+        T::GtDot => (30, 31, BinOp::GtF),
+        T::GeDot => (30, 31, BinOp::GeF),
         T::Concat => (40, 41, BinOp::Concat),
         T::Plus => (50, 51, BinOp::Add),
         T::Minus => (50, 51, BinOp::Sub),

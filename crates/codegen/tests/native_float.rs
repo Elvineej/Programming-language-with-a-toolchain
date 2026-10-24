@@ -13,6 +13,14 @@
 //! - K3, `elya_any_check` ignoring a NaN: `with_any_shows_encodes_and_decodes_floats`
 //!   (`o == o` is `same` natively, `differs` in the evaluator).
 //!
+//! Part 2 (spec 2026-10-24-elya-float-part-2), each reverted after:
+//! - K4, `<.` as the unordered `fcmp ult`: `float_comparisons_and_negation_agree`
+//!   (a NaN row is `T` natively).
+//! - K5, `-.e` lowered as `0.0 -. e` (core.rs): the same test (`-.0.0` is `0.0`
+//!   natively, `-0.0` in the evaluator, which negates directly).
+//! - K6, `elya_float_to_int`'s range check off: `float_conversions_agree`'s fail1
+//!   answers natively.
+//!
 //! Found on the way: `%.*e` rounds a tie half to even, Rust's shortest form half
 //! up (2^-25 writes `...95313`); the printer rounds from the exact expansion.
 use elya::core::lower_module;
@@ -333,4 +341,94 @@ fn the_printer_matches_the_evaluator() {
         bad.len(),
         &bad[..bad.len().min(5)]
     );
+}
+
+/// `Float`, part 2 (spec 2026-10-24-elya-float-part-2): comparisons with NaN and
+/// -0.0, and `-.`, in a direct function and in an effectful one (the CPS
+/// emitter).
+#[test]
+fn float_comparisons_and_negation_agree() {
+    let b = |e: &str| format!("io.println(if {e} {{ \"T\" }} else {{ \"F\" }})");
+    let mut lines = Vec::new();
+    for (l, r) in [
+        ("1.5", "2.0"),
+        ("2.0", "2.0"),
+        ("-0.0", "0.0"),
+        ("(0.0 /. 0.0)", "1.0"),
+        ("1.0", "(0.0 /. 0.0)"),
+        ("(1.0 /. 0.0)", "1.0"),
+    ] {
+        for op in ["<.", "<=.", ">.", ">=."] {
+            lines.push(b(&format!("{l} {op} {r}")));
+        }
+    }
+    for x in ["0.0", "-0.0", "1.5", "(1.0 /. 0.0)", "(0.0 /. 0.0)"] {
+        lines.push(format!("show(-.{x})"));
+        lines.push(format!("show(-.(-.{x}))"));
+    }
+    let body = lines.join("\n  ");
+    let src = format!(
+        "{SHOW}effect E {{ fn e() -> Float }}\n\
+         fn lt(x: Float, y: Float) / {{E}} -> Bool {{ e() <. x && -.y >=. e() }}\n\
+         pub fn main() -> Int {{\n  {body}\n  \
+         let c = handle {{ lt(1.0, -2.0) }} with {{ E.e() -> resume(0.5) }}\n  \
+         if c {{ 1 }} else {{ 0 }}\n}}\n"
+    );
+    let got = agree(&src, "cmp");
+    assert_eq!(got.end, Ok("1".into()));
+}
+
+/// Conversions and their failures by name, directly and in a CPS function.
+#[test]
+fn float_conversions_agree() {
+    let mut lines = Vec::new();
+    for n in [
+        "3",
+        "-7",
+        "9007199254740993",
+        "-9223372036854775807 - 1",
+        "9223372036854775807",
+    ] {
+        lines.push(format!("show(float.of_int({n}))"));
+    }
+    for x in [
+        "2.7",
+        "-2.7",
+        "2.5",
+        "-2.5",
+        "0.49999999999999994",
+        "-0.0",
+        "-9223372036854775808.0",
+        "9223372036854774784.0",
+    ] {
+        lines.push(format!("io.println(int.to_string(float.truncate({x})))"));
+        lines.push(format!("io.println(int.to_string(float.round({x})))"));
+    }
+    let body = lines.join("\n  ");
+    let src = format!(
+        "{SHOW}effect E {{ fn e() -> Float }}\n\
+         fn r() / {{E}} -> Int {{ float.round(e()) + float.truncate(e()) }}\n\
+         pub fn main() -> Int {{\n  {body}\n  \
+         handle {{ r() }} with {{ E.e() -> resume(-3.5) }}\n}}\n"
+    );
+    assert_eq!(agree(&src, "conv").end, Ok("-7".into()));
+    for (i, e) in [
+        "float.round(0.0 /. 0.0)",
+        "float.truncate(9223372036854775808.0)",
+        "float.truncate(-9223372036854777856.0)",
+        "float.round(1.0 /. 0.0)",
+        "float.truncate(-1.0 /. 0.0)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let src = format!("pub fn main() -> Int {{ io.println(\"before\")  {e} }}\n");
+        let got = agree(&src, &format!("fail{i}"));
+        assert!(got.end.is_err(), "{e}: {got:?}");
+    }
+    // In a CPS function too.
+    let src = "effect E { fn e() -> Float }\n\
+               fn r() / {E} -> Int { float.truncate(e()) }\n\
+               pub fn main() -> Int { handle { r() } with { E.e() -> resume(0.0 /. 0.0) } }\n";
+    assert!(agree(src, "failcps").end.is_err());
 }

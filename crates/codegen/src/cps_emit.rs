@@ -1399,6 +1399,9 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                     vals[1].into_int_value(),
                 )
             }
+            "float.of_int" | "float.truncate" | "float.round" if vals.len() == 1 => {
+                crate::float_conversion(self.ctx, self.b, self.lc, name, vals[0].into_int_value())
+            }
             "int.to_string" if vals.len() == 1 => {
                 let roots = self.root_live(st, &[])?;
                 let v = crate::int_to_string(self.ctx, self.b, self.lc, vals[0])?;

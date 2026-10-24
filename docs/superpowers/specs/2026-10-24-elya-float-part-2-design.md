@@ -1,6 +1,6 @@
 # `Float`, part 2: comparisons, negation and conversions
 
-**Status:** in progress (2026-10-24, branch `auto/elya`, a scheduled run). HANDOFF
+**Status:** done (2026-10-24, branch `auto/elya`, a scheduled run). HANDOFF
 step 1. The design choices are Claude's under the maintainer's delegation (rule
 2), recorded here.
 
@@ -52,3 +52,19 @@ glued to a literal is part of it (`-1.5`).
 - Negative controls: NaN comparisons as unordered (`fcmp ult`) natively: the
   NaN row disagrees; D2 as `0.0 -. e`: `-.0.0` prints `0.0`; the range check off
   natively: `float.truncate(1e19)` answers.
+
+## 3. Outcome and review
+
+Red as predicted (E0201/E0400; natively a compile error first). Gate 1229 / 121
+as predicted. Controls K4-K6 (in `native_float.rs`'s header) each failed
+distinctly. `float_to_int` takes no libm: `trunc`/`round` would need `-lm` on
+Linux, so the runtime truncates by conversion and rounds by the exact fraction
+(every double at or past 2^52 is an integer).
+
+The independent review found no defect: halves, ±2^63 neighbours, subnormals,
+NaN of either sign, precedence and lexing of `-.`, the layout rule, comparisons
+and conversions inside CPS functions, closures and a `with any` recorder, record
+and replay; all ten examples unchanged. Two older observations, recorded in
+HANDOFF: exponent literals (`1e19`) do not lex; a `main` whose body ends in a
+`let` runs in the evaluator but is refused natively ("block without tail
+expression").

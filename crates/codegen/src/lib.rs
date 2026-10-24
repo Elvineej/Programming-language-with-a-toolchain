@@ -118,6 +118,10 @@ fn op_label(op: BinOp) -> &'static str {
         BinOp::Le => "Le",
         BinOp::Gt => "Gt",
         BinOp::Ge => "Ge",
+        BinOp::LtF => "LtF",
+        BinOp::LeF => "LeF",
+        BinOp::GtF => "GtF",
+        BinOp::GeF => "GeF",
         BinOp::Concat => "Concat",
         BinOp::And => "And",
         BinOp::Or => "Or",
@@ -480,8 +484,17 @@ pub(crate) fn is_data_eq_prim(op: BinOp, args: &[CoreExpr]) -> bool {
 /// `+. -. *. /.`, and `==`/`!=` on two floats (spec 2026-10-23-elya-float-natively
 /// D1, D2): operands are words holding IEEE-754 bits.
 pub(crate) fn is_float_prim(op: BinOp, args: &[CoreExpr]) -> bool {
-    matches!(op, BinOp::AddF | BinOp::SubF | BinOp::MulF | BinOp::DivF)
-        || (matches!(op, BinOp::Eq | BinOp::Ne) && matches!(args[0].ty, Ty::Base(TyCon::Float)))
+    matches!(
+        op,
+        BinOp::AddF
+            | BinOp::SubF
+            | BinOp::MulF
+            | BinOp::DivF
+            | BinOp::LtF
+            | BinOp::LeF
+            | BinOp::GtF
+            | BinOp::GeF
+    ) || (matches!(op, BinOp::Eq | BinOp::Ne) && matches!(args[0].ty, Ty::Base(TyCon::Float)))
 }
 
 /// A float operation on two words: bitcast to `double`, IEEE arithmetic (no
@@ -509,11 +522,16 @@ pub(crate) fn float_prim<'ctx>(
         BinOp::SubF => b.build_float_sub(x, y, "fsub").map_err(internal)?,
         BinOp::MulF => b.build_float_mul(x, y, "fmul").map_err(internal)?,
         BinOp::DivF => b.build_float_div(x, y, "fdiv").map_err(internal)?,
-        BinOp::Eq | BinOp::Ne => {
-            let pred = if op == BinOp::Eq {
-                inkwell::FloatPredicate::OEQ
-            } else {
-                inkwell::FloatPredicate::UNE
+        BinOp::Eq | BinOp::Ne | BinOp::LtF | BinOp::LeF | BinOp::GtF | BinOp::GeF => {
+            // Ordered comparisons: false with a NaN (spec
+            // 2026-10-24-elya-float-part-2 D1); `!=` is unordered-or-unequal.
+            let pred = match op {
+                BinOp::Eq => inkwell::FloatPredicate::OEQ,
+                BinOp::Ne => inkwell::FloatPredicate::UNE,
+                BinOp::LtF => inkwell::FloatPredicate::OLT,
+                BinOp::LeF => inkwell::FloatPredicate::OLE,
+                BinOp::GtF => inkwell::FloatPredicate::OGT,
+                _ => inkwell::FloatPredicate::OGE,
             };
             return b
                 .build_float_compare(pred, x, y, "fcmp")
@@ -548,6 +566,44 @@ pub(crate) fn float_to_string<'ctx>(
     .ok_or(CodegenError::Unsupported(
         "elya_float_to_string returned no value",
     ))
+}
+
+/// `float.of_int`, `float.truncate`, `float.round` (spec
+/// 2026-10-24-elya-float-part-2 D3, D4), both emitters: `sitofp` (round to
+/// nearest, ties to even); the two to `Int` through `elya_float_to_int`, which
+/// fails by name on NaN and outside `Int`'s range. Allocates nothing.
+pub(crate) fn float_conversion<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    name: &str,
+    x: IntValue<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    match name {
+        "float.of_int" => {
+            let f = b
+                .build_signed_int_to_float(x, ctx.f64_type(), "itof")
+                .map_err(internal)?;
+            b.build_bit_cast(f, i64t, "fw").map_err(internal)
+        }
+        "float.truncate" | "float.round" => {
+            let n = name.strip_prefix("float.").unwrap_or(name);
+            let mode = i64t.const_int(u64::from(n == "round"), false);
+            b.build_call(
+                lc.float_to_int,
+                &[c_string(ctx, lc, n).into(), x.into(), mode.into()],
+                "ftoi",
+            )
+            .map_err(internal)?
+            .try_as_basic_value()
+            .left()
+            .ok_or(CodegenError::Unsupported(
+                "elya_float_to_int returned no value",
+            ))
+        }
+        _ => Err(CodegenError::UnsupportedBuiltin(name.to_string())),
+    }
 }
 
 /// `==`/`!=` on `Unit`: both operands are evaluated, the answer is constant.
@@ -655,6 +711,9 @@ pub(crate) fn is_native_builtin(name: &str) -> bool {
         "io.println"
             | "int.to_string"
             | "float.to_string"
+            | "float.of_int"
+            | "float.truncate"
+            | "float.round"
             | "time.now_ms"
             | "time.sleep_ms"
             | "any.show"
@@ -1685,6 +1744,15 @@ fn lower_expr<'ctx>(
             let y = lower_expr(ctx, func, b, lc, &args[1], env)?.into_int_value();
             int_binary(ctx, func, b, lc, builtin, x, y)
         }
+        CoreKind::Builtin(builtin, args)
+            if matches!(
+                builtin.as_str(),
+                "float.of_int" | "float.truncate" | "float.round"
+            ) && args.len() == 1 =>
+        {
+            let x = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
+            float_conversion(ctx, b, lc, builtin, x)
+        }
         CoreKind::Builtin(builtin, args) if builtin == "int.to_string" && args.len() == 1 => {
             let n = lower_expr(ctx, func, b, lc, &args[0], env)?;
             let roots = gc_root_env(b, lc, env)?;
@@ -2253,6 +2321,9 @@ struct LowerCtx<'a, 'ctx> {
     /// `elya_shift_range(name, amount)` (`ccc`, exits): a shift amount outside
     /// `0..=63` (spec 2026-10-17-elya-unary-and-wrapping D3).
     shift_range: FunctionValue<'ctx>,
+    /// `elya_float_to_int(name, bits, round)` (`ccc`; exits on NaN or outside
+    /// `Int`, spec 2026-10-24-elya-float-part-2 D4).
+    float_to_int: FunctionValue<'ctx>,
 }
 
 /// Fold `core.types` into a flat constructor table: name -> (tag, field types).
@@ -2512,6 +2583,8 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let any_check = module.add_function("elya_any_check", any_check_ty, None); // ccc
     let shift_range_ty = ctx.void_type().fn_type(&[ptrt.into(), i64t.into()], false);
     let shift_range = module.add_function("elya_shift_range", shift_range_ty, None); // ccc
+    let float_to_int_ty = i64t.fn_type(&[ptrt.into(), i64t.into(), i64t.into()], false);
+    let float_to_int = module.add_function("elya_float_to_int", float_to_int_ty, None); // ccc
     let op_ids = cps_emit::op_ids(core);
     let (resume_fns, handler_fns) =
         cps_emit::declare(ctx, &module, &nodes, &sites, &handlers, &op_ids)?;
@@ -2566,6 +2639,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         any_fail,
         any_check,
         shift_range,
+        float_to_int,
     };
     let b = ctx.create_builder();
     let handle_end_code = cps_emit::emit_handle_end(ctx, &module, &b, current_handler)?;

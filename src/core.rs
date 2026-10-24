@@ -838,6 +838,13 @@ fn lower_expr(
             let (bin, lit, lit_ty) = match op {
                 crate::ast::UnOp::Neg => (BinOp::Sub, CoreLit::Int(0), Ty::int()),
                 crate::ast::UnOp::Not => (BinOp::Eq, CoreLit::Bool(false), Ty::bool()),
+                // `-.e` is `-0.0 -. e`: exactly the negation, `-0.0` for `0.0`
+                // (spec 2026-10-24-elya-float-part-2 D2).
+                crate::ast::UnOp::NegF => (
+                    BinOp::SubF,
+                    CoreLit::Float((-0.0f64).to_bits()),
+                    Ty::float(),
+                ),
             };
             let k = CoreExpr {
                 span,
@@ -845,7 +852,7 @@ fn lower_expr(
                 kind: CoreKind::Lit(lit),
             };
             let args: Rc<[CoreExpr]> = match op {
-                crate::ast::UnOp::Neg => Rc::from([k, v]),
+                crate::ast::UnOp::Neg | crate::ast::UnOp::NegF => Rc::from([k, v]),
                 crate::ast::UnOp::Not => Rc::from([v, k]),
             };
             CoreKind::Prim(bin, args)

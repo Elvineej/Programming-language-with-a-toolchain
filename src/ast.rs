@@ -245,6 +245,12 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
+    /// `<. <=. >. >=.`: IEEE ordered float comparisons (spec
+    /// 2026-10-24-elya-float-part-2 D1).
+    LtF,
+    LeF,
+    GtF,
+    GeF,
     Concat,
     And,
     Or,
@@ -254,6 +260,8 @@ pub enum BinOp {
 pub enum UnOp {
     Neg,
     Not,
+    /// `-.e`: IEEE negation (spec 2026-10-24-elya-float-part-2 D2).
+    NegF,
 }
 
 pub fn pretty(m: &Module) -> String {
@@ -486,6 +494,10 @@ fn binop_sym(op: BinOp) -> &'static str {
         BinOp::Le => "<=",
         BinOp::Gt => ">",
         BinOp::Ge => ">=",
+        BinOp::LtF => "<.",
+        BinOp::LeF => "<=.",
+        BinOp::GtF => ">.",
+        BinOp::GeF => ">=.",
         BinOp::Concat => "<>",
         BinOp::And => "&&",
         BinOp::Or => "||",
@@ -496,6 +508,7 @@ fn unop_sym(op: UnOp) -> &'static str {
     match op {
         UnOp::Neg => "-",
         UnOp::Not => "!",
+        UnOp::NegF => "-.",
     }
 }
 

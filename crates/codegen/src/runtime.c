@@ -1706,6 +1706,38 @@ void elya_shift_range(const char *name, int64_t n) {
     exit(1);
 }
 
+/* `float.truncate` (round == 0) and `float.round` (round == 1) (spec
+ * 2026-10-24-elya-float-part-2 D4): the evaluator's words on NaN and outside
+ * `Int`'s range [-2^63, 2^63), both bounds exact doubles. */
+int64_t elya_float_to_int(const char *name, int64_t bits, int64_t round_half_away) {
+    double x;
+    memcpy(&x, &bits, sizeof x);
+    if (x != x) {
+        fprintf(stderr, "elya: float.%s: NaN has no Int value\n", name);
+        exit(1);
+    }
+    /* Every double at or past 2^52 is an integer, and the doubles next to
+     * +-2^63 are 1024 or 2048 apart, so truncating or rounding x lands in
+     * range exactly when x does. No libm: `trunc` and `round` would need `-lm`
+     * on Linux. */
+    if (!(x >= -9223372036854775808.0 && x < 9223372036854775808.0)) {
+        char buf[1100];
+        int64_t len = elya_float_text(bits, buf);
+        fprintf(stderr, "elya: float.%s: %.*s is outside Int's range\n", name, (int)len, buf);
+        exit(1);
+    }
+    int64_t t = (int64_t)x; /* toward zero */
+    if (round_half_away) {
+        double frac = x - (double)t; /* exact: |x| < 2^52 or frac == 0 */
+        if (frac >= 0.5) {
+            t += 1;
+        } else if (frac <= -0.5) {
+            t -= 1;
+        }
+    }
+    return t;
+}
+
 /* A perform whose handler has no clause for it. The type checker makes this
  * unreachable; a guard, never `unreachable`. */
 void elya_unhandled_effect(void) {
