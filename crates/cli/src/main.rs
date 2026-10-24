@@ -15,8 +15,36 @@ fn files(program: &str) -> impl FnMut(&str) -> Option<(String, String)> {
     }
 }
 
+/// The compiler's stack: 1 GiB, reserved rather than committed, as native
+/// programs run on (`elya_start`). The front end and every Core pass recurse on
+/// the host stack -- down an expression (bounded by E0102 at 1024 levels) and
+/// down a block's chain of statements (not bounded): an 8 MiB main thread
+/// overflowed a debug `elya build` at about 700 statements (spec
+/// 2026-10-24-elya-diagnostics-at-the-edges D5).
+const COMPILER_STACK: usize = 1 << 30;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    let shared = std::sync::Arc::new(args);
+    let for_thread = std::sync::Arc::clone(&shared);
+    let worker = std::thread::Builder::new()
+        .name("elya".to_string())
+        .stack_size(COMPILER_STACK)
+        .spawn(move || dispatch(&for_thread));
+    match worker {
+        Ok(handle) => match handle.join() {
+            Ok(code) => code,
+            // A compiler panic keeps its exit status (101): the panic message was
+            // printed on the thread; re-raise it here.
+            Err(panic) => std::panic::resume_unwind(panic),
+        },
+        // No room for the stack (a limit on address space): compile on the main
+        // thread, as before D5, rather than refuse (the review's F3).
+        Err(_) => dispatch(&shared),
+    }
+}
+
+fn dispatch(args: &[String]) -> ExitCode {
     match args.get(1).map(String::as_str) {
         Some("run")
             if matches!(
@@ -24,17 +52,17 @@ fn main() -> ExitCode {
                 Some("--record" | "--replay")
             ) =>
         {
-            trace_cmd(&args)
+            trace_cmd(args)
         }
-        Some("run") if args.get(2).map(String::as_str) == Some("--value") => value_cmd(&args),
+        Some("run") if args.get(2).map(String::as_str) == Some("--value") => value_cmd(args),
         Some("run") if args.len() > 3 => {
             eprintln!("usage: elya run <file.elya>  (flags go before the program: elya run --record <trace> <file.elya>)");
             ExitCode::from(2)
         }
-        Some("run") => cmd(&args, true),
-        Some("check") => cmd(&args, false),
+        Some("run") => cmd(args, true),
+        Some("check") => cmd(args, false),
         #[cfg(feature = "codegen")]
-        Some("build") => build_cmd(&args),
+        Some("build") => build_cmd(args),
         _ => {
             eprintln!("usage: elya <run|check|build> <file.elya>");
             eprintln!("       elya run --value <file.elya>");

@@ -259,3 +259,28 @@ fn elya_build_reads_imported_files() {
     assert_eq!(run.stdout, native.stdout);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Diagnostics at the edges D5 (spec 2026-10-24): a 2000-line `main` built.
+/// Every Core pass recurses down a block's chain of `let`s, and on an 8 MiB
+/// main thread a debug `elya build` overflowed at about 700 statements.
+#[test]
+fn elya_build_of_a_2000_line_main_runs() {
+    let dir = temp_dir("long-main");
+    let src = dir.join("long.elya");
+    let mut prog = String::from("pub fn main() {\n");
+    for i in 0..2000 {
+        prog.push_str(&format!("  io.println(\"{i}\")\n"));
+    }
+    prog.push_str("}\n");
+    std::fs::write(&src, prog).expect("write source");
+    let exe = dir.join(format!("long{}", std::env::consts::EXE_SUFFIX));
+    elya_build(&[src.as_os_str(), "-o".as_ref(), exe.as_os_str()]);
+    let out = Command::new(&exe).output().expect("run produced binary");
+    assert!(out.status.success(), "binary exited {:?}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    // 2000 lines, then main's value (a `Unit` main prints 0).
+    assert_eq!(lines.len(), 2001);
+    assert_eq!(lines[1999], "1999");
+    std::fs::remove_dir_all(&dir).ok();
+}

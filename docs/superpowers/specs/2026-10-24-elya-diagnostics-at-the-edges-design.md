@@ -1,6 +1,6 @@
 # Diagnostics at the edges
 
-**Status:** in progress (2026-10-24, branch `auto/elya`, a scheduled run).
+**Status:** done (2026-10-24, branch `auto/elya`, a scheduled run).
 HANDOFF step 1. The design choices are Claude's under the maintainer's
 delegation (rule 2), recorded here.
 
@@ -54,10 +54,13 @@ A test of the suite already relies on a 258-term chain (`specialize`'s
   part 1 D3).
   - *Rejected:* labelling only the first: the second is the one to rename.
 
-- **D3. One parser diagnostic per position.** A parser error whose label is at
-  exactly the span of the parser's previous error is not reported. e3 keeps
-  "expected `else`". This generalises the end-of-file rule (parser recovery
-  D1): a second error at the same token is always a consequence of the first.
+- **D3. The end of the file is reported once.** A parser error labelled at the
+  end of the file, exactly where the previous parser error was, is not
+  reported. e3 keeps "expected `else`". This extends the end-of-file rule
+  (parser recovery D1) from `}` to every construct.
+  - *Narrowed after the review (F1):* the first version dropped a repeat at any
+    position. Before a following declaration, `if c { 1 }` misses both `else`
+    and its function's `}`: two missing tokens, both reported again.
   - *Rejected:* special-casing `if`: the same cascade exists for any construct
     that needs one more token at the end of the file.
 
@@ -69,12 +72,17 @@ A test of the suite already relies on a 258-term chain (`specialize`'s
   first construct past the limit is E0102 "expression nested too deeply"
   (labelled at it, with a help: bind an inner part with `let` or move it into
   a function); the parser then reads nothing more of that declaration (no
-  follow-on errors) and resumes at the next declaration.
+  follow-on errors) and resumes at the next declaration: the first one at
+  which every `{` opened since the declaration began is closed (so not an
+  operation of the same `effect`, the review's F2), or, when they never close,
+  the first at a line's start.
   - The height is counted while parsing, bottom up: each `expr` call reports
     the height of what it returned, an atom is one more than the expressions
     inside it, a chain step (an operator or a call) one more than both sides.
     So a chain (built by a loop, not by recursion) is limited as much as
-    nesting is, and no later pass ever sees a tree taller than the limit.
+    nesting is. Patterns and types are limited by the open-call count only, so
+    a tree may reach an expression's 1024 levels plus a pattern's (the
+    review's F4: such a program checks, runs and builds); both are bounded.
   - The limit is a property of the language, the same on every build and
     host, rather than "whatever the stack allows".
   - Why 1024: C requires 63 levels of parenthesised nesting, Python's parser
@@ -101,6 +109,9 @@ A test of the suite already relies on a 258-term chain (`specialize`'s
     thread, as `crosscheck` does.
   - A panic on the thread is re-raised on the main thread (`resume_unwind`),
     so the exit status of a compiler bug is unchanged (101).
+  - When the thread cannot be created (a limit on address space, `ulimit -v`),
+    the CLI compiles on its main thread as before rather than refuse (the
+    review's F3).
 
 ## 2. Evidence (planned)
 
@@ -119,3 +130,35 @@ Negative controls: D1 off (the default `Char` index) puts e1 back at `3:9`; D3
 off brings e3's second report back; D4's height off (recursion counted only)
 lets the chain through the parser (E0102 missing, a crash or a value); D5 off
 (no thread) aborts the CLI tests.
+
+## 3. Outcome and review
+
+Red as predicted (Task 1 of the plan); gate 1260 / 127 as predicted, then
+1264 / 127 with the review's two tests.
+
+Negative controls (each reverted, files compared byte for byte):
+
+- K1, D1 off (`Config::default()`): `a_label_after_non_ascii_text_is_under_its_bytes`
+  fails, the header at `3:9`.
+- K2, D3 off: `an_if_cut_off_by_the_end_of_the_file_is_one_error` gains
+  "expected `}`".
+- K3, D4's height off (open calls counted only): the test process aborts (a
+  100 000-term chain reaches the later passes).
+- K4, D5 off: `elya_run_at_the_nesting_limit_prints_its_value` aborts; the
+  E0102 test still passes (the parser stops at 1024, within 8 MiB).
+
+The independent review swept 10 examples and 686 program strings through
+`check` and `run --value` on the base and the new build: no valid program gained
+a diagnostic or an E0102; the only differences are D1's corrected label
+positions and two programs losing e3's repeat. E0102 fires exactly at the
+counted level for every shape tried (brackets, chains, blocks, calls, unary
+operators, `if`, `match`, `handle`, `resume`, patterns, function types, lambda
+parameter types), and every shape at the deepest accepted level runs and
+builds; 20 000 match arms and 20 000 statements build. Findings, fixed
+test-first (each red before its fix): F1 (D3 dropped a real second missing
+token), F2 (recovery resumed at an operation inside the same `effect`), F3 (the
+CLI refused to run when 1 GiB of address space was unavailable); F4 (patterns
+outside the height) is recorded in D4.
+
+Seen, older, not changed: `let a{i+1} = fn() { a{i} }` 2000 times makes `check`
+take over 300 s (inference), on the base too.

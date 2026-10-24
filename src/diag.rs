@@ -1,7 +1,7 @@
 //! Structured diagnostics and human-readable rendering.
 
 use crate::span::{SourceMap, Span};
-use ariadne::{sources, Color, Label as AriadneLabel, Report, ReportKind};
+use ariadne::{sources, Color, Config, IndexType, Label as AriadneLabel, Report, ReportKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -86,7 +86,10 @@ pub fn render(diags: &[Diagnostic], src: &SourceMap) -> String {
             Some(l) => at(l.span.start),
             None => (src.name().to_string(), 0),
         };
+        // Every span is a byte offset (spec 2026-10-24-elya-diagnostics-at-the-edges
+        // D1); `ariadne` counts characters unless told.
         let mut report = Report::build(kind, id, offset)
+            .with_config(Config::default().with_index_type(IndexType::Byte))
             .with_code(&d.code)
             .with_message(&d.message);
         for l in &d.labels {

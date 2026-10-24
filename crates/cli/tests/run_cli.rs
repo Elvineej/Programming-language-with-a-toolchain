@@ -242,3 +242,71 @@ fn elya_run_reads_imported_files() {
     assert!(err.contains("util.elya:1:"), "{err}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Diagnostics at the edges D4/D5 (spec 2026-10-24): the CLI compiles on its
+/// own 1 GiB stack, so a program past the nesting limit is E0102, not an abort.
+#[test]
+fn elya_check_on_deep_brackets_is_e0102() {
+    let dir = scratch("deep");
+    let prog = dir.join("deep.elya");
+    std::fs::write(
+        &prog,
+        format!(
+            "pub fn main() -> Int {{ {}1{} }}\n",
+            "(".repeat(5000),
+            ")".repeat(5000)
+        ),
+    )
+    .expect("write program");
+    let check = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .arg("check")
+        .arg(&prog)
+        .output()
+        .expect("spawn elya check");
+    assert_eq!(check.status.code(), Some(1), "{check:?}");
+    let err = String::from_utf8_lossy(&check.stderr);
+    assert!(err.contains("E0102"), "{err}");
+    assert!(err.contains("expression nested too deeply"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// At the limit (1023 blocks around `1`: 1024 levels), `elya run` works: an
+/// 8 MiB main thread overflowed at about 985 in a debug build.
+#[test]
+fn elya_run_at_the_nesting_limit_prints_its_value() {
+    let dir = scratch("limit");
+    let prog = dir.join("limit.elya");
+    std::fs::write(
+        &prog,
+        format!(
+            "pub fn main() -> Int {{ {}7{} }}\n",
+            "{ ".repeat(1023),
+            " }".repeat(1023)
+        ),
+    )
+    .expect("write program");
+    let run = elya_run(&["--value".as_ref(), prog.as_os_str()]);
+    assert!(run.status.success(), "{run:?}");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "7\n");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// D5, the review's F3: with too little address space for the compiler's own
+/// stack, the CLI compiles on its main thread rather than refusing.
+#[cfg(target_os = "linux")]
+#[test]
+fn elya_runs_without_room_for_its_own_stack() {
+    let dir = scratch("ulimit");
+    let prog = dir.join("small.elya");
+    std::fs::write(&prog, "pub fn main() -> Int { 6 * 7 }\n").expect("write program");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -v 800000 && exec \"$0\" run --value \"$1\"")
+        .arg(env!("CARGO_BIN_EXE_elya"))
+        .arg(&prog)
+        .output()
+        .expect("spawn sh");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+    std::fs::remove_dir_all(&dir).ok();
+}

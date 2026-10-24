@@ -23,7 +23,28 @@ struct Parser<'a> {
     /// "unexpected end of file" was reported: the missing `}`s after it are not
     /// reported again (spec 2026-10-23-elya-parser-recovery D1).
     eof_reported: bool,
+    /// The first token of the declaration being parsed (D4's resume point is
+    /// found from it).
+    decl_start: usize,
+    /// Parser errors raised, counting those D3 did not report (spec
+    /// 2026-10-24-elya-diagnostics-at-the-edges): "did this fail with an error"
+    /// is this count, not the length of `diags`.
+    raised: usize,
+    /// D4: how many `expr`, `pattern` and `type_ann` calls are open.
+    depth: usize,
+    /// D4: the height of the tallest expression returned by an `expr` call since
+    /// the enclosing `expr` began (each call folds its own height in).
+    inner_h: usize,
+    /// D4: after E0102 the parser reads nothing more of the declaration (every
+    /// `peek` sees the end, nothing is reported) until `module` resumes at this
+    /// token: the next declaration.
+    stop: Option<usize>,
 }
+
+/// D4: the deepest an expression may be nested (levels: expression nodes on a
+/// path, a parenthesised expression counting as one), and the most `expr`,
+/// `pattern` and `type_ann` calls open at once.
+pub const MAX_NESTING: usize = 1024;
 
 /// `Int`'s largest magnitude: `9223372036854775807`, or `9223372036854775808`
 /// under a folded `-`.
@@ -39,6 +60,11 @@ impl<'a> Parser<'a> {
             diags: Vec::new(),
             braces: true,
             eof_reported: false,
+            decl_start: 0,
+            raised: 0,
+            depth: 0,
+            inner_h: 0,
+            stop: None,
         }
     }
 
@@ -87,7 +113,7 @@ impl<'a> Parser<'a> {
     fn layout_error(&mut self) {
         let at = self.peek_span();
         let text = self.source(at.start, at.end).unwrap_or("");
-        self.diags.push(
+        self.push(
             Diagnostic::error(
                 "E0101",
                 "an operator at the start of a line does not continue the line before",
@@ -109,7 +135,7 @@ impl<'a> Parser<'a> {
             INT_MAX_MAGNITUDE
         };
         if magnitude > limit {
-            self.diags.push(
+            self.push(
                 Diagnostic::error("E0002", "integer literal out of range")
                     .with_label(span, "does not fit in `Int`")
                     .with_help("`Int` is 64-bit: from -9223372036854775808 to 9223372036854775807"),
@@ -124,6 +150,9 @@ impl<'a> Parser<'a> {
     }
 
     fn peek(&self) -> Option<&TokenKind> {
+        if self.stop.is_some() {
+            return None; // D4: the declaration ends at E0102
+        }
         self.tokens.get(self.pos).map(|t| &t.kind)
     }
 
@@ -139,6 +168,9 @@ impl<'a> Parser<'a> {
     }
 
     fn bump(&mut self) -> Option<&Token> {
+        if self.stop.is_some() {
+            return None;
+        }
         let t = self.tokens.get(self.pos);
         if t.is_some() {
             self.pos += 1;
@@ -156,22 +188,97 @@ impl<'a> Parser<'a> {
     }
 
     fn error(&mut self, span: Span, msg: impl Into<String>) {
-        self.diags
-            .push(Diagnostic::error("E0100", msg).with_label(span, "here"));
+        self.push(Diagnostic::error("E0100", msg).with_label(span, "here"));
+    }
+
+    /// Every parser diagnostic goes through here. D3: the end of the file is
+    /// reported once -- an error labelled at the end of the file, exactly where
+    /// the previous one was, is not reported (elsewhere two errors at one token
+    /// are two missing tokens, and both are reported: the review's F1). D4:
+    /// nothing is reported after E0102 until the next declaration.
+    fn push(&mut self, d: Diagnostic) {
+        self.raised += 1;
+        if self.stop.is_some() {
+            return;
+        }
+        let at = |d: &Diagnostic| d.labels.first().map(|l| l.span);
+        if let Some(last) = self.diags.last() {
+            let eof = self.base + self.text.len() as u32;
+            if at(last).is_some() && at(last) == at(&d) && at(&d).map(|s| s.start) == Some(eof) {
+                return;
+            }
+        }
+        self.diags.push(d);
+    }
+
+    /// D4: E0102 at `at`, once; then the declaration stops (see `stop`).
+    fn too_deep(&mut self, at: Span) {
+        if self.stop.is_some() {
+            return;
+        }
+        self.push(
+            Diagnostic::error("E0102", "expression nested too deeply")
+                .with_label(at, format!("more than {MAX_NESTING} levels deep here"))
+                .with_help("bind an inner part with `let`, or move it into a function"),
+        );
+        self.stop = Some(self.resume_point());
+    }
+
+    /// D4: where parsing resumes after E0102 -- the first declaration after the
+    /// current token at which every `{` opened since this declaration began is
+    /// closed (an operation `fn name` inside the same `effect { }` is not one:
+    /// the review's F2). When the braces never balance (a truncated file), the
+    /// first declaration at a line's start, then the end of the file.
+    fn resume_point(&self) -> usize {
+        let brace = |k: &TokenKind| match k {
+            TokenKind::LBrace => 1,
+            TokenKind::RBrace => -1,
+            _ => 0,
+        };
+        let mut open: i64 = self.tokens[self.decl_start.min(self.pos)..self.pos]
+            .iter()
+            .map(|t| brace(&t.kind))
+            .sum();
+        for i in self.pos..self.tokens.len() {
+            if open <= 0 && i > self.pos && self.starts_decl(i) {
+                return i;
+            }
+            open += brace(&self.tokens[i].kind);
+        }
+        (self.pos + 1..self.tokens.len())
+            .find(|&i| self.starts_decl(i) && self.newline_before(i))
+            .unwrap_or(self.tokens.len())
+    }
+
+    /// D4: open one more `expr`, `pattern` or `type_ann` call, or E0102 past the
+    /// limit (and `false`).
+    fn enter(&mut self) -> bool {
+        if self.stop.is_some() {
+            return false;
+        }
+        if self.depth >= MAX_NESTING {
+            let at = self.peek_span();
+            self.too_deep(at);
+            return false;
+        }
+        self.depth += 1;
+        true
     }
 
     /// D1: a parse that ran out of tokens without saying so is E0100 "unexpected
     /// end of file", once.
     fn eof_error(&mut self) {
-        if self.eof_reported {
+        self.raised += 1;
+        if self.eof_reported || self.stop.is_some() {
             return;
         }
         self.eof_reported = true;
         let at = self.peek_span();
-        self.diags.push(
+        self.push(
             Diagnostic::error("E0100", "unexpected end of file")
                 .with_label(at, "the file ends here"),
         );
+        self.raised -= 1; // counted once, above
     }
 
     /// A closing `}`: eaten, or E0100 "expected `}`" -- at the end of the file
@@ -180,6 +287,10 @@ impl<'a> Parser<'a> {
         let end = self.peek_span();
         if self.eat(&TokenKind::RBrace) {
             return true;
+        }
+        if self.stop.is_some() {
+            self.raised += 1;
+            return false;
         }
         if self.peek().is_none() {
             if !self.eof_reported {
@@ -278,8 +389,37 @@ impl<'a> Parser<'a> {
     // ---- Expressions (Pratt) ----
 
     /// Pratt expression parser. `min_bp` is the minimum binding power.
+    ///
+    /// D4 of the diagnostics spec: at most `MAX_NESTING` calls open, and the
+    /// height of what it returns folded into the enclosing call's `inner_h`.
     fn expr(&mut self, min_bp: u8) -> Option<Spanned<Expr>> {
+        if !self.enter() {
+            return None;
+        }
+        let outer = std::mem::replace(&mut self.inner_h, 0);
+        let r = self.expr_chain(min_bp);
+        self.inner_h = outer.max(self.inner_h);
+        self.depth -= 1;
+        r
+    }
+
+    /// D4: `h` levels is E0102 past the limit, at `at`.
+    fn check_height(&mut self, h: usize, at: Span) -> Option<()> {
+        if h > MAX_NESTING {
+            self.too_deep(at);
+            return None;
+        }
+        Some(())
+    }
+
+    /// `expr`'s body; leaves its result's height in `inner_h`. An atom is one
+    /// level more than the expressions inside it, each step of a chain (an
+    /// operator, a call) one more than both its sides: a chain is built by this
+    /// loop, not by recursion, and is limited as nesting is.
+    fn expr_chain(&mut self, min_bp: u8) -> Option<Spanned<Expr>> {
         let mut lhs = self.atom()?;
+        let mut h = self.inner_h + 1;
+        self.check_height(h, lhs.span)?;
         // `cloned()` frees the immutable borrow so the body can mutate `self`.
         while let Some(kind) = self.peek().cloned() {
             // postfix call: `expr(...)`; in braces, not across a newline (D4).
@@ -287,7 +427,10 @@ impl<'a> Parser<'a> {
                 if self.braces && self.newline_before(self.pos) {
                     break;
                 }
+                self.inner_h = 0;
                 lhs = self.finish_call(lhs)?;
+                h = h.max(self.inner_h) + 1;
+                self.check_height(h, lhs.span)?;
                 continue;
             }
             let Some((l_bp, r_bp, op)) = infix_bp(&kind) else {
@@ -306,8 +449,11 @@ impl<'a> Parser<'a> {
                 return None;
             }
             self.bump(); // operator
+            self.inner_h = 0;
             let rhs = self.expr(r_bp)?;
             let span = lhs.span.merge(rhs.span);
+            h = h.max(self.inner_h) + 1;
+            self.check_height(h, span)?;
             lhs = spanned(
                 Expr::Binary {
                     op,
@@ -317,6 +463,7 @@ impl<'a> Parser<'a> {
                 span,
             );
         }
+        self.inner_h = h;
         Some(lhs)
     }
 
@@ -502,13 +649,14 @@ impl<'a> Parser<'a> {
         let mut decls = Vec::new();
         while self.peek().is_some() {
             let before = self.pos;
-            let reported = self.diags.len();
+            self.decl_start = self.pos;
+            let reported = self.raised;
             match self.peek() {
                 Some(TokenKind::KwImport) => {
                     if let Some(i) = self.import() {
                         imports.push(i);
                     } else {
-                        if self.diags.len() == reported {
+                        if self.raised == reported {
                             self.eof_error();
                         }
                         self.recover_to_decl();
@@ -530,7 +678,7 @@ impl<'a> Parser<'a> {
                     if let Some(d) = self.fn_decl(is_pub) {
                         decls.push(d);
                     } else {
-                        if self.diags.len() == reported {
+                        if self.raised == reported {
                             self.eof_error();
                         }
                         // D3: a function whose header failed is still a known
@@ -563,7 +711,7 @@ impl<'a> Parser<'a> {
                     if let Some(e) = self.effect_decl() {
                         decls.push(e);
                     } else {
-                        if self.diags.len() == reported {
+                        if self.raised == reported {
                             self.eof_error();
                         }
                         self.recover_to_decl();
@@ -574,7 +722,7 @@ impl<'a> Parser<'a> {
                         decls.push(t);
                     } else {
                         // D1, missed by the first version (the review's F4).
-                        if self.diags.len() == reported {
+                        if self.raised == reported {
                             self.eof_error();
                         }
                         self.recover_to_decl();
@@ -588,6 +736,12 @@ impl<'a> Parser<'a> {
                     );
                     self.recover_to_decl();
                 }
+            }
+            // D4: after E0102, the next declaration.
+            if let Some(resume) = self.stop.take() {
+                self.pos = resume;
+                self.depth = 0;
+                self.inner_h = 0;
             }
             if self.pos == before {
                 self.bump(); // ensure forward progress
@@ -864,7 +1018,17 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    /// A pattern; D4 counts it as one more call open.
     fn pattern(&mut self) -> Option<Spanned<Pattern>> {
+        if !self.enter() {
+            return None;
+        }
+        let r = self.pattern_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn pattern_inner(&mut self) -> Option<Spanned<Pattern>> {
         let span = self.peek_span();
         match self.peek()?.clone() {
             // Constructor pattern: `Nil`, `Some(p)`, `Cons(h, t)`.
@@ -1016,7 +1180,17 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    /// A type annotation; D4 counts it as one more call open.
     fn type_ann(&mut self) -> Option<Spanned<TypeAnn>> {
+        if !self.enter() {
+            return None;
+        }
+        let r = self.type_ann_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn type_ann_inner(&mut self) -> Option<Spanned<TypeAnn>> {
         let span = self.peek_span();
         // A function type (2026-10-09): `fn(A, B) / {E} -> R`; the row is
         // optional (none written: any effects).
@@ -1510,7 +1684,7 @@ impl<'a> Parser<'a> {
             }
             let at = self.pos;
             let first = self.peek_span();
-            let reported = self.diags.len();
+            let reported = self.raised;
             if self.peek() == Some(&TokenKind::KwLet) {
                 // D2: a bad `let` is one error; its name, when read, stays bound.
                 let name = match self.tokens.get(at + 1).map(|t| &t.kind) {
@@ -1615,7 +1789,7 @@ impl<'a> Parser<'a> {
     /// file if nothing was said, skip to the next statement, and return the
     /// span the error node covers.
     fn recover_statement(&mut self, at: usize, reported: usize, first: Span) -> Span {
-        if self.diags.len() == reported && self.peek().is_none() {
+        if self.raised == reported && self.peek().is_none() {
             self.eof_error();
         }
         self.skip_statement(at);

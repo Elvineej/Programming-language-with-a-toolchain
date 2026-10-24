@@ -96,6 +96,8 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
     // `op_table`, `ast::op_effects`) is keyed by op name, so a second
     // declaration is E0202 rather than a silent overwrite.
     let mut op_effect: HashMap<String, String> = HashMap::new();
+    // Where each operation was first declared (D2 of the diagnostics spec).
+    let mut op_span: HashMap<String, crate::span::Span> = HashMap::new();
     let mut op_arity: HashMap<String, usize> = HashMap::new();
     // E0207: each effect's operations, in declaration order, with their
     // declared parameter names (for the clauses the help suggests).
@@ -108,20 +110,36 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
     // won -- and an empty match on a name declared once empty and once not
     // accepted a real value (the failure slice's review). Each kind is its own
     // namespace.
-    let mut seen: HashSet<(&str, String)> = HashSet::new();
+    //
+    // Both declarations are labelled, the first in its own file (spec
+    // 2026-10-24-elya-diagnostics-at-the-edges D2).
+    let mut seen: HashMap<(&str, String), crate::span::Span> = HashMap::new();
     let mut dup =
         |kind: &'static str, name: &str, span: crate::span::Span, out: &mut Vec<Diagnostic>| {
-            if !seen.insert((kind, name.to_string())) {
-                out.push(
-                    Diagnostic::error(
-                        "E0209",
-                        format!("{kind} `{name}` is declared more than once"),
-                    )
-                    .with_label(span, "a second declaration of this name")
-                    .with_help(format!(
-                        "rename one of them: a {kind} name is unique across a module"
-                    )),
-                );
+            match seen.get(&(kind, name.to_string())) {
+                Some(first) => {
+                    // Functions are qualified across files (modules part 1); the
+                    // other kinds are one name space for the whole program.
+                    let scope = if kind == "function" {
+                        "within its file"
+                    } else {
+                        "across the program, imported files included"
+                    };
+                    out.push(
+                        Diagnostic::error(
+                            "E0209",
+                            format!("{kind} `{name}` is declared more than once"),
+                        )
+                        .with_label(span, "a second declaration of this name")
+                        .with_label(*first, "first declared here")
+                        .with_help(format!(
+                            "rename one of them: a {kind} name is unique {scope}"
+                        )),
+                    );
+                }
+                None => {
+                    seen.insert((kind, name.to_string()), span);
+                }
             }
         };
     for d in &module.decls {
@@ -145,7 +163,9 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
                 effect_names.insert(e.name.clone());
                 for op in &e.ops {
                     let name = &op.node.name;
-                    if let Some(first) = op_effect.get(name) {
+                    if let (Some(first), Some(first_span)) =
+                        (op_effect.get(name), op_span.get(name))
+                    {
                         dup_ops.insert(name.clone());
                         dup_diags.push(
                             Diagnostic::error(
@@ -156,12 +176,14 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
                                 op.span,
                                 format!("`{name}` is already declared by effect `{first}`"),
                             )
+                            .with_label(*first_span, "first declared here")
                             .with_help(
                                 "operation names are unique across a module: a perform names only the operation, so it must say which effect it performs",
                             ),
                         );
                     } else {
                         op_effect.insert(name.clone(), e.name.clone());
+                        op_span.insert(name.clone(), op.span);
                         op_arity.insert(name.clone(), op.node.param_tys.len());
                         effect_ops.entry(e.name.clone()).or_default().push((
                             name.clone(),

@@ -27,3 +27,8 @@ Prediction: 7 x 2 + 2 x 2 + 1 = **19 new tests: 1260 passed, 127 suites**.
 ## Task 3: D4 (the limit in the parser)
 ## Task 4: D5 (the CLI's thread)
 ## Task 5: gate, controls (K1 D1, K2 D3, K3 D4's height, K4 D5), review
+
+## Outcome
+
+Red as predicted; green at 1260 / 127 as predicted. The review's F1-F3 added
+two tests (one root, one CLI): 1264 / 127.
