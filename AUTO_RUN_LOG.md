@@ -3,7 +3,12 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-23 21:55 UTC — IN PROGRESS (scheduled run, FULL mode)
+## 2026-10-24 05:53 UTC — IN PROGRESS (scheduled run, FULL mode)
+
+- The 21:55 entry started eight hours ago (over the three-hour lock); its last commit
+  is 8757408 (00:33). Taken over.
+
+## 2026-10-23 21:55 UTC — ended without a DONE mark (last commit 8757408, 00:33), taken over 2026-10-24 05:53 (scheduled run, FULL mode)
 
 - The 17:53 entry started four hours ago (over the three-hour lock); its last commit
   is daed520 (20:48). Taken over; if that run is still pushing, I merge, never force.
