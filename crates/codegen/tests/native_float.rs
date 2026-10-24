@@ -432,3 +432,27 @@ fn float_conversions_agree() {
                pub fn main() -> Int { handle { r() } with { E.e() -> resume(0.0 /. 0.0) } }\n";
     assert!(agree(src, "failcps").end.is_err());
 }
+
+/// Exponent literals (spec 2026-10-24-elya-block-tails-and-exponents D2):
+/// natively the same floats as in the evaluator.
+#[test]
+fn exponent_literals_run_natively() {
+    let body = [
+        "show(1.0e19)",
+        "show(2.5E-3)",
+        "show(-1.5e+2)",
+        "show(5.0e-324)",
+        "show(5.0e-324 /. 2.0)",
+        "show(1.7976931348623157e308)",
+        "show(1.0e308 *. 10.0)",
+    ]
+    .join("\n  ");
+    let src = format!("{SHOW}pub fn main() -> Int {{\n  {body}\n  0\n}}\n");
+    let got = agree(&src, "exponents");
+    assert!(
+        got.text
+            .starts_with("10000000000000000000.0\n0.0025\n-150.0\n"),
+        "{}",
+        got.text
+    );
+}

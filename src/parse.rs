@@ -1727,6 +1727,30 @@ impl<'a> Parser<'a> {
             }
         }
         let end = self.peek_span();
+        // A block's value is its last expression (spec
+        // 2026-10-24-elya-block-tails-and-exponents D1): one that ends in a `let`,
+        // or has nothing in it, has none.
+        if tail.is_none() && self.stop.is_none() && self.peek() == Some(&TokenKind::RBrace) {
+            match stmts.last() {
+                None => self.push(
+                    Diagnostic::error("E0103", "a block has no value")
+                        .with_label(start.merge(end), "an empty block")
+                        .with_help("write the value it has, `Unit` for none"),
+                ),
+                Some(st) if matches!(&st.node, Stmt::Let { value, .. } if !matches!(value.node, Expr::Error)) =>
+                {
+                    let at = st.span;
+                    self.push(
+                        Diagnostic::error("E0103", "a block cannot end with `let`")
+                            .with_label(at, "the block's last statement")
+                            .with_help(
+                                "end the block with its value: the bound name, another expression, or `Unit`",
+                            ),
+                    );
+                }
+                Some(_) => {}
+            }
+        }
         self.close_brace();
         Some(spanned(
             Block {
