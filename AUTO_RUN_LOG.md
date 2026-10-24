@@ -7,6 +7,28 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 
 - The 21:55 entry started eight hours ago (over the three-hour lock); its last commit
   is 8757408 (00:33). Taken over.
+- LLVM 18 headers were missing again; installed (`llvm-18-dev`, `libpolly-18-dev`,
+  `libzstd-dev`). Baseline 1241 / 125.
+- **Done: diagnostics at the edges** (HANDOFF step 1). Spec+plan 863e7c5,
+  implementation 0f8da88.
+- Working on: HANDOFF step 1 (capabilities part 3).
+  - Byte offsets in the renderer (labels after non-ASCII text were shifted);
+    E0209/E0202 label the first declaration too (in its own file); the end of
+    the file is reported once; expressions nest at most 1024 levels, E0102
+    (chains counted by height), recovery at the next declaration; the CLI
+    compiles on a 1 GiB thread (measured: a 700-line `main` overflowed a debug
+    `elya build`; 1600 `+` terms or ~900 nested blocks overflowed `check`).
+  - Gate 1264 / 127 (predicted 1260; the review added two tests). K1-K4 distinct.
+    Review: 686 programs + examples on both builds, no valid program changed;
+    F1 (a real second missing token dropped), F2 (recovery inside an `effect`),
+    F3 (the CLI refused under `ulimit -v`) fixed test-first; F4 recorded.
+  - **Decisions (mine; please review):** a language-level nesting limit of
+    1024 (not an explicit stack); the CLI's 1 GiB thread (block length stays
+    unbounded, so iterative Core passes are new HANDOFF step 5); D3 narrowed to
+    the end of the file.
+- Windows-gate debt: 0f8da88 (the CLI's thread; a `#[cfg(target_os = "linux")]`
+  test), with the earlier list (dce886a, 670c842, dfb8a5c, e78ace6, ...).
+- `graphify` is not installed here, so `graphify update .` was not run.
 
 ## 2026-10-23 21:55 UTC — ended without a DONE mark (last commit 8757408, 00:33), taken over 2026-10-24 05:53 (scheduled run, FULL mode)
 

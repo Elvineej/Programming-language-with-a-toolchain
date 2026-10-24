@@ -3,7 +3,7 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-23, a scheduled run on `auto/elya`)
+## State at handoff (updated 2026-10-24, a scheduled run on `auto/elya`)
 
 - `main` has everything through #23 (merged 2026-10-16 at ab791b6: N7 part 2 through
   argument records and `elya run --record/--replay`). Draft PR #24 carries `auto/elya`
@@ -15,8 +15,9 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1241 passed, 125 suites. Native programs run on
-  their own 1 GiB stack (`elya_start`). Since `main`, the runtime
+- Linux gate at the tip of `auto/elya`: 1264 passed, 127 suites. Native programs run on
+  their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
+  (since 2026-10-24). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
   current handler as a root); `gc_mark` is unchanged (637 bytes of source).
@@ -533,20 +534,17 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   function shares its name; the sweep's "effect-polymorphic function used at a
   user effect" refusals are gone. Core pass only.
 
+- **Diagnostics at the edges** (2026-10-24, branch `auto/elya`, a scheduled
+  run, 0f8da88): spec
+  `docs/superpowers/specs/2026-10-24-elya-diagnostics-at-the-edges-design.md`.
+  Byte offsets in the renderer; E0209/E0202 label both declarations; the end
+  of the file is reported once; expressions nest at most 1024 levels (E0102,
+  chains counted by height); the CLI compiles on its own 1 GiB stack (a
+  700-line `main` overflowed a debug `elya build`).
+
 ## The next five steps
 
-### 1. Diagnostics at the edges
-
-Left by the parser-recovery slice (spec 2026-10-23-elya-parser-recovery §3):
-a label after non-ASCII text is dropped by the renderer (byte offsets passed
-where `ariadne` counts characters); E0209 across files labels only the second
-declaration; 5000 nested brackets overflow the parser's host stack (both
-`check` and `run` die, no diagnostic); an `if` without `else` before a block's
-end reports twice at one span. Measure each, then decide in a spec: character
-offsets in the renderer, a nesting limit with a named error (or an explicit
-stack), and the double report.
-
-### 2. Capabilities, part 3: attenuation, and builtins behind an import
+### 1. Capabilities, part 3: attenuation, and builtins behind an import
 
 ROADMAP priority 2's last part. Modules part 2 (spec 2026-10-24) checks what an
 import grants; the root holds every capability and builtins need no import.
@@ -559,7 +557,7 @@ the root), so a module's source says it touches the host. Also recorded by the
 part-2 review: data of a type with an `IO` field passed through a module needs
 the grant (a type cannot say who built a value).
 
-### 3. Two gaps the Float part-2 review saw
+### 2. Two gaps the Float part-2 review saw
 
 Older than that slice. (a) A function body (`main` included) that ends in a
 `let` statement runs in the evaluator (its value is `Unit`/0) and is refused
@@ -572,7 +570,7 @@ subnormal values must be computed; decide the literal syntax (`1.0e19`, a digit
 on both sides of the `.` as now) and its text in `float.to_string`/`op.show`
 (which never write an exponent today).
 
-### 4. Strings to read a trace: one trace format for the host and `elya/replay`
+### 3. Strings to read a trace: one trace format for the host and `elya/replay`
 
 `elya/replay` (spec 2026-10-24-elya-std-replay §3) writes the host trace's line
 shape, but no Elya program can read text back (no string functions beyond `<>`,
@@ -585,7 +583,7 @@ readers share, and `replay.parse(text)`. Also from that review: `record` under a
 multi-shot handler fails at run time (one-shot `with any`), and `replay` cannot
 decode an answer typed by the effect's own parameter.
 
-### 5. The sweep's last native refusals
+### 4. The sweep's last native refusals
 
 After alias renaming (spec 2026-10-24 §3) the differential sweep's native
 refusals are four, all older: two `main`s whose value is not an `Int` (a
@@ -595,6 +593,19 @@ instances, and how), then decide in a spec: what a native binary prints for a
 `main` of each type (the evaluator's `run --value` text, as for `Int` and
 `Unit`), and whether the budget is hit by non-regular types (a named refusal
 is right) or by ordinary ones (a bigger or a smarter bound).
+
+### 5. Core passes iterative over a block's statements
+
+Left by diagnostics at the edges (spec 2026-10-24 D5): a block is a chain of
+`let`s in Core and every Core pass (`mono::rewrite_let` first) recurses down
+it, so a block's length is bounded only by the CLI's 1 GiB stack (about 90 000
+statements in a debug build; a library caller on a small thread overflows far
+sooner, about 700 statements on 8 MiB). Measure which passes recurse on the
+spine (`gdb` on a 10 000-line `main` under a small stack), then decide in a
+spec: an explicit loop over the `let` spine in each pass (the principled
+fix: no bound at all), or a flatter Core block node. Also from that review:
+`let a{i+1} = fn() { a{i} }` repeated 2000 times takes over 300 s in `check`
+(inference).
 
 ## Also open, unscheduled
 
