@@ -308,22 +308,152 @@ impl Anf<'_> {
     /// - `y` is a LOCAL. An alias of a top-level function stays a local, so
     ///   rule 2 wraps the function once, at the binding, and the upcast adapter
     ///   still sees a local binder at every later upcast (5 for 15 otherwise);
-    /// - no top-level function is named `y`. When this rule was written,
-    ///   closure conversion read a name free in a lambda as the top-level
-    ///   function of that name whenever one existed, so planting a shadowing
-    ///   `y` inside one changed which function ran (2004 for 1007). Captures are
-    ///   decided by scope since 2026-10-23; the condition stays, conservatively;
     /// - `y`'s type at the binding has an open row (or is an operation): the
     ///   row-polymorphic alias the rule is for. A closed row may be an
     ///   annotated upcast, which `specialize` coerces at the binding but not at
     ///   a callee;
-    /// - nothing in `b` binds `y` again (renaming would capture).
-    fn substitutes(&self, x: &str, v: &CoreExpr, y: &str, b: &CoreExpr, locals: &[String]) -> bool {
-        x != y
-            && locals.iter().any(|l| l == y)
-            && !self.top.contains_key(y)
-            && (has_open_row(&v.ty) || is_operation(&v.ty))
-            && !binds(b, y)
+    ///
+    /// Since 2026-10-24 (spec 2026-10-24-elya-alias-renaming) a top-level
+    /// function sharing `y`'s name no longer blocks it (D2: captures are decided
+    /// by scope since 2026-10-23), and a body that binds `y` again has those
+    /// binders renamed first (D1: capture-avoiding substitution).
+    fn substitutes(&self, x: &str, v: &CoreExpr, y: &str, locals: &[String]) -> bool {
+        x != y && locals.iter().any(|l| l == y) && (has_open_row(&v.ty) || is_operation(&v.ty))
+    }
+
+    /// D1: `e` with every binder of `name` in it (a `let`, a lambda's or a
+    /// clause's parameter, a pattern's variable, a `return` binder) renamed to a
+    /// fresh name no source can write, together with the uses it scopes.
+    fn fresh_binders(&mut self, e: &CoreExpr, name: &str) -> CoreExpr {
+        let kind = match &e.kind {
+            CoreKind::Lit(_) | CoreKind::Var(_) => return e.clone(),
+            CoreKind::App(f, a) => CoreKind::App(
+                Rc::new(self.fresh_binders(f, name)),
+                self.fresh_all(a, name),
+            ),
+            CoreKind::Builtin(n, a) => CoreKind::Builtin(n.clone(), self.fresh_all(a, name)),
+            CoreKind::Ctor(n, a) => CoreKind::Ctor(n.clone(), self.fresh_all(a, name)),
+            CoreKind::Prim(o, a) => CoreKind::Prim(*o, self.fresh_all(a, name)),
+            CoreKind::Lambda(ps, b) => {
+                let mut b = (**b).clone();
+                let ps: Rc<[CoreParam]> = ps
+                    .iter()
+                    .map(|p| {
+                        if p.name == name {
+                            let n = self.fresh(&format!("{name}$alias"));
+                            b = rename(&b, name, &n);
+                            CoreParam {
+                                name: n,
+                                ty: p.ty.clone(),
+                            }
+                        } else {
+                            p.clone()
+                        }
+                    })
+                    .collect();
+                CoreKind::Lambda(ps, Rc::new(self.fresh_binders(&b, name)))
+            }
+            CoreKind::Let(x, v, b) => {
+                let v = self.fresh_binders(v, name);
+                if x == name {
+                    let n = self.fresh(&format!("{name}$alias"));
+                    let b = rename(b, name, &n);
+                    CoreKind::Let(n, Rc::new(v), Rc::new(self.fresh_binders(&b, name)))
+                } else {
+                    CoreKind::Let(x.clone(), Rc::new(v), Rc::new(self.fresh_binders(b, name)))
+                }
+            }
+            CoreKind::If(c, t, f) => CoreKind::If(
+                Rc::new(self.fresh_binders(c, name)),
+                Rc::new(self.fresh_binders(t, name)),
+                Rc::new(self.fresh_binders(f, name)),
+            ),
+            CoreKind::Match(sc, arms) => {
+                let sc = self.fresh_binders(sc, name);
+                let mut out = Vec::with_capacity(arms.len());
+                for a in arms.iter() {
+                    let mut names = Vec::new();
+                    crate::closure::pat_binders(&a.pat, &mut names);
+                    let (pat, body) = if names.iter().any(|n| n == name) {
+                        let n = self.fresh(&format!("{name}$alias"));
+                        (rename_pat(&a.pat, name, &n), rename(&a.body, name, &n))
+                    } else {
+                        (a.pat.clone(), a.body.clone())
+                    };
+                    out.push(CoreArm {
+                        pat,
+                        body: self.fresh_binders(&body, name),
+                    });
+                }
+                CoreKind::Match(Rc::new(sc), out.into())
+            }
+            CoreKind::Handle(h) => {
+                let body = Rc::new(self.fresh_binders(&h.body, name));
+                let mut clauses = Vec::with_capacity(h.clauses.len());
+                for c in h.clauses.iter() {
+                    let mut cb = (*c.body).clone();
+                    let params: Rc<[CoreParam]> = c
+                        .params
+                        .iter()
+                        .map(|p| {
+                            if p.name == name {
+                                let n = self.fresh(&format!("{name}$alias"));
+                                cb = rename(&cb, name, &n);
+                                CoreParam {
+                                    name: n,
+                                    ty: p.ty.clone(),
+                                }
+                            } else {
+                                p.clone()
+                            }
+                        })
+                        .collect();
+                    clauses.push(CoreClause {
+                        effect: c.effect.clone(),
+                        op: c.op.clone(),
+                        params,
+                        body: Rc::new(self.fresh_binders(&cb, name)),
+                    });
+                }
+                let ret = h.ret.as_ref().map(|r| {
+                    let (binder, rb) = if r.binder == name {
+                        let n = self.fresh(&format!("{name}$alias"));
+                        let rb = rename(&r.body, name, &n);
+                        (n, rb)
+                    } else {
+                        (r.binder.clone(), (*r.body).clone())
+                    };
+                    Rc::new(CoreReturn {
+                        binder,
+                        body: Rc::new(self.fresh_binders(&rb, name)),
+                    })
+                });
+                CoreKind::Handle(Rc::new(CoreHandle {
+                    body,
+                    clauses: clauses.into(),
+                    ret,
+                    is_multi_declared: h.is_multi_declared,
+                    multi: h.multi,
+                    any: h.any,
+                }))
+            }
+            CoreKind::Resume(v) => CoreKind::Resume(Rc::new(self.fresh_binders(v, name))),
+            CoreKind::Perform(p) => CoreKind::Perform(Rc::new(CorePerform {
+                effect: p.effect.clone(),
+                op: p.op.clone(),
+                op_ty: p.op_ty.clone(),
+                args: self.fresh_all(&p.args, name),
+            })),
+        };
+        CoreExpr {
+            span: e.span,
+            ty: e.ty.clone(),
+            kind,
+        }
+    }
+
+    fn fresh_all(&mut self, cs: &[CoreExpr], name: &str) -> Rc<[CoreExpr]> {
+        cs.iter().map(|c| self.fresh_binders(c, name)).collect()
     }
 
     fn expr(&mut self, e: &CoreExpr, locals: &mut Vec<String>) -> CoreExpr {
@@ -381,8 +511,15 @@ impl Anf<'_> {
             }
             CoreKind::Let(x, v, b) => {
                 if let CoreKind::Var(y) = &v.kind {
-                    if self.substitutes(x, v, y, b, locals) {
-                        return self.expr(&rename(b, x, y), locals);
+                    if self.substitutes(x, v, y, locals) {
+                        // D1: the body's own binders of `y` are renamed first,
+                        // so substituting `y` for `x` captures nothing.
+                        let b = if binds(b, y) {
+                            self.fresh_binders(b, y)
+                        } else {
+                            (**b).clone()
+                        };
+                        return self.expr(&rename(&b, x, y), locals);
                     }
                 }
                 let v = self.expr(v, locals);
@@ -527,6 +664,19 @@ fn binds(e: &CoreExpr, name: &str) -> bool {
 /// `e` with every free `from` renamed `to`, each occurrence keeping its type.
 /// A binder of `from` ends the renaming beneath it; the caller has checked
 /// that nothing in `e` binds `to` (`binds`).
+/// A pattern with its variable `from` renamed `to`.
+fn rename_pat(p: &elya::core::CorePat, from: &str, to: &str) -> elya::core::CorePat {
+    use elya::core::CorePat;
+    match p {
+        CorePat::Var(v) if v == from => CorePat::Var(to.to_string()),
+        CorePat::Ctor(c, subs) => CorePat::Ctor(
+            c.clone(),
+            subs.iter().map(|s| rename_pat(s, from, to)).collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 fn rename(e: &CoreExpr, from: &str, to: &str) -> CoreExpr {
     let go = |c: &CoreExpr| rename(c, from, to);
     let all = |cs: &[CoreExpr]| cs.iter().map(go).collect::<Rc<[CoreExpr]>>();
@@ -727,8 +877,9 @@ mod tests {
         assert!(wrapped, "no `fn(x) {{ Wrap(x) }}` in main");
     }
 
-    /// Spec 2026-10-22 D3: `let x = y` is substituted away -- unless something
-    /// in its body binds `y` again, where renaming `x` to `y` would capture.
+    /// Spec 2026-10-22 D3: `let x = y` is substituted away. When its body binds
+    /// `y` again, that binder is renamed first (spec 2026-10-24-elya-alias-renaming
+    /// D1; it used to keep the alias -- CHANGED EXPECTATION by that decision).
     #[test]
     fn an_alias_whose_target_is_rebound_is_kept() {
         let alias_let = |core: &CoreModule| {
@@ -749,8 +900,20 @@ mod tests {
              }\n",
         ));
         assert!(
-            alias_let(&rebound),
-            "the alias was substituted under a rebinding of its target"
+            !alias_let(&rebound),
+            "the alias was kept under a rebinding of its target"
+        );
+        // ... and the inner `let ap = 5` is renamed, with its use.
+        let renamed = main_nodes(&rebound).iter().any(|n| {
+            matches!(&n.kind, CoreKind::Let(x, _, b)
+                if x.starts_with("$ap$alias.")
+                    && matches!(&b.kind, CoreKind::App(_, a)
+                        if a.iter().any(|l| matches!(&l.kind, CoreKind::Lambda(_, body)
+                            if matches!(&body.kind, CoreKind::Var(v) if v == x)))))
+        });
+        assert!(
+            renamed,
+            "the inner binder of `ap` was not renamed with its use"
         );
     }
 

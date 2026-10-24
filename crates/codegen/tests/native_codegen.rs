@@ -3940,14 +3940,13 @@ fn the_conventions_review_corpus_matches_the_evaluator() {
 /// The review's finding 3 (pre-existing): an ALIAS of a generic local
 /// (`let mk2 = mk`) gets no clone, and the result of `mk2(1)` was a direct
 /// closure called with the CPS convention -- natively it hung where the
-/// evaluator printed 8. The deep callee guard refuses it by name: the
-/// result layer is an instantiation of `mk`'s open row at {S}.
+/// evaluator printed 8. The deep callee guard refused it by name.
 ///
-/// Since 2026-10-22 `anf` substitutes the alias (spec
-/// 2026-10-22-elya-one-shot-words-and-sweep-gaps D3), so that program runs
-/// (the `ALIASES` row w1). A changed test, by that decision: the alias is kept
-/// only when its body rebinds `mk`, which still meets the guard, so this
-/// program rebinds it.
+/// Since 2026-10-22 `anf` substitutes the alias, and since 2026-10-24 (spec
+/// 2026-10-24-elya-alias-renaming D1) also when its body rebinds `mk` (the
+/// inner `mk` is renamed first), so this program RUNS. CHANGED EXPECTATION by
+/// that decision (it was refused by name); the guard itself is pinned by
+/// `specialize`'s unit test `the_alias_guard_refuses_by_name_without_the_pass`.
 #[test]
 fn an_alias_of_a_generic_local_used_at_a_user_effect_is_refused_by_name() {
     let src = "effect S { fn get() -> Int }\n\
@@ -3958,13 +3957,7 @@ fn an_alias_of_a_generic_local_used_at_a_user_effect_is_refused_by_name() {
                \x20 handle { k(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
                }\n";
     assert_eq!(eval_main_int(src), "8");
-    let dir = temp_dir("generic-alias");
-    let err = try_compile_and_link(&lower_src(src), &dir, "generic-alias").unwrap_err();
-    std::fs::remove_dir_all(&dir).ok();
-    assert!(
-        err.contains("effect-polymorphic function used at a user effect"),
-        "{err}"
-    );
+    run_value_corpus(&[("generic-alias", src, "8")], "generic-alias");
 }
 
 /// Async step 1 (spec `2026-10-09-elya-async-step1-design.md`): function

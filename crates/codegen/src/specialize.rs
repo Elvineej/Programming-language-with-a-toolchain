@@ -1365,6 +1365,34 @@ mod tests {
         crate::cps_emit::prepass(&adapted, &cps_fns).expect("adapted");
     }
 
+    /// The deep callee guard (`cps_emit::prepass`) on an alias of a generic
+    /// local used at a user effect, WITHOUT `anf` and this pass: refused by
+    /// name. Since 2026-10-24 no source program reaches it through the
+    /// pipeline (`anf` renames and substitutes every such alias), so it is
+    /// pinned here.
+    #[test]
+    fn the_alias_guard_refuses_by_name_without_the_pass() {
+        let core = core_of(
+            "effect S { fn get() -> Int }\n\
+             pub fn main() -> Int {\n\
+             \x20 let mk = fn(n) { fn(g) { g() + n } }\n\
+             \x20 let mk2 = mk\n\
+             \x20 let k = mk2(1)\n\
+             \x20 handle { k(fn() { get() }) } with { S.get() -> resume(7)  return(r) -> r }\n\
+             }\n",
+        );
+        let fx = crate::cps::effect_facts(&core);
+        let cps_fns = crate::cps_emit::cps_functions(&core, &fx);
+        let err = crate::cps_emit::prepass(&core, &cps_fns).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CodegenError::Unsupported("effect-polymorphic function used at a user effect")
+            ),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn the_clone_budget_is_refused_by_name() {
         // A 257-term program: the front end recurses on the host stack, so it
