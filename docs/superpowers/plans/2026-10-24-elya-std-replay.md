@@ -10,3 +10,8 @@ Prediction: **1238 passed, 124 suites**.
 
 ## Task 2: the module (`std/replay.elya`) and its loading (`modules.rs`)
 ## Task 3: gate, control, review
+
+## Outcome
+
+Red as predicted; green at 1238 / 124 as predicted; the review found no defect
+(limitations recorded in the spec's section 3).

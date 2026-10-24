@@ -1,6 +1,6 @@
 # Record and replay as an Elya library: `import elya/replay`
 
-**Status:** in progress (2026-10-24, branch `auto/elya`, a scheduled run). HANDOFF
+**Status:** done (2026-10-24, branch `auto/elya`, a scheduled run). HANDOFF
 step 1, ROADMAP priority 3. The design choices are Claude's under the
 maintainer's delegation (rule 2), recorded here.
 
@@ -73,3 +73,28 @@ maintainer's delegation (rule 2), recorded here.
   same bytes.
 - Negative control: the embedded source's replay without its question check
   (`q == op.show(o)` always true): the divergence test fails.
+
+## 3. Outcome and review
+
+Red as predicted (E0600); green at 1238 / 124 as predicted; control K1 in
+`tests/std_replay.rs`'s header. The `elya/` prefix is reserved: a user file
+`elya/replay.elya` next to a program is not read (the embedded module is).
+
+The independent review found no defect: nested recordings over two effects,
+Float, Unit and string answers (escaped), empty bodies, programs that print,
+aliases, a module and the root both importing it (loaded once), E0209 on
+clashing names, no grant needed, the CLI's run/build/record/replay on disk, all
+examples unchanged; the evaluator and native agree everywhere. Limitations it
+recorded (each the existing `with any` behaviour, not the library's), now
+HANDOFF material:
+
+- inside a `with multi` handler of an `effect multi` that resumes twice,
+  `record` fails at run time with "a one-shot continuation was resumed twice";
+- `replay` cannot decode an answer whose type is the effect's own parameter
+  (`effect Box(a) { fn get(x: a) -> a }`): "op.decode: ... not known at run time";
+- `replay`'s body cannot perform `IO` (E0434: `with any` does not handle `IO`),
+  where `record`'s can (it relays it);
+- `text` writes the host's line shape, but a string containing ` = ` makes a
+  line the host's `rsplit_once(" = ")` reader splits wrongly; the host records
+  only `time.*` today, so nothing reads such a line yet. A reader must
+  understand quotes before the two formats are one.

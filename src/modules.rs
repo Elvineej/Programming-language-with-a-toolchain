@@ -53,6 +53,17 @@ pub type Reader<'a> = dyn FnMut(&str) -> Option<(String, String)> + 'a;
 /// The builtin modules: `m.f` names a builtin there, and `elya/<m>` imports one.
 const BUILTIN_MODULES: &[&str] = &["io", "int", "float", "time", "op"];
 
+/// The standard modules written in Elya (spec 2026-10-24-elya-std-replay D1):
+/// `elya/<name>` is this source, loaded as if it were the file `elya/<name>.elya`.
+const STD_SOURCES: &[(&str, &str)] = &[("elya/replay", include_str!("std/replay.elya"))];
+
+fn std_source(path: &str) -> Option<&'static str> {
+    STD_SOURCES
+        .iter()
+        .find(|(p, _)| *p == path)
+        .map(|(_, t)| *t)
+}
+
 /// One file of the program.
 struct Unit {
     /// `a/b`; the root's is its file's stem.
@@ -104,7 +115,9 @@ impl<'r, 'a> Loader<'r, 'a> {
         for imp in &module.imports {
             let span = imp.span;
             let target = imp.node.path.join("/");
-            if imp.node.path.first().map(String::as_str) == Some("elya") {
+            if imp.node.path.first().map(String::as_str) == Some("elya")
+                && std_source(&target).is_none()
+            {
                 // Part 2 D5: builtins are in scope without an import, and the
                 // root holds every capability.
                 if let Some(effects) = &imp.node.effects {
@@ -138,6 +151,7 @@ impl<'r, 'a> Loader<'r, 'a> {
                                 BUILTIN_MODULES
                                     .iter()
                                     .map(|m| format!("`elya/{m}`"))
+                                    .chain(STD_SOURCES.iter().map(|(p, _)| format!("`{p}`")))
                                     .collect::<Vec<_>>()
                                     .join(", ")
                             )),
@@ -189,7 +203,11 @@ impl<'r, 'a> Loader<'r, 'a> {
                 continue;
             }
             if !self.loaded.contains_key(&target) {
-                match (self.read)(&target) {
+                let found = match std_source(&target) {
+                    Some(text) => Some((format!("{target}.elya"), text.to_string())),
+                    None => (self.read)(&target),
+                };
+                match found {
                     None => {
                         self.diags.push(
                             Diagnostic::error("E0600", format!("no module `{target}`"))
@@ -290,7 +308,9 @@ fn grants(units: &[Unit], diags: &mut Vec<Diagnostic>) -> Vec<Grant> {
     for (me, u) in units.iter().enumerate() {
         for imp in &u.module.imports {
             let target = imp.node.path.join("/");
-            if imp.node.path.first().map(String::as_str) == Some("elya") {
+            if imp.node.path.first().map(String::as_str) == Some("elya")
+                && std_source(&target).is_none()
+            {
                 continue;
             }
             let list = imp.node.effects.clone().unwrap_or_default();

@@ -1,0 +1,80 @@
+// elya/replay: record a run's answers, and replay them (spec
+// docs/superpowers/specs/2026-10-24-elya-std-replay-design.md).
+//
+// A `with any` handler handles every operation its body performs (but `IO`).
+// `record` asks the handlers outside and writes each question and answer down;
+// `replay` answers from the recording alone, checking each question. The
+// answer's type is the operation's own, so a replayed answer of the wrong type
+// cannot get in.
+
+// What a run asked, and what it was told: the question as `op.show` writes it,
+// and the answer as `op.encode` writes it.
+type Trace { TraceEnd, TraceEntry(String, String, Trace) }
+
+type Recorded(a) { Recorded(a, Trace) }
+
+type Replayed(a) {
+  Replayed(a),
+  // The program asked the first; the trace held the second.
+  Diverged(String, String),
+  // The program finished with entries left over.
+  Unconsumed(a, Trace)
+}
+
+// Run `body`, asking the handlers outside, and write every question and
+// answer down. The trace is built as the resumed computation returns, so it is
+// in order.
+pub fn record(body) {
+  handle { body() } with any {
+    op(o) -> {
+      let v = op.perform(o)
+      match resume(v) {
+        Recorded(x, t) -> Recorded(x, TraceEntry(op.show(o), op.encode(o, v), t))
+      }
+    }
+    return(x) -> Recorded(x, TraceEnd)
+  }
+}
+
+// Run `body` answering every question from `trace`, which must hold the same
+// question next. No handler of the program's effects is needed.
+pub fn replay(body, trace) {
+  let run = handle { body() } with any {
+    op(o) -> fn(t) {
+      match t {
+        TraceEntry(q, a, rest) ->
+          if q == op.show(o) { resume(op.decode(o, a))(rest) }
+          else { Diverged(op.show(o), q) }
+        TraceEnd -> Diverged(op.show(o), "the end of the trace")
+      }
+    }
+    return(x) -> fn(t) {
+      match t {
+        TraceEnd -> Replayed(x)
+        TraceEntry(q, a, rest) -> Unconsumed(x, t)
+      }
+    }
+  }
+  run(trace)
+}
+
+// The trace as the host trace's text: `elya trace 1`, then a
+// `question = answer` line each.
+pub fn text(trace: Trace) -> String {
+  "elya trace 1\n" <> lines(trace)
+}
+
+fn lines(trace: Trace) -> String {
+  match trace {
+    TraceEnd -> ""
+    TraceEntry(q, a, rest) -> q <> " = " <> a <> "\n" <> lines(rest)
+  }
+}
+
+// The number of entries.
+pub fn size(trace: Trace) -> Int {
+  match trace {
+    TraceEnd -> 0
+    TraceEntry(q, a, rest) -> 1 + size(rest)
+  }
+}
