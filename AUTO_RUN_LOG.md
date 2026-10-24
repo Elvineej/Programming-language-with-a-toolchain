@@ -61,7 +61,17 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     overloading `<`); `-.` prefix; rounding `of_int`; failing (not saturating)
     `truncate`/`round`.
 - New HANDOFF step 5: a block ending in `let` natively; exponent float literals.
-- Working on: HANDOFF step 1 (record and replay as an Elya library).
+- **Done: record and replay as an Elya library** (HANDOFF step 1). Spec+plan e04c0ee,
+  implementation c5d618a. `import elya/replay` (Elya source embedded in the
+  compiler): `record`, `replay`, `text`, `size`. Gate 1238 / 124 as predicted; K1
+  distinct; the review found no defect, and four limitations of `with any`
+  (recorded in the spec and HANDOFF step 5).
+  - **Decisions (mine; please review):** the standard library's first Elya-source
+    module (the `elya/` prefix reserved, the embedded file wins); prefixed type
+    names (`Trace`, `Recorded`, `Replayed`); reading trace text deferred until
+    string functions exist.
+- New HANDOFF step 5: strings to read a trace.
+- Working on: HANDOFF step 1 (diagnostics at the edges).
 
 ## 2026-10-23 17:53 UTC — IN PROGRESS (scheduled run, FULL mode)
 

@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1229 passed, 121 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1238 passed, 124 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
@@ -519,20 +519,15 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   by name on NaN and outside `Int`), both sides. Needs the Windows gate
   (`runtime.c`'s `elya_float_to_int`).
 
+- **Record and replay as an Elya library** (2026-10-24, branch `auto/elya`, a
+  scheduled run, c5d618a): spec
+  `docs/superpowers/specs/2026-10-24-elya-std-replay-design.md`. `import
+  elya/replay` is a standard module written in Elya (embedded `src/std/`):
+  `record`, `replay`, `text`, `size`; it needs no grant and runs natively.
+
 ## The next five steps
 
-### 1. Record and replay as an Elya library
-
-ROADMAP priority 3. `examples/09_record_any.elya` shows a recorder written with
-`with any`; the host-level trace (`elya run --record`, `ELYA_RECORD`) covers only
-`time.*`. Measure what a test author needs to record a program's own effects and
-replay them in a test (a recorder and a replayer over a list of answers, their
-failure words on divergence, their cost per operation natively), then decide in a
-spec whether a standard module (`import elya/replay`, now that modules exist)
-ships them, and in what trace format (the host trace's `question = answer`
-lines, so one replayer reads both).
-
-### 2. Aliases that rebind their target: rename instead of keeping the `let`
+### 1. Aliases that rebind their target: rename instead of keeping the `let`
 
 `anf`'s alias rule (spec 2026-10-22 D3) keeps `let x = y` when the body binds
 `y` again, so the alias stays a local whose uses at a user effect are refused
@@ -542,7 +537,7 @@ are other shapes), then decide in a spec whether renaming the inner binder
 (capture-avoiding substitution) lets them run, with differential tests and a
 control that brings the refusal back.
 
-### 3. Diagnostics at the edges
+### 2. Diagnostics at the edges
 
 Left by the parser-recovery slice (spec 2026-10-23-elya-parser-recovery §3):
 a label after non-ASCII text is dropped by the renderer (byte offsets passed
@@ -553,7 +548,7 @@ end reports twice at one span. Measure each, then decide in a spec: character
 offsets in the renderer, a nesting limit with a named error (or an explicit
 stack), and the double report.
 
-### 4. Capabilities, part 3: attenuation, and builtins behind an import
+### 3. Capabilities, part 3: attenuation, and builtins behind an import
 
 ROADMAP priority 2's last part. Modules part 2 (spec 2026-10-24) checks what an
 import grants; the root holds every capability and builtins need no import.
@@ -566,7 +561,7 @@ the root), so a module's source says it touches the host. Also recorded by the
 part-2 review: data of a type with an `IO` field passed through a module needs
 the grant (a type cannot say who built a value).
 
-### 5. Two gaps the Float part-2 review saw
+### 4. Two gaps the Float part-2 review saw
 
 Older than that slice. (a) A function body (`main` included) that ends in a
 `let` statement runs in the evaluator (its value is `Unit`/0) and is refused
@@ -578,6 +573,19 @@ error everywhere (the stricter choice, if nothing in the corpus relies on it).
 subnormal values must be computed; decide the literal syntax (`1.0e19`, a digit
 on both sides of the `.` as now) and its text in `float.to_string`/`op.show`
 (which never write an exponent today).
+
+### 5. Strings to read a trace: one trace format for the host and `elya/replay`
+
+`elya/replay` (spec 2026-10-24-elya-std-replay §3) writes the host trace's line
+shape, but no Elya program can read text back (no string functions beyond `<>`,
+`==` and the `to_string`s, no input), and the host's reader splits a line at its
+last ` = `, which a string answer containing ` = ` breaks. Measure what a reader
+needs (length, a character or byte at an index, a slice, a search; reading a
+file or stdin as an effect), then decide in a spec: the string builtins (bytes
+or characters; failures by name out of range), a quote-aware line format both
+readers share, and `replay.parse(text)`. Also from that review: `record` under a
+multi-shot handler fails at run time (one-shot `with any`), and `replay` cannot
+decode an answer typed by the effect's own parameter.
 
 ## Also open, unscheduled
 
