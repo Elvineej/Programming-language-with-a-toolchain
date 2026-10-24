@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1275 passed, 130 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1284 passed, 132 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -552,22 +552,16 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   and needs `/ {IO}`. Builtins still need no import in a module (D5, for the
   maintainer's review).
 
+- **Block tails and float exponents** (2026-10-24, branch `auto/elya`, a
+  scheduled run, 3ccab88): spec
+  `docs/superpowers/specs/2026-10-24-elya-block-tails-and-exponents-design.md`.
+  A block ending in `let`, or empty, is E0103 (it was `Unit` in the evaluator
+  and refused natively); float literals take an exponent (`1.0e19`), `1e19` is
+  E0003, out of range is E0002. `float.to_string` unchanged.
+
 ## The next five steps
 
-### 1. Two gaps the Float part-2 review saw
-
-Older than that slice. (a) A function body (`main` included) that ends in a
-`let` statement runs in the evaluator (its value is `Unit`/0) and is refused
-natively ("block without tail expression"); measure which block positions
-(function bodies, `if` arms, lambdas, clauses) and decide in a spec: lower a
-missing tail as `Unit` in Core, so both sides agree, or make it a front-end
-error everywhere (the stricter choice, if nothing in the corpus relies on it).
-(b) Float literals have no exponent (`1e19`, `5e-324` are E0100), so huge and
-subnormal values must be computed; decide the literal syntax (`1.0e19`, a digit
-on both sides of the `.` as now) and its text in `float.to_string`/`op.show`
-(which never write an exponent today).
-
-### 2. Strings to read a trace: one trace format for the host and `elya/replay`
+### 1. Strings to read a trace: one trace format for the host and `elya/replay`
 
 `elya/replay` (spec 2026-10-24-elya-std-replay §3) writes the host trace's line
 shape, but no Elya program can read text back (no string functions beyond `<>`,
@@ -580,7 +574,7 @@ readers share, and `replay.parse(text)`. Also from that review: `record` under a
 multi-shot handler fails at run time (one-shot `with any`), and `replay` cannot
 decode an answer typed by the effect's own parameter.
 
-### 3. The sweep's last native refusals
+### 2. The sweep's last native refusals
 
 After alias renaming (spec 2026-10-24 §3) the differential sweep's native
 refusals are four, all older: two `main`s whose value is not an `Int` (a
@@ -591,7 +585,7 @@ instances, and how), then decide in a spec: what a native binary prints for a
 `Unit`), and whether the budget is hit by non-regular types (a named refusal
 is right) or by ordinary ones (a bigger or a smarter bound).
 
-### 4. Core passes iterative over a block's statements
+### 3. Core passes iterative over a block's statements
 
 Left by diagnostics at the edges (spec 2026-10-24 D5): a block is a chain of
 `let`s in Core and every Core pass (`mono::rewrite_let` first) recurses down
@@ -604,7 +598,7 @@ fix: no bound at all), or a flatter Core block node. Also from that review:
 `let a{i+1} = fn() { a{i} }` repeated 2000 times takes over 300 s in `check`
 (inference).
 
-### 5. Name clashes across files: diagnostics that stay in the user's file
+### 4. Name clashes across files: diagnostics that stay in the user's file
 
 Seen by the capabilities part-3 review (older): a root that declares `fn
 console_line` while importing `elya/console` gets the right E0205 and also
@@ -616,6 +610,19 @@ operation of the root clashing with one of a module's, direct and transitive),
 then decide in a spec: report a clash once, in the importing file, naming the
 module; and whether E0605's help should say "rename" when following it would
 be E0209.
+
+### 5. Async as a standard module: `elya/async`
+
+ROADMAP priority 1's examples (`04_async.elya`, `06_structured.elya`,
+`08_timers.elya`) each carry their own scheduler: `spawn`/`await`/`yld`, a
+`scope` that joins its children, timers. Like `elya/replay` and
+`elya/console`, ship them as a standard module written in Elya, so a
+dependency is written against one `Async` vocabulary and granted it (part 3's
+pattern: the effects and pure schedulers in `elya/async`, any host binding in
+`elya/host`). Measure what the three examples share and what each needs
+(result types, cancellation, a timer's host clock through `elya/clock`), then
+decide the API in a spec; prove it by rewriting the examples on it, in the
+evaluator and natively. The names carry the module's (part 3 D1).
 
 ## Also open, unscheduled
 

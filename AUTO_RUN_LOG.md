@@ -3,7 +3,7 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-24 05:53 UTC — IN PROGRESS (scheduled run, FULL mode)
+## 2026-10-24 05:53 UTC — DONE at 07:58 (scheduled run, FULL mode: three tasks)
 
 - The 21:55 entry started eight hours ago (over the three-hour lock); its last commit
   is 8757408 (00:33). Taken over.
@@ -11,21 +11,6 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   `libzstd-dev`). Baseline 1241 / 125.
 - **Done: diagnostics at the edges** (HANDOFF step 1). Spec+plan 863e7c5,
   implementation 0f8da88.
-- **Done: capabilities part 3, attenuation in the standard library** (HANDOFF
-  step 1). Spec+plan 931b898, implementation b70707f.
-  - `elya/console` (`Console`) and `elya/clock` (`WallClock`), written in Elya,
-    with attenuating handlers; `elya/host` turns them into `IO` and needs
-    `/ {IO}`. A dependency can now be given lines or a fixed clock, not the host.
-  - Gate 1275 / 130 as predicted; K1-K2 distinct. Review: no soundness defect
-    (no route from a `Console`-only grant to `IO`), evaluator = native for every
-    handler; the generic names (`Out`, `Clock`, `Counted`) renamed on its advice.
-  - **Decisions (mine; please review):** the host handlers in a module of their
-    own; grants apply to the standard Elya modules unchanged (so
-    `import elya/console / {Console}`); builtins stay importless in modules
-    (D5: a file's own import adds no authority; requiring it would change eight
-    tests' expectations).
-- New HANDOFF step 5: name clashes across files (diagnostics in the user's file).
-- Working on: HANDOFF step 1 (two gaps the Float part-2 review saw).
   - Byte offsets in the renderer (labels after non-ASCII text were shifted);
     E0209/E0202 label the first declaration too (in its own file); the end of
     the file is reported once; expressions nest at most 1024 levels, E0102
@@ -40,8 +25,37 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     1024 (not an explicit stack); the CLI's 1 GiB thread (block length stays
     unbounded, so iterative Core passes are new HANDOFF step 5); D3 narrowed to
     the end of the file.
-- Windows-gate debt: b70707f (new std sources; no runtime change, low risk), 0f8da88 (the CLI's thread; a `#[cfg(target_os = "linux")]`
-  test), with the earlier list (dce886a, 670c842, dfb8a5c, e78ace6, ...).
+- **Done: capabilities part 3, attenuation in the standard library** (HANDOFF
+  step 1). Spec+plan 931b898, implementation b70707f.
+  - `elya/console` (`Console`) and `elya/clock` (`WallClock`), written in Elya,
+    with attenuating handlers; `elya/host` turns them into `IO` and needs
+    `/ {IO}`. A dependency can now be given lines or a fixed clock, not the host.
+  - Gate 1275 / 130 as predicted; K1-K2 distinct. Review: no soundness defect
+    (no route from a `Console`-only grant to `IO`), evaluator = native for every
+    handler; the generic names (`Out`, `Clock`, `Counted`) renamed on its advice.
+  - **Decisions (mine; please review):** the host handlers in a module of their
+    own; grants apply to the standard Elya modules unchanged (so
+    `import elya/console / {Console}`); builtins stay importless in modules
+    (D5: a file's own import adds no authority; requiring it would change eight
+    tests' expectations).
+- New HANDOFF step 5: name clashes across files (diagnostics in the user's file).
+- **Done: block tails and float exponents** (HANDOFF step 1). Spec, plan and
+  implementation 3ccab88.
+  - A block ending in `let`, or empty, is E0103 (was `Unit` in the evaluator,
+    refused natively). `1.0e19`-style literals; `1e19` E0003; out of range E0002.
+  - Gate 1284 / 132 as predicted; K1-K2 distinct. Review: nothing changed
+    meaning; F1-F2 (two help/diagnostic gaps) fixed test-first.
+  - **Decisions (mine; please review):** a front-end error rather than lowering
+    a missing tail as `Unit`; the `.` stays required (`1e19` refused, not a
+    float); `float.to_string` keeps positional text (the trace format).
+- New HANDOFF step 5: async as a standard module, `elya/async`.
+- Stopped near the three-hour lock so a later run can take over cleanly. Next:
+  HANDOFF step 1 (strings to read a trace). Gate at the tip: 1284 / 132.
+- Windows gate (`scripts/check.ps1`) still owed for this run's commits (listed
+  below) and the earlier ones.
+- Windows-gate debt: 3ccab88 (lexer only; low risk), b70707f (new std
+  sources; no runtime change), 0f8da88 (the CLI's thread; a
+  `#[cfg(target_os = "linux")]` test), with the earlier list (dce886a, 670c842, dfb8a5c, e78ace6, ...).
 - `graphify` is not installed here, so `graphify update .` was not run.
 
 ## 2026-10-23 21:55 UTC — ended without a DONE mark (last commit 8757408, 00:33), taken over 2026-10-24 05:53 (scheduled run, FULL mode)
