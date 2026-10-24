@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1238 passed, 124 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1251 passed, 125 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
@@ -525,19 +525,17 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   elya/replay` is a standard module written in Elya (embedded `src/std/`):
   `record`, `replay`, `text`, `size`; it needs no grant and runs natively.
 
+- **Aliases that rebind their target are renamed** (2026-10-24, branch
+  `auto/elya`, a scheduled run, b7a176b): spec
+  `docs/superpowers/specs/2026-10-24-elya-alias-renaming-design.md`. `anf`
+  substitutes an alias of a row-polymorphic local with capture-avoiding
+  renaming of the body's own binders of the target, also when a top-level
+  function shares its name; the sweep's "effect-polymorphic function used at a
+  user effect" refusals are gone. Core pass only.
+
 ## The next five steps
 
-### 1. Aliases that rebind their target: rename instead of keeping the `let`
-
-`anf`'s alias rule (spec 2026-10-22 D3) keeps `let x = y` when the body binds
-`y` again, so the alias stays a local whose uses at a user effect are refused
-natively ("effect-polymorphic function used at a user effect"): 18 programs of
-the 2026-10-23 review fuzzer. Measure them first (which are rebinding, which
-are other shapes), then decide in a spec whether renaming the inner binder
-(capture-avoiding substitution) lets them run, with differential tests and a
-control that brings the refusal back.
-
-### 2. Diagnostics at the edges
+### 1. Diagnostics at the edges
 
 Left by the parser-recovery slice (spec 2026-10-23-elya-parser-recovery §3):
 a label after non-ASCII text is dropped by the renderer (byte offsets passed
@@ -548,7 +546,7 @@ end reports twice at one span. Measure each, then decide in a spec: character
 offsets in the renderer, a nesting limit with a named error (or an explicit
 stack), and the double report.
 
-### 3. Capabilities, part 3: attenuation, and builtins behind an import
+### 2. Capabilities, part 3: attenuation, and builtins behind an import
 
 ROADMAP priority 2's last part. Modules part 2 (spec 2026-10-24) checks what an
 import grants; the root holds every capability and builtins need no import.
@@ -561,7 +559,7 @@ the root), so a module's source says it touches the host. Also recorded by the
 part-2 review: data of a type with an `IO` field passed through a module needs
 the grant (a type cannot say who built a value).
 
-### 4. Two gaps the Float part-2 review saw
+### 3. Two gaps the Float part-2 review saw
 
 Older than that slice. (a) A function body (`main` included) that ends in a
 `let` statement runs in the evaluator (its value is `Unit`/0) and is refused
@@ -574,7 +572,7 @@ subnormal values must be computed; decide the literal syntax (`1.0e19`, a digit
 on both sides of the `.` as now) and its text in `float.to_string`/`op.show`
 (which never write an exponent today).
 
-### 5. Strings to read a trace: one trace format for the host and `elya/replay`
+### 4. Strings to read a trace: one trace format for the host and `elya/replay`
 
 `elya/replay` (spec 2026-10-24-elya-std-replay §3) writes the host trace's line
 shape, but no Elya program can read text back (no string functions beyond `<>`,
@@ -587,15 +585,23 @@ readers share, and `replay.parse(text)`. Also from that review: `record` under a
 multi-shot handler fails at run time (one-shot `with any`), and `replay` cannot
 decode an answer typed by the effect's own parameter.
 
+### 5. The sweep's last native refusals
+
+After alias renaming (spec 2026-10-24 §3) the differential sweep's native
+refusals are four, all older: two `main`s whose value is not an `Int` (a
+`Float` main, "non-Int value"), two "too many type instances" (the N7 part 2
+instance budget). Measure each family (which `main` types, which programs grow
+instances, and how), then decide in a spec: what a native binary prints for a
+`main` of each type (the evaluator's `run --value` text, as for `Int` and
+`Unit`), and whether the budget is hit by non-regular types (a named refusal
+is right) or by ordinary ones (a bigger or a smarter bound).
+
 ## Also open, unscheduled
 
 E0434 rejects a direct inner `with any` over `Hold(Opt(Op))` but accepts the same
 handler through a generic function (the 2026-10-23 review's F4). A helper taking an
 operation costs a clone per operation and helper (refused past the budget, 256).
-`anf`'s alias rule keeps the `let` when the body rebinds the
-alias's target. Renaming the inner binder instead would let the rest of the review
-fuzzer's refusals run (18 programs, "effect-polymorphic function used at a user
-effect"). Also row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
+Also row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
 per platform, deferred by the timers spec D1); Elya functions are mangled
 `elya.<name>`; the roadmap's
 other priorities (record/replay handlers, then capabilities once modules exist); the rest

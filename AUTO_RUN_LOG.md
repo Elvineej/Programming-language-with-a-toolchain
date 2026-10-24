@@ -71,6 +71,14 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     names (`Trace`, `Recorded`, `Replayed`); reading trace text deferred until
     string functions exist.
 - New HANDOFF step 5: strings to read a trace.
+- **Done: aliases that rebind their target** (HANDOFF step 1). Implementation, spec
+  and plan b7a176b. Capture-avoiding renaming in `anf`'s alias rule; the
+  top-level-name guard dropped. Gate 1241 / 125 as predicted; K1-K2 distinct; the
+  review found no defect (sweep 982 programs, 0 failing, six refusals gone).
+  - **Changed tests (by D1):** native_codegen's alias-guard test now runs its
+    program; anf's rebound-alias unit test asserts the renaming; a new unit test
+    pins the guard.
+- New HANDOFF step 5: the sweep's last native refusals.
 - Working on: HANDOFF step 1 (diagnostics at the edges).
 
 ## 2026-10-23 17:53 UTC — IN PROGRESS (scheduled run, FULL mode)
