@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1221 passed, 119 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1229 passed, 121 suites. Native programs run on
   their own 1 GiB stack (`elya_start`). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
@@ -512,21 +512,16 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   signatures (the review found three holes there). E0606 (not granted), E0607
   (unknown or repeated name), E0608 (a list on a standard module).
 
+- **`Float`, part 2: comparisons, negation and conversions** (2026-10-24, branch
+  `auto/elya`, a scheduled run, 21a622e): spec
+  `docs/superpowers/specs/2026-10-24-elya-float-part-2-design.md`. `<. <=. >. >=.`
+  (IEEE ordered), `-.e`, `float.of_int`, `float.truncate`, `float.round` (failing
+  by name on NaN and outside `Int`), both sides. Needs the Windows gate
+  (`runtime.c`'s `elya_float_to_int`).
+
 ## The next five steps
 
-### 1. `Float`, part 2: comparisons, negation and conversions
-
-Floats run natively since 6baf595, but `<`, `<=`, `>`, `>=` are `Int` only, `-x`
-on a float expression is E0400 (only a literal folds its sign), and nothing
-converts between `Int` and `Float`. Measure what a numeric program needs (a mean,
-a square root by Newton's method, a fixed-point loop), then decide in a spec:
-`<.`-style operators or overloading the comparisons by type (the stricter choice is
-separate operators, like `+.`); IEEE comparison semantics with NaN (every
-comparison false); `-.x` or `-` on floats; `float.of_int` (exact or rounded),
-`float.truncate`/`round` to `Int` (failing by name outside `Int`'s range and on
-NaN, as checked arithmetic does). Both sides, differential tests on the edges.
-
-### 2. Record and replay as an Elya library
+### 1. Record and replay as an Elya library
 
 ROADMAP priority 3. `examples/09_record_any.elya` shows a recorder written with
 `with any`; the host-level trace (`elya run --record`, `ELYA_RECORD`) covers only
@@ -537,7 +532,7 @@ spec whether a standard module (`import elya/replay`, now that modules exist)
 ships them, and in what trace format (the host trace's `question = answer`
 lines, so one replayer reads both).
 
-### 3. Aliases that rebind their target: rename instead of keeping the `let`
+### 2. Aliases that rebind their target: rename instead of keeping the `let`
 
 `anf`'s alias rule (spec 2026-10-22 D3) keeps `let x = y` when the body binds
 `y` again, so the alias stays a local whose uses at a user effect are refused
@@ -547,7 +542,7 @@ are other shapes), then decide in a spec whether renaming the inner binder
 (capture-avoiding substitution) lets them run, with differential tests and a
 control that brings the refusal back.
 
-### 4. Diagnostics at the edges
+### 3. Diagnostics at the edges
 
 Left by the parser-recovery slice (spec 2026-10-23-elya-parser-recovery §3):
 a label after non-ASCII text is dropped by the renderer (byte offsets passed
@@ -558,7 +553,7 @@ end reports twice at one span. Measure each, then decide in a spec: character
 offsets in the renderer, a nesting limit with a named error (or an explicit
 stack), and the double report.
 
-### 5. Capabilities, part 3: attenuation, and builtins behind an import
+### 4. Capabilities, part 3: attenuation, and builtins behind an import
 
 ROADMAP priority 2's last part. Modules part 2 (spec 2026-10-24) checks what an
 import grants; the root holds every capability and builtins need no import.
@@ -570,6 +565,19 @@ module; and whether `io`/`time` should need `import elya/io` in a module (not
 the root), so a module's source says it touches the host. Also recorded by the
 part-2 review: data of a type with an `IO` field passed through a module needs
 the grant (a type cannot say who built a value).
+
+### 5. Two gaps the Float part-2 review saw
+
+Older than that slice. (a) A function body (`main` included) that ends in a
+`let` statement runs in the evaluator (its value is `Unit`/0) and is refused
+natively ("block without tail expression"); measure which block positions
+(function bodies, `if` arms, lambdas, clauses) and decide in a spec: lower a
+missing tail as `Unit` in Core, so both sides agree, or make it a front-end
+error everywhere (the stricter choice, if nothing in the corpus relies on it).
+(b) Float literals have no exponent (`1e19`, `5e-324` are E0100), so huge and
+subnormal values must be computed; decide the literal syntax (`1.0e19`, a digit
+on both sides of the `.` as now) and its text in `float.to_string`/`op.show`
+(which never write an exponent today).
 
 ## Also open, unscheduled
 

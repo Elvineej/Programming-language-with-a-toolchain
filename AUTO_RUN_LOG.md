@@ -54,7 +54,14 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   - **Changed tests:** `an_allow_list_is_e0606` (expectation, by D2); two programs
     gained `/ {Log}` (expectations unchanged).
 - New HANDOFF step 5: capabilities part 3 (attenuation; builtins behind an import).
-- Working on: HANDOFF step 1 (`Float`, part 2).
+- **Done: `Float` part 2** (HANDOFF step 1). Spec+plan a4354ce, implementation
+  21a622e. `<. <=. >. >=.`, `-.e`, `float.of_int/truncate/round` on both sides.
+  Gate 1229 / 121 as predicted; K4-K6 distinct; the review found no defect.
+  - **Decisions (mine; please review):** separate comparison operators (not
+    overloading `<`); `-.` prefix; rounding `of_int`; failing (not saturating)
+    `truncate`/`round`.
+- New HANDOFF step 5: a block ending in `let` natively; exponent float literals.
+- Working on: HANDOFF step 1 (record and replay as an Elya library).
 
 ## 2026-10-23 17:53 UTC — IN PROGRESS (scheduled run, FULL mode)
 
