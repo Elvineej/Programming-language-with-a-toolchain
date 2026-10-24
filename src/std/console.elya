@@ -1,0 +1,57 @@
+// elya/console: a program's text output as an effect, and handlers that give a
+// dependency less than the host's `IO` (spec
+// docs/superpowers/specs/2026-10-24-elya-capabilities-part-3-design.md).
+//
+// A module that writes lines performs `Console` and is granted `/ {Console}`, never
+// `IO`; whoever imports it decides where the lines go. Every handler here
+// performs nothing of its own but `Console`: none needs `IO` granted. The host's
+// handler is `elya/host`'s `console`.
+
+effect Console { fn console_line(text: String) -> Unit }
+
+type ConsoleCaptured(a) { ConsoleCaptured(a, String) }
+
+type ConsoleCounted(a) { ConsoleCounted(a, Int) }
+
+// Every line `body` writes, with `prefix` in front.
+pub fn prefixed(prefix: String, body) {
+  handle { body() } with {
+    Console.console_line(text) -> { console_line(prefix <> text)  resume(Unit) }
+  }
+}
+
+// `body`'s lines are dropped.
+pub fn silenced(body) {
+  handle { body() } with { Console.console_line(text) -> resume(Unit) }
+}
+
+// At most `n` of `body`'s lines get out; the rest are dropped.
+pub fn limited(n: Int, body) {
+  let run = handle { body() } with {
+    Console.console_line(text) -> fn(left) {
+      if left > 0 { console_line(text)  resume(Unit)(left - 1) } else { resume(Unit)(0) }
+    }
+    return(x) -> fn(left) { x }
+  }
+  run(n)
+}
+
+// `body`'s lines go out, and are counted: `ConsoleCounted(value, lines)`.
+pub fn counted(body) {
+  handle { body() } with {
+    Console.console_line(text) -> {
+      console_line(text)
+      match resume(Unit) { ConsoleCounted(x, k) -> ConsoleCounted(x, k + 1) }
+    }
+    return(x) -> ConsoleCounted(x, 0)
+  }
+}
+
+// `body`'s lines are kept, not written: `ConsoleCaptured(value, text)`, each line
+// ended by a newline.
+pub fn captured(body) {
+  handle { body() } with {
+    Console.console_line(text) -> match resume(Unit) { ConsoleCaptured(x, rest) -> ConsoleCaptured(x, text <> "\n" <> rest) }
+    return(x) -> ConsoleCaptured(x, "")
+  }
+}

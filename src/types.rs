@@ -286,6 +286,14 @@ pub struct Infer {
     /// Declared type -> its parameters' variables and each constructor's
     /// field types, for the data check.
     adt_fields: HashMap<String, AdtFields>,
+    /// Equality type variables (structural equality, 2026-10-16, D1): each
+    /// must become data, because a `==` compares values of it. Binding one
+    /// checks what it is bound to (marking variables in it); instantiating a
+    /// scheme that quantifies one marks the fresh copy.
+    /// Each with the span of the `==` that marked it, named in the error.
+    eq_vars: HashMap<u32, Span>,
+    /// The `==` sites already reported, so a site is blamed once.
+    eq_reported: HashSet<Span>,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -319,6 +327,8 @@ impl Infer {
             pending_generic: Vec::new(),
             cur_span: Span::EMPTY,
             adt_fields: HashMap::new(),
+            eq_vars: HashMap::new(),
+            eq_reported: HashSet::new(),
             diags: Vec::new(),
         }
     }
@@ -543,6 +553,66 @@ impl Infer {
             return;
         }
         self.subst[v as usize] = Some(t.clone());
+        if let Some(origin) = self.eq_vars.get(&v).copied() {
+            self.require_data(t, span, Some(origin));
+        }
+    }
+
+    /// E0436 (structural equality, D1): `t` is compared with `==`, so it must be
+    /// data. Checked eagerly: a variable in it is MARKED (`eq_vars`) and checked
+    /// again when it is bound, and wherever a scheme quantifying it is
+    /// instantiated, so a generic comparison is decided at its uses.
+    /// `origin`: the `==` that marked the variable being bound, or `None` at
+    /// the `==` itself.
+    fn require_data(&mut self, t: &Ty, span: Span, origin: Option<Span>) {
+        let marker = origin.unwrap_or(span);
+        if let Some(why) = self.eq_not_data(t, marker) {
+            if self.eq_reported.insert(span) {
+                let mut d =
+                    Diagnostic::error("E0436", "only data can be compared with `==` or `!=`");
+                d = match origin {
+                    None => d.with_label(span, format!("this compares {why}")),
+                    Some(o) => d
+                        .with_label(span, format!("this makes a comparison compare {why}"))
+                        .with_label(o, "the comparison it reaches"),
+                };
+                self.diags.push(
+                    d
+                        .with_help("data is `Int`, `Float`, `Bool`, `String`, `Unit` and declared types whose fields are data; a function has no equality (two functions that agree on every argument cannot be told apart by running them)"),
+                );
+            }
+        }
+    }
+
+    /// Why `t` is not data, or `None`; marks the variables in it (D1) with
+    /// the comparison `origin`.
+    fn eq_not_data(&mut self, t: &Ty, origin: Span) -> Option<String> {
+        match self.resolve(t) {
+            Ty::Base(_) | Ty::Error => None,
+            Ty::Var(v) => {
+                self.eq_vars.entry(v).or_insert(origin);
+                None
+            }
+            Ty::Fn(..) => Some("functions".to_string()),
+            Ty::Tuple(xs) => xs.iter().find_map(|x| self.eq_not_data(x, origin)),
+            // An operation caught by `with any` is data: E0434 requires every
+            // operation such a handler handles to take data. Its answer-type
+            // argument is an index, not a field (N3: two operations compare by
+            // what they are).
+            Ty::Con(n, _) if n == "$Op" => None,
+            Ty::Con(n, args) => {
+                let mut why = None;
+                for a in &args {
+                    if let Some(w) = self.eq_not_data(a, origin) {
+                        why.get_or_insert(w);
+                    }
+                }
+                why.or_else(|| {
+                    self.decl_not_data(&n, &mut Vec::new())
+                        .map(|w| format!("values of `{n}`, which holds {w}"))
+                })
+            }
+        }
     }
 
     pub fn unify(&mut self, a: &Ty, b: &Ty, span: Span) {
@@ -1198,6 +1268,7 @@ fn binop_type(op: BinOp) -> (Ty, Ty, Ty) {
         Add | Sub | Mul | Div | Rem => (Ty::int(), Ty::int(), Ty::int()),
         AddF | SubF | MulF | DivF => (Ty::float(), Ty::float(), Ty::float()),
         Lt | Le | Gt | Ge => (Ty::int(), Ty::int(), Ty::bool()),
+        LtF | LeF | GtF | GeF => (Ty::float(), Ty::float(), Ty::bool()),
         Concat => (Ty::str(), Ty::str(), Ty::str()),
         And | Or => (Ty::bool(), Ty::bool(), Ty::bool()),
         // Eq/Ne handled specially in infer_expr (both operands share a fresh var).
@@ -1211,6 +1282,11 @@ impl Infer {
             return s.ty.clone();
         }
         let mapping: HashMap<u32, Ty> = s.vars.iter().map(|v| (*v, self.fresh())).collect();
+        for (v, fresh) in &mapping {
+            if let (Some(origin), Ty::Var(f)) = (self.eq_vars.get(v).copied(), fresh) {
+                self.eq_vars.insert(*f, origin);
+            }
+        }
         let mut row_mapping: HashMap<RowVar, RowVar> = HashMap::new();
         for v in &s.row_vars {
             let fresh = if self.phantom.contains(v) {
@@ -1317,6 +1393,8 @@ impl Infer {
             Expr::Str(_) => Ty::str(),
             Expr::Bool(_) => Ty::bool(),
             Expr::Unit => Ty::unit(),
+            // Poison: only in a module with a parse error (never inferred).
+            Expr::Error => Ty::Error,
             Expr::Var(name) => {
                 // A bare constructor is a first-class function value (Slice 4b-1):
                 // its scheme is already an arrow (`Some : ∀a. (a) -> Option(a)`), so
@@ -1340,6 +1418,7 @@ impl Infer {
                 let (operand, result) = match op {
                     UnOp::Neg => (Ty::int(), Ty::int()),
                     UnOp::Not => (Ty::bool(), Ty::bool()),
+                    UnOp::NegF => (Ty::float(), Ty::float()),
                 };
                 self.unify(&t, &operand, span);
                 result
@@ -1349,6 +1428,7 @@ impl Infer {
                 let rt = self.infer_expr(rhs, env, amb);
                 if matches!(op, BinOp::Eq | BinOp::Ne) {
                     self.unify(&lt, &rt, span);
+                    self.require_data(&lt, span, None);
                     Ty::bool()
                 } else {
                     let (l, r, res) = binop_type(*op);
@@ -1753,13 +1833,50 @@ impl Infer {
             }
             // `int.to_string : fn(Int) -> String`, pure (spec
             // 2026-10-15-elya-native-strings D1).
-            if module == "int" && name == "to_string" {
+            // `float.to_string : fn(Float) -> String`, pure (spec
+            // 2026-10-23-elya-float-natively D5).
+            if (module == "int" || module == "float") && name == "to_string" {
                 let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
-                let want = Ty::Fn(vec![Ty::int()], EffectRow::pure(), Box::new(Ty::str()));
+                let num = if module == "int" {
+                    Ty::int()
+                } else {
+                    Ty::float()
+                };
+                let want = Ty::Fn(vec![num], EffectRow::pure(), Box::new(Ty::str()));
                 let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::str()));
                 self.unify(&want, &got, span);
                 self.node_types.insert(callee.span, want);
                 return Ty::str();
+            }
+            // `float.of_int : fn(Int) -> Float`, `float.truncate`/`round :
+            // fn(Float) -> Int`, pure (spec 2026-10-24-elya-float-part-2 D3, D4;
+            // a failure is not an effect, as with checked `Int` arithmetic).
+            if module == "float" && crate::resolve::FLOAT_CONVERSIONS.contains(&name.as_str()) {
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+                let (from, to) = if name == "of_int" {
+                    (Ty::int(), Ty::float())
+                } else {
+                    (Ty::float(), Ty::int())
+                };
+                let want = Ty::Fn(vec![from], EffectRow::pure(), Box::new(to.clone()));
+                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(to.clone()));
+                self.unify(&want, &got, span);
+                self.node_types.insert(callee.span, want);
+                return to;
+            }
+            // Wrapping and bit arithmetic: `fn(Int, Int) -> Int`, pure (spec
+            // 2026-10-17-elya-unary-and-wrapping D2).
+            if module == "int" && crate::resolve::INT_BINARY_BUILTINS.contains(&name.as_str()) {
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+                let want = Ty::Fn(
+                    vec![Ty::int(), Ty::int()],
+                    EffectRow::pure(),
+                    Box::new(Ty::int()),
+                );
+                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::int()));
+                self.unify(&want, &got, span);
+                self.node_types.insert(callee.span, want);
+                return Ty::int();
             }
             return Ty::Error; // unknown builtin is E0201 from resolution
         }
@@ -2956,7 +3073,7 @@ pub fn infer_schemes(
     _session: &Session,
     module: &Module,
 ) -> (Vec<(String, String)>, Vec<Diagnostic>) {
-    let (schemes, diags, _sites, _typed) = infer_all(module, false);
+    let (schemes, diags, _sites, _typed, _fns) = infer_all(module, false);
     (schemes, diags)
 }
 
@@ -2964,8 +3081,18 @@ pub fn infer_schemes(
 /// params have a `linear`-declared type. The one bounded reach the `affine::check`
 /// pass consumes; the affine *logic* lives entirely in that pass.
 pub fn infer_with_sites(_session: &Session, module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
-    let (_schemes, diags, sites, _typed) = infer_all(module, false);
+    let (_schemes, diags, sites, _typed, _fns) = infer_all(module, false);
     (diags, sites)
+}
+
+/// [`infer_with_sites`] plus every top-level function's generalized type, by
+/// name: a module's interface (spec 2026-10-24-elya-modules-part-2 D1).
+pub fn infer_with_interfaces(
+    _session: &Session,
+    module: &Module,
+) -> (Vec<Diagnostic>, HashSet<Span>, HashMap<String, Ty>) {
+    let (_schemes, diags, sites, _typed, fns) = infer_all(module, false);
+    (diags, sites, fns)
 }
 
 /// Inference plus the per-node type table (Slice 5a-1): every expression node's
@@ -2976,7 +3103,7 @@ pub fn infer_with_types(
     _session: &Session,
     module: &Module,
 ) -> (Vec<Diagnostic>, BTreeMap<Span, String>) {
-    let (_schemes, diags, _sites, typed) = infer_all(module, true);
+    let (_schemes, diags, _sites, typed, _fns) = infer_all(module, true);
     let mut names = Names::default();
     let mut rendered: BTreeMap<Span, String> = BTreeMap::new();
     for (span, ty) in &typed {
@@ -2995,7 +3122,7 @@ pub fn infer_typed_table(
     _session: &Session,
     module: &Module,
 ) -> (Vec<Diagnostic>, BTreeMap<Span, Ty>) {
-    let (_schemes, diags, _sites, typed) = infer_all(module, true);
+    let (_schemes, diags, _sites, typed, _fns) = infer_all(module, true);
     (diags, typed)
 }
 
@@ -3008,6 +3135,7 @@ type InferAllOut = (
     Vec<Diagnostic>,
     HashSet<Span>,
     BTreeMap<Span, Ty>,
+    HashMap<String, Ty>,
 );
 
 /// Type every top-level function, processing mutually-recursive groups (SCCs of
@@ -3182,6 +3310,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
     let groups = tarjan_scc(&edges); // callees before callers (reverse topological)
 
     let mut schemes_out: Vec<(String, String)> = Vec::new();
+    let mut fn_types: Vec<(String, Ty)> = Vec::new();
 
     for group in &groups {
         // 1. fresh monotype per member (with a fresh open ambient row), in scope
@@ -3333,8 +3462,13 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             let scheme = generalize_toplevel(&mut inf, &fnty, &env, group, &fns);
             env.insert(&f.name, scheme.clone());
             schemes_out.push((f.name.clone(), display_scheme(&inf, &scheme)));
+            fn_types.push((f.name.clone(), scheme.ty.clone()));
         }
     }
+    let fn_types: HashMap<String, Ty> = fn_types
+        .into_iter()
+        .map(|(n, t)| (n, inf.resolve(&t)))
+        .collect();
 
     // Record-then-zonk (spec §3): resolve every recorded node type ONCE here,
     // after all SCC groups are solved — never at record-time. Skipped unless a
@@ -3347,7 +3481,13 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
     } else {
         BTreeMap::new()
     };
-    (schemes_out, inf.diags, inf.affine_sites, node_types)
+    (
+        schemes_out,
+        inf.diags,
+        inf.affine_sites,
+        node_types,
+        fn_types,
+    )
 }
 
 fn collect_refs(b: &Block, acc: &mut Vec<String>) {
@@ -3413,6 +3553,7 @@ fn collect_refs_expr(e: &Expr, acc: &mut Vec<String>) {
         | Expr::Str(_)
         | Expr::Bool(_)
         | Expr::Unit
+        | Expr::Error
         | Expr::Qualified { .. } => {}
     }
 }

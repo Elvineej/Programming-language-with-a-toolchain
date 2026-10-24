@@ -119,6 +119,14 @@ fn write(v: &Value, out: &mut String) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// A float's literal text: [`write_float`]'s, as a `String` (`float.to_string`,
+/// spec 2026-10-23-elya-float-natively D5).
+pub fn float_text(f: f64) -> String {
+    let mut s = String::new();
+    write_float(f, &mut s);
+    s
+}
+
 /// A decimal with a point and no exponent (Rust's shortest round-trip `Display`),
 /// or `inf`, `-inf`, `nan`.
 fn write_float(f: f64, out: &mut String) {
@@ -185,7 +193,7 @@ pub fn decode(info: &TypeInfo, op: &str, text: &str) -> Result<Value, String> {
     Ok(v)
 }
 
-fn mentions(ann: &TypeAnn, name: &str) -> bool {
+pub(crate) fn mentions(ann: &TypeAnn, name: &str) -> bool {
     let mut stack = vec![ann];
     while let Some(a) = stack.pop() {
         if a.name == name {
@@ -254,7 +262,7 @@ fn substitute(ann: &TypeAnn, env: &HashMap<&str, &TypeAnn>) -> TypeAnn {
     out
 }
 
-fn render_ann(a: &TypeAnn) -> String {
+pub(crate) fn render_ann(a: &TypeAnn) -> String {
     let args: Vec<String> = a.args.iter().map(|x| render_ann(&x.node)).collect();
     if a.name == "fn" && !args.is_empty() {
         let (ps, r) = args.split_at(args.len() - 1);

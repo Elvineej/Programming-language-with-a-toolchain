@@ -9,31 +9,168 @@ use std::rc::Rc;
 
 struct Parser<'a> {
     tokens: &'a [Token],
+    /// The source, for the layout rule: whether a newline separates two tokens.
+    text: &'a str,
+    /// The file's first offset in the program's span space (modules part 1 D5):
+    /// spans are `base + offset in text`.
+    base: u32,
     pos: usize,
     diags: Vec<Diagnostic>,
+    /// Inside braces (a block, `match` arms, a handler's clauses) a newline before
+    /// an infix operator or a call's `(` ends the expression; inside parentheses it
+    /// is whitespace (spec 2026-10-23-elya-literals-and-layout D4).
+    braces: bool,
+    /// "unexpected end of file" was reported: the missing `}`s after it are not
+    /// reported again (spec 2026-10-23-elya-parser-recovery D1).
+    eof_reported: bool,
+    /// The first token of the declaration being parsed (D4's resume point is
+    /// found from it).
+    decl_start: usize,
+    /// Parser errors raised, counting those D3 did not report (spec
+    /// 2026-10-24-elya-diagnostics-at-the-edges): "did this fail with an error"
+    /// is this count, not the length of `diags`.
+    raised: usize,
+    /// D4: how many `expr`, `pattern` and `type_ann` calls are open.
+    depth: usize,
+    /// D4: the height of the tallest expression returned by an `expr` call since
+    /// the enclosing `expr` began (each call folds its own height in).
+    inner_h: usize,
+    /// D4: after E0102 the parser reads nothing more of the declaration (every
+    /// `peek` sees the end, nothing is reported) until `module` resumes at this
+    /// token: the next declaration.
+    stop: Option<usize>,
 }
 
+/// D4: the deepest an expression may be nested (levels: expression nodes on a
+/// path, a parenthesised expression counting as one), and the most `expr`,
+/// `pattern` and `type_ann` calls open at once.
+pub const MAX_NESTING: usize = 1024;
+
+/// `Int`'s largest magnitude: `9223372036854775807`, or `9223372036854775808`
+/// under a folded `-`.
+const INT_MAX_MAGNITUDE: u128 = i64::MAX as u128;
+
 impl<'a> Parser<'a> {
-    fn new(tokens: &'a [Token]) -> Parser<'a> {
+    fn new(tokens: &'a [Token], text: &'a str, base: u32) -> Parser<'a> {
         Parser {
             tokens,
+            text,
+            base,
             pos: 0,
             diags: Vec::new(),
+            braces: true,
+            eof_reported: false,
+            decl_start: 0,
+            raised: 0,
+            depth: 0,
+            inner_h: 0,
+            stop: None,
+        }
+    }
+
+    /// Run `f` with the layout rule on (`true`, braces) or off (parentheses),
+    /// restoring the enclosing setting after, on every path.
+    fn with_braces<T>(&mut self, on: bool, f: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = self.braces;
+        self.braces = on;
+        let r = f(self);
+        self.braces = outer;
+        r
+    }
+
+    /// Whether a newline separates the token at `pos` from the one before it
+    /// (comments between them included).
+    fn newline_before(&self, pos: usize) -> bool {
+        if pos == 0 || pos >= self.tokens.len() {
+            return false;
+        }
+        let from = self.tokens[pos - 1].span.end;
+        let to = self.tokens[pos].span.start;
+        self.source(from, to).is_some_and(|gap| gap.contains('\n'))
+    }
+
+    /// The source text between two span offsets of this file.
+    fn source(&self, from: u32, to: u32) -> Option<&'a str> {
+        let from = from.checked_sub(self.base)? as usize;
+        let to = to.checked_sub(self.base)? as usize;
+        self.text.get(from..to)
+    }
+
+    /// A `-` at `pos` written against the token after it (`-x`, `-1`): the prefix
+    /// style, which starts a statement at a line's start.
+    fn glued_minus(&self, pos: usize) -> bool {
+        match (self.tokens.get(pos), self.tokens.get(pos + 1)) {
+            // `-.` too (spec 2026-10-24-elya-float-part-2 D2).
+            (Some(m), Some(next)) => {
+                matches!(m.kind, TokenKind::Minus | TokenKind::MinusDot)
+                    && m.span.end == next.span.start
+            }
+            _ => false,
+        }
+    }
+
+    /// E0101 at the operator starting this line (D4).
+    fn layout_error(&mut self) {
+        let at = self.peek_span();
+        let text = self.source(at.start, at.end).unwrap_or("");
+        self.push(
+            Diagnostic::error(
+                "E0101",
+                "an operator at the start of a line does not continue the line before",
+            )
+            .with_label(at, "starts a line")
+            .with_help(format!(
+                "end the line before with `{text}`, or put the whole expression in parentheses"
+            )),
+        );
+    }
+
+    /// An integer literal's value: its magnitude, negated when a `-` was folded into
+    /// it, or E0002 when it does not fit in `Int` (D2). Parsing goes on after the
+    /// error, at 0, so one bad literal is one diagnostic.
+    fn int_literal(&mut self, negative: bool, magnitude: u128, span: Span) -> i64 {
+        let limit = if negative {
+            INT_MAX_MAGNITUDE + 1
+        } else {
+            INT_MAX_MAGNITUDE
+        };
+        if magnitude > limit {
+            self.push(
+                Diagnostic::error("E0002", "integer literal out of range")
+                    .with_label(span, "does not fit in `Int`")
+                    .with_help("`Int` is 64-bit: from -9223372036854775808 to 9223372036854775807"),
+            );
+            return 0;
+        }
+        if negative {
+            (magnitude as i128).wrapping_neg() as i64
+        } else {
+            magnitude as i64
         }
     }
 
     fn peek(&self) -> Option<&TokenKind> {
+        if self.stop.is_some() {
+            return None; // D4: the declaration ends at E0102
+        }
         self.tokens.get(self.pos).map(|t| &t.kind)
     }
 
     fn peek_span(&self) -> Span {
+        // At the end of the file: an empty span there, in this file (it was
+        // offset 0, which in a program of several files is the root's first
+        // byte; the modules review's R4).
+        let eof = self.base + self.text.len() as u32;
         self.tokens
             .get(self.pos)
             .map(|t| t.span)
-            .unwrap_or(Span::EMPTY)
+            .unwrap_or(Span::new(eof, eof))
     }
 
     fn bump(&mut self) -> Option<&Token> {
+        if self.stop.is_some() {
+            return None;
+        }
         let t = self.tokens.get(self.pos);
         if t.is_some() {
             self.pos += 1;
@@ -51,20 +188,249 @@ impl<'a> Parser<'a> {
     }
 
     fn error(&mut self, span: Span, msg: impl Into<String>) {
-        self.diags
-            .push(Diagnostic::error("E0100", msg).with_label(span, "here"));
+        self.push(Diagnostic::error("E0100", msg).with_label(span, "here"));
+    }
+
+    /// Every parser diagnostic goes through here. D3: the end of the file is
+    /// reported once -- an error labelled at the end of the file, exactly where
+    /// the previous one was, is not reported (elsewhere two errors at one token
+    /// are two missing tokens, and both are reported: the review's F1). D4:
+    /// nothing is reported after E0102 until the next declaration.
+    fn push(&mut self, d: Diagnostic) {
+        self.raised += 1;
+        if self.stop.is_some() {
+            return;
+        }
+        let at = |d: &Diagnostic| d.labels.first().map(|l| l.span);
+        if let Some(last) = self.diags.last() {
+            let eof = self.base + self.text.len() as u32;
+            if at(last).is_some() && at(last) == at(&d) && at(&d).map(|s| s.start) == Some(eof) {
+                return;
+            }
+        }
+        self.diags.push(d);
+    }
+
+    /// D4: E0102 at `at`, once; then the declaration stops (see `stop`).
+    fn too_deep(&mut self, at: Span) {
+        if self.stop.is_some() {
+            return;
+        }
+        self.push(
+            Diagnostic::error("E0102", "expression nested too deeply")
+                .with_label(at, format!("more than {MAX_NESTING} levels deep here"))
+                .with_help("bind an inner part with `let`, or move it into a function"),
+        );
+        self.stop = Some(self.resume_point());
+    }
+
+    /// D4: where parsing resumes after E0102 -- the first declaration after the
+    /// current token at which every `{` opened since this declaration began is
+    /// closed (an operation `fn name` inside the same `effect { }` is not one:
+    /// the review's F2). When the braces never balance (a truncated file), the
+    /// first declaration at a line's start, then the end of the file.
+    fn resume_point(&self) -> usize {
+        let brace = |k: &TokenKind| match k {
+            TokenKind::LBrace => 1,
+            TokenKind::RBrace => -1,
+            _ => 0,
+        };
+        let mut open: i64 = self.tokens[self.decl_start.min(self.pos)..self.pos]
+            .iter()
+            .map(|t| brace(&t.kind))
+            .sum();
+        for i in self.pos..self.tokens.len() {
+            if open <= 0 && i > self.pos && self.starts_decl(i) {
+                return i;
+            }
+            open += brace(&self.tokens[i].kind);
+        }
+        (self.pos + 1..self.tokens.len())
+            .find(|&i| self.starts_decl(i) && self.newline_before(i))
+            .unwrap_or(self.tokens.len())
+    }
+
+    /// D4: open one more `expr`, `pattern` or `type_ann` call, or E0102 past the
+    /// limit (and `false`).
+    fn enter(&mut self) -> bool {
+        if self.stop.is_some() {
+            return false;
+        }
+        if self.depth >= MAX_NESTING {
+            let at = self.peek_span();
+            self.too_deep(at);
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    /// D1: a parse that ran out of tokens without saying so is E0100 "unexpected
+    /// end of file", once.
+    fn eof_error(&mut self) {
+        self.raised += 1;
+        if self.eof_reported || self.stop.is_some() {
+            return;
+        }
+        self.eof_reported = true;
+        let at = self.peek_span();
+        self.push(
+            Diagnostic::error("E0100", "unexpected end of file")
+                .with_label(at, "the file ends here"),
+        );
+        self.raised -= 1; // counted once, above
+    }
+
+    /// A closing `}`: eaten, or E0100 "expected `}`" -- at the end of the file
+    /// once, however many braces are still open there (D1; the review's F2).
+    fn close_brace(&mut self) -> bool {
+        let end = self.peek_span();
+        if self.eat(&TokenKind::RBrace) {
+            return true;
+        }
+        if self.stop.is_some() {
+            self.raised += 1;
+            return false;
+        }
+        if self.peek().is_none() {
+            if !self.eof_reported {
+                self.eof_reported = true;
+                self.error(end, "expected `}`");
+            }
+        } else {
+            self.error(end, "expected `}`");
+        }
+        false
+    }
+
+    /// D4: a token that starts a top-level declaration: `pub`, `import`,
+    /// `effect`, `type` or `linear` (the review's F1), or `fn` followed by a name (a lambda's `fn` is
+    /// followed by `(`).
+    fn starts_decl(&self, pos: usize) -> bool {
+        match self.tokens.get(pos).map(|t| &t.kind) {
+            Some(TokenKind::KwPub)
+            | Some(TokenKind::KwImport)
+            | Some(TokenKind::KwEffect)
+            | Some(TokenKind::KwType)
+            | Some(TokenKind::KwLinear) => true,
+            Some(TokenKind::KwFn) => matches!(
+                self.tokens.get(pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Lower(_))
+            ),
+            _ => false,
+        }
+    }
+
+    /// D2: after a statement failed (it began at token `start`), skip to where
+    /// the next one begins: a token that starts a line and can start a statement
+    /// (not an operator: E0101's `+` is part of the bad statement), with no
+    /// bracket opened since `start` left open; a line-start `let` when no `{` is left open; the
+    /// block's own `}` (not consumed); a declaration at a line's start; or the
+    /// end of the file. An unclosed `(` or `[` is dropped by the `}` that closes
+    /// the brace around it.
+    fn skip_statement(&mut self, start: usize) {
+        let mut open: Vec<TokenKind> = Vec::new();
+        let push_or_pop = |open: &mut Vec<TokenKind>, k: &TokenKind| -> bool {
+            match k {
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => {
+                    open.push(k.clone());
+                    true
+                }
+                TokenKind::RParen | TokenKind::RBracket => {
+                    let want = if *k == TokenKind::RParen {
+                        TokenKind::LParen
+                    } else {
+                        TokenKind::LBracket
+                    };
+                    if open.last() == Some(&want) {
+                        open.pop();
+                    }
+                    true
+                }
+                TokenKind::RBrace => {
+                    // Close up to and including the innermost `{`; with none open
+                    // it is the block's own `}`.
+                    match open.iter().rposition(|o| *o == TokenKind::LBrace) {
+                        Some(i) => {
+                            open.truncate(i);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                _ => true,
+            }
+        };
+        for i in start..self.pos {
+            let k = self.tokens[i].kind.clone();
+            push_or_pop(&mut open, &k);
+        }
+        let mut first = self.pos == start;
+        while let Some(k) = self.peek().cloned() {
+            if !first {
+                let line_start = self.newline_before(self.pos);
+                if line_start
+                    && ((open.is_empty() && can_start_statement(&k)) || self.starts_decl(self.pos))
+                {
+                    return;
+                }
+                if line_start && k == TokenKind::KwLet && !open.contains(&TokenKind::LBrace) {
+                    return;
+                }
+            }
+            first = false;
+            if !push_or_pop(&mut open, &k) {
+                return; // the block's `}`
+            }
+            self.bump();
+        }
     }
 
     // ---- Expressions (Pratt) ----
 
     /// Pratt expression parser. `min_bp` is the minimum binding power.
+    ///
+    /// D4 of the diagnostics spec: at most `MAX_NESTING` calls open, and the
+    /// height of what it returns folded into the enclosing call's `inner_h`.
     fn expr(&mut self, min_bp: u8) -> Option<Spanned<Expr>> {
+        if !self.enter() {
+            return None;
+        }
+        let outer = std::mem::replace(&mut self.inner_h, 0);
+        let r = self.expr_chain(min_bp);
+        self.inner_h = outer.max(self.inner_h);
+        self.depth -= 1;
+        r
+    }
+
+    /// D4: `h` levels is E0102 past the limit, at `at`.
+    fn check_height(&mut self, h: usize, at: Span) -> Option<()> {
+        if h > MAX_NESTING {
+            self.too_deep(at);
+            return None;
+        }
+        Some(())
+    }
+
+    /// `expr`'s body; leaves its result's height in `inner_h`. An atom is one
+    /// level more than the expressions inside it, each step of a chain (an
+    /// operator, a call) one more than both its sides: a chain is built by this
+    /// loop, not by recursion, and is limited as nesting is.
+    fn expr_chain(&mut self, min_bp: u8) -> Option<Spanned<Expr>> {
         let mut lhs = self.atom()?;
+        let mut h = self.inner_h + 1;
+        self.check_height(h, lhs.span)?;
         // `cloned()` frees the immutable borrow so the body can mutate `self`.
         while let Some(kind) = self.peek().cloned() {
-            // postfix call: `expr(...)`
+            // postfix call: `expr(...)`; in braces, not across a newline (D4).
             if kind == TokenKind::LParen {
+                if self.braces && self.newline_before(self.pos) {
+                    break;
+                }
+                self.inner_h = 0;
                 lhs = self.finish_call(lhs)?;
+                h = h.max(self.inner_h) + 1;
+                self.check_height(h, lhs.span)?;
                 continue;
             }
             let Some((l_bp, r_bp, op)) = infix_bp(&kind) else {
@@ -73,9 +439,21 @@ impl<'a> Parser<'a> {
             if l_bp < min_bp {
                 break;
             }
+            // In braces an infix operator does not continue across a newline (D4):
+            // a glued `-` starts the next statement, any other operator is E0101.
+            if self.braces && self.newline_before(self.pos) {
+                if self.glued_minus(self.pos) {
+                    break;
+                }
+                self.layout_error();
+                return None;
+            }
             self.bump(); // operator
+            self.inner_h = 0;
             let rhs = self.expr(r_bp)?;
             let span = lhs.span.merge(rhs.span);
+            h = h.max(self.inner_h) + 1;
+            self.check_height(h, span)?;
             lhs = spanned(
                 Expr::Binary {
                     op,
@@ -85,22 +463,25 @@ impl<'a> Parser<'a> {
                 span,
             );
         }
+        self.inner_h = h;
         Some(lhs)
     }
 
     fn finish_call(&mut self, callee: Spanned<Expr>) -> Option<Spanned<Expr>> {
         let start = callee.span;
         self.bump(); // '('
-        let mut args = Vec::new();
-        if self.peek() != Some(&TokenKind::RParen) {
-            loop {
-                let arg = self.expr(0)?;
-                args.push(arg);
-                if !self.eat(&TokenKind::Comma) {
-                    break;
+        let args = self.with_braces(false, |p| {
+            let mut args = Vec::new();
+            if p.peek() != Some(&TokenKind::RParen) {
+                loop {
+                    args.push(p.expr(0)?);
+                    if !p.eat(&TokenKind::Comma) {
+                        break;
+                    }
                 }
             }
-        }
+            Some(args)
+        })?;
         let end = self.peek_span();
         if !self.eat(&TokenKind::RParen) {
             self.error(end, "expected `)` to close call");
@@ -123,8 +504,9 @@ impl<'a> Parser<'a> {
             TokenKind::KwFn => self.lambda_expr(),
             TokenKind::KwMatch => self.match_expr(),
             TokenKind::LBrace => self.block_expr(),
-            TokenKind::Int(n) => {
+            TokenKind::Int(m) => {
                 self.bump();
+                let n = self.int_literal(false, m, span);
                 Some(spanned(Expr::Int(n), span))
             }
             TokenKind::Float(x) => {
@@ -149,11 +531,38 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Minus => {
                 self.bump();
+                // A `-` directly before a numeric literal is part of it (D1).
+                let lit = self.peek_span();
+                match self.peek().cloned() {
+                    Some(TokenKind::Int(m)) => {
+                        self.bump();
+                        let n = self.int_literal(true, m, span.merge(lit));
+                        return Some(spanned(Expr::Int(n), span.merge(lit)));
+                    }
+                    Some(TokenKind::Float(x)) => {
+                        self.bump();
+                        return Some(spanned(Expr::Float(-x), span.merge(lit)));
+                    }
+                    _ => {}
+                }
                 let e = self.expr(100)?;
                 let s = span.merge(e.span);
                 Some(spanned(
                     Expr::Unary {
                         op: UnOp::Neg,
+                        expr: Rc::new(e),
+                    },
+                    s,
+                ))
+            }
+            // `-.e` (spec 2026-10-24-elya-float-part-2 D2).
+            TokenKind::MinusDot => {
+                self.bump();
+                let e = self.expr(100)?;
+                let s = span.merge(e.span);
+                Some(spanned(
+                    Expr::Unary {
+                        op: UnOp::NegF,
                         expr: Rc::new(e),
                     },
                     s,
@@ -173,7 +582,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LParen => {
                 self.bump();
-                let e = self.expr(0)?;
+                let e = self.with_braces(false, |p| p.expr(0))?;
                 let end = self.peek_span();
                 if !self.eat(&TokenKind::RParen) {
                     self.error(end, "expected `)`");
@@ -188,7 +597,7 @@ impl<'a> Parser<'a> {
                     self.error(self.peek_span(), "expected `(` after `resume`");
                     return None;
                 }
-                let arg = self.expr(0)?;
+                let arg = self.with_braces(false, |p| p.expr(0))?;
                 let end = self.peek_span();
                 if !self.eat(&TokenKind::RParen) {
                     self.error(end, "expected `)`");
@@ -240,19 +649,61 @@ impl<'a> Parser<'a> {
         let mut decls = Vec::new();
         while self.peek().is_some() {
             let before = self.pos;
+            self.decl_start = self.pos;
+            let reported = self.raised;
             match self.peek() {
                 Some(TokenKind::KwImport) => {
                     if let Some(i) = self.import() {
                         imports.push(i);
                     } else {
+                        if self.raised == reported {
+                            self.eof_error();
+                        }
                         self.recover_to_decl();
                     }
                 }
                 Some(TokenKind::KwPub) | Some(TokenKind::KwFn) => {
+                    let start = self.peek_span();
                     let is_pub = self.eat(&TokenKind::KwPub);
+                    let name = match (
+                        self.tokens.get(self.pos).map(|t| &t.kind),
+                        self.tokens.get(self.pos + 1),
+                    ) {
+                        (Some(TokenKind::KwFn), Some(t)) => match &t.kind {
+                            TokenKind::Lower(n) => Some(spanned(n.clone(), t.span)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
                     if let Some(d) = self.fn_decl(is_pub) {
                         decls.push(d);
                     } else {
+                        if self.raised == reported {
+                            self.eof_error();
+                        }
+                        // D3: a function whose header failed is still a known
+                        // name, so its callers are not reported. Inference never
+                        // runs on a module with a parse error.
+                        if let Some(name) = name {
+                            let span = start.merge(name.span);
+                            decls.push(spanned(
+                                Decl::Fn(FnDecl {
+                                    is_pub,
+                                    name: name.node,
+                                    params: Vec::new(),
+                                    effect_row: None,
+                                    ret_ann: None,
+                                    body: Rc::new(spanned(
+                                        Block {
+                                            stmts: Rc::new([]),
+                                            tail: Some(Rc::new(spanned(Expr::Error, span))),
+                                        },
+                                        span,
+                                    )),
+                                }),
+                                span,
+                            ));
+                        }
                         self.recover_to_decl();
                     }
                 }
@@ -260,6 +711,9 @@ impl<'a> Parser<'a> {
                     if let Some(e) = self.effect_decl() {
                         decls.push(e);
                     } else {
+                        if self.raised == reported {
+                            self.eof_error();
+                        }
                         self.recover_to_decl();
                     }
                 }
@@ -267,6 +721,10 @@ impl<'a> Parser<'a> {
                     if let Some(t) = self.type_decl() {
                         decls.push(t);
                     } else {
+                        // D1, missed by the first version (the review's F4).
+                        if self.raised == reported {
+                            self.eof_error();
+                        }
                         self.recover_to_decl();
                     }
                 }
@@ -278,6 +736,12 @@ impl<'a> Parser<'a> {
                     );
                     self.recover_to_decl();
                 }
+            }
+            // D4: after E0102, the next declaration.
+            if let Some(resume) = self.stop.take() {
+                self.pos = resume;
+                self.depth = 0;
+                self.inner_h = 0;
             }
             if self.pos == before {
                 self.bump(); // ensure forward progress
@@ -336,7 +800,10 @@ impl<'a> Parser<'a> {
             ops.push(op);
         }
         let end = self.peek_span();
-        self.eat(&TokenKind::RBrace);
+        // D1: it was accepted unchecked, also at the end of the file.
+        if !self.close_brace() {
+            return None;
+        }
         Some(spanned(
             Decl::Effect(EffectDecl {
                 name,
@@ -410,8 +877,7 @@ impl<'a> Parser<'a> {
             }
         }
         let end = self.peek_span();
-        if !self.eat(&TokenKind::RBrace) {
-            self.error(self.peek_span(), "expected `}`");
+        if !self.close_brace() {
             return None;
         }
         Some(spanned(
@@ -514,12 +980,15 @@ impl<'a> Parser<'a> {
             return None;
         }
         let mut arms = Vec::new();
-        while self.peek().is_some() && self.peek() != Some(&TokenKind::RBrace) {
-            arms.push(self.match_arm()?);
-        }
+        // The arms are braces (D4); the scrutinee is in the enclosing setting.
+        self.with_braces(true, |p| {
+            while p.peek().is_some() && p.peek() != Some(&TokenKind::RBrace) {
+                arms.push(p.match_arm()?);
+            }
+            Some(())
+        })?;
         let end = self.peek_span();
-        if !self.eat(&TokenKind::RBrace) {
-            self.error(self.peek_span(), "expected `}`");
+        if !self.close_brace() {
             return None;
         }
         Some(spanned(
@@ -549,7 +1018,17 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    /// A pattern; D4 counts it as one more call open.
     fn pattern(&mut self) -> Option<Spanned<Pattern>> {
+        if !self.enter() {
+            return None;
+        }
+        let r = self.pattern_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn pattern_inner(&mut self) -> Option<Spanned<Pattern>> {
         let span = self.peek_span();
         match self.peek()?.clone() {
             // Constructor pattern: `Nil`, `Some(p)`, `Cons(h, t)`.
@@ -585,9 +1064,27 @@ impl<'a> Parser<'a> {
                 Some(spanned(p, span))
             }
             // Literal patterns.
-            TokenKind::Int(n) => {
+            TokenKind::Int(m) => {
                 self.bump();
+                let n = self.int_literal(false, m, span);
                 Some(spanned(Pattern::Lit(PatLit::Int(n)), span))
+            }
+            // A negative literal (D3): the `-` folded into the number, as in
+            // expressions.
+            TokenKind::Minus => {
+                self.bump();
+                let lit = self.peek_span();
+                match self.peek().cloned() {
+                    Some(TokenKind::Int(m)) => {
+                        self.bump();
+                        let n = self.int_literal(true, m, span.merge(lit));
+                        Some(spanned(Pattern::Lit(PatLit::Int(n)), span.merge(lit)))
+                    }
+                    _ => {
+                        self.error(lit, "expected an integer after `-` in a pattern");
+                        None
+                    }
+                }
             }
             TokenKind::Str(s) => {
                 self.bump();
@@ -683,7 +1180,17 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    /// A type annotation; D4 counts it as one more call open.
     fn type_ann(&mut self) -> Option<Spanned<TypeAnn>> {
+        if !self.enter() {
+            return None;
+        }
+        let r = self.type_ann_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn type_ann_inner(&mut self) -> Option<Spanned<TypeAnn>> {
         let span = self.peek_span();
         // A function type (2026-10-09): `fn(A, B) / {E} -> R`; the row is
         // optional (none written: any effects).
@@ -811,64 +1318,78 @@ impl<'a> Parser<'a> {
             self.error(self.peek_span(), "expected `{`");
             return None;
         }
-        let mut clauses: Vec<Spanned<OpClause>> = Vec::new();
-        let mut ret = None;
-        while self.peek().is_some() && self.peek() != Some(&TokenKind::RBrace) {
-            if self.peek() == Some(&TokenKind::KwReturn) {
-                self.bump(); // return
-                if !self.eat(&TokenKind::LParen) {
-                    self.error(self.peek_span(), "expected `(`");
+        // The clauses are braces (D4); the body before `with` is in the enclosing
+        // setting.
+        let (clauses, ret) = self.with_braces(true, |p| {
+            let mut clauses: Vec<Spanned<OpClause>> = Vec::new();
+            let mut ret = None;
+            while p.peek().is_some() && p.peek() != Some(&TokenKind::RBrace) {
+                // A clause body is no statement list: a `-` starting a line after a
+                // clause cannot begin a statement here, so it is E0101 (the review's
+                // R4).
+                if p.peek() == Some(&TokenKind::Minus) && p.newline_before(p.pos) {
+                    p.layout_error();
                     return None;
                 }
-                let binder = match self.peek()?.clone() {
-                    TokenKind::Lower(n) => {
-                        self.bump();
-                        n
-                    }
-                    _ => {
-                        self.error(self.peek_span(), "expected binder");
+                if p.peek() == Some(&TokenKind::KwReturn) {
+                    p.bump(); // return
+                    if !p.eat(&TokenKind::LParen) {
+                        p.error(p.peek_span(), "expected `(`");
                         return None;
                     }
-                };
-                if !self.eat(&TokenKind::RParen) {
-                    self.error(self.peek_span(), "expected `)`");
-                    return None;
-                }
-                if !self.eat(&TokenKind::Arrow) {
-                    self.error(self.peek_span(), "expected `->`");
-                    return None;
-                }
-                let body_r = self.expr(0)?;
-                ret = Some(ReturnClause {
-                    binder,
-                    body: Rc::new(body_r),
-                });
-            } else {
-                let c = self.op_clause()?;
-                if any {
-                    let ok =
-                        c.node.effect.is_none() && c.node.op == "op" && c.node.params.len() == 1;
-                    if !ok {
-                        self.error(
-                            c.span,
-                            "a `with any` handler has one operation clause, `op(o)`, and a `return` clause",
-                        );
+                    let binder = match p.peek()?.clone() {
+                        TokenKind::Lower(n) => {
+                            p.bump();
+                            n
+                        }
+                        _ => {
+                            p.error(p.peek_span(), "expected binder");
+                            return None;
+                        }
+                    };
+                    if !p.eat(&TokenKind::RParen) {
+                        p.error(p.peek_span(), "expected `)`");
                         return None;
                     }
-                    if !clauses.is_empty() {
-                        self.error(c.span, "a `with any` handler has one `op(o)` clause");
+                    if !p.eat(&TokenKind::Arrow) {
+                        p.error(p.peek_span(), "expected `->`");
                         return None;
                     }
+                    let body_r = p.expr(0)?;
+                    ret = Some(ReturnClause {
+                        binder,
+                        body: Rc::new(body_r),
+                    });
+                } else {
+                    let c = p.op_clause()?;
+                    if any {
+                        let ok =
+                            c.node.effect.is_none() && c.node.op == "op" && c.node.params.len() == 1;
+                        if !ok {
+                            p.error(
+                                c.span,
+                                "a `with any` handler has one operation clause, `op(o)`, and a `return` clause",
+                            );
+                            return None;
+                        }
+                        if !clauses.is_empty() {
+                            p.error(c.span, "a `with any` handler has one `op(o)` clause");
+                            return None;
+                        }
+                    }
+                    clauses.push(c);
                 }
-                clauses.push(c);
             }
-        }
+            Some((clauses, ret))
+        })?;
         let end = self.peek_span();
         if any && clauses.is_empty() {
             self.error(end, "a `with any` handler needs its `op(o)` clause");
             return None;
         }
-        self.eat(&TokenKind::RBrace);
+        if !self.close_brace() {
+            return None;
+        }
         Some(spanned(
             Expr::Handle {
                 body: Rc::new(body),
@@ -962,24 +1483,65 @@ impl<'a> Parser<'a> {
         let start = self.peek_span();
         self.bump(); // import
         let mut path = Vec::new();
+        let mut end;
         loop {
             let seg_span = self.peek_span();
             match self.peek()?.clone() {
                 TokenKind::Lower(seg) => {
                     self.bump();
                     path.push(seg);
+                    end = seg_span;
                 }
                 _ => {
                     self.error(seg_span, "expected module path segment");
                     return None;
                 }
             }
-            if !self.eat(&TokenKind::Slash) {
+            // `/ {` starts the effect allow-list, not another segment.
+            let list_next = matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::LBrace)
+            );
+            if self.peek() != Some(&TokenKind::Slash) || list_next {
                 break;
             }
+            self.bump(); // '/'
         }
-        let end = self.peek_span();
-        Some(spanned(Import { path, alias: None }, start.merge(end)))
+        // `as` is contextual: a keyword only here (modules part 1 D2).
+        let mut alias = None;
+        if matches!(self.peek(), Some(TokenKind::Lower(n)) if n == "as") {
+            self.bump();
+            let at = self.peek_span();
+            match self.peek().cloned() {
+                Some(TokenKind::Lower(n)) => {
+                    self.bump();
+                    alias = Some(n);
+                    end = at;
+                }
+                _ => {
+                    self.error(at, "expected a name after `as`");
+                    return None;
+                }
+            }
+        }
+        let mut effects = None;
+        if self.eat(&TokenKind::Slash) {
+            let list_start = self.peek_span();
+            let row = self.effect_row();
+            end = end.merge(list_start);
+            if let Some(last) = row.last() {
+                end = end.merge(last.span);
+            }
+            effects = Some(row);
+        }
+        Some(spanned(
+            Import {
+                path,
+                alias,
+                effects,
+            },
+            start.merge(end),
+        ))
     }
 
     fn fn_decl(&mut self, is_pub: bool) -> Option<Spanned<Decl>> {
@@ -1087,7 +1649,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        self.eat(&TokenKind::RBrace);
+        self.close_brace();
         names
     }
 
@@ -1104,6 +1666,10 @@ impl<'a> Parser<'a> {
     }
 
     fn block(&mut self) -> Option<Spanned<Block>> {
+        self.with_braces(true, |p| p.block_inner())
+    }
+
+    fn block_inner(&mut self) -> Option<Spanned<Block>> {
         let start = self.peek_span();
         if !self.eat(&TokenKind::LBrace) {
             self.error(start, "expected `{`");
@@ -1112,24 +1678,80 @@ impl<'a> Parser<'a> {
         let mut stmts = Vec::new();
         let mut tail = None;
         while self.peek().is_some() && self.peek() != Some(&TokenKind::RBrace) {
+            // A declaration at a line's start: this block's `}` is missing (D1).
+            if self.newline_before(self.pos) && self.starts_decl(self.pos) {
+                break;
+            }
+            let at = self.pos;
+            let first = self.peek_span();
+            let reported = self.raised;
             if self.peek() == Some(&TokenKind::KwLet) {
-                if let Some(s) = self.let_stmt() {
-                    stmts.push(s);
-                } else {
-                    break;
+                // D2: a bad `let` is one error; its name, when read, stays bound.
+                let name = match self.tokens.get(at + 1).map(|t| &t.kind) {
+                    Some(TokenKind::Lower(n)) => Some(n.clone()),
+                    _ => None,
+                };
+                match self.let_stmt() {
+                    Some(st) => stmts.push(st),
+                    None => {
+                        let span = self.recover_statement(at, reported, first);
+                        let error = spanned(Expr::Error, span);
+                        stmts.push(spanned(
+                            match name {
+                                Some(name) => Stmt::Let {
+                                    name,
+                                    ann: None,
+                                    value: error,
+                                },
+                                None => Stmt::Expr(error),
+                            },
+                            span,
+                        ));
+                    }
                 }
             } else {
-                let e = self.expr(0)?;
-                if self.peek() == Some(&TokenKind::RBrace) {
-                    tail = Some(e);
-                } else {
-                    let span = e.span;
-                    stmts.push(spanned(Stmt::Expr(e), span));
+                match self.expr(0) {
+                    Some(e) => {
+                        if self.peek() == Some(&TokenKind::RBrace) {
+                            tail = Some(e);
+                        } else {
+                            let span = e.span;
+                            stmts.push(spanned(Stmt::Expr(e), span));
+                        }
+                    }
+                    None => {
+                        let span = self.recover_statement(at, reported, first);
+                        stmts.push(spanned(Stmt::Expr(spanned(Expr::Error, span)), span));
+                    }
                 }
             }
         }
         let end = self.peek_span();
-        self.eat(&TokenKind::RBrace);
+        // A block's value is its last expression (spec
+        // 2026-10-24-elya-block-tails-and-exponents D1): one that ends in a `let`,
+        // or has nothing in it, has none.
+        if tail.is_none() && self.stop.is_none() && self.peek() == Some(&TokenKind::RBrace) {
+            match stmts.last() {
+                None => self.push(
+                    Diagnostic::error("E0103", "a block has no value")
+                        .with_label(start.merge(end), "an empty block")
+                        .with_help("write the value it has, `Unit` for none"),
+                ),
+                Some(st) if matches!(&st.node, Stmt::Let { value, .. } if !matches!(value.node, Expr::Error)) =>
+                {
+                    let at = st.span;
+                    self.push(
+                        Diagnostic::error("E0103", "a block cannot end with `let`")
+                            .with_label(at, "the block's last statement")
+                            .with_help(
+                                "end the block with its value: the bound name, another expression, or `Unit`",
+                            ),
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        self.close_brace();
         Some(spanned(
             Block {
                 stmts: stmts.into(),
@@ -1187,27 +1809,62 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    /// D2: a statement that began at token `at` failed; report the end of the
+    /// file if nothing was said, skip to the next statement, and return the
+    /// span the error node covers.
+    fn recover_statement(&mut self, at: usize, reported: usize, first: Span) -> Span {
+        if self.raised == reported && self.peek().is_none() {
+            self.eof_error();
+        }
+        self.skip_statement(at);
+        let last = self.pos.max(at + 1).min(self.tokens.len()) - 1;
+        match self.tokens.get(last) {
+            Some(t) if self.pos > at => first.merge(t.span),
+            _ => first,
+        }
+    }
+
     fn block_expr(&mut self) -> Option<Spanned<Expr>> {
         let b = self.block()?;
         Some(spanned(Expr::Block(b.node), b.span))
     }
 
     fn recover_to_decl(&mut self) {
-        // Synchronize: skip tokens until a declaration keyword or EOF.
-        while let Some(k) = self.peek() {
-            if matches!(
-                k,
-                TokenKind::KwFn
-                    | TokenKind::KwPub
-                    | TokenKind::KwImport
-                    | TokenKind::KwEffect
-                    | TokenKind::KwType
-            ) {
+        // Synchronize: skip tokens until a declaration (D4: a `fn` only when a
+        // name follows it) or EOF.
+        while self.peek().is_some() {
+            if self.starts_decl(self.pos) {
                 return;
             }
             self.bump();
         }
     }
+}
+
+/// D2: a token a statement can begin with (an expression's first token, or `let`).
+fn can_start_statement(k: &TokenKind) -> bool {
+    use TokenKind as T;
+    matches!(
+        k,
+        T::Int(_)
+            | T::Float(_)
+            | T::Str(_)
+            | T::True
+            | T::False
+            | T::Unit
+            | T::Lower(_)
+            | T::Upper(_)
+            | T::KwLet
+            | T::KwIf
+            | T::KwMatch
+            | T::KwHandle
+            | T::KwFn
+            | T::LParen
+            | T::LBrace
+            | T::Minus
+            | T::MinusDot
+            | T::Bang
+    )
 }
 
 /// Binding powers: (left_bp, right_bp, op). Higher binds tighter.
@@ -1222,6 +1879,10 @@ fn infix_bp(kind: &TokenKind) -> Option<(u8, u8, BinOp)> {
         T::Le => (30, 31, BinOp::Le),
         T::Gt => (30, 31, BinOp::Gt),
         T::Ge => (30, 31, BinOp::Ge),
+        T::LtDot => (30, 31, BinOp::LtF),
+        T::LeDot => (30, 31, BinOp::LeF),
+        T::GtDot => (30, 31, BinOp::GtF),
+        T::GeDot => (30, 31, BinOp::GeF),
         T::Concat => (40, 41, BinOp::Concat),
         T::Plus => (50, 51, BinOp::Add),
         T::Minus => (50, 51, BinOp::Sub),
@@ -1240,15 +1901,21 @@ fn infix_bp(kind: &TokenKind) -> Option<(u8, u8, BinOp)> {
 /// Test/convenience entry: parse a single expression from source text.
 pub fn parse_expr_str(session: &Session, text: &str) -> (Option<Spanned<Expr>>, Vec<Diagnostic>) {
     let (tokens, mut diags) = lex(session, text);
-    let mut p = Parser::new(&tokens);
+    let mut p = Parser::new(&tokens, text, 0);
     let e = p.expr(0);
     diags.append(&mut p.diags);
     (e, diags)
 }
 
 pub fn parse_module(session: &Session, text: &str) -> (Module, Vec<Diagnostic>) {
-    let (tokens, mut diags) = lex(session, text);
-    let mut p = Parser::new(&tokens);
+    parse_module_at(session, text, 0)
+}
+
+/// [`parse_module`] for a file whose spans start at `base` in the program's span
+/// space (modules part 1 D5).
+pub fn parse_module_at(session: &Session, text: &str, base: u32) -> (Module, Vec<Diagnostic>) {
+    let (tokens, mut diags) = crate::lex::lex_at(session, text, base);
+    let mut p = Parser::new(&tokens, text, base);
     let m = p.module();
     diags.append(&mut p.diags);
     (m, diags)

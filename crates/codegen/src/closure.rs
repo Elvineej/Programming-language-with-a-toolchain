@@ -77,8 +77,8 @@ pub fn free_vars(e: &CoreExpr) -> BTreeMap<String, Ty> {
     free_vars_under(e, &[])
 }
 
-/// `free_vars`, with an initial set of already-bound names — used to bind the
-/// enclosing function's parameters when computing which names are module-level.
+/// `free_vars`, with an initial set of already-bound names (the CPS passes
+/// bind a clause's parameters or a `let`'s name this way).
 pub fn free_vars_under(e: &CoreExpr, bound: &[String]) -> BTreeMap<String, Ty> {
     let mut scope: Vec<String> = bound.to_vec();
     let mut out = BTreeMap::new();
@@ -206,16 +206,18 @@ pub(crate) fn pat_binders(p: &CorePat, scope: &mut Vec<String>) {
 pub fn collect_lambdas(core: &CoreModule, first_tag: usize) -> Vec<LambdaSite> {
     let mut out = Vec::new();
     for f in &core.fns {
-        // A name free in the WHOLE enclosing function body (with that function's
-        // parameters bound) is module-level, so it is not a capture. A name bound
-        // by an enclosing `let`, parameter, or pattern IS. This is structural: it
-        // needs no symbol table, and it gets a local that shadows a top-level name
-        // right, where a by-name filter would drop the capture and then silently
-        // call the global instead.
-        let param_names: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
-        let module_level = free_vars_under(&f.body, &param_names);
+        // A name free in a lambda is a capture iff it is BOUND AROUND the lambda:
+        // by the enclosing function's parameters, a `let`, a pattern, an
+        // enclosing lambda's parameters, a clause (its parameters and its
+        // continuation) or a return binder. Otherwise it names a top-level
+        // function. Decided by scope, not by name (spec
+        // 2026-10-23-elya-scope-captures-and-wrapper-results D1): a by-name rule
+        // ("free anywhere in the function, so module-level") dropped a local
+        // that shadows a top-level function the same function also calls, and
+        // the lifted body then called the top-level one.
+        let mut scope: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
         let mut n = 0usize;
-        collect_in(&f.body, &f.name, &mut n, &module_level, first_tag, &mut out);
+        collect_in(&f.body, &f.name, &mut n, &mut scope, first_tag, &mut out);
     }
     out
 }
@@ -224,7 +226,7 @@ fn collect_in(
     e: &CoreExpr,
     enclosing: &str,
     n: &mut usize,
-    module_level: &BTreeMap<String, Ty>,
+    scope: &mut Vec<String>,
     first_tag: usize,
     out: &mut Vec<LambdaSite>,
 ) {
@@ -232,7 +234,7 @@ fn collect_in(
         CoreKind::Lambda(params, body) => {
             let captures: Vec<(String, Ty)> = free_vars(e)
                 .into_iter()
-                .filter(|(name, _)| !module_level.contains_key(name))
+                .filter(|(name, _)| scope.iter().any(|b| b == name))
                 .collect();
             let symbol = format!("{enclosing}.lambda.{n}");
             *n += 1;
@@ -246,58 +248,62 @@ fn collect_in(
                 ret: body.ty.clone(),
                 effectful: crate::cps::needs_cps(&e.ty),
             });
-            collect_in(body, enclosing, n, module_level, first_tag, out);
+            let depth = scope.len();
+            scope.extend(params.iter().map(|p| p.name.clone()));
+            collect_in(body, enclosing, n, scope, first_tag, out);
+            scope.truncate(depth);
         }
         CoreKind::Lit(_) | CoreKind::Var(_) => {}
         CoreKind::App(f, args) => {
-            collect_in(f, enclosing, n, module_level, first_tag, out);
+            collect_in(f, enclosing, n, scope, first_tag, out);
             for a in args.iter() {
-                collect_in(a, enclosing, n, module_level, first_tag, out);
+                collect_in(a, enclosing, n, scope, first_tag, out);
             }
         }
-        CoreKind::Builtin(_, args) => {
+        CoreKind::Builtin(_, args) | CoreKind::Ctor(_, args) | CoreKind::Prim(_, args) => {
             for a in args.iter() {
-                collect_in(a, enclosing, n, module_level, first_tag, out);
+                collect_in(a, enclosing, n, scope, first_tag, out);
             }
         }
-        CoreKind::Ctor(_, fields) => {
-            for f in fields.iter() {
-                collect_in(f, enclosing, n, module_level, first_tag, out);
-            }
-        }
-        CoreKind::Prim(_, args) => {
-            for a in args.iter() {
-                collect_in(a, enclosing, n, module_level, first_tag, out);
-            }
-        }
-        CoreKind::Let(_, value, body) => {
-            collect_in(value, enclosing, n, module_level, first_tag, out);
-            collect_in(body, enclosing, n, module_level, first_tag, out);
+        CoreKind::Let(name, value, body) => {
+            collect_in(value, enclosing, n, scope, first_tag, out);
+            scope.push(name.clone());
+            collect_in(body, enclosing, n, scope, first_tag, out);
+            scope.pop();
         }
         CoreKind::If(c, t, f) => {
-            collect_in(c, enclosing, n, module_level, first_tag, out);
-            collect_in(t, enclosing, n, module_level, first_tag, out);
-            collect_in(f, enclosing, n, module_level, first_tag, out);
+            collect_in(c, enclosing, n, scope, first_tag, out);
+            collect_in(t, enclosing, n, scope, first_tag, out);
+            collect_in(f, enclosing, n, scope, first_tag, out);
         }
         CoreKind::Match(scrutinee, arms) => {
-            collect_in(scrutinee, enclosing, n, module_level, first_tag, out);
+            collect_in(scrutinee, enclosing, n, scope, first_tag, out);
             for arm in arms.iter() {
-                collect_in(&arm.body, enclosing, n, module_level, first_tag, out);
+                let depth = scope.len();
+                pat_binders(&arm.pat, scope);
+                collect_in(&arm.body, enclosing, n, scope, first_tag, out);
+                scope.truncate(depth);
             }
         }
         CoreKind::Handle(h) => {
-            collect_in(&h.body, enclosing, n, module_level, first_tag, out);
+            collect_in(&h.body, enclosing, n, scope, first_tag, out);
             for c in h.clauses.iter() {
-                collect_in(&c.body, enclosing, n, module_level, first_tag, out);
+                let depth = scope.len();
+                scope.extend(c.params.iter().map(|p| p.name.clone()));
+                scope.push(CONT.to_string());
+                collect_in(&c.body, enclosing, n, scope, first_tag, out);
+                scope.truncate(depth);
             }
             if let Some(r) = &h.ret {
-                collect_in(&r.body, enclosing, n, module_level, first_tag, out);
+                scope.push(r.binder.clone());
+                collect_in(&r.body, enclosing, n, scope, first_tag, out);
+                scope.pop();
             }
         }
-        CoreKind::Resume(v) => collect_in(v, enclosing, n, module_level, first_tag, out),
+        CoreKind::Resume(v) => collect_in(v, enclosing, n, scope, first_tag, out),
         CoreKind::Perform(p) => {
             for a in p.args.iter() {
-                collect_in(a, enclosing, n, module_level, first_tag, out);
+                collect_in(a, enclosing, n, scope, first_tag, out);
             }
         }
     }
@@ -405,6 +411,7 @@ mod tests {
         let core = CoreModule {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
+            effects: Default::default(),
             fns: vec![CoreFn {
                 row: elya::types::EffectRow::pure(),
                 name: "main".to_string(),
@@ -438,6 +445,7 @@ mod tests {
         let core = CoreModule {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
+            effects: Default::default(),
             fns: vec![CoreFn {
                 row: elya::types::EffectRow::pure(),
                 name: "wrap".to_string(),
@@ -473,6 +481,7 @@ mod tests {
         let core = CoreModule {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
+            effects: Default::default(),
             fns: vec![CoreFn {
                 row: elya::types::EffectRow::pure(),
                 name: "id".to_string(),
@@ -522,6 +531,7 @@ mod tests {
         let core = CoreModule {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
+            effects: Default::default(),
             fns: vec![CoreFn {
                 row: elya::types::EffectRow::pure(),
                 name: "two".to_string(),
@@ -558,6 +568,7 @@ mod tests {
                 ret,
                 is_multi_declared: false,
                 multi: false,
+                any: false,
             })),
         )
     }
@@ -626,6 +637,7 @@ mod tests {
         let core = CoreModule {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
+            effects: Default::default(),
             fns: vec![CoreFn {
                 row: elya::types::EffectRow::pure(),
                 name: "h".to_string(),
@@ -677,6 +689,7 @@ mod tests {
         let core = CoreModule {
             generic_types: Vec::new(),
             effect_params_used: Default::default(),
+            effects: Default::default(),
             fns: vec![CoreFn {
                 row: elya::types::EffectRow::pure(),
                 name: "p".to_string(),
@@ -690,5 +703,32 @@ mod tests {
             1,
             "a lambda passed to an op gets its site and descriptor row"
         );
+    }
+
+    /// Spec 2026-10-23 D1: `inc` is used free (the top-level function) AND bound
+    /// by a local the lambda uses. The capture is decided by the scope around
+    /// the lambda, not by whether the name is free somewhere in the function.
+    #[test]
+    fn a_shadowing_local_is_captured_where_the_top_level_name_is_also_used() {
+        let src = "fn inc(x) { x + 1000 }\n\
+                   pub fn main() -> Int {\n\
+                   \x20 let a = inc(1)\n\
+                   \x20 let inc = fn(z) { z * 2 }\n\
+                   \x20 let f = fn(q) { inc(q) }\n\
+                   \x20 a + f(3)\n\
+                   }\n";
+        let session = elya::Session::new();
+        let (m, pd) = elya::parse::parse_module(&session, src);
+        assert!(pd.is_empty(), "parse: {pd:?}");
+        let (diags, table) = elya::types::infer_typed_table(&session, &m);
+        assert!(diags.is_empty(), "type errors: {diags:?}");
+        let core = elya::core::lower_module(&m, &table).expect("lowers");
+        let sites = collect_lambdas(&core, 0);
+        let f = sites
+            .iter()
+            .find(|s| s.params.iter().any(|p| p.name == "q"))
+            .expect("the lambda over `q`");
+        let names: Vec<&str> = f.captures.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["inc"], "the local `inc` must be captured");
     }
 }

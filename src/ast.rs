@@ -12,7 +12,11 @@ pub struct Module {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Import {
     pub path: Vec<String>,
+    /// `import a/b as c` (modules part 1 D2).
     pub alias: Option<String>,
+    /// `import a/b / {E, F}`: the effect allow-list (modules part 2, spec
+    /// 2026-10-24): what the module may perform for its importer.
+    pub effects: Option<Vec<Spanned<String>>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -218,6 +222,10 @@ pub enum Expr {
         params: Vec<Spanned<Param>>,
         body: Rc<Spanned<Block>>,
     },
+    /// A statement the parser could not read (spec
+    /// 2026-10-23-elya-parser-recovery D2). Only in a module with a parse error,
+    /// on which inference, evaluation and lowering never run.
+    Error,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,6 +245,12 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
+    /// `<. <=. >. >=.`: IEEE ordered float comparisons (spec
+    /// 2026-10-24-elya-float-part-2 D1).
+    LtF,
+    LeF,
+    GtF,
+    GeF,
     Concat,
     And,
     Or,
@@ -246,6 +260,8 @@ pub enum BinOp {
 pub enum UnOp {
     Neg,
     Not,
+    /// `-.e`: IEEE negation (spec 2026-10-24-elya-float-part-2 D2).
+    NegF,
 }
 
 pub fn pretty(m: &Module) -> String {
@@ -367,6 +383,7 @@ fn pretty_expr(e: &Expr, s: &mut String) {
         Expr::Str(v) => s.push_str(&format!("{v:?}")),
         Expr::Bool(b) => s.push_str(if *b { "True" } else { "False" }),
         Expr::Unit => s.push_str("Unit"),
+        Expr::Error => s.push_str("<error>"),
         Expr::Var(name) => s.push_str(name),
         Expr::Qualified { module, name } => s.push_str(&format!("{module}.{name}")),
         Expr::Call { callee, args } => {
@@ -477,6 +494,10 @@ fn binop_sym(op: BinOp) -> &'static str {
         BinOp::Le => "<=",
         BinOp::Gt => ">",
         BinOp::Ge => ">=",
+        BinOp::LtF => "<.",
+        BinOp::LeF => "<=.",
+        BinOp::GtF => ">.",
+        BinOp::GeF => ">=.",
         BinOp::Concat => "<>",
         BinOp::And => "&&",
         BinOp::Or => "||",
@@ -487,6 +508,7 @@ fn unop_sym(op: UnOp) -> &'static str {
     match op {
         UnOp::Neg => "-",
         UnOp::Not => "!",
+        UnOp::NegF => "-.",
     }
 }
 

@@ -177,6 +177,9 @@ did not finish in 10 minutes. The 7b-3 deep-frames test uses n = 4000 because of
   frame O(1) access to its handler (e.g. a handler word in every site frame, or the handler
   passed alongside `k`) -- a frame-layout change, so its own step with its own controls. Must be
   settled before any N = 1 000 000 obligation that recurses non-tail through a perform.
+- **RESOLVED (2026-10-16, spec 2026-10-16-elya-native-stack): native stack overflow is an
+  unnamed SIGSEGV.** The program runs on its own 1 GiB stack; reaching its guard prints
+  `elya: native stack overflow: ...` and exits 1. The 1M non-tail resume runs. Original:
 - **Native stack overflow is an unnamed SIGSEGV.** A clause with a NON-tail `resume` over a
   1M-perform tail loop segfaults (rc 139, no message); 100k works. Each nested resume is a
   native frame (D14's nesting call). Plain non-tail recursion at 1M segfaults the same way, so it
@@ -384,3 +387,23 @@ sub-effecting at function-value joins (a pure function usable where `{T}` is exp
 - Function-typed ADT fields and effect-operation parameters are a named error ("not
   supported yet"): they need a row story for type declarations.
 
+
+## RESOLVED (auto/elya, 2026-10-22, spec `2026-10-22-elya-multi-shot-sharing-design.md`): multi-shot with a non-tail resume over deep non-tail recursion exhausts memory (found 2026-10-16)
+
+A handle's body now ends at a shared end frame, so a multi-shot resume shares every site
+frame and copies only the handler frames on the perform's path. The program below runs
+natively in 0.01 s at 20 000 deep (`the_parked_deep_multi_shot_program_runs_natively`);
+its live set is linear (`a_deep_multi_shot_chain_is_shared_not_copied`). Original report:
+
+Found by the native-stack review, on `HEAD` before that slice too:
+
+```
+effect multi Flip { fn flip() -> Bool }
+fn nest(n) { if n == 0 { 0 } else { let b = flip()  if b { 1 + nest(n - 1) } else { nest(n - 1) } } }
+pub fn main() -> Int { handle nest(20000) with multi { Flip.flip() -> 0 + resume(True) } }
+```
+
+is SIGKILLed (out of memory) natively at 20 000 deep. Each resume copies the whole
+captured chain (`elya_cont_copy`), so a chain of depth d resumed at every level copies
+O(d^2) frames. Not measured in the evaluator yet. Needs its own measurement and spec
+(share an unchanged chain prefix, or copy lazily).

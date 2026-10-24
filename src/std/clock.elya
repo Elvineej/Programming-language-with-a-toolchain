@@ -1,0 +1,27 @@
+// elya/clock: the time as an effect, and handlers that give a dependency a
+// clock it cannot use to observe the host (spec
+// docs/superpowers/specs/2026-10-24-elya-capabilities-part-3-design.md).
+//
+// A module that reads the time performs `WallClock` and is granted `/ {WallClock}`,
+// never `IO`. The host's handler is `elya/host`'s `clock`.
+
+effect WallClock { fn wall_clock_ms() -> Int }
+
+// The time is always `t`.
+pub fn fixed(t: Int, body) {
+  handle { body() } with { WallClock.wall_clock_ms() -> resume(t) }
+}
+
+// The time starts at `start` and moves on `step` each time it is read.
+pub fn stepping(start: Int, step: Int, body) {
+  let run = handle { body() } with {
+    WallClock.wall_clock_ms() -> fn(t) { resume(t)(t + step) }
+    return(x) -> fn(t) { x }
+  }
+  run(start)
+}
+
+// The time outside, moved by `delta`.
+pub fn shifted(delta: Int, body) {
+  handle { body() } with { WallClock.wall_clock_ms() -> resume(wall_clock_ms() + delta) }
+}

@@ -298,15 +298,158 @@ pub(crate) fn apply_binop(
         (MulF, Float(a), Float(b)) => Ok(Float(a * b)),
         (DivF, Float(a), Float(b)) => Ok(Float(a / b)),
         (Concat, Str(a), Str(b)) => Ok(Str(a + &b)),
-        (Eq, a, b) => Ok(Bool(a == b)),
-        (Ne, a, b) => Ok(Bool(a != b)),
+        (Eq, a, b) => structural_eq(&a, &b, span).map(Bool),
+        (Ne, a, b) => structural_eq(&a, &b, span).map(|e| Bool(!e)),
         (Lt, Int(a), Int(b)) => Ok(Bool(a < b)),
         (Le, Int(a), Int(b)) => Ok(Bool(a <= b)),
         (Gt, Int(a), Int(b)) => Ok(Bool(a > b)),
         (Ge, Int(a), Int(b)) => Ok(Bool(a >= b)),
+        // IEEE ordered: false with a NaN (spec 2026-10-24-elya-float-part-2 D1).
+        (LtF, Float(a), Float(b)) => Ok(Bool(a < b)),
+        (LeF, Float(a), Float(b)) => Ok(Bool(a <= b)),
+        (GtF, Float(a), Float(b)) => Ok(Bool(a > b)),
+        (GeF, Float(a), Float(b)) => Ok(Bool(a >= b)),
         (And, Bool(a), Bool(b)) => Ok(Bool(a && b)),
         (Or, Bool(a), Bool(b)) => Ok(Bool(a || b)),
         _ => Err(rt(span, "type error in binary operator")),
+    }
+}
+
+/// `==` on data (spec 2026-10-16-elya-structural-equality, D2): the same
+/// constructor and equal fields, strings by their bytes. An explicit worklist,
+/// never recursion: comparing two million-element lists recursed once per cell
+/// and overflowed the host stack. E0436 keeps functions and continuations
+/// out; one arriving anyway is an internal error by name.
+fn structural_eq(a: &Value, b: &Value, span: Span) -> Result<bool, RuntimeError> {
+    use Value::*;
+    let mut work: Vec<(&Value, &Value)> = vec![(a, b)];
+    while let Some((x, y)) = work.pop() {
+        match (x, y) {
+            (Int(p), Int(q)) => {
+                if p != q {
+                    return Ok(false);
+                }
+            }
+            (Float(p), Float(q)) => {
+                if p != q {
+                    return Ok(false);
+                }
+            }
+            (Str(p), Str(q)) => {
+                if p != q {
+                    return Ok(false);
+                }
+            }
+            (Bool(p), Bool(q)) => {
+                if p != q {
+                    return Ok(false);
+                }
+            }
+            (Unit, Unit) => {}
+            (Ctor(n1, a1), Ctor(n2, a2)) => {
+                if n1 != n2 || a1.0.len() != a2.0.len() {
+                    return Ok(false);
+                }
+                // No shortcut for a shared value: a `Float` NaN in it is not
+                // equal to itself, so sharing must not decide (the review).
+                work.extend(a1.0.iter().zip(a2.0.iter()));
+            }
+            // N3: two operations caught by `with any` compare by what they are
+            // (E0434 makes their arguments data).
+            (
+                Op {
+                    effect: e1,
+                    op: o1,
+                    args: a1,
+                },
+                Op {
+                    effect: e2,
+                    op: o2,
+                    args: a2,
+                },
+            ) => {
+                if e1 != e2 || o1 != o2 || a1.len() != a2.len() {
+                    return Ok(false);
+                }
+                work.extend(a1.iter().zip(a2.iter()));
+            }
+            _ => {
+                return Err(rt(
+                    span,
+                    "`==` reached a value that is not data (E0436 should have rejected it)",
+                ))
+            }
+        }
+    }
+    Ok(true)
+}
+
+pub use crate::resolve::INT_BINARY_BUILTINS;
+
+/// `int.<name>(a, b)`. A shift amount outside `0..=63` fails by name.
+pub(crate) fn int_binary(name: &str, args: &[Value], span: Span) -> Result<Value, RuntimeError> {
+    let [Value::Int(a), Value::Int(b)] = args else {
+        return Err(rt(span, format!("int.{name} expects two Ints")));
+    };
+    let (a, b) = (*a, *b);
+    let shift = |b: i64| -> Result<u32, RuntimeError> {
+        if (0..=63).contains(&b) {
+            Ok(b as u32)
+        } else {
+            Err(rt(
+                span,
+                format!("int.{name}: a shift by {b} is outside 0..=63"),
+            ))
+        }
+    };
+    let v = match name {
+        "wrapping_add" => a.wrapping_add(b),
+        "wrapping_sub" => a.wrapping_sub(b),
+        "wrapping_mul" => a.wrapping_mul(b),
+        "and" => a & b,
+        "or" => a | b,
+        "xor" => a ^ b,
+        "shl" => a << shift(b)?,
+        "shr" => a >> shift(b)?,
+        "ushr" => ((a as u64) >> shift(b)?) as i64,
+        _ => return Err(rt(span, format!("unknown builtin `int.{name}`"))),
+    };
+    Ok(Value::Int(v))
+}
+
+/// `float.<name>(x)` (spec 2026-10-24-elya-float-part-2 D3, D4): `of_int`
+/// rounds to nearest (ties to even); `truncate` and `round` (halves away from
+/// zero) fail by name on NaN and outside `Int`'s range.
+pub(crate) fn float_conversion(
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, RuntimeError> {
+    match (name, args) {
+        ("of_int", [Value::Int(n)]) => Ok(Value::Float(*n as f64)),
+        ("truncate" | "round", [Value::Float(x)]) => {
+            if x.is_nan() {
+                return Err(rt(span, format!("float.{name}: NaN has no Int value")));
+            }
+            let t = if name == "round" {
+                x.round()
+            } else {
+                x.trunc()
+            };
+            // [-2^63, 2^63): both bounds are exact floats.
+            if (-9223372036854775808.0..9223372036854775808.0).contains(&t) {
+                Ok(Value::Int(t as i64))
+            } else {
+                Err(rt(
+                    span,
+                    format!(
+                        "float.{name}: {} is outside Int's range",
+                        crate::literal::float_text(*x)
+                    ),
+                ))
+            }
+        }
+        _ => Err(rt(span, format!("float.{name}: a wrong argument"))),
     }
 }
 
@@ -318,6 +461,7 @@ pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Runtim
             .ok_or_else(|| overflow(span)),
         (UnOp::Neg, Value::Float(x)) => Ok(Value::Float(-x)),
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+        (UnOp::NegF, Value::Float(x)) => Ok(Value::Float(-x)),
         _ => Err(rt(span, "type error in unary operator")),
     }
 }
@@ -398,6 +542,8 @@ pub mod tree {
             Expr::Str(s) => Ok(Value::Str(s.clone())),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Unit => Ok(Value::Unit),
+            // Only in a module with a parse error, which is never run.
+            Expr::Error => Err(rt(span, "a statement that did not parse")),
             Expr::Var(name) => {
                 if let Some(v) = env.get(name) {
                     Ok(v)
@@ -469,6 +615,32 @@ pub mod tree {
                             return Err(rt(span, "int.to_string expects a single Int"));
                         };
                         return Ok(Value::Str(n.to_string()));
+                    }
+                    if module == "float" && name == "to_string" {
+                        let mut vals = Vec::new();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        let [Value::Float(x)] = &vals[..] else {
+                            return Err(rt(span, "float.to_string expects a single Float"));
+                        };
+                        return Ok(Value::Str(crate::literal::float_text(*x)));
+                    }
+                    if module == "float"
+                        && crate::resolve::FLOAT_CONVERSIONS.contains(&name.as_str())
+                    {
+                        let mut vals = Vec::new();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        return super::float_conversion(name, &vals, span);
+                    }
+                    if module == "int" && super::INT_BINARY_BUILTINS.contains(&name.as_str()) {
+                        let mut vals = Vec::new();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        return super::int_binary(name, &vals, span);
                     }
                     return Err(rt(span, format!("unknown builtin `{module}.{name}`")));
                 }
@@ -607,6 +779,8 @@ pub mod cek {
     enum CalleeSlot {
         Pending,                                  // still evaluating the callee expression
         Builtin(&'static str),                    // e.g. "io.println"
+        IntBinary(&'static str),                  // `int.<name>` of two Ints
+        FloatConversion(&'static str),            // `float.<name>` conversions
         Value(Value),                             // an evaluated callee (a Value::Fn)
         Operation { effect: String, op: String }, // a perform of an effect op
         Ctor { name: String },                    // a data-constructor application
@@ -960,6 +1134,7 @@ pub mod cek {
             Expr::Str(s) => State::Return(Value::Str(s.clone()), k),
             Expr::Bool(b) => State::Return(Value::Bool(*b), k),
             Expr::Unit => State::Return(Value::Unit, k),
+            Expr::Error => return Err(rt(span, "a statement that did not parse")),
             Expr::Var(name) => {
                 let v = if let Some(v) = env.get(name) {
                     v
@@ -1028,8 +1203,35 @@ pub mod cek {
                     Expr::Qualified { module, name } if module == "int" && name == "to_string" => {
                         CalleeSlot::Builtin("int.to_string")
                     }
+                    Expr::Qualified { module, name }
+                        if module == "float" && name == "to_string" =>
+                    {
+                        CalleeSlot::Builtin("float.to_string")
+                    }
                     Expr::Qualified { module, name } if module == "time" && name == "now_ms" => {
                         CalleeSlot::Builtin("time.now_ms")
+                    }
+                    Expr::Qualified { module, name }
+                        if module == "float"
+                            && crate::resolve::FLOAT_CONVERSIONS.contains(&name.as_str()) =>
+                    {
+                        match crate::resolve::FLOAT_CONVERSIONS
+                            .iter()
+                            .position(|b| b == name)
+                        {
+                            Some(i) => {
+                                CalleeSlot::FloatConversion(crate::resolve::FLOAT_CONVERSIONS[i])
+                            }
+                            None => {
+                                return Err(rt(span, format!("unknown builtin `float.{name}`")))
+                            }
+                        }
+                    }
+                    Expr::Qualified { module, name } if module == "int" => {
+                        match super::INT_BINARY_BUILTINS.iter().position(|b| b == name) {
+                            Some(i) => CalleeSlot::IntBinary(super::INT_BINARY_BUILTINS[i]),
+                            None => return Err(rt(span, format!("unknown builtin `int.{name}`"))),
+                        }
                     }
                     Expr::Qualified { module, name } if module == "time" && name == "sleep_ms" => {
                         CalleeSlot::Builtin("time.sleep_ms")
@@ -1276,10 +1478,13 @@ pub mod cek {
         if !rd.handler.multi {
             if rd.consumed.get() {
                 return Err(RuntimeError {
-                    diag: Diagnostic::error("E0425", "continuation resumed more than once")
+                    // The native trap's words (spec 2026-10-22 D1). The label
+                    // names both halves: `with multi` alone is E0427 over an
+                    // effect not declared `multi`.
+                    diag: Diagnostic::error("E0425", "a one-shot continuation was resumed twice")
                         .with_label(
                             span,
-                            "this handler is one-shot — use `with multi` for multi-shot",
+                            "this handler is one-shot: only a `with multi` handler of an `effect multi` resumes more than once",
                         ),
                 });
             }
@@ -1488,11 +1693,24 @@ pub mod cek {
                 let v = super::host_builtin(interp, b, &args, span)?;
                 Ok(State::Return(v, k))
             }
+            CalleeSlot::IntBinary(name) => {
+                Ok(State::Return(super::int_binary(name, &args, span)?, k))
+            }
+            CalleeSlot::FloatConversion(name) => Ok(State::Return(
+                super::float_conversion(name, &args, span)?,
+                k,
+            )),
             CalleeSlot::Builtin("int.to_string") => {
                 let [Value::Int(n)] = &args[..] else {
                     return Err(rt(span, "int.to_string expects a single Int"));
                 };
                 Ok(State::Return(Value::Str(n.to_string()), k))
+            }
+            CalleeSlot::Builtin("float.to_string") => {
+                let [Value::Float(x)] = &args[..] else {
+                    return Err(rt(span, "float.to_string expects a single Float"));
+                };
+                Ok(State::Return(Value::Str(crate::literal::float_text(*x)), k))
             }
             CalleeSlot::Builtin(b) if b.starts_with("op.") => {
                 let Some(Value::Op {

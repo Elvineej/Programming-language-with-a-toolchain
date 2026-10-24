@@ -8,6 +8,7 @@ pub mod eval;
 pub mod exhaust;
 pub mod lex;
 pub mod literal;
+pub mod modules;
 pub mod parse;
 pub mod resolve;
 pub mod span;
@@ -26,28 +27,48 @@ impl Session {
     }
 }
 
-/// The front-end passes (parse → resolve → infer → exhaustiveness), returning the
-/// module and all diagnostics. Exhaustiveness runs only on an error-free program;
-/// warnings never block a later pass.
-fn front_end(session: &Session, text: &str) -> (ast::Module, Vec<Diagnostic>) {
-    let (module, mut diags) = parse::parse_module(session, text);
-    diags.extend(resolve::check(session, &module));
+/// Reads no file: the text entry points see one file, and a user import there is
+/// E0600 (spec 2026-10-23-elya-modules-part-1 D7).
+fn no_files(_: &str) -> Option<(String, String)> {
+    None
+}
+
+/// The front-end passes over a whole program (load and merge the modules, then
+/// resolve → infer → exhaustiveness), returning the merged module, all
+/// diagnostics and the program's sources. The root and the modules it imports are
+/// read by `read` (spec 2026-10-23-elya-modules-part-1 D7). Exhaustiveness runs
+/// only on an error-free program; warnings never block a later pass.
+pub fn front_end_with(
+    name: &str,
+    text: &str,
+    read: &mut modules::Reader,
+) -> (ast::Module, Vec<Diagnostic>, SourceMap) {
+    let session = Session::new();
+    let (program, mut diags) = modules::load(&session, name, text, read);
+    let module = program.module;
+    // A name a module diagnostic already refused is not reported again (the
+    // modules review's R3: E0201 "unknown builtin" after E0600 or E0603).
+    diags.extend(resolve::check(&session, &module).into_iter().filter(|d| {
+        !d.labels
+            .first()
+            .is_some_and(|l| program.refused.contains(&l.span))
+    }));
     if diags.is_empty() {
-        let (idiags, affine_sites) = types::infer_with_sites(session, &module);
+        let (idiags, affine_sites, fns) = types::infer_with_interfaces(&session, &module);
         diags.extend(idiags);
         if !diags.iter().any(|d| d.severity == Severity::Error) {
             diags.extend(exhaust::check(&module));
             diags.extend(affine::check(&module, &affine_sites));
+            // Modules part 2: what each import grants (spec 2026-10-24).
+            diags.extend(modules::check_grants(&program.grants, &module, &fns));
         }
     }
-    (module, diags)
+    (module, diags, program.sources)
 }
 
 /// Full pipeline: returns program output, or rendered diagnostics on failure.
 pub fn run_source(name: &str, text: &str) -> Result<String, String> {
-    let session = Session::new();
-    let sm = SourceMap::new(name, text);
-    let (module, diags) = front_end(&session, text);
+    let (module, diags, sm) = front_end_with(name, text, &mut no_files);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
         return Err(rendered);
     }
@@ -57,19 +78,90 @@ pub fn run_source(name: &str, text: &str) -> Result<String, String> {
     }
 }
 
+/// What `elya run` shows (spec 2026-10-16-elya-differential-sweep): the
+/// program's output, kept when the run fails (D1), and main's value as a native
+/// binary prints it (D2: an `Int` in decimal, `Unit` as `0`; `None` for any
+/// other type). `error` is the rendered diagnostic of a front-end or runtime
+/// failure.
+pub struct RunOutcome {
+    pub output: String,
+    pub value: Option<Result<i64, String>>,
+    pub error: Option<String>,
+}
+
+pub fn run_source_outcome(name: &str, text: &str) -> RunOutcome {
+    run_source_outcome_with(name, text, &mut no_files)
+}
+
+/// [`run_source_outcome`] over a whole program (modules part 1 D7).
+pub fn run_source_outcome_with(name: &str, text: &str, read: &mut modules::Reader) -> RunOutcome {
+    let (module, diags, sm) = front_end_with(name, text, read);
+    if let Some(rendered) = fail_if_errors(&diags, &sm) {
+        return RunOutcome::refused(rendered);
+    }
+    let (interp, result) = eval::run_module_keeping(&module, eval::World::Live);
+    RunOutcome::of(interp.output().to_string(), result, &sm)
+}
+
+impl RunOutcome {
+    /// Nothing ran: the front end, or the trace, refused.
+    fn refused(error: String) -> RunOutcome {
+        RunOutcome {
+            output: String::new(),
+            value: None,
+            error: Some(error),
+        }
+    }
+
+    /// A run's outcome: its output, kept whether it succeeded or failed.
+    fn of(
+        output: String,
+        result: Result<eval::Value, eval::RuntimeError>,
+        sm: &SourceMap,
+    ) -> RunOutcome {
+        match result {
+            Ok(v) => RunOutcome {
+                output,
+                value: Some(match v {
+                    eval::Value::Int(n) => Ok(n),
+                    eval::Value::Unit => Ok(0),
+                    _ => Err(
+                        "main's value is not an `Int` or `Unit`, so it has no native value line"
+                            .to_string(),
+                    ),
+                }),
+                error: None,
+            },
+            Err(e) => RunOutcome {
+                output,
+                value: None,
+                error: Some(render(&[e.diag], sm)),
+            },
+        }
+    }
+}
+
 /// The trace format's first line (spec 2026-10-16-elya-cli-record-replay).
 const TRACE_HEADER: &str = "elya trace 1";
 
 /// Runs live and writes down every answer the host gave. The trace is
 /// returned whether the run succeeds or fails (a failing run is the one most
-/// worth replaying): `(trace, Ok(output))` or `(trace, Err(diagnostics))`; a
-/// program that does not pass the front end has no trace (`None`).
-pub fn run_source_recording(name: &str, text: &str) -> (Option<String>, Result<String, String>) {
-    let session = Session::new();
-    let sm = SourceMap::new(name, text);
-    let (module, diags) = front_end(&session, text);
+/// worth replaying); a program that does not pass the front end has no trace
+/// (`None`). The outcome keeps the program's output apart from its error (spec
+/// 2026-10-23-elya-traced-run-output D1).
+pub fn record_source(name: &str, text: &str) -> (Option<String>, RunOutcome) {
+    record_source_with(name, text, &mut no_files)
+}
+
+/// [`record_source`] over a whole program (modules part 1 D7).
+pub fn record_source_with(
+    name: &str,
+    text: &str,
+    read: &mut modules::Reader,
+) -> (Option<String>, RunOutcome) {
+    let (module, diags, sm) = front_end_with(name, text, read);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
-        return (None, Err(rendered));
+        return (None, RunOutcome::refused(rendered));
     }
     let (interp, result) = eval::run_module_keeping(&module, eval::World::Record(Vec::new()));
     let mut trace = format!("{TRACE_HEADER}\n");
@@ -78,21 +170,40 @@ pub fn run_source_recording(name: &str, text: &str) -> (Option<String>, Result<S
             trace.push_str(&format!("{q} = {a}\n"));
         }
     }
-    let out = match result {
-        Ok(_) => Ok(interp.output().to_string()),
-        Err(e) => Err(format!("{}{}", interp.output(), render(&[e.diag], &sm))),
-    };
-    (Some(trace), out)
+    let output = interp.output().to_string();
+    (Some(trace), RunOutcome::of(output, result, &sm))
 }
 
-/// Runs with the host answered from `trace` (the text `run_source_recording`
+/// [`record_source`] as `(trace, Ok(output))` or `(trace, Err(output and
+/// diagnostics))`, the shape the trace tests compare against.
+pub fn run_source_recording(name: &str, text: &str) -> (Option<String>, Result<String, String>) {
+    let (trace, o) = record_source(name, text);
+    let out = match o.error {
+        None => Ok(o.output),
+        Some(e) => Err(format!("{}{e}", o.output)),
+    };
+    (trace, out)
+}
+
+/// Runs with the host answered from `trace` (the text [`record_source`]
 /// writes); a divergence or a leftover entry is a runtime error. Lines are
-/// read with surrounding whitespace (and a leading byte-order mark) ignored.
-pub fn run_source_replaying(name: &str, text: &str, trace: &str) -> Result<String, String> {
+/// read with surrounding whitespace (and a leading byte-order mark) ignored. A
+/// trace that cannot be read runs nothing.
+pub fn replay_source(name: &str, text: &str, trace: &str) -> RunOutcome {
+    replay_source_with(name, text, trace, &mut no_files)
+}
+
+/// [`replay_source`] over a whole program (modules part 1 D7).
+pub fn replay_source_with(
+    name: &str,
+    text: &str,
+    trace: &str,
+    read: &mut modules::Reader,
+) -> RunOutcome {
     let trace = trace.strip_prefix('\u{feff}').unwrap_or(trace);
     let mut lines = trace.lines();
     if lines.next().map(str::trim) != Some(TRACE_HEADER) {
-        return Err(format!(
+        return RunOutcome::refused(format!(
             "error: not a trace: the first line must be `{TRACE_HEADER}`\n"
         ));
     }
@@ -105,30 +216,40 @@ pub fn run_source_replaying(name: &str, text: &str, trace: &str) -> Result<Strin
         // question's arguments may contain one. A String answer would need
         // a quoted-aware split (spec §2).
         let Some((q, a)) = line.rsplit_once(" = ") else {
-            return Err(format!(
+            return RunOutcome::refused(format!(
                 "error: trace line {}: expected `question = answer`\n",
                 i + 2
             ));
         };
         entries.push((q.trim().to_string(), a.trim().to_string()));
     }
-    let session = Session::new();
-    let sm = SourceMap::new(name, text);
-    let (module, diags) = front_end(&session, text);
+    let (module, diags, sm) = front_end_with(name, text, read);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
-        return Err(rendered);
+        return RunOutcome::refused(rendered);
     }
-    match eval::run_module_in(&module, eval::World::Replay { entries, next: 0 }) {
-        Ok((interp, _)) => Ok(interp.output().to_string()),
-        Err(e) => Err(render(&[e.diag], &sm)),
+    let (interp, result) =
+        eval::run_module_keeping(&module, eval::World::Replay { entries, next: 0 });
+    RunOutcome::of(interp.output().to_string(), result, &sm)
+}
+
+/// [`replay_source`] as `Ok(output)` or `Err(diagnostics)` (the output of a
+/// failing replay is not in the error), the shape the trace tests compare against.
+pub fn run_source_replaying(name: &str, text: &str, trace: &str) -> Result<String, String> {
+    let o = replay_source(name, text, trace);
+    match o.error {
+        None => Ok(o.output),
+        Some(e) => Err(e),
     }
 }
 
 /// Front-end only (no execution).
 pub fn check_source(name: &str, text: &str) -> Result<(), String> {
-    let session = Session::new();
-    let sm = SourceMap::new(name, text);
-    let (_module, diags) = front_end(&session, text);
+    check_source_with(name, text, &mut no_files)
+}
+
+/// [`check_source`] over a whole program (modules part 1 D7).
+pub fn check_source_with(name: &str, text: &str, read: &mut modules::Reader) -> Result<(), String> {
+    let (_module, diags, sm) = front_end_with(name, text, read);
     match fail_if_errors(&diags, &sm) {
         Some(rendered) => Err(rendered),
         None => Ok(()),
@@ -139,9 +260,12 @@ pub fn check_source(name: &str, text: &str) -> Result<(), String> {
 /// CLI surfaces these on a *successful* compile (the spec §11 obligation) so an
 /// `E0426`/`E0431` lint reaches the user even though it does not fail the build.
 pub fn warnings(name: &str, text: &str) -> Option<String> {
-    let session = Session::new();
-    let sm = SourceMap::new(name, text);
-    let (_module, diags) = front_end(&session, text);
+    warnings_with(name, text, &mut no_files)
+}
+
+/// [`warnings`] over a whole program (modules part 1 D7).
+pub fn warnings_with(name: &str, text: &str, read: &mut modules::Reader) -> Option<String> {
+    let (_module, diags, sm) = front_end_with(name, text, read);
     let warns: Vec<Diagnostic> = diags
         .into_iter()
         .filter(|d| d.severity == Severity::Warning)

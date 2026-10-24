@@ -119,3 +119,168 @@ fn elya_build_reports_front_end_errors_and_emits_nothing() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Found by the 2026-10-16 sweep: `elya build` asserted that inference returned
+/// no diagnostics at all, so a program with only a warning (E0426) panicked
+/// the debug binary instead of building.
+#[test]
+fn a_program_with_only_warnings_builds() {
+    let dir = temp_dir("warning-only");
+    let src = dir.join("multi.elya");
+    std::fs::write(
+        &src,
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn noisy() { let x = flip()  let _ = io.println(\"tick\")  x }\n\
+         pub fn main() {\n\
+         \x20 let _ = handle noisy() with multi { Flip.flip() -> resume(True) }\n\
+         \x20 io.println(\"done\")\n\
+         }\n",
+    )
+    .expect("write program");
+    let exe = dir.join(format!("multi{}", std::env::consts::EXE_SUFFIX));
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .arg("build")
+        .arg(&src)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .expect("spawn elya build");
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("E0426"),
+        "the warning is still shown: {out:?}"
+    );
+    let run = Command::new(&exe).output().expect("run produced binary");
+    assert!(run.status.success(), "{run:?}");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "tick\ndone\n0\n");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Spec 2026-10-23-elya-traced-run-output D1: a traced run prints on stdout what
+/// the native binary prints, and exits alike, failing or not.
+#[test]
+fn a_traced_run_prints_what_the_native_binary_prints() {
+    let dir = temp_dir("traced");
+    let fails = "pub fn main() -> Int { let t = time.now_ms()  let z = t - t  io.println(\"x\")  10 / z }\n";
+    let asks = "pub fn main() -> Int { io.println(\"y\")  let t = time.now_ms()  t }\n";
+    let mut exes = Vec::new();
+    for (name, src) in [("f", fails), ("g", asks)] {
+        let prog = dir.join(format!("{name}.elya"));
+        std::fs::write(&prog, src).unwrap();
+        let exe = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        elya_build(&[prog.as_os_str(), "-o".as_ref(), exe.as_os_str()]);
+        exes.push((prog, exe));
+    }
+    let cli = |flag: &str, trace: &Path, prog: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_elya"))
+            .arg("run")
+            .arg(flag)
+            .arg(trace)
+            .arg(prog)
+            .output()
+            .expect("spawn elya run")
+    };
+    let native = |var: &str, trace: &Path, exe: &Path| {
+        Command::new(exe)
+            .env(var, trace)
+            .output()
+            .expect("run the binary")
+    };
+    let same = |what: &str, c: &std::process::Output, n: &std::process::Output| {
+        assert_eq!(c.status.code(), n.status.code(), "{what}: {c:?} {n:?}");
+        // The native binary ends a successful run with main's value line.
+        let n_out = String::from_utf8_lossy(&n.stdout).into_owned();
+        let n_text = if n.status.success() {
+            n_out
+                .trim_end_matches('\n')
+                .rsplit_once('\n')
+                .map_or(String::new(), |(t, _)| format!("{t}\n"))
+        } else {
+            n_out
+        };
+        assert_eq!(String::from_utf8_lossy(&c.stdout), n_text, "{what}");
+    };
+    let (f, f_exe) = &exes[0];
+    let (g, g_exe) = &exes[1];
+    let t_cli = dir.join("cli.trace");
+    let t_nat = dir.join("native.trace");
+    same(
+        "a failing record",
+        &cli("--record", &t_cli, f),
+        &native("ELYA_RECORD", &t_nat, f_exe),
+    );
+    same(
+        "its replay",
+        &cli("--replay", &t_cli, f),
+        &native("ELYA_REPLAY", &t_cli, f_exe),
+    );
+    let short = dir.join("short.trace");
+    std::fs::write(&short, "elya trace 1\n").unwrap();
+    same(
+        "a diverging replay",
+        &cli("--replay", &short, g),
+        &native("ELYA_REPLAY", &short, g_exe),
+    );
+    let full = dir.join("full.trace");
+    std::fs::write(&full, "elya trace 1\ntime.now_ms() = 7\n").unwrap();
+    same(
+        "a successful replay",
+        &cli("--replay", &full, g),
+        &native("ELYA_REPLAY", &full, g_exe),
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Modules part 1 (spec `2026-10-23-elya-modules-part-1-design.md` D7): `elya
+/// build` reads a program's imports, and the binary prints what `elya run` does.
+#[test]
+fn elya_build_reads_imported_files() {
+    let dir = temp_dir("modules");
+    std::fs::write(
+        dir.join("util.elya"),
+        "fn helper() -> Int { 2 }\npub fn twice(x: Int) -> Int { x * helper() }\n",
+    )
+    .unwrap();
+    let prog = dir.join("main.elya");
+    std::fs::write(
+        &prog,
+        "import util\nfn helper() -> Int { 1 }\npub fn main() -> Int { io.println(\"go\")  util.twice(20) + helper() }\n",
+    )
+    .unwrap();
+    let exe = dir.join(format!("main{}", std::env::consts::EXE_SUFFIX));
+    elya_build(&[prog.as_os_str(), "-o".as_ref(), exe.as_os_str()]);
+    let native = Command::new(&exe).output().expect("run the binary");
+    assert!(native.status.success(), "{native:?}");
+    assert_eq!(String::from_utf8_lossy(&native.stdout), "go\n41\n");
+    let run = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .args(["run".as_ref(), "--value".as_ref(), prog.as_os_str()])
+        .output()
+        .expect("spawn elya run --value");
+    assert_eq!(run.stdout, native.stdout);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Diagnostics at the edges D5 (spec 2026-10-24): a 2000-line `main` built.
+/// Every Core pass recurses down a block's chain of `let`s, and on an 8 MiB
+/// main thread a debug `elya build` overflowed at about 700 statements.
+#[test]
+fn elya_build_of_a_2000_line_main_runs() {
+    let dir = temp_dir("long-main");
+    let src = dir.join("long.elya");
+    let mut prog = String::from("pub fn main() {\n");
+    for i in 0..2000 {
+        prog.push_str(&format!("  io.println(\"{i}\")\n"));
+    }
+    prog.push_str("}\n");
+    std::fs::write(&src, prog).expect("write source");
+    let exe = dir.join(format!("long{}", std::env::consts::EXE_SUFFIX));
+    elya_build(&[src.as_os_str(), "-o".as_ref(), exe.as_os_str()]);
+    let out = Command::new(&exe).output().expect("run produced binary");
+    assert!(out.status.success(), "binary exited {:?}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    // 2000 lines, then main's value (a `Unit` main prints 0).
+    assert_eq!(lines.len(), 2001);
+    assert_eq!(lines[1999], "1999");
+    std::fs::remove_dir_all(&dir).ok();
+}

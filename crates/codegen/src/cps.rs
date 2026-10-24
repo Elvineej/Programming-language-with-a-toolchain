@@ -11,7 +11,8 @@ use elya::types::{EffectRow, RowTail, Ty};
 use crate::closure::{cont_ty, free_vars_under, pat_binders, CONT};
 
 /// The one effect label the back end treats as builtin. Sound as a *name* test
-/// only because lowering refuses a user-declared `effect IO` (D1, Task 2) --
+/// only because a user-declared `effect IO` is refused (E0209 at resolve since
+/// 2026-10-22; lowering's D1 refusal is the guard behind it) --
 /// `CoreModule` carries no effect declarations, so the name is all codegen has.
 /// Mirrors `src/types.rs`'s `OBSERVABLE_EFFECTS`.
 const BUILTIN_EFFECT: &str = "IO";

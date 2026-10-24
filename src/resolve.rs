@@ -7,10 +7,61 @@ use crate::span::{Span, Spanned};
 use crate::Session;
 use std::collections::{HashMap, HashSet};
 
+/// The `int.*` builtins of two `Int`s (spec 2026-10-17-elya-unary-and-wrapping
+/// D2): wrapping arithmetic and bit operations. Their full names are `int.` and
+/// these.
+pub const INT_BINARY_BUILTINS: &[&str] = &[
+    "wrapping_add",
+    "wrapping_sub",
+    "wrapping_mul",
+    "and",
+    "or",
+    "xor",
+    "shl",
+    "shr",
+    "ushr",
+];
+
+/// The `float.*` conversions (spec 2026-10-24-elya-float-part-2 D3, D4):
+/// `of_int : fn(Int) -> Float`, `truncate` and `round : fn(Float) -> Int`.
+pub const FLOAT_CONVERSIONS: &[&str] = &["of_int", "truncate", "round"];
+
+/// How many arguments a builtin takes (every name in [`builtins`]).
+pub fn builtin_arity(full: &str) -> usize {
+    match full {
+        "time.now_ms" => 0,
+        "op.encode" | "op.decode" => 2,
+        f if f
+            .strip_prefix("int.")
+            .is_some_and(|n| INT_BINARY_BUILTINS.contains(&n)) =>
+        {
+            2
+        }
+        _ => 1,
+    }
+}
+
 pub fn builtins() -> &'static [&'static str] {
     &[
         "io.println",
         "int.to_string",
+        // A float's literal text (2026-10-23, spec 2026-10-23-elya-float-natively D5).
+        "float.to_string",
+        // Conversions (2026-10-24, spec 2026-10-24-elya-float-part-2 D3, D4).
+        "float.of_int",
+        "float.truncate",
+        "float.round",
+        // Explicit wrapping and bit arithmetic (2026-10-17, spec
+        // 2026-10-17-elya-unary-and-wrapping D2).
+        "int.wrapping_add",
+        "int.wrapping_sub",
+        "int.wrapping_mul",
+        "int.and",
+        "int.or",
+        "int.xor",
+        "int.shl",
+        "int.shr",
+        "int.ushr",
         "time.now_ms",
         "time.sleep_ms",
         // On an operation `o` of a `with any` clause (2026-10-16).
@@ -45,6 +96,8 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
     // `op_table`, `ast::op_effects`) is keyed by op name, so a second
     // declaration is E0202 rather than a silent overwrite.
     let mut op_effect: HashMap<String, String> = HashMap::new();
+    // Where each operation was first declared (D2 of the diagnostics spec).
+    let mut op_span: HashMap<String, crate::span::Span> = HashMap::new();
     let mut op_arity: HashMap<String, usize> = HashMap::new();
     // E0207: each effect's operations, in declaration order, with their
     // declared parameter names (for the clauses the help suggests).
@@ -57,20 +110,37 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
     // won -- and an empty match on a name declared once empty and once not
     // accepted a real value (the failure slice's review). Each kind is its own
     // namespace.
-    let mut seen: HashSet<(&str, String)> = HashSet::new();
+    //
+    // Both declarations are labelled, the first in its own file (spec
+    // 2026-10-24-elya-diagnostics-at-the-edges D2).
+    let mut seen: HashMap<(&str, String), crate::span::Span> = HashMap::new();
     let mut dup =
         |kind: &'static str, name: &str, span: crate::span::Span, out: &mut Vec<Diagnostic>| {
-            if !seen.insert((kind, name.to_string())) {
-                out.push(
-                    Diagnostic::error(
-                        "E0209",
-                        format!("{kind} `{name}` is declared more than once"),
-                    )
-                    .with_label(span, "a second declaration of this name")
-                    .with_help(format!(
-                        "rename one of them: a {kind} name is unique across a module"
-                    )),
-                );
+            match seen.get(&(kind, name.to_string())) {
+                Some(first) => {
+                    // Functions are qualified across files (modules part 1); the
+                    // other kinds are one name space for the whole program.
+                    let scope = if kind == "function" {
+                        "within its file"
+                    } else {
+                        "across the program, imported files included"
+                    };
+                    out.push(
+                        Diagnostic::error(
+                            "E0209",
+                            format!("{kind} `{name}` is declared more than once"),
+                        )
+                        .with_label(span, "a second declaration of this name")
+                        .with_label(*first, "first declared here")
+                        .with_help(format!(
+                            "rename one of them: {} {kind} name is unique {scope}",
+                            if kind == "effect" { "an" } else { "a" }
+                        )),
+                    );
+                }
+                None => {
+                    seen.insert((kind, name.to_string()), span);
+                }
             }
         };
     for d in &module.decls {
@@ -81,10 +151,22 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
             }
             Decl::Effect(e) => {
                 dup("effect", &e.name, d.span, &mut dup_diags);
+                // Spec 2026-10-22 D4: the language declared `IO` first. A
+                // handler never dispatches it, and every back-end pass reads
+                // "a user effect" as a label other than `IO`.
+                if e.name == "IO" {
+                    dup_diags.push(
+                        Diagnostic::error("E0209", "effect `IO` is built in")
+                            .with_label(d.span, "the built-in effect already has this name")
+                            .with_help("rename this effect: `IO` is the effect `io.*` performs"),
+                    );
+                }
                 effect_names.insert(e.name.clone());
                 for op in &e.ops {
                     let name = &op.node.name;
-                    if let Some(first) = op_effect.get(name) {
+                    if let (Some(first), Some(first_span)) =
+                        (op_effect.get(name), op_span.get(name))
+                    {
                         dup_ops.insert(name.clone());
                         dup_diags.push(
                             Diagnostic::error(
@@ -95,12 +177,14 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
                                 op.span,
                                 format!("`{name}` is already declared by effect `{first}`"),
                             )
+                            .with_label(*first_span, "first declared here")
                             .with_help(
                                 "operation names are unique across a module: a perform names only the operation, so it must say which effect it performs",
                             ),
                         );
                     } else {
                         op_effect.insert(name.clone(), e.name.clone());
+                        op_span.insert(name.clone(), op.span);
                         op_arity.insert(name.clone(), op.node.param_tys.len());
                         effect_ops.entry(e.name.clone()).or_default().push((
                             name.clone(),
@@ -353,7 +437,12 @@ impl Cx<'_> {
 
     fn check_expr(&mut self, e: &Expr, span: Span, scope: &mut Vec<HashSet<String>>) {
         match e {
-            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Unit => {}
+            Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Str(_)
+            | Expr::Bool(_)
+            | Expr::Unit
+            | Expr::Error => {}
             Expr::Var(name) => {
                 self.check_name(name, span, scope);
                 // E0206 (slice 5c-3): an operation may only be called. Named
@@ -396,11 +485,14 @@ impl Cx<'_> {
                             .with_label(span, "no such function"),
                     );
                 } else {
+                    // At the builtin's own arity (the 2026-10-17 review's L1:
+                    // `fn(x) { int.xor(x) }` was itself an arity error).
+                    let ps = ["a", "b"][..builtin_arity(&full)].join(", ");
                     self.diags.push(
                         Diagnostic::error("E0208", format!("builtin `{full}` used as a value"))
                             .with_label(span, "a builtin can only be called")
                             .with_help(format!(
-                                "to pass it on, wrap it in a function: `fn(x) {{ {full}(x) }}`"
+                                "to pass it on, wrap it in a function: `fn({ps}) {{ {full}({ps}) }}`"
                             )),
                     );
                 }
