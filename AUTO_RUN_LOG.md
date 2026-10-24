@@ -11,7 +11,21 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   `libzstd-dev`). Baseline 1241 / 125.
 - **Done: diagnostics at the edges** (HANDOFF step 1). Spec+plan 863e7c5,
   implementation 0f8da88.
-- Working on: HANDOFF step 1 (capabilities part 3).
+- **Done: capabilities part 3, attenuation in the standard library** (HANDOFF
+  step 1). Spec+plan 931b898, implementation b70707f.
+  - `elya/console` (`Console`) and `elya/clock` (`WallClock`), written in Elya,
+    with attenuating handlers; `elya/host` turns them into `IO` and needs
+    `/ {IO}`. A dependency can now be given lines or a fixed clock, not the host.
+  - Gate 1275 / 130 as predicted; K1-K2 distinct. Review: no soundness defect
+    (no route from a `Console`-only grant to `IO`), evaluator = native for every
+    handler; the generic names (`Out`, `Clock`, `Counted`) renamed on its advice.
+  - **Decisions (mine; please review):** the host handlers in a module of their
+    own; grants apply to the standard Elya modules unchanged (so
+    `import elya/console / {Console}`); builtins stay importless in modules
+    (D5: a file's own import adds no authority; requiring it would change eight
+    tests' expectations).
+- New HANDOFF step 5: name clashes across files (diagnostics in the user's file).
+- Working on: HANDOFF step 1 (two gaps the Float part-2 review saw).
   - Byte offsets in the renderer (labels after non-ASCII text were shifted);
     E0209/E0202 label the first declaration too (in its own file); the end of
     the file is reported once; expressions nest at most 1024 levels, E0102
@@ -26,7 +40,7 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     1024 (not an explicit stack); the CLI's 1 GiB thread (block length stays
     unbounded, so iterative Core passes are new HANDOFF step 5); D3 narrowed to
     the end of the file.
-- Windows-gate debt: 0f8da88 (the CLI's thread; a `#[cfg(target_os = "linux")]`
+- Windows-gate debt: b70707f (new std sources; no runtime change, low risk), 0f8da88 (the CLI's thread; a `#[cfg(target_os = "linux")]`
   test), with the earlier list (dce886a, 670c842, dfb8a5c, e78ace6, ...).
 - `graphify` is not installed here, so `graphify update .` was not run.
 

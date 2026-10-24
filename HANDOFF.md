@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1264 passed, 127 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1275 passed, 130 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -542,22 +542,19 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   chains counted by height); the CLI compiles on its own 1 GiB stack (a
   700-line `main` overflowed a debug `elya build`).
 
+- **Capabilities, part 3: attenuation in the standard library** (2026-10-24,
+  branch `auto/elya`, a scheduled run, b70707f): spec
+  `docs/superpowers/specs/2026-10-24-elya-capabilities-part-3-design.md`.
+  `elya/console` (`Console`, `console_line`; `prefixed`, `limited`, `counted`,
+  `captured`, `silenced`) and `elya/clock` (`WallClock`, `wall_clock_ms`;
+  `fixed`, `stepping`, `shifted`), written in Elya: a dependency is granted
+  these instead of `IO`. `elya/host` (`console`, `clock`) turns them into `IO`
+  and needs `/ {IO}`. Builtins still need no import in a module (D5, for the
+  maintainer's review).
+
 ## The next five steps
 
-### 1. Capabilities, part 3: attenuation, and builtins behind an import
-
-ROADMAP priority 2's last part. Modules part 2 (spec 2026-10-24) checks what an
-import grants; the root holds every capability and builtins need no import.
-Measure what a program needs to give a dependency LESS than a builtin (a clock
-that only answers a fixed time, a printer that prefixes or counts lines), then
-decide in a spec: an attenuating handler written in Elya over a user effect
-(`Clock`, `Out`) that the root grants instead of `IO`, shipped as a standard
-module; and whether `io`/`time` should need `import elya/io` in a module (not
-the root), so a module's source says it touches the host. Also recorded by the
-part-2 review: data of a type with an `IO` field passed through a module needs
-the grant (a type cannot say who built a value).
-
-### 2. Two gaps the Float part-2 review saw
+### 1. Two gaps the Float part-2 review saw
 
 Older than that slice. (a) A function body (`main` included) that ends in a
 `let` statement runs in the evaluator (its value is `Unit`/0) and is refused
@@ -570,7 +567,7 @@ subnormal values must be computed; decide the literal syntax (`1.0e19`, a digit
 on both sides of the `.` as now) and its text in `float.to_string`/`op.show`
 (which never write an exponent today).
 
-### 3. Strings to read a trace: one trace format for the host and `elya/replay`
+### 2. Strings to read a trace: one trace format for the host and `elya/replay`
 
 `elya/replay` (spec 2026-10-24-elya-std-replay §3) writes the host trace's line
 shape, but no Elya program can read text back (no string functions beyond `<>`,
@@ -583,7 +580,7 @@ readers share, and `replay.parse(text)`. Also from that review: `record` under a
 multi-shot handler fails at run time (one-shot `with any`), and `replay` cannot
 decode an answer typed by the effect's own parameter.
 
-### 4. The sweep's last native refusals
+### 3. The sweep's last native refusals
 
 After alias renaming (spec 2026-10-24 §3) the differential sweep's native
 refusals are four, all older: two `main`s whose value is not an `Int` (a
@@ -594,7 +591,7 @@ instances, and how), then decide in a spec: what a native binary prints for a
 `Unit`), and whether the budget is hit by non-regular types (a named refusal
 is right) or by ordinary ones (a bigger or a smarter bound).
 
-### 5. Core passes iterative over a block's statements
+### 4. Core passes iterative over a block's statements
 
 Left by diagnostics at the edges (spec 2026-10-24 D5): a block is a chain of
 `let`s in Core and every Core pass (`mono::rewrite_let` first) recurses down
@@ -606,6 +603,19 @@ spec: an explicit loop over the `let` spine in each pass (the principled
 fix: no bound at all), or a flatter Core block node. Also from that review:
 `let a{i+1} = fn() { a{i} }` repeated 2000 times takes over 300 s in `check`
 (inference).
+
+### 5. Name clashes across files: diagnostics that stay in the user's file
+
+Seen by the capabilities part-3 review (older): a root that declares `fn
+console_line` while importing `elya/console` gets the right E0205 and also
+E0200s inside `elya/console.elya`, a file the user never wrote (a user module
+does the same); and a root declaring its own `type Counted` without importing
+the module that declares one gets E0605 "add `import ...`", whose advice then
+leads to E0209. Measure the cascades (a function, type, constructor, effect or
+operation of the root clashing with one of a module's, direct and transitive),
+then decide in a spec: report a clash once, in the importing file, naming the
+module; and whether E0605's help should say "rename" when following it would
+be E0209.
 
 ## Also open, unscheduled
 
