@@ -55,7 +55,13 @@ const BUILTIN_MODULES: &[&str] = &["io", "int", "float", "time", "op"];
 
 /// The standard modules written in Elya (spec 2026-10-24-elya-std-replay D1):
 /// `elya/<name>` is this source, loaded as if it were the file `elya/<name>.elya`.
-const STD_SOURCES: &[(&str, &str)] = &[("elya/replay", include_str!("std/replay.elya"))];
+const STD_SOURCES: &[(&str, &str)] = &[
+    ("elya/replay", include_str!("std/replay.elya")),
+    // Capabilities part 3 (spec 2026-10-24-elya-capabilities-part-3 D1, D2).
+    ("elya/console", include_str!("std/console.elya")),
+    ("elya/clock", include_str!("std/clock.elya")),
+    ("elya/host", include_str!("std/host.elya")),
+];
 
 fn std_source(path: &str) -> Option<&'static str> {
     STD_SOURCES

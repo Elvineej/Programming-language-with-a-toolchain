@@ -14,3 +14,8 @@ Prediction: **1275 passed, 130 suites**.
 
 ## Task 2: `std/console.elya`, `std/clock.elya`, `std/host.elya`; `STD_SOURCES`
 ## Task 3: gate, controls, review
+
+## Outcome
+
+Red as predicted; green at 1275 / 130 as predicted. The review's naming finding
+renamed the modules' names (no test added).

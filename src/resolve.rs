@@ -133,7 +133,8 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
                         .with_label(span, "a second declaration of this name")
                         .with_label(*first, "first declared here")
                         .with_help(format!(
-                            "rename one of them: a {kind} name is unique {scope}"
+                            "rename one of them: {} {kind} name is unique {scope}",
+                            if kind == "effect" { "an" } else { "a" }
                         )),
                     );
                 }
