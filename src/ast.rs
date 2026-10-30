@@ -1,6 +1,6 @@
 //! Abstract syntax tree (Slice 1 subset). Every node is `Spanned`.
 
-use crate::span::Spanned;
+use crate::span::{Span, Spanned};
 use std::rc::Rc;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -50,9 +50,9 @@ pub struct FnDecl {
     pub name: String,
     pub params: Vec<Spanned<Param>>,
     /// Effect-row annotation: `None` = unannotated (row inferred, Slice 3b),
-    /// `Some(vec![])` = explicit pure `/ {}`, `Some([Log@span, …])` = declared
+    /// `Some` with no labels and no tail = explicit pure `/ {}`, labels = declared
     /// exactly those effects. Spans point diagnostics at the declared effect.
-    pub effect_row: Option<Vec<Spanned<String>>>,
+    pub effect_row: Option<RowAnn>,
     /// The declared return type, `-> T` (checked since 2026-10-09; it used to
     /// be parsed and discarded).
     pub ret_ann: Option<Spanned<TypeAnn>>,
@@ -75,20 +75,61 @@ pub struct TypeAnn {
     pub args: Vec<Spanned<TypeAnn>>,
     /// A function type `fn(A, B) / {E} -> R` (2026-10-09) has `name == "fn"`,
     /// `args == [A, B, R]` (the result last) and its row here: `None` when the
-    /// annotation names no row (any effects), `Some(vec![])` for `/ {}`.
-    pub row: Option<Vec<Spanned<String>>>,
+    /// annotation names no row (any effects), an empty `RowAnn` for `/ {}`.
+    ///
+    /// A row written as a type argument (`Task({Log})`, spec
+    /// 2026-10-30-elya-row-variables D7) is parsed into its phantom's annotation:
+    /// `fn() / {Log} -> $Row` ([`ROW_RESULT`]), so every walker of annotations
+    /// sees a function type.
+    pub row: Option<RowAnn>,
 }
 
-/// An annotation's row as its effects and the row variable that ends it, if any
-/// (spec 2026-10-30-elya-row-variables D1): the parser pushes the variable last,
-/// and it alone is lowercase.
-pub fn row_tail(row: &[Spanned<String>]) -> (&[Spanned<String>], Option<&Spanned<String>>) {
-    match row.split_last() {
-        Some((last, rest)) if !last.node.starts_with(|c: char| c.is_ascii_uppercase()) => {
-            (rest, Some(last))
+/// The result type of a row argument's phantom function type (spec
+/// 2026-10-30-elya-row-variables D4): a name no program can write.
+pub const ROW_RESULT: &str = "$Row";
+
+impl TypeAnn {
+    /// A row written as a type argument: the phantom `fn() / {..} -> $Row`.
+    pub fn row_arg(row: RowAnn, span: Span) -> TypeAnn {
+        TypeAnn {
+            name: "fn".to_string(),
+            args: vec![Spanned {
+                node: TypeAnn {
+                    name: ROW_RESULT.to_string(),
+                    args: Vec::new(),
+                    row: None,
+                },
+                span,
+            }],
+            row: Some(row),
         }
-        _ => (row, None),
     }
+
+    /// The row of a row argument's phantom (`{..}` written as a type argument).
+    pub fn as_row_arg(&self) -> Option<&RowAnn> {
+        match (self.name.as_str(), self.args.as_slice(), &self.row) {
+            ("fn", [r], Some(row)) if r.node.name == ROW_RESULT => Some(row),
+            _ => None,
+        }
+    }
+}
+
+/// An annotation's row (spec 2026-10-30-elya-row-variables D1, D7): its effects,
+/// each with the arguments written for it, and the row variable that ends it.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct RowAnn {
+    pub labels: Vec<LabelAnn>,
+    /// `{Log | e}`'s `e` (`{e}` alone: no labels).
+    pub tail: Option<Spanned<String>>,
+}
+
+/// One effect in a row: `Log`, `State(Int)`, `Async(e)`, `Async({Log | e})`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabelAnn {
+    pub name: Spanned<String>,
+    /// The arguments written in parentheses (a type, or a row as a phantom);
+    /// `None` when none are written (inferred in a function's annotations).
+    pub args: Option<Vec<Spanned<TypeAnn>>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

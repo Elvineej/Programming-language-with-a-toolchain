@@ -1273,18 +1273,11 @@ impl<'a> Parser<'a> {
                 return None;
             }
         };
-        let mut args = Vec::new();
-        if self.eat(&TokenKind::LParen) {
-            if self.peek() != Some(&TokenKind::RParen) {
-                loop {
-                    args.push(self.type_ann()?);
-                    if !self.eat(&TokenKind::Comma) {
-                        break;
-                    }
-                }
-            }
-            self.eat(&TokenKind::RParen);
-        }
+        let args = if self.eat(&TokenKind::LParen) {
+            self.type_args_after_paren()?
+        } else {
+            Vec::new()
+        };
         Some(spanned(
             TypeAnn {
                 name,
@@ -1527,7 +1520,12 @@ impl<'a> Parser<'a> {
         let mut effects = None;
         if self.eat(&TokenKind::Slash) {
             let list_start = self.peek_span();
-            let row = self.effect_row(false);
+            let row: Vec<Spanned<String>> = self
+                .effect_row(false)
+                .labels
+                .into_iter()
+                .map(|l| l.name)
+                .collect();
             end = end.merge(list_start);
             if let Some(last) = row.last() {
                 end = end.merge(last.span);
@@ -1622,33 +1620,57 @@ impl<'a> Parser<'a> {
 
     /// Parse `{ Name, Name }` after `/`, keeping effect head names with spans.
     /// With `tail`, the row may end in a row variable (spec
-    /// 2026-10-30-elya-row-variables D1): `{e}` alone, or `{Name, Name | e}`;
-    /// it is pushed last, lowercase (`ast::row_tail` splits it off). A grant list
-    /// (`import m / {..}`) is parsed with `tail` false: it names effects only.
-    fn effect_row(&mut self, tail: bool) -> Vec<Spanned<String>> {
-        let mut names = Vec::new();
+    /// 2026-10-30-elya-row-variables D1): `{e}` alone, or `{Name, Name | e}`.
+    /// A label may carry arguments (D5): `State(Int)`, `Async(e)`,
+    /// `Async({Log | e})`. A grant list (`import m / {..}`) is parsed with `tail`
+    /// false: it names effects only (a label's arguments skipped).
+    fn effect_row(&mut self, tail: bool) -> RowAnn {
+        let mut row = RowAnn::default();
         if !self.eat(&TokenKind::LBrace) {
             self.error(self.peek_span(), "expected `{` for effect row");
-            return names;
+            return row;
         }
         // The items first (effects and any lowercase name), then `| name`; then
         // one named error at most (the row-variables review's F5).
-        let mut items: Vec<(bool, Spanned<String>)> = Vec::new();
+        let mut items: Vec<(bool, LabelAnn)> = Vec::new();
         if !matches!(self.peek(), Some(TokenKind::RBrace) | Some(TokenKind::Bar)) {
             loop {
                 let lspan = self.peek_span();
                 match self.peek().cloned() {
                     Some(TokenKind::Upper(n)) => {
                         self.bump();
-                        // skip optional effect type args: `(...)`
-                        if self.eat(&TokenKind::LParen) {
+                        let args = if self.peek() != Some(&TokenKind::LParen) {
+                            None
+                        } else if !tail {
+                            self.bump();
                             self.skip_balanced_parens();
-                        }
-                        items.push((false, spanned(n, lspan)));
+                            None
+                        } else {
+                            self.bump();
+                            let args = self.type_args_after_paren();
+                            if args.is_none() {
+                                // The argument's error is reported: resynchronise.
+                                self.skip_balanced_parens();
+                            }
+                            args
+                        };
+                        items.push((
+                            false,
+                            LabelAnn {
+                                name: spanned(n, lspan),
+                                args,
+                            },
+                        ));
                     }
                     Some(TokenKind::Lower(n)) => {
                         self.bump();
-                        items.push((true, spanned(n, lspan)));
+                        items.push((
+                            true,
+                            LabelAnn {
+                                name: spanned(n, lspan),
+                                args: None,
+                            },
+                        ));
                     }
                     _ => {
                         self.error(self.peek_span(), "expected effect name");
@@ -1663,7 +1685,7 @@ impl<'a> Parser<'a> {
         let mut var = None;
         if let [(true, v)] = items.as_slice() {
             // `{e}`: any effects, named; nothing may follow it.
-            var = Some(v.clone());
+            var = Some(v.name.clone());
             items.clear();
             if self.peek() == Some(&TokenKind::Bar) {
                 self.error(self.peek_span(), "nothing follows a row variable");
@@ -1675,7 +1697,7 @@ impl<'a> Parser<'a> {
         } else {
             if let Some((_, v)) = items.iter().find(|(lower, _)| *lower) {
                 self.error(
-                    v.span,
+                    v.name.span,
                     "a row variable comes after the effects and `|`: write `{Log | e}`",
                 );
                 items.retain(|(lower, _)| !*lower);
@@ -1703,18 +1725,45 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        names.extend(items.into_iter().map(|(_, l)| l));
+        row.labels.extend(items.into_iter().map(|(_, l)| l));
         if let Some(v) = var {
             if !tail {
                 self.error(v.span, "a grant names effects, not a row variable");
             } else if v.node == "_" {
                 self.error(v.span, "a row variable needs a name");
             } else {
-                names.push(v);
+                row.tail = Some(v);
             }
         }
         self.close_brace();
-        names
+        row
+    }
+
+    /// A type argument: a type, or a row written as one (`Task({Log})`, spec
+    /// 2026-10-30-elya-row-variables D5), parsed into its phantom (D7).
+    fn type_arg(&mut self) -> Option<Spanned<TypeAnn>> {
+        if self.peek() == Some(&TokenKind::LBrace) {
+            let span = self.peek_span();
+            let row = self.effect_row(true);
+            return Some(spanned(TypeAnn::row_arg(row, span), span));
+        }
+        self.type_ann()
+    }
+
+    /// The arguments after an opening `(`, through the closing `)`; `None` when
+    /// one fails to parse (its error reported, the `)` not consumed).
+    fn type_args_after_paren(&mut self) -> Option<Vec<Spanned<TypeAnn>>> {
+        let mut args = Vec::new();
+        if self.peek() != Some(&TokenKind::RParen) {
+            loop {
+                args.push(self.type_arg()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.eat(&TokenKind::RParen);
+        Some(args)
     }
 
     fn skip_balanced_parens(&mut self) {
@@ -2066,8 +2115,9 @@ mod tests {
             .effect_row
             .as_ref()
             .unwrap()
+            .labels
             .iter()
-            .map(|l| l.node.as_str())
+            .map(|l| l.name.node.as_str())
             .collect();
         assert_eq!(labels, ["IO"]);
         assert!(f.is_pub);
@@ -2107,7 +2157,7 @@ mod tests {
             panic!("expected fn")
         };
         assert_eq!(
-            f2.effect_row.as_ref().map(|r| r.len()),
+            f2.effect_row.as_ref().map(|r| r.labels.len()),
             Some(0),
             "explicit pure => Some([])"
         );

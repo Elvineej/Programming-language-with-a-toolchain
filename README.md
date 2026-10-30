@@ -174,6 +174,23 @@ whole function, its signature and the annotations in its body; like a lowercase
 type name it is flexible, so what the body performs beyond the named labels joins
 the row.
 
+A declaration takes a row the same way: a parameter it uses where a row goes is a
+row parameter. So a scheduler is written once, for whatever else its tasks perform:
+
+```elya
+effect Async(e) { fn spawn(f: fn() / {Async | e} -> Int) -> Int }
+type Task(e) { Paused(fn() / {e} -> Task(e)), Done }
+
+fn sched(body: fn() / {Async(e) | e} -> Int) / {e} -> Int {
+  handle { body() } with { Async.spawn(f) -> resume(sched(f)) }
+}
+```
+
+Inside its own declaration `Async` is `Async(e)`; elsewhere its argument is written
+as a row, `Async({Log})`, or a row variable, `Task(e)`, or left to inference in a
+function's annotations. A task can spawn tasks: its type is finite, because `e` is
+the other effects, not the task.
+
 ### Exact replay, and tests without mocks
 
 A program touches the outside world only through effects, so whoever handles them decides

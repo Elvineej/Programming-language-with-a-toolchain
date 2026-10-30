@@ -226,10 +226,11 @@ fn a_name_is_shared_by_the_function_row_and_the_body() {
     );
 }
 
-/// A declaration's row variable is part 2's (a row parameter): refused by name
-/// until then, not "unknown effect `e`".
+/// A declaration's row variable must be one of its parameters (part 2, D3: a
+/// declared one is a row parameter, `tests/row_parameters.rs`); an undeclared one
+/// is refused by name, not "unknown effect `e`".
 #[test]
-fn a_declarations_row_variable_waits_for_part_2() {
+fn a_declarations_row_variable_must_be_its_parameter() {
     let src = "type T { T(fn() / {e} -> Int) }\neffect A { fn spawn(f: fn() / {e} -> Int) -> Int }\npub fn main() -> Int { 0 }\n";
     let (_, diags, _) = elya::front_end_with("t.elya", src, &mut |_| None);
     assert_eq!(diags.len(), 2, "{diags:?}");

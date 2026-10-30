@@ -1,0 +1,65 @@
+// The round-robin scheduler of `examples/04_async.elya`, written once for any
+// other effects: `Task(e)` and `Queue(e)` take the row the tasks perform
+// besides `Async(e)` (tests/row_parameters.rs).
+effect Async(e) {
+  fn fork(f: fn() / {Async | e} -> Unit) -> Unit
+  fn yld() -> Unit
+}
+effect Log { fn say(line: String) -> Unit }
+type Task(e) {
+  Done,
+  Paused(fn() / {e} -> Task(e)),
+  Forked(fn() / {Async(e) | e} -> Unit, fn() / {e} -> Task(e))
+}
+type Queue(e) { Empty, Push(Task(e), Queue(e)) }
+fn task(body: fn() / {Async(e) | e} -> Unit) / {e} -> Task(e) {
+  handle { body() } with {
+    Async.yld() -> Paused(fn() { resume(Unit) })
+    Async.fork(f) -> Forked(f, fn() { resume(Unit) })
+    return(u) -> Done
+  }
+}
+fn append(q: Queue(e), t: Task(e)) -> Queue(e) {
+  match q {
+    Empty -> Push(t, Empty)
+    Push(h, rest) -> Push(h, append(rest, t))
+  }
+}
+fn run(q: Queue(e)) / {e} -> Int {
+  match q {
+    Empty -> 0
+    Push(t, rest) -> match t {
+      Done -> 1 + run(rest)
+      Paused(k) -> run(append(rest, k()))
+      Forked(child, parent) -> run(append(append(rest, parent()), task(child)))
+    }
+  }
+}
+fn each(f: fn(Int) -> Unit, n: Int) -> Unit {
+  if n == 0 { Unit } else {
+    let _ = f(n)
+    each(f, n - 1)
+  }
+}
+fn worker(name: String, steps: Int) -> Unit {
+  each(fn(i) {
+    let _ = say(name)
+    yld()
+  }, steps)
+}
+fn program() -> Unit {
+  let _ = say("main: start")
+  let _ = fork(fn() { worker("  ping", 3) })
+  let _ = fork(fn() { worker("    pong", 2) })
+  let _ = worker("main", 2)
+  say("main: done")
+}
+pub fn main() -> Int {
+  handle { run(Push(task(fn() { program() }), Empty)) } with {
+    Log.say(line) -> {
+      io.println(line)
+      resume(Unit)
+    }
+    return(finished) -> finished
+  }
+}

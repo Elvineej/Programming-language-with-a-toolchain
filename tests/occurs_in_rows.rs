@@ -35,12 +35,16 @@ fn a_type_inside_its_own_row_is_a_named_error() {
     // A row variable inside its own label's argument: `f`'s row is `{E(type of f)}`.
     let row = "effect E(t) { fn op(x: t) -> Unit }\nfn f() { op(f) }\npub fn main() -> Int { 0 }\n";
     assert_eq!(codes(row), ["E0424"], "{row}");
-    // A parameter performed and called: `k`'s row and `g`'s are one (a call of a
-    // parameter relays its row), and that row would hold `E(type of k)`.
+    // A parameter performed and called. It was E0424: a call of a parameter
+    // equated `k`'s row with `g`'s, which then held `E(type of k)`. Since row
+    // parameters (spec 2026-10-30-elya-row-variables, the part 2 review's F3) a
+    // label whose arguments mention the relayed row stays the caller's own:
+    // `g : fn(fn() / {a} -> b) / {E(fn() / {a} -> b) | a} -> b`, a finite type.
+    // A `k` that performs `E` itself is refused at the call
+    // (`tests/row_parameters.rs`, `a_label_met_twice_along_a_row_is_unified`).
     let ty =
         "effect E(t) { fn op(x: t) -> Unit }\nfn g(k) { op(k)  k() }\npub fn main() -> Int { 0 }\n";
-    // (`k`'s row and `g`'s are one: the row check sees it first.)
-    assert_eq!(codes(ty), ["E0424"], "{ty}");
+    assert_eq!(codes(ty), Vec::<String>::new(), "{ty}");
     // A type variable inside a row of its own type, directly (D1):
     // `k: fn(fn() / {E(type of k)} -> ..) -> ..`.
     let direct = "effect E(t) { fn op(x: t) -> Unit }\nfn g(k) { k(fn() { op(k) }) }\npub fn main() -> Int { 0 }\n";

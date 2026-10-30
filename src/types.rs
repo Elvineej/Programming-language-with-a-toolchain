@@ -6,7 +6,7 @@ use crate::ast::{
 use crate::diag::Diagnostic;
 use crate::span::{Span, Spanned};
 use crate::Session;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TyCon {
@@ -143,8 +143,205 @@ struct OpInfo {
     /// expressed over these. Empty for a monomorphic effect (the arity-0 case).
     /// A perform instantiates them fresh; a handle fixes them for its scope.
     effect_params: Vec<u32>,
+    /// Per effect parameter, its row variable when it is a row parameter (spec
+    /// 2026-10-30-elya-row-variables D3, D4): `params`/`ret` mention it, and the
+    /// label's argument there is its phantom.
+    row_params: Vec<Option<RowVar>>,
     params: Vec<Ty>,
     ret: Ty,
+}
+
+/// Every declaration's parameters, each with its kind: `true` for a row
+/// parameter (spec 2026-10-30-elya-row-variables D3). Types and effects by name.
+#[derive(Clone, Debug, Default)]
+pub struct Kinds {
+    pub types: HashMap<String, Vec<(String, bool)>>,
+    pub effects: HashMap<String, Vec<(String, bool)>>,
+}
+
+impl Kinds {
+    /// Whether type `name`'s parameter `i` is a row parameter.
+    pub fn type_row(&self, name: &str, i: usize) -> bool {
+        self.types
+            .get(name)
+            .and_then(|k| k.get(i))
+            .is_some_and(|k| k.1)
+    }
+    /// Whether effect `name`'s parameter `i` is a row parameter.
+    pub fn effect_row(&self, name: &str, i: usize) -> bool {
+        self.effects
+            .get(name)
+            .and_then(|k| k.get(i))
+            .is_some_and(|k| k.1)
+    }
+    fn param_name<'a>(
+        map: &'a HashMap<String, Vec<(String, bool)>>,
+        name: &str,
+        i: usize,
+    ) -> &'a str {
+        map.get(name)
+            .and_then(|k| k.get(i))
+            .map(|k| k.0.as_str())
+            .unwrap_or("?")
+    }
+}
+
+/// Each declaration's parameters' kinds (spec 2026-10-30-elya-row-variables D3):
+/// a parameter is a row parameter when its declaration uses it where a row goes
+/// -- a row's tail, or the argument at another declaration's row parameter. A
+/// fixpoint over every declaration: a parameter only turns from type to row.
+pub fn decl_kinds(module: &Module) -> Kinds {
+    let mut k = Kinds::default();
+    for d in &module.decls {
+        match &d.node {
+            Decl::Type(t) => {
+                let ps = t.params.iter().map(|p| (p.clone(), false)).collect();
+                k.types.insert(t.name.clone(), ps);
+            }
+            Decl::Effect(e) => {
+                let ps = e.params.iter().map(|p| (p.clone(), false)).collect();
+                k.effects.insert(e.name.clone(), ps);
+            }
+            Decl::Fn(_) => {}
+        }
+    }
+    loop {
+        let mut changed = false;
+        for d in &module.decls {
+            let mut rows = HashSet::new();
+            match &d.node {
+                Decl::Type(t) => {
+                    for v in &t.variants {
+                        for f in &v.node.fields {
+                            row_uses(&f.node, &t.params, &k, &mut rows);
+                        }
+                    }
+                    let ps = k.types.get_mut(&t.name).expect("registered above");
+                    changed |= mark_rows(ps, &rows);
+                }
+                Decl::Effect(e) => {
+                    for op in &e.ops {
+                        for a in op
+                            .node
+                            .param_tys
+                            .iter()
+                            .chain(std::iter::once(&op.node.ret))
+                        {
+                            row_uses(&a.node, &e.params, &k, &mut rows);
+                        }
+                    }
+                    let ps = k.effects.get_mut(&e.name).expect("registered above");
+                    changed |= mark_rows(ps, &rows);
+                }
+                Decl::Fn(_) => {}
+            }
+        }
+        if !changed {
+            return k;
+        }
+    }
+}
+
+fn mark_rows(ps: &mut [(String, bool)], rows: &HashSet<String>) -> bool {
+    let mut changed = false;
+    for (p, is_row) in ps.iter_mut() {
+        if !*is_row && rows.contains(p.as_str()) {
+            *is_row = true;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// The parameters (of `params`) that `a` uses where a row goes.
+fn row_uses(a: &TypeAnn, params: &[String], k: &Kinds, out: &mut HashSet<String>) {
+    let bare = |x: &TypeAnn, out: &mut HashSet<String>| {
+        if x.args.is_empty() && x.row.is_none() && params.contains(&x.name) {
+            out.insert(x.name.clone());
+        }
+    };
+    if let Some(row) = &a.row {
+        if let Some(t) = &row.tail {
+            if params.contains(&t.node) {
+                out.insert(t.node.clone());
+            }
+        }
+        for l in &row.labels {
+            for (j, x) in l.args.iter().flatten().enumerate() {
+                if k.effect_row(&l.name.node, j) {
+                    bare(&x.node, out);
+                }
+                row_uses(&x.node, params, k, out);
+            }
+        }
+    }
+    for (j, x) in a.args.iter().enumerate() {
+        if a.name != "fn" && k.type_row(&a.name, j) {
+            bare(&x.node, out);
+        }
+        row_uses(&x.node, params, k, out);
+    }
+}
+
+/// A row argument as a type (spec 2026-10-30-elya-row-variables D4): the
+/// phantom function type `fn() / R -> $Row`.
+pub fn phantom(row: EffectRow) -> Ty {
+    Ty::Fn(
+        Vec::new(),
+        row,
+        Box::new(Ty::Con(crate::ast::ROW_RESULT.to_string(), Vec::new())),
+    )
+}
+
+/// The row a row argument's phantom carries.
+pub fn phantom_row(t: &Ty) -> Option<&EffectRow> {
+    match t {
+        Ty::Fn(ps, row, r)
+            if ps.is_empty()
+                && matches!(&**r, Ty::Con(n, a) if n == crate::ast::ROW_RESULT && a.is_empty()) =>
+        {
+            Some(row)
+        }
+        _ => None,
+    }
+}
+
+/// A resolved type's head, for `unify_effect_args`: its constructor and arity.
+fn head(t: &Ty) -> (u8, String, usize) {
+    match t {
+        Ty::Var(_) => (0, String::new(), 0),
+        Ty::Base(b) => (1, format!("{b:?}"), 0),
+        Ty::Fn(ps, _, _) => (2, String::new(), ps.len()),
+        Ty::Tuple(xs) => (3, String::new(), xs.len()),
+        Ty::Con(n, a) => (4, n.clone(), a.len()),
+        Ty::Error => (5, String::new(), 0),
+    }
+}
+
+/// Whether a resolved type has no variable in it (type or row).
+fn ground(t: &Ty) -> bool {
+    match t {
+        Ty::Var(_) | Ty::Error => false,
+        Ty::Base(_) => true,
+        Ty::Fn(ps, row, r) => {
+            matches!(row.tail, RowTail::Closed)
+                && row.labels.values().all(|l| l.args.iter().all(ground))
+                && ps.iter().all(ground)
+                && ground(r)
+        }
+        Ty::Tuple(xs) | Ty::Con(_, xs) => xs.iter().all(ground),
+    }
+}
+
+/// D5's messages, shared by both elaborators.
+fn wants_row(decl: &str, param: &str) -> String {
+    format!("`{decl}`'s parameter `{param}` is a row: write one, `{{Log}}`")
+}
+fn wants_type(decl: &str, param: &str) -> String {
+    format!("`{decl}`'s parameter `{param}` is a type, not a row")
+}
+fn row_not_here() -> &'static str {
+    "a row is written only where a type or an effect takes one"
 }
 
 /// What a `resume` inside a clause needs (resume-row fix, 2026-10-08, and
@@ -301,6 +498,9 @@ pub struct Infer {
     eq_vars: HashMap<u32, Span>,
     /// The `==` sites already reported, so a site is blamed once.
     eq_reported: HashSet<Span>,
+    /// Every declaration's parameters and their kinds (spec
+    /// 2026-10-30-elya-row-variables D3).
+    kinds: Kinds,
     pub diags: Vec<Diagnostic>,
 }
 
@@ -337,6 +537,7 @@ impl Infer {
             adt_fields: HashMap::new(),
             eq_vars: HashMap::new(),
             eq_reported: HashSet::new(),
+            kinds: Kinds::default(),
             diags: Vec::new(),
         }
     }
@@ -387,6 +588,22 @@ impl Infer {
     /// written, is open (any effects), and when written is exactly those.
     fn elaborate_ann(&mut self, ann: &Spanned<TypeAnn>, covariant: bool) -> Ty {
         let t = &ann.node;
+        if t.as_row_arg().is_some() {
+            // A row where a type goes (a type's or an effect's row argument is
+            // read by `ann_row_arg`).
+            self.diags.push(
+                Diagnostic::error("E0400", row_not_here()).with_label(ann.span, "a row here"),
+            );
+            return Ty::Error;
+        }
+        self.elaborate_ann_inner(ann, covariant)
+    }
+
+    fn elaborate_ann_inner(&mut self, ann: &Spanned<TypeAnn>, covariant: bool) -> Ty {
+        let t = &ann.node;
+        if t.name == crate::ast::ROW_RESULT && t.args.is_empty() {
+            return Ty::Con(t.name.clone(), Vec::new());
+        }
         if t.name == "fn" && !t.args.is_empty() {
             let n = t.args.len();
             let params: Vec<Ty> = t.args[..n - 1]
@@ -403,30 +620,11 @@ impl Infer {
                 // real variable the body's calls relay.
                 None if covariant => EffectRow::open(self.fresh_phantom_row()),
                 None => EffectRow::open(self.fresh_row()),
-                Some(names) => {
-                    // D1: a lowercase name, last, is the row's tail.
-                    let (labels, tail) = crate::ast::row_tail(names);
-                    let mut m = BTreeMap::new();
-                    for l in labels {
-                        if !self.effect_multi.contains_key(&l.node) && l.node != "IO" {
-                            self.diags.push(
-                                Diagnostic::error("E0432", format!("unknown effect `{}`", l.node))
-                                    .with_label(l.span, "no such effect"),
-                            );
-                            continue;
-                        }
-                        let arity = self
-                            .ops
-                            .values()
-                            .find(|o| o.effect == l.node)
-                            .map(|o| o.effect_params.len())
-                            .unwrap_or(0);
-                        let args = (0..arity).map(|_| self.fresh()).collect();
-                        m.insert(l.node.clone(), EffectLabel { args, span: l.span });
-                    }
+                Some(row) => {
+                    let labels = self.ann_labels(row);
                     EffectRow {
-                        labels: m,
-                        tail: match tail {
+                        labels,
+                        tail: match &row.tail {
                             Some(v) => RowTail::Open(self.ann_row(&v.node, v.span)),
                             None => RowTail::Closed,
                         },
@@ -482,12 +680,17 @@ impl Infer {
                         );
                         return Ty::Error;
                     }
-                    // Type arguments are invariant: no upcast tails inside.
-                    let args = t
-                        .args
-                        .iter()
-                        .map(|a| self.elaborate_ann(a, false))
-                        .collect();
+                    // Type arguments are invariant: no upcast tails inside. A
+                    // row parameter's argument is a row (D5).
+                    let mut args = Vec::with_capacity(t.args.len());
+                    for (j, a) in t.args.iter().enumerate() {
+                        let param = Kinds::param_name(&self.kinds.types, other, j).to_string();
+                        args.push(if self.kinds.type_row(other, j) {
+                            self.ann_row_arg(a, other, &param)
+                        } else {
+                            self.ann_type_arg(a, other, &param)
+                        });
+                    }
                     Ty::Con(other.to_string(), args)
                 }
                 None => {
@@ -499,6 +702,113 @@ impl Infer {
                 }
             },
         }
+    }
+
+    /// A row's labels in a function's annotations, each with its arguments: the
+    /// written ones elaborated (D5: they used to be dropped), unwritten ones
+    /// fresh.
+    fn ann_labels(&mut self, row: &crate::ast::RowAnn) -> BTreeMap<String, EffectLabel> {
+        let mut m = BTreeMap::new();
+        for l in &row.labels {
+            let name = &l.name.node;
+            if !self.effect_multi.contains_key(name) && name != "IO" {
+                self.diags.push(
+                    Diagnostic::error("E0432", format!("unknown effect `{name}`"))
+                        .with_label(l.name.span, "no such effect"),
+                );
+                continue;
+            }
+            let arity = self.kinds.effects.get(name).map(|k| k.len()).unwrap_or(0);
+            let args = match &l.args {
+                None => (0..arity).map(|_| self.fresh()).collect(),
+                Some(xs) if xs.len() != arity => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            "E0400",
+                            format!(
+                                "effect `{name}` takes {arity} argument(s), found {}",
+                                xs.len()
+                            ),
+                        )
+                        .with_label(l.name.span, "wrong number of arguments"),
+                    );
+                    continue;
+                }
+                Some(xs) => {
+                    let mut args = Vec::with_capacity(xs.len());
+                    for (j, x) in xs.iter().enumerate() {
+                        let param = Kinds::param_name(&self.kinds.effects, name, j).to_string();
+                        args.push(if self.kinds.effect_row(name, j) {
+                            self.ann_row_arg(x, name, &param)
+                        } else {
+                            self.ann_type_arg(x, name, &param)
+                        });
+                    }
+                    args
+                }
+            };
+            m.insert(
+                name.clone(),
+                EffectLabel {
+                    args,
+                    span: l.name.span,
+                },
+            );
+        }
+        m
+    }
+
+    /// A row parameter's argument in a function's annotations (D5): a row
+    /// (`{Log | e}`, its phantom), or a row variable alone (`e`).
+    fn ann_row_arg(&mut self, a: &Spanned<TypeAnn>, decl: &str, param: &str) -> Ty {
+        let t = &a.node;
+        if t.as_row_arg().is_some() {
+            return self.elaborate_ann_inner(a, false);
+        }
+        if t.args.is_empty()
+            && t.row.is_none()
+            && t.name.starts_with(|c: char| c.is_ascii_lowercase())
+        {
+            let v = self.ann_row(&t.name, a.span);
+            return phantom(EffectRow::open(v));
+        }
+        self.diags.push(
+            Diagnostic::error("E0400", wants_row(decl, param)).with_label(a.span, "a type here"),
+        );
+        Ty::Error
+    }
+
+    /// A type parameter's argument in a function's annotations: a type, not a
+    /// row (D5).
+    fn ann_type_arg(&mut self, a: &Spanned<TypeAnn>, decl: &str, param: &str) -> Ty {
+        if a.node.as_row_arg().is_some() {
+            self.diags.push(
+                Diagnostic::error("E0400", wants_type(decl, param))
+                    .with_label(a.span, "a row here"),
+            );
+            return Ty::Error;
+        }
+        self.elaborate_ann(a, false)
+    }
+
+    /// A function's declared row's written label arguments (spec
+    /// 2026-10-30-elya-row-variables D5), elaborated where its annotation names
+    /// are live; unified with what the body performs before anything closes
+    /// (2.47). An unknown effect is reported by the row's own checks.
+    fn declared_label_args(&mut self, row: &crate::ast::RowAnn) -> Vec<(String, Vec<Ty>, Span)> {
+        let written = crate::ast::RowAnn {
+            labels: row
+                .labels
+                .iter()
+                .filter(|l| l.args.is_some() && self.kinds.effects.contains_key(&l.name.node))
+                .cloned()
+                .collect(),
+            tail: None,
+        };
+        self.ann_labels(&written)
+            .into_iter()
+            .map(|(n, l)| (n, l.args, l.span))
+            .collect()
     }
 
     /// Check an annotation against the type inference gave the annotated
@@ -563,6 +873,49 @@ impl Infer {
             }
         }
         EffectRow { labels, tail }
+    }
+
+    /// One effect met twice along a row's chain (a label, and the same label
+    /// inside a binding of its tail): `resolve_row` keeps the first, so their
+    /// arguments are unified here, where rows meet. A label kept out of a
+    /// row variable its arguments mention (`add_row`, spec
+    /// 2026-10-30-elya-row-variables, the part 2 review's F3) can reach that
+    /// variable later by another path: dropped, `E(Int)` beside
+    /// `E(fn() -> Int)` checked clean.
+    fn settle_duplicates(&mut self, r: &EffectRow, span: Span) {
+        let mut seen: BTreeMap<String, Vec<Ty>> = r
+            .labels
+            .iter()
+            .map(|(k, l)| (k.clone(), l.args.clone()))
+            .collect();
+        let mut pairs: Vec<(String, Vec<Ty>, Vec<Ty>)> = Vec::new();
+        let mut tail = r.tail.clone();
+        while let RowTail::Open(v) = tail {
+            let Some(bound) = self.row_subst[v as usize].clone() else {
+                break;
+            };
+            for (k, l) in &bound.labels {
+                match seen.get(k) {
+                    Some(first) => {
+                        let differ = first.len() == l.args.len()
+                            && first
+                                .iter()
+                                .zip(&l.args)
+                                .any(|(a, b)| self.resolve(a) != self.resolve(b));
+                        if differ {
+                            pairs.push((k.clone(), first.clone(), l.args.clone()));
+                        }
+                    }
+                    None => {
+                        seen.insert(k.clone(), l.args.clone());
+                    }
+                }
+            }
+            tail = bound.tail;
+        }
+        for (k, a, b) in pairs {
+            self.unify_effect_args(&k, &a, &b, span);
+        }
     }
 
     /// Follow bound variables to a representative, recursively (deep).
@@ -757,26 +1110,44 @@ impl Infer {
         r2: &EffectRow,
         span: Span,
     ) -> Result<(), RowConflict> {
-        let r1 = self.resolve_row(r1);
-        let r2 = self.resolve_row(r2);
-        // A poison tail on either side absorbs everything — no cascade.
-        if r1.tail == RowTail::ErrorRow || r2.tail == RowTail::ErrorRow {
-            return Ok(());
-        }
+        let (given1, given2) = (r1, r2);
+        self.settle_duplicates(given1, span);
+        self.settle_duplicates(given2, span);
+        let mut r1 = self.resolve_row(given1);
+        let mut r2 = self.resolve_row(given2);
         // A label present on BOTH sides must agree on its type arguments (Slice
         // 4c-2, design B). Monomorphic effects have empty args, so this is a no-op
         // — exactly the Slice-3 behavior. A conflicting instantiation is `E0423`.
-        let shared: Vec<(String, Vec<Ty>, Vec<Ty>)> = r1
-            .labels
-            .iter()
-            .filter_map(|(k, l1)| {
-                r2.labels
-                    .get(k)
-                    .map(|l2| (k.clone(), l1.args.clone(), l2.args.clone()))
-            })
-            .collect();
-        for (effect, a1, a2) in shared {
-            self.unify_effect_args(&effect, &a1, &a2, span);
+        // Unifying them can bind either row's tail (a row argument's phantom
+        // binds the other row's own tail, spec 2026-10-30-elya-row-variables,
+        // the part 2 review's F1), so both rows are read again until no label
+        // is newly shared: split as they were, a label was lost (`St(String)`
+        // beside `St(Int)`) or never matched.
+        let mut unified: BTreeSet<String> = BTreeSet::new();
+        loop {
+            // A poison tail on either side absorbs everything — no cascade.
+            if r1.tail == RowTail::ErrorRow || r2.tail == RowTail::ErrorRow {
+                return Ok(());
+            }
+            let shared: Vec<(String, Vec<Ty>, Vec<Ty>)> = r1
+                .labels
+                .iter()
+                .filter(|(k, _)| !unified.contains(*k))
+                .filter_map(|(k, l1)| {
+                    r2.labels
+                        .get(k)
+                        .map(|l2| (k.clone(), l1.args.clone(), l2.args.clone()))
+                })
+                .collect();
+            if shared.is_empty() {
+                break;
+            }
+            for (effect, a1, a2) in shared {
+                self.unify_effect_args(&effect, &a1, &a2, span);
+                unified.insert(effect);
+            }
+            r1 = self.resolve_row(given1);
+            r2 = self.resolve_row(given2);
         }
         // Split out each side's labels absent from the other (their args ride
         // along, so growing an open tail preserves them).
@@ -962,7 +1333,11 @@ impl Infer {
                 // F1: `f` was typed pure though it calls its parameter `k`).
                 if let RowTail::Open(w) = want.tail {
                     if !self.phantom.contains(&w) && have.tail != RowTail::Open(w) {
-                        let r = self.unify_row(&EffectRow::open(dst), &EffectRow::open(w), span);
+                        // Through `add_row`: an including row whose labels
+                        // mention `w` keeps them its own (the part 2 review's
+                        // F2: a state holding a function, `St(fn(Int) -> Int)`,
+                        // called; equated with `w`, `w` held `St(.. w ..)`).
+                        let r = self.add_row(dst, &EffectRow::open(w), span);
                         if r.is_ok() {
                             changed = true;
                         }
@@ -1072,17 +1447,36 @@ impl Infer {
         if op.effect_params.is_empty() {
             return (Vec::new(), op.params.clone(), op.ret.clone());
         }
-        let mut m: HashMap<u32, Ty> = HashMap::new();
-        let mut args = Vec::with_capacity(op.effect_params.len());
-        for &p in &op.effect_params {
-            let fresh = self.fresh();
-            m.insert(p, fresh.clone());
-            args.push(fresh);
-        }
-        let rm = HashMap::new();
+        let (args, m, rm) = self.fresh_effect_args(op);
         let params = op.params.iter().map(|t| subst_vars(t, &m, &rm)).collect();
         let ret = subst_vars(&op.ret, &m, &rm);
         (args, params, ret)
+    }
+
+    /// Fresh arguments for an operation's effect: a type variable per type
+    /// parameter, a fresh row's phantom per row parameter (spec
+    /// 2026-10-30-elya-row-variables D4), and the substitutions that take the
+    /// declaration's variables to them.
+    fn fresh_effect_args(
+        &mut self,
+        op: &OpInfo,
+    ) -> (Vec<Ty>, HashMap<u32, Ty>, HashMap<RowVar, RowVar>) {
+        let mut m: HashMap<u32, Ty> = HashMap::new();
+        let mut rm: HashMap<RowVar, RowVar> = HashMap::new();
+        let mut args = Vec::with_capacity(op.effect_params.len());
+        for (i, &p) in op.effect_params.iter().enumerate() {
+            let a = match op.row_params.get(i).copied().flatten() {
+                Some(rv) => {
+                    let fresh = self.fresh_row();
+                    rm.insert(rv, fresh);
+                    phantom(EffectRow::open(fresh))
+                }
+                None => self.fresh(),
+            };
+            m.insert(p, a.clone());
+            args.push(a);
+        }
+        (args, m, rm)
     }
 
     /// Reconcile the type arguments of one effect present in two rows (design B).
@@ -1095,7 +1489,14 @@ impl Infer {
             let ry = self.resolve(y);
             let both_concrete =
                 !matches!(rx, Ty::Var(_) | Ty::Error) && !matches!(ry, Ty::Var(_) | Ty::Error);
-            if both_concrete && rx != ry {
+            // A conflict is two arguments that cannot be one type: different
+            // heads, or two ground types that differ. Two that inference only
+            // partly knows (`Box(a)`, `Box(Int)`; a row argument's phantom,
+            // concrete from the start) are unified, and a conflict inside them
+            // reported there (spec 2026-10-30-elya-row-variables, the part 2
+            // review's F2: written label arguments are now checked).
+            let conflict = head(&rx) != head(&ry) || (ground(&rx) && ground(&ry));
+            if both_concrete && rx != ry && conflict {
                 let (dx, dy) = (display_ty(self, &rx), display_ty(self, &ry));
                 self.diags.push(
                     Diagnostic::error("E0423", "effect row mismatch")
@@ -1114,7 +1515,33 @@ impl Infer {
     /// `eff`'s labels (keeping `amb` open, so a *closed* callee row never forces
     /// the ambient closed), and relays a polymorphic tail into the ambient.
     pub fn add_row(&mut self, amb: RowVar, eff: &EffectRow, span: Span) -> Result<(), RowConflict> {
+        self.settle_duplicates(eff, span);
         let eff = self.resolve_row(eff);
+        if let RowTail::Open(rho) = eff.tail {
+            // A label whose arguments mention the row's own tail (a task's row,
+            // `{Async(e) | e}`, spec 2026-10-30-elya-row-variables D4) cannot be
+            // inside that tail. Such a row is unified whole: `Async` meets the
+            // ambient's `Async`, and `e` the rest; adding the labels and then
+            // equating the ambient with `e` would put `Async(e)` inside `e`
+            // (E0424). The same holds for such a label already in the ambient
+            // (a handle's residual `e` reaching an ambient where a clause ran a
+            // task: the part 2 review's F3): it stays the ambient's own.
+            let mentions =
+                |me: &Self, l: &EffectLabel| l.args.iter().any(|a| me.mentions_row(rho, a));
+            let own = eff.labels.values().any(|l| mentions(self, l));
+            let amb_now = self.resolve_row(&EffectRow::open(amb));
+            let theirs: Vec<(String, EffectLabel)> = amb_now
+                .labels
+                .iter()
+                .filter(|(k, l)| !eff.labels.contains_key(*k) && mentions(self, l))
+                .map(|(k, l)| (k.clone(), l.clone()))
+                .collect();
+            if own || !theirs.is_empty() {
+                let mut whole = eff.clone();
+                whole.labels.extend(theirs);
+                return self.unify_row(&EffectRow::open(amb), &whole, span);
+            }
+        }
         for (label, l) in &eff.labels {
             self.add_effect(amb, label, l.args.clone(), l.span)?;
         }
@@ -1257,6 +1684,11 @@ fn write_ty(t: &Ty, names: &mut Names, out: &mut String) {
         Ty::Base(TyCon::Bool) => out.push_str("Bool"),
         Ty::Base(TyCon::Str) => out.push_str("String"),
         Ty::Base(TyCon::Unit) => out.push_str("Unit"),
+        // A row argument (spec 2026-10-30-elya-row-variables D4) is its row:
+        // `Task({Log | a})`, not its phantom function type.
+        t if phantom_row(t).is_some() => {
+            write_row(phantom_row(t).expect("a phantom"), names, out);
+        }
         Ty::Fn(ps, row, r) => {
             out.push_str("fn(");
             for (i, p) in ps.iter().enumerate() {
@@ -2229,16 +2661,18 @@ impl Infer {
         // shared by the seeded ambient AND every clause — so the body's performs
         // (which unify against the seed via the row) and the clauses agree on the
         // effect's type arguments. Empty for a monomorphic effect.
-        let effect_param_ids: Vec<u32> = match &effect {
-            Some(e) => self
-                .ops
-                .values()
-                .find(|o| &o.effect == e)
-                .map(|o| o.effect_params.clone())
-                .unwrap_or_default(),
-            None => Vec::new(),
+        // A row parameter is instantiated as a fresh row, shared the same way
+        // (spec 2026-10-30-elya-row-variables D4).
+        let (eff_args, eff_rows): (Vec<Ty>, HashMap<RowVar, RowVar>) = match effect
+            .as_ref()
+            .and_then(|e| self.ops.values().find(|o| &o.effect == e).cloned())
+        {
+            Some(op) => {
+                let (args, _, rm) = self.fresh_effect_args(&op);
+                (args, rm)
+            }
+            None => (Vec::new(), HashMap::new()),
         };
-        let eff_args: Vec<Ty> = effect_param_ids.iter().map(|_| self.fresh()).collect();
         // `e` may perform E plus a polymorphic remainder.
         let amb_in = self.fresh_row();
         if let Some(e) = &effect {
@@ -2305,13 +2739,12 @@ impl Infer {
                         .cloned()
                         .zip(eff_args.iter().cloned())
                         .collect();
-                    let rm = HashMap::new();
                     (
                         op.params
                             .iter()
-                            .map(|t| subst_vars(t, &m, &rm))
+                            .map(|t| subst_vars(t, &m, &eff_rows))
                             .collect::<Vec<_>>(),
-                        subst_vars(&op.ret, &m, &rm),
+                        subst_vars(&op.ret, &m, &eff_rows),
                     )
                 }
                 None => (Vec::new(), Ty::Error),
@@ -2900,12 +3333,13 @@ impl Infer {
     /// (spec §3.6, strict default — no sub-effecting). Declaring pure (`/ {}`)
     /// but performing an effect is `E0421`; any set difference (in either
     /// direction) is `E0423`, naming the exact labels it differs by.
-    fn check_exact_row(&mut self, amb: RowVar, declared: &[Spanned<String>]) {
+    fn check_exact_row(&mut self, amb: RowVar, declared: &crate::ast::RowAnn) {
         // A named row's check is done earlier, before the ambient closes
         // (2.48).
-        if crate::ast::row_tail(declared).1.is_some() {
+        if declared.tail.is_some() {
             return;
         }
+        let declared: Vec<&Spanned<String>> = declared.labels.iter().map(|l| &l.name).collect();
         let performed = self.resolve_row(&EffectRow::open(amb));
         if declared.is_empty() {
             // Declared pure `/ {}`: any performed effect is a purity violation.
@@ -2987,6 +3421,33 @@ impl Infer {
             return;
         }
         let tail = self.ann_row(&name.node, name.span);
+        // A performed label whose arguments mention the named row (a task's own
+        // `Async(e)` under `/ {e}`) cannot be in it: the body performs an effect
+        // the row leaves out, by name (the part 2 review's F4: unified, it was
+        // "cyclic effect row" and named nothing). The name's variable as it
+        // stands now: a relay may have bound it to a fresh tail.
+        let now = match self.tail_now(&RowTail::Open(tail)) {
+            RowTail::Open(v) => v,
+            _ => tail,
+        };
+        let left_out: Vec<(String, Span)> = performed
+            .labels
+            .iter()
+            .filter(|(k, l)| {
+                !labels.iter().any(|d| &d.node == *k)
+                    && l.args.iter().any(|a| self.mentions_row(now, a))
+            })
+            .map(|(k, l)| (k.clone(), l.span))
+            .collect();
+        if !left_out.is_empty() {
+            let span = left_out[0].1;
+            self.emit_row_mismatch(
+                &left_out,
+                span,
+                "the body performs an effect the declared row does not",
+            );
+            return;
+        }
         let mut m = BTreeMap::new();
         for l in labels {
             if let Some(have) = performed.labels.get(&l.node) {
@@ -3021,90 +3482,162 @@ impl Infer {
     }
 }
 
+/// What a declaration's annotations are elaborated under (spec
+/// 2026-10-30-elya-row-variables D3).
+struct DeclCx<'a> {
+    /// The declaration's name, for messages.
+    decl: &'a str,
+    /// Its type parameters' variables.
+    param_env: &'a HashMap<String, Ty>,
+    /// Its row parameters' row variables.
+    row_env: &'a HashMap<String, RowVar>,
+    known: &'a HashMap<String, usize>,
+    /// Every declared effect and its arity.
+    effects: &'a HashMap<String, usize>,
+    kinds: &'a Kinds,
+    /// The effect being declared and its own arguments: its bare name in its
+    /// own declaration is itself at its own parameters (D3).
+    own: Option<(&'a str, &'a [Ty])>,
+}
+
 /// Elaborate an ADT field/argument type annotation under a type-parameter
 /// environment: a bare param name → its type variable; a base name → its
 /// `Base`; an `Upper(args)` → a `Ty::Con` (arity-checked against `known`).
 ///
 /// A function type `fn(A) / {E} -> R` (2026-10-09, async step 1): a
-/// declaration has no row variables, so its rows are exactly what is written
-/// -- no `/ {..}` is the empty row (pure), not "any effects" as in a
-/// function's own annotations. A row may name `IO` and any declared effect
-/// without type parameters (`effects` maps every declared effect to its
-/// arity); an effect's arguments cannot be written in a row yet.
-fn elaborate_adt_ty(
-    inf: &mut Infer,
-    ann: &Spanned<TypeAnn>,
-    param_env: &HashMap<String, Ty>,
-    known: &HashMap<String, usize>,
-    effects: &HashMap<String, usize>,
-) -> Ty {
+/// declaration's rows are exactly what is written -- no `/ {..}` is the empty
+/// row (pure), not "any effects" as in a function's own annotations. A row may
+/// name `IO` and any declared effect, with its arguments written (spec
+/// 2026-10-30-elya-row-variables D5), and end in one of the declaration's row
+/// parameters (D3).
+fn elaborate_adt_ty(inf: &mut Infer, ann: &Spanned<TypeAnn>, cx: &DeclCx) -> Ty {
+    if ann.node.as_row_arg().is_some() {
+        inf.diags
+            .push(Diagnostic::error("E0400", row_not_here()).with_label(ann.span, "a row here"));
+        return Ty::Error;
+    }
+    elaborate_adt_inner(inf, ann, cx)
+}
+
+fn elaborate_adt_inner(inf: &mut Infer, ann: &Spanned<TypeAnn>, cx: &DeclCx) -> Ty {
     let t = &ann.node;
+    if t.name == crate::ast::ROW_RESULT && t.args.is_empty() {
+        return Ty::Con(t.name.clone(), Vec::new());
+    }
     if t.name == "fn" && !t.args.is_empty() {
         let n = t.args.len();
         let params: Vec<Ty> = t.args[..n - 1]
             .iter()
-            .map(|a| elaborate_adt_ty(inf, a, param_env, known, effects))
+            .map(|a| elaborate_adt_ty(inf, a, cx))
             .collect();
-        let ret = elaborate_adt_ty(inf, &t.args[n - 1], param_env, known, effects);
+        let ret = elaborate_adt_ty(inf, &t.args[n - 1], cx);
         let mut labels = BTreeMap::new();
-        let (row, tail) = crate::ast::row_tail(t.row.as_deref().unwrap_or(&[]));
-        if let Some(v) = tail {
-            // Spec 2026-10-30-elya-row-variables: a declaration's row variable is
-            // its part 2 (a row parameter); refused by name until then.
-            inf.diags.push(
-                Diagnostic::error(
-                    "E0432",
-                    format!("a declaration's row cannot name a row variable (`{}`) yet", v.node),
-                )
-                .with_label(v.span, "a row variable in a declaration")
-                .with_help("write the row's effects, or leave it out: a declaration's unwritten row is pure"),
-            );
-        }
-        for l in row {
-            match effects.get(&l.node) {
-                _ if l.node == "IO" => {}
-                Some(0) => {}
-                Some(_) => {
-                    inf.diags.push(
-                        Diagnostic::error(
-                            "E0432",
-                            format!(
-                                "effect `{}` takes type arguments, which a declaration row cannot write yet",
-                                l.node
-                            ),
-                        )
-                        .with_label(l.span, "a parameterized effect"),
-                    );
-                    continue;
+        let empty = crate::ast::RowAnn::default();
+        let row = t.row.as_ref().unwrap_or(&empty);
+        for l in &row.labels {
+            let name = &l.name.node;
+            if name == "IO" {
+                labels.insert(
+                    name.clone(),
+                    EffectLabel {
+                        args: Vec::new(),
+                        span: l.name.span,
+                    },
+                );
+                continue;
+            }
+            let Some(&arity) = cx.effects.get(name) else {
+                inf.diags.push(
+                    Diagnostic::error("E0432", format!("unknown effect `{name}`"))
+                        .with_label(l.name.span, "no such effect"),
+                );
+                continue;
+            };
+            let args = match &l.args {
+                None if arity == 0 => Vec::new(),
+                None if cx.own.is_some_and(|o| o.0 == name) => {
+                    cx.own.map(|o| o.1.to_vec()).unwrap_or_default()
                 }
                 None => {
+                    let mut d = Diagnostic::error(
+                        "E0432",
+                        format!("effect `{name}` takes type arguments: write them, `{name}(..)`"),
+                    )
+                    .with_label(l.name.span, "a parameterized effect")
+                    .with_help("a declaration's rows are exactly what is written");
+                    if (0..arity).any(|j| cx.kinds.effect_row(name, j)) {
+                        d = d.with_help(format!(
+                            "its argument is a row: `{name}({{Log}})`, or a row parameter, `{name}(e)`"
+                        ));
+                    }
+                    inf.diags.push(d);
+                    continue;
+                }
+                Some(xs) if xs.len() != arity => {
                     inf.diags.push(
-                        Diagnostic::error("E0432", format!("unknown effect `{}`", l.node))
-                            .with_label(l.span, "no such effect"),
+                        Diagnostic::error(
+                            "E0400",
+                            format!(
+                                "effect `{name}` takes {arity} argument(s), found {}",
+                                xs.len()
+                            ),
+                        )
+                        .with_label(l.name.span, "wrong number of arguments"),
                     );
                     continue;
                 }
-            }
+                Some(xs) => {
+                    let mut args = Vec::with_capacity(xs.len());
+                    for (j, x) in xs.iter().enumerate() {
+                        let param = Kinds::param_name(&cx.kinds.effects, name, j);
+                        args.push(if cx.kinds.effect_row(name, j) {
+                            decl_row_arg(inf, x, cx, name, param)
+                        } else {
+                            decl_type_arg(inf, x, cx, name, param)
+                        });
+                    }
+                    args
+                }
+            };
             labels.insert(
-                l.node.clone(),
+                name.clone(),
                 EffectLabel {
-                    args: Vec::new(),
-                    span: l.span,
+                    args,
+                    span: l.name.span,
                 },
             );
         }
-        return Ty::Fn(
-            params,
-            EffectRow {
-                labels,
-                tail: RowTail::Closed,
+        let tail = match &row.tail {
+            None => RowTail::Closed,
+            Some(v) => match cx.row_env.get(&v.node) {
+                Some(&rv) => RowTail::Open(rv),
+                None => {
+                    inf.diags.push(undeclared_row_var(&v.node, v.span, cx.decl));
+                    RowTail::Closed
+                }
             },
-            Box::new(ret),
-        );
+        };
+        return Ty::Fn(params, EffectRow { labels, tail }, Box::new(ret));
     }
     if t.args.is_empty() {
-        if let Some(ty) = param_env.get(&t.name) {
+        if let Some(ty) = cx.param_env.get(&t.name) {
             return ty.clone();
+        }
+        if cx.row_env.contains_key(&t.name) {
+            inf.diags.push(
+                Diagnostic::error(
+                    "E0400",
+                    format!(
+                        "`{}` is a row parameter of `{}`: a type goes here",
+                        t.name, cx.decl
+                    ),
+                )
+                .with_label(ann.span, "a type here")
+                .with_help(
+                    "a parameter is a type or a row: the declaration uses this one as a row",
+                ),
+            );
+            return Ty::Error;
         }
     }
     match t.name.as_str() {
@@ -3113,7 +3646,7 @@ fn elaborate_adt_ty(
         "Bool" => Ty::bool(),
         "String" => Ty::str(),
         "Unit" => Ty::unit(),
-        other => match known.get(other) {
+        other => match cx.known.get(other) {
             Some(&arity) => {
                 if t.args.len() != arity {
                     inf.diags.push(
@@ -3128,8 +3661,13 @@ fn elaborate_adt_ty(
                     );
                 }
                 let mut args = Vec::new();
-                for a in &t.args {
-                    args.push(elaborate_adt_ty(inf, a, param_env, known, effects));
+                for (j, a) in t.args.iter().enumerate() {
+                    let param = Kinds::param_name(&cx.kinds.types, other, j);
+                    args.push(if cx.kinds.type_row(other, j) {
+                        decl_row_arg(inf, a, cx, other, param)
+                    } else {
+                        decl_type_arg(inf, a, cx, other, param)
+                    });
                 }
                 Ty::Con(other.to_string(), args)
             }
@@ -3142,6 +3680,58 @@ fn elaborate_adt_ty(
             }
         },
     }
+}
+
+/// E0432 for a row variable a declaration does not declare (part 1 refused
+/// every one; D3 makes a declared one a row parameter).
+fn undeclared_row_var(v: &str, span: Span, decl: &str) -> Diagnostic {
+    Diagnostic::error(
+        "E0432",
+        format!("a declaration's row cannot name a row variable (`{v}`) it does not declare"),
+    )
+    .with_label(span, "a row variable in a declaration")
+    .with_help(format!(
+        "declare it as a parameter (`{decl}({v})`), or write the row's effects: a declaration's unwritten row is pure"
+    ))
+}
+
+/// A row parameter's argument in a declaration (D5): a row, or one of the
+/// declaration's row parameters alone.
+fn decl_row_arg(inf: &mut Infer, a: &Spanned<TypeAnn>, cx: &DeclCx, decl: &str, param: &str) -> Ty {
+    let t = &a.node;
+    if t.as_row_arg().is_some() {
+        return elaborate_adt_inner(inf, a, cx);
+    }
+    if t.args.is_empty() && t.row.is_none() && t.name.starts_with(|c: char| c.is_ascii_lowercase())
+    {
+        if let Some(&rv) = cx.row_env.get(&t.name) {
+            return phantom(EffectRow::open(rv));
+        }
+        if !cx.param_env.contains_key(&t.name) {
+            inf.diags.push(undeclared_row_var(&t.name, a.span, cx.decl));
+            return Ty::Error;
+        }
+    }
+    inf.diags
+        .push(Diagnostic::error("E0400", wants_row(decl, param)).with_label(a.span, "a type here"));
+    Ty::Error
+}
+
+/// A type parameter's argument in a declaration: a type, not a row (D5).
+fn decl_type_arg(
+    inf: &mut Infer,
+    a: &Spanned<TypeAnn>,
+    cx: &DeclCx,
+    decl: &str,
+    param: &str,
+) -> Ty {
+    if a.node.as_row_arg().is_some() {
+        inf.diags.push(
+            Diagnostic::error("E0400", wants_type(decl, param)).with_label(a.span, "a row here"),
+        );
+        return Ty::Error;
+    }
+    elaborate_adt_ty(inf, a, cx)
 }
 
 fn free_vars(inf: &Infer, t: &Ty, acc: &mut Vec<u32>) {
@@ -3390,36 +3980,72 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             effect_arity.insert(e.name.clone(), e.params.len());
         }
     }
+    // Each declaration's parameters' kinds (spec 2026-10-30-elya-row-variables
+    // D3), before any declaration is elaborated.
+    let kinds = decl_kinds(module);
+    inf.kinds = kinds.clone();
+    // A declaration's parameters: a type parameter is a type variable; a row
+    // parameter is a row variable, its argument the variable's phantom (D4).
+    struct DeclParams {
+        args: Vec<Ty>,
+        var_ids: Vec<u32>,
+        row_vars: Vec<Option<RowVar>>,
+        param_env: HashMap<String, Ty>,
+        row_env: HashMap<String, RowVar>,
+    }
+    let decl_params = |inf: &mut Infer, ps: &[(String, bool)]| -> DeclParams {
+        let mut out = DeclParams {
+            args: Vec::new(),
+            var_ids: Vec::new(),
+            row_vars: Vec::new(),
+            param_env: HashMap::new(),
+            row_env: HashMap::new(),
+        };
+        for (p, is_row) in ps {
+            let v = inf.fresh();
+            let Ty::Var(id) = v else { unreachable!() };
+            out.var_ids.push(id);
+            if *is_row {
+                let rv = inf.fresh_row();
+                out.row_env.insert(p.clone(), rv);
+                out.row_vars.push(Some(rv));
+                out.args.push(phantom(EffectRow::open(rv)));
+            } else {
+                out.param_env.insert(p.clone(), v.clone());
+                out.row_vars.push(None);
+                out.args.push(v);
+            }
+        }
+        out
+    };
     for d in &module.decls {
         if let Decl::Type(t) = &d.node {
-            let param_vars: Vec<Ty> = t.params.iter().map(|_| inf.fresh()).collect();
-            let var_ids: Vec<u32> = param_vars
+            let dp = decl_params(&mut inf, &kinds.types[&t.name]);
+            let var_ids: Vec<u32> = dp
+                .var_ids
                 .iter()
-                .map(|v| match v {
-                    Ty::Var(id) => *id,
-                    _ => unreachable!(),
-                })
+                .zip(&dp.row_vars)
+                .filter(|(_, r)| r.is_none())
+                .map(|(v, _)| *v)
                 .collect();
-            let param_env: HashMap<String, Ty> = t
-                .params
-                .iter()
-                .cloned()
-                .zip(param_vars.iter().cloned())
-                .collect();
-            let result = Ty::Con(t.name.clone(), param_vars.clone());
+            let row_vars: Vec<RowVar> = dp.row_vars.iter().flatten().copied().collect();
+            let cx = DeclCx {
+                decl: &t.name,
+                param_env: &dp.param_env,
+                row_env: &dp.row_env,
+                known: &known_types,
+                effects: &effect_arity,
+                kinds: &kinds,
+                own: None,
+            };
+            let result = Ty::Con(t.name.clone(), dp.args.clone());
             let mut ctors: Vec<Vec<Ty>> = Vec::new();
             for v in &t.variants {
                 let vd = &v.node;
                 inf.ctor_arity.insert(vd.name.clone(), vd.fields.len());
                 let mut field_tys = Vec::new();
                 for f in &vd.fields {
-                    field_tys.push(elaborate_adt_ty(
-                        &mut inf,
-                        f,
-                        &param_env,
-                        &known_types,
-                        &effect_arity,
-                    ));
+                    field_tys.push(elaborate_adt_ty(&mut inf, f, &cx));
                 }
                 ctors.push(field_tys.clone());
                 let ty = if field_tys.is_empty() {
@@ -3431,7 +4057,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                     &vd.name,
                     Scheme {
                         vars: var_ids.clone(),
-                        row_vars: Vec::new(),
+                        row_vars: row_vars.clone(),
                         ty,
                     },
                 );
@@ -3452,34 +4078,32 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             // its operation signatures (Slice 4c-2). Empty for a monomorphic
             // effect. Op signatures elaborate under this param-env (reusing the
             // ADT elaborator), which is what lifts the old E0404 generic-op reject.
-            let param_vars: Vec<Ty> = e.params.iter().map(|_| inf.fresh()).collect();
-            let effect_params: Vec<u32> = param_vars
-                .iter()
-                .map(|v| match v {
-                    Ty::Var(id) => *id,
-                    _ => unreachable!(),
-                })
-                .collect();
-            let param_env: HashMap<String, Ty> = e
-                .params
-                .iter()
-                .cloned()
-                .zip(param_vars.iter().cloned())
-                .collect();
+            // A row parameter is a row variable, and the effect's own label in
+            // its declaration carries its phantom (D3, D4).
+            let dp = decl_params(&mut inf, &kinds.effects[&e.name]);
+            let cx = DeclCx {
+                decl: &e.name,
+                param_env: &dp.param_env,
+                row_env: &dp.row_env,
+                known: &known_types,
+                effects: &effect_arity,
+                kinds: &kinds,
+                own: Some((&e.name, &dp.args)),
+            };
             for op in &e.ops {
                 let sig = &op.node;
                 let params: Vec<Ty> = sig
                     .param_tys
                     .iter()
-                    .map(|t| elaborate_adt_ty(&mut inf, t, &param_env, &known_types, &effect_arity))
+                    .map(|t| elaborate_adt_ty(&mut inf, t, &cx))
                     .collect();
-                let ret =
-                    elaborate_adt_ty(&mut inf, &sig.ret, &param_env, &known_types, &effect_arity);
+                let ret = elaborate_adt_ty(&mut inf, &sig.ret, &cx);
                 inf.ops.insert(
                     sig.name.clone(),
                     OpInfo {
                         effect: e.name.clone(),
-                        effect_params: effect_params.clone(),
+                        effect_params: dp.var_ids.clone(),
+                        row_params: dp.row_vars.clone(),
                         params,
                         ret,
                     },
@@ -3532,6 +4156,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
         //    for the whole group.
         let mut member_ty: HashMap<usize, (Vec<Ty>, RowVar, Ty)> = HashMap::new();
         let mut ann_vars_of: HashMap<usize, AnnNames> = HashMap::new();
+        let mut declared_args_of: HashMap<usize, Vec<(String, Vec<Ty>, Span)>> = HashMap::new();
         for &i in group {
             let f = fns[i];
             let params: Vec<Ty> = f.params.iter().map(|_| inf.fresh()).collect();
@@ -3559,6 +4184,10 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                 inf.check_ann(&p.node.ann, pty, false);
             }
             inf.check_ann(&f.ret_ann, &result, true);
+            if let Some(row) = &f.effect_row {
+                let args = inf.declared_label_args(row);
+                declared_args_of.insert(i, args);
+            }
             ann_vars_of.insert(
                 i,
                 (
@@ -3648,6 +4277,19 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             params.extend(group_params.iter().cloned());
             inf.close_unrelayed_residual(l, &params);
         }
+        // 2.47. A declared row's written label arguments (spec
+        //       2026-10-30-elya-row-variables D5): what the body performs is at
+        //       them. Before anything closes, like 2.48.
+        for &i in group {
+            let amb_f = member_ty[&i].1;
+            for (name, want, span) in declared_args_of.remove(&i).unwrap_or_default() {
+                let performed = inf.resolve_row(&EffectRow::open(amb_f));
+                if let Some(have) = performed.labels.get(&name) {
+                    let have = have.args.clone();
+                    inf.unify_effect_args(&name, &have, &want, span);
+                }
+            }
+        }
         // 2.48. A declared row that ends in a named variable (spec
         //       2026-10-30-elya-row-variables D2), with its own member's names,
         //       BEFORE anything closes: closing first forced the name pure
@@ -3656,10 +4298,11 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             let f = fns[i];
             let (_params, amb_f, _result) = member_ty[&i].clone();
             if let Some(declared) = &f.effect_row {
-                let (labels, tail) = crate::ast::row_tail(declared);
-                if let Some(v) = tail {
+                if let Some(v) = &declared.tail {
+                    let labels: Vec<Spanned<String>> =
+                        declared.labels.iter().map(|l| l.name.clone()).collect();
                     inf.ann_rows = named_of.remove(&i).unwrap_or_default();
-                    inf.check_named_row(amb_f, labels, v);
+                    inf.check_named_row(amb_f, &labels, v);
                 }
             }
         }
@@ -3671,6 +4314,13 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             inf.close_unrelayed_residual(amb_f, &params);
         }
         // 2.6. enforce annotated rows (exact match) and main's discharge set.
+        //      A member's row with one effect met twice along it has its
+        //      arguments unified first (`settle_duplicates`).
+        for &i in group {
+            let amb_f = member_ty[&i].1;
+            let span = fns[i].body.span;
+            inf.settle_duplicates(&EffectRow::open(amb_f), span);
+        }
         for &i in group {
             let f = fns[i];
             let (_params, amb_f, _result) = member_ty[&i].clone();

@@ -347,6 +347,76 @@ fn canon(t: &Ty, rows: &mut Option<HashMap<RowVar, usize>>, out: &mut String) {
     }
 }
 
+/// A generic constructor's field types at `args`: the row parameters first
+/// (spec 2026-10-30-elya-row-variables D6: a row parameter's argument is a
+/// phantom carrying its row, and the only open tails in a declaration's field
+/// are its row parameters'), then the type parameters.
+fn ctor_fields_at(c: &CoreCtor, args: &[Ty]) -> Vec<Ty> {
+    let s: TySubst = args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (i as u32, a.clone()))
+        .collect();
+    let rows: HashMap<u32, EffectRow> = args
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| elya::types::phantom_row(a).map(|r| (i as u32, r.clone())))
+        .collect();
+    c.fields
+        .iter()
+        .map(|f| apply(&subst_row_params(f, &rows), &s))
+        .collect()
+}
+
+/// A generic declaration's field type with its row parameters substituted (spec
+/// 2026-10-30-elya-row-variables D6): row parameter `i`'s tail, `Open(i)`,
+/// becomes the row its argument's phantom carries, labels joined.
+fn subst_row_params(t: &Ty, rows: &HashMap<u32, EffectRow>) -> Ty {
+    if rows.is_empty() {
+        return t.clone();
+    }
+    match t {
+        Ty::Fn(ps, row, r) => {
+            let mut labels: BTreeMap<String, EffectLabel> = row
+                .labels
+                .iter()
+                .map(|(k, l)| {
+                    (
+                        k.clone(),
+                        EffectLabel {
+                            args: l.args.iter().map(|a| subst_row_params(a, rows)).collect(),
+                            span: l.span,
+                        },
+                    )
+                })
+                .collect();
+            let tail = match &row.tail {
+                RowTail::Open(v) => match rows.get(v) {
+                    Some(sub) => {
+                        for (k, l) in &sub.labels {
+                            labels.entry(k.clone()).or_insert_with(|| l.clone());
+                        }
+                        sub.tail.clone()
+                    }
+                    None => RowTail::Open(*v),
+                },
+                other => other.clone(),
+            };
+            Ty::Fn(
+                ps.iter().map(|p| subst_row_params(p, rows)).collect(),
+                EffectRow { labels, tail },
+                Box::new(subst_row_params(r, rows)),
+            )
+        }
+        Ty::Con(n, a) => Ty::Con(
+            n.clone(),
+            a.iter().map(|x| subst_row_params(x, rows)).collect(),
+        ),
+        Ty::Tuple(a) => Ty::Tuple(a.iter().map(|x| subst_row_params(x, rows)).collect()),
+        Ty::Var(_) | Ty::Base(_) | Ty::Error => t.clone(),
+    }
+}
+
 fn key_of(s: &TySubst) -> String {
     let mut rows = Some(HashMap::new());
     let mut k = String::new();
@@ -844,12 +914,7 @@ impl Instances<'_> {
     fn fields_at(&self, t: &str, args: &[Ty], ctor: &str) -> Option<Vec<Ty>> {
         let g = self.generic.get(t)?;
         let c = g.ctors.iter().find(|c| c.name == ctor)?;
-        let s: TySubst = args
-            .iter()
-            .enumerate()
-            .map(|(i, a)| (i as u32, a.clone()))
-            .collect();
-        Some(c.fields.iter().map(|f| apply(f, &s)).collect())
+        Some(ctor_fields_at(c, args))
     }
 
     /// Builds instance `k` if it is not built yet: its constructors, renamed,
@@ -1133,12 +1198,7 @@ pub(crate) fn generic_fields(
     };
     let g = generic.iter().find(|g| g.name == *n)?;
     let c = g.ctors.iter().find(|c| c.name == ctor)?;
-    let s: TySubst = args
-        .iter()
-        .enumerate()
-        .map(|(i, a)| (i as u32, a.clone()))
-        .collect();
-    Some(c.fields.iter().map(|f| apply(f, &s)).collect())
+    Some(ctor_fields_at(c, args))
 }
 
 #[cfg(test)]

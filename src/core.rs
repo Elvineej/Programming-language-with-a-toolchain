@@ -421,6 +421,9 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
     let mut generic_types = Vec::new();
     let mut effect_params_used = BTreeMap::new();
     let mut effects = Vec::new();
+    // Each declaration's parameters' kinds (spec 2026-10-30-elya-row-variables
+    // D3), as inference found them.
+    let kinds = crate::types::decl_kinds(module);
     for d in &module.decls {
         if let Decl::Type(t) = &d.node {
             // Collect every constructor name regardless of arity, so a constructor
@@ -436,7 +439,11 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
                 let mut ctors = Vec::with_capacity(t.variants.len());
                 for v in &t.variants {
                     let vd = &v.node;
-                    let fields = vd.fields.iter().map(|f| ann_to_ty(&f.node)).collect();
+                    let fields = vd
+                        .fields
+                        .iter()
+                        .map(|f| ann_to_ty(&f.node, &kinds))
+                        .collect();
                     ctors.push(CoreCtor {
                         name: vd.name.clone(),
                         fields,
@@ -448,12 +455,17 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
                 });
             } else {
                 let mut ctors = Vec::with_capacity(t.variants.len());
+                let dp = DeclParams {
+                    params: &kinds.types[&t.name],
+                    kinds: &kinds,
+                    own: None,
+                };
                 for v in &t.variants {
                     let vd = &v.node;
                     let fields = vd
                         .fields
                         .iter()
-                        .map(|f| ann_to_ty_in(&f.node, &t.params))
+                        .map(|f| ann_to_ty_in(&f.node, &dp))
                         .collect();
                     ctors.push(CoreCtor {
                         name: vd.name.clone(),
@@ -483,6 +495,11 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
             }
         }
         if let Decl::Effect(e) = &d.node {
+            let dp = DeclParams {
+                params: &kinds.effects[&e.name],
+                kinds: &kinds,
+                own: Some(&e.name),
+            };
             effects.push(CoreEffect {
                 name: e.name.clone(),
                 params: e.params.len(),
@@ -498,9 +515,9 @@ pub fn lower_module(module: &Module, table: &BTreeMap<Span, Ty>) -> Result<CoreM
                                 .node
                                 .param_tys
                                 .iter()
-                                .map(|t| ann_to_ty_in(&t.node, &e.params))
+                                .map(|t| ann_to_ty_in(&t.node, &dp))
                                 .collect(),
-                            ret: ann_to_ty_in(ret, &e.params),
+                            ret: ann_to_ty_in(ret, &dp),
                             ret_display: crate::literal::render_ann(ret),
                             ret_mentions_param: e
                                 .params
@@ -589,12 +606,29 @@ struct LowerCx {
     shadowed_op_calls: std::collections::HashSet<Span>,
 }
 
+/// A declaration's parameters as Core's generic types number them (N7 part 2;
+/// spec 2026-10-30-elya-row-variables D6): type parameter `i` is `Ty::Var(i)`,
+/// row parameter `i` is a row ending in `Open(i)`. With the effect being
+/// declared, whose bare name in its own declaration is itself at them (D3).
+struct DeclParams<'a> {
+    params: &'a [(String, bool)],
+    kinds: &'a crate::types::Kinds,
+    own: Option<&'a str>,
+}
+
 /// Elaborate a ground ADT field type annotation to a `Ty` (5b-4 §6): base
 /// names map to their `Base`, any other name is an ADT reference and maps to
 /// `Ty::Con` with its args elaborated. A parametric declaration's fields go
 /// through `ann_to_ty_in` with its parameters (N7 part 2).
-fn ann_to_ty(a: &TypeAnn) -> Ty {
-    ann_to_ty_in(a, &[])
+fn ann_to_ty(a: &TypeAnn, kinds: &crate::types::Kinds) -> Ty {
+    ann_to_ty_in(
+        a,
+        &DeclParams {
+            params: &[],
+            kinds,
+            own: None,
+        },
+    )
 }
 
 /// Does the annotation mention the (type parameter) name `p` anywhere?
@@ -602,46 +636,86 @@ fn ann_mentions(a: &TypeAnn, p: &str) -> bool {
     (a.name == p && a.args.is_empty()) || a.args.iter().any(|x| ann_mentions(&x.node, p))
 }
 
-/// `ann_to_ty` under a parametric declaration's parameters: a name that is
-/// one of them is `Ty::Var(position)` (N7 part 2).
-fn ann_to_ty_in(a: &TypeAnn, tparams: &[String]) -> Ty {
-    if a.args.is_empty() {
-        if let Some(i) = tparams.iter().position(|p| *p == a.name) {
+/// `ann_to_ty` under a parametric declaration's parameters (`DeclParams`).
+fn ann_to_ty_in(a: &TypeAnn, dp: &DeclParams) -> Ty {
+    use crate::types::{phantom, EffectLabel, EffectRow, RowTail};
+    let position = |name: &str| dp.params.iter().position(|p| p.0 == name);
+    if a.name == crate::ast::ROW_RESULT && a.args.is_empty() {
+        return Ty::Con(a.name.clone(), Vec::new());
+    }
+    if a.args.is_empty() && a.row.is_none() {
+        if let Some(i) = position(&a.name) {
             return Ty::Var(i as u32);
         }
     }
+    // A row parameter's argument: a row (its phantom), or a row parameter alone.
+    let row_arg = |x: &TypeAnn| -> Ty {
+        if x.as_row_arg().is_some() {
+            return ann_to_ty_in(x, dp);
+        }
+        match position(&x.name) {
+            Some(i) if x.args.is_empty() => phantom(EffectRow::open(i as u32)),
+            _ => Ty::Error,
+        }
+    };
     // A function type in a declaration (2026-10-09, async step 1): its row is
-    // exactly what is written, closed -- the same elaboration inference gives
-    // the field (`types::elaborate_adt_ty`), so the back end reads the
-    // field's real type (a pattern binder holding a closure is tracked by it).
+    // exactly what is written -- the same elaboration inference gives the field
+    // (`types::elaborate_adt_ty`), so the back end reads the field's real type
+    // (a pattern binder holding a closure is tracked by it).
     if a.name == "fn" && !a.args.is_empty() {
         let n = a.args.len();
         let params = a.args[..n - 1]
             .iter()
-            .map(|x| ann_to_ty_in(&x.node, tparams))
+            .map(|x| ann_to_ty_in(&x.node, dp))
             .collect();
-        let ret = ann_to_ty_in(&a.args[n - 1].node, tparams);
-        let labels = crate::ast::row_tail(a.row.as_deref().unwrap_or(&[]))
-            .0
+        let ret = ann_to_ty_in(&a.args[n - 1].node, dp);
+        let empty = crate::ast::RowAnn::default();
+        let row = a.row.as_ref().unwrap_or(&empty);
+        let labels = row
+            .labels
             .iter()
             .map(|l| {
+                let name = &l.name.node;
+                let args = match &l.args {
+                    Some(xs) => xs
+                        .iter()
+                        .enumerate()
+                        .map(|(j, x)| {
+                            if dp.kinds.effect_row(name, j) {
+                                row_arg(&x.node)
+                            } else {
+                                ann_to_ty_in(&x.node, dp)
+                            }
+                        })
+                        .collect(),
+                    None if dp.own == Some(name.as_str()) => dp
+                        .params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| {
+                            if p.1 {
+                                phantom(EffectRow::open(i as u32))
+                            } else {
+                                Ty::Var(i as u32)
+                            }
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
                 (
-                    l.node.clone(),
-                    crate::types::EffectLabel {
-                        args: Vec::new(),
-                        span: l.span,
+                    name.clone(),
+                    EffectLabel {
+                        args,
+                        span: l.name.span,
                     },
                 )
             })
             .collect();
-        return Ty::Fn(
-            params,
-            crate::types::EffectRow {
-                labels,
-                tail: crate::types::RowTail::Closed,
-            },
-            Box::new(ret),
-        );
+        let tail = match row.tail.as_ref().and_then(|v| position(&v.node)) {
+            Some(i) => RowTail::Open(i as u32),
+            None => RowTail::Closed,
+        };
+        return Ty::Fn(params, EffectRow { labels, tail }, Box::new(ret));
     }
     match a.name.as_str() {
         "Int" => Ty::int(),
@@ -653,7 +727,14 @@ fn ann_to_ty_in(a: &TypeAnn, tparams: &[String]) -> Ty {
             let args = a
                 .args
                 .iter()
-                .map(|x| ann_to_ty_in(&x.node, tparams))
+                .enumerate()
+                .map(|(j, x)| {
+                    if dp.kinds.type_row(other, j) {
+                        row_arg(&x.node)
+                    } else {
+                        ann_to_ty_in(&x.node, dp)
+                    }
+                })
                 .collect();
             Ty::Con(other.to_string(), args)
         }
