@@ -16,7 +16,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is public (seen 2026-10-30; the maintainer flipped it).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1355 passed, 145 suites. Native programs run on
+- Linux gate at the tip of `main`: 1374 passed, 148 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). In October the runtime
   gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -624,31 +624,27 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
     ended in one variable (a clean-checking program failed at run time), fixed;
     named declared rows are unified per member before the ambient closes.
 
+- **Row parameters on declarations** (2026-10-30, on `main`, 499c048; step 1's
+  part 2): spec `docs/superpowers/specs/2026-10-30-elya-row-variables-design.md`
+  section 3.
+  - A declaration's parameter used where a row goes is a row parameter (found by
+    a fixpoint over the declarations): `type Task(e) { Paused(fn() / {e} -> Task(e)) }`,
+    `effect Async(e) { fn spawn(f: fn() / {Async | e} -> Int) -> Int }` (its own
+    bare name is `Async(e)` there). A use writes a row, `Task({Log})`, or a row
+    variable, `Task(e)`; a label's written arguments (`{State(Int)}`) are now
+    checked (they were dropped).
+  - Encoding: a row argument is a phantom `fn() / R -> $Row`; natively, instances
+    key by convention and the instance builder substitutes rows first.
+  - A scheduler is written once: a task that spawns has a finite type (it was
+    E0401), on both back ends; `examples/04_async.elya`'s round robin, written
+    generically, prints the same (`tests/row_parameters/round_robin.elya`).
+  - Found on the way: a call's row whose labels mention its own tail is unified
+    whole (pouring it label by label made `e` contain `Async(e)`, E0424), and the
+    specializer's pattern binder types now substitute rows too.
+
 ## The next five steps
 
-### 1. Row parameters on declarations: effects and types that carry a task's effects (part 2)
-
-Measured 2026-10-30, for step 2: a standard `elya/async` cannot be written
-today. Each async example declares its own `effect Async` whose task type
-names the program's other effects (`fn spawn(f: fn() / {Async, Log} -> Int)`),
-and a module cannot name the user's `Log`.
-- A function's signature already leaves a row open by writing none:
-  `fn twice(f: fn() -> Int)` takes a task that says something (2).
-- An operation's cannot: `effect Async { fn spawn(f: fn() -> Int) -> Int }`
-  takes pure tasks only (a task that says is E0423), and no row can be written
-  open (`/ {e}` is E0100, `/ {Log | e}` is E0001; `effect Async(t)` takes
-  types, not rows).
-- A type's fields are the same (`types::elaborate_adt_ty`: "a declaration has
-  no row variables"), and each scheduler stores its tasks in one (`type Step`
-  in every example).
-Part 1 (row variables in a function's own annotations) is done (394a0b8); the
-spec's D3-D6 are this part. Decide in it: row parameters on effect and type declarations
-(`effect Async(e)`, `type Step(e)`, a task `fn() / {Async(e) | e} -> Int`), how
-a use writes one (`Async(Log)`? a row in an effect's argument list), what a
-clause that calls a task may perform, and both back ends (rows are
-monomorphized natively, N7 part 1).
-
-### 2. Async as a standard module: `elya/async`
+### 1. Async as a standard module: `elya/async`
 
 ROADMAP priority 1's examples (`04_async.elya`, `06_structured.elya`,
 `08_timers.elya`) each carry their own scheduler: `spawn`/`await`/`yld`, a
@@ -659,10 +655,11 @@ pattern: the effects and pure schedulers in `elya/async`, any host binding in
 `elya/host`). Measure what the three examples share and what each needs
 (result types, cancellation, a timer's host clock through `elya/clock`), then
 decide the API in a spec; prove it by rewriting the examples on it, in the
-evaluator and natively. The names carry the module's (part 3 D1). Needs step 1:
-a task's row must be open (measured 2026-10-30).
+evaluator and natively. The names carry the module's (part 3 D1). Row parameters
+are done (499c048): `tests/row_parameters/round_robin.elya` is 04's scheduler written
+once for any other effects; start from it.
 
-### 3. Compiler scalability: no step quadratic in a program's size
+### 2. Compiler scalability: no step quadratic in a program's size
 
 The maintainer's priority (2026-10-30: "compiler scalability is still
 fragile"). A block's length is no longer a stack bound (17869d4); measured and
@@ -686,7 +683,7 @@ place, or resolve names to slots before the run (the tree-walking oracle too);
 continuations that share the rest of a region instead of copying it. The proof:
 each at ten times today's size, linear.
 
-### 4. The affine guarantee across functions
+### 3. The affine guarantee across functions
 
 The maintainer's priority (2026-10-30: "the affine resource guarantee is
 incomplete"). `linear` values are checked within one function body (slice
@@ -699,7 +696,7 @@ multiplicity, inferred or annotated, checked at every call; branch-sensitive
 counting (the maximum over arms, not the sum); and what crosses a lambda, a
 handler clause and a resume.
 
-### 5. Native compilation without its implementation limits
+### 4. Native compilation without its implementation limits
 
 The maintainer's priority (2026-10-30: "native compilation has restrictive
 implementation limits"). Inventory every refusal natively against the
@@ -713,10 +710,10 @@ named row says more than its body performs). For each: a
 program the evaluator runs, then lift it or say in a spec why it stays. The
 differential sweep is the measure: no refusal left that the evaluator runs.
 
-## Also open, unscheduled
+### 5. Reading text from outside
 
-**Reading text from outside** (was step 3; moved for the maintainer's priorities,
-2026-10-30): `replay.parse` reads a trace the program already holds as a `String`. No Elya
+Back from "Also open" (it was step 3 until the maintainer's priorities moved it,
+2026-10-30). `replay.parse` reads a trace the program already holds as a `String`. No Elya
 program can read a file or standard input (spec 2026-10-24-elya-trace-text D4).
 Measure what reading needs:
 - whole files or lines;
@@ -725,6 +722,8 @@ Measure what reading needs:
 Then decide in a spec: the builtins (`io.read_file`, `io.read_line`?) and their
 effect (`IO`, which the host records like `time.*`, or a capability of their own
 under `elya/host`); and both back ends, recording and replaying a read the same way.
+
+## Also open, unscheduled
 
 `examples/08_timers.elya`'s real-clock part can reorder `a` and `c` under heavy
 load (its snapshot then fails): the three deadlines are 10 ms apart and counted

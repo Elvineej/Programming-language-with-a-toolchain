@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-30 16:30 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
+## 2026-10-30 22:20 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -78,9 +78,28 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   failed at run time). Gate 1355 / 145.
   - **Decisions (mine; please review):** the printer's syntax (`{Log | e}`);
     flexible names, not rigid; a lowercase name spelled like an effect is a typo.
-- Next: HANDOFF step 1, part 2: row parameters on declarations.
-- Windows-gate debt: 20a4804 (runtime.c string functions and the trace split),
-  fa24c18 (runtime.c `elya_trace_finish` exported, `elya_any_show` flushes).
+- **Done: row parameters on declarations** (HANDOFF step 1, part 2; spec
+  2026-10-30-elya-row-variables section 3; 499c048, on `main`). `type Task(e)`,
+  `effect Async(e)`, row arguments written as rows (`Task({Log})`); a label's
+  written arguments are now checked. A task that spawns has a finite type, on
+  both back ends; 04's round robin written once for any other effects. Gate
+  1385 / 148 (predicted 1385; 1372 and 1374 at the earlier checkpoints, each as
+  predicted).
+  - The review found one high (a lost label: checked clean, crashed natively),
+    two medium (correct programs refused) and one low; all fixed first, and
+    checking F3's fix found a fifth (a duplicate label dropped), fixed with a
+    control. One existing expectation changed: `occurs_in_rows.rs`'s
+    `fn g(k) { op(k)  k() }` checks now (a finite type).
+  - **Decisions (mine; please review):** kinds by use, not marked; a row
+    argument is a phantom function type; a label's arguments, once written, are
+    checked.
+- **Windows:** the gate on main (2ab5833) ran 1165 tests, 3 failed (native
+  failure lines read "\r" on Windows: stderr was text mode); ba8b629 puts
+  stderr in binary mode like stdout. The run was then cancelled from the
+  maintainer's account.
+- Next: HANDOFF step 1, `elya/async`.
+- Windows-gate debt: 20a4804, fa24c18, and since then 499c048 and ba8b629
+  (the next Windows run on `main` covers them).
 
 ## 2026-10-24 09:48 UTC — IN PROGRESS (scheduled run, FULL mode)
 
