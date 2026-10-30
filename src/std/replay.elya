@@ -78,3 +78,133 @@ pub fn size(trace: Trace) -> Int {
     TraceEntry(q, a, rest) -> 1 + size(rest)
   }
 }
+
+// Reading a trace's text back (spec 2026-10-24-elya-trace-text D2, D3): the
+// trace, or the first line that cannot be read and why.
+type ParsedTrace { TraceParsed(Trace), TraceUnreadable(Int, String) }
+
+// Read `text` as the host reads a trace file: a leading byte-order mark is
+// skipped; lines end at `\n`; each is trimmed of whitespace (`str::trim`'s);
+// blank lines are skipped; the first must be `elya trace 1`; every other one
+// splits at the first ` = ` outside a string literal. `parse(text(t))` is
+// `TraceParsed(t)`. Every loop is a tail call, so any length reads in constant
+// stack.
+pub fn parse(text: String) -> ParsedTrace {
+  let start = if bom(text) { 3 } else { 0 }
+  let e = line_end(text, start)
+  if trimmed(text, start, e) != "elya trace 1" {
+    TraceUnreadable(1, "the first line must be `elya trace 1`")
+  } else {
+    entries(text, e + 1, 2, TraceEnd)
+  }
+}
+
+fn bom(s: String) -> Bool {
+  if string.length(s) < 3 { False } else {
+    string.byte_at(s, 0) == 239 && string.byte_at(s, 1) == 187 && string.byte_at(s, 2) == 191
+  }
+}
+
+// The lines from byte `i` on, line `n` first; `acc` holds the entries so far,
+// last first.
+fn entries(s: String, i: Int, n: Int, acc: Trace) -> ParsedTrace {
+  if i >= string.length(s) { TraceParsed(reversed(acc, TraceEnd)) } else {
+    let e = line_end(s, i)
+    let a = trim_start(s, i, e)
+    if a == trim_end(s, a, e) { entries(s, e + 1, n + 1, acc) } else {
+      // The whole line is searched, not the trimmed one: a ` = ` may touch a
+      // trimmed edge (`A.a() = ` is an empty answer). A `\r` before the `\n`
+      // changes no split (it is neither a quote nor a separator) and is
+      // trimmed from the answer.
+      let k = separator(s, i, e, False)
+      if k == 0 - 2 { TraceUnreadable(n, "a string is not closed") } else {
+        if k == 0 - 1 { TraceUnreadable(n, "expected `question = answer`") } else {
+          let q = trimmed(s, i, k)
+          let v = trimmed(s, k + 3, e)
+          entries(s, e + 1, n + 1, TraceEntry(q, v, acc))
+        }
+      }
+    }
+  }
+}
+
+fn reversed(t: Trace, out: Trace) -> Trace {
+  match t {
+    TraceEnd -> out
+    TraceEntry(q, a, rest) -> reversed(rest, TraceEntry(q, a, out))
+  }
+}
+
+// The index of the first `\n` at or after `i`, or the length.
+fn line_end(s: String, i: Int) -> Int {
+  if i >= string.length(s) { string.length(s) } else {
+    if string.byte_at(s, i) == 10 { i } else { line_end(s, i + 1) }
+  }
+}
+
+// Where the first ` = ` outside a string literal starts, in [i, e): -1 if
+// there is none, -2 if the line ends inside a literal.
+fn separator(s: String, i: Int, e: Int, quoted: Bool) -> Int {
+  if i >= e { if quoted { 0 - 2 } else { 0 - 1 } } else {
+    let c = string.byte_at(s, i)
+    if quoted && c == 92 { separator(s, i + 2, e, quoted) } else {
+      if c == 34 { separator(s, i + 1, e, !quoted) } else {
+        let sep = if !quoted && c == 32 && i + 3 <= e {
+          string.byte_at(s, i + 1) == 61 && string.byte_at(s, i + 2) == 32
+        } else { False }
+        if sep { i } else { separator(s, i + 1, e, quoted) }
+      }
+    }
+  }
+}
+
+fn trimmed(s: String, i: Int, e: Int) -> String {
+  let a = trim_start(s, i, e)
+  string.slice(s, a, trim_end(s, a, e))
+}
+
+fn trim_start(s: String, i: Int, e: Int) -> Int {
+  let w = space_at(s, i, e)
+  if w == 0 { i } else { trim_start(s, i + w, e) }
+}
+
+fn trim_end(s: String, a: Int, e: Int) -> Int {
+  let w = space_before(s, a, e)
+  if w == 0 { e } else { trim_end(s, a, e - w) }
+}
+
+// The length of a whitespace character ending at `e` and starting at or after
+// `a`, or 0.
+fn space_before(s: String, a: Int, e: Int) -> Int {
+  if e - 1 >= a && space_at(s, e - 1, e) == 1 { 1 } else {
+    if e - 2 >= a && space_at(s, e - 2, e) == 2 { 2 } else {
+      if e - 3 >= a && space_at(s, e - 3, e) == 3 { 3 } else { 0 }
+    }
+  }
+}
+
+// The length of a whitespace character (Rust's `char::is_whitespace`: ASCII's
+// six, U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F, U+205F
+// and U+3000) starting at `i` and ending by `e`, or 0. UTF-8 lead bytes are
+// never continuation bytes, so a match is a whole character.
+fn space_at(s: String, i: Int, e: Int) -> Int {
+  if i < 0 || i >= e { 0 } else {
+    let c = string.byte_at(s, i)
+    if c == 32 || (c >= 9 && c <= 13) { 1 } else {
+      if c == 194 && i + 2 <= e {
+        let d = string.byte_at(s, i + 1)
+        if d == 133 || d == 160 { 2 } else { 0 }
+      } else {
+        if c >= 225 && c <= 227 && i + 3 <= e {
+          let d = string.byte_at(s, i + 1)
+          let f = string.byte_at(s, i + 2)
+          let ogham = c == 225 && d == 154 && f == 128
+          let general = c == 226 && d == 128 && ((f >= 128 && f <= 138) || f == 168 || f == 169 || f == 175)
+          let math = c == 226 && d == 129 && f == 159
+          let ideographic = c == 227 && d == 128 && f == 128
+          if ogham || general || math || ideographic { 3 } else { 0 }
+        } else { 0 }
+      }
+    }
+  }
+}

@@ -56,10 +56,13 @@ impl TypeInfo {
     }
 }
 
-/// A data value in literal syntax, or what in it is not data.
-pub fn show(v: &Value) -> Result<String, &'static str> {
+/// A data value in literal syntax, or what in it is not data. `info` tells a
+/// constructor used as a function (fewer arguments than its fields, so far only
+/// none) from a value: it is "a function", as natively, where it is a closure
+/// (the main-values review's F1, 2026-10-30).
+pub fn show(info: &TypeInfo, v: &Value) -> Result<String, &'static str> {
     let mut out = String::new();
-    write(v, &mut out)?;
+    write(info, v, &mut out)?;
     Ok(out)
 }
 
@@ -68,7 +71,7 @@ enum Item<'a> {
     Text(&'static str),
 }
 
-fn write(v: &Value, out: &mut String) -> Result<(), &'static str> {
+fn write(info: &TypeInfo, v: &Value, out: &mut String) -> Result<(), &'static str> {
     let mut stack = vec![Item::Val(v)];
     while let Some(item) = stack.pop() {
         let v = match item {
@@ -99,6 +102,13 @@ fn write(v: &Value, out: &mut String) -> Result<(), &'static str> {
                 out.push('"');
             }
             Value::Ctor(name, args) => {
+                if info
+                    .ctors
+                    .get(name.as_str())
+                    .is_some_and(|(_, _, fields)| fields.len() > args.0.len())
+                {
+                    return Err("a function");
+                }
                 out.push_str(name);
                 if !args.0.is_empty() {
                     out.push('(');
@@ -144,13 +154,18 @@ fn write_float(f: f64, out: &mut String) {
 }
 
 /// An operation as `Effect.op(args)`.
-pub fn show_op(effect: &str, op: &str, args: &[Value]) -> Result<String, &'static str> {
+pub fn show_op(
+    info: &TypeInfo,
+    effect: &str,
+    op: &str,
+    args: &[Value],
+) -> Result<String, &'static str> {
     let mut out = format!("{effect}.{op}(");
     for (i, a) in args.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
-        write(a, &mut out)?;
+        write(info, a, &mut out)?;
     }
     out.push(')');
     Ok(out)
@@ -429,7 +444,7 @@ impl Parser<'_> {
             }
         }
         String::from_utf8(bytes)
-            .map(Value::Str)
+            .map(|s| Value::Str(s.into()))
             .map_err(|_| "a string that is not UTF-8")
     }
 }

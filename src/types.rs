@@ -123,6 +123,9 @@ impl Ty {
     }
 }
 
+/// A function's annotation names: its type variables and its row variables.
+type AnnNames = (HashMap<String, Ty>, HashMap<String, RowVar>);
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scheme {
     pub vars: Vec<u32>,
@@ -270,6 +273,10 @@ pub struct Infer {
     /// name in any annotation of one function (its signature, its `let`s and
     /// lambdas) is one shared unification variable.
     ann_vars: HashMap<String, Ty>,
+    /// The current top-level function's named row variables (spec
+    /// 2026-10-30-elya-row-variables D2): `e` in `/ {e}` or `/ {Log | e}`, one
+    /// row for the whole function, as a lowercase type name is one type.
+    ann_rows: HashMap<String, RowVar>,
     /// The answer types of `with any` clauses (2026-10-16): rigid, one per
     /// clause, as `Ty::Con` names that no declaration can spell. Each with its
     /// clause's span, for E0435 when one escapes.
@@ -322,6 +329,7 @@ impl Infer {
             node_types: HashMap::new(),
             known_types: HashMap::new(),
             ann_vars: HashMap::new(),
+            ann_rows: HashMap::new(),
             skolems: Vec::new(),
             generic_rows: HashSet::new(),
             pending_generic: Vec::new(),
@@ -331,6 +339,44 @@ impl Infer {
             eq_reported: HashSet::new(),
             diags: Vec::new(),
         }
+    }
+
+    /// The function's row variable named `name` (D2): the same one at every
+    /// mention, a meaningful (not phantom) variable.
+    fn ann_row(&mut self, name: &str, span: Span) -> RowVar {
+        if let Some(v) = self.ann_rows.get(name) {
+            return *v;
+        }
+        // Checked where a name first appears (the review's F5): an effect's
+        // name in lowercase is a typo, not a variable; and one name is a type or
+        // a row, not both.
+        let mut cap = name.to_string();
+        if let Some(c) = cap.get_mut(0..1) {
+            c.make_ascii_uppercase();
+        }
+        if self.effect_multi.contains_key(&cap) || cap == "IO" {
+            self.diags.push(
+                Diagnostic::error(
+                    "E0432",
+                    format!("row variable `{name}` is spelled like an effect"),
+                )
+                .with_label(span, "a row variable")
+                .with_help(format!(
+                    "write `{cap}` for the effect, or give the row variable another name"
+                )),
+            );
+        } else if self.ann_vars.contains_key(name) {
+            self.diags.push(
+                Diagnostic::error("E0400", format!("`{name}` names a type and a row"))
+                    .with_label(span, "a row variable here")
+                    .with_help(
+                        "a lowercase name in a row is a row; elsewhere it is a type: use two names",
+                    ),
+            );
+        }
+        let v = self.fresh_row();
+        self.ann_rows.insert(name.to_string(), v);
+        v
     }
 
     /// A type annotation as a type (2026-10-09; annotations used to be parsed
@@ -357,7 +403,9 @@ impl Infer {
                 // real variable the body's calls relay.
                 None if covariant => EffectRow::open(self.fresh_phantom_row()),
                 None => EffectRow::open(self.fresh_row()),
-                Some(labels) => {
+                Some(names) => {
+                    // D1: a lowercase name, last, is the row's tail.
+                    let (labels, tail) = crate::ast::row_tail(names);
                     let mut m = BTreeMap::new();
                     for l in labels {
                         if !self.effect_multi.contains_key(&l.node) && l.node != "IO" {
@@ -378,7 +426,10 @@ impl Infer {
                     }
                     EffectRow {
                         labels: m,
-                        tail: RowTail::Closed,
+                        tail: match tail {
+                            Some(v) => RowTail::Open(self.ann_row(&v.node, v.span)),
+                            None => RowTail::Closed,
+                        },
                     }
                 }
             };
@@ -387,6 +438,13 @@ impl Infer {
         if t.args.is_empty() && t.name.starts_with(|c: char| c.is_ascii_lowercase()) {
             if let Some(v) = self.ann_vars.get(&t.name) {
                 return v.clone();
+            }
+            if self.ann_rows.contains_key(&t.name) {
+                self.diags.push(
+                    Diagnostic::error("E0400", format!("`{}` names a type and a row", t.name))
+                        .with_label(ann.span, "a type here")
+                        .with_help("a lowercase name in a row is a row; elsewhere it is a type: use two names"),
+                );
             }
             let v = self.fresh();
             self.ann_vars.insert(t.name.clone(), v.clone());
@@ -528,14 +586,30 @@ impl Infer {
 
     fn occurs(&self, v: u32, t: &Ty) -> bool {
         // Type occurs-check only concerns the type-variable space; row variables
-        // live in a separate union-find with its own occurs-check (Task 3).
-        match self.resolve(t) {
-            Ty::Var(u) => u == v,
-            Ty::Base(_) | Ty::Error => false,
-            Ty::Fn(ps, _row, r) => ps.iter().any(|p| self.occurs(v, p)) || self.occurs(v, &r),
-            Ty::Tuple(xs) => xs.iter().any(|x| self.occurs(v, x)),
-            Ty::Con(_, args) => args.iter().any(|a| self.occurs(v, a)),
+        // live in a separate union-find with its own occurs-check (Task 3). A
+        // row's labels carry types, though: `t := fn() / {E(t)} -> Int` contains
+        // itself through one (spec 2026-10-30-elya-occurs-in-rows D1; it was
+        // bound, and `resolve` recursed until the stack ran out).
+        // `resolve` is deep (rows and their labels' arguments included), so
+        // one call and a plain walk of its result decide it: resolving again
+        // at every level was polynomial in a type's depth (the review's F3:
+        // 8.4 s became 43.8 s on a hundred nested performs).
+        fn walk(v: u32, t: &Ty) -> bool {
+            match t {
+                Ty::Var(u) => *u == v,
+                Ty::Base(_) | Ty::Error => false,
+                Ty::Fn(ps, row, r) => {
+                    ps.iter().any(|p| walk(v, p))
+                        || walk(v, r)
+                        || row
+                            .labels
+                            .values()
+                            .any(|l| l.args.iter().any(|a| walk(v, a)))
+                }
+                Ty::Tuple(xs) | Ty::Con(_, xs) => xs.iter().any(|x| walk(v, x)),
+            }
         }
+        walk(v, &self.resolve(t))
     }
 
     fn bind(&mut self, v: u32, t: &Ty, span: Span) {
@@ -723,13 +797,30 @@ impl Infer {
         // r2's tail must absorb only1; r1's tail must absorb only2. Each returns
         // the residual tail left after rewriting.
         let t2 = self.absorb(&only1, &r2.tail, span, &mut conflict.only1);
-        let t1 = self.absorb(&only2, &r1.tail, span, &mut conflict.only2);
+        // Each tail read again after the other side's absorb: when both rows end
+        // in one variable (`{Log | e}` against `{e}`), the first absorb binds it,
+        // and the stale tail was then rebound, dropping the label -- a program
+        // that checked clean failed at run time (spec
+        // 2026-10-30-elya-row-variables, the review's F1; older, but row
+        // variables made it writable). Rows are sets, so `e := {Log | f}` solves it.
+        let r1_tail = self.tail_now(&r1.tail);
+        let t1 = self.absorb(&only2, &r1_tail, span, &mut conflict.only2);
         if !conflict.only1.is_empty() || !conflict.only2.is_empty() {
             return Err(conflict);
         }
         // The two residual tails must be equal.
+        let t2 = self.tail_now(&t2);
         self.unify_tails(&t1, &t2, span);
         Ok(())
+    }
+
+    /// `tail` as it stands now: through any binding made since it was read.
+    fn tail_now(&self, tail: &RowTail) -> RowTail {
+        self.resolve_row(&EffectRow {
+            labels: BTreeMap::new(),
+            tail: tail.clone(),
+        })
+        .tail
     }
 
     /// Rewrite `tail` so it contains `extra`, returning the residual tail.
@@ -787,11 +878,48 @@ impl Infer {
         }
     }
 
+    /// Whether `t` mentions row variable `v`: in a function type's row tail, or
+    /// in a row's labels' arguments, at any depth.
+    fn mentions_row(&self, v: RowVar, t: &Ty) -> bool {
+        // One deep `resolve`, then a plain walk (as in `occurs`).
+        fn walk(v: RowVar, t: &Ty) -> bool {
+            match t {
+                Ty::Var(_) | Ty::Base(_) | Ty::Error => false,
+                Ty::Fn(ps, row, r) => {
+                    row.tail == RowTail::Open(v)
+                        || row
+                            .labels
+                            .values()
+                            .any(|l| l.args.iter().any(|a| walk(v, a)))
+                        || ps.iter().any(|p| walk(v, p))
+                        || walk(v, r)
+                }
+                Ty::Tuple(xs) | Ty::Con(_, xs) => xs.iter().any(|x| walk(v, x)),
+            }
+        }
+        walk(v, &self.resolve(t))
+    }
+
     /// Bind row variable `v := r`, with an occurs-check (`E0424`): `v` may not
-    /// appear in `r`'s tail, or the row would contain itself.
+    /// appear in `r`'s tail, or in its labels' arguments, or the row would
+    /// contain itself.
     fn bind_row(&mut self, v: RowVar, r: &EffectRow, span: Span) {
+        // A bound variable is never overwritten (that drops what it holds):
+        // unify with what it holds instead (the row-variables review's F1).
+        if self.row_subst[v as usize].is_some() {
+            let r2 = self.unify_row(&EffectRow::open(v), r, span);
+            self.surface_conflict(r2);
+            return;
+        }
         let resolved = self.resolve_row(r);
-        if resolved.tail == RowTail::Open(v) {
+        // Also through a label's arguments: `v := {E(fn() / {.. | v} -> ..)}`
+        // (spec 2026-10-30-elya-occurs-in-rows D2).
+        if resolved.tail == RowTail::Open(v)
+            || resolved
+                .labels
+                .values()
+                .any(|l| l.args.iter().any(|a| self.mentions_row(v, a)))
+        {
             self.diags.push(
                 Diagnostic::error("E0424", "cyclic effect row")
                     .with_label(span, "an effect row would contain itself"),
@@ -819,6 +947,13 @@ impl Infer {
             let mut changed = false;
             for (src, dst, span) in self.pending_incl.clone() {
                 let have = self.resolve_row(&EffectRow::open(dst));
+                // A poisoned row (a reported conflict, E0424) absorbs every
+                // label: nothing to add, so it is settled. Adding to it
+                // "succeeded" every pass, and the fixpoint never ended (spec
+                // 2026-10-30-elya-occurs-in-rows, the review's F1).
+                if have.tail == RowTail::ErrorRow {
+                    continue;
+                }
                 let want = self.resolve_row(&EffectRow::open(src));
                 // A recorded tail that has since become MEANINGFUL (it aliased
                 // a real row variable, e.g. a parameter's) is a relay after
@@ -855,6 +990,10 @@ impl Infer {
             }
             for (src, dst, span) in self.pending_member_incl.clone() {
                 let have = self.resolve_row(&EffectRow::open(dst));
+                // Settled when poisoned, as above.
+                if have.tail == RowTail::ErrorRow {
+                    continue;
+                }
                 let want = self.resolve_row(&EffectRow::open(src));
                 // A member's tail that has since become a RELAY of a member's
                 // parameter is whatever the arguments perform: the including
@@ -1864,6 +2003,21 @@ impl Infer {
                 self.node_types.insert(callee.span, want);
                 return to;
             }
+            // A string by byte (spec 2026-10-24-elya-trace-text D1), pure: a
+            // failure is not an effect.
+            if module == "string" && crate::resolve::STRING_BUILTINS.contains(&name.as_str()) {
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+                let (params, ret) = match name.as_str() {
+                    "length" => (vec![Ty::str()], Ty::int()),
+                    "byte_at" => (vec![Ty::str(), Ty::int()], Ty::int()),
+                    _ => (vec![Ty::str(), Ty::int(), Ty::int()], Ty::str()),
+                };
+                let want = Ty::Fn(params, EffectRow::pure(), Box::new(ret.clone()));
+                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
+                self.unify(&want, &got, span);
+                self.node_types.insert(callee.span, want);
+                return ret;
+            }
             // Wrapping and bit arithmetic: `fn(Int, Int) -> Int`, pure (spec
             // 2026-10-17-elya-unary-and-wrapping D2).
             if module == "int" && crate::resolve::INT_BINARY_BUILTINS.contains(&name.as_str()) {
@@ -2675,6 +2829,13 @@ impl Infer {
         free_row_vars(self, &resolved, &mut row_in_ty);
         let mut row_in_env = Vec::new();
         env_free_row_vars(self, env, &mut row_in_env);
+        // The function's named rows are one row for the whole function (D2), as
+        // its annotation type variables are (above).
+        for v in self.ann_rows.values().copied().collect::<Vec<_>>() {
+            if let RowTail::Open(w) = self.resolve_row(&EffectRow::open(v)).tail {
+                row_in_env.push(w);
+            }
+        }
         // A handle's clauses row still being filled is not quantified: its
         // labels arrive when the handle is done (the resume-row review's F1).
         for c in self.pending_clause_rows.clone().into_iter().chain(
@@ -2740,6 +2901,11 @@ impl Infer {
     /// but performing an effect is `E0421`; any set difference (in either
     /// direction) is `E0423`, naming the exact labels it differs by.
     fn check_exact_row(&mut self, amb: RowVar, declared: &[Spanned<String>]) {
+        // A named row's check is done earlier, before the ambient closes
+        // (2.48).
+        if crate::ast::row_tail(declared).1.is_some() {
+            return;
+        }
         let performed = self.resolve_row(&EffectRow::open(amb));
         if declared.is_empty() {
             // Declared pure `/ {}`: any performed effect is a purity violation.
@@ -2800,6 +2966,42 @@ impl Infer {
         }
     }
 
+    /// A declared row that ends in a named variable, `/ {Log | e}` (spec
+    /// 2026-10-30-elya-row-variables D2): each declared label must be performed
+    /// (E0423, as for a closed row), and the rest of what the body performs is
+    /// `e`'s: the ambient is unified with `{labels | e}`.
+    fn check_named_row(&mut self, amb: RowVar, labels: &[Spanned<String>], name: &Spanned<String>) {
+        let performed = self.resolve_row(&EffectRow::open(amb));
+        let unused: Vec<(String, Span)> = labels
+            .iter()
+            .filter(|l| !performed.labels.contains_key(&l.node))
+            .map(|l| (l.node.clone(), l.span))
+            .collect();
+        if !unused.is_empty() {
+            let span = unused[0].1;
+            self.emit_row_mismatch(
+                &unused,
+                span,
+                "the declared row includes an effect the body never performs",
+            );
+            return;
+        }
+        let tail = self.ann_row(&name.node, name.span);
+        let mut m = BTreeMap::new();
+        for l in labels {
+            if let Some(have) = performed.labels.get(&l.node) {
+                m.insert(l.node.clone(), have.clone());
+            }
+        }
+        let declared = EffectRow {
+            labels: m,
+            tail: RowTail::Open(tail),
+        };
+        let span = labels.first().map(|l| l.span).unwrap_or(Span::EMPTY);
+        let r = self.unify_row(&EffectRow::open(amb), &declared, span);
+        self.surface_conflict(r);
+    }
+
     /// The discharge pass at `main`: `main` may perform only `{IO}` (natively
     /// discharged by the runtime). Any user effect that survives to `main` is
     /// unhandled — `E0420`, naming the perform site from provenance.
@@ -2845,7 +3047,20 @@ fn elaborate_adt_ty(
             .collect();
         let ret = elaborate_adt_ty(inf, &t.args[n - 1], param_env, known, effects);
         let mut labels = BTreeMap::new();
-        for l in t.row.iter().flatten() {
+        let (row, tail) = crate::ast::row_tail(t.row.as_deref().unwrap_or(&[]));
+        if let Some(v) = tail {
+            // Spec 2026-10-30-elya-row-variables: a declaration's row variable is
+            // its part 2 (a row parameter); refused by name until then.
+            inf.diags.push(
+                Diagnostic::error(
+                    "E0432",
+                    format!("a declaration's row cannot name a row variable (`{}`) yet", v.node),
+                )
+                .with_label(v.span, "a row variable in a declaration")
+                .with_help("write the row's effects, or leave it out: a declaration's unwritten row is pure"),
+            );
+        }
+        for l in row {
             match effects.get(&l.node) {
                 _ if l.node == "IO" => {}
                 Some(0) => {}
@@ -3316,7 +3531,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
         // 1. fresh monotype per member (with a fresh open ambient row), in scope
         //    for the whole group.
         let mut member_ty: HashMap<usize, (Vec<Ty>, RowVar, Ty)> = HashMap::new();
-        let mut ann_vars_of: HashMap<usize, HashMap<String, Ty>> = HashMap::new();
+        let mut ann_vars_of: HashMap<usize, AnnNames> = HashMap::new();
         for &i in group {
             let f = fns[i];
             let params: Vec<Ty> = f.params.iter().map(|_| inf.fresh()).collect();
@@ -3339,11 +3554,18 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             // so a call earlier in the group already sees them. The function's
             // annotation variables live on into its body (step 2).
             inf.ann_vars = HashMap::new();
+            inf.ann_rows = HashMap::new();
             for (p, pty) in f.params.iter().zip(&params) {
                 inf.check_ann(&p.node.ann, pty, false);
             }
             inf.check_ann(&f.ret_ann, &result, true);
-            ann_vars_of.insert(i, std::mem::take(&mut inf.ann_vars));
+            ann_vars_of.insert(
+                i,
+                (
+                    std::mem::take(&mut inf.ann_vars),
+                    std::mem::take(&mut inf.ann_rows),
+                ),
+            );
             // A function's own row is in no expression's type: recorded at its
             // declaration's span, pre-zonk like every entry (the single zonk at
             // the end resolves it), for `CoreFn::row` (spec 2026-10-16).
@@ -3363,10 +3585,13 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             .flat_map(|i| member_ty[i].0.iter().cloned())
             .collect();
         // 2. infer each body under its params + ambient (monomorphic in-group).
+        let mut named_of: HashMap<usize, HashMap<String, RowVar>> = HashMap::new();
         for &i in group {
             let f = fns[i];
             let (params, amb_f, result) = member_ty[&i].clone();
-            inf.ann_vars = ann_vars_of.remove(&i).unwrap_or_default();
+            let (vars, rows) = ann_vars_of.remove(&i).unwrap_or_default();
+            inf.ann_vars = vars;
+            inf.ann_rows = rows;
             env.push();
             for (p, pty) in f.params.iter().zip(&params) {
                 // Slice 5b-3 §3.2: record the parameter's type at its OWN span,
@@ -3391,6 +3616,9 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             inf.param_tys.clear();
             inf.unify(&result, &body_ty, f.body.span);
             env.pop();
+            // This member's row names, its body's included, for its declared
+            // row (2.48; the review's F3: the last member's were read).
+            named_of.insert(i, std::mem::take(&mut inf.ann_rows));
         }
         // 2.4. Sub-effecting: every pending inclusion reaches its ambient
         //      before anything closes. A recorded tail that is now free in a
@@ -3420,6 +3648,22 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             params.extend(group_params.iter().cloned());
             inf.close_unrelayed_residual(l, &params);
         }
+        // 2.48. A declared row that ends in a named variable (spec
+        //       2026-10-30-elya-row-variables D2), with its own member's names,
+        //       BEFORE anything closes: closing first forced the name pure
+        //       wherever else it is written (the review's F2).
+        for &i in group {
+            let f = fns[i];
+            let (_params, amb_f, _result) = member_ty[&i].clone();
+            if let Some(declared) = &f.effect_row {
+                let (labels, tail) = crate::ast::row_tail(declared);
+                if let Some(v) = tail {
+                    inf.ann_rows = named_of.remove(&i).unwrap_or_default();
+                    inf.check_named_row(amb_f, labels, v);
+                }
+            }
+        }
+        inf.ann_rows.clear();
         // 2.5. close each member's residual ambient (once all in-group effects
         //      are accumulated), unless it is relayed through a parameter.
         for &i in group {

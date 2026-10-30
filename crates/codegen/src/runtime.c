@@ -338,6 +338,52 @@ int64_t elya_str_eq(void *a, void *b) {
     return memcmp(&((int64_t *)a)[2], &((int64_t *)b)[2], (size_t)la) == 0;
 }
 
+/* A string by byte (spec 2026-10-24-elya-trace-text D1), with the
+ * evaluator's words for every failure. `[tag, length, bytes..., NUL]`: the
+ * length and any byte are one load each. */
+int64_t elya_str_length(void *s) { return ((int64_t *)s)[1]; }
+
+int64_t elya_str_byte_at(void *s, int64_t i) {
+    int64_t len = ((int64_t *)s)[1];
+    if (i < 0 || i >= len) {
+        fprintf(stderr, "elya: string.byte_at: index %lld is outside a string of %lld bytes\n",
+                (long long)i, (long long)len);
+        exit(1);
+    }
+    return ((const unsigned char *)&((int64_t *)s)[2])[i];
+}
+
+/* Rust's `str::is_char_boundary` for `i` in [0, len]: not a continuation byte. */
+static int elya_str_boundary(const unsigned char *b, int64_t len, int64_t i) {
+    return i == 0 || i == len || (b[i] & 0xC0) != 0x80;
+}
+
+/* `string.slice(s, from, to)`: a fresh string of the bytes [from, to). The
+ * range is checked first, then both ends against UTF-8 boundaries (the
+ * evaluator's order). `s` is rooted while the slice allocates. */
+void *elya_str_slice(int64_t tag, void *s, int64_t from, int64_t to) {
+    int64_t len = ((int64_t *)s)[1];
+    if (!(0 <= from && from <= to && to <= len)) {
+        fprintf(stderr, "elya: string.slice: %lld..%lld is not a range in a string of %lld bytes\n",
+                (long long)from, (long long)to, (long long)len);
+        exit(1);
+    }
+    const unsigned char *b = (const unsigned char *)&((int64_t *)s)[2];
+    if (!elya_str_boundary(b, len, from) || !elya_str_boundary(b, len, to)) {
+        fprintf(stderr, "elya: string.slice: %lld..%lld splits a UTF-8 character\n",
+                (long long)from, (long long)to);
+        exit(1);
+    }
+    int64_t n = to - from;
+    elya_gc_push(s);
+    int64_t *p = (int64_t *)elya_alloc(2 + ((n + 1) + 7) / 8);
+    elya_gc_pop();
+    p[0] = tag;
+    p[1] = n;
+    memcpy(&p[2], (const char *)&((int64_t *)s)[2] + from, (size_t)n);
+    return p;
+}
+
 /* `==` on data (spec 2026-10-16-elya-structural-equality, D3): 1 when `a` and
  * `b` are structurally equal. The descriptor table says which fields are heap
  * values (compared as values) and which are words (compared as words); a
@@ -708,6 +754,9 @@ void *elya_any_show(int64_t string_tag, const int64_t *t, const char *names, int
             break;
         }
         case ANY_FN:
+            /* The program's output first, as from the evaluator (the
+             * main-values review's L1). */
+            fflush(stdout);
             fprintf(stderr, "elya: %sa function%s\n", before, after);
             exit(1);
         case ANY_ADT: {
@@ -1396,7 +1445,7 @@ static int trace_utf8(const unsigned char *p, int64_t n) {
 
 /* Reads the trace as `run_source_replaying` does: a byte-order mark skipped,
  * `lines()` (a trailing `\r` dropped), the header trimmed, blank lines
- * skipped, the LAST ` = ` splitting a line, both sides trimmed. The entries
+ * skipped, the first ` = ` outside quotes splitting a line, both sides trimmed. The entries
  * point into `t`, which lives as long as the process. */
 static void trace_parse(const char *t, int64_t n) {
     if (n >= 3 && (unsigned char)t[0] == 0xEF && (unsigned char)t[1] == 0xBB &&
@@ -1419,14 +1468,26 @@ static void trace_parse(const char *t, int64_t n) {
                 trace_bad("not a trace: the first line must be `" ELYA_TRACE_HEADER "`", 0);
             }
         } else if (trace_trim(line, le).n > 0) {
+            /* The first ` = ` outside a string literal (spec
+             * 2026-10-24-elya-trace-text D2), as `split_entry` splits. */
             const char *split = NULL;
-            for (const char *p = line; p + 3 <= le; p++) {
-                if (p[0] == ' ' && p[1] == '=' && p[2] == ' ') {
+            int in_str = 0;
+            for (const char *p = line; p < le; p++) {
+                if (in_str && *p == '\\') {
+                    p++;
+                    if (p >= le) {
+                        break;
+                    }
+                } else if (*p == '"') {
+                    in_str = !in_str;
+                } else if (!in_str && p + 3 <= le && p[0] == ' ' && p[1] == '=' && p[2] == ' ') {
                     split = p;
+                    break;
                 }
             }
             if (!split) {
-                trace_bad("expected `question = answer`", index + 2);
+                trace_bad(in_str ? "a string is not closed" : "expected `question = answer`",
+                          index + 2);
             }
             elya_trace_entries = (TraceEntry *)any_grow(elya_trace_entries, &elya_trace_cap,
                                                         elya_trace_n + 1, sizeof(TraceEntry));
@@ -1499,8 +1560,12 @@ static void elya_trace_init(void) {
 }
 
 /* After `main` returns, before its value is printed: a replay must have asked
- * everything (the evaluator's unread-entries error). */
-static void elya_trace_finish(void) {
+ * everything (the evaluator's unread-entries error). `elya_start` calls it, and
+ * so does `@elya_entry` before it writes a non-`Int` value line (the main-values
+ * review's F2: the line, or the failure to write it, comes after the check, as
+ * from the evaluator). Writing the line reads no entry, so a second call finds
+ * what the first did. */
+void elya_trace_finish(void) {
     if (elya_trace_mode == TRACE_REPLAY && elya_trace_next < elya_trace_n) {
         int64_t left = elya_trace_n - elya_trace_next;
         TraceEntry *e = &elya_trace_entries[elya_trace_next];

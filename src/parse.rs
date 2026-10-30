@@ -1213,7 +1213,7 @@ impl<'a> Parser<'a> {
                 return None;
             }
             let row = if self.eat(&TokenKind::Slash) {
-                Some(self.effect_row())
+                Some(self.effect_row(true))
             } else {
                 None
             };
@@ -1527,7 +1527,7 @@ impl<'a> Parser<'a> {
         let mut effects = None;
         if self.eat(&TokenKind::Slash) {
             let list_start = self.peek_span();
-            let row = self.effect_row();
+            let row = self.effect_row(false);
             end = end.merge(list_start);
             if let Some(last) = row.last() {
                 end = end.merge(last.span);
@@ -1595,7 +1595,7 @@ impl<'a> Parser<'a> {
         // optional effect row: `/ { Name, Name }`. `None` distinguishes an
         // absent annotation (infer the row) from an explicit pure `/ {}`.
         let effect_row = if self.eat(&TokenKind::Slash) {
-            Some(self.effect_row())
+            Some(self.effect_row(true))
         } else {
             None
         };
@@ -1621,13 +1621,20 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse `{ Name, Name }` after `/`, keeping effect head names with spans.
-    fn effect_row(&mut self) -> Vec<Spanned<String>> {
+    /// With `tail`, the row may end in a row variable (spec
+    /// 2026-10-30-elya-row-variables D1): `{e}` alone, or `{Name, Name | e}`;
+    /// it is pushed last, lowercase (`ast::row_tail` splits it off). A grant list
+    /// (`import m / {..}`) is parsed with `tail` false: it names effects only.
+    fn effect_row(&mut self, tail: bool) -> Vec<Spanned<String>> {
         let mut names = Vec::new();
         if !self.eat(&TokenKind::LBrace) {
             self.error(self.peek_span(), "expected `{` for effect row");
             return names;
         }
-        if self.peek() != Some(&TokenKind::RBrace) {
+        // The items first (effects and any lowercase name), then `| name`; then
+        // one named error at most (the row-variables review's F5).
+        let mut items: Vec<(bool, Spanned<String>)> = Vec::new();
+        if !matches!(self.peek(), Some(TokenKind::RBrace) | Some(TokenKind::Bar)) {
             loop {
                 let lspan = self.peek_span();
                 match self.peek().cloned() {
@@ -1637,7 +1644,11 @@ impl<'a> Parser<'a> {
                         if self.eat(&TokenKind::LParen) {
                             self.skip_balanced_parens();
                         }
-                        names.push(spanned(n, lspan));
+                        items.push((false, spanned(n, lspan)));
+                    }
+                    Some(TokenKind::Lower(n)) => {
+                        self.bump();
+                        items.push((true, spanned(n, lspan)));
                     }
                     _ => {
                         self.error(self.peek_span(), "expected effect name");
@@ -1647,6 +1658,59 @@ impl<'a> Parser<'a> {
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
+            }
+        }
+        let mut var = None;
+        if let [(true, v)] = items.as_slice() {
+            // `{e}`: any effects, named; nothing may follow it.
+            var = Some(v.clone());
+            items.clear();
+            if self.peek() == Some(&TokenKind::Bar) {
+                self.error(self.peek_span(), "nothing follows a row variable");
+                while !matches!(self.peek(), Some(TokenKind::RBrace) | None) {
+                    self.bump();
+                }
+                var = None;
+            }
+        } else {
+            if let Some((_, v)) = items.iter().find(|(lower, _)| *lower) {
+                self.error(
+                    v.span,
+                    "a row variable comes after the effects and `|`: write `{Log | e}`",
+                );
+                items.retain(|(lower, _)| !*lower);
+            }
+            if self.eat(&TokenKind::Bar) {
+                let vspan = self.peek_span();
+                match self.peek().cloned() {
+                    Some(TokenKind::Lower(n)) => {
+                        self.bump();
+                        var = Some(spanned(n, vspan));
+                        if self.peek() == Some(&TokenKind::Bar) {
+                            self.error(self.peek_span(), "nothing follows a row variable");
+                            while !matches!(self.peek(), Some(TokenKind::RBrace) | None) {
+                                self.bump();
+                            }
+                            var = None;
+                        }
+                    }
+                    _ => {
+                        self.error(vspan, "expected a row variable (lowercase) after `|`");
+                        while !matches!(self.peek(), Some(TokenKind::RBrace) | None) {
+                            self.bump();
+                        }
+                    }
+                }
+            }
+        }
+        names.extend(items.into_iter().map(|(_, l)| l));
+        if let Some(v) = var {
+            if !tail {
+                self.error(v.span, "a grant names effects, not a row variable");
+            } else if v.node == "_" {
+                self.error(v.span, "a row variable needs a name");
+            } else {
+                names.push(v);
             }
         }
         self.close_brace();

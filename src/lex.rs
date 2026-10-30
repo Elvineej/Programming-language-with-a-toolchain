@@ -115,6 +115,10 @@ pub enum TokenKind {
     AmpAmp,
     #[token("||")]
     PipePipe,
+    /// `|` before a row's variable: `/ {Log | e}` (spec
+    /// 2026-10-30-elya-row-variables D1).
+    #[token("|")]
+    Bar,
     #[token("..")]
     DotDot,
 

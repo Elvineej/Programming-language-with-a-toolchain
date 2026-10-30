@@ -79,6 +79,18 @@ pub struct TypeAnn {
     pub row: Option<Vec<Spanned<String>>>,
 }
 
+/// An annotation's row as its effects and the row variable that ends it, if any
+/// (spec 2026-10-30-elya-row-variables D1): the parser pushes the variable last,
+/// and it alone is lowercase.
+pub fn row_tail(row: &[Spanned<String>]) -> (&[Spanned<String>], Option<&Spanned<String>>) {
+    match row.split_last() {
+        Some((last, rest)) if !last.node.starts_with(|c: char| c.is_ascii_uppercase()) => {
+            (rest, Some(last))
+        }
+        _ => (row, None),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct OpSig {
     pub name: String,

@@ -3,19 +3,20 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-24, a scheduled run on `auto/elya`)
+## State at handoff (updated 2026-10-30, an interactive session on `auto/elya`)
 
-- `main` has everything through #23 (merged 2026-10-16 at ab791b6: N7 part 2 through
-  argument records and `elya run --record/--replay`). Draft PR #24 carries `auto/elya`
-  since (the native stack onward).
+- `main` has everything through #24 (merged 2026-10-24 at 6c9ab27: the native stack
+  through alias renaming). Draft PR #25 carries `auto/elya` since (strings by byte
+  onward; opened 2026-10-30, when the maintainer saw no new commits: nothing had
+  carried the branch after #24's merge).
 - Scheduled auto-runs work on branch `auto/elya` (one draft PR to `main`) and log in
   `AUTO_RUN_LOG.md`; the maintainer reviews on GitHub.
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
   former e-mail address; every branch was force-pushed. Do not push old local branches.
-- The repo is private until the maintainer flips it public (only they can).
+- The repo is public (seen 2026-10-30; the maintainer flipped it).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1284 passed, 132 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1355 passed, 145 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -559,59 +560,94 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   and refused natively); float literals take an exponent (`1.0e19`), `1e19` is
   E0003, out of range is E0002. `float.to_string` unchanged.
 
+- **Strings by byte, one trace line format, and `replay.parse`** (2026-10-30, branch
+  `auto/elya`): spec `docs/superpowers/specs/2026-10-24-elya-trace-text-design.md`.
+  - `string.length`, `string.byte_at` and `string.slice` index a string by byte. They
+    are pure, each failure is named, and a slice may not split a UTF-8 character.
+    They work on both evaluators and both native emitters.
+  - Both host readers split a trace line at the first ` = ` outside a string
+    literal; `read_trace` is the host's reader as a function.
+  - `replay.parse(text)` is written in Elya and reads exactly as the host does
+    (checked on 1 041 short traces).
+  - The evaluator's strings are shared (`Rc<str>`), so a byte loop is linear.
+  - Needs the Windows gate.
+
+- **What `main` is worth, for every data type** (2026-10-30, branch `auto/elya`,
+  fa24c18): spec `docs/superpowers/specs/2026-10-30-elya-main-values-design.md`.
+  The sweep's last native refusals.
+  - `elya run --value` and a native binary end with main's value as its literal
+    (`True`, `1.5`, `Some(3)`); `Int` and `Unit` (`0`) are unchanged. A value that
+    holds a function fails by name on both sides, after the output.
+  - A generic `main` is instantiated at its defaults (natively it was "no `main`").
+  - The two instance-budget refusals stay: both decode at a non-regular type.
+  - From the review: a constructor used as a function is "a function" in the
+    evaluator too, also in `op.encode` and `op.show`; natively the value line comes
+    after a replay's unread-entry check.
+  - Needs the Windows gate.
+
+- **A block's length is not a stack bound** (2026-10-30, branch `auto/elya`,
+  17869d4): spec `docs/superpowers/specs/2026-10-30-elya-long-blocks-design.md`.
+  - Every codegen pass walks a block's `let`s with a loop (`core::let_spine`), in
+    the recursion's order of effects; Core and the evaluator's environment drop
+    through a heap stack.
+  - `elya build` of 100 000 statements: 18.6 s (was a stack overflow). Long blocks
+    in every place a block can be build on a 512 KiB thread.
+  - From the review: `spill` had kept a `let`'s type unspilled (a function of four
+    from a computed callee was refused); the CPS sites' saved sets were quadratic
+    on a long block (names looked up from the oldest binding).
+  - Nesting depth stays bounded; the parser refuses past 1024 levels by name.
+  - Needs the Windows gate.
+
+- **A name clash is reported once, where it was made** (2026-10-30, branch
+  `auto/elya`, d868904): spec `docs/superpowers/specs/2026-10-30-elya-name-clashes-design.md`.
+  - A module's reference to an operation means the operation, whatever the root
+    declares: a root `fn console_line` is its one E0205 (it also made three E0200s
+    inside `elya/console.elya`).
+  - An effect declared twice is E0209 alone (its handlers made five E0207s).
+  - E0605 is never about a name the file, or a file it imports, declares.
+  - Types, constructors, effects and operations stay one name space (their names
+    are data: traces, `op.show`).
+
+- **The occurs checks look inside effect rows** (2026-10-30, branch `auto/elya`,
+  2736024): spec `docs/superpowers/specs/2026-10-30-elya-occurs-in-rows-design.md`.
+  Found measuring step 1: three-line programs crashed `elya check` with a stack
+  overflow (a type or row variable bound inside its own effect label's argument).
+  Now E0401 or E0424.
+
+- **Row variables you can write in a signature** (2026-10-30, branch `auto/elya`,
+  394a0b8; step 1's part 1): spec `docs/superpowers/specs/2026-10-30-elya-row-variables-design.md`.
+  - `fn run(f: fn() / {e} -> Int) / {e} -> Int` and `/ {Log | e}`, written as the
+    checker prints a row (a new `|` token); one name is one row for its whole
+    function, flexible like a lowercase type name.
+  - From the review: an older row-unification bug dropped a label when two rows
+    ended in one variable (a clean-checking program failed at run time), fixed;
+    named declared rows are unified per member before the ambient closes.
+
 ## The next five steps
 
-### 1. Strings to read a trace: one trace format for the host and `elya/replay`
+### 1. Row parameters on declarations: effects and types that carry a task's effects (part 2)
 
-`elya/replay` (spec 2026-10-24-elya-std-replay §3) writes the host trace's line
-shape, but no Elya program can read text back (no string functions beyond `<>`,
-`==` and the `to_string`s, no input), and the host's reader splits a line at its
-last ` = `, which a string answer containing ` = ` breaks. Measure what a reader
-needs (length, a character or byte at an index, a slice, a search; reading a
-file or stdin as an effect), then decide in a spec: the string builtins (bytes
-or characters; failures by name out of range), a quote-aware line format both
-readers share, and `replay.parse(text)`. Also from that review: `record` under a
-multi-shot handler fails at run time (one-shot `with any`), and `replay` cannot
-decode an answer typed by the effect's own parameter.
+Measured 2026-10-30, for step 2: a standard `elya/async` cannot be written
+today. Each async example declares its own `effect Async` whose task type
+names the program's other effects (`fn spawn(f: fn() / {Async, Log} -> Int)`),
+and a module cannot name the user's `Log`.
+- A function's signature already leaves a row open by writing none:
+  `fn twice(f: fn() -> Int)` takes a task that says something (2).
+- An operation's cannot: `effect Async { fn spawn(f: fn() -> Int) -> Int }`
+  takes pure tasks only (a task that says is E0423), and no row can be written
+  open (`/ {e}` is E0100, `/ {Log | e}` is E0001; `effect Async(t)` takes
+  types, not rows).
+- A type's fields are the same (`types::elaborate_adt_ty`: "a declaration has
+  no row variables"), and each scheduler stores its tasks in one (`type Step`
+  in every example).
+Part 1 (row variables in a function's own annotations) is done (394a0b8); the
+spec's D3-D6 are this part. Decide in it: row parameters on effect and type declarations
+(`effect Async(e)`, `type Step(e)`, a task `fn() / {Async(e) | e} -> Int`), how
+a use writes one (`Async(Log)`? a row in an effect's argument list), what a
+clause that calls a task may perform, and both back ends (rows are
+monomorphized natively, N7 part 1).
 
-### 2. The sweep's last native refusals
-
-After alias renaming (spec 2026-10-24 §3) the differential sweep's native
-refusals are four, all older: two `main`s whose value is not an `Int` (a
-`Float` main, "non-Int value"), two "too many type instances" (the N7 part 2
-instance budget). Measure each family (which `main` types, which programs grow
-instances, and how), then decide in a spec: what a native binary prints for a
-`main` of each type (the evaluator's `run --value` text, as for `Int` and
-`Unit`), and whether the budget is hit by non-regular types (a named refusal
-is right) or by ordinary ones (a bigger or a smarter bound).
-
-### 3. Core passes iterative over a block's statements
-
-Left by diagnostics at the edges (spec 2026-10-24 D5): a block is a chain of
-`let`s in Core and every Core pass (`mono::rewrite_let` first) recurses down
-it, so a block's length is bounded only by the CLI's 1 GiB stack (about 90 000
-statements in a debug build; a library caller on a small thread overflows far
-sooner, about 700 statements on 8 MiB). Measure which passes recurse on the
-spine (`gdb` on a 10 000-line `main` under a small stack), then decide in a
-spec: an explicit loop over the `let` spine in each pass (the principled
-fix: no bound at all), or a flatter Core block node. Also from that review:
-`let a{i+1} = fn() { a{i} }` repeated 2000 times takes over 300 s in `check`
-(inference).
-
-### 4. Name clashes across files: diagnostics that stay in the user's file
-
-Seen by the capabilities part-3 review (older): a root that declares `fn
-console_line` while importing `elya/console` gets the right E0205 and also
-E0200s inside `elya/console.elya`, a file the user never wrote (a user module
-does the same); and a root declaring its own `type Counted` without importing
-the module that declares one gets E0605 "add `import ...`", whose advice then
-leads to E0209. Measure the cascades (a function, type, constructor, effect or
-operation of the root clashing with one of a module's, direct and transitive),
-then decide in a spec: report a clash once, in the importing file, naming the
-module; and whether E0605's help should say "rename" when following it would
-be E0209.
-
-### 5. Async as a standard module: `elya/async`
+### 2. Async as a standard module: `elya/async`
 
 ROADMAP priority 1's examples (`04_async.elya`, `06_structured.elya`,
 `08_timers.elya`) each carry their own scheduler: `spawn`/`await`/`yld`, a
@@ -622,9 +658,87 @@ pattern: the effects and pure schedulers in `elya/async`, any host binding in
 `elya/host`). Measure what the three examples share and what each needs
 (result types, cancellation, a timer's host clock through `elya/clock`), then
 decide the API in a spec; prove it by rewriting the examples on it, in the
-evaluator and natively. The names carry the module's (part 3 D1).
+evaluator and natively. The names carry the module's (part 3 D1). Needs step 1:
+a task's row must be open (measured 2026-10-30).
+
+### 3. Compiler scalability: no step quadratic in a program's size
+
+The maintainer's priority (2026-10-30: "compiler scalability is still
+fragile"). A block's length is no longer a stack bound (17869d4); measured and
+still open, each in a debug build:
+- **inference on chains of closures:** `let a{i+1} = fn() { a{i} }`: 100 links
+  6.5 s, 200 links 108 s (about n^4), 400 not done in 300 s. Each `a{i}` is
+  generalized and instantiated, and its type is a tower of `i` arrows;
+- **the evaluator's name lookup:** a parameter used down a block of
+  `let a{i} = (a{i-1} + x) % 1000003`: 5 000 statements 4.5 s, 10 000 17 s,
+  20 000 77 s. The environment is a chain of scopes, one per `let`;
+- **nested performs in inference:** `fn f() { op(fn() { op(fn() { .. }) }) }`
+  25 deep 0.09 s, 50 deep 0.68 s, 100 deep 8.4 s (measured by the occurs-in-rows
+  review);
+- **CPS code size:** each site's continuation emits the rest of its region,
+  so a function's code grows with its sites times its length (the long-blocks
+  places test: about 30 s for 70 000 statements at one site per thousand).
+Measure where each goes (a profile; the corpus's programs too), then decide in
+a spec, per item: share types instead of copying them, or skip generalizing a
+binding with no free variable of its own; extend a uniquely owned scope in
+place, or resolve names to slots before the run (the tree-walking oracle too);
+continuations that share the rest of a region instead of copying it. The proof:
+each at ten times today's size, linear.
+
+### 4. The affine guarantee across functions
+
+The maintainer's priority (2026-10-30: "the affine resource guarantee is
+incomplete"). `linear` values are checked within one function body (slice
+4d-2, E0428 and E0429; README "Affine resources"); the 4d-2 spec tracks two
+approximations: a callee that duplicates an affine parameter is not caught at
+its callers, and the check is insensitive to branches (a use in each arm of an
+`if` counts twice). Measure each with programs (accepted that should not be,
+refused that should not be), then decide in a spec: a parameter's
+multiplicity, inferred or annotated, checked at every call; branch-sensitive
+counting (the maximum over arms, not the sum); and what crosses a lambda, a
+handler clause and a resume.
+
+### 5. Native compilation without its implementation limits
+
+The maintainer's priority (2026-10-30: "native compilation has restrictive
+implementation limits"). Inventory every refusal natively against the
+evaluator: the budgets (256 type instances, 256 type and convention clones),
+non-regular types (refused by name on purpose, spec 2026-10-17 D5), and the
+effect-polymorphism corners ("upcast in a parameter position", "type variable
+only in an effect row", "effect-polymorphic function used at a user effect",
+"direct function used where an effectful one is expected", and since row
+variables, "calling convention disagrees with the callee" for a function whose
+named row says more than its body performs). For each: a
+program the evaluator runs, then lift it or say in a spec why it stays. The
+differential sweep is the measure: no refusal left that the evaluator runs.
 
 ## Also open, unscheduled
+
+Row unification's `absorb` may drop labels (the occurs-in-rows review, 2026-10-30, by
+reasoning, not reproduced): its second call can rebind an already-bound tail when
+`r1.tail == r2.tail`, as Remy's side condition is missing. It cannot form a cycle
+(the stored row is resolved). Find a program that shows it, or show it cannot.
+
+**Reading text from outside** (was step 3; moved for the maintainer's priorities,
+2026-10-30): `replay.parse` reads a trace the program already holds as a `String`. No Elya
+program can read a file or standard input (spec 2026-10-24-elya-trace-text D4).
+Measure what reading needs:
+- whole files or lines;
+- what a missing file or invalid UTF-8 is (a failure by name, or an answer);
+- how a replay answers a read (the trace holds the text it returned).
+Then decide in a spec: the builtins (`io.read_file`, `io.read_line`?) and their
+effect (`IO`, which the host records like `time.*`, or a capability of their own
+under `elya/host`); and both back ends, recording and replaying a read the same way.
+
+`examples/08_timers.elya`'s real-clock part can reorder `a` and `c` under heavy
+load (its snapshot then fails): the three deadlines are 10 ms apart and counted
+from each task's own spawn (seen 2026-10-30 with a debugger running beside the
+gate). Wider gaps, or deadlines from one start, would make it hold.
+
+`else if` does not exist: an `else` branch must be a block, so a chain of
+conditions nests (`else { if .. }`), as `std/replay.elya`'s `parse` does
+(2026-10-30). Parsing `else if c { .. }` as `else { if c { .. } }` is a small
+language decision with a spec of its own.
 
 E0434 rejects a direct inner `with any` over `Hold(Opt(Op))` but accepts the same
 handler through a generic function (the 2026-10-23 review's F4). A helper taking an

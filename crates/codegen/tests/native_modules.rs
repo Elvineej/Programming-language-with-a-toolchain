@@ -23,7 +23,7 @@ fn agree(root: &str, files: &[(&str, &str)], tag: &str) {
     };
     let o = elya::run_source_outcome_with("main.elya", root, &mut read);
     assert!(o.error.is_none(), "{tag}: {:?}", o.error);
-    let want = format!("{}{}\n", o.output, o.value.unwrap().unwrap());
+    let want = format!("{}{}\n", o.output, o.line.unwrap().unwrap());
     let (module, diags, _) = elya::front_end_with("main.elya", root, &mut read);
     assert!(diags.is_empty(), "{tag}: {diags:?}");
     let session = elya::Session::new();

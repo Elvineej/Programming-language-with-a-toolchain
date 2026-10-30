@@ -11,7 +11,10 @@ use std::rc::Rc;
 pub enum Value {
     Int(i64),
     Float(f64),
-    Str(String),
+    /// Shared, so reading a variable or passing an argument is O(1) whatever
+    /// the length (the 2026-10-30 review's F2: `byte_at` in a loop copied the
+    /// whole string at every read, so `replay.parse` was quadratic).
+    Str(Rc<str>),
     Bool(bool),
     Unit,
     /// A top-level function, referenced by name (Slice 2 has no lambdas).
@@ -116,7 +119,7 @@ pub(crate) fn match_pattern(value: &Value, pat: &Pattern) -> Option<Vec<(String,
             let matches = match (l, value) {
                 (PatLit::Int(a), Value::Int(b)) => a == b,
                 (PatLit::Bool(a), Value::Bool(b)) => a == b,
-                (PatLit::Str(a), Value::Str(b)) => a == b,
+                (PatLit::Str(a), Value::Str(b)) => a.as_str() == &**b,
                 (PatLit::Unit, Value::Unit) => true,
                 _ => false,
             };
@@ -154,6 +157,22 @@ fn rt(span: Span, msg: impl Into<String>) -> RuntimeError {
 struct Scope {
     vars: HashMap<String, Value>,
     parent: Option<Rc<Scope>>,
+}
+
+/// A scope's parents are freed in a loop: a block's `let`s make a chain as long
+/// as the block, and the derived `Drop` recursed down it (spec
+/// 2026-10-30-elya-long-blocks D2). A parent another environment still holds
+/// stops the loop; its last owner frees it.
+impl Drop for Scope {
+    fn drop(&mut self) {
+        let mut next = self.parent.take();
+        while let Some(rc) = next {
+            match Rc::try_unwrap(rc) {
+                Ok(mut scope) => next = scope.parent.take(),
+                Err(_) => break,
+            }
+        }
+    }
 }
 
 /// Persistent parent-pointer environment holding local bindings only.
@@ -240,6 +259,10 @@ impl Interp {
     pub fn output(&self) -> &str {
         &self.output
     }
+    /// The module's constructors and operations, as [`crate::literal::show`] reads them.
+    pub fn types(&self) -> &crate::literal::TypeInfo {
+        &self.types
+    }
     pub fn peak_kont_depth(&self) -> usize {
         self.peak_kont
     }
@@ -297,7 +320,12 @@ pub(crate) fn apply_binop(
         (SubF, Float(a), Float(b)) => Ok(Float(a - b)),
         (MulF, Float(a), Float(b)) => Ok(Float(a * b)),
         (DivF, Float(a), Float(b)) => Ok(Float(a / b)),
-        (Concat, Str(a), Str(b)) => Ok(Str(a + &b)),
+        (Concat, Str(a), Str(b)) => {
+            let mut s = String::with_capacity(a.len() + b.len());
+            s.push_str(&a);
+            s.push_str(&b);
+            Ok(Str(s.into()))
+        }
         (Eq, a, b) => structural_eq(&a, &b, span).map(Bool),
         (Ne, a, b) => structural_eq(&a, &b, span).map(|e| Bool(!e)),
         (Lt, Int(a), Int(b)) => Ok(Bool(a < b)),
@@ -453,6 +481,49 @@ pub(crate) fn float_conversion(
     }
 }
 
+/// `string.length`, `string.byte_at`, `string.slice` (spec
+/// 2026-10-24-elya-trace-text D1): a string by byte. Each failure is named; a
+/// slice may not split a UTF-8 character, so a `String` stays UTF-8.
+pub(crate) fn string_builtin(
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, RuntimeError> {
+    match (name, args) {
+        ("length", [Value::Str(s)]) => Ok(Value::Int(s.len() as i64)),
+        ("byte_at", [Value::Str(s), Value::Int(i)]) => {
+            match usize::try_from(*i).ok().and_then(|k| s.as_bytes().get(k)) {
+                Some(b) => Ok(Value::Int(i64::from(*b))),
+                None => Err(rt(
+                    span,
+                    format!(
+                        "string.byte_at: index {i} is outside a string of {} bytes",
+                        s.len()
+                    ),
+                )),
+            }
+        }
+        ("slice", [Value::Str(s), Value::Int(from), Value::Int(to)]) => {
+            let len = s.len() as i64;
+            if !(0 <= *from && from <= to && *to <= len) {
+                return Err(rt(
+                    span,
+                    format!("string.slice: {from}..{to} is not a range in a string of {len} bytes"),
+                ));
+            }
+            let (a, b) = (*from as usize, *to as usize);
+            if !s.is_char_boundary(a) || !s.is_char_boundary(b) {
+                return Err(rt(
+                    span,
+                    format!("string.slice: {from}..{to} splits a UTF-8 character"),
+                ));
+            }
+            Ok(Value::Str(Rc::from(&s[a..b])))
+        }
+        _ => Err(rt(span, format!("string.{name}: a wrong argument"))),
+    }
+}
+
 pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, RuntimeError> {
     match (op, v) {
         (UnOp::Neg, Value::Int(n)) => n
@@ -539,7 +610,7 @@ pub mod tree {
         match &e.node {
             Expr::Int(n) => Ok(Value::Int(*n)),
             Expr::Float(x) => Ok(Value::Float(*x)),
-            Expr::Str(s) => Ok(Value::Str(s.clone())),
+            Expr::Str(s) => Ok(Value::Str(Rc::from(s.as_str()))),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Unit => Ok(Value::Unit),
             // Only in a module with a parse error, which is never run.
@@ -614,7 +685,7 @@ pub mod tree {
                         let [Value::Int(n)] = &vals[..] else {
                             return Err(rt(span, "int.to_string expects a single Int"));
                         };
-                        return Ok(Value::Str(n.to_string()));
+                        return Ok(Value::Str(n.to_string().into()));
                     }
                     if module == "float" && name == "to_string" {
                         let mut vals = Vec::new();
@@ -624,7 +695,7 @@ pub mod tree {
                         let [Value::Float(x)] = &vals[..] else {
                             return Err(rt(span, "float.to_string expects a single Float"));
                         };
-                        return Ok(Value::Str(crate::literal::float_text(*x)));
+                        return Ok(Value::Str(crate::literal::float_text(*x).into()));
                     }
                     if module == "float"
                         && crate::resolve::FLOAT_CONVERSIONS.contains(&name.as_str())
@@ -634,6 +705,15 @@ pub mod tree {
                             vals.push(eval_expr(interp, a, env, fns)?);
                         }
                         return super::float_conversion(name, &vals, span);
+                    }
+                    if module == "string"
+                        && crate::resolve::STRING_BUILTINS.contains(&name.as_str())
+                    {
+                        let mut vals = Vec::new();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        return super::string_builtin(name, &vals, span);
                     }
                     if module == "int" && super::INT_BINARY_BUILTINS.contains(&name.as_str()) {
                         let mut vals = Vec::new();
@@ -781,6 +861,7 @@ pub mod cek {
         Builtin(&'static str),                    // e.g. "io.println"
         IntBinary(&'static str),                  // `int.<name>` of two Ints
         FloatConversion(&'static str),            // `float.<name>` conversions
+        StringBuiltin(&'static str),              // `string.<name>` by byte
         Value(Value),                             // an evaluated callee (a Value::Fn)
         Operation { effect: String, op: String }, // a perform of an effect op
         Ctor { name: String },                    // a data-constructor application
@@ -1131,7 +1212,7 @@ pub mod cek {
         Ok(match &e.node {
             Expr::Int(n) => State::Return(Value::Int(*n), k),
             Expr::Float(x) => State::Return(Value::Float(*x), k),
-            Expr::Str(s) => State::Return(Value::Str(s.clone()), k),
+            Expr::Str(s) => State::Return(Value::Str(Rc::from(s.as_str())), k),
             Expr::Bool(b) => State::Return(Value::Bool(*b), k),
             Expr::Unit => State::Return(Value::Unit, k),
             Expr::Error => return Err(rt(span, "a statement that did not parse")),
@@ -1224,6 +1305,19 @@ pub mod cek {
                             }
                             None => {
                                 return Err(rt(span, format!("unknown builtin `float.{name}`")))
+                            }
+                        }
+                    }
+                    Expr::Qualified { module, name } if module == "string" => {
+                        match crate::resolve::STRING_BUILTINS
+                            .iter()
+                            .position(|b| b == name)
+                        {
+                            Some(i) => {
+                                CalleeSlot::StringBuiltin(crate::resolve::STRING_BUILTINS[i])
+                            }
+                            None => {
+                                return Err(rt(span, format!("unknown builtin `string.{name}`")))
                             }
                         }
                     }
@@ -1700,17 +1794,23 @@ pub mod cek {
                 super::float_conversion(name, &args, span)?,
                 k,
             )),
+            CalleeSlot::StringBuiltin(name) => {
+                Ok(State::Return(super::string_builtin(name, &args, span)?, k))
+            }
             CalleeSlot::Builtin("int.to_string") => {
                 let [Value::Int(n)] = &args[..] else {
                     return Err(rt(span, "int.to_string expects a single Int"));
                 };
-                Ok(State::Return(Value::Str(n.to_string()), k))
+                Ok(State::Return(Value::Str(n.to_string().into()), k))
             }
             CalleeSlot::Builtin("float.to_string") => {
                 let [Value::Float(x)] = &args[..] else {
                     return Err(rt(span, "float.to_string expects a single Float"));
                 };
-                Ok(State::Return(Value::Str(crate::literal::float_text(*x)), k))
+                Ok(State::Return(
+                    Value::Str(crate::literal::float_text(*x).into()),
+                    k,
+                ))
             }
             CalleeSlot::Builtin(b) if b.starts_with("op.") => {
                 let Some(Value::Op {
@@ -1724,21 +1824,23 @@ pub mod cek {
                 let (effect, op, op_args) = (effect.clone(), op.clone(), op_args.clone());
                 let named = format!("{effect}.{op}");
                 match (b, &args[1..]) {
-                    ("op.name", []) => Ok(State::Return(Value::Str(named), k)),
-                    ("op.show", []) => match crate::literal::show_op(&effect, &op, &op_args) {
-                        Ok(s) => Ok(State::Return(Value::Str(s), k)),
-                        Err(what) => Err(rt(
-                            span,
-                            format!(
+                    ("op.name", []) => Ok(State::Return(Value::Str(named.into()), k)),
+                    ("op.show", []) => {
+                        match crate::literal::show_op(&interp.types, &effect, &op, &op_args) {
+                            Ok(s) => Ok(State::Return(Value::Str(s.into()), k)),
+                            Err(what) => Err(rt(
+                                span,
+                                format!(
                                 "op.show: an argument of `{named}` is {what}, which is not data"
                             ),
-                        )),
-                    },
+                            )),
+                        }
+                    }
                     // The same operation again, from the clause: outside the
                     // handler, so it reaches the next one out.
                     ("op.perform", []) => perform(interp, effect, op, (*op_args).clone(), span, k),
-                    ("op.encode", [v]) => match crate::literal::show(v) {
-                        Ok(s) => Ok(State::Return(Value::Str(s), k)),
+                    ("op.encode", [v]) => match crate::literal::show(&interp.types, v) {
+                        Ok(s) => Ok(State::Return(Value::Str(s.into()), k)),
                         Err(what) => Err(rt(
                             span,
                             format!(
@@ -1826,14 +1928,14 @@ fn host_builtin(
         if i > 0 {
             q.push_str(", ");
         }
-        q.push_str(&crate::literal::show(a).map_err(|e| rt(span, e))?);
+        q.push_str(&crate::literal::show(&interp.types, a).map_err(|e| rt(span, e))?);
     }
     q.push(')');
     match &mut interp.world {
         World::Live => time_builtin(&name["time.".len()..], args, span),
         World::Record(log) => {
             let v = time_builtin(&name["time.".len()..], args, span)?;
-            let a = crate::literal::show(&v).map_err(|e| rt(span, e))?;
+            let a = crate::literal::show(&interp.types, &v).map_err(|e| rt(span, e))?;
             log.push((q, a));
             Ok(v)
         }

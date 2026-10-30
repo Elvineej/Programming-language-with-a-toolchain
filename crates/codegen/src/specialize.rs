@@ -26,8 +26,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use elya::core::{
-    CoreClause, CoreExpr, CoreFn, CoreGenericType, CoreHandle, CoreKind, CoreModule, CoreParam,
-    CorePat, CorePerform, CoreReturn, CoreType,
+    let_spine, rebuild_spine, CoreClause, CoreExpr, CoreFn, CoreGenericType, CoreHandle, CoreKind,
+    CoreModule, CoreParam, CorePat, CorePerform, CoreReturn, CoreType,
 };
 use elya::types::{EffectLabel, EffectRow, RowTail, RowVar, Ty};
 
@@ -196,7 +196,22 @@ pub(crate) fn subst_expr(e: &CoreExpr, s: &RowSubst) -> CoreExpr {
         CoreKind::Ctor(n, a) => CoreKind::Ctor(n.clone(), all(a)),
         CoreKind::Prim(o, a) => CoreKind::Prim(*o, all(a)),
         CoreKind::Lambda(ps, b) => CoreKind::Lambda(subst_params(ps, s), go(b)),
-        CoreKind::Let(x, v, b) => CoreKind::Let(x.clone(), go(v), go(b)),
+        // A block in a loop (spec 2026-10-30-elya-long-blocks D1).
+        CoreKind::Let(..) => {
+            let (spine, body) = let_spine(e);
+            let lets = spine
+                .iter()
+                .map(|l| {
+                    (
+                        l.node.span,
+                        subst_ty(&l.node.ty, s),
+                        l.name.to_string(),
+                        subst_expr(l.value, s),
+                    )
+                })
+                .collect();
+            return rebuild_spine(lets, subst_expr(body, s));
+        }
         CoreKind::If(c, t, f) => CoreKind::If(go(c), go(t), go(f)),
         CoreKind::Match(sc, arms) => CoreKind::Match(
             go(sc),
@@ -343,7 +358,7 @@ impl<'a> Specializer<'a> {
                 locals.truncate(depth);
                 CoreKind::Lambda(ps.clone(), Rc::new(b?))
             }
-            CoreKind::Let(x, v, b) => return self.rewrite_let(e, x, v, b, locals),
+            CoreKind::Let(..) => return self.rewrite_block(e, locals),
             CoreKind::If(c, t, f) => CoreKind::If(
                 Rc::new(self.rewrite(c, locals)?),
                 Rc::new(self.rewrite(t, locals)?),
@@ -475,50 +490,62 @@ impl<'a> Specializer<'a> {
         self.top_clone(x, s)
     }
 
-    /// A `let` of a row-polymorphic lambda: rewrite the body first (which
-    /// records the instantiations its uses need), then bind one clone per
+    /// A block, in a loop over its `let`s (spec 2026-10-30-elya-long-blocks D1).
+    /// A `let` of a row-polymorphic lambda: rewrite the rest of the block first
+    /// (which records the instantiations its uses need), then bind one clone per
     /// instantiation right after the original, in the same scope.
-    fn rewrite_let(
-        &mut self,
-        e: &CoreExpr,
-        x: &str,
-        v: &CoreExpr,
-        b: &CoreExpr,
-        locals: &mut Vec<Local>,
-    ) -> R<CoreExpr> {
-        let v2 = self.rewrite(v, locals)?;
-        let generic = match &v.kind {
-            CoreKind::Lambda(..) if crate::cps::ty_has_open_row(&v.ty) => Some(LocalGeneric {
-                ty: v.ty.clone(),
-                clones: Vec::new(),
-            }),
-            _ => None,
-        };
-        locals.push(Local {
-            name: x.to_string(),
-            generic,
-        });
-        let b2 = self.rewrite(b, locals);
-        let me = locals.pop().expect("pushed above");
-        let mut out = CoreExpr {
-            span: e.span,
-            ty: e.ty.clone(),
-            kind: CoreKind::Let(x.to_string(), Rc::new(v2), Rc::new(b2?)),
-        };
-        if let Some(g) = me.generic {
-            // The clones are bound BEFORE the original, in the scope the
-            // original's value sees: a free `x` inside the lambda means an
-            // OUTER binding of `x`, which a clone bound under `let x` would
-            // capture instead (the review's finding 1: 1007 for 12, panics).
-            // Each is a substituted copy of the ORIGINAL value, rewritten in
-            // that same scope (it may itself call generics).
-            for (_, name, s) in g.clones.into_iter().rev() {
-                let clone = self.rewrite(&subst_expr(v, &s), locals)?;
-                out = CoreExpr {
-                    span: e.span,
-                    ty: e.ty.clone(),
-                    kind: CoreKind::Let(name, Rc::new(clone), Rc::new(out)),
-                };
+    fn rewrite_block(&mut self, e: &CoreExpr, locals: &mut Vec<Local>) -> R<CoreExpr> {
+        // The scope is restored on every path, an error's too, as the
+        // recursion restored it (the review's F6).
+        let depth = locals.len();
+        let out = self.rewrite_spine(e, locals);
+        locals.truncate(depth);
+        out
+    }
+
+    fn rewrite_spine(&mut self, e: &CoreExpr, locals: &mut Vec<Local>) -> R<CoreExpr> {
+        let (spine, body) = let_spine(e);
+        let mut bound = Vec::with_capacity(spine.len());
+        for l in &spine {
+            let v = l.value;
+            let v2 = self.rewrite(v, locals)?;
+            let generic = match &v.kind {
+                CoreKind::Lambda(..) if crate::cps::ty_has_open_row(&v.ty) => Some(LocalGeneric {
+                    ty: v.ty.clone(),
+                    clones: Vec::new(),
+                }),
+                _ => None,
+            };
+            locals.push(Local {
+                name: l.name.to_string(),
+                generic,
+            });
+            bound.push((l, v2));
+        }
+        let mut out = self.rewrite(body, locals)?;
+        for (l, v2) in bound.into_iter().rev() {
+            let me = locals.pop().expect("pushed above");
+            let (span, ty) = (l.node.span, &l.node.ty);
+            out = CoreExpr {
+                span,
+                ty: ty.clone(),
+                kind: CoreKind::Let(l.name.to_string(), Rc::new(v2), Rc::new(out)),
+            };
+            if let Some(g) = me.generic {
+                // The clones are bound BEFORE the original, in the scope the
+                // original's value sees: a free `x` inside the lambda means an
+                // OUTER binding of `x`, which a clone bound under `let x` would
+                // capture instead (the review's finding 1: 1007 for 12, panics).
+                // Each is a substituted copy of the ORIGINAL value, rewritten in
+                // that same scope (it may itself call generics).
+                for (_, name, s) in g.clones.into_iter().rev() {
+                    let clone = self.rewrite(&subst_expr(l.value, &s), locals)?;
+                    out = CoreExpr {
+                        span,
+                        ty: ty.clone(),
+                        kind: CoreKind::Let(name, Rc::new(clone), Rc::new(out)),
+                    };
+                }
             }
         }
         Ok(out)
@@ -783,10 +810,13 @@ impl Adapter<'_> {
                 kind: CoreKind::Let(t, Rc::new(e), Rc::new(inner)),
             });
         }
+        let mut e = e;
         let callee = CoreExpr {
             span,
             ty: from.clone(),
-            kind: e.kind,
+            // Taken, not moved: `CoreExpr` has a `Drop` (spec
+            // 2026-10-30-elya-long-blocks D2).
+            kind: e.take_kind(),
         };
         let params: Vec<CoreParam> = tp
             .iter()
@@ -982,12 +1012,31 @@ impl Adapter<'_> {
                 locals.truncate(depth);
                 CoreKind::Lambda(ps.clone(), Rc::new(b?))
             }
-            CoreKind::Let(x, v, b) => {
-                let v2 = self.walk(v, locals)?;
-                locals.push((x.clone(), Some(v.ty.clone())));
-                let b2 = self.walk(b, locals);
-                locals.pop();
-                CoreKind::Let(x.clone(), Rc::new(v2), Rc::new(b2?))
+            // A block in a loop (spec 2026-10-30-elya-long-blocks D1); the scope
+            // is restored on every path, an error's too (the review's F6).
+            CoreKind::Let(..) => {
+                let depth = locals.len();
+                let (spine, body) = let_spine(e);
+                let mut lets = Vec::with_capacity(spine.len());
+                let mut failed = None;
+                for l in &spine {
+                    match self.walk(l.value, locals) {
+                        Ok(v2) => {
+                            locals.push((l.name.to_string(), Some(l.value.ty.clone())));
+                            lets.push((l.node.span, l.node.ty.clone(), l.name.to_string(), v2));
+                        }
+                        Err(err) => {
+                            failed = Some(err);
+                            break;
+                        }
+                    }
+                }
+                let body = match failed {
+                    Some(err) => Err(err),
+                    None => self.walk(body, locals),
+                };
+                locals.truncate(depth);
+                return Ok(rebuild_spine(lets, body?));
             }
             CoreKind::If(c, t, f) => CoreKind::If(
                 Rc::new(self.walk(c, locals)?),

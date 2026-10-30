@@ -41,7 +41,7 @@ use inkwell::values::{IntValue, LLVMTailCallKind};
 use inkwell::AddressSpace;
 
 use elya::ast::BinOp;
-use elya::core::{CoreExpr, CoreKind, CoreModule, CorePat};
+use elya::core::{let_spine, push_children, CoreExpr, CoreKind, CoreModule, CorePat};
 use elya::types::{Ty, TyCon};
 
 use crate::cps::{self, contains_effect, is_tail_slot, needs_cps, ContSite, HandlerSite, Saved};
@@ -77,44 +77,12 @@ pub(crate) fn cps_functions(core: &CoreModule, fx: &cps::Fx) -> HashSet<String> 
 /// Every Core node by address (the identity `LambdaSite::key` and
 /// `ContSite::key` already use), so a site's recorded path can be walked.
 pub(crate) fn index_nodes(core: &CoreModule) -> HashMap<usize, &CoreExpr> {
-    fn go<'a>(e: &'a CoreExpr, out: &mut HashMap<usize, &'a CoreExpr>) {
-        out.insert(e as *const CoreExpr as usize, e);
-        match &e.kind {
-            CoreKind::Lit(_) | CoreKind::Var(_) => {}
-            CoreKind::App(f, args) => {
-                go(f, out);
-                args.iter().for_each(|a| go(a, out));
-            }
-            CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
-                a.iter().for_each(|x| go(x, out));
-            }
-            CoreKind::Perform(p) => p.args.iter().for_each(|a| go(a, out)),
-            CoreKind::Lambda(_, body) | CoreKind::Resume(body) => go(body, out),
-            CoreKind::Let(_, v, b) => {
-                go(v, out);
-                go(b, out);
-            }
-            CoreKind::If(c, t, f) => {
-                go(c, out);
-                go(t, out);
-                go(f, out);
-            }
-            CoreKind::Match(s, arms) => {
-                go(s, out);
-                arms.iter().for_each(|a| go(&a.body, out));
-            }
-            CoreKind::Handle(h) => {
-                go(&h.body, out);
-                h.clauses.iter().for_each(|c| go(&c.body, out));
-                if let Some(r) = &h.ret {
-                    go(&r.body, out);
-                }
-            }
-        }
-    }
+    // A heap stack, not recursion (spec 2026-10-30-elya-long-blocks D1).
     let mut out = HashMap::new();
-    for f in &core.fns {
-        go(&f.body, &mut out);
+    let mut stack: Vec<&CoreExpr> = core.fns.iter().map(|f| &f.body).collect();
+    while let Some(e) = stack.pop() {
+        out.insert(e as *const CoreExpr as usize, e);
+        push_children(e, &mut stack);
     }
     out
 }
@@ -225,11 +193,22 @@ fn check_local_conventions(
         }
         CoreKind::Perform(p) => p.args.iter().try_for_each(|a| go(a, locals)),
         CoreKind::Resume(v) => go(v, locals),
-        CoreKind::Let(x, v, body) => {
-            go(v, locals)?;
-            locals.push((x.clone(), Some(v.ty.clone())));
-            let r = go(body, locals);
-            locals.pop();
+        // A block in a loop (spec 2026-10-30-elya-long-blocks D1).
+        CoreKind::Let(..) => {
+            let depth = locals.len();
+            let (spine, body) = let_spine(e);
+            let mut r = Ok(());
+            for l in &spine {
+                r = go(l.value, locals);
+                if r.is_err() {
+                    break;
+                }
+                locals.push((l.name.to_string(), Some(l.value.ty.clone())));
+            }
+            if r.is_ok() {
+                r = go(body, locals);
+            }
+            locals.truncate(depth);
             r
         }
         CoreKind::If(c, t, f) => {
@@ -319,11 +298,22 @@ fn check(
             p.args.iter().try_for_each(|a| go(a, scope))
         }
         CoreKind::Resume(v) => go(v, scope),
-        CoreKind::Let(x, v, body) => {
-            go(v, scope)?;
-            scope.push(x.clone());
-            let r = go(body, scope);
-            scope.pop();
+        // A block in a loop (spec 2026-10-30-elya-long-blocks D1).
+        CoreKind::Let(..) => {
+            let depth = scope.len();
+            let (spine, body) = let_spine(e);
+            let mut r = Ok(());
+            for l in &spine {
+                r = go(l.value, scope);
+                if r.is_err() {
+                    break;
+                }
+                scope.push(l.name.to_string());
+            }
+            if r.is_ok() {
+                r = go(body, scope);
+            }
+            scope.truncate(depth);
             r
         }
         CoreKind::If(c, t, f) => {
@@ -1402,6 +1392,12 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             "float.of_int" | "float.truncate" | "float.round" if vals.len() == 1 => {
                 crate::float_conversion(self.ctx, self.b, self.lc, name, vals[0].into_int_value())
             }
+            n if n.starts_with("string.") && !vals.is_empty() => {
+                let roots = self.root_live(st, &vals[..1])?;
+                let v = crate::string_builtin(self.ctx, self.b, self.lc, n, vals)?;
+                gc_unroot(self.b, self.lc, roots)?;
+                Ok(v)
+            }
             "int.to_string" if vals.len() == 1 => {
                 let roots = self.root_live(st, &[])?;
                 let v = crate::int_to_string(self.ctx, self.b, self.lc, vals[0])?;
@@ -1549,13 +1545,28 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                 self.settle(st, before)?;
                 Ok(Some(v))
             }
-            CoreKind::Let(x, v, body) => {
-                let Some(val) = self.expr(st, v)? else {
-                    return Ok(None);
+            // A block in a loop (spec 2026-10-30-elya-long-blocks D1). A value
+            // that suspends (`None`: the rest is a continuation's) ends it.
+            CoreKind::Let(..) => {
+                let (spine, body) = let_spine(e);
+                let mut bound = Vec::with_capacity(spine.len());
+                let mut ended = None;
+                for l in &spine {
+                    match self.expr(st, l.value) {
+                        Ok(Some(val)) => bound.push((l.name, st.bind(l.name, val))),
+                        other => {
+                            ended = Some(other);
+                            break;
+                        }
+                    }
+                }
+                let out = match ended {
+                    Some(o) => o,
+                    None => self.expr(st, body),
                 };
-                let saved = st.bind(x, val);
-                let out = self.expr(st, body);
-                st.unbind(x, saved);
+                for (x, saved) in bound.into_iter().rev() {
+                    st.unbind(x, saved);
+                }
                 out
             }
             CoreKind::If(c, t, f) => {
@@ -1877,13 +1888,32 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                 };
                 self.perform(st, e, &vals, true)
             }
-            CoreKind::Let(x, v, body) => {
-                let Some(val) = self.expr(st, v)? else {
-                    return Ok(());
+            // A block in a loop (spec 2026-10-30-elya-long-blocks D1). A value
+            // that suspends (`None`: the rest is a continuation's) ends it.
+            CoreKind::Let(..) => {
+                let (spine, body) = let_spine(e);
+                let mut bound = Vec::with_capacity(spine.len());
+                let mut ended = None;
+                for l in &spine {
+                    match self.expr(st, l.value) {
+                        Ok(Some(val)) => bound.push((l.name, st.bind(l.name, val))),
+                        Ok(None) => {
+                            ended = Some(Ok(()));
+                            break;
+                        }
+                        Err(err) => {
+                            ended = Some(Err(err));
+                            break;
+                        }
+                    }
+                }
+                let out = match ended {
+                    Some(o) => o,
+                    None => self.tail(st, body),
                 };
-                let saved = st.bind(x, val);
-                let out = self.tail(st, body);
-                st.unbind(x, saved);
+                for (x, saved) in bound.into_iter().rev() {
+                    st.unbind(x, saved);
+                }
                 out
             }
             CoreKind::If(c, t, f) => {
@@ -2366,12 +2396,11 @@ fn clause_tail<'ctx>(
     env: &mut HashMap<String, BasicValueEnum<'ctx>>,
 ) -> R<()> {
     match &e.kind {
-        CoreKind::Let(x, v, body) => {
-            let val = lower_expr(cx.ctx, cx.func, cx.b, cx.lc, v, env)?;
-            let sh = bind_local(env, x, val);
-            let out = clause_tail(cx, body, answer, env);
-            unbind_local(env, x, sh);
-            out
+        // A block in a loop (spec 2026-10-30-elya-long-blocks D1).
+        CoreKind::Let(..) => {
+            crate::lower_block(cx.ctx, cx.func, cx.b, cx.lc, e, env, |body, env| {
+                clause_tail(cx, body, answer, env)
+            })
         }
         CoreKind::If(c, t, f) => {
             let cv = lower_expr(cx.ctx, cx.func, cx.b, cx.lc, c, env)?.into_int_value();

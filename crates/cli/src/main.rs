@@ -136,9 +136,9 @@ fn value_cmd(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     surface_warnings(path, &text);
-    match o.value {
-        Some(Ok(n)) => {
-            println!("{n}");
+    match o.line {
+        Some(Ok(line)) => {
+            println!("{line}");
             ExitCode::SUCCESS
         }
         Some(Err(why)) => {

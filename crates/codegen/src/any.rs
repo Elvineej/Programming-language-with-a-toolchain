@@ -24,8 +24,9 @@ use std::rc::Rc;
 
 use elya::ast::BinOp;
 use elya::core::{
-    CoreArm, CoreClause, CoreCtor, CoreEffect, CoreExpr, CoreFn, CoreHandle, CoreKind, CoreLit,
-    CoreModule, CoreOp, CoreParam, CorePat, CorePerform, CoreReturn, CoreType,
+    let_spine, rebuild_spine, CoreArm, CoreClause, CoreCtor, CoreEffect, CoreExpr, CoreFn,
+    CoreHandle, CoreKind, CoreLit, CoreModule, CoreOp, CoreParam, CorePat, CorePerform, CoreReturn,
+    CoreType,
 };
 use elya::span::Span;
 use elya::types::{EffectLabel, EffectRow, RowTail, Ty, TyCon};
@@ -303,8 +304,19 @@ impl<'a> Cx<'a> {
             CoreKind::Ctor(n, a) => CoreKind::Ctor(n.clone(), self.all(a)?),
             CoreKind::Prim(o, a) => CoreKind::Prim(*o, self.all(a)?),
             CoreKind::Lambda(ps, b) => CoreKind::Lambda(ps.clone(), Rc::new(self.expr(b)?)),
-            CoreKind::Let(x, v, b) => {
-                CoreKind::Let(x.clone(), Rc::new(self.expr(v)?), Rc::new(self.expr(b)?))
+            // A block in a loop (spec 2026-10-30-elya-long-blocks D1).
+            CoreKind::Let(..) => {
+                let (spine, body) = let_spine(e);
+                let mut lets = Vec::with_capacity(spine.len());
+                for l in &spine {
+                    lets.push((
+                        l.node.span,
+                        l.node.ty.clone(),
+                        l.name.to_string(),
+                        self.expr(l.value)?,
+                    ));
+                }
+                return Ok(rebuild_spine(lets, self.expr(body)?));
             }
             CoreKind::If(c, t, f) => CoreKind::If(
                 Rc::new(self.expr(c)?),
@@ -695,8 +707,19 @@ impl<'a> Cx<'a> {
             CoreKind::Ctor(n, a) => CoreKind::Ctor(n.clone(), self.all_ops(a)?),
             CoreKind::Prim(p, a) => CoreKind::Prim(*p, self.all_ops(a)?),
             CoreKind::Lambda(ps, b) => CoreKind::Lambda(ps.clone(), Rc::new(self.ops(b)?)),
-            CoreKind::Let(x, v, b) => {
-                CoreKind::Let(x.clone(), Rc::new(self.ops(v)?), Rc::new(self.ops(b)?))
+            // A block in a loop (spec 2026-10-30-elya-long-blocks D1).
+            CoreKind::Let(..) => {
+                let (spine, body) = let_spine(e);
+                let mut lets = Vec::with_capacity(spine.len());
+                for l in &spine {
+                    lets.push((
+                        l.node.span,
+                        l.node.ty.clone(),
+                        l.name.to_string(),
+                        self.ops(l.value)?,
+                    ));
+                }
+                return Ok(rebuild_spine(lets, self.ops(body)?));
             }
             CoreKind::If(c, t, f) => CoreKind::If(
                 Rc::new(self.ops(c)?),
@@ -782,7 +805,20 @@ fn map_vars_named(e: &CoreExpr, f: &mut dyn FnMut(&str) -> Option<String>) -> Co
         ),
         CoreKind::Prim(o, a) => CoreKind::Prim(*o, a.iter().map(|x| go(x, f)).collect()),
         CoreKind::Lambda(ps, b) => CoreKind::Lambda(ps.clone(), Rc::new(go(b, f))),
-        CoreKind::Let(x, v, b) => CoreKind::Let(x.clone(), Rc::new(go(v, f)), Rc::new(go(b, f))),
+        // A block in a loop (spec 2026-10-30-elya-long-blocks D1).
+        CoreKind::Let(..) => {
+            let (spine, body) = let_spine(e);
+            let mut lets = Vec::with_capacity(spine.len());
+            for l in &spine {
+                lets.push((
+                    l.node.span,
+                    l.node.ty.clone(),
+                    l.name.to_string(),
+                    go(l.value, f),
+                ));
+            }
+            return rebuild_spine(lets, go(body, f));
+        }
         CoreKind::If(c, t, e2) => {
             CoreKind::If(Rc::new(go(c, f)), Rc::new(go(t, f)), Rc::new(go(e2, f)))
         }

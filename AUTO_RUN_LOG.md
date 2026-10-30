@@ -3,6 +3,81 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
+## 2026-10-30 16:30 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
+
+- The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
+  spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
+- At the maintainer's "continue when the limit resets, no stops", this session keeps
+  two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
+  after the usage limit (primary)" about 5 h ahead (trig_012WFJHxdZgSbHq5NwMX3uFD) and
+  "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
+- **Done: strings by byte, one trace line format, `replay.parse`** (HANDOFF step 1;
+  spec 2026-10-24-elya-trace-text, the scheduled run's spec and plan; implementation
+  20a4804).
+  - `string.length/byte_at/slice` on both back ends.
+  - Both host readers split at the first unquoted ` = `.
+  - `replay.parse` is in Elya.
+  - Gate 1310 / 135 (predicted 1308; +2 for the review's test).
+  - **Decisions (mine; please review):**
+    - bytes, not characters;
+    - failures by name, not an `Option`;
+    - the host keeps `str::trim` (the spec's first draft moved it to ASCII, which
+      would have broken a native review test);
+    - the evaluator's strings are `Rc<str>`.
+  - The review found two issues, both fixed first:
+    - `parse` split the trimmed line (21 of 1 041 short traces read differently);
+    - the evaluator was quadratic on byte loops (89 s, now 27 s, linear).
+  - Found: no `else if` in the language (HANDOFF's open list).
+- **Done: what `main` is worth, for every data type** (HANDOFF step 1, the sweep's
+  last native refusals; spec 2026-10-30-elya-main-values; fa24c18).
+  - `--value` and native binaries write main's value as its literal; a function in
+    it fails by name; a generic `main` builds at its defaults.
+  - Gate 1315 / 136 (predicted 1315; 1312 before the review's fixes, as predicted).
+  - **Decisions (mine; please review):** `Unit` stays `0`; the instance budget's two
+    refusals stay (non-regular types).
+  - The review found five issues, all fixed first. The worst: the evaluator wrote a
+    constructor used as a function (`Some`) as data, in `op.encode` too.
+  - Seen under load: `08_timers`'s real-clock snapshot can reorder (HANDOFF's open
+    list); the re-run, alone, passed.
+- **Done: a block's length is not a stack bound** (HANDOFF step 1; spec
+  2026-10-30-elya-long-blocks; 17869d4).
+  - Every codegen pass loops over a block's `let`s; Core and the evaluator's
+    environment drop iteratively. `elya build` of 100 000 statements: 18.6 s (was a
+    stack overflow).
+  - Gate 1319 / 139 (predicted 1319).
+  - **Decisions (mine; please review):** loops over the spine, not a flatter Core
+    block node; no `stacker` (its `psm` needs Rust 1.88); nesting depth stays
+    bounded (the parser's E0102 at 1024 levels).
+  - The review found a miscompile, fixed first: `spill` had kept a `let`'s type
+    unspilled. Its tests now run on 512 KiB threads.
+  - Measured on the way: the evaluator's name lookup is quadratic on a long block
+    (77 s for 20 000 statements): HANDOFF's new step 5.
+- **Done: a name clash is reported once, where it was made** (HANDOFF step 1; spec
+  2026-10-30-elya-name-clashes; d868904).
+  - No diagnostics inside a module because of a root's clash; E0605 never for a
+    name the file or an import declares. Gate 1331 / 141 (predicted 1331).
+  - **Decision (mine; please review):** types, constructors, effects and operations
+    stay one name space (their names are data in traces and `op.show`).
+- PR #24 had been merged (2026-10-24), and nothing carried `auto/elya` after it, so
+  the maintainer saw no new commits: opened draft PR #25.
+- **Done: the occurs checks look inside effect rows** (2736024; spec
+  2026-10-30-elya-occurs-in-rows). Found measuring step 1: three-line programs
+  crashed `elya check` (a stack overflow). The review found the first fix turned some
+  into a hang, fixed first. Gate 1337 / 143.
+- At the maintainer's request (2026-10-30), HANDOFF's steps 3-5 are now their three
+  priorities: compiler scalability, the affine guarantee across functions, native
+  compilation without its limits.
+- **Done: row variables you can write in a signature** (HANDOFF step 1, part 1; spec
+  2026-10-30-elya-row-variables; 394a0b8). `/ {e}` and `/ {Log | e}`, one row per name
+  per function. The review found three serious bugs, all fixed first, the worst an
+  older row-unification bug that names made writable (a clean-checking program
+  failed at run time). Gate 1355 / 145.
+  - **Decisions (mine; please review):** the printer's syntax (`{Log | e}`);
+    flexible names, not rigid; a lowercase name spelled like an effect is a typo.
+- Next: HANDOFF step 1, part 2: row parameters on declarations.
+- Windows-gate debt: 20a4804 (runtime.c string functions and the trace split),
+  fa24c18 (runtime.c `elya_trace_finish` exported, `elya_any_show` flushes).
+
 ## 2026-10-24 09:48 UTC — IN PROGRESS (scheduled run, FULL mode)
 
 - The 05:53 entry is DONE (07:58). Next: HANDOFF step 1, strings to read a trace.

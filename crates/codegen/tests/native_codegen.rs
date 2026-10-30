@@ -5858,6 +5858,20 @@ const ARITY: &[(&str, &str, &str)] = &[
          pub fn main() -> Int { handle { k(3, 1, 0, fn(p) { lg(p) + 1 }) } with { L.lg(v) -> resume(v * 10)  return(r) -> r } }\n",
         "14",
     ),
+    // The long-blocks review's F1 (2026-10-30): a `let` whose value is the
+    // `let` naming a computed callee kept its type unspilled (a function of
+    // four), and the binder's convention check refused the program.
+    (
+        "l1-a-function-of-four-from-a-computed-callee",
+        "fn mk(k: Int) -> fn(Int) -> fn(Int, Int, Int, Int) -> Int {\n\
+         \x20 fn(m) { fn(a, b, c, d) { a + b + c + d + k * m } }\n\
+         }\n\
+         pub fn main() -> Int {\n\
+         \x20 let g = mk(10)(2)\n\
+         \x20 g(1, 2, 3, 4)\n\
+         }\n",
+        "30",
+    ),
 ];
 
 #[test]

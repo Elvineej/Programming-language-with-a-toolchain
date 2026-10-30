@@ -127,15 +127,34 @@ fn elya_run_value_prints_main_as_a_native_binary_does() {
     );
     assert!(unit.status.success(), "{unit:?}");
     assert_eq!(String::from_utf8_lossy(&unit.stdout), "x\n0\n");
+    // Every data type's literal (spec 2026-10-30-elya-main-values D1; until then
+    // a `Bool` main was refused by name: a changed expectation).
     let boolean = run(
         "bool.elya",
         "pub fn main() -> Bool { True }\n",
         &["--value"],
     );
-    assert_eq!(boolean.status.code(), Some(1), "{boolean:?}");
+    assert!(boolean.status.success(), "{boolean:?}");
+    assert_eq!(String::from_utf8_lossy(&boolean.stdout), "True\n");
+    let text = run(
+        "text.elya",
+        "type P { P(String, Float) }\npub fn main() { P(\"a\\n\", 0.5) }\n",
+        &["--value"],
+    );
+    assert!(text.status.success(), "{text:?}");
+    assert_eq!(String::from_utf8_lossy(&text.stdout), "P(\"a\\n\", 0.5)\n");
+    // A function is not data (D2): the output, then the failure by name.
+    let function = run(
+        "fn.elya",
+        "pub fn main() { io.println(\"c\")  fn(x: Int) { x } }\n",
+        &["--value"],
+    );
+    assert_eq!(function.status.code(), Some(1), "{function:?}");
+    assert_eq!(String::from_utf8_lossy(&function.stdout), "c\n");
     assert!(
-        String::from_utf8_lossy(&boolean.stderr).contains("main's value is not an `Int` or `Unit`"),
-        "{boolean:?}"
+        String::from_utf8_lossy(&function.stderr)
+            .contains("main's value is a function, which is not data"),
+        "{function:?}"
     );
     // A runtime error: the output so far, then no value line.
     let failing = run(

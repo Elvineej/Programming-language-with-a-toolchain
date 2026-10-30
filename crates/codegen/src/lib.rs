@@ -55,7 +55,7 @@ use inkwell::OptimizationLevel;
 
 use crate::closure::LambdaSite;
 use elya::ast::BinOp;
-use elya::core::{CoreExpr, CoreFn, CoreKind, CoreLit, CoreModule, CorePat};
+use elya::core::{let_spine, CoreExpr, CoreFn, CoreKind, CoreLit, CoreModule, CorePat};
 use elya::types::{Ty, TyCon};
 
 #[derive(Debug)]
@@ -250,20 +250,11 @@ fn fn_type_of<'ctx>(
     }
 }
 
-/// `main` returns i64: `@elya.main`'s signature says so and the print shim's
-/// format string is `%lld`. A `Bool`-bodied main is a representable value in an
-/// unrepresentable *place*, so it is refused at the module boundary rather than
-/// inside the fold — which is why this message stayed "non-Int value" when the
-/// fold widened.
-fn require_int(ty: &Ty) -> Result<(), CodegenError> {
-    // 5b-8 Task 11: a `Unit` main is also an i64 word (0), so the shim's
-    // `%lld` prints it as-is; A9's main ends in `io.println(..)`. A `Bool`
-    // main stays refused (an i1 is not the shim's word).
-    if matches!(ty, Ty::Base(TyCon::Int) | Ty::Base(TyCon::Unit)) {
-        Ok(())
-    } else {
-        Err(CodegenError::Unsupported("non-Int value"))
-    }
+/// Whether `main`'s value line is its literal, written by the reflection table
+/// after the run (spec 2026-10-30-elya-main-values D1), rather than the shim's
+/// `%lld`. An `Int` main prints its digits and a `Unit` main `0`, as always.
+pub(crate) fn main_shows_value(ty: &Ty) -> bool {
+    !matches!(ty, Ty::Base(TyCon::Int) | Ty::Base(TyCon::Unit))
 }
 
 /// Pass 1 of §4.2: declare every function before any body is emitted, so a body
@@ -606,6 +597,43 @@ pub(crate) fn float_conversion<'ctx>(
     }
 }
 
+/// `string.length`, `string.byte_at`, `string.slice` on lowered operands (spec
+/// 2026-10-24-elya-trace-text D1), both emitters. Only `slice` allocates; the
+/// runtime roots its string, and the caller roots whatever else is live.
+pub(crate) fn string_builtin<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    name: &str,
+    vals: &[BasicValueEnum<'ctx>],
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    let (f, args): (
+        FunctionValue<'ctx>,
+        Vec<inkwell::values::BasicMetadataValueEnum<'ctx>>,
+    ) = match (name, vals) {
+        ("string.length", [s]) => (lc.str_length, vec![(*s).into()]),
+        ("string.byte_at", [s, i]) => (lc.str_byte_at, vec![(*s).into(), (*i).into()]),
+        ("string.slice", [s, from, to]) => (
+            lc.str_slice,
+            vec![
+                i64t.const_int(lc.string_tag as u64, false).into(),
+                (*s).into(),
+                (*from).into(),
+                (*to).into(),
+            ],
+        ),
+        _ => return Err(CodegenError::UnsupportedBuiltin(name.to_string())),
+    };
+    b.build_call(f, &args, "strb")
+        .map_err(internal)?
+        .try_as_basic_value()
+        .left()
+        .ok_or(CodegenError::Unsupported(
+            "a string builtin returned no value",
+        ))
+}
+
 /// `==`/`!=` on `Unit`: both operands are evaluated, the answer is constant.
 pub(crate) fn is_unit_eq_prim(op: BinOp, args: &[CoreExpr]) -> bool {
     matches!(op, BinOp::Eq | BinOp::Ne) && matches!(args[0].ty, Ty::Base(TyCon::Unit))
@@ -714,6 +742,9 @@ pub(crate) fn is_native_builtin(name: &str) -> bool {
             | "float.of_int"
             | "float.truncate"
             | "float.round"
+            | "string.length"
+            | "string.byte_at"
+            | "string.slice"
             | "time.now_ms"
             | "time.sleep_ms"
             | "any.show"
@@ -1246,6 +1277,43 @@ fn build_closure_call<'ctx>(
     Ok(site)
 }
 
+/// A block's `let`s lowered in a loop, each bound as it is lowered, then `rest`
+/// on the expression that ends the block; the bindings are undone after, in
+/// reverse, on every path (spec 2026-10-30-elya-long-blocks D1: a block's
+/// length is not a recursion depth). A shadowed outer binding stays rooted
+/// meanwhile (`bind_local`).
+pub(crate) fn lower_block<'ctx, T>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    e: &CoreExpr,
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    rest: impl FnOnce(&CoreExpr, &mut HashMap<String, BasicValueEnum<'ctx>>) -> Result<T, CodegenError>,
+) -> Result<T, CodegenError> {
+    let (spine, body) = let_spine(e);
+    let mut bound = Vec::with_capacity(spine.len());
+    let mut failed = None;
+    for l in &spine {
+        // A bound value is NOT in tail position; only the block's end can be.
+        match lower_expr(ctx, func, b, lc, l.value, env) {
+            Ok(v) => bound.push((l.name, bind_local(env, l.name, v))),
+            Err(err) => {
+                failed = Some(err);
+                break;
+            }
+        }
+    }
+    let out = match failed {
+        Some(err) => Err(err),
+        None => rest(body, env),
+    };
+    for (x, shadowed) in bound.into_iter().rev() {
+        unbind_local(env, x, shadowed);
+    }
+    out
+}
+
 /// §4.3: the tail half of the emission split. `lower_expr` produces a VALUE;
 /// `lower_tail` emits a TERMINATOR. On `Ok` the current block is terminated —
 /// every arm here ends in a `ret` or hands off to a recursive call that does.
@@ -1285,15 +1353,9 @@ fn lower_tail<'ctx>(
             lower_tail(ctx, func, b, lc, else_e, env)?;
             Ok(())
         }
-        CoreKind::Let(x, rhs, body) => {
-            // The bound value is NOT in tail position; only the body is.
-            let v = lower_expr(ctx, func, b, lc, rhs, env)?;
-            // A shadowed outer binding stays rooted (`bind_local`).
-            let shadowed = bind_local(env, x, v);
-            let out = lower_tail(ctx, func, b, lc, body, env);
-            unbind_local(env, x, shadowed);
-            out
-        }
+        CoreKind::Let(..) => lower_block(ctx, func, b, lc, e, env, |body, env| {
+            lower_tail(ctx, func, b, lc, body, env)
+        }),
         // A call in a match arm is in tail position too (HANDOFF step 1).
         CoreKind::Match(scrutinee, arms) => {
             lower_match(ctx, func, b, lc, scrutinee, arms, None, env)?;
@@ -1753,6 +1815,20 @@ fn lower_expr<'ctx>(
             let x = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
             float_conversion(ctx, b, lc, builtin, x)
         }
+        CoreKind::Builtin(builtin, args) if builtin.starts_with("string.") => {
+            // The string is rooted while later operands are lowered (they may
+            // allocate), and the environment across a slice's allocation.
+            let s = lower_expr(ctx, func, b, lc, &args[0], env)?;
+            let own = usize::from(gc_root(b, lc, s)?);
+            let mut vals = vec![s];
+            for a in args[1..].iter() {
+                vals.push(lower_expr(ctx, func, b, lc, a, env)?);
+            }
+            let roots = gc_root_env(b, lc, env)?;
+            let v = string_builtin(ctx, b, lc, builtin, &vals)?;
+            gc_unroot(b, lc, roots + own)?;
+            Ok(v)
+        }
         CoreKind::Builtin(builtin, args) if builtin == "int.to_string" && args.len() == 1 => {
             let n = lower_expr(ctx, func, b, lc, &args[0], env)?;
             let roots = gc_root_env(b, lc, env)?;
@@ -1789,15 +1865,11 @@ fn lower_expr<'ctx>(
             Some(v) => Ok(*v),
             None => Err(CodegenError::Unsupported("unbound var")),
         },
-        CoreKind::Let(x, rhs, body) => {
-            let v = lower_expr(ctx, func, b, lc, rhs, env)?;
-            // Restore any shadowed binding -- `let x = 1; let x = x + 1` stays
-            // correct -- and keep it ROOTED meanwhile (`bind_local`).
-            let shadowed = bind_local(env, x, v);
-            let out = lower_expr(ctx, func, b, lc, body, env);
-            unbind_local(env, x, shadowed);
-            out
-        }
+        // Any shadowed binding is restored -- `let x = 1; let x = x + 1` stays
+        // correct -- and kept ROOTED meanwhile (`bind_local`).
+        CoreKind::Let(..) => lower_block(ctx, func, b, lc, e, env, |body, env| {
+            lower_expr(ctx, func, b, lc, body, env)
+        }),
         CoreKind::Prim(op, args) => {
             if args.len() != 2 {
                 return Err(CodegenError::Unsupported("binary Prim arity"));
@@ -2324,6 +2396,12 @@ struct LowerCtx<'a, 'ctx> {
     /// `elya_float_to_int(name, bits, round)` (`ccc`; exits on NaN or outside
     /// `Int`, spec 2026-10-24-elya-float-part-2 D4).
     float_to_int: FunctionValue<'ctx>,
+    /// `elya_str_length(s)`, `elya_str_byte_at(s, i)` and
+    /// `elya_str_slice(tag, s, from, to)` (`ccc`; the last two exit by name,
+    /// spec 2026-10-24-elya-trace-text D1).
+    str_length: FunctionValue<'ctx>,
+    str_byte_at: FunctionValue<'ctx>,
+    str_slice: FunctionValue<'ctx>,
 }
 
 /// Fold `core.types` into a flat constructor table: name -> (tag, field types).
@@ -2430,12 +2508,12 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let descriptors = descriptor_rows(core, &lambdas, &sites, &handlers, n_real_ctors, string_tag)?;
 
     let main = find_main(core)?;
-    // §5.5: `main` ALONE. The scope narrows from "every function" (which was
-    // trivially just `main` in N1) to "`main`", because `@elya.main`'s signature
-    // says i64 and the shim's format string is `%lld`. Applying this per
-    // function would refuse every ordinary predicate — see `is_pos` in the
-    // corpus — and is the most likely way to implement this section wrong.
-    require_int(&main.body.ty)?;
+    // Since 2026-10-30 every type of `main` has a value line (spec
+    // 2026-10-30-elya-main-values D1): an `Int` or `Unit` one through the
+    // shim's `%lld`, any other written by `elya_entry` through the reflection
+    // table. (Until then a non-`Int` main was refused here, "non-Int value".)
+    let main_ty = main.body.ty.clone();
+    let shows_value = main_shows_value(&main_ty);
 
     let i64t = ctx.i64_type();
     let i32t = ctx.i32_type();
@@ -2486,6 +2564,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let gc_pop = module.add_function("elya_gc_pop", gc_pop_ty, None); // ccc
     let gc_report_ty = ctx.void_type().fn_type(&[], false);
     let gc_report = module.add_function("elya_gc_report", gc_report_ty, None); // ccc
+    let trace_finish = module.add_function("elya_trace_finish", gc_report_ty, None); // ccc
 
     let lifted = declare_lifted(ctx, &module, &lambdas)?;
     let trap_ty = ctx.void_type().fn_type(&[], false);
@@ -2585,6 +2664,12 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let shift_range = module.add_function("elya_shift_range", shift_range_ty, None); // ccc
     let float_to_int_ty = i64t.fn_type(&[ptrt.into(), i64t.into(), i64t.into()], false);
     let float_to_int = module.add_function("elya_float_to_int", float_to_int_ty, None); // ccc
+    let str_length_ty = i64t.fn_type(&[ptrt.into()], false);
+    let str_length = module.add_function("elya_str_length", str_length_ty, None); // ccc
+    let str_byte_at_ty = i64t.fn_type(&[ptrt.into(), i64t.into()], false);
+    let str_byte_at = module.add_function("elya_str_byte_at", str_byte_at_ty, None); // ccc
+    let str_slice_ty = ptrt.fn_type(&[i64t.into(), ptrt.into(), i64t.into(), i64t.into()], false);
+    let str_slice = module.add_function("elya_str_slice", str_slice_ty, None); // ccc
     let op_ids = cps_emit::op_ids(core);
     let (resume_fns, handler_fns) =
         cps_emit::declare(ctx, &module, &nodes, &sites, &handlers, &op_ids)?;
@@ -2640,6 +2725,9 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         any_check,
         shift_range,
         float_to_int,
+        str_length,
+        str_byte_at,
+        str_slice,
     };
     let b = ctx.create_builder();
     let handle_end_code = cps_emit::emit_handle_end(ctx, &module, &b, current_handler)?;
@@ -2738,7 +2826,43 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         .try_as_basic_value()
         .left()
         .ok_or_else(|| internal("elya_main did not return a value"))?;
-    b.build_return(Some(&main_value)).map_err(internal)?;
+    if shows_value {
+        // D1: the value's literal, as `elya run --value` writes it; D2: a
+        // function stops by name in `elya_any_show`. The walk allocates only the
+        // finished string, after it has read the value. A replay's check that
+        // every entry was read comes first, as in the evaluator (the review's
+        // F2); `elya_start` repeats it, finding the same.
+        b.build_call(trace_finish, &[], "").map_err(internal)?;
+        let node = lc
+            .reflect
+            .node_of(&main_ty)
+            .ok_or_else(|| internal("main's type is not in the reflection table"))?;
+        let w = value_to_word(&b, main_value, &main_ty, i64t)?;
+        let text = b
+            .build_call(
+                lc.any_show,
+                &[
+                    i64t.const_int(lc.string_tag as u64, false).into(),
+                    lc.any_table.into(),
+                    lc.any_names.into(),
+                    i64t.const_int(node as u64, false).into(),
+                    w.into(),
+                    c_string(ctx, &lc, "main's value is ").into(),
+                    c_string(ctx, &lc, ", which is not data").into(),
+                ],
+                "mainshow",
+            )
+            .map_err(internal)?
+            .try_as_basic_value()
+            .left()
+            .ok_or(CodegenError::Unsupported("elya_any_show returned no value"))?;
+        b.build_call(lc.println, &[text.into()], "")
+            .map_err(internal)?;
+        b.build_return(Some(&i64t.const_int(0, false)))
+            .map_err(internal)?;
+    } else {
+        b.build_return(Some(&main_value)).map_err(internal)?;
+    }
     let start_ty = i64t.fn_type(&[ptrt.into()], false);
     let start = module.add_function("elya_start", start_ty, None); // ccc
 
@@ -2788,8 +2912,10 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         .try_as_basic_value()
         .left()
         .ok_or_else(|| internal("elya_start did not return a value"))?;
-    b.build_call(printf, &[fmt.as_pointer_value().into(), v.into()], "p")
-        .map_err(internal)?;
+    if !shows_value {
+        b.build_call(printf, &[fmt.as_pointer_value().into(), v.into()], "p")
+            .map_err(internal)?;
+    }
     // AFTER the answer, so a stats dump can never interleave with the value the
     // execution proofs assert on, and gated on ELY_GC_STATS inside the runtime
     // so stderr stays empty unless a test asks for the counters.
@@ -3126,17 +3252,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bool_literal_specifically() {
+    fn a_bool_literal_main_compiles() {
+        // Was `rejects_bool_literal_specifically` ("non-Int value") until
+        // 2026-10-30: every data `main` has a value line now, written through
+        // the reflection table (spec 2026-10-30-elya-main-values D1). A changed
+        // expectation, by that decision.
         let e = CoreExpr {
             span: Span::EMPTY,
             ty: Ty::Base(TyCon::Bool),
             kind: CoreKind::Lit(CoreLit::Bool(true)),
         };
-        let err = emit_ir(&main_fn(e)).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("non-Int value")),
-            "{err:?}"
-        );
+        emit_ir(&main_fn(e)).expect("a Bool main verifies");
     }
 
     #[test]
@@ -3667,7 +3793,9 @@ mod tests {
     }
 
     #[test]
-    fn a_bool_returning_helper_compiles_but_a_bool_main_still_refuses() {
+    fn a_bool_returning_helper_and_a_bool_main_compile() {
+        // The second half changed on 2026-10-30 (spec 2026-10-30-elya-main-values
+        // D1): a `Bool` main was refused, "non-Int value"; it has a value line now.
         // §5.5. `require_int`'s SCOPE narrows from "every function" (trivially
         // just `main` in N1) to "`main` alone". The likely way to get this wrong
         // is to implement it as scope-PRESERVING — applying `require_int` per
@@ -3678,11 +3806,7 @@ mod tests {
             "fn is_pos(n) { n > 0 }\npub fn main() { if is_pos(3) { 1 } else { 0 } }\n",
         ))
         .expect("a Bool-returning helper is legal");
-        let err = emit_ir(&core_of("pub fn main() { 1 < 2 }\n")).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("non-Int value")),
-            "{err:?}"
-        );
+        emit_ir(&core_of("pub fn main() { 1 < 2 }\n")).expect("a Bool main verifies");
     }
 
     /// `repr_ty` says pointer <=> `is_heap_ty` says traced. If these ever disagree,

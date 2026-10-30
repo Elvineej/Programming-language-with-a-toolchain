@@ -29,6 +29,170 @@ pub struct CoreExpr {
     pub kind: CoreKind,
 }
 
+/// Dismantles the tree through a heap stack, not the host's (spec
+/// 2026-10-30-elya-long-blocks D2): a block is a `Let` spine as long as the block,
+/// and the derived `Drop` recursed down it (60 000 statements overflowed 8 MiB).
+/// Only children whose last reference this is are taken; a shared subtree is
+/// freed by its last owner, as the evaluator's `CtorArgs` does.
+impl Drop for CoreExpr {
+    fn drop(&mut self) {
+        if matches!(self.kind, CoreKind::Lit(_) | CoreKind::Var(_)) {
+            return;
+        }
+        let mut stack = vec![self.take_kind()];
+        while let Some(kind) = stack.pop() {
+            match kind {
+                CoreKind::Lit(_) | CoreKind::Var(_) => {}
+                CoreKind::App(mut f, mut a) => {
+                    take_one(&mut f, &mut stack);
+                    take_all(&mut a, &mut stack);
+                }
+                CoreKind::Builtin(_, mut a)
+                | CoreKind::Ctor(_, mut a)
+                | CoreKind::Prim(_, mut a) => take_all(&mut a, &mut stack),
+                CoreKind::Lambda(_, mut b) | CoreKind::Resume(mut b) => {
+                    take_one(&mut b, &mut stack)
+                }
+                CoreKind::Let(_, mut v, mut b) => {
+                    take_one(&mut v, &mut stack);
+                    take_one(&mut b, &mut stack);
+                }
+                CoreKind::If(mut c, mut t, mut f) => {
+                    take_one(&mut c, &mut stack);
+                    take_one(&mut t, &mut stack);
+                    take_one(&mut f, &mut stack);
+                }
+                CoreKind::Match(mut s, mut arms) => {
+                    take_one(&mut s, &mut stack);
+                    if let Some(arms) = Rc::get_mut(&mut arms) {
+                        for a in arms.iter_mut() {
+                            stack.push(a.body.take_kind());
+                        }
+                    }
+                }
+                CoreKind::Handle(mut h) => {
+                    if let Some(h) = Rc::get_mut(&mut h) {
+                        take_one(&mut h.body, &mut stack);
+                        if let Some(clauses) = Rc::get_mut(&mut h.clauses) {
+                            for c in clauses.iter_mut() {
+                                take_one(&mut c.body, &mut stack);
+                            }
+                        }
+                        if let Some(r) = h.ret.as_mut().and_then(Rc::get_mut) {
+                            take_one(&mut r.body, &mut stack);
+                        }
+                    }
+                }
+                CoreKind::Perform(mut p) => {
+                    if let Some(p) = Rc::get_mut(&mut p) {
+                        take_all(&mut p.args, &mut stack);
+                    }
+                }
+            }
+            // `kind` drops here, its children emptied: each of their drops
+            // returns at the leaf check above.
+        }
+    }
+}
+
+impl CoreExpr {
+    /// This node's kind, a leaf (`Unit`) left in its place: how a pass takes a
+    /// node apart, since a type with a `Drop` cannot be moved out of.
+    pub fn take_kind(&mut self) -> CoreKind {
+        std::mem::replace(&mut self.kind, CoreKind::Lit(CoreLit::Unit))
+    }
+}
+
+fn take_one(e: &mut Rc<CoreExpr>, stack: &mut Vec<CoreKind>) {
+    if let Some(e) = Rc::get_mut(e) {
+        stack.push(e.take_kind());
+    }
+}
+
+fn take_all(es: &mut Rc<[CoreExpr]>, stack: &mut Vec<CoreKind>) {
+    if let Some(es) = Rc::get_mut(es) {
+        stack.extend(es.iter_mut().map(CoreExpr::take_kind));
+    }
+}
+
+/// One binding of a `let` spine: the `Let` node (its span and type), its name and
+/// its value.
+pub struct SpineLet<'a> {
+    pub node: &'a CoreExpr,
+    pub name: &'a str,
+    pub value: &'a CoreExpr,
+}
+
+/// `e`'s chain of `Let`s, outermost first, and the expression that ends it. A pass
+/// walks a block with this loop rather than recursing into each `let`'s body, so
+/// its depth is the program's nesting, not a block's length (spec
+/// 2026-10-30-elya-long-blocks D1).
+pub fn let_spine(e: &CoreExpr) -> (Vec<SpineLet<'_>>, &CoreExpr) {
+    let mut lets = Vec::new();
+    let mut cur = e;
+    while let CoreKind::Let(x, v, b) = &cur.kind {
+        lets.push(SpineLet {
+            node: cur,
+            name: x,
+            value: v,
+        });
+        cur = b;
+    }
+    (lets, cur)
+}
+
+/// `e`'s direct children, pushed on `out` for a walk with a heap stack (spec
+/// 2026-10-30-elya-long-blocks D1): a match arm's body, a clause's and the
+/// `return`'s are children too; a pattern, a parameter or a binder name is not.
+pub fn push_children<'a>(e: &'a CoreExpr, out: &mut Vec<&'a CoreExpr>) {
+    match &e.kind {
+        CoreKind::Lit(_) | CoreKind::Var(_) => {}
+        CoreKind::App(f, a) => {
+            out.push(f);
+            out.extend(a.iter());
+        }
+        CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
+            out.extend(a.iter())
+        }
+        CoreKind::Lambda(_, b) | CoreKind::Resume(b) => out.push(b),
+        CoreKind::Let(_, v, b) => {
+            out.push(v);
+            out.push(b);
+        }
+        CoreKind::If(c, t, f) => {
+            out.push(c);
+            out.push(t);
+            out.push(f);
+        }
+        CoreKind::Match(s, arms) => {
+            out.push(s);
+            out.extend(arms.iter().map(|a| &a.body));
+        }
+        CoreKind::Handle(h) => {
+            out.push(&h.body);
+            out.extend(h.clauses.iter().map(|c| &*c.body));
+            if let Some(r) = &h.ret {
+                out.push(&r.body);
+            }
+        }
+        CoreKind::Perform(p) => out.extend(p.args.iter()),
+    }
+}
+
+/// The inverse of [`let_spine`]: each `(span, type, name, value)`, outermost first,
+/// bound around `body`.
+pub fn rebuild_spine(lets: Vec<(Span, Ty, String, CoreExpr)>, body: CoreExpr) -> CoreExpr {
+    let mut out = body;
+    for (span, ty, x, v) in lets.into_iter().rev() {
+        out = CoreExpr {
+            span,
+            ty,
+            kind: CoreKind::Let(x, Rc::new(v), Rc::new(out)),
+        };
+    }
+    out
+}
+
 #[derive(Clone, Debug)]
 pub enum CoreKind {
     Lit(CoreLit),
@@ -457,10 +621,9 @@ fn ann_to_ty_in(a: &TypeAnn, tparams: &[String]) -> Ty {
             .map(|x| ann_to_ty_in(&x.node, tparams))
             .collect();
         let ret = ann_to_ty_in(&a.args[n - 1].node, tparams);
-        let labels = a
-            .row
+        let labels = crate::ast::row_tail(a.row.as_deref().unwrap_or(&[]))
+            .0
             .iter()
-            .flatten()
             .map(|l| {
                 (
                     l.node.clone(),

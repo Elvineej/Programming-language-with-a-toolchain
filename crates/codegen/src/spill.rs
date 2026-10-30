@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use elya::core::{
-    CoreArm, CoreClause, CoreCtor, CoreExpr, CoreFn, CoreHandle, CoreKind, CoreModule, CoreParam,
-    CorePat, CorePerform, CoreReturn, CoreType,
+    let_spine, CoreArm, CoreClause, CoreCtor, CoreExpr, CoreFn, CoreHandle, CoreKind, CoreModule,
+    CoreParam, CorePat, CorePerform, CoreReturn, CoreType,
 };
 use elya::span::Span;
 use elya::types::{EffectLabel, EffectRow, Ty};
@@ -253,8 +253,22 @@ impl Spill {
                 let (ps, body) = self.bind_params(ps, body);
                 CoreKind::Lambda(ps, Rc::new(body))
             }
-            CoreKind::Let(x, v, b) => {
-                CoreKind::Let(x.clone(), Rc::new(self.expr(v)), Rc::new(self.expr(b)))
+            // A block in a loop (spec 2026-10-30-elya-long-blocks D1), in the
+            // recursion's order: the values, the body, then each `let`'s type
+            // spilled from the innermost out (the review's F1: the types were
+            // kept unspilled, and a binder's convention check refused).
+            CoreKind::Let(..) => {
+                let (spine, body) = let_spine(e);
+                let values: Vec<CoreExpr> = spine.iter().map(|l| self.expr(l.value)).collect();
+                let mut out = self.expr(body);
+                for (l, v) in spine.iter().zip(values).rev() {
+                    out = CoreExpr {
+                        span: l.node.span,
+                        ty: self.ty(&l.node.ty),
+                        kind: CoreKind::Let(l.name.to_string(), Rc::new(v), Rc::new(out)),
+                    };
+                }
+                return out;
             }
             CoreKind::If(c, t, f) => CoreKind::If(
                 Rc::new(self.expr(c)),

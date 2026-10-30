@@ -23,9 +23,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use elya::core::{
-    CoreArm, CoreClause, CoreCtor, CoreExpr, CoreFn, CoreGenericType, CoreHandle, CoreKind,
-    CoreModule, CoreParam, CorePat, CorePerform, CoreReturn, CoreType,
+    let_spine, push_children, rebuild_spine, CoreArm, CoreClause, CoreCtor, CoreExpr, CoreFn,
+    CoreGenericType, CoreHandle, CoreKind, CoreModule, CoreParam, CorePat, CorePerform, CoreReturn,
+    CoreType,
 };
+use elya::span::Span;
 use elya::types::{EffectLabel, EffectRow, RowTail, RowVar, Ty, TyCon};
 
 use crate::CodegenError;
@@ -207,7 +209,22 @@ pub(crate) fn map_expr(e: &CoreExpr, f: &dyn Fn(&Ty) -> Ty) -> CoreExpr {
         CoreKind::Ctor(n, a) => CoreKind::Ctor(n.clone(), all(a)),
         CoreKind::Prim(o, a) => CoreKind::Prim(*o, all(a)),
         CoreKind::Lambda(ps, b) => CoreKind::Lambda(params(ps), go(b)),
-        CoreKind::Let(x, v, b) => CoreKind::Let(x.clone(), go(v), go(b)),
+        // A block in a loop (spec 2026-10-30-elya-long-blocks D1).
+        CoreKind::Let(..) => {
+            let (spine, body) = let_spine(e);
+            let lets = spine
+                .iter()
+                .map(|l| {
+                    (
+                        l.node.span,
+                        f(&l.node.ty),
+                        l.name.to_string(),
+                        map_expr(l.value, f),
+                    )
+                })
+                .collect();
+            return rebuild_spine(lets, map_expr(body, f));
+        }
         CoreKind::If(c, t, e2) => CoreKind::If(go(c), go(t), go(e2)),
         CoreKind::Match(s, arms) => CoreKind::Match(
             go(s),
@@ -466,7 +483,7 @@ impl Mono<'_> {
                 locals.truncate(depth);
                 CoreKind::Lambda(ps.clone(), Rc::new(b?))
             }
-            CoreKind::Let(x, v, b) => return self.rewrite_let(e, x, v, b, locals),
+            CoreKind::Let(..) => return self.rewrite_block(e, locals),
             CoreKind::If(c, t, f) => CoreKind::If(
                 Rc::new(self.rewrite(c, locals)?),
                 Rc::new(self.rewrite(t, locals)?),
@@ -549,51 +566,77 @@ impl Mono<'_> {
         Ok(out.into())
     }
 
-    /// A `let` of a generic syntactic value: the body is rewritten first (its
-    /// uses record the instantiations they need), then one substituted clone of
-    /// the value per instantiation is bound where the original was -- in the
-    /// scope the original's value sees -- and the original is dropped: every
-    /// use now names a clone.
-    fn rewrite_let(
-        &mut self,
-        e: &CoreExpr,
-        x: &str,
-        v: &CoreExpr,
-        b: &CoreExpr,
-        locals: &mut Vec<Local>,
-    ) -> R<CoreExpr> {
-        if !(is_syntactic_value(v) && has_tvs(&v.ty)) {
-            let v2 = self.rewrite(v, locals)?;
-            locals.push(Local {
-                name: x.to_string(),
-                generic: None,
-            });
-            let b2 = self.rewrite(b, locals);
-            locals.pop();
-            return Ok(CoreExpr {
-                span: e.span,
-                ty: e.ty.clone(),
-                kind: CoreKind::Let(x.to_string(), Rc::new(v2), Rc::new(b2?)),
-            });
+    /// A block, in a loop over its `let`s (spec 2026-10-30-elya-long-blocks D1).
+    /// A `let` of a generic syntactic value: the rest of the block is rewritten
+    /// first (its uses record the instantiations they need), then one
+    /// substituted clone of the value per instantiation is bound where the
+    /// original was -- in the scope the original's value sees -- and the
+    /// original is dropped: every use now names a clone. Any other `let`'s value
+    /// is rewritten where it stands.
+    fn rewrite_block(&mut self, e: &CoreExpr, locals: &mut Vec<Local>) -> R<CoreExpr> {
+        // The scope is restored on every path, an error's too, as the
+        // recursion restored it (the review's F6).
+        let depth = locals.len();
+        let out = self.rewrite_spine(e, locals);
+        locals.truncate(depth);
+        out
+    }
+
+    fn rewrite_spine(&mut self, e: &CoreExpr, locals: &mut Vec<Local>) -> R<CoreExpr> {
+        enum Bound<'e> {
+            Plain(Span, Ty, String, CoreExpr),
+            Generic(Span, Ty, &'e CoreExpr),
         }
-        locals.push(Local {
-            name: x.to_string(),
-            generic: Some(LocalGeneric {
-                ty: v.ty.clone(),
-                clones: Vec::new(),
-            }),
-        });
-        let b2 = self.rewrite(b, locals);
-        let me = locals.pop().expect("pushed above");
-        let mut out = b2?;
-        let g = me.generic.expect("pushed generic");
-        for (_, name, s) in g.clones.into_iter().rev() {
-            let clone = self.rewrite(&map_expr(v, &|t| apply(t, &s)), locals)?;
-            out = CoreExpr {
-                span: e.span,
-                ty: e.ty.clone(),
-                kind: CoreKind::Let(name, Rc::new(clone), Rc::new(out)),
-            };
+        let (spine, body) = let_spine(e);
+        let mut bound = Vec::with_capacity(spine.len());
+        for l in &spine {
+            let v = l.value;
+            if !(is_syntactic_value(v) && has_tvs(&v.ty)) {
+                let v2 = self.rewrite(v, locals)?;
+                locals.push(Local {
+                    name: l.name.to_string(),
+                    generic: None,
+                });
+                bound.push(Bound::Plain(
+                    l.node.span,
+                    l.node.ty.clone(),
+                    l.name.to_string(),
+                    v2,
+                ));
+            } else {
+                locals.push(Local {
+                    name: l.name.to_string(),
+                    generic: Some(LocalGeneric {
+                        ty: v.ty.clone(),
+                        clones: Vec::new(),
+                    }),
+                });
+                bound.push(Bound::Generic(l.node.span, l.node.ty.clone(), v));
+            }
+        }
+        let mut out = self.rewrite(body, locals)?;
+        for b in bound.into_iter().rev() {
+            let me = locals.pop().expect("pushed above");
+            match b {
+                Bound::Plain(span, ty, x, v2) => {
+                    out = CoreExpr {
+                        span,
+                        ty,
+                        kind: CoreKind::Let(x, Rc::new(v2), Rc::new(out)),
+                    };
+                }
+                Bound::Generic(span, ty, v) => {
+                    let g = me.generic.expect("pushed generic");
+                    for (_, name, s) in g.clones.into_iter().rev() {
+                        let clone = self.rewrite(&map_expr(v, &|t| apply(t, &s)), locals)?;
+                        out = CoreExpr {
+                            span,
+                            ty: ty.clone(),
+                            kind: CoreKind::Let(name, Rc::new(clone), Rc::new(out)),
+                        };
+                    }
+                }
+            }
         }
         Ok(out)
     }
@@ -670,52 +713,15 @@ fn effect_var(e: &CoreExpr, used: &BTreeMap<String, Vec<bool>>) -> bool {
     found
 }
 
-/// Pre-order visit of every node.
+/// Pre-order visit of every node, left to right, with a heap stack (spec
+/// 2026-10-30-elya-long-blocks D1).
 fn visit(e: &CoreExpr, f: &mut dyn FnMut(&CoreExpr)) {
-    f(e);
-    match &e.kind {
-        CoreKind::Lit(_) | CoreKind::Var(_) => {}
-        CoreKind::App(g, a) => {
-            visit(g, f);
-            for x in a.iter() {
-                visit(x, f);
-            }
-        }
-        CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
-            for x in a.iter() {
-                visit(x, f);
-            }
-        }
-        CoreKind::Lambda(_, b) | CoreKind::Resume(b) => visit(b, f),
-        CoreKind::Let(_, v, b) => {
-            visit(v, f);
-            visit(b, f);
-        }
-        CoreKind::If(c, t, e2) => {
-            visit(c, f);
-            visit(t, f);
-            visit(e2, f);
-        }
-        CoreKind::Match(s, arms) => {
-            visit(s, f);
-            for a in arms.iter() {
-                visit(&a.body, f);
-            }
-        }
-        CoreKind::Handle(h) => {
-            visit(&h.body, f);
-            for c in h.clauses.iter() {
-                visit(&c.body, f);
-            }
-            if let Some(r) = &h.ret {
-                visit(&r.body, f);
-            }
-        }
-        CoreKind::Perform(p) => {
-            for x in p.args.iter() {
-                visit(x, f);
-            }
-        }
+    let mut stack = vec![e];
+    let mut children = Vec::new();
+    while let Some(e) = stack.pop() {
+        f(e);
+        push_children(e, &mut children);
+        stack.extend(children.drain(..).rev());
     }
 }
 
@@ -742,6 +748,22 @@ pub(crate) fn run(core: &CoreModule) -> R<CoreModule> {
     for f in &core.fns {
         if !m.generic.contains_key(&f.name) {
             fns.push(m.emit(f.name.clone(), f, &TySubst::new())?);
+        } else if f.name == "main" {
+            // The entry point is used once, by the shim, at its own type with
+            // every variable at the ambiguity default (spec
+            // 2026-10-30-elya-main-values D3): `pub fn main() { None }` is
+            // `Option(Unit)`. Before, nothing used it, so it was never cloned
+            // ("no `main`").
+            let mut tvs = BTreeSet::new();
+            free_tvs(&m.generic["main"], &mut tvs);
+            let s: TySubst = tvs
+                .into_iter()
+                .map(|v| (v, Ty::Base(TyCon::Unit)))
+                .collect();
+            // Registered, so `main`'s own calls at that type are to itself (the
+            // review's L3: they cloned a second, identical `main`).
+            m.top.insert((f.name.clone(), key_of(&s)), f.name.clone());
+            fns.push(m.emit(f.name.clone(), f, &s)?);
         }
     }
     while let Some((name, orig, s)) = m.queue.pop() {
@@ -952,7 +974,25 @@ impl Instances<'_> {
             }
             CoreKind::Prim(o, a) => CoreKind::Prim(*o, self.all(a, ground)?),
             CoreKind::Lambda(ps, b) => CoreKind::Lambda(self.params(ps), go(b, self)?),
-            CoreKind::Let(x, v, b) => CoreKind::Let(x.clone(), go(v, self)?, go(b, self)?),
+            // A block in a loop (spec 2026-10-30-elya-long-blocks D1), in the
+            // recursion's order: the values, the body, then each `let`'s type
+            // from the innermost out (instances are numbered as they are met).
+            CoreKind::Let(..) => {
+                let (spine, body) = let_spine(e);
+                let mut values = Vec::with_capacity(spine.len());
+                for l in &spine {
+                    values.push(self.expr(l.value, ground)?);
+                }
+                let mut out = self.expr(body, ground)?;
+                for (l, v) in spine.iter().zip(values).rev() {
+                    out = CoreExpr {
+                        span: l.node.span,
+                        ty: self.rename_ty(&l.node.ty),
+                        kind: CoreKind::Let(l.name.to_string(), Rc::new(v), Rc::new(out)),
+                    };
+                }
+                return Ok(out);
+            }
             CoreKind::If(c, t, f) => CoreKind::If(go(c, self)?, go(t, self)?, go(f, self)?),
             CoreKind::Match(s, arms) => {
                 let s2 = go(s, self)?;
@@ -1316,6 +1356,20 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_recursive_generic_main_calls_itself() {
+        // The main-values review's L3: the default instance was not registered,
+        // so `main`'s own call cloned a second, identical `main`.
+        let m = run(&core_of(
+            "type Opt(a) { No, Yes(a) }\n\
+             fn depth() -> Int { 3 }\n\
+             pub fn main() { if depth() > 5 { main() } else { No } }\n",
+        ))
+        .expect("monomorphizes");
+        let names: Vec<&str> = m.fns.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["depth", "main"]);
     }
 
     #[test]

@@ -79,13 +79,17 @@ pub fn run_source(name: &str, text: &str) -> Result<String, String> {
 }
 
 /// What `elya run` shows (spec 2026-10-16-elya-differential-sweep): the
-/// program's output, kept when the run fails (D1), and main's value as a native
-/// binary prints it (D2: an `Int` in decimal, `Unit` as `0`; `None` for any
-/// other type). `error` is the rendered diagnostic of a front-end or runtime
-/// failure.
+/// program's output, kept when the run fails (D1), and main's value. `error` is
+/// the rendered diagnostic of a front-end or runtime failure.
 pub struct RunOutcome {
     pub output: String,
+    /// main's value as a number, for the callers that compute one: an `Int`, or
+    /// `Unit` as `0`; any other type is `Err`. What is printed is [`Self::line`].
     pub value: Option<Result<i64, String>>,
+    /// The value line `elya run --value` and a native binary print after the
+    /// output: main's value as a literal (spec 2026-10-30-elya-main-values D1;
+    /// `Unit` is `0`), or why it has none (a function is not data, D2).
+    pub line: Option<Result<String, String>>,
     pub error: Option<String>,
 }
 
@@ -100,7 +104,7 @@ pub fn run_source_outcome_with(name: &str, text: &str, read: &mut modules::Reade
         return RunOutcome::refused(rendered);
     }
     let (interp, result) = eval::run_module_keeping(&module, eval::World::Live);
-    RunOutcome::of(interp.output().to_string(), result, &sm)
+    RunOutcome::of(interp.output().to_string(), interp.types(), result, &sm)
 }
 
 impl RunOutcome {
@@ -109,6 +113,7 @@ impl RunOutcome {
         RunOutcome {
             output: String::new(),
             value: None,
+            line: None,
             error: Some(error),
         }
     }
@@ -116,25 +121,30 @@ impl RunOutcome {
     /// A run's outcome: its output, kept whether it succeeded or failed.
     fn of(
         output: String,
+        types: &literal::TypeInfo,
         result: Result<eval::Value, eval::RuntimeError>,
         sm: &SourceMap,
     ) -> RunOutcome {
         match result {
             Ok(v) => RunOutcome {
                 output,
+                line: Some(match &v {
+                    eval::Value::Int(n) => Ok(n.to_string()),
+                    eval::Value::Unit => Ok("0".to_string()),
+                    other => literal::show(types, other)
+                        .map_err(|what| format!("main's value is {what}, which is not data")),
+                }),
                 value: Some(match v {
                     eval::Value::Int(n) => Ok(n),
                     eval::Value::Unit => Ok(0),
-                    _ => Err(
-                        "main's value is not an `Int` or `Unit`, so it has no native value line"
-                            .to_string(),
-                    ),
+                    _ => Err("main's value is not an `Int` or `Unit`".to_string()),
                 }),
                 error: None,
             },
             Err(e) => RunOutcome {
                 output,
                 value: None,
+                line: None,
                 error: Some(render(&[e.diag], sm)),
             },
         }
@@ -171,7 +181,10 @@ pub fn record_source_with(
         }
     }
     let output = interp.output().to_string();
-    (Some(trace), RunOutcome::of(output, result, &sm))
+    (
+        Some(trace),
+        RunOutcome::of(output, interp.types(), result, &sm),
+    )
 }
 
 /// [`record_source`] as `(trace, Ok(output))` or `(trace, Err(output and
@@ -183,6 +196,54 @@ pub fn run_source_recording(name: &str, text: &str) -> (Option<String>, Result<S
         Some(e) => Err(format!("{}{e}", o.output)),
     };
     (trace, out)
+}
+
+/// A trace's text as the host reads it: its entries, or the line (from 1) that
+/// cannot be read and why (spec 2026-10-24-elya-trace-text D2). A leading
+/// byte-order mark is skipped; the first line, trimmed, must be the header;
+/// a blank line is skipped; every other line is split by [`split_entry`] and
+/// both halves are trimmed. `elya/replay`'s `parse` reads the same way.
+pub fn read_trace(trace: &str) -> Result<Vec<(String, String)>, (usize, &'static str)> {
+    let trace = trace.strip_prefix('\u{feff}').unwrap_or(trace);
+    let mut lines = trace.lines();
+    if lines.next().map(str::trim) != Some(TRACE_HEADER) {
+        return Err((1, "the first line must be `elya trace 1`"));
+    }
+    let mut entries = Vec::new();
+    for (i, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (q, a) = split_entry(line).map_err(|why| (i + 2, why))?;
+        entries.push((q.trim().to_string(), a.trim().to_string()));
+    }
+    Ok(entries)
+}
+
+/// One trace entry's question and answer: the line split at the first ` = `
+/// outside a string literal, a literal running from a `"` to the next
+/// unescaped `"` (spec 2026-10-24-elya-trace-text D2). Neither half is trimmed.
+/// `elya/replay`'s `parse` and the native runtime split the same way.
+pub fn split_entry(line: &str) -> Result<(&str, &str), &'static str> {
+    let b = line.as_bytes();
+    let mut in_str = false;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' if in_str => i += 1,
+            b'"' => in_str = !in_str,
+            b' ' if !in_str && b[i..].starts_with(b" = ") => {
+                return Ok((&line[..i], &line[i + 3..]));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Err(if in_str {
+        "a string is not closed"
+    } else {
+        "expected `question = answer`"
+    })
 }
 
 /// Runs with the host answered from `trace` (the text [`record_source`]
@@ -200,36 +261,22 @@ pub fn replay_source_with(
     trace: &str,
     read: &mut modules::Reader,
 ) -> RunOutcome {
-    let trace = trace.strip_prefix('\u{feff}').unwrap_or(trace);
-    let mut lines = trace.lines();
-    if lines.next().map(str::trim) != Some(TRACE_HEADER) {
-        return RunOutcome::refused(format!(
-            "error: not a trace: the first line must be `{TRACE_HEADER}`\n"
-        ));
-    }
-    let mut entries = Vec::new();
-    for (i, line) in lines.enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        // Today's answers are Int and Unit; the LAST ` = ` splits, so a
-        // question's arguments may contain one. A String answer would need
-        // a quoted-aware split (spec §2).
-        let Some((q, a)) = line.rsplit_once(" = ") else {
+    let entries = match read_trace(trace) {
+        Ok(entries) => entries,
+        Err((1, _)) => {
             return RunOutcome::refused(format!(
-                "error: trace line {}: expected `question = answer`\n",
-                i + 2
+                "error: not a trace: the first line must be `{TRACE_HEADER}`\n"
             ));
-        };
-        entries.push((q.trim().to_string(), a.trim().to_string()));
-    }
+        }
+        Err((n, why)) => return RunOutcome::refused(format!("error: trace line {n}: {why}\n")),
+    };
     let (module, diags, sm) = front_end_with(name, text, read);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
         return RunOutcome::refused(rendered);
     }
     let (interp, result) =
         eval::run_module_keeping(&module, eval::World::Replay { entries, next: 0 });
-    RunOutcome::of(interp.output().to_string(), result, &sm)
+    RunOutcome::of(interp.output().to_string(), interp.types(), result, &sm)
 }
 
 /// [`replay_source`] as `Ok(output)` or `Err(diagnostics)` (the output of a

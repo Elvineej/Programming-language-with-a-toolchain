@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use elya::core::{CoreExpr, CoreKind, CoreModule, CoreParam, CorePat};
+use elya::core::{let_spine, CoreExpr, CoreKind, CoreModule, CoreParam, CorePat};
 use elya::types::Ty;
 
 /// The synthetic binder for a handler clause's continuation (5b-8 D12). A
@@ -94,7 +94,10 @@ fn fv_walk(e: &CoreExpr, scope: &mut Vec<String>, out: &mut BTreeMap<String, Ty>
     match &e.kind {
         CoreKind::Lit(_) => {}
         CoreKind::Var(x) => {
-            if !scope.iter().any(|b| b == x) {
+            // From the innermost binding out: most uses are of a binding a
+            // statement or two back, and a long block's scope is as long as the
+            // block (the same answer; `any` has no order).
+            if !scope.iter().rev().any(|b| b == x) {
                 out.entry(x.clone()).or_insert_with(|| e.ty.clone());
             }
         }
@@ -127,11 +130,15 @@ fn fv_walk(e: &CoreExpr, scope: &mut Vec<String>, out: &mut BTreeMap<String, Ty>
             fv_walk(body, scope, out);
             scope.truncate(depth);
         }
-        CoreKind::Let(name, value, body) => {
-            // The VALUE is outside the binding; the BODY is inside it.
-            fv_walk(value, scope, out);
+        // A block in a loop (spec 2026-10-30-elya-long-blocks D1).
+        CoreKind::Let(..) => {
+            // Each VALUE is outside its binding; the rest is inside it.
             let depth = scope.len();
-            scope.push(name.clone());
+            let (spine, body) = let_spine(e);
+            for l in &spine {
+                fv_walk(l.value, scope, out);
+                scope.push(l.name.to_string());
+            }
             fv_walk(body, scope, out);
             scope.truncate(depth);
         }
@@ -265,11 +272,16 @@ fn collect_in(
                 collect_in(a, enclosing, n, scope, first_tag, out);
             }
         }
-        CoreKind::Let(name, value, body) => {
-            collect_in(value, enclosing, n, scope, first_tag, out);
-            scope.push(name.clone());
+        // A block in a loop (spec 2026-10-30-elya-long-blocks D1).
+        CoreKind::Let(..) => {
+            let depth = scope.len();
+            let (spine, body) = let_spine(e);
+            for l in &spine {
+                collect_in(l.value, enclosing, n, scope, first_tag, out);
+                scope.push(l.name.to_string());
+            }
             collect_in(body, enclosing, n, scope, first_tag, out);
-            scope.pop();
+            scope.truncate(depth);
         }
         CoreKind::If(c, t, f) => {
             collect_in(c, enclosing, n, scope, first_tag, out);
