@@ -114,6 +114,9 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
     let mut effect_ops: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
     let mut dup_ops: HashSet<String> = HashSet::new();
     let mut effect_names: HashSet<String> = HashSet::new();
+    // Effects declared more than once (E0209): their handlers are not checked
+    // for coverage (spec 2026-10-30-elya-name-clashes D2).
+    let mut dup_effects: HashSet<String> = HashSet::new();
     let mut dup_diags: Vec<Diagnostic> = Vec::new();
     // E0209 (2026-10-16): a function, type, constructor or effect name declared
     // twice was a silent overwrite -- whichever declaration a pass consulted
@@ -171,7 +174,9 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
                             .with_help("rename this effect: `IO` is the effect `io.*` performs"),
                     );
                 }
-                effect_names.insert(e.name.clone());
+                if !effect_names.insert(e.name.clone()) {
+                    dup_effects.insert(e.name.clone());
+                }
                 for op in &e.ops {
                     let name = &op.node.name;
                     if let (Some(first), Some(first_span)) =
@@ -241,6 +246,7 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
         op_arity: &op_arity,
         effect_ops: &effect_ops,
         dup_ops: &dup_ops,
+        dup_effects: &dup_effects,
         effects: &effect_names,
         in_handler: 0,
         diags: dup_diags,
@@ -276,6 +282,11 @@ struct Cx<'a> {
     /// Op names already reported E0202: a clause on one is not checked again
     /// (its owner is ambiguous, so any E0203 there would be noise or false).
     dup_ops: &'a HashSet<String>,
+    /// Effects already reported E0209: which declaration's operations a handler
+    /// of one must cover is the question E0209 asks, so E0207 is not checked
+    /// (spec 2026-10-30-elya-name-clashes D2: a root's `effect Console` made five
+    /// E0207s inside `elya/console.elya`).
+    dup_effects: &'a HashSet<String>,
     effects: &'a HashSet<String>,
     /// Nesting depth of handler clauses currently being checked. `resume` is
     /// only legal where this is nonzero (E0210 otherwise).
@@ -358,6 +369,9 @@ impl Cx<'_> {
         let [eff] = effects.as_slice() else {
             return;
         };
+        if self.dup_effects.contains(*eff) {
+            return;
+        }
         let Some(ops) = self.effect_ops.get(*eff) else {
             return;
         };

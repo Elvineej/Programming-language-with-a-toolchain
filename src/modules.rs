@@ -556,6 +556,9 @@ struct Decls {
     owner: HashMap<(Kind, String), usize>,
     /// Each operation's effect (for E0205 in a module, the review's R2).
     op_effect: HashMap<String, String>,
+    /// Each file's own type-level names: visible there, whichever file declared
+    /// them first (spec 2026-10-30-elya-name-clashes D3).
+    declared: Vec<HashSet<(Kind, String)>>,
 }
 
 /// The name spaces a type-level name can live in.
@@ -571,8 +574,10 @@ fn decls(units: &[Unit]) -> Decls {
     let mut fns = Vec::new();
     let mut owner = HashMap::new();
     let mut op_effect = HashMap::new();
+    let mut declared = Vec::new();
     for (i, u) in units.iter().enumerate() {
         let mut f = HashMap::new();
+        let mut own = HashSet::new();
         for d in &u.module.decls {
             match &d.node {
                 Decl::Fn(fd) => {
@@ -580,14 +585,18 @@ fn decls(units: &[Unit]) -> Decls {
                 }
                 Decl::Type(t) => {
                     owner.entry((Kind::Type, t.name.clone())).or_insert(i);
+                    own.insert((Kind::Type, t.name.clone()));
                     for v in &t.variants {
                         owner.entry((Kind::Ctor, v.node.name.clone())).or_insert(i);
+                        own.insert((Kind::Ctor, v.node.name.clone()));
                     }
                 }
                 Decl::Effect(e) => {
                     owner.entry((Kind::Effect, e.name.clone())).or_insert(i);
+                    own.insert((Kind::Effect, e.name.clone()));
                     for op in &e.ops {
                         owner.entry((Kind::Op, op.node.name.clone())).or_insert(i);
+                        own.insert((Kind::Op, op.node.name.clone()));
                         op_effect
                             .entry(op.node.name.clone())
                             .or_insert_with(|| e.name.clone());
@@ -596,11 +605,13 @@ fn decls(units: &[Unit]) -> Decls {
             }
         }
         fns.push(f);
+        declared.push(own);
     }
     Decls {
         fns,
         owner,
         op_effect,
+        declared,
     }
 }
 
@@ -705,7 +716,18 @@ impl<'u> Rewriter<'u> {
         let Some(&owner) = self.info.owner.get(&(kind, name.to_string())) else {
             return;
         };
+        // D3: a name this file or a file it imports declares is visible here,
+        // though another file declared it first (that clash is E0209's, or
+        // E0202's for an operation; the review's F1: an imported file's own
+        // declaration counted only when it was the first).
+        let key = (kind, name.to_string());
+        let declares = |j: usize| self.info.declared[j].contains(&key);
         if owner == self.me
+            || declares(self.me)
+            || self.units[self.me]
+                .imports
+                .iter()
+                .any(|p| self.index.get(p.as_str()).is_some_and(|&j| declares(j)))
             || self.units[self.me]
                 .imports
                 .contains(&self.units[owner].path)
@@ -855,7 +877,19 @@ impl<'u> Rewriter<'u> {
                     Expr::Var(self.own(name))
                 } else {
                     let root = self.units.len() - 1;
-                    if !self.is_root && self.info.fns[root].contains_key(name) {
+                    let kind = if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                        Kind::Ctor
+                    } else {
+                        Kind::Op
+                    };
+                    // An operation first (spec 2026-10-30-elya-name-clashes
+                    // D1): a root function of the same name is the root's error
+                    // (E0205), and this file's `console_line(..)` still means its
+                    // operation (or E0605, if this file cannot see it). Only a
+                    // lowercase name can be both: a constructor is capitalised,
+                    // a function is not.
+                    let program_name = self.info.owner.contains_key(&(kind, name.clone()));
+                    if !self.is_root && !program_name && self.info.fns[root].contains_key(name) {
                         // The root's functions keep their names in the merged
                         // module; they are not this file's (D2).
                         self.diags.push(
@@ -863,11 +897,6 @@ impl<'u> Rewriter<'u> {
                                 .with_label(span, "not found in this scope"),
                         );
                     } else {
-                        let kind = if name.starts_with(|c: char| c.is_ascii_uppercase()) {
-                            Kind::Ctor
-                        } else {
-                            Kind::Op
-                        };
                         self.visible(kind, name, span);
                     }
                     Expr::Var(name.clone())
