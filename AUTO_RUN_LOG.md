@@ -3,7 +3,7 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-30 14:10 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
+## 2026-10-30 15:30 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -60,6 +60,13 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     stay one name space (their names are data in traces and `op.show`).
 - PR #24 had been merged (2026-10-24), and nothing carried `auto/elya` after it, so
   the maintainer saw no new commits: opened draft PR #25.
+- **Done: the occurs checks look inside effect rows** (2736024; spec
+  2026-10-30-elya-occurs-in-rows). Found measuring step 1: three-line programs
+  crashed `elya check` (a stack overflow). The review found the first fix turned some
+  into a hang, fixed first. Gate 1337 / 143.
+- At the maintainer's request (2026-10-30), HANDOFF's steps 3-5 are now their three
+  priorities: compiler scalability, the affine guarantee across functions, native
+  compilation without its limits.
 - Next: HANDOFF step 1, row parameters on declarations (needed by `elya/async`).
 - Windows-gate debt: 20a4804 (runtime.c string functions and the trace split),
   fa24c18 (runtime.c `elya_trace_finish` exported, `elya_any_show` flushes).

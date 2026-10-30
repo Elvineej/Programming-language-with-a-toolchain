@@ -16,7 +16,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is public (seen 2026-10-30; the maintainer flipped it).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1331 passed, 141 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1337 passed, 143 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -608,6 +608,12 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   - Types, constructors, effects and operations stay one name space (their names
     are data: traces, `op.show`).
 
+- **The occurs checks look inside effect rows** (2026-10-30, branch `auto/elya`,
+  2736024): spec `docs/superpowers/specs/2026-10-30-elya-occurs-in-rows-design.md`.
+  Found measuring step 1: three-line programs crashed `elya check` with a stack
+  overflow (a type or row variable bound inside its own effect label's argument).
+  Now E0401 or E0424.
+
 ## The next five steps
 
 ### 1. Row parameters on declarations: effects and types that carry a task's effects
@@ -645,44 +651,72 @@ decide the API in a spec; prove it by rewriting the examples on it, in the
 evaluator and natively. The names carry the module's (part 3 D1). Needs step 1:
 a task's row must be open (measured 2026-10-30).
 
-### 3. Reading text from outside: an input effect the host records
+### 3. Compiler scalability: no step quadratic in a program's size
 
-`replay.parse` reads a trace the program already holds as a `String`. No Elya
+The maintainer's priority (2026-10-30: "compiler scalability is still
+fragile"). A block's length is no longer a stack bound (17869d4); measured and
+still open, each in a debug build:
+- **inference on chains of closures:** `let a{i+1} = fn() { a{i} }`: 100 links
+  6.5 s, 200 links 108 s (about n^4), 400 not done in 300 s. Each `a{i}` is
+  generalized and instantiated, and its type is a tower of `i` arrows;
+- **the evaluator's name lookup:** a parameter used down a block of
+  `let a{i} = (a{i-1} + x) % 1000003`: 5 000 statements 4.5 s, 10 000 17 s,
+  20 000 77 s. The environment is a chain of scopes, one per `let`;
+- **nested performs in inference:** `fn f() { op(fn() { op(fn() { .. }) }) }`
+  25 deep 0.09 s, 50 deep 0.68 s, 100 deep 8.4 s (measured by the occurs-in-rows
+  review);
+- **CPS code size:** each site's continuation emits the rest of its region,
+  so a function's code grows with its sites times its length (the long-blocks
+  places test: about 30 s for 70 000 statements at one site per thousand).
+Measure where each goes (a profile; the corpus's programs too), then decide in
+a spec, per item: share types instead of copying them, or skip generalizing a
+binding with no free variable of its own; extend a uniquely owned scope in
+place, or resolve names to slots before the run (the tree-walking oracle too);
+continuations that share the rest of a region instead of copying it. The proof:
+each at ten times today's size, linear.
+
+### 4. The affine guarantee across functions
+
+The maintainer's priority (2026-10-30: "the affine resource guarantee is
+incomplete"). `linear` values are checked within one function body (slice
+4d-2, E0428 and E0429; README "Affine resources"); the 4d-2 spec tracks two
+approximations: a callee that duplicates an affine parameter is not caught at
+its callers, and the check is insensitive to branches (a use in each arm of an
+`if` counts twice). Measure each with programs (accepted that should not be,
+refused that should not be), then decide in a spec: a parameter's
+multiplicity, inferred or annotated, checked at every call; branch-sensitive
+counting (the maximum over arms, not the sum); and what crosses a lambda, a
+handler clause and a resume.
+
+### 5. Native compilation without its implementation limits
+
+The maintainer's priority (2026-10-30: "native compilation has restrictive
+implementation limits"). Inventory every refusal natively against the
+evaluator: the budgets (256 type instances, 256 type and convention clones),
+non-regular types (refused by name on purpose, spec 2026-10-17 D5), and the
+effect-polymorphism corners ("upcast in a parameter position", "type variable
+only in an effect row", "effect-polymorphic function used at a user effect",
+"direct function used where an effectful one is expected"). For each: a
+program the evaluator runs, then lift it or say in a spec why it stays. The
+differential sweep is the measure: no refusal left that the evaluator runs.
+
+## Also open, unscheduled
+
+Row unification's `absorb` may drop labels (the occurs-in-rows review, 2026-10-30, by
+reasoning, not reproduced): its second call can rebind an already-bound tail when
+`r1.tail == r2.tail`, as Remy's side condition is missing. It cannot form a cycle
+(the stored row is resolved). Find a program that shows it, or show it cannot.
+
+**Reading text from outside** (was step 3; moved for the maintainer's priorities,
+2026-10-30): `replay.parse` reads a trace the program already holds as a `String`. No Elya
 program can read a file or standard input (spec 2026-10-24-elya-trace-text D4).
 Measure what reading needs:
 - whole files or lines;
 - what a missing file or invalid UTF-8 is (a failure by name, or an answer);
 - how a replay answers a read (the trace holds the text it returned).
-
 Then decide in a spec: the builtins (`io.read_file`, `io.read_line`?) and their
 effect (`IO`, which the host records like `time.*`, or a capability of their own
 under `elya/host`); and both back ends, recording and replaying a read the same way.
-
-### 4. Inference on long chains of closures
-
-Measured 2026-10-30 (debug build), `elya check` of a `main` whose block is
-`let a0 = fn() { 1 }` then `let a{i+1} = fn() { a{i} }`: 100 links take 6.5 s,
-200 take 108 s (sixteen times as long for twice the links, about n^4), 400 do not
-finish in 300 s. Each `a{i}` is generalized and instantiated, and its type is a
-tower of `i` arrows. Measure where the time goes (a profile of the 200-link
-check: generalization, instantiation, or the occurs check walking the towers),
-then decide in a spec: share types instead of copying them, or skip
-generalizing a binding whose type has no free variable of its own.
-
-### 5. Names found in constant time in the evaluator
-
-Measured 2026-10-30 (debug build), `elya run` of a function whose block is
-`let a{i} = (a{i-1} + x) % 1000003`, `x` a parameter: 5 000 statements take
-4.5 s, 10 000 take 17 s, 20 000 take 77 s (quadratic). The environment is a
-chain of scopes, one per `let` (`eval::Env`), so a name bound before a block
-is found by walking back past every later binding. Measure the corpus's
-programs too (how long are their chains at a lookup), then decide in a spec:
-extend a uniquely owned scope in place (no one else can see it), resolve
-names to slots before the run, or a persistent map; the tree-walking oracle
-included. `elya build`'s output does not walk: natively a local is a register
-or a slot.
-
-## Also open, unscheduled
 
 `examples/08_timers.elya`'s real-clock part can reorder `a` and `c` under heavy
 load (its snapshot then fails): the three deadlines are 10 ms apart and counted
