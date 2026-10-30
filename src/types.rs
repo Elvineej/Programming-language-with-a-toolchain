@@ -528,14 +528,30 @@ impl Infer {
 
     fn occurs(&self, v: u32, t: &Ty) -> bool {
         // Type occurs-check only concerns the type-variable space; row variables
-        // live in a separate union-find with its own occurs-check (Task 3).
-        match self.resolve(t) {
-            Ty::Var(u) => u == v,
-            Ty::Base(_) | Ty::Error => false,
-            Ty::Fn(ps, _row, r) => ps.iter().any(|p| self.occurs(v, p)) || self.occurs(v, &r),
-            Ty::Tuple(xs) => xs.iter().any(|x| self.occurs(v, x)),
-            Ty::Con(_, args) => args.iter().any(|a| self.occurs(v, a)),
+        // live in a separate union-find with its own occurs-check (Task 3). A
+        // row's labels carry types, though: `t := fn() / {E(t)} -> Int` contains
+        // itself through one (spec 2026-10-30-elya-occurs-in-rows D1; it was
+        // bound, and `resolve` recursed until the stack ran out).
+        // `resolve` is deep (rows and their labels' arguments included), so
+        // one call and a plain walk of its result decide it: resolving again
+        // at every level was polynomial in a type's depth (the review's F3:
+        // 8.4 s became 43.8 s on a hundred nested performs).
+        fn walk(v: u32, t: &Ty) -> bool {
+            match t {
+                Ty::Var(u) => *u == v,
+                Ty::Base(_) | Ty::Error => false,
+                Ty::Fn(ps, row, r) => {
+                    ps.iter().any(|p| walk(v, p))
+                        || walk(v, r)
+                        || row
+                            .labels
+                            .values()
+                            .any(|l| l.args.iter().any(|a| walk(v, a)))
+                }
+                Ty::Tuple(xs) | Ty::Con(_, xs) => xs.iter().any(|x| walk(v, x)),
+            }
         }
+        walk(v, &self.resolve(t))
     }
 
     fn bind(&mut self, v: u32, t: &Ty, span: Span) {
@@ -787,11 +803,41 @@ impl Infer {
         }
     }
 
+    /// Whether `t` mentions row variable `v`: in a function type's row tail, or
+    /// in a row's labels' arguments, at any depth.
+    fn mentions_row(&self, v: RowVar, t: &Ty) -> bool {
+        // One deep `resolve`, then a plain walk (as in `occurs`).
+        fn walk(v: RowVar, t: &Ty) -> bool {
+            match t {
+                Ty::Var(_) | Ty::Base(_) | Ty::Error => false,
+                Ty::Fn(ps, row, r) => {
+                    row.tail == RowTail::Open(v)
+                        || row
+                            .labels
+                            .values()
+                            .any(|l| l.args.iter().any(|a| walk(v, a)))
+                        || ps.iter().any(|p| walk(v, p))
+                        || walk(v, r)
+                }
+                Ty::Tuple(xs) | Ty::Con(_, xs) => xs.iter().any(|x| walk(v, x)),
+            }
+        }
+        walk(v, &self.resolve(t))
+    }
+
     /// Bind row variable `v := r`, with an occurs-check (`E0424`): `v` may not
-    /// appear in `r`'s tail, or the row would contain itself.
+    /// appear in `r`'s tail, or in its labels' arguments, or the row would
+    /// contain itself.
     fn bind_row(&mut self, v: RowVar, r: &EffectRow, span: Span) {
         let resolved = self.resolve_row(r);
-        if resolved.tail == RowTail::Open(v) {
+        // Also through a label's arguments: `v := {E(fn() / {.. | v} -> ..)}`
+        // (spec 2026-10-30-elya-occurs-in-rows D2).
+        if resolved.tail == RowTail::Open(v)
+            || resolved
+                .labels
+                .values()
+                .any(|l| l.args.iter().any(|a| self.mentions_row(v, a)))
+        {
             self.diags.push(
                 Diagnostic::error("E0424", "cyclic effect row")
                     .with_label(span, "an effect row would contain itself"),
@@ -819,6 +865,13 @@ impl Infer {
             let mut changed = false;
             for (src, dst, span) in self.pending_incl.clone() {
                 let have = self.resolve_row(&EffectRow::open(dst));
+                // A poisoned row (a reported conflict, E0424) absorbs every
+                // label: nothing to add, so it is settled. Adding to it
+                // "succeeded" every pass, and the fixpoint never ended (spec
+                // 2026-10-30-elya-occurs-in-rows, the review's F1).
+                if have.tail == RowTail::ErrorRow {
+                    continue;
+                }
                 let want = self.resolve_row(&EffectRow::open(src));
                 // A recorded tail that has since become MEANINGFUL (it aliased
                 // a real row variable, e.g. a parameter's) is a relay after
@@ -855,6 +908,10 @@ impl Infer {
             }
             for (src, dst, span) in self.pending_member_incl.clone() {
                 let have = self.resolve_row(&EffectRow::open(dst));
+                // Settled when poisoned, as above.
+                if have.tail == RowTail::ErrorRow {
+                    continue;
+                }
                 let want = self.resolve_row(&EffectRow::open(src));
                 // A member's tail that has since become a RELAY of a member's
                 // parameter is whatever the arguments perform: the including
