@@ -286,3 +286,26 @@ fn a_trace_that_cannot_be_written_stops_the_run() {
     assert!(m.starts_with("cannot write the trace `/dev/full`: "), "{m}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn the_native_reader_splits_at_the_first_separator_outside_quotes() {
+    // Spec 2026-10-24-elya-trace-text D2, natively: the same failure in the
+    // same words as the evaluator's reader, for an answer holding ` = ` and for
+    // a line that ends inside quotes.
+    let dir = temp_dir("first-split");
+    let exe = build(CLOCK, &dir, "clock");
+    for trace in [
+        "elya trace 1\ntime.now_ms() = \"a = b\"\n",
+        "elya trace 1\ntime.now_ms(\"x) = 1\n",
+    ] {
+        let (native, eval) = both_read(&exe, &dir, trace.as_bytes());
+        let want = eval.unwrap_err();
+        let got = failure(&native, 1);
+        assert!(
+            want.contains(&got),
+            "{trace:?}: native `{got}`, evaluator {want}"
+        );
+        assert!(!got.contains("diverged"), "{trace:?}: {got}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

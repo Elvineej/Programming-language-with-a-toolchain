@@ -429,7 +429,7 @@ impl Parser<'_> {
             }
         }
         String::from_utf8(bytes)
-            .map(Value::Str)
+            .map(|s| Value::Str(s.into()))
             .map_err(|_| "a string that is not UTF-8")
     }
 }

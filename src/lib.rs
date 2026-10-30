@@ -185,6 +185,54 @@ pub fn run_source_recording(name: &str, text: &str) -> (Option<String>, Result<S
     (trace, out)
 }
 
+/// A trace's text as the host reads it: its entries, or the line (from 1) that
+/// cannot be read and why (spec 2026-10-24-elya-trace-text D2). A leading
+/// byte-order mark is skipped; the first line, trimmed, must be the header;
+/// a blank line is skipped; every other line is split by [`split_entry`] and
+/// both halves are trimmed. `elya/replay`'s `parse` reads the same way.
+pub fn read_trace(trace: &str) -> Result<Vec<(String, String)>, (usize, &'static str)> {
+    let trace = trace.strip_prefix('\u{feff}').unwrap_or(trace);
+    let mut lines = trace.lines();
+    if lines.next().map(str::trim) != Some(TRACE_HEADER) {
+        return Err((1, "the first line must be `elya trace 1`"));
+    }
+    let mut entries = Vec::new();
+    for (i, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (q, a) = split_entry(line).map_err(|why| (i + 2, why))?;
+        entries.push((q.trim().to_string(), a.trim().to_string()));
+    }
+    Ok(entries)
+}
+
+/// One trace entry's question and answer: the line split at the first ` = `
+/// outside a string literal, a literal running from a `"` to the next
+/// unescaped `"` (spec 2026-10-24-elya-trace-text D2). Neither half is trimmed.
+/// `elya/replay`'s `parse` and the native runtime split the same way.
+pub fn split_entry(line: &str) -> Result<(&str, &str), &'static str> {
+    let b = line.as_bytes();
+    let mut in_str = false;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' if in_str => i += 1,
+            b'"' => in_str = !in_str,
+            b' ' if !in_str && b[i..].starts_with(b" = ") => {
+                return Ok((&line[..i], &line[i + 3..]));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Err(if in_str {
+        "a string is not closed"
+    } else {
+        "expected `question = answer`"
+    })
+}
+
 /// Runs with the host answered from `trace` (the text [`record_source`]
 /// writes); a divergence or a leftover entry is a runtime error. Lines are
 /// read with surrounding whitespace (and a leading byte-order mark) ignored. A
@@ -200,29 +248,15 @@ pub fn replay_source_with(
     trace: &str,
     read: &mut modules::Reader,
 ) -> RunOutcome {
-    let trace = trace.strip_prefix('\u{feff}').unwrap_or(trace);
-    let mut lines = trace.lines();
-    if lines.next().map(str::trim) != Some(TRACE_HEADER) {
-        return RunOutcome::refused(format!(
-            "error: not a trace: the first line must be `{TRACE_HEADER}`\n"
-        ));
-    }
-    let mut entries = Vec::new();
-    for (i, line) in lines.enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        // Today's answers are Int and Unit; the LAST ` = ` splits, so a
-        // question's arguments may contain one. A String answer would need
-        // a quoted-aware split (spec §2).
-        let Some((q, a)) = line.rsplit_once(" = ") else {
+    let entries = match read_trace(trace) {
+        Ok(entries) => entries,
+        Err((1, _)) => {
             return RunOutcome::refused(format!(
-                "error: trace line {}: expected `question = answer`\n",
-                i + 2
+                "error: not a trace: the first line must be `{TRACE_HEADER}`\n"
             ));
-        };
-        entries.push((q.trim().to_string(), a.trim().to_string()));
-    }
+        }
+        Err((n, why)) => return RunOutcome::refused(format!("error: trace line {n}: {why}\n")),
+    };
     let (module, diags, sm) = front_end_with(name, text, read);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
         return RunOutcome::refused(rendered);

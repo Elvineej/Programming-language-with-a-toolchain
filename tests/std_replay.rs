@@ -6,6 +6,9 @@
 //! - K1, `replay` answering without its question check (`if True`): the game
 //!   with an eight-sided die "replays" instead of diverging, and
 //!   `the_library_records_and_replays_two_programs` fails.
+//! - K2 (2026-10-30, spec 2026-10-24-elya-trace-text), `parse`'s separator
+//!   ignoring quotes: `a_parsed_trace_is_the_trace_it_was_written_from` and
+//!   `an_unreadable_trace_names_its_line` fail (a ` = ` inside a string splits).
 
 /// The dice game and the shop of `examples/09_record_any.elya`, through the
 /// library instead of its own recorder.
@@ -172,5 +175,216 @@ fn its_names_are_program_unique() {
     assert_eq!(
         errors("type Trace { Mine }\npub fn main() -> Int { 1 }\n"),
         ""
+    );
+}
+
+/// A trace with string answers that hold ` = `, quotes, a newline and a
+/// two-byte character, written by `text` and read back by `parse` (spec
+/// 2026-10-24-elya-trace-text D2, D3).
+pub const PARSE_ROUND_TRIP: &str = r#"import elya/replay
+effect Ask {
+  fn ask(q: String) -> String
+  fn n(k: Int) -> Int
+}
+
+fn prog() / {Ask} -> Int {
+  let a = ask("x = y")
+  let b = ask("p")
+  string.length(a) * 100 + string.length(b) * 10 + n(3)
+}
+
+fn live(body: fn() / {Ask} -> Recorded(Int)) -> Recorded(Int) {
+  handle { body() } with {
+    Ask.ask(q) -> resume(if q == "p" { "plain" } else { "p = \"q\"\né" })
+    Ask.n(k) -> resume(k * 2)
+    return(x) -> x
+  }
+}
+
+pub fn main() -> Int {
+  match live(fn() { replay.record(fn() { prog() }) }) {
+    Recorded(x, t) -> {
+      io.println(replay.text(t))
+      match replay.parse(replay.text(t)) {
+        TraceParsed(u) -> {
+          let same = if u == t { 1 } else { 0 }
+          match replay.replay(fn() { prog() }, u) {
+            Replayed(y) -> x * 10 + same + y * 100000
+            Diverged(a, b) -> 0 - 1
+            Unconsumed(y, r) -> 0 - 2
+          }
+        }
+        TraceUnreadable(line, why) -> {
+          io.println(why)
+          0 - 3
+        }
+      }
+    }
+  }
+}
+"#;
+
+#[test]
+fn a_parsed_trace_is_the_trace_it_was_written_from() {
+    let (out, v) = run(PARSE_ROUND_TRIP);
+    // a is 10 bytes (`p = "q"`, a newline, two for `é`), b is 5: 1056; the
+    // parse equals the recording (1) and replays to the same answer.
+    assert_eq!(v, Ok(1056 * 100000 + 10561), "{out}");
+    assert_eq!(
+        out,
+        "elya trace 1\n\
+         Ask.ask(\"x = y\") = \"p = \\\"q\\\"\\n\u{e9}\"\n\
+         Ask.ask(\"p\") = \"plain\"\n\
+         Ask.n(3) = 6\n\n"
+    );
+    // The game and the shop round trip too.
+    let src = GAME_AND_SHOP.replace(
+        "report(\"the game\", replay.replay(fn() { game(3, 6, 0) }, log))",
+        "match replay.parse(replay.text(log)) {\n\
+         \x20 TraceParsed(u) -> report(if u == log { \"the parsed game\" } else { \"another game\" }, replay.replay(fn() { game(3, 6, 0) }, u))\n\
+         \x20 TraceUnreadable(n, why) -> io.println(why)\n\
+         }",
+    );
+    let (out, v) = run(&src);
+    assert_eq!(v, Ok(2404), "{out}");
+    assert!(out.contains("the parsed game: replayed, 24\n"), "{out}");
+}
+
+/// `parse` on `text` the program holds, answering `TraceUnreadable(line, why)`.
+fn parsed(text: &str) -> String {
+    let lit = text
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    let src = format!(
+        "import elya/replay\n\
+         fn show(t: Trace) -> String {{ match t {{ TraceEnd -> \"\"  TraceEntry(q, a, r) -> \"[\" <> q <> \"|\" <> a <> \"]\" <> show(r) }} }}\n\
+         pub fn main() -> Int {{\n\
+         \x20 match replay.parse(\"{lit}\") {{\n\
+         \x20   TraceParsed(t) -> {{ io.println(show(t))  0 }}\n\
+         \x20   TraceUnreadable(n, why) -> {{ io.println(why)  n }}\n\
+         \x20 }}\n\
+         }}\n"
+    );
+    let (out, v) = run(&src);
+    format!(
+        "{}:{}",
+        v.unwrap_or_else(|e| panic!("{text:?}: {e}")),
+        out.trim_end()
+    )
+}
+
+#[test]
+fn an_unreadable_trace_names_its_line() {
+    assert_eq!(
+        parsed("elya trace 2\nA.a() = 1\n"),
+        "1:the first line must be `elya trace 1`"
+    );
+    assert_eq!(parsed(""), "1:the first line must be `elya trace 1`");
+    assert_eq!(
+        parsed("elya trace 1\nA.a() = 1\nA.b()\n"),
+        "3:expected `question = answer`"
+    );
+    assert_eq!(
+        parsed("elya trace 1\n\nA.a(\"x = 1) = 2\n"),
+        "3:a string is not closed"
+    );
+    // A separator inside quotes is not one; the first one outside is.
+    assert_eq!(
+        parsed("elya trace 1\nA.a(\"k = v\", \"\\\"\") = \"= \\\\\" = \"\n"),
+        "0:[A.a(\"k = v\", \"\\\"\")|\"= \\\\\" = \"]"
+    );
+}
+
+#[test]
+fn the_hosts_lenient_trace_parses_the_same() {
+    let clean = parsed("elya trace 1\nA.a(1) = 2\nA.b() = Unit\n");
+    assert_eq!(clean, "0:[A.a(1)|2][A.b()|Unit]");
+    for lenient in [
+        "\u{feff}elya trace 1\nA.a(1) = 2\nA.b() = Unit\n",
+        "elya trace 1\r\nA.a(1) = 2\r\nA.b() = Unit\r\n",
+        "  elya trace 1  \n\n   \nA.a(1)   =   2\n\tA.b() = Unit\t\n\n",
+        "elya trace 1\nA.a(1) = 2\nA.b() = Unit",
+        // `str::trim`'s whitespace, beyond ASCII (the host's rule, kept).
+        "elya trace 1\u{a0}\n\u{3000}\nA.a(1) = 2\u{2003}\n\u{85}A.b() = Unit\n",
+    ] {
+        assert_eq!(parsed(lenient), clean, "{lenient:?}");
+    }
+}
+
+/// The review's F1 (2026-10-30): `parse` and the host reader (`read_trace`) on
+/// every short trace over a small alphabet: the same entries, or the same line
+/// and the same words. The first version of `parse` split the TRIMMED line, so
+/// a ` = ` touching a trimmed edge (`A.a() = ` then the end) read differently.
+#[test]
+fn parse_reads_every_short_trace_as_the_host_does() {
+    // Every line of up to three symbols, under the header, two lines each.
+    let alphabet = [" ", "=", "\"", "\\", "a", "\u{3000}"];
+    let mut lines: Vec<String> = vec![String::new()];
+    for _ in 0..3 {
+        let longer: Vec<String> = lines
+            .iter()
+            .flat_map(|l| alphabet.iter().map(move |c| format!("{l}{c}")))
+            .collect();
+        lines.extend(longer);
+    }
+    lines.sort();
+    lines.dedup();
+    let mut texts: Vec<String> = Vec::new();
+    for l in &lines {
+        texts.push(format!("elya trace 1\n{l}\n"));
+        texts.push(format!("elya trace 1\nA.a() = 1\n{l}"));
+        texts.push(format!("elya trace 1\r\n{l} = {l}\r\n"));
+    }
+    texts.push(String::new());
+    texts.push("elya trace 1".to_string());
+    texts.push("\u{feff} elya trace 1 \n".to_string());
+    // One program parses them all and prints one line per text.
+    let lit = |t: &str| {
+        t.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    };
+    let mut calls = String::new();
+    for t in &texts {
+        calls.push_str(&format!("  io.println(read(\"{}\"))\n", lit(t)));
+    }
+    let src = format!(
+        "import elya/replay\n\
+         fn show(t: Trace) -> String {{ match t {{ TraceEnd -> \"\"  TraceEntry(q, a, r) -> \"[\" <> q <> \"|\" <> a <> \"]\" <> show(r) }} }}\n\
+         fn read(text: String) -> String {{\n\
+         \x20 match replay.parse(text) {{\n\
+         \x20   TraceParsed(t) -> \"ok \" <> show(t)\n\
+         \x20   TraceUnreadable(n, why) -> int.to_string(n) <> \" \" <> why\n\
+         \x20 }}\n\
+         }}\n\
+         pub fn main() -> Int {{\n{calls}  0\n}}\n"
+    );
+    let (out, v) = run(&src);
+    assert_eq!(v, Ok(0), "{out}");
+    let got: Vec<&str> = out.lines().collect();
+    assert_eq!(got.len(), texts.len());
+    let mut differ = Vec::new();
+    for (t, g) in texts.iter().zip(got) {
+        let want = match elya::read_trace(t) {
+            Ok(entries) => {
+                let shown: String = entries.iter().map(|(q, a)| format!("[{q}|{a}]")).collect();
+                format!("ok {shown}")
+            }
+            Err((n, why)) => format!("{n} {why}"),
+        };
+        if want != g {
+            differ.push(format!("{t:?}: host `{want}`, parse `{g}`"));
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} differ:\n{}",
+        differ.len(),
+        differ.join("\n")
     );
 }

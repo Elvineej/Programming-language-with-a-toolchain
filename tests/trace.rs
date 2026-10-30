@@ -86,3 +86,21 @@ fn a_trace_is_read_ignoring_surrounding_whitespace() {
     let out = run_source_replaying("c.elya", CLOCK, trace).expect("replays");
     assert_eq!(out, "slept\n150\n");
 }
+
+#[test]
+fn a_line_splits_at_the_first_separator_outside_quotes() {
+    // Spec 2026-10-24-elya-trace-text D2: the question is `time.now_ms()` and
+    // the answer `"a = b"`, which is not an `Int`. The last ` = ` would have
+    // made the question `time.now_ms() = "a`, a divergence.
+    let trace = "elya trace 1\ntime.now_ms() = \"a = b\"\n";
+    let err = run_source_replaying("c.elya", CLOCK, trace).unwrap_err();
+    assert!(err.contains("not an answer of type Int"), "{err}");
+    assert!(!err.contains("diverged"), "{err}");
+    // A line that ends inside quotes before any separator.
+    let trace = "elya trace 1\ntime.now_ms(\"x) = 1\n";
+    let err = run_source_replaying("c.elya", CLOCK, trace).unwrap_err();
+    assert!(
+        err.contains("trace line 2: a string is not closed"),
+        "{err}"
+    );
+}

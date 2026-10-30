@@ -16,6 +16,13 @@ Baseline: 1284 passed, 132 suites (bac4834, measured).
 Prediction: **1307 passed, 135 suites**, with exactly these 13 new tests (23
 counted) red before the code.
 
+Revised 2026-10-30 (the interactive session that continued this plan):
+- `crates/codegen/tests/native_trace.rs` gains a test: the native reader's split
+  (+1). Red: the native reader's divergence message.
+- The baseline is re-measured at 7de6bf6, the lock over 2778bc1 (documents only).
+
+Revised prediction: **1308 passed, 135 suites**.
+
 ## Task 2: the builtins (D1)
 
 `resolve.rs` (names, arity), `modules.rs` (`string`), `types.rs` (types),
@@ -28,3 +35,6 @@ counted) red before the code.
 `lib.rs`'s reader through one `split_entry`; `std/replay.elya`'s `parse`.
 
 ## Task 4: gate, controls K1-K3, review
+
+Measured: **1308 passed, 135 suites**, as predicted. The review's F1 test is in an
+existing file (+1, counted twice): **1310 passed, 135 suites** after it.

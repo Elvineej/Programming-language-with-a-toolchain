@@ -26,11 +26,17 @@ pub const INT_BINARY_BUILTINS: &[&str] = &[
 /// `of_int : fn(Int) -> Float`, `truncate` and `round : fn(Float) -> Int`.
 pub const FLOAT_CONVERSIONS: &[&str] = &["of_int", "truncate", "round"];
 
+/// The `string.*` builtins (spec 2026-10-24-elya-trace-text D1): a string by
+/// byte. `length : fn(String) -> Int`, `byte_at : fn(String, Int) -> Int`,
+/// `slice : fn(String, Int, Int) -> String`, all pure.
+pub const STRING_BUILTINS: &[&str] = &["length", "byte_at", "slice"];
+
 /// How many arguments a builtin takes (every name in [`builtins`]).
 pub fn builtin_arity(full: &str) -> usize {
     match full {
         "time.now_ms" => 0,
-        "op.encode" | "op.decode" => 2,
+        "op.encode" | "op.decode" | "string.byte_at" => 2,
+        "string.slice" => 3,
         f if f
             .strip_prefix("int.")
             .is_some_and(|n| INT_BINARY_BUILTINS.contains(&n)) =>
@@ -51,6 +57,10 @@ pub fn builtins() -> &'static [&'static str] {
         "float.of_int",
         "float.truncate",
         "float.round",
+        // A string by byte (2026-10-30, spec 2026-10-24-elya-trace-text D1).
+        "string.length",
+        "string.byte_at",
+        "string.slice",
         // Explicit wrapping and bit arithmetic (2026-10-17, spec
         // 2026-10-17-elya-unary-and-wrapping D2).
         "int.wrapping_add",
@@ -487,7 +497,7 @@ impl Cx<'_> {
                 } else {
                     // At the builtin's own arity (the 2026-10-17 review's L1:
                     // `fn(x) { int.xor(x) }` was itself an arity error).
-                    let ps = ["a", "b"][..builtin_arity(&full)].join(", ");
+                    let ps = ["a", "b", "c"][..builtin_arity(&full)].join(", ");
                     self.diags.push(
                         Diagnostic::error("E0208", format!("builtin `{full}` used as a value"))
                             .with_label(span, "a builtin can only be called")

@@ -606,6 +606,43 @@ pub(crate) fn float_conversion<'ctx>(
     }
 }
 
+/// `string.length`, `string.byte_at`, `string.slice` on lowered operands (spec
+/// 2026-10-24-elya-trace-text D1), both emitters. Only `slice` allocates; the
+/// runtime roots its string, and the caller roots whatever else is live.
+pub(crate) fn string_builtin<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    name: &str,
+    vals: &[BasicValueEnum<'ctx>],
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    let (f, args): (
+        FunctionValue<'ctx>,
+        Vec<inkwell::values::BasicMetadataValueEnum<'ctx>>,
+    ) = match (name, vals) {
+        ("string.length", [s]) => (lc.str_length, vec![(*s).into()]),
+        ("string.byte_at", [s, i]) => (lc.str_byte_at, vec![(*s).into(), (*i).into()]),
+        ("string.slice", [s, from, to]) => (
+            lc.str_slice,
+            vec![
+                i64t.const_int(lc.string_tag as u64, false).into(),
+                (*s).into(),
+                (*from).into(),
+                (*to).into(),
+            ],
+        ),
+        _ => return Err(CodegenError::UnsupportedBuiltin(name.to_string())),
+    };
+    b.build_call(f, &args, "strb")
+        .map_err(internal)?
+        .try_as_basic_value()
+        .left()
+        .ok_or(CodegenError::Unsupported(
+            "a string builtin returned no value",
+        ))
+}
+
 /// `==`/`!=` on `Unit`: both operands are evaluated, the answer is constant.
 pub(crate) fn is_unit_eq_prim(op: BinOp, args: &[CoreExpr]) -> bool {
     matches!(op, BinOp::Eq | BinOp::Ne) && matches!(args[0].ty, Ty::Base(TyCon::Unit))
@@ -714,6 +751,9 @@ pub(crate) fn is_native_builtin(name: &str) -> bool {
             | "float.of_int"
             | "float.truncate"
             | "float.round"
+            | "string.length"
+            | "string.byte_at"
+            | "string.slice"
             | "time.now_ms"
             | "time.sleep_ms"
             | "any.show"
@@ -1753,6 +1793,20 @@ fn lower_expr<'ctx>(
             let x = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
             float_conversion(ctx, b, lc, builtin, x)
         }
+        CoreKind::Builtin(builtin, args) if builtin.starts_with("string.") => {
+            // The string is rooted while later operands are lowered (they may
+            // allocate), and the environment across a slice's allocation.
+            let s = lower_expr(ctx, func, b, lc, &args[0], env)?;
+            let own = usize::from(gc_root(b, lc, s)?);
+            let mut vals = vec![s];
+            for a in args[1..].iter() {
+                vals.push(lower_expr(ctx, func, b, lc, a, env)?);
+            }
+            let roots = gc_root_env(b, lc, env)?;
+            let v = string_builtin(ctx, b, lc, builtin, &vals)?;
+            gc_unroot(b, lc, roots + own)?;
+            Ok(v)
+        }
         CoreKind::Builtin(builtin, args) if builtin == "int.to_string" && args.len() == 1 => {
             let n = lower_expr(ctx, func, b, lc, &args[0], env)?;
             let roots = gc_root_env(b, lc, env)?;
@@ -2324,6 +2378,12 @@ struct LowerCtx<'a, 'ctx> {
     /// `elya_float_to_int(name, bits, round)` (`ccc`; exits on NaN or outside
     /// `Int`, spec 2026-10-24-elya-float-part-2 D4).
     float_to_int: FunctionValue<'ctx>,
+    /// `elya_str_length(s)`, `elya_str_byte_at(s, i)` and
+    /// `elya_str_slice(tag, s, from, to)` (`ccc`; the last two exit by name,
+    /// spec 2026-10-24-elya-trace-text D1).
+    str_length: FunctionValue<'ctx>,
+    str_byte_at: FunctionValue<'ctx>,
+    str_slice: FunctionValue<'ctx>,
 }
 
 /// Fold `core.types` into a flat constructor table: name -> (tag, field types).
@@ -2585,6 +2645,12 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let shift_range = module.add_function("elya_shift_range", shift_range_ty, None); // ccc
     let float_to_int_ty = i64t.fn_type(&[ptrt.into(), i64t.into(), i64t.into()], false);
     let float_to_int = module.add_function("elya_float_to_int", float_to_int_ty, None); // ccc
+    let str_length_ty = i64t.fn_type(&[ptrt.into()], false);
+    let str_length = module.add_function("elya_str_length", str_length_ty, None); // ccc
+    let str_byte_at_ty = i64t.fn_type(&[ptrt.into(), i64t.into()], false);
+    let str_byte_at = module.add_function("elya_str_byte_at", str_byte_at_ty, None); // ccc
+    let str_slice_ty = ptrt.fn_type(&[i64t.into(), ptrt.into(), i64t.into(), i64t.into()], false);
+    let str_slice = module.add_function("elya_str_slice", str_slice_ty, None); // ccc
     let op_ids = cps_emit::op_ids(core);
     let (resume_fns, handler_fns) =
         cps_emit::declare(ctx, &module, &nodes, &sites, &handlers, &op_ids)?;
@@ -2640,6 +2706,9 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         any_check,
         shift_range,
         float_to_int,
+        str_length,
+        str_byte_at,
+        str_slice,
     };
     let b = ctx.create_builder();
     let handle_end_code = cps_emit::emit_handle_end(ctx, &module, &b, current_handler)?;

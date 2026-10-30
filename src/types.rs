@@ -1864,6 +1864,21 @@ impl Infer {
                 self.node_types.insert(callee.span, want);
                 return to;
             }
+            // A string by byte (spec 2026-10-24-elya-trace-text D1), pure: a
+            // failure is not an effect.
+            if module == "string" && crate::resolve::STRING_BUILTINS.contains(&name.as_str()) {
+                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+                let (params, ret) = match name.as_str() {
+                    "length" => (vec![Ty::str()], Ty::int()),
+                    "byte_at" => (vec![Ty::str(), Ty::int()], Ty::int()),
+                    _ => (vec![Ty::str(), Ty::int(), Ty::int()], Ty::str()),
+                };
+                let want = Ty::Fn(params, EffectRow::pure(), Box::new(ret.clone()));
+                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
+                self.unify(&want, &got, span);
+                self.node_types.insert(callee.span, want);
+                return ret;
+            }
             // Wrapping and bit arithmetic: `fn(Int, Int) -> Int`, pure (spec
             // 2026-10-17-elya-unary-and-wrapping D2).
             if module == "int" && crate::resolve::INT_BINARY_BUILTINS.contains(&name.as_str()) {
