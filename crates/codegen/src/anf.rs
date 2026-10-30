@@ -34,8 +34,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use elya::core::{
-    CoreArm, CoreClause, CoreExpr, CoreFn, CoreHandle, CoreKind, CoreModule, CoreParam,
-    CorePerform, CoreReturn,
+    let_spine, push_children, rebuild_spine, CoreArm, CoreClause, CoreExpr, CoreFn, CoreHandle,
+    CoreKind, CoreModule, CoreParam, CorePerform, CoreReturn,
 };
 use elya::types::{RowTail, Ty, TyCon};
 
@@ -353,15 +353,25 @@ impl Anf<'_> {
                     .collect();
                 CoreKind::Lambda(ps, Rc::new(self.fresh_binders(&b, name)))
             }
-            CoreKind::Let(x, v, b) => {
-                let v = self.fresh_binders(v, name);
-                if x == name {
-                    let n = self.fresh(&format!("{name}$alias"));
-                    let b = rename(b, name, &n);
-                    CoreKind::Let(n, Rc::new(v), Rc::new(self.fresh_binders(&b, name)))
-                } else {
-                    CoreKind::Let(x.clone(), Rc::new(v), Rc::new(self.fresh_binders(b, name)))
+            // A block in a loop (spec 2026-10-30-elya-long-blocks D1); a binder
+            // of `name` renames the rest of the block, as before.
+            CoreKind::Let(..) => {
+                let mut lets = Vec::new();
+                let mut cur = e.clone();
+                while let CoreKind::Let(x, v, b) = &cur.kind {
+                    let v = self.fresh_binders(v, name);
+                    let (x, next) = if x == name {
+                        let n = self.fresh(&format!("{name}$alias"));
+                        let b = rename(b, name, &n);
+                        (n, b)
+                    } else {
+                        (x.clone(), (**b).clone())
+                    };
+                    lets.push((cur.span, cur.ty.clone(), x, v));
+                    cur = next;
                 }
+                let body = self.fresh_binders(&cur, name);
+                return rebuild_spine(lets, body);
             }
             CoreKind::If(c, t, f) => CoreKind::If(
                 Rc::new(self.fresh_binders(c, name)),
@@ -509,24 +519,35 @@ impl Anf<'_> {
                 locals.truncate(depth);
                 CoreKind::Lambda(ps.clone(), Rc::new(b))
             }
-            CoreKind::Let(x, v, b) => {
-                if let CoreKind::Var(y) = &v.kind {
-                    if self.substitutes(x, v, y, locals) {
-                        // D1: the body's own binders of `y` are renamed first,
-                        // so substituting `y` for `x` captures nothing.
-                        let b = if binds(b, y) {
-                            self.fresh_binders(b, y)
-                        } else {
-                            (**b).clone()
-                        };
-                        return self.expr(&rename(&b, x, y), locals);
+            // A block in a loop, not a recursion down its `let`s (spec
+            // 2026-10-30-elya-long-blocks D1).
+            CoreKind::Let(..) => {
+                let depth = locals.len();
+                let mut lets = Vec::new();
+                let mut cur = e.clone();
+                while let CoreKind::Let(x, v, b) = &cur.kind {
+                    if let CoreKind::Var(y) = &v.kind {
+                        if self.substitutes(x, v, y, locals) {
+                            // D1: the body's own binders of `y` are renamed
+                            // first, so substituting `y` for `x` captures nothing.
+                            let b = if binds(b, y) {
+                                self.fresh_binders(b, y)
+                            } else {
+                                (**b).clone()
+                            };
+                            cur = rename(&b, x, y);
+                            continue;
+                        }
                     }
+                    let v = self.expr(v, locals);
+                    locals.push(x.clone());
+                    lets.push((cur.span, cur.ty.clone(), x.clone(), v));
+                    let next = (**b).clone();
+                    cur = next;
                 }
-                let v = self.expr(v, locals);
-                locals.push(x.clone());
-                let b = self.expr(b, locals);
-                locals.pop();
-                CoreKind::Let(x.clone(), Rc::new(v), Rc::new(b))
+                let body = self.expr(&cur, locals);
+                locals.truncate(depth);
+                return rebuild_spine(lets, body);
             }
             CoreKind::If(c, t, f) => CoreKind::If(
                 Rc::new(self.expr(c, locals)),
@@ -631,34 +652,31 @@ fn is_operation(t: &Ty) -> bool {
 /// Whether `e` binds `name` anywhere: a `let`, a parameter, a pattern, a
 /// clause's parameter or a return binder (rule 4's capture check).
 fn binds(e: &CoreExpr, name: &str) -> bool {
-    let any = |cs: &[CoreExpr]| cs.iter().any(|c| binds(c, name));
-    match &e.kind {
-        CoreKind::Lit(_) | CoreKind::Var(_) => false,
-        CoreKind::App(f, a) => binds(f, name) || any(a),
-        CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => any(a),
-        CoreKind::Lambda(ps, b) => ps.iter().any(|p| p.name == name) || binds(b, name),
-        CoreKind::Let(x, v, b) => x == name || binds(v, name) || binds(b, name),
-        CoreKind::If(c, t, f) => binds(c, name) || binds(t, name) || binds(f, name),
-        CoreKind::Match(s, arms) => {
-            binds(s, name)
-                || arms.iter().any(|a| {
-                    let mut names = Vec::new();
-                    crate::closure::pat_binders(&a.pat, &mut names);
-                    names.iter().any(|n| n == name) || binds(&a.body, name)
-                })
-        }
-        CoreKind::Handle(h) => {
-            binds(&h.body, name)
-                || h.clauses
+    // A heap stack, not recursion (spec 2026-10-30-elya-long-blocks D1).
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        let binder = match &e.kind {
+            CoreKind::Lambda(ps, _) => ps.iter().any(|p| p.name == name),
+            CoreKind::Let(x, _, _) => x == name,
+            CoreKind::Match(_, arms) => arms.iter().any(|a| {
+                let mut names = Vec::new();
+                crate::closure::pat_binders(&a.pat, &mut names);
+                names.iter().any(|n| n == name)
+            }),
+            CoreKind::Handle(h) => {
+                h.clauses
                     .iter()
-                    .any(|c| c.params.iter().any(|p| p.name == name) || binds(&c.body, name))
-                || h.ret
-                    .as_ref()
-                    .is_some_and(|r| r.binder == name || binds(&r.body, name))
+                    .any(|c| c.params.iter().any(|p| p.name == name))
+                    || h.ret.as_ref().is_some_and(|r| r.binder == name)
+            }
+            _ => false,
+        };
+        if binder {
+            return true;
         }
-        CoreKind::Resume(v) => binds(v, name),
-        CoreKind::Perform(p) => any(&p.args),
+        push_children(e, &mut stack);
     }
+    false
 }
 
 /// `e` with every free `from` renamed `to`, each occurrence keeping its type.
@@ -694,9 +712,28 @@ fn rename(e: &CoreExpr, from: &str, to: &str) -> CoreExpr {
             }
             CoreKind::Lambda(ps.clone(), Rc::new(go(b)))
         }
-        CoreKind::Let(x, v, b) => {
-            let b = if x == from { b.clone() } else { Rc::new(go(b)) };
-            CoreKind::Let(x.clone(), Rc::new(go(v)), b)
+        // A block in a loop (spec 2026-10-30-elya-long-blocks D1): values are
+        // renamed down to the first binder of `from`, whose rest is kept.
+        CoreKind::Let(..) => {
+            let (spine, body) = let_spine(e);
+            let mut lets = Vec::with_capacity(spine.len());
+            let mut rest = None;
+            for l in spine {
+                lets.push((
+                    l.node.span,
+                    l.node.ty.clone(),
+                    l.name.to_string(),
+                    go(l.value),
+                ));
+                if l.name == from {
+                    let CoreKind::Let(_, _, b) = &l.node.kind else {
+                        unreachable!("a spine binding is a `let`")
+                    };
+                    rest = Some((**b).clone());
+                    break;
+                }
+            }
+            return rebuild_spine(lets, rest.unwrap_or_else(|| go(body)));
         }
         CoreKind::If(c, t, f) => CoreKind::If(Rc::new(go(c)), Rc::new(go(t)), Rc::new(go(f))),
         CoreKind::Match(s, arms) => CoreKind::Match(

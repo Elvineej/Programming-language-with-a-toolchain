@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use elya::core::{CoreExpr, CoreKind, CoreModule};
+use elya::core::{push_children, CoreExpr, CoreKind, CoreModule};
 use elya::types::{Ty, TyCon};
 
 use crate::CodegenError;
@@ -128,45 +128,21 @@ impl Reflect {
     }
 }
 
-/// The types `any.show` writes (its operand's) and `any.decode` reads (its own).
+/// The types `any.show` writes (its operand's) and `any.decode` reads (its own),
+/// in pre-order, left to right, with a heap stack (spec
+/// 2026-10-30-elya-long-blocks D1).
 fn targets_in(e: &CoreExpr, out: &mut Vec<Ty>) {
-    match &e.kind {
-        CoreKind::Builtin(n, a) => {
+    let mut stack = vec![e];
+    let mut children = Vec::new();
+    while let Some(e) = stack.pop() {
+        if let CoreKind::Builtin(n, a) = &e.kind {
             match n.as_str() {
                 "any.show" | "any.check" => out.push(a[0].ty.clone()),
                 "any.decode" => out.push(e.ty.clone()),
                 _ => {}
             }
-            a.iter().for_each(|x| targets_in(x, out));
         }
-        CoreKind::Lit(_) | CoreKind::Var(_) => {}
-        CoreKind::App(f, a) => {
-            targets_in(f, out);
-            a.iter().for_each(|x| targets_in(x, out));
-        }
-        CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => a.iter().for_each(|x| targets_in(x, out)),
-        CoreKind::Lambda(_, b) => targets_in(b, out),
-        CoreKind::Let(_, v, b) => {
-            targets_in(v, out);
-            targets_in(b, out);
-        }
-        CoreKind::If(c, t, f) => {
-            targets_in(c, out);
-            targets_in(t, out);
-            targets_in(f, out);
-        }
-        CoreKind::Match(s, arms) => {
-            targets_in(s, out);
-            arms.iter().for_each(|a| targets_in(&a.body, out));
-        }
-        CoreKind::Handle(h) => {
-            targets_in(&h.body, out);
-            h.clauses.iter().for_each(|c| targets_in(&c.body, out));
-            if let Some(r) = &h.ret {
-                targets_in(&r.body, out);
-            }
-        }
-        CoreKind::Resume(v) => targets_in(v, out),
-        CoreKind::Perform(p) => p.args.iter().for_each(|x| targets_in(x, out)),
+        push_children(e, &mut children);
+        stack.extend(children.drain(..).rev());
     }
 }

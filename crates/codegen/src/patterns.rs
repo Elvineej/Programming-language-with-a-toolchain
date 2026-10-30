@@ -21,8 +21,8 @@ use std::rc::Rc;
 
 use elya::ast::BinOp;
 use elya::core::{
-    CoreArm, CoreClause, CoreExpr, CoreFn, CoreHandle, CoreKind, CoreLit, CoreModule, CorePat,
-    CorePerform, CoreReturn, CoreType,
+    let_spine, push_children, rebuild_spine, CoreArm, CoreClause, CoreExpr, CoreFn, CoreHandle,
+    CoreKind, CoreLit, CoreModule, CorePat, CorePerform, CoreReturn, CoreType,
 };
 use elya::span::Span;
 use elya::types::{Ty, TyCon};
@@ -76,25 +76,17 @@ fn is_flat_match(scrut: &Ty, arms: &[CoreArm]) -> bool {
 
 /// Does `e` contain a match this pass rewrites?
 fn needs(e: &CoreExpr) -> bool {
-    let any = |cs: &[CoreExpr]| cs.iter().any(needs);
-    match &e.kind {
-        CoreKind::Lit(_) | CoreKind::Var(_) => false,
-        CoreKind::App(f, a) => needs(f) || any(a),
-        CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => any(a),
-        CoreKind::Lambda(_, b) => needs(b),
-        CoreKind::Let(_, v, b) => needs(v) || needs(b),
-        CoreKind::If(c, t, f) => needs(c) || needs(t) || needs(f),
-        CoreKind::Match(sc, arms) => {
-            !is_flat_match(&sc.ty, arms) || needs(sc) || arms.iter().any(|a| needs(&a.body))
+    // A heap stack, not recursion (spec 2026-10-30-elya-long-blocks D1).
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        if let CoreKind::Match(sc, arms) = &e.kind {
+            if !is_flat_match(&sc.ty, arms) {
+                return true;
+            }
         }
-        CoreKind::Handle(h) => {
-            needs(&h.body)
-                || h.clauses.iter().any(|c| needs(&c.body))
-                || h.ret.as_ref().is_some_and(|r| needs(&r.body))
-        }
-        CoreKind::Resume(v) => needs(v),
-        CoreKind::Perform(p) => any(&p.args),
+        push_children(e, &mut stack);
     }
+    false
 }
 
 fn node(span: Span, ty: Ty, kind: CoreKind) -> CoreExpr {
@@ -148,8 +140,21 @@ impl Compiler<'_> {
             CoreKind::Ctor(n, a) => CoreKind::Ctor(n.clone(), self.all(a)),
             CoreKind::Prim(o, a) => CoreKind::Prim(*o, self.all(a)),
             CoreKind::Lambda(ps, b) => CoreKind::Lambda(ps.clone(), Rc::new(self.expr(b))),
-            CoreKind::Let(x, v, b) => {
-                CoreKind::Let(x.clone(), Rc::new(self.expr(v)), Rc::new(self.expr(b)))
+            // A block in a loop (spec 2026-10-30-elya-long-blocks D1).
+            CoreKind::Let(..) => {
+                let (spine, body) = let_spine(e);
+                let lets = spine
+                    .iter()
+                    .map(|l| {
+                        (
+                            l.node.span,
+                            l.node.ty.clone(),
+                            l.name.to_string(),
+                            self.expr(l.value),
+                        )
+                    })
+                    .collect();
+                return rebuild_spine(lets, self.expr(body));
             }
             CoreKind::If(c, t, f) => CoreKind::If(
                 Rc::new(self.expr(c)),

@@ -159,6 +159,22 @@ struct Scope {
     parent: Option<Rc<Scope>>,
 }
 
+/// A scope's parents are freed in a loop: a block's `let`s make a chain as long
+/// as the block, and the derived `Drop` recursed down it (spec
+/// 2026-10-30-elya-long-blocks D2). A parent another environment still holds
+/// stops the loop; its last owner frees it.
+impl Drop for Scope {
+    fn drop(&mut self) {
+        let mut next = self.parent.take();
+        while let Some(rc) = next {
+            match Rc::try_unwrap(rc) {
+                Ok(mut scope) => next = scope.parent.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 /// Persistent parent-pointer environment holding local bindings only.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Env(Option<Rc<Scope>>);

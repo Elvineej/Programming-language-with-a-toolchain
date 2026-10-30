@@ -55,7 +55,7 @@ use inkwell::OptimizationLevel;
 
 use crate::closure::LambdaSite;
 use elya::ast::BinOp;
-use elya::core::{CoreExpr, CoreFn, CoreKind, CoreLit, CoreModule, CorePat};
+use elya::core::{let_spine, CoreExpr, CoreFn, CoreKind, CoreLit, CoreModule, CorePat};
 use elya::types::{Ty, TyCon};
 
 #[derive(Debug)]
@@ -1277,6 +1277,43 @@ fn build_closure_call<'ctx>(
     Ok(site)
 }
 
+/// A block's `let`s lowered in a loop, each bound as it is lowered, then `rest`
+/// on the expression that ends the block; the bindings are undone after, in
+/// reverse, on every path (spec 2026-10-30-elya-long-blocks D1: a block's
+/// length is not a recursion depth). A shadowed outer binding stays rooted
+/// meanwhile (`bind_local`).
+pub(crate) fn lower_block<'ctx, T>(
+    ctx: &'ctx Context,
+    func: FunctionValue<'ctx>,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    e: &CoreExpr,
+    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    rest: impl FnOnce(&CoreExpr, &mut HashMap<String, BasicValueEnum<'ctx>>) -> Result<T, CodegenError>,
+) -> Result<T, CodegenError> {
+    let (spine, body) = let_spine(e);
+    let mut bound = Vec::with_capacity(spine.len());
+    let mut failed = None;
+    for l in &spine {
+        // A bound value is NOT in tail position; only the block's end can be.
+        match lower_expr(ctx, func, b, lc, l.value, env) {
+            Ok(v) => bound.push((l.name, bind_local(env, l.name, v))),
+            Err(err) => {
+                failed = Some(err);
+                break;
+            }
+        }
+    }
+    let out = match failed {
+        Some(err) => Err(err),
+        None => rest(body, env),
+    };
+    for (x, shadowed) in bound.into_iter().rev() {
+        unbind_local(env, x, shadowed);
+    }
+    out
+}
+
 /// §4.3: the tail half of the emission split. `lower_expr` produces a VALUE;
 /// `lower_tail` emits a TERMINATOR. On `Ok` the current block is terminated —
 /// every arm here ends in a `ret` or hands off to a recursive call that does.
@@ -1316,15 +1353,9 @@ fn lower_tail<'ctx>(
             lower_tail(ctx, func, b, lc, else_e, env)?;
             Ok(())
         }
-        CoreKind::Let(x, rhs, body) => {
-            // The bound value is NOT in tail position; only the body is.
-            let v = lower_expr(ctx, func, b, lc, rhs, env)?;
-            // A shadowed outer binding stays rooted (`bind_local`).
-            let shadowed = bind_local(env, x, v);
-            let out = lower_tail(ctx, func, b, lc, body, env);
-            unbind_local(env, x, shadowed);
-            out
-        }
+        CoreKind::Let(..) => lower_block(ctx, func, b, lc, e, env, |body, env| {
+            lower_tail(ctx, func, b, lc, body, env)
+        }),
         // A call in a match arm is in tail position too (HANDOFF step 1).
         CoreKind::Match(scrutinee, arms) => {
             lower_match(ctx, func, b, lc, scrutinee, arms, None, env)?;
@@ -1834,15 +1865,11 @@ fn lower_expr<'ctx>(
             Some(v) => Ok(*v),
             None => Err(CodegenError::Unsupported("unbound var")),
         },
-        CoreKind::Let(x, rhs, body) => {
-            let v = lower_expr(ctx, func, b, lc, rhs, env)?;
-            // Restore any shadowed binding -- `let x = 1; let x = x + 1` stays
-            // correct -- and keep it ROOTED meanwhile (`bind_local`).
-            let shadowed = bind_local(env, x, v);
-            let out = lower_expr(ctx, func, b, lc, body, env);
-            unbind_local(env, x, shadowed);
-            out
-        }
+        // Any shadowed binding is restored -- `let x = 1; let x = x + 1` stays
+        // correct -- and kept ROOTED meanwhile (`bind_local`).
+        CoreKind::Let(..) => lower_block(ctx, func, b, lc, e, env, |body, env| {
+            lower_expr(ctx, func, b, lc, body, env)
+        }),
         CoreKind::Prim(op, args) => {
             if args.len() != 2 {
                 return Err(CodegenError::Unsupported("binary Prim arity"));

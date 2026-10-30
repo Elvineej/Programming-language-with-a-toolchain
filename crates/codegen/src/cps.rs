@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use elya::core::{CoreExpr, CoreKind, CoreModule};
+use elya::core::{let_spine, push_children, CoreExpr, CoreKind, CoreModule};
 use elya::types::{EffectRow, RowTail, Ty};
 
 use crate::closure::{cont_ty, free_vars_under, pat_binders, CONT};
@@ -269,43 +269,15 @@ fn key(e: &CoreExpr) -> usize {
 /// Every `(effect, op)` performed anywhere in `e`, lambda bodies and handle
 /// regions included.
 fn performed_ops(e: &CoreExpr, out: &mut HashMap<String, BTreeSet<String>>) {
-    if let CoreKind::Perform(p) = &e.kind {
-        out.entry(p.effect.clone())
-            .or_default()
-            .insert(p.op.clone());
-    }
-    let mut go = |c: &CoreExpr| performed_ops(c, out);
-    match &e.kind {
-        CoreKind::Lit(_) | CoreKind::Var(_) => {}
-        CoreKind::App(f, args) => {
-            go(f);
-            args.iter().for_each(go);
+    // A heap stack, not recursion (spec 2026-10-30-elya-long-blocks D1).
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        if let CoreKind::Perform(p) = &e.kind {
+            out.entry(p.effect.clone())
+                .or_default()
+                .insert(p.op.clone());
         }
-        CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
-            a.iter().for_each(go)
-        }
-        CoreKind::Perform(p) => p.args.iter().for_each(go),
-        CoreKind::Lambda(_, body) | CoreKind::Resume(body) => go(body),
-        CoreKind::Let(_, v, b) => {
-            go(v);
-            go(b);
-        }
-        CoreKind::If(c, t, f) => {
-            go(c);
-            go(t);
-            go(f);
-        }
-        CoreKind::Match(s, arms) => {
-            go(s);
-            arms.iter().for_each(|a| go(&a.body));
-        }
-        CoreKind::Handle(h) => {
-            go(&h.body);
-            h.clauses.iter().for_each(|c| go(&c.body));
-            if let Some(r) = &h.ret {
-                go(&r.body);
-            }
-        }
+        push_children(e, &mut stack);
     }
 }
 
@@ -316,49 +288,31 @@ fn resume_owners(
     out: &mut HashMap<usize, usize>,
     multi: &mut HashSet<usize>,
 ) {
-    if let (CoreKind::Resume(_), Some((h, is_multi))) = (&e.kind, clause_of) {
-        out.insert(key(e), h);
-        if is_multi {
-            multi.insert(key(e));
-        }
-    }
-    let mut go = |c: &CoreExpr| resume_owners(c, clause_of, out, multi);
-    match &e.kind {
-        CoreKind::Lit(_) | CoreKind::Var(_) => {}
-        CoreKind::App(f, args) => {
-            go(f);
-            args.iter().for_each(go);
-        }
-        CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => {
-            a.iter().for_each(go)
-        }
-        CoreKind::Perform(p) => p.args.iter().for_each(go),
-        CoreKind::Lambda(_, body) => go(body),
-        CoreKind::Resume(v) => go(v),
-        CoreKind::Let(_, v, b) => {
-            go(v);
-            go(b);
-        }
-        CoreKind::If(c, t, f) => {
-            go(c);
-            go(t);
-            go(f);
-        }
-        CoreKind::Match(s, arms) => {
-            go(s);
-            arms.iter().for_each(|a| go(&a.body));
-        }
-        CoreKind::Handle(h) => {
-            go(&h.body);
-            if let Some(r) = &h.ret {
-                go(&r.body);
+    // A heap stack, not recursion (spec 2026-10-30-elya-long-blocks D1), in the
+    // recursion's pre-order (the review's F5): a node, its children left to
+    // right, and a handle's clauses after its body and `return`. A handle's
+    // clauses are inside it; its body and `return` are not.
+    let mut stack = vec![(e, clause_of)];
+    let mut children = Vec::new();
+    while let Some((e, clause_of)) = stack.pop() {
+        if let (CoreKind::Resume(_), Some((h, is_multi))) = (&e.kind, clause_of) {
+            out.insert(key(e), h);
+            if is_multi {
+                multi.insert(key(e));
             }
         }
-    }
-    if let CoreKind::Handle(h) = &e.kind {
-        for c in h.clauses.iter() {
-            resume_owners(&c.body, Some((key(e), h.multi)), out, multi);
+        if let CoreKind::Handle(h) = &e.kind {
+            for c in h.clauses.iter().rev() {
+                stack.push((&c.body, Some((key(e), h.multi))));
+            }
+            if let Some(r) = &h.ret {
+                stack.push((&r.body, clause_of));
+            }
+            stack.push((&h.body, clause_of));
+            continue;
         }
+        push_children(e, &mut children);
+        stack.extend(children.drain(..).rev().map(|c| (c, clause_of)));
     }
 }
 
@@ -406,9 +360,13 @@ fn region_effects(
                     }
                 }
             }
-            CoreKind::Let(_, v, b) => {
-                go(v, &mut out);
-                go(b, &mut out);
+            // A block in a loop (spec 2026-10-30-elya-long-blocks D1).
+            CoreKind::Let(..) => {
+                let (spine, body) = let_spine(e);
+                for l in &spine {
+                    go(l.value, &mut out);
+                }
+                go(body, &mut out);
             }
             CoreKind::If(c, t, f) => {
                 go(c, &mut out);
@@ -467,7 +425,12 @@ pub fn contains_effect(e: &CoreExpr, fx: &Fx) -> bool {
         CoreKind::App(f, args) => go(f) || args.iter().any(go),
         CoreKind::Builtin(_, a) | CoreKind::Ctor(_, a) | CoreKind::Prim(_, a) => a.iter().any(go),
         CoreKind::Perform(p) => p.args.iter().any(go),
-        CoreKind::Let(_, v, b) => go(v) || go(b),
+        // A block in a loop (spec 2026-10-30-elya-long-blocks D1); a `let` is
+        // never a call site.
+        CoreKind::Let(..) => {
+            let (spine, body) = let_spine(e);
+            spine.iter().any(|l| go(l.value)) || go(body)
+        }
         CoreKind::If(c, t, f) => go(c) || go(t) || go(f),
         CoreKind::Match(s, arms) => go(s) || arms.iter().any(|a| go(&a.body)),
         CoreKind::Resume(v) => go(v),
@@ -580,11 +543,31 @@ fn walk<'a>(
                 visit(a, i, scope, path, out);
             }
         }
-        CoreKind::Let(name, value, body) => {
-            visit(value, 0, scope, path, out);
+        // A block in a loop (spec 2026-10-30-elya-long-blocks D1), with the
+        // steps the recursion pushed: `(let, 0, depth)` around each value, then
+        // `(let, 1, depth + 1)` for the rest of the block. A `let` is never a
+        // call site, so the spine's own nodes need no site check.
+        CoreKind::Let(..) => {
             let depth = scope.len();
-            scope.push(name.clone());
-            visit(body, 1, scope, path, out);
+            let base = path.len();
+            let (spine, body) = let_spine(e);
+            for l in &spine {
+                path.push(Step {
+                    node: l.node,
+                    slot: 0,
+                    depth: scope.len(),
+                });
+                walk(l.value, owner, scope, path, out);
+                path.pop();
+                scope.push(l.name.to_string());
+                path.push(Step {
+                    node: l.node,
+                    slot: 1,
+                    depth: scope.len(),
+                });
+            }
+            walk(body, owner, scope, path, out);
+            path.truncate(base);
             scope.truncate(depth);
         }
         CoreKind::If(c, t, f) => {
