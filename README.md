@@ -167,6 +167,12 @@ main
 
 Function types can be written in `type` and `effect` declarations for this
 (`Paused(fn() / {Log} -> Task)`); a declaration's rows are exactly what is written.
+In a function's own annotations a row may end in a named row variable, written as
+the checker prints one: `fn run(f: fn() / {e} -> Int) / {e} -> Int` says `run`'s
+row is `f`'s, and `/ {Log | e}` adds `Log` to it. One name is one row across the
+whole function, its signature and the annotations in its body; like a lowercase
+type name it is flexible, so what the body performs beyond the named labels joins
+the row.
 
 ### Exact replay, and tests without mocks
 

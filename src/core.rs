@@ -621,10 +621,9 @@ fn ann_to_ty_in(a: &TypeAnn, tparams: &[String]) -> Ty {
             .map(|x| ann_to_ty_in(&x.node, tparams))
             .collect();
         let ret = ann_to_ty_in(&a.args[n - 1].node, tparams);
-        let labels = a
-            .row
+        let labels = crate::ast::row_tail(a.row.as_deref().unwrap_or(&[]))
+            .0
             .iter()
-            .flatten()
             .map(|l| {
                 (
                     l.node.clone(),

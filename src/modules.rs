@@ -530,7 +530,8 @@ impl Interface<'_> {
 
     fn ann(&mut self, a: &TypeAnn, positive: bool) {
         if a.name == "fn" {
-            for l in a.row.iter().flatten() {
+            // Effects only: a row's variable (its lowercase tail) is not one.
+            for l in crate::ast::row_tail(a.row.as_deref().unwrap_or(&[])).0 {
                 self.label(&l.node, positive);
             }
             let n = a.args.len();
@@ -768,7 +769,7 @@ impl<'u> Rewriter<'u> {
                     self.ann(a);
                 }
                 if let Some(row) = &f.effect_row {
-                    for e in row {
+                    for e in crate::ast::row_tail(row).0 {
                         self.visible(Kind::Effect, &e.node, e.span);
                     }
                 }
@@ -812,7 +813,7 @@ impl<'u> Rewriter<'u> {
             self.ann(x);
         }
         if let Some(row) = &a.node.row {
-            for e in row {
+            for e in crate::ast::row_tail(row).0 {
                 self.visible(Kind::Effect, &e.node, e.span);
             }
         }
