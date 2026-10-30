@@ -754,6 +754,9 @@ void *elya_any_show(int64_t string_tag, const int64_t *t, const char *names, int
             break;
         }
         case ANY_FN:
+            /* The program's output first, as from the evaluator (the
+             * main-values review's L1). */
+            fflush(stdout);
             fprintf(stderr, "elya: %sa function%s\n", before, after);
             exit(1);
         case ANY_ADT: {
@@ -1557,8 +1560,12 @@ static void elya_trace_init(void) {
 }
 
 /* After `main` returns, before its value is printed: a replay must have asked
- * everything (the evaluator's unread-entries error). */
-static void elya_trace_finish(void) {
+ * everything (the evaluator's unread-entries error). `elya_start` calls it, and
+ * so does `@elya_entry` before it writes a non-`Int` value line (the main-values
+ * review's F2: the line, or the failure to write it, comes after the check, as
+ * from the evaluator). Writing the line reads no entry, so a second call finds
+ * what the first did. */
+void elya_trace_finish(void) {
     if (elya_trace_mode == TRACE_REPLAY && elya_trace_next < elya_trace_n) {
         int64_t left = elya_trace_n - elya_trace_next;
         TraceEntry *e = &elya_trace_entries[elya_trace_next];

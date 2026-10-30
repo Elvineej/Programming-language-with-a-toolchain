@@ -250,20 +250,11 @@ fn fn_type_of<'ctx>(
     }
 }
 
-/// `main` returns i64: `@elya.main`'s signature says so and the print shim's
-/// format string is `%lld`. A `Bool`-bodied main is a representable value in an
-/// unrepresentable *place*, so it is refused at the module boundary rather than
-/// inside the fold — which is why this message stayed "non-Int value" when the
-/// fold widened.
-fn require_int(ty: &Ty) -> Result<(), CodegenError> {
-    // 5b-8 Task 11: a `Unit` main is also an i64 word (0), so the shim's
-    // `%lld` prints it as-is; A9's main ends in `io.println(..)`. A `Bool`
-    // main stays refused (an i1 is not the shim's word).
-    if matches!(ty, Ty::Base(TyCon::Int) | Ty::Base(TyCon::Unit)) {
-        Ok(())
-    } else {
-        Err(CodegenError::Unsupported("non-Int value"))
-    }
+/// Whether `main`'s value line is its literal, written by the reflection table
+/// after the run (spec 2026-10-30-elya-main-values D1), rather than the shim's
+/// `%lld`. An `Int` main prints its digits and a `Unit` main `0`, as always.
+pub(crate) fn main_shows_value(ty: &Ty) -> bool {
+    !matches!(ty, Ty::Base(TyCon::Int) | Ty::Base(TyCon::Unit))
 }
 
 /// Pass 1 of §4.2: declare every function before any body is emitted, so a body
@@ -2490,12 +2481,12 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let descriptors = descriptor_rows(core, &lambdas, &sites, &handlers, n_real_ctors, string_tag)?;
 
     let main = find_main(core)?;
-    // §5.5: `main` ALONE. The scope narrows from "every function" (which was
-    // trivially just `main` in N1) to "`main`", because `@elya.main`'s signature
-    // says i64 and the shim's format string is `%lld`. Applying this per
-    // function would refuse every ordinary predicate — see `is_pos` in the
-    // corpus — and is the most likely way to implement this section wrong.
-    require_int(&main.body.ty)?;
+    // Since 2026-10-30 every type of `main` has a value line (spec
+    // 2026-10-30-elya-main-values D1): an `Int` or `Unit` one through the
+    // shim's `%lld`, any other written by `elya_entry` through the reflection
+    // table. (Until then a non-`Int` main was refused here, "non-Int value".)
+    let main_ty = main.body.ty.clone();
+    let shows_value = main_shows_value(&main_ty);
 
     let i64t = ctx.i64_type();
     let i32t = ctx.i32_type();
@@ -2546,6 +2537,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let gc_pop = module.add_function("elya_gc_pop", gc_pop_ty, None); // ccc
     let gc_report_ty = ctx.void_type().fn_type(&[], false);
     let gc_report = module.add_function("elya_gc_report", gc_report_ty, None); // ccc
+    let trace_finish = module.add_function("elya_trace_finish", gc_report_ty, None); // ccc
 
     let lifted = declare_lifted(ctx, &module, &lambdas)?;
     let trap_ty = ctx.void_type().fn_type(&[], false);
@@ -2807,7 +2799,43 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         .try_as_basic_value()
         .left()
         .ok_or_else(|| internal("elya_main did not return a value"))?;
-    b.build_return(Some(&main_value)).map_err(internal)?;
+    if shows_value {
+        // D1: the value's literal, as `elya run --value` writes it; D2: a
+        // function stops by name in `elya_any_show`. The walk allocates only the
+        // finished string, after it has read the value. A replay's check that
+        // every entry was read comes first, as in the evaluator (the review's
+        // F2); `elya_start` repeats it, finding the same.
+        b.build_call(trace_finish, &[], "").map_err(internal)?;
+        let node = lc
+            .reflect
+            .node_of(&main_ty)
+            .ok_or_else(|| internal("main's type is not in the reflection table"))?;
+        let w = value_to_word(&b, main_value, &main_ty, i64t)?;
+        let text = b
+            .build_call(
+                lc.any_show,
+                &[
+                    i64t.const_int(lc.string_tag as u64, false).into(),
+                    lc.any_table.into(),
+                    lc.any_names.into(),
+                    i64t.const_int(node as u64, false).into(),
+                    w.into(),
+                    c_string(ctx, &lc, "main's value is ").into(),
+                    c_string(ctx, &lc, ", which is not data").into(),
+                ],
+                "mainshow",
+            )
+            .map_err(internal)?
+            .try_as_basic_value()
+            .left()
+            .ok_or(CodegenError::Unsupported("elya_any_show returned no value"))?;
+        b.build_call(lc.println, &[text.into()], "")
+            .map_err(internal)?;
+        b.build_return(Some(&i64t.const_int(0, false)))
+            .map_err(internal)?;
+    } else {
+        b.build_return(Some(&main_value)).map_err(internal)?;
+    }
     let start_ty = i64t.fn_type(&[ptrt.into()], false);
     let start = module.add_function("elya_start", start_ty, None); // ccc
 
@@ -2857,8 +2885,10 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         .try_as_basic_value()
         .left()
         .ok_or_else(|| internal("elya_start did not return a value"))?;
-    b.build_call(printf, &[fmt.as_pointer_value().into(), v.into()], "p")
-        .map_err(internal)?;
+    if !shows_value {
+        b.build_call(printf, &[fmt.as_pointer_value().into(), v.into()], "p")
+            .map_err(internal)?;
+    }
     // AFTER the answer, so a stats dump can never interleave with the value the
     // execution proofs assert on, and gated on ELY_GC_STATS inside the runtime
     // so stderr stays empty unless a test asks for the counters.
@@ -3195,17 +3225,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bool_literal_specifically() {
+    fn a_bool_literal_main_compiles() {
+        // Was `rejects_bool_literal_specifically` ("non-Int value") until
+        // 2026-10-30: every data `main` has a value line now, written through
+        // the reflection table (spec 2026-10-30-elya-main-values D1). A changed
+        // expectation, by that decision.
         let e = CoreExpr {
             span: Span::EMPTY,
             ty: Ty::Base(TyCon::Bool),
             kind: CoreKind::Lit(CoreLit::Bool(true)),
         };
-        let err = emit_ir(&main_fn(e)).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("non-Int value")),
-            "{err:?}"
-        );
+        emit_ir(&main_fn(e)).expect("a Bool main verifies");
     }
 
     #[test]
@@ -3736,7 +3766,9 @@ mod tests {
     }
 
     #[test]
-    fn a_bool_returning_helper_compiles_but_a_bool_main_still_refuses() {
+    fn a_bool_returning_helper_and_a_bool_main_compile() {
+        // The second half changed on 2026-10-30 (spec 2026-10-30-elya-main-values
+        // D1): a `Bool` main was refused, "non-Int value"; it has a value line now.
         // §5.5. `require_int`'s SCOPE narrows from "every function" (trivially
         // just `main` in N1) to "`main` alone". The likely way to get this wrong
         // is to implement it as scope-PRESERVING — applying `require_int` per
@@ -3747,11 +3779,7 @@ mod tests {
             "fn is_pos(n) { n > 0 }\npub fn main() { if is_pos(3) { 1 } else { 0 } }\n",
         ))
         .expect("a Bool-returning helper is legal");
-        let err = emit_ir(&core_of("pub fn main() { 1 < 2 }\n")).unwrap_err();
-        assert!(
-            matches!(err, CodegenError::Unsupported("non-Int value")),
-            "{err:?}"
-        );
+        emit_ir(&core_of("pub fn main() { 1 < 2 }\n")).expect("a Bool main verifies");
     }
 
     /// `repr_ty` says pointer <=> `is_heap_ty` says traced. If these ever disagree,

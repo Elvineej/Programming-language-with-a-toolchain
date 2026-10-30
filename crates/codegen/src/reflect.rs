@@ -53,6 +53,10 @@ impl Reflect {
         let mut targets = Vec::new();
         for f in &core.fns {
             targets_in(&f.body, &mut targets);
+            // `main`'s value line (spec 2026-10-30-elya-main-values D1).
+            if f.name == "main" && crate::main_shows_value(&f.body.ty) {
+                targets.push(f.body.ty.clone());
+            }
         }
         let mut r = Reflect::default();
         for t in &targets {

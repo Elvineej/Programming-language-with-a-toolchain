@@ -13,7 +13,7 @@ fn native_equals_evaluator(tag: &str, root: &str) {
     let mut read = move |path: &str| (path == "dep").then(|| ("dep.elya".to_string(), dep.clone()));
     let o = elya::run_source_outcome_with("main.elya", root, &mut read);
     assert!(o.error.is_none(), "{:?}", o.error);
-    let want = format!("{}{}\n", o.output, o.value.unwrap().unwrap());
+    let want = format!("{}{}\n", o.output, o.line.unwrap().unwrap());
     let (module, diags, _) = elya::front_end_with("main.elya", root, &mut read);
     assert!(diags.is_empty(), "{diags:?}");
     let session = elya::Session::new();

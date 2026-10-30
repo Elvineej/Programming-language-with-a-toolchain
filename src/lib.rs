@@ -79,13 +79,17 @@ pub fn run_source(name: &str, text: &str) -> Result<String, String> {
 }
 
 /// What `elya run` shows (spec 2026-10-16-elya-differential-sweep): the
-/// program's output, kept when the run fails (D1), and main's value as a native
-/// binary prints it (D2: an `Int` in decimal, `Unit` as `0`; `None` for any
-/// other type). `error` is the rendered diagnostic of a front-end or runtime
-/// failure.
+/// program's output, kept when the run fails (D1), and main's value. `error` is
+/// the rendered diagnostic of a front-end or runtime failure.
 pub struct RunOutcome {
     pub output: String,
+    /// main's value as a number, for the callers that compute one: an `Int`, or
+    /// `Unit` as `0`; any other type is `Err`. What is printed is [`Self::line`].
     pub value: Option<Result<i64, String>>,
+    /// The value line `elya run --value` and a native binary print after the
+    /// output: main's value as a literal (spec 2026-10-30-elya-main-values D1;
+    /// `Unit` is `0`), or why it has none (a function is not data, D2).
+    pub line: Option<Result<String, String>>,
     pub error: Option<String>,
 }
 
@@ -100,7 +104,7 @@ pub fn run_source_outcome_with(name: &str, text: &str, read: &mut modules::Reade
         return RunOutcome::refused(rendered);
     }
     let (interp, result) = eval::run_module_keeping(&module, eval::World::Live);
-    RunOutcome::of(interp.output().to_string(), result, &sm)
+    RunOutcome::of(interp.output().to_string(), interp.types(), result, &sm)
 }
 
 impl RunOutcome {
@@ -109,6 +113,7 @@ impl RunOutcome {
         RunOutcome {
             output: String::new(),
             value: None,
+            line: None,
             error: Some(error),
         }
     }
@@ -116,25 +121,30 @@ impl RunOutcome {
     /// A run's outcome: its output, kept whether it succeeded or failed.
     fn of(
         output: String,
+        types: &literal::TypeInfo,
         result: Result<eval::Value, eval::RuntimeError>,
         sm: &SourceMap,
     ) -> RunOutcome {
         match result {
             Ok(v) => RunOutcome {
                 output,
+                line: Some(match &v {
+                    eval::Value::Int(n) => Ok(n.to_string()),
+                    eval::Value::Unit => Ok("0".to_string()),
+                    other => literal::show(types, other)
+                        .map_err(|what| format!("main's value is {what}, which is not data")),
+                }),
                 value: Some(match v {
                     eval::Value::Int(n) => Ok(n),
                     eval::Value::Unit => Ok(0),
-                    _ => Err(
-                        "main's value is not an `Int` or `Unit`, so it has no native value line"
-                            .to_string(),
-                    ),
+                    _ => Err("main's value is not an `Int` or `Unit`".to_string()),
                 }),
                 error: None,
             },
             Err(e) => RunOutcome {
                 output,
                 value: None,
+                line: None,
                 error: Some(render(&[e.diag], sm)),
             },
         }
@@ -171,7 +181,10 @@ pub fn record_source_with(
         }
     }
     let output = interp.output().to_string();
-    (Some(trace), RunOutcome::of(output, result, &sm))
+    (
+        Some(trace),
+        RunOutcome::of(output, interp.types(), result, &sm),
+    )
 }
 
 /// [`record_source`] as `(trace, Ok(output))` or `(trace, Err(output and
@@ -263,7 +276,7 @@ pub fn replay_source_with(
     }
     let (interp, result) =
         eval::run_module_keeping(&module, eval::World::Replay { entries, next: 0 });
-    RunOutcome::of(interp.output().to_string(), result, &sm)
+    RunOutcome::of(interp.output().to_string(), interp.types(), result, &sm)
 }
 
 /// [`replay_source`] as `Ok(output)` or `Err(diagnostics)` (the output of a

@@ -102,7 +102,7 @@ fn the_library_runs_natively() {
     let mut read = |_: &str| None;
     let o = elya::run_source_outcome_with("main.elya", GAME_AND_SHOP, &mut read);
     assert!(o.error.is_none(), "{:?}", o.error);
-    let want = format!("{}{}\n", o.output, o.value.unwrap().unwrap());
+    let want = format!("{}{}\n", o.output, o.line.unwrap().unwrap());
     let (module, diags, _) = elya::front_end_with("main.elya", GAME_AND_SHOP, &mut read);
     assert!(diags.is_empty(), "{diags:?}");
     let session = elya::Session::new();

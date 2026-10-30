@@ -370,6 +370,30 @@ fn showing_a_function_fails_by_name() {
         pub fn main() -> Int { handle { rec(fn() { match mk() { B(f) -> f(2) } }) } with { K.mk() -> resume(B(fn(x) { x * 10 })) } }\n";
     let got = agree(encode, "encodefn");
     assert!(got.end.is_err(), "{got:?}");
+    // A constructor used as a function is a function (2026-10-30, the main-values
+    // review's F1): the evaluator wrote `Yes`, a field-less value of that name.
+    let ctor = "type Opt { No, Yes(Int) }\n\
+        effect K { fn k(f: fn(Int) -> Opt) -> Int  fn mk() -> fn(Int) -> Opt }\n\
+        fn rec(body) { handle { body() } with any { op(o) -> { io.println(op.name(o))  io.println(op.show(o))  resume(op.perform(o)) } } }\n\
+        fn enc(body) { handle { body() } with any { op(o) -> { let v = op.perform(o)  io.println(op.encode(o, v))  resume(v) } } }\n\
+        fn opt(o) { match o { No -> 0  Yes(n) -> n } }\n\
+        fn host(body) { handle { body() } with { K.k(f) -> resume(opt(f(3)))  K.mk() -> resume(Yes) } }\n";
+    for (tag, main) in [
+        (
+            "showctor",
+            "pub fn main() -> Int { host(fn() { rec(fn() { k(Yes) }) }) }\n",
+        ),
+        (
+            "encctor",
+            "pub fn main() -> Int { host(fn() { enc(fn() { opt(mk()(4)) }) }) }\n",
+        ),
+    ] {
+        let got = agree(&format!("{ctor}{main}"), tag);
+        assert!(
+            matches!(&got.end, Err(m) if m.contains("is a function, which is not data")),
+            "{tag}: {got:?}"
+        );
+    }
 }
 
 #[test]

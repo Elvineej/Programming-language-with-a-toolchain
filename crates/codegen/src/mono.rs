@@ -742,6 +742,22 @@ pub(crate) fn run(core: &CoreModule) -> R<CoreModule> {
     for f in &core.fns {
         if !m.generic.contains_key(&f.name) {
             fns.push(m.emit(f.name.clone(), f, &TySubst::new())?);
+        } else if f.name == "main" {
+            // The entry point is used once, by the shim, at its own type with
+            // every variable at the ambiguity default (spec
+            // 2026-10-30-elya-main-values D3): `pub fn main() { None }` is
+            // `Option(Unit)`. Before, nothing used it, so it was never cloned
+            // ("no `main`").
+            let mut tvs = BTreeSet::new();
+            free_tvs(&m.generic["main"], &mut tvs);
+            let s: TySubst = tvs
+                .into_iter()
+                .map(|v| (v, Ty::Base(TyCon::Unit)))
+                .collect();
+            // Registered, so `main`'s own calls at that type are to itself (the
+            // review's L3: they cloned a second, identical `main`).
+            m.top.insert((f.name.clone(), key_of(&s)), f.name.clone());
+            fns.push(m.emit(f.name.clone(), f, &s)?);
         }
     }
     while let Some((name, orig, s)) = m.queue.pop() {
@@ -1316,6 +1332,20 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_recursive_generic_main_calls_itself() {
+        // The main-values review's L3: the default instance was not registered,
+        // so `main`'s own call cloned a second, identical `main`.
+        let m = run(&core_of(
+            "type Opt(a) { No, Yes(a) }\n\
+             fn depth() -> Int { 3 }\n\
+             pub fn main() { if depth() > 5 { main() } else { No } }\n",
+        ))
+        .expect("monomorphizes");
+        let names: Vec<&str> = m.fns.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["depth", "main"]);
     }
 
     #[test]

@@ -243,6 +243,10 @@ impl Interp {
     pub fn output(&self) -> &str {
         &self.output
     }
+    /// The module's constructors and operations, as [`crate::literal::show`] reads them.
+    pub fn types(&self) -> &crate::literal::TypeInfo {
+        &self.types
+    }
     pub fn peak_kont_depth(&self) -> usize {
         self.peak_kont
     }
@@ -1805,19 +1809,21 @@ pub mod cek {
                 let named = format!("{effect}.{op}");
                 match (b, &args[1..]) {
                     ("op.name", []) => Ok(State::Return(Value::Str(named.into()), k)),
-                    ("op.show", []) => match crate::literal::show_op(&effect, &op, &op_args) {
-                        Ok(s) => Ok(State::Return(Value::Str(s.into()), k)),
-                        Err(what) => Err(rt(
-                            span,
-                            format!(
+                    ("op.show", []) => {
+                        match crate::literal::show_op(&interp.types, &effect, &op, &op_args) {
+                            Ok(s) => Ok(State::Return(Value::Str(s.into()), k)),
+                            Err(what) => Err(rt(
+                                span,
+                                format!(
                                 "op.show: an argument of `{named}` is {what}, which is not data"
                             ),
-                        )),
-                    },
+                            )),
+                        }
+                    }
                     // The same operation again, from the clause: outside the
                     // handler, so it reaches the next one out.
                     ("op.perform", []) => perform(interp, effect, op, (*op_args).clone(), span, k),
-                    ("op.encode", [v]) => match crate::literal::show(v) {
+                    ("op.encode", [v]) => match crate::literal::show(&interp.types, v) {
                         Ok(s) => Ok(State::Return(Value::Str(s.into()), k)),
                         Err(what) => Err(rt(
                             span,
@@ -1906,14 +1912,14 @@ fn host_builtin(
         if i > 0 {
             q.push_str(", ");
         }
-        q.push_str(&crate::literal::show(a).map_err(|e| rt(span, e))?);
+        q.push_str(&crate::literal::show(&interp.types, a).map_err(|e| rt(span, e))?);
     }
     q.push(')');
     match &mut interp.world {
         World::Live => time_builtin(&name["time.".len()..], args, span),
         World::Record(log) => {
             let v = time_builtin(&name["time.".len()..], args, span)?;
-            let a = crate::literal::show(&v).map_err(|e| rt(span, e))?;
+            let a = crate::literal::show(&interp.types, &v).map_err(|e| rt(span, e))?;
             log.push((q, a));
             Ok(v)
         }
