@@ -126,8 +126,11 @@ void elya_gc_init(const int64_t *descriptors, int64_t n_ctors) {
      * including main's value line, which a program that never prints would
      * otherwise write in text mode as "\r\n" (found by the Windows gate on the
      * non-printing CPS-rooting corpus, 2026-10-04). elya_println keeps its own
-     * call; it is now redundant but harmless. */
+     * call; it is now redundant but harmless. stderr too (2026-10-30): a
+     * failure is one line, "elya: ...\n", which text mode wrote as "\r\n"
+     * (the Windows gate on main: three native_any.rs tests read a stray "\r"). */
     _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
 #endif
 }
 
