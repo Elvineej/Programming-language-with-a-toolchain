@@ -3,7 +3,7 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-30 10:07 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated after the usage-limit pause)
+## 2026-10-30 11:20 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -28,7 +28,22 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     - `parse` split the trimmed line (21 of 1 041 short traces read differently);
     - the evaluator was quadratic on byte loops (89 s, now 27 s, linear).
   - Found: no `else if` in the language (HANDOFF's open list).
-- Windows-gate debt: 20a4804 (runtime.c string functions and the trace split).
+- **Done: what `main` is worth, for every data type** (HANDOFF step 1, the sweep's
+  last native refusals; spec 2026-10-30-elya-main-values; fa24c18).
+  - `--value` and native binaries write main's value as its literal; a function in
+    it fails by name; a generic `main` builds at its defaults.
+  - Gate 1315 / 136 (predicted 1315; 1312 before the review's fixes, as predicted).
+  - **Decisions (mine; please review):** `Unit` stays `0`; the instance budget's two
+    refusals stay (non-regular types).
+  - The review found five issues, all fixed first. The worst: the evaluator wrote a
+    constructor used as a function (`Some`) as data, in `op.encode` too.
+  - Seen under load: `08_timers`'s real-clock snapshot can reorder (HANDOFF's open
+    list); the re-run, alone, passed.
+- Next: HANDOFF step 1, Core passes iterative over a block (measured: `elya build`
+  overflows at 100 000 statements in `mono::rewrite_let`; Core's `Drop` at 60 000 on
+  8 MiB).
+- Windows-gate debt: 20a4804 (runtime.c string functions and the trace split),
+  fa24c18 (runtime.c `elya_trace_finish` exported, `elya_any_show` flushes).
 
 ## 2026-10-24 09:48 UTC — IN PROGRESS (scheduled run, FULL mode)
 
