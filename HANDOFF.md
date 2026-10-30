@@ -5,17 +5,18 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 
 ## State at handoff (updated 2026-10-30, an interactive session on `auto/elya`)
 
-- `main` has everything through #23 (merged 2026-10-16 at ab791b6: N7 part 2 through
-  argument records and `elya run --record/--replay`). Draft PR #24 carries `auto/elya`
-  since (the native stack onward).
+- `main` has everything through #24 (merged 2026-10-24 at 6c9ab27: the native stack
+  through alias renaming). Draft PR #25 carries `auto/elya` since (strings by byte
+  onward; opened 2026-10-30, when the maintainer saw no new commits: nothing had
+  carried the branch after #24's merge).
 - Scheduled auto-runs work on branch `auto/elya` (one draft PR to `main`) and log in
   `AUTO_RUN_LOG.md`; the maintainer reviews on GitHub.
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
   former e-mail address; every branch was force-pushed. Do not push old local branches.
-- The repo is private until the maintainer flips it public (only they can).
+- The repo is public (seen 2026-10-30; the maintainer flipped it).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1319 passed, 139 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1331 passed, 141 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -597,25 +598,38 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   - Nesting depth stays bounded; the parser refuses past 1024 levels by name.
   - Needs the Windows gate.
 
+- **A name clash is reported once, where it was made** (2026-10-30, branch
+  `auto/elya`, d868904): spec `docs/superpowers/specs/2026-10-30-elya-name-clashes-design.md`.
+  - A module's reference to an operation means the operation, whatever the root
+    declares: a root `fn console_line` is its one E0205 (it also made three E0200s
+    inside `elya/console.elya`).
+  - An effect declared twice is E0209 alone (its handlers made five E0207s).
+  - E0605 is never about a name the file, or a file it imports, declares.
+  - Types, constructors, effects and operations stay one name space (their names
+    are data: traces, `op.show`).
+
 ## The next five steps
 
-### 1. Name clashes across files: diagnostics that stay in the user's file
+### 1. Row parameters on declarations: effects and types that carry a task's effects
 
-Measured 2026-10-30 (`elya check`; functions are per module, while types,
-constructors, effects and operations share one namespace across the program):
-- a root `fn console_line` with `import elya/console`: the right E0205, and
-  three E0200s inside `elya/console.elya`, a file the user never wrote; the
-  same through `import elya/host`;
-- a root `effect Console`: E0209, and five E0207s inside the module;
-- a root `type ConsoleCounted` or a constructor `TraceEnd`: one E0209, labelled
-  in both files;
-- a root's own `type Counted` while a module it imports transitively declares
-  one: two E0605s ("add `import lib/b`", for the root's own uses) and two
-  E0209s; following the advice leaves the E0209s.
-Decide in a spec: report a clash once, in the importing file, naming the
-module (no diagnostics inside a module because of a clash it did not make);
-E0605 never for a name the file declares itself; and E0209's help when the
-other declaration is a module's ("rename yours; `elya/console` declares it").
+Measured 2026-10-30, for step 2: a standard `elya/async` cannot be written
+today. Each async example declares its own `effect Async` whose task type
+names the program's other effects (`fn spawn(f: fn() / {Async, Log} -> Int)`),
+and a module cannot name the user's `Log`.
+- A function's signature already leaves a row open by writing none:
+  `fn twice(f: fn() -> Int)` takes a task that says something (2).
+- An operation's cannot: `effect Async { fn spawn(f: fn() -> Int) -> Int }`
+  takes pure tasks only (a task that says is E0423), and no row can be written
+  open (`/ {e}` is E0100, `/ {Log | e}` is E0001; `effect Async(t)` takes
+  types, not rows).
+- A type's fields are the same (`types::elaborate_adt_ty`: "a declaration has
+  no row variables"), and each scheduler stores its tasks in one (`type Step`
+  in every example).
+Decide in a spec: row parameters on effect and type declarations
+(`effect Async(e)`, `type Step(e)`, a task `fn() / {Async(e) | e} -> Int`), how
+a use writes one (`Async(Log)`? a row in an effect's argument list), what a
+clause that calls a task may perform, and both back ends (rows are
+monomorphized natively, N7 part 1).
 
 ### 2. Async as a standard module: `elya/async`
 
@@ -628,7 +642,8 @@ pattern: the effects and pure schedulers in `elya/async`, any host binding in
 `elya/host`). Measure what the three examples share and what each needs
 (result types, cancellation, a timer's host clock through `elya/clock`), then
 decide the API in a spec; prove it by rewriting the examples on it, in the
-evaluator and natively. The names carry the module's (part 3 D1).
+evaluator and natively. The names carry the module's (part 3 D1). Needs step 1:
+a task's row must be open (measured 2026-10-30).
 
 ### 3. Reading text from outside: an input effect the host records
 

@@ -3,7 +3,7 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-30 12:45 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
+## 2026-10-30 14:10 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -52,7 +52,15 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     unspilled. Its tests now run on 512 KiB threads.
   - Measured on the way: the evaluator's name lookup is quadratic on a long block
     (77 s for 20 000 statements): HANDOFF's new step 5.
-- Next: HANDOFF step 1, name clashes across files (measured; the causes found).
+- **Done: a name clash is reported once, where it was made** (HANDOFF step 1; spec
+  2026-10-30-elya-name-clashes; d868904).
+  - No diagnostics inside a module because of a root's clash; E0605 never for a
+    name the file or an import declares. Gate 1331 / 141 (predicted 1331).
+  - **Decision (mine; please review):** types, constructors, effects and operations
+    stay one name space (their names are data in traces and `op.show`).
+- PR #24 had been merged (2026-10-24), and nothing carried `auto/elya` after it, so
+  the maintainer saw no new commits: opened draft PR #25.
+- Next: HANDOFF step 1, row parameters on declarations (needed by `elya/async`).
 - Windows-gate debt: 20a4804 (runtime.c string functions and the trace split),
   fa24c18 (runtime.c `elya_trace_finish` exported, `elya_any_show` flushes).
 
