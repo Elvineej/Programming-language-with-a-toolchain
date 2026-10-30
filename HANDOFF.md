@@ -3,7 +3,7 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-24, a scheduled run on `auto/elya`)
+## State at handoff (updated 2026-10-30, an interactive session on `auto/elya`)
 
 - `main` has everything through #23 (merged 2026-10-16 at ab791b6: N7 part 2 through
   argument records and `elya run --record/--replay`). Draft PR #24 carries `auto/elya`
@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1284 passed, 132 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1310 passed, 135 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -559,22 +559,21 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   and refused natively); float literals take an exponent (`1.0e19`), `1e19` is
   E0003, out of range is E0002. `float.to_string` unchanged.
 
+- **Strings by byte, one trace line format, and `replay.parse`** (2026-10-30, branch
+  `auto/elya`): spec `docs/superpowers/specs/2026-10-24-elya-trace-text-design.md`.
+  - `string.length`, `string.byte_at` and `string.slice` index a string by byte. They
+    are pure, each failure is named, and a slice may not split a UTF-8 character.
+    They work on both evaluators and both native emitters.
+  - Both host readers split a trace line at the first ` = ` outside a string
+    literal; `read_trace` is the host's reader as a function.
+  - `replay.parse(text)` is written in Elya and reads exactly as the host does
+    (checked on 1 041 short traces).
+  - The evaluator's strings are shared (`Rc<str>`), so a byte loop is linear.
+  - Needs the Windows gate.
+
 ## The next five steps
 
-### 1. Strings to read a trace: one trace format for the host and `elya/replay`
-
-`elya/replay` (spec 2026-10-24-elya-std-replay §3) writes the host trace's line
-shape, but no Elya program can read text back (no string functions beyond `<>`,
-`==` and the `to_string`s, no input), and the host's reader splits a line at its
-last ` = `, which a string answer containing ` = ` breaks. Measure what a reader
-needs (length, a character or byte at an index, a slice, a search; reading a
-file or stdin as an effect), then decide in a spec: the string builtins (bytes
-or characters; failures by name out of range), a quote-aware line format both
-readers share, and `replay.parse(text)`. Also from that review: `record` under a
-multi-shot handler fails at run time (one-shot `with any`), and `replay` cannot
-decode an answer typed by the effect's own parameter.
-
-### 2. The sweep's last native refusals
+### 1. The sweep's last native refusals
 
 After alias renaming (spec 2026-10-24 §3) the differential sweep's native
 refusals are four, all older: two `main`s whose value is not an `Int` (a
@@ -585,7 +584,7 @@ instances, and how), then decide in a spec: what a native binary prints for a
 `Unit`), and whether the budget is hit by non-regular types (a named refusal
 is right) or by ordinary ones (a bigger or a smarter bound).
 
-### 3. Core passes iterative over a block's statements
+### 2. Core passes iterative over a block's statements
 
 Left by diagnostics at the edges (spec 2026-10-24 D5): a block is a chain of
 `let`s in Core and every Core pass (`mono::rewrite_let` first) recurses down
@@ -598,7 +597,7 @@ fix: no bound at all), or a flatter Core block node. Also from that review:
 `let a{i+1} = fn() { a{i} }` repeated 2000 times takes over 300 s in `check`
 (inference).
 
-### 4. Name clashes across files: diagnostics that stay in the user's file
+### 3. Name clashes across files: diagnostics that stay in the user's file
 
 Seen by the capabilities part-3 review (older): a root that declares `fn
 console_line` while importing `elya/console` gets the right E0205 and also
@@ -611,7 +610,7 @@ then decide in a spec: report a clash once, in the importing file, naming the
 module; and whether E0605's help should say "rename" when following it would
 be E0209.
 
-### 5. Async as a standard module: `elya/async`
+### 4. Async as a standard module: `elya/async`
 
 ROADMAP priority 1's examples (`04_async.elya`, `06_structured.elya`,
 `08_timers.elya`) each carry their own scheduler: `spawn`/`await`/`yld`, a
@@ -624,7 +623,25 @@ pattern: the effects and pure schedulers in `elya/async`, any host binding in
 decide the API in a spec; prove it by rewriting the examples on it, in the
 evaluator and natively. The names carry the module's (part 3 D1).
 
+### 5. Reading text from outside: an input effect the host records
+
+`replay.parse` reads a trace the program already holds as a `String`. No Elya
+program can read a file or standard input (spec 2026-10-24-elya-trace-text D4).
+Measure what reading needs:
+- whole files or lines;
+- what a missing file or invalid UTF-8 is (a failure by name, or an answer);
+- how a replay answers a read (the trace holds the text it returned).
+
+Then decide in a spec: the builtins (`io.read_file`, `io.read_line`?) and their
+effect (`IO`, which the host records like `time.*`, or a capability of their own
+under `elya/host`); and both back ends, recording and replaying a read the same way.
+
 ## Also open, unscheduled
+
+`else if` does not exist: an `else` branch must be a block, so a chain of
+conditions nests (`else { if .. }`), as `std/replay.elya`'s `parse` does
+(2026-10-30). Parsing `else if c { .. }` as `else { if c { .. } }` is a small
+language decision with a spec of its own.
 
 E0434 rejects a direct inner `with any` over `Hold(Opt(Op))` but accepts the same
 handler through a generic function (the 2026-10-23 review's F4). A helper taking an

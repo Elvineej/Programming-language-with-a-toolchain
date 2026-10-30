@@ -7,6 +7,28 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
+- At the maintainer's "continue when the limit resets, no stops", this session keeps
+  two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
+  after the usage limit (primary)" about 5 h ahead (trig_012WFJHxdZgSbHq5NwMX3uFD) and
+  "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
+- **Done: strings by byte, one trace line format, `replay.parse`** (HANDOFF step 1;
+  spec 2026-10-24-elya-trace-text, the scheduled run's spec and plan; implementation
+  20a4804).
+  - `string.length/byte_at/slice` on both back ends.
+  - Both host readers split at the first unquoted ` = `.
+  - `replay.parse` is in Elya.
+  - Gate 1310 / 135 (predicted 1308; +2 for the review's test).
+  - **Decisions (mine; please review):**
+    - bytes, not characters;
+    - failures by name, not an `Option`;
+    - the host keeps `str::trim` (the spec's first draft moved it to ASCII, which
+      would have broken a native review test);
+    - the evaluator's strings are `Rc<str>`.
+  - The review found two issues, both fixed first:
+    - `parse` split the trimmed line (21 of 1 041 short traces read differently);
+    - the evaluator was quadratic on byte loops (89 s, now 27 s, linear).
+  - Found: no `else if` in the language (HANDOFF's open list).
+- Windows-gate debt: 20a4804 (runtime.c string functions and the trace split).
 
 ## 2026-10-24 09:48 UTC — IN PROGRESS (scheduled run, FULL mode)
 
