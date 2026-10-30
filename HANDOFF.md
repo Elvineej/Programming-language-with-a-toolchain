@@ -16,7 +16,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is public (seen 2026-10-30; the maintainer flipped it).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1337 passed, 143 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1355 passed, 145 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -614,9 +614,18 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   overflow (a type or row variable bound inside its own effect label's argument).
   Now E0401 or E0424.
 
+- **Row variables you can write in a signature** (2026-10-30, branch `auto/elya`,
+  394a0b8; step 1's part 1): spec `docs/superpowers/specs/2026-10-30-elya-row-variables-design.md`.
+  - `fn run(f: fn() / {e} -> Int) / {e} -> Int` and `/ {Log | e}`, written as the
+    checker prints a row (a new `|` token); one name is one row for its whole
+    function, flexible like a lowercase type name.
+  - From the review: an older row-unification bug dropped a label when two rows
+    ended in one variable (a clean-checking program failed at run time), fixed;
+    named declared rows are unified per member before the ambient closes.
+
 ## The next five steps
 
-### 1. Row parameters on declarations: effects and types that carry a task's effects
+### 1. Row parameters on declarations: effects and types that carry a task's effects (part 2)
 
 Measured 2026-10-30, for step 2: a standard `elya/async` cannot be written
 today. Each async example declares its own `effect Async` whose task type
@@ -631,7 +640,8 @@ and a module cannot name the user's `Log`.
 - A type's fields are the same (`types::elaborate_adt_ty`: "a declaration has
   no row variables"), and each scheduler stores its tasks in one (`type Step`
   in every example).
-Decide in a spec: row parameters on effect and type declarations
+Part 1 (row variables in a function's own annotations) is done (394a0b8); the
+spec's D3-D6 are this part. Decide in it: row parameters on effect and type declarations
 (`effect Async(e)`, `type Step(e)`, a task `fn() / {Async(e) | e} -> Int`), how
 a use writes one (`Async(Log)`? a row in an effect's argument list), what a
 clause that calls a task may perform, and both back ends (rows are
@@ -696,7 +706,9 @@ evaluator: the budgets (256 type instances, 256 type and convention clones),
 non-regular types (refused by name on purpose, spec 2026-10-17 D5), and the
 effect-polymorphism corners ("upcast in a parameter position", "type variable
 only in an effect row", "effect-polymorphic function used at a user effect",
-"direct function used where an effectful one is expected"). For each: a
+"direct function used where an effectful one is expected", and since row
+variables, "calling convention disagrees with the callee" for a function whose
+named row says more than its body performs). For each: a
 program the evaluator runs, then lift it or say in a spec why it stays. The
 differential sweep is the measure: no refusal left that the evaluator runs.
 

@@ -3,7 +3,7 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-30 15:30 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
+## 2026-10-30 16:30 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -67,7 +67,14 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 - At the maintainer's request (2026-10-30), HANDOFF's steps 3-5 are now their three
   priorities: compiler scalability, the affine guarantee across functions, native
   compilation without its limits.
-- Next: HANDOFF step 1, row parameters on declarations (needed by `elya/async`).
+- **Done: row variables you can write in a signature** (HANDOFF step 1, part 1; spec
+  2026-10-30-elya-row-variables; 394a0b8). `/ {e}` and `/ {Log | e}`, one row per name
+  per function. The review found three serious bugs, all fixed first, the worst an
+  older row-unification bug that names made writable (a clean-checking program
+  failed at run time). Gate 1355 / 145.
+  - **Decisions (mine; please review):** the printer's syntax (`{Log | e}`);
+    flexible names, not rigid; a lowercase name spelled like an effect is a typo.
+- Next: HANDOFF step 1, part 2: row parameters on declarations.
 - Windows-gate debt: 20a4804 (runtime.c string functions and the trace split),
   fa24c18 (runtime.c `elya_trace_finish` exported, `elya_any_show` flushes).
 
