@@ -1,12 +1,16 @@
 # Auto-run log
 
-Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
+Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their state here,
+newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
 ## 2026-10-30 16:30 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
+- At the maintainer's "Commit in the main tho" (16:21), `auto/elya` was merged into
+  `main` (731ce70, its tree identical to the gated 68fdc9f; PR #25 merged by it), and
+  work continues on `main`.
 - At the maintainer's "continue when the limit resets, no stops", this session keeps
   two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
   after the usage limit (primary)" about 5 h ahead (trig_012WFJHxdZgSbHq5NwMX3uFD) and

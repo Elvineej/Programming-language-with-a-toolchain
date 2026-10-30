@@ -3,29 +3,28 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-30, an interactive session on `auto/elya`)
+## State at handoff (updated 2026-10-30, an interactive session on `main`)
 
-- `main` has everything through #24 (merged 2026-10-24 at 6c9ab27: the native stack
-  through alias renaming). Draft PR #25 carries `auto/elya` since (strings by byte
-  onward; opened 2026-10-30, when the maintainer saw no new commits: nothing had
-  carried the branch after #24's merge).
-- Scheduled auto-runs work on branch `auto/elya` (one draft PR to `main`) and log in
-  `AUTO_RUN_LOG.md`; the maintainer reviews on GitHub.
+- **Work lands on `main` directly** (the maintainer, 2026-10-30: "Commit in the main
+  tho"). `main` has everything: #24 (2026-10-24), then `auto/elya`'s 15 commits since,
+  merged at 731ce70 (strings by byte through row variables part 1; PR #25 shows them
+  merged). `auto/elya` stays at 68fdc9f, not deleted; nothing new goes there.
+- Scheduled auto-runs and interactive sessions commit to `main` after a green gate
+  and log in `AUTO_RUN_LOG.md`; the maintainer reviews on GitHub.
 - History was rewritten on 2026-10-05 (the maintainer's request) so no commit carries a
   former e-mail address; every branch was force-pushed. Do not push old local branches.
 - The repo is public (seen 2026-10-30; the maintainer flipped it).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1355 passed, 145 suites. Native programs run on
+- Linux gate at the tip of `main`: 1355 passed, 145 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
-  (since 2026-10-24). Since `main`, the runtime
-  has gained `elya_cont_copy` (multi-shot), the string functions and the two time
+  (since 2026-10-24). In October the runtime
+  gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
   current handler as a root); `gc_mark` is unchanged (637 bytes of source).
   `elya_eq` takes a fourth argument (the first closure tag) since 2026-10-23.
-- Interactive sessions may also work on `auto/elya`. They use the same
-  `AUTO_RUN_LOG.md` lock: an IN PROGRESS entry under 3 hours old makes a scheduled run
-  exit.
+- Interactive sessions use the same `AUTO_RUN_LOG.md` lock: an IN PROGRESS entry
+  under 3 hours old makes a scheduled run exit.
 - **Direction (2026-10-09):** `docs/ROADMAP.md` -- the problems Elya is for (async without
   colouring, per-dependency capabilities, exact replay and handler-based testing) and the
   language decisions taken. The maintainer delegated all choices (rule 2).
@@ -59,14 +58,16 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 9. **MSRV is 1.75** (clippy enforces it): no `is_none_or`, no let-chains.
 10. **Windows:**
     - `.github/workflows/windows-gate.yml` runs `scripts/check.ps1` on every push to
-      `claude/**`.
+      `main` (since 2026-10-30) and `claude/**`.
     - The Actions logs API is blocked from the cloud session. Read the results with
       `gh api repos/Elvineej/Programming-language-with-a-toolchain/commits/<sha>/check-runs`,
       then that run's `/annotations` (a `notice` carries `passed=N failed=M`; failures
       carry the log tail).
-11. **The agent cannot mark PRs ready or merge them** (blocked by the permission system,
-    including via the browser). Open PRs ready for review and let the maintainer click
-    Merge.
+11. **Commit to `main`, gated** (the maintainer, 2026-10-30). Push `main` only with
+    `sh scripts/check.sh` green at the predicted count, as a fast-forward (never a
+    force-push). The agent still cannot mark PRs ready or merge them through GitHub
+    (blocked by the permission system); a branch reaches `main` by a local merge and a
+    push, as `auto/elya` did at 731ce70.
 12. **Only Claude writes this file** (the maintainer's rule, 2026-10-05). Other agents and
     tools (Cline, other models) read it but never edit it; they report progress and Claude
     records it here.
@@ -714,11 +715,6 @@ differential sweep is the measure: no refusal left that the evaluator runs.
 
 ## Also open, unscheduled
 
-Row unification's `absorb` may drop labels (the occurs-in-rows review, 2026-10-30, by
-reasoning, not reproduced): its second call can rebind an already-bound tail when
-`r1.tail == r2.tail`, as Remy's side condition is missing. It cannot form a cycle
-(the stored row is resolved). Find a program that shows it, or show it cannot.
-
 **Reading text from outside** (was step 3; moved for the maintainer's priorities,
 2026-10-30): `replay.parse` reads a trace the program already holds as a `String`. No Elya
 program can read a file or standard input (spec 2026-10-24-elya-trace-text D4).
@@ -743,7 +739,7 @@ language decision with a spec of its own.
 E0434 rejects a direct inner `with any` over `Hold(Opt(Op))` but accepts the same
 handler through a generic function (the 2026-10-23 review's F4). A helper taking an
 operation costs a clone per operation and helper (refused past the budget, 256).
-Also row variables in annotations (`fn(fn() / {e} -> a)`); I/O sources beyond timers (pipes, sockets: a readiness builtin
+Also I/O sources beyond timers (pipes, sockets: a readiness builtin
 per platform, deferred by the timers spec D1); Elya functions are mangled
 `elya.<name>`; the roadmap's
 other priorities (record/replay handlers, then capabilities once modules exist); the rest

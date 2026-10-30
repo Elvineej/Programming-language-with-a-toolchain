@@ -8,7 +8,7 @@ name: windows-gate
 on:
   workflow_dispatch:
   push:
-    branches: ['claude/**']
+    branches: ['main', 'claude/**']
 
 jobs:
   check:
