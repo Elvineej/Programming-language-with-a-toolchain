@@ -15,7 +15,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is private until the maintainer flips it public (only they can).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `auto/elya`: 1315 passed, 136 suites. Native programs run on
+- Linux gate at the tip of `auto/elya`: 1319 passed, 139 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). Since `main`, the runtime
   has gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -584,40 +584,40 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
     after a replay's unread-entry check.
   - Needs the Windows gate.
 
+- **A block's length is not a stack bound** (2026-10-30, branch `auto/elya`,
+  17869d4): spec `docs/superpowers/specs/2026-10-30-elya-long-blocks-design.md`.
+  - Every codegen pass walks a block's `let`s with a loop (`core::let_spine`), in
+    the recursion's order of effects; Core and the evaluator's environment drop
+    through a heap stack.
+  - `elya build` of 100 000 statements: 18.6 s (was a stack overflow). Long blocks
+    in every place a block can be build on a 512 KiB thread.
+  - From the review: `spill` had kept a `let`'s type unspilled (a function of four
+    from a computed callee was refused); the CPS sites' saved sets were quadratic
+    on a long block (names looked up from the oldest binding).
+  - Nesting depth stays bounded; the parser refuses past 1024 levels by name.
+  - Needs the Windows gate.
+
 ## The next five steps
 
-### 1. Core passes iterative over a block's statements
+### 1. Name clashes across files: diagnostics that stay in the user's file
 
-Left by diagnostics at the edges (spec 2026-10-24 D5): a block is a chain of
-`let`s in Core and the codegen passes recurse down it. Measured 2026-10-30
-(debug build):
-- `elya check` and `elya run` take 100 000 statements (3.9 s); `elya build` takes
-  50 000 (11.9 s) and overflows its 1 GiB thread at 100 000, in
-  `mono::rewrite_let` (two frames per statement).
-- The front end and Core lowering are already iterative: 300 000 statements on an
-  8 MiB thread, 15 s. On 8 MiB, Core's derived `Drop` overflows at 60 000.
-- About 40 traversals in 11 codegen files match a `CoreKind::Let`.
+Measured 2026-10-30 (`elya check`; functions are per module, while types,
+constructors, effects and operations share one namespace across the program):
+- a root `fn console_line` with `import elya/console`: the right E0205, and
+  three E0200s inside `elya/console.elya`, a file the user never wrote; the
+  same through `import elya/host`;
+- a root `effect Console`: E0209, and five E0207s inside the module;
+- a root `type ConsoleCounted` or a constructor `TraceEnd`: one E0209, labelled
+  in both files;
+- a root's own `type Counted` while a module it imports transitively declares
+  one: two E0605s ("add `import lib/b`", for the root's own uses) and two
+  E0209s; following the advice leaves the E0209s.
+Decide in a spec: report a clash once, in the importing file, naming the
+module (no diagnostics inside a module because of a clash it did not make);
+E0605 never for a name the file declares itself; and E0209's help when the
+other declaration is a module's ("rename yours; `elya/console` declares it").
 
-Decide in a spec: an explicit loop over the `let` spine in each pass (no bound
-from a block's length), or a flatter Core block node; and Core's `Drop` made
-iterative. (`stacker`, as rustc does it, needs `psm`, whose current release
-needs Rust 1.88, past the MSRV.) Prove it with a long `main` built and run on a
-small thread.
-
-### 2. Name clashes across files: diagnostics that stay in the user's file
-
-Seen by the capabilities part-3 review (older): a root that declares `fn
-console_line` while importing `elya/console` gets the right E0205 and also
-E0200s inside `elya/console.elya`, a file the user never wrote (a user module
-does the same); and a root declaring its own `type Counted` without importing
-the module that declares one gets E0605 "add `import ...`", whose advice then
-leads to E0209. Measure the cascades (a function, type, constructor, effect or
-operation of the root clashing with one of a module's, direct and transitive),
-then decide in a spec: report a clash once, in the importing file, naming the
-module; and whether E0605's help should say "rename" when following it would
-be E0209.
-
-### 3. Async as a standard module: `elya/async`
+### 2. Async as a standard module: `elya/async`
 
 ROADMAP priority 1's examples (`04_async.elya`, `06_structured.elya`,
 `08_timers.elya`) each carry their own scheduler: `spawn`/`await`/`yld`, a
@@ -630,7 +630,7 @@ pattern: the effects and pure schedulers in `elya/async`, any host binding in
 decide the API in a spec; prove it by rewriting the examples on it, in the
 evaluator and natively. The names carry the module's (part 3 D1).
 
-### 4. Reading text from outside: an input effect the host records
+### 3. Reading text from outside: an input effect the host records
 
 `replay.parse` reads a trace the program already holds as a `String`. No Elya
 program can read a file or standard input (spec 2026-10-24-elya-trace-text D4).
@@ -643,7 +643,7 @@ Then decide in a spec: the builtins (`io.read_file`, `io.read_line`?) and their
 effect (`IO`, which the host records like `time.*`, or a capability of their own
 under `elya/host`); and both back ends, recording and replaying a read the same way.
 
-### 5. Inference on long chains of closures
+### 4. Inference on long chains of closures
 
 Measured 2026-10-30 (debug build), `elya check` of a `main` whose block is
 `let a0 = fn() { 1 }` then `let a{i+1} = fn() { a{i} }`: 100 links take 6.5 s,
@@ -653,6 +653,19 @@ tower of `i` arrows. Measure where the time goes (a profile of the 200-link
 check: generalization, instantiation, or the occurs check walking the towers),
 then decide in a spec: share types instead of copying them, or skip
 generalizing a binding whose type has no free variable of its own.
+
+### 5. Names found in constant time in the evaluator
+
+Measured 2026-10-30 (debug build), `elya run` of a function whose block is
+`let a{i} = (a{i-1} + x) % 1000003`, `x` a parameter: 5 000 statements take
+4.5 s, 10 000 take 17 s, 20 000 take 77 s (quadratic). The environment is a
+chain of scopes, one per `let` (`eval::Env`), so a name bound before a block
+is found by walking back past every later binding. Measure the corpus's
+programs too (how long are their chains at a lookup), then decide in a spec:
+extend a uniquely owned scope in place (no one else can see it), resolve
+names to slots before the run, or a persistent map; the tree-walking oracle
+included. `elya build`'s output does not walk: natively a local is a register
+or a slot.
 
 ## Also open, unscheduled
 

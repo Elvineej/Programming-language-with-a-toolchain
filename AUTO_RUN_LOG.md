@@ -3,7 +3,7 @@
 Scheduled runs working on branch `auto/elya` record their state here, newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-30 11:20 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
+## 2026-10-30 12:45 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -39,9 +39,20 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
     constructor used as a function (`Some`) as data, in `op.encode` too.
   - Seen under load: `08_timers`'s real-clock snapshot can reorder (HANDOFF's open
     list); the re-run, alone, passed.
-- Next: HANDOFF step 1, Core passes iterative over a block (measured: `elya build`
-  overflows at 100 000 statements in `mono::rewrite_let`; Core's `Drop` at 60 000 on
-  8 MiB).
+- **Done: a block's length is not a stack bound** (HANDOFF step 1; spec
+  2026-10-30-elya-long-blocks; 17869d4).
+  - Every codegen pass loops over a block's `let`s; Core and the evaluator's
+    environment drop iteratively. `elya build` of 100 000 statements: 18.6 s (was a
+    stack overflow).
+  - Gate 1319 / 139 (predicted 1319).
+  - **Decisions (mine; please review):** loops over the spine, not a flatter Core
+    block node; no `stacker` (its `psm` needs Rust 1.88); nesting depth stays
+    bounded (the parser's E0102 at 1024 levels).
+  - The review found a miscompile, fixed first: `spill` had kept a `let`'s type
+    unspilled. Its tests now run on 512 KiB threads.
+  - Measured on the way: the evaluator's name lookup is quadratic on a long block
+    (77 s for 20 000 statements): HANDOFF's new step 5.
+- Next: HANDOFF step 1, name clashes across files (measured; the causes found).
 - Windows-gate debt: 20a4804 (runtime.c string functions and the trace split),
   fa24c18 (runtime.c `elya_trace_finish` exported, `elya_any_show` flushes).
 
