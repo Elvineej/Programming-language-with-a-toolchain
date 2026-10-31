@@ -191,6 +191,32 @@ as a row, `Async({Log})`, or a row variable, `Task(e)`, or left to inference in 
 function's annotations. A task can spawn tasks: its type is finite, because `e` is
 the other effects, not the task.
 
+The standard module `elya/async` is that scheduler, written once in Elya. A scope
+joins every task it started and says how it ended:
+
+```elya
+import elya/async
+
+fn fib(n: Int) -> Int {
+  if n < 2 { n } else {
+    let a = async_spawn(fn() { fib(n - 1) })
+    let b = async_spawn(fn() { fib(n - 2) })
+    async_await(a) + async_await(b)
+  }
+}
+
+pub fn main() -> Int {
+  match async.scope(fn() { fib(10) }) { AsyncFinished(v) -> v  AsyncDeadlocked(ids) -> 0 - 1 }
+}
+```
+
+Tasks can also `async_yield()` and `async_sleep(ms)`. `async.scope` keeps time on a
+clock of its own, so a run is the same every time; `async.schedule` takes a clock as
+two functions, and `elya/async_host`'s `async_host.timed` is the machine's. A task id
+names a task of the scope that spawned it. Tasks that await each
+other end their scope as `AsyncDeadlocked(ids)`, not in a hang. A dependency that
+spawns tasks performs `Async`, so its importer grants it: `import lib/dep / {Async}`.
+
 ### Exact replay, and tests without mocks
 
 A program touches the outside world only through effects, so whoever handles them decides

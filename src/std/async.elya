@@ -1,0 +1,266 @@
+// elya/async: tasks as an effect, and one scheduler for every program (spec
+// docs/superpowers/specs/2026-10-31-elya-async-module-design.md).
+//
+// A task performs `Async(a, e)`: it spawns tasks that answer an `a`, awaits
+// them, yields and sleeps. `e` is whatever else the tasks perform; a scope
+// passes it out, so nothing a task does is hidden, and nothing about being a
+// task shows in a function's type but `Async`. A scope joins every task it
+// started and answers how it ended: `AsyncFinished(v)`, or
+// `AsyncDeadlocked(ids)` when the tasks left can never finish.
+//
+// `async.scope` runs on a clock of its own (time moves only when every task
+// sleeps), so it is deterministic. `async.schedule` takes the clock as two
+// functions instead: what the time is (given the time the scheduler keeps),
+// and the time after waiting for a deadline; `elya/host`'s `host.timed` gives
+// it the machine's. (A clock effect handled inside `scope` reached the tasks'
+// row, and one performed by the module needed a grant at every import: spec
+// D3.)
+
+effect Async(a, e) {
+  fn async_spawn(f: fn() / {Async | e} -> a) -> Int
+  fn async_await(id: Int) -> a
+  fn async_yield() -> Unit
+  fn async_sleep(ms: Int) -> Unit
+}
+
+type AsyncList(a) { AsyncNil, AsyncCons(a, AsyncList(a)) }
+
+type AsyncPair(a, b) { AsyncPair(a, b) }
+
+type AsyncOption(a) { AsyncNone, AsyncSome(a) }
+
+// A table indexed by task id, a Braun tree: id 0 at the root, an odd id `i` in
+// the left subtree at `(i - 1) / 2`, an even one in the right at `(i - 2) / 2`;
+// each access walks about log2(id) nodes (the review's R3: a list made every
+// lookup cost the number of tasks).
+type AsyncTable(v) { AsyncLeaf, AsyncNode(AsyncOption(v), AsyncTable(v), AsyncTable(v)) }
+
+// How a scope ended.
+type AsyncEnded(a) { AsyncFinished(a), AsyncDeadlocked(AsyncList(Int)) }
+
+// A task as the scheduler sees it: finished, or stopped at an operation with
+// the rest of its computation.
+type AsyncStep(a, e) {
+  AsyncDone(a),
+  AsyncYielded(fn() / {e} -> AsyncStep(a, e)),
+  AsyncSpawned(fn() / {Async(a, e) | e} -> a, fn(Int) / {e} -> AsyncStep(a, e)),
+  AsyncAwaiting(Int, fn(a) / {e} -> AsyncStep(a, e)),
+  AsyncSleeping(Int, fn(Unit) / {e} -> AsyncStep(a, e))
+}
+
+// A sleeping task: its deadline, its id, and the rest of it.
+type AsyncTimer(a, e) { AsyncTimer(Int, Int, fn(Unit) / {e} -> AsyncStep(a, e)) }
+
+// A task ready to run: its id, and what runs it to its next operation.
+type AsyncReady(a, e) { AsyncReady(Int, fn() / {e} -> AsyncStep(a, e)) }
+
+// A queue in two lists: taken from the front, added to the back (kept reversed).
+type AsyncQueue(a) { AsyncQueue(AsyncList(a), AsyncList(a)) }
+
+// What the scheduler knows of a task: still running, with the tasks waiting
+// for it (each parked until it answers), or its answer.
+type AsyncEntry(a, e) {
+  AsyncPending(AsyncList(AsyncPair(Int, fn(a) / {e} -> AsyncStep(a, e)))),
+  AsyncAnswered(a)
+}
+
+// The scheduler's state: the ready queue, the sleeping tasks, every task's
+// entry, the tasks waiting for an id not spawned yet, the next task id, and
+// the time it keeps.
+type AsyncSched(a, e) {
+  AsyncSched(
+    AsyncQueue(AsyncReady(a, e)),
+    AsyncList(AsyncTimer(a, e)),
+    AsyncTable(AsyncEntry(a, e)),
+    AsyncList(AsyncPair(Int, AsyncPair(Int, fn(a) / {e} -> AsyncStep(a, e)))),
+    Int,
+    Int
+  )
+}
+
+fn step(body: fn() / {Async(a, e) | e} -> a) / {e} -> AsyncStep(a, e) {
+  handle { AsyncDone(body()) } with {
+    Async.async_yield() -> AsyncYielded(fn() { resume(Unit) })
+    Async.async_spawn(f) -> AsyncSpawned(f, fn(id) { resume(id) })
+    Async.async_await(id) -> AsyncAwaiting(id, fn(v) { resume(v) })
+    Async.async_sleep(ms) -> AsyncSleeping(ms, fn(u) { resume(u) })
+    return(s) -> s
+  }
+}
+
+fn rev(l, acc) {
+  match l {
+    AsyncNil -> acc
+    AsyncCons(h, t) -> rev(t, AsyncCons(h, acc))
+  }
+}
+
+fn enqueue(q, x) {
+  match q { AsyncQueue(front, back) -> AsyncQueue(front, AsyncCons(x, back)) }
+}
+
+fn dequeue(q) {
+  match q {
+    AsyncQueue(front, back) -> match front {
+      AsyncCons(x, rest) -> AsyncSome(AsyncPair(x, AsyncQueue(rest, back)))
+      AsyncNil -> match back {
+        AsyncNil -> AsyncNone
+        AsyncCons(y, ys) -> dequeue(AsyncQueue(rev(back, AsyncNil), AsyncNil))
+      }
+    }
+  }
+}
+
+fn find(table, i) {
+  match table {
+    AsyncLeaf -> AsyncNone
+    AsyncNode(here, l, r) ->
+      if i == 0 { here } else {
+        if i % 2 == 1 { find(l, (i - 1) / 2) } else { find(r, (i - 2) / 2) }
+      }
+  }
+}
+
+fn update(table, i, v) {
+  match table {
+    AsyncLeaf -> update(AsyncNode(AsyncNone, AsyncLeaf, AsyncLeaf), i, v)
+    AsyncNode(here, l, r) ->
+      if i == 0 { AsyncNode(AsyncSome(v), l, r) } else {
+        if i % 2 == 1 { AsyncNode(here, update(l, (i - 1) / 2, v), r) } else { AsyncNode(here, l, update(r, (i - 2) / 2, v)) }
+      }
+  }
+}
+
+// Timers in deadline order; a timer goes after those with the same deadline,
+// so ties wake in the order they were set.
+fn insert(ts, t) {
+  match t {
+    AsyncTimer(d, i, k) -> match ts {
+      AsyncNil -> AsyncCons(t, AsyncNil)
+      AsyncCons(AsyncTimer(d2, i2, k2), rest) ->
+        if d < d2 { AsyncCons(t, ts) } else { AsyncCons(AsyncTimer(d2, i2, k2), insert(rest, t)) }
+    }
+  }
+}
+
+// The waiters (id, rest) woken with `v`, in the order they began to wait.
+fn wake(q, waiters, v) {
+  match waiters {
+    AsyncNil -> q
+    AsyncCons(AsyncPair(id, k), more) -> wake(enqueue(q, AsyncReady(id, fn() { k(v) })), more, v)
+  }
+}
+
+// The tasks waiting for `n`, and the others.
+fn waiting_for(orphans, n, mine, others) {
+  match orphans {
+    AsyncNil -> AsyncPair(mine, others)
+    AsyncCons(AsyncPair(c, w), rest) ->
+      if c == n { waiting_for(rest, n, AsyncCons(w, mine), others) } else { waiting_for(rest, n, mine, AsyncCons(AsyncPair(c, w), others)) }
+  }
+}
+
+// The ids of the tasks that have not answered, onto `acc`. A node of this
+// subtree at its own index `j` has the id `base + step * j`.
+fn pending(table, base, step, acc) {
+  match table {
+    AsyncLeaf -> acc
+    AsyncNode(here, l, r) -> {
+      let rest = pending(l, base + step, step * 2, pending(r, base + step * 2, step * 2, acc))
+      match here {
+        AsyncSome(AsyncPending(ws)) -> AsyncCons(base, rest)
+        other -> rest
+      }
+    }
+  }
+}
+
+// Task `id` stopped at `s`: where it goes next. A sleep's deadline is read
+// now, when the task sleeps (the review's R6: it was read when the scheduler
+// next looked at the task).
+fn admit(id, s, st, now_of) {
+  match st {
+    AsyncSched(q, timers, table, orphans, next, t) -> match s {
+      AsyncDone(v) -> match find(table, id) {
+        AsyncSome(AsyncPending(ws)) ->
+          AsyncSched(wake(q, rev(ws, AsyncNil), v), timers, update(table, id, AsyncAnswered(v)), orphans, next, t)
+        other -> AsyncSched(q, timers, update(table, id, AsyncAnswered(v)), orphans, next, t)
+      }
+      AsyncYielded(k) -> AsyncSched(enqueue(q, AsyncReady(id, k)), timers, table, orphans, next, t)
+      AsyncSpawned(f, k) -> match waiting_for(orphans, next, AsyncNil, AsyncNil) {
+        AsyncPair(mine, others) -> {
+          let q2 = enqueue(enqueue(q, AsyncReady(id, fn() { k(next) })), AsyncReady(next, fn() { step(f) }))
+          AsyncSched(q2, timers, update(table, next, AsyncPending(mine)), others, next + 1, t)
+        }
+      }
+      AsyncAwaiting(c, k) -> match find(table, c) {
+        AsyncSome(AsyncAnswered(v)) -> AsyncSched(enqueue(q, AsyncReady(id, fn() { k(v) })), timers, table, orphans, next, t)
+        AsyncSome(AsyncPending(ws)) ->
+          AsyncSched(q, timers, update(table, c, AsyncPending(AsyncCons(AsyncPair(id, k), ws))), orphans, next, t)
+        AsyncNone -> AsyncSched(q, timers, table, AsyncCons(AsyncPair(c, AsyncPair(id, k)), orphans), next, t)
+      }
+      AsyncSleeping(ms, k) -> {
+        let now = now_of(t)
+        AsyncSched(q, insert(timers, AsyncTimer(now + ms, id, k)), table, orphans, next, now)
+      }
+    }
+  }
+}
+
+// One turn: a timer whose deadline has passed wakes before anything else
+// runs, so a busy queue cannot starve a sleeper (the time is read each turn
+// while a timer is set: under a real clock that is what makes it true).
+fn run(st, now_of, wait_for) {
+  match st {
+    AsyncSched(q, timers, table, orphans, next, t0) -> match timers {
+      AsyncNil -> next_task(st, now_of, wait_for)
+      AsyncCons(AsyncTimer(d, id, k), later) -> {
+        let t = now_of(t0)
+        if d <= t {
+          run(AsyncSched(enqueue(q, AsyncReady(id, fn() { k(Unit) })), later, table, orphans, next, t), now_of, wait_for)
+        } else { next_task(AsyncSched(q, timers, table, orphans, next, t), now_of, wait_for) }
+      }
+    }
+  }
+}
+
+// Run the next ready task to its next operation; with none ready, wait for the
+// earliest timer; with no timer either, the run is over (every task answered,
+// or the ones left wait for tasks that never will).
+fn next_task(st, now_of, wait_for) {
+  match st {
+    AsyncSched(q, timers, table, orphans, next, t) -> match dequeue(q) {
+      AsyncSome(AsyncPair(AsyncReady(id, go), q2)) ->
+        run(admit(id, go(), AsyncSched(q2, timers, table, orphans, next, t), now_of), now_of, wait_for)
+      AsyncNone -> match timers {
+        AsyncNil -> st
+        AsyncCons(AsyncTimer(d, id, k), later) -> {
+          let t2 = wait_for(t, d)
+          run(AsyncSched(enqueue(q, AsyncReady(id, fn() { k(Unit) })), later, table, orphans, next, t2), now_of, wait_for)
+        }
+      }
+    }
+  }
+}
+
+// The scheduler: the body is task 0; it answers the body's value once every
+// task started in it has answered, or the ids of the tasks that never can.
+pub fn schedule(body: fn() / {Async(a, e) | e} -> a, now_of: fn(Int) -> Int, wait_for: fn(Int, Int) -> Int) / {e} -> AsyncEnded(a) {
+  let first = AsyncQueue(AsyncCons(AsyncReady(0, fn() { step(body) }), AsyncNil), AsyncNil)
+  let table = update(AsyncLeaf, 0, AsyncPending(AsyncNil))
+  match run(AsyncSched(first, AsyncNil, table, AsyncNil, 1, 0), now_of, wait_for) {
+    AsyncSched(q, timers, done, orphans, next, t) -> match pending(done, 0, 1, AsyncNil) {
+      AsyncNil -> match find(done, 0) {
+        AsyncSome(AsyncAnswered(v)) -> AsyncFinished(v)
+        other -> AsyncDeadlocked(AsyncCons(0, AsyncNil))
+      }
+      ids -> AsyncDeadlocked(ids)
+    }
+  }
+}
+
+// The scope on a clock of its own: time moves only when every task sleeps,
+// to the earliest deadline. Deterministic.
+pub fn scope(body: fn() / {Async(a, e) | e} -> a) / {e} -> AsyncEnded(a) {
+  schedule(body, fn(t: Int) { t }, fn(t: Int, d: Int) { if d > t { d } else { t } })
+}

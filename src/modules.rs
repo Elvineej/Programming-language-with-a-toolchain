@@ -61,6 +61,9 @@ const STD_SOURCES: &[(&str, &str)] = &[
     ("elya/console", include_str!("std/console.elya")),
     ("elya/clock", include_str!("std/clock.elya")),
     ("elya/host", include_str!("std/host.elya")),
+    // Async as a standard module (spec 2026-10-31-elya-async-module D1).
+    ("elya/async", include_str!("std/async.elya")),
+    ("elya/async_host", include_str!("std/async_host.elya")),
 ];
 
 fn std_source(path: &str) -> Option<&'static str> {

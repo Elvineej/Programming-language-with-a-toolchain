@@ -1,0 +1,15 @@
+// elya/async_host: `elya/async`'s scheduler on the machine's clock (spec
+// docs/superpowers/specs/2026-10-31-elya-async-module-design.md, D3). Its
+// interface performs `IO`, so an import of it needs `/ {IO}` (capabilities part 3
+// D3). A module of its own, not part of `elya/host`: importing the host's
+// handlers must not bring `elya/async`'s names with it (the review's R2).
+
+import elya/async
+
+// `body`'s tasks run on the host's clock: `async_sleep` really waits.
+pub fn timed(body) {
+  async.schedule(body, fn(t: Int) { time.now_ms() }, fn(t: Int, d: Int) {
+    time.sleep_ms(d - time.now_ms())
+    time.now_ms()
+  })
+}
