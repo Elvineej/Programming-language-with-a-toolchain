@@ -3,7 +3,7 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-10-30, an interactive session on `main`)
+## State at handoff (updated 2026-10-31, an interactive session on `main`)
 
 - **Work lands on `main` directly** (the maintainer, 2026-10-30: "Commit in the main
   tho"). `main` has everything: #24 (2026-10-24), then `auto/elya`'s 15 commits since,
@@ -16,7 +16,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is public (seen 2026-10-30; the maintainer flipped it).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1407 passed, 151 suites. Native programs run on
+- Linux gate at the tip of `main`: 1409 passed, 151 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). In October the runtime
   gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -642,34 +642,24 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
     whole (pouring it label by label made `e` contain `Async(e)`, E0424), and the
     specializer's pattern binder types now substitute rows too.
 
+- **Async as a standard module, `elya/async`** (2026-10-31, on `main`, faeec2a and
+  a6f782a; step 1): spec `docs/superpowers/specs/2026-10-31-elya-async-module-design.md`.
+  - `effect Async(a, e)` (`async_spawn`, `async_await`, `async_yield`,
+    `async_sleep`); `async.scope` (a virtual clock: deterministic),
+    `async.schedule` (a clock as two functions), `elya/async_host`'s
+    `async_host.timed` (the machine's); a scope answers `AsyncFinished(v)` or
+    `AsyncDeadlocked(ids)`, never a hang. Spawning is a capability a dependency
+    is granted (`import lib/dep / {Async}`).
+  - `examples/06_structured.elya` and `08_timers.elya` run on it, outputs as
+    before (08's deadlock ids now ascending); 04 stays the scheduler written out.
+  - The review's: a quadratic scheduler (fib(14) over 60 s in the evaluator, now
+    1.7 s: waiting tasks parked, a two-list queue, a Braun tree by id); a clock
+    effect that leaked into the tasks' row (now two functions). Nested scopes
+    written inline are refused natively by name: older, step 4's.
+
 ## The next five steps
 
-### 1. Async as a standard module: `elya/async`
-
-ROADMAP priority 1's examples (`04_async.elya`, `06_structured.elya`,
-`08_timers.elya`) each carry their own scheduler: `spawn`/`await`/`yld`, a
-`scope` that joins its children, timers. Like `elya/replay` and
-`elya/console`, ship them as a standard module written in Elya, so a
-dependency is written against one `Async` vocabulary and granted it (part 3's
-pattern: the effects and pure schedulers in `elya/async`, any host binding in
-`elya/host`). Measure what the three examples share and what each needs
-(result types, cancellation, a timer's host clock through `elya/clock`), then
-decide the API in a spec; prove it by rewriting the examples on it, in the
-evaluator and natively. The names carry the module's (part 3 D1). Row parameters
-are done (499c048).
-**Part 1, the module, is done (faeec2a):** spec
-`docs/superpowers/specs/2026-10-31-elya-async-module-design.md`; `elya/async`
-(`Async(a, e)`, `async.scope`, `async.schedule`, `AsyncEnded`) and
-`elya/async_host` (`async_host.timed`). **Part 2 (this step's rest):** rewrite
-`examples/04_async.elya`, `06_structured.elya` and `08_timers.elya` on it (spec D5),
-outputs unchanged (snapshots `tests/snapshots/examples__0{4,6,8}_*.snap`), in the
-evaluator and natively. Their sources are also read by `tests/timers.rs` (08's
-scheduler with a test `main`), `crates/codegen/tests/native_trace.rs` (08's real
-clock recorded), `native_codegen.rs` and `tests/crosscheck.rs`: adapt those to the
-module, or keep a copy of the old scheduler where a test is about it. 08's
-`Clock` handlers become clocks passed to `async.schedule`.
-
-### 2. Compiler scalability: no step quadratic in a program's size
+### 1. Compiler scalability: no step quadratic in a program's size
 
 The maintainer's priority (2026-10-30: "compiler scalability is still
 fragile"). A block's length is no longer a stack bound (17869d4); measured and
@@ -693,7 +683,7 @@ place, or resolve names to slots before the run (the tree-walking oracle too);
 continuations that share the rest of a region instead of copying it. The proof:
 each at ten times today's size, linear.
 
-### 3. The affine guarantee across functions
+### 2. The affine guarantee across functions
 
 The maintainer's priority (2026-10-30: "the affine resource guarantee is
 incomplete"). `linear` values are checked within one function body (slice
@@ -706,7 +696,7 @@ multiplicity, inferred or annotated, checked at every call; branch-sensitive
 counting (the maximum over arms, not the sum); and what crosses a lambda, a
 handler clause and a resume.
 
-### 4. Native compilation without its implementation limits
+### 3. Native compilation without its implementation limits
 
 The maintainer's priority (2026-10-30: "native compilation has restrictive
 implementation limits"). Inventory every refusal natively against the
@@ -724,7 +714,7 @@ program without the module fails the same way). For each: a
 program the evaluator runs, then lift it or say in a spec why it stays. The
 differential sweep is the measure: no refusal left that the evaluator runs.
 
-### 5. Reading text from outside
+### 4. Reading text from outside
 
 Back from "Also open" (it was step 3 until the maintainer's priorities moved it,
 2026-10-30). `replay.parse` reads a trace the program already holds as a `String`. No Elya
@@ -736,6 +726,21 @@ Measure what reading needs:
 Then decide in a spec: the builtins (`io.read_file`, `io.read_line`?) and their
 effect (`IO`, which the host records like `time.*`, or a capability of their own
 under `elya/host`); and both back ends, recording and replaying a read the same way.
+
+### 5. Abstract types: a module's types its importers cannot open
+
+Found by `elya/async`'s review (R4, 2026-10-31): a task id is an `Int`, so an id
+from one scope names a task of another (with the same result type, an inner scope
+answers for its own task of that number; the spec writes it down). A typed handle
+`AsyncTask(a)` that only the module can build or read would close it, and would
+let `elya/async` keep `AsyncStep`, `AsyncSched` and the rest to itself (today an
+importer can build and match every one). Measure what an importer can do with a
+module's type now (construct, match, name), then decide in a spec: a type whose
+constructors are the module's alone (`opaque type`? constructors without `pub`?),
+what an importer may still do with its values (pass, store, compare?), the
+diagnostics, and both back ends (natively nothing should change: types are
+instances by then). Prove it on `elya/async`: `async_spawn` answers an
+`AsyncTask(a)`.
 
 ## Also open, unscheduled
 

@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-31 07:30 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
+## 2026-10-31 18:26 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -111,7 +111,17 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   - **Decisions (mine; please review):** a scope answers `AsyncEnded` (a deadlock
     by name); time is virtual by default; the clock is two functions, not an
     effect (measured: an effect leaked into the tasks' row and needed a grant).
-- Next: HANDOFF step 1, part 2: the examples on `elya/async`.
+- (The 07:30 heartbeat above was written at 05:25 by mistake.) The container
+  restarted near 15:10; the scratchpad and the uncommitted part 2 survived.
+- Windows: the gate on 4e66899 passed (1403, 0 failed).
+- **Done: `elya/async`, part 2, the examples on it** (HANDOFF step 1, now Done;
+  a6f782a, on `main`). 06 and 08 run on the module with their outputs as before
+  (08's deadlock ids ascending); 04 stays the scheduler written out. Three test
+  expectations changed, each named (08's deadlock line twice, and
+  `modules.rs`'s single-file guard from 10 examples to 8). The review found no
+  blocking defect; its order finding was fixed test-first (a scope's deadlock
+  ids sorted). Gate 1409 / 151 (predicted 1409).
+- Next: HANDOFF step 1, compiler scalability (the maintainer's priority).
 - Windows-gate debt: 20a4804, fa24c18, and since then 499c048 and ba8b629
   (the next Windows run on `main` covers them).
 
