@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-31 18:26 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
+## 2026-10-31 23:31 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -121,7 +121,14 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   `modules.rs`'s single-file guard from 10 examples to 8). The review found no
   blocking defect; its order finding was fixed test-first (a scope's deadlock
   ids sorted). Gate 1409 / 151 (predicted 1409).
-- Next: HANDOFF step 1, compiler scalability (the maintainer's priority).
+- HANDOFF step 1, compiler scalability (the maintainer's priority), in progress:
+  spec `docs/superpowers/specs/2026-10-31-elya-scalability-design.md`. Parts 1
+  and 2 (inference and the evaluators) are written and gated (1429 / 153, as
+  predicted; nine negative controls each fail their tests), not yet committed:
+  the independent review stopped at the usage limit and resumes after it. Part
+  3a (the native passes find bindings without searching) is written in the
+  scratchpad worktree `p3`: the IR of all 583 modules the codegen suite compiles
+  is byte-identical before and after.
 - Windows-gate debt: 20a4804, fa24c18, and since then 499c048 and ba8b629
   (the next Windows run on `main` covers them).
 
