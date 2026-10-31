@@ -203,6 +203,28 @@ fn corpus_lowers_to_core_through_the_real_pipeline() {
     }
 }
 
+/// `lower_src` for a program that imports standard modules (`elya/async`):
+/// through the front end that resolves them (2026-10-31).
+fn lower_with_imports(src: &str) -> elya::core::CoreModule {
+    let (module, diags, _) = elya::front_end_with("corpus.elya", src, &mut |_| None);
+    assert!(
+        diags.is_empty(),
+        "front end rejected corpus program: {diags:?}"
+    );
+    let (diags, table) = elya::types::infer_typed_table(&Session::new(), &module);
+    assert!(diags.is_empty(), "{diags:?}");
+    elya::core::lower_module(&module, &table).expect("lowers")
+}
+
+/// The evaluator's output and main's value, for a program that imports
+/// standard modules.
+fn eval_with_imports(src: &str) -> (String, String) {
+    let o = elya::run_source_outcome_with("corpus.elya", src, &mut |_| None);
+    assert!(o.error.is_none(), "{:?}", o.error);
+    let value = o.line.expect("a value line").expect("a value");
+    (o.output, value)
+}
+
 /// Compile + link through the LIBRARY API into `dir`. Task 5 adds the CLI path.
 fn compile_and_link(core: &elya::core::CoreModule, dir: &Path, tag: &str) -> PathBuf {
     let obj = dir.join(format!("{tag}.o"));
@@ -5176,25 +5198,26 @@ fn recursion_through_a_handle_body_runs_natively() {
     run_differential_corpus(HANDLE_RECURSION, "handle-recursion-diff");
 }
 
-/// `examples/06_structured.elya` (2026-10-15): spawn/await and a joining
-/// scope as ordinary handlers over the generic `List` and `Pair`; a task that
-/// spawns itself (recursion through a lambda) and a scope per call. The same
-/// bytes and value natively as in the evaluator.
+/// `examples/06_structured.elya` (2026-10-15; on `elya/async` since
+/// 2026-10-31): spawn/await and a joining scope; a task that spawns itself
+/// (recursion through a lambda) and a scope per call. The same bytes and value
+/// natively as in the evaluator.
 #[test]
 fn the_structured_concurrency_example_runs_natively() {
     let src = include_str!("../../../examples/06_structured.elya");
     let dir = temp_dir("structured-example");
-    let exe = compile_and_link(&lower_src(src), &dir, "structured");
+    let exe = compile_and_link(&lower_with_imports(src), &dir, "structured");
     let (text, value) = native_text_value(&exe, "structured");
     std::fs::remove_dir_all(&dir).ok();
-    assert_eq!(text, eval_main_text(src));
+    let (eval_text, eval_value) = eval_with_imports(src);
+    assert_eq!(text, eval_text);
     assert_eq!(
         text,
         "scope: start\n  ping\n  body: done, the children run on\n    pong\n  ping\n    pong\n  ping\n\
          scope: joined\nfib(10) by spawned tasks\npfib(10) by nested scopes\n"
     );
     assert_eq!(value, "25555");
-    assert_eq!(value, eval_main_int(src));
+    assert_eq!(value, eval_value);
 }
 
 /// `examples/07_search.elya` (2026-10-15): one backtracking search over a
@@ -5216,28 +5239,31 @@ fn the_search_example_runs_natively() {
     assert_eq!(value, eval_main_int(src));
 }
 
-/// `examples/08_timers.elya` (2026-10-16): the structured scheduler with
-/// `sleep`, a poll loop over timers, a `Clock` effect under a virtual clock
-/// and the real one (`time.now_ms`/`time.sleep_ms`), and a deadlock named.
-/// The same bytes and value natively as in the evaluator.
+/// `examples/08_timers.elya` (2026-10-16; on `elya/async` since 2026-10-31):
+/// sleeping tasks, a poll loop over timers, a `Clock` effect under a virtual
+/// clock and the real one (`time.now_ms`/`time.sleep_ms`), and a deadlock
+/// named. The same bytes and value natively as in the evaluator. (The
+/// deadlock's ids are in ascending order since `elya/async`: "1 0 2" was 08's
+/// own queue order.)
 #[test]
 fn the_timers_example_runs_natively() {
     let src = include_str!("../../../examples/08_timers.elya");
     let dir = temp_dir("timers-example");
-    let exe = compile_and_link(&lower_src(src), &dir, "timers");
+    let exe = compile_and_link(&lower_with_imports(src), &dir, "timers");
     let (text, value) = native_text_value(&exe, "timers");
     std::fs::remove_dir_all(&dir).ok();
-    assert_eq!(text, eval_main_text(src));
+    let (eval_text, eval_value) = eval_with_imports(src);
+    assert_eq!(text, eval_text);
     assert_eq!(
         text,
         "virtual clock:\n  b answered (10 ms)\n  c answered (20 ms)\n  a answered (30 ms)\n\
          \x20 60 ms of requests in 30 virtual ms\na deadlock:\n\
-         \x20 deadlock: tasks 1 0 2 can never finish\nreal clock:\n\
+         \x20 deadlock: tasks 0 1 2 can never finish\nreal clock:\n\
          \x20 b answered (10 ms)\n  c answered (20 ms)\n  a answered (30 ms)\n\
          \x20 at least 30 real ms\n"
     );
     assert_eq!(value, "60361");
-    assert_eq!(value, eval_main_int(src));
+    assert_eq!(value, eval_value);
 }
 
 /// A multi-shot copy of a chain of 100 000 handler frames, natively (the

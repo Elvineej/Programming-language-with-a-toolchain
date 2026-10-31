@@ -1,7 +1,7 @@
 # Async as a standard module: `elya/async`
 
-**Status:** part 1 (the module) in progress (2026-10-31, on `main`, an interactive
-session); part 2 rewrites the three examples on it (D5). HANDOFF step 1.
+**Status:** part 1 (the module) done (faeec2a); part 2 (the examples on it) in
+progress (2026-10-31, on `main`, an interactive session). HANDOFF step 1.
 The design choices are Claude's under the maintainer's delegation (rule 2).
 
 ## 0. Measured first
@@ -71,10 +71,14 @@ the debug CLI at 5e3bb5c, evaluator and native binary:
   `AsyncTable`, `AsyncStep`, `AsyncTimer`, `AsyncReady`, `AsyncQueue`, `AsyncEntry`,
   `AsyncSched`, `AsyncEnded` (named by D1's rule); only
   `AsyncEnded` and `AsyncList` reach a caller.
-- **D5. Proof:** `examples/04_async.elya`, `06_structured.elya` and
-  `08_timers.elya` rewritten on `elya/async`, their outputs unchanged except where a
-  decision says (06 and 08 report a deadlock by D2), in the evaluator and
-  natively. `elya/async` itself is imported without a grant (a scope's row is its
+- **D5. Proof:** `examples/06_structured.elya` and `08_timers.elya` rewritten on
+  `elya/async`, their outputs unchanged except where a decision says, in the
+  evaluator and natively. `examples/04_async.elya` stays the scheduler written out
+  (how one works, in Elya; its value counts finished tasks, which a scope does
+  not expose), and points at the module. 08 keeps its own `Clock` effect and
+  handlers and gives `async.schedule` a clock that performs it, so "the scheduler
+  never reads time itself" still holds and its real clock is still `time.*` (the
+  native trace test records it). `elya/async` itself is imported without a grant (a scope's row is its
   tasks' other effects alone); a dependency that spawns tasks performs `Async`, so
   spawning is a capability its importer grants (`import lib/dep / {Async}`;
   E0606 otherwise: corrected from the first draft's claim).
@@ -82,7 +86,8 @@ the debug CLI at 5e3bb5c, evaluator and native binary:
 ## 2. Evidence (part 1: the module)
 
 - `src/std/async.elya` (08's scheduler made generic, its clock as two functions),
-  `elya/host`'s `host.timed`.
+  and the machine's clock (`elya/host`'s `host.timed` in this draft; moved to
+  `elya/async_host`'s `async_host.timed` by the review's R2, below).
 - `tests/std_async.rs` (7, red first: E0600 "no module `elya/async`"): joining
   and the body's value; two result types and the tasks' `Log` outside; a
   deadlock by name (tasks 0, 1, 2); sleepers in deadline order; a clock given as
@@ -123,3 +128,33 @@ the debug CLI at 5e3bb5c, evaluator and native binary:
     for 100 ms delayed a 50 ms sleep to 150 ms). Now it is read when the task
     sleeps. No test: it shows only on a clock that moves while tasks compute,
     and a real-time test flakes under load (`08_timers`, HANDOFF).
+
+## 3. Evidence (part 2: the examples)
+
+- `examples/06_structured.elya` on `elya/async`: output byte-identical to its
+  snapshot, value 25555, both back ends.
+- `examples/08_timers.elya` on `elya/async`: one line differs, by D2's module:
+  "deadlock: tasks 1 0 2 can never finish" is now "tasks 0 1 2" (a scope reports
+  ids in ascending order, sorted since part 2's review, which found the table's
+  pre-order, 0 1 3 5 2 4 6 for seven: test `a_deadlocks_ids_are_in_ascending_order`;
+  08's own queue gave its order); value 60361, both back ends. **Two
+  expectations change with it:** the snapshot `examples__08_timers.snap` and
+  `native_codegen.rs`'s `the_timers_example_runs_natively` literal.
+- The other tests that read the examples' sources, adapted without changing what
+  they expect:
+  `native_codegen.rs`'s 06 and 08 tests and `native_trace.rs`'s `build` go through
+  the front end that resolves standard modules (`parse_module` alone does not);
+  `tests/timers.rs`'s spliced `main` uses the module's operation names (the test,
+  a timer that fires while other tasks run, holds on the module's poll rule).
+- Found by the gate: `tests/modules.rs`'s `a_single_file_program_is_unchanged`
+  holds for every example that is a single file; 06 and 08 now import
+  `elya/async` (a module written in Elya, merged when loaded), so it skips them,
+  and its guard **changes from at least 10 examples to at least 8** (named).
+- Review (an independent agent): no blocking defect; the examples behave as the
+  spec says, no adapted test was weakened (`tests/timers.rs` still catches a
+  scheduler that wakes due timers only when its queue is empty: a mutant flipped
+  its output). Fixed: the ids' order (above, test-first); stale references (10's
+  header, `tests/timers.rs`'s comments, 08's header, the module's and this
+  spec's `host.timed`); a misplaced doc comment; `modules.rs`'s skip now reads
+  import lines only; 06's `value` says a deadlock rather than turning it into a
+  result.

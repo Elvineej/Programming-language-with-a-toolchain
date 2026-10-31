@@ -234,3 +234,27 @@ fn many_tasks_are_scheduled_without_polling_the_waiting() {
     );
     assert_eq!(run(SRC), Ok((String::new(), 377)));
 }
+
+/// Part 2's review: a deadlock's ids are in ascending order (the table's own
+/// order, a Braun tree's pre-order, gave 0 1 3 5 2 4 6 for seven stuck tasks).
+#[test]
+fn a_deadlocks_ids_are_in_ascending_order() {
+    const SRC: &str = concat!(
+        "import elya/async\n",
+        "fn digits(l) { match l { AsyncNil -> 0  AsyncCons(x, rest) -> x + 10 * digits(rest) } }\n",
+        "pub fn main() -> Int {\n",
+        "  let ended = async.scope(fn() {\n",
+        "    let a = async_spawn(fn() { async_await(6) })\n",
+        "    let b = async_spawn(fn() { async_await(1) })\n",
+        "    let c = async_spawn(fn() { async_await(2) })\n",
+        "    let d = async_spawn(fn() { async_await(3) })\n",
+        "    let e = async_spawn(fn() { async_await(4) })\n",
+        "    let f = async_spawn(fn() { async_await(5) })\n",
+        "    async_await(a)\n",
+        "  })\n",
+        "  match ended { AsyncFinished(v) -> 0 - 1  AsyncDeadlocked(ids) -> digits(ids) }\n",
+        "}\n"
+    );
+    // 0, 1, ..., 6 read least significant digit first: 6543210.
+    assert_eq!(run(SRC), Ok((String::new(), 6543210)));
+}

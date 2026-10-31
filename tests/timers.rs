@@ -57,8 +57,9 @@ fn time_builtins_used_as_values_are_refused() {
     }
 }
 
-/// `examples/08_timers.elya`'s scheduler with a test `main` in place of the example's
-/// (the review of 2026-10-16). Everything before `pub fn main` is the example, unchanged.
+/// `examples/08_timers.elya` with a test `main` in place of the example's (the review of
+/// 2026-10-16): its `Clock`, its `scope` and, since 2026-10-31, `elya/async`'s scheduler
+/// under them. Everything before `pub fn main` is the example, unchanged.
 fn timers_example_with(main: &str) -> String {
     let src = include_str!("../examples/08_timers.elya");
     let cut = src.find("pub fn main").expect("the example has a main");
@@ -68,7 +69,8 @@ fn timers_example_with(main: &str) -> String {
 /// A timer whose deadline has passed fires even while other tasks can still run: the
 /// scheduler polls its timers every turn, not only when every task is stuck. Under a
 /// `ticking` clock (each reading is one ms later) a 5 ms sleeper must wake long before
-/// a task that yields 100 times. Before the fix it woke only after the spinner was done.
+/// a task that yields 100 times. Before the fix (in 08's own scheduler, 2026-10-16) it woke
+/// only after the spinner was done; `elya/async`'s `run` keeps the rule.
 #[test]
 fn an_expired_timer_fires_while_other_tasks_run() {
     let src = timers_example_with(
@@ -80,15 +82,15 @@ fn an_expired_timer_fires_while_other_tasks_run() {
          \x20 }\n\
          \x20 go(0)\n\
          }\n\
-         fn spin(n: Int) / {Async, Log} -> Int {\n\
-         \x20 if n == 0 { let _ = say(\"spinner done\")  0 } else { let _ = yld()  spin(n - 1) }\n\
+         fn spin(n: Int) -> Int {\n\
+         \x20 if n == 0 { let _ = say(\"spinner done\")  0 } else { let _ = async_yield()  spin(n - 1) }\n\
          }\n\
          pub fn main() -> Int {\n\
          \x20 handle {\n\
          \x20   ticking(fn() { scope(fn() {\n\
-         \x20     let a = spawn(fn() { let _ = sleep(5)  let _ = say(\"sleeper woke\")  1 })\n\
-         \x20     let b = spawn(fn() { spin(100) })\n\
-         \x20     await(a) + await(b)\n\
+         \x20     let a = async_spawn(fn() { let _ = async_sleep(5)  let _ = say(\"sleeper woke\")  1 })\n\
+         \x20     let b = async_spawn(fn() { spin(100) })\n\
+         \x20     async_await(a) + async_await(b)\n\
          \x20   }) })\n\
          \x20 } with {\n\
          \x20   Log.say(line) -> { io.println(line)  resume(Unit) }\n\

@@ -251,6 +251,15 @@ fn a_single_file_program_is_unchanged() {
             continue;
         }
         let text = std::fs::read_to_string(&path).unwrap();
+        // A program that imports `elya/async`, a module written in Elya, is
+        // not a single file (06 and 08 since 2026-10-31; `elya/io`, a builtin
+        // module, loads nothing). The guard below is the exact count left.
+        if text
+            .lines()
+            .any(|l| l.trim_start().starts_with("import elya/async"))
+        {
+            continue;
+        }
         let (alone, d1) = elya::parse::parse_module(&Session::new(), &text);
         let mut none = |_: &str| None;
         let (program, d2) = elya::modules::load(&Session::new(), "x.elya", &text, &mut none);
@@ -262,7 +271,7 @@ fn a_single_file_program_is_unchanged() {
         assert_eq!(d1.len(), d2.len(), "{path:?}");
         seen += 1;
     }
-    assert!(seen >= 10, "{seen}");
+    assert!(seen >= 8, "{seen}");
 }
 
 // ---- The review (2026-10-23), each red first ---------------------------------

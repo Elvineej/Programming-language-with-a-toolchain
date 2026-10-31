@@ -12,7 +12,6 @@
 //!   where the evaluator fails.
 
 use elya::core::lower_module;
-use elya::parse::parse_module;
 use elya::{run_source_recording, run_source_replaying, Session};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -24,10 +23,12 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// Through the front end that resolves standard modules (`examples/08_timers.elya`
+/// imports `elya/async` since 2026-10-31).
 fn build(src: &str, dir: &Path, tag: &str) -> PathBuf {
     let session = Session::new();
-    let (m, pd) = parse_module(&session, src);
-    assert!(pd.is_empty(), "parse: {pd:?}");
+    let (m, pd, _) = elya::front_end_with("t.elya", src, &mut |_| None);
+    assert!(pd.is_empty(), "front end: {pd:?}");
     let (diags, table) = elya::types::infer_typed_table(&session, &m);
     assert!(diags.is_empty(), "type errors: {diags:?}");
     let core = lower_module(&m, &table).expect("lowers");

@@ -11,6 +11,11 @@
 // the workers, walks a range that yields at every step: there is no async
 // copy of it, and no `await` at its call sites. Its type says what it does --
 // it performs whatever its argument performs.
+//
+// This is the scheduler written out, to show how it works. Programs use the
+// standard one, `elya/async` (`examples/06_structured.elya`,
+// `examples/08_timers.elya`): one scheduler for every program, with `await`,
+// sleeping, and a deadlock answered by name.
 
 effect Async {
   fn fork(f: fn() / {Async, Log} -> Unit) -> Unit

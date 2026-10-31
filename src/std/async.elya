@@ -11,7 +11,7 @@
 // `async.scope` runs on a clock of its own (time moves only when every task
 // sleeps), so it is deterministic. `async.schedule` takes the clock as two
 // functions instead: what the time is (given the time the scheduler keeps),
-// and the time after waiting for a deadline; `elya/host`'s `host.timed` gives
+// and the time after waiting for a deadline; `elya/async_host`'s `async_host.timed` gives
 // it the machine's. (A clock effect handled inside `scope` reached the tasks'
 // row, and one performed by the module needed a grant at every import: spec
 // D3.)
@@ -175,6 +175,21 @@ fn pending(table, base, step, acc) {
   }
 }
 
+// `ids` in ascending order (the table's walk is not: part 2's review).
+fn sorted(ids) {
+  match ids {
+    AsyncNil -> AsyncNil
+    AsyncCons(x, rest) -> placed(x, sorted(rest))
+  }
+}
+
+fn placed(x, l) {
+  match l {
+    AsyncNil -> AsyncCons(x, AsyncNil)
+    AsyncCons(y, rest) -> if x < y { AsyncCons(x, l) } else { AsyncCons(y, placed(x, rest)) }
+  }
+}
+
 // Task `id` stopped at `s`: where it goes next. A sleep's deadline is read
 // now, when the task sleeps (the review's R6: it was read when the scheduler
 // next looked at the task).
@@ -254,7 +269,7 @@ pub fn schedule(body: fn() / {Async(a, e) | e} -> a, now_of: fn(Int) -> Int, wai
         AsyncSome(AsyncAnswered(v)) -> AsyncFinished(v)
         other -> AsyncDeadlocked(AsyncCons(0, AsyncNil))
       }
-      ids -> AsyncDeadlocked(ids)
+      ids -> AsyncDeadlocked(sorted(ids))
     }
   }
 }

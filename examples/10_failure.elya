@@ -6,7 +6,8 @@
 // on a type with no constructors needs no arms). `catch` is an ordinary
 // handler that answers a fallback instead.
 //
-// The scheduler is `examples/06_structured.elya`'s, with one rule more: when
+// The scheduler is the one `examples/06_structured.elya` used before it moved
+// to `elya/async` (written out here), with one rule more: when
 // any task of a scope fails, the scope drops the tasks still queued -- they
 // never run -- and fails itself, with the same reason. A failure inside a
 // nested scope therefore climbs scope by scope until something catches it.
