@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-30 22:20 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
+## 2026-10-31 07:30 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -97,7 +97,21 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   failure lines read "\r" on Windows: stderr was text mode); ba8b629 puts
   stderr in binary mode like stdout. The run was then cancelled from the
   maintainer's account.
-- Next: HANDOFF step 1, `elya/async`.
+- Windows: the gate on 5e3bb5c passed (1381, 0 failed): 20a4804, fa24c18, 499c048
+  and ba8b629 are clear.
+- **Done: `elya/async`, part 1, the module** (HANDOFF step 1; spec
+  2026-10-31-elya-async-module; faeec2a, on `main`). `Async(a, e)`, `async.scope`
+  (a virtual clock), `async.schedule` (a clock as two functions),
+  `elya/async_host` (the machine's clock). Gate 1407 / 151 (predicted 1407; 1402
+  before the review's fixes, as predicted).
+  - The review found one high (nested scopes refused natively: older, recorded in
+    HANDOFF's native-limits step), three medium (the host module reserving
+    `Async*` names; a quadratic scheduler: fib(14) over 60 s, now 1.7 s; ids
+    across scopes, written down) and two low. All fixed first or written down.
+  - **Decisions (mine; please review):** a scope answers `AsyncEnded` (a deadlock
+    by name); time is virtual by default; the clock is two functions, not an
+    effect (measured: an effect leaked into the tasks' row and needed a grant).
+- Next: HANDOFF step 1, part 2: the examples on `elya/async`.
 - Windows-gate debt: 20a4804, fa24c18, and since then 499c048 and ba8b629
   (the next Windows run on `main` covers them).
 

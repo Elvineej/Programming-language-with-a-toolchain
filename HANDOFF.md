@@ -16,7 +16,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - The repo is public (seen 2026-10-30; the maintainer flipped it).
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1374 passed, 148 suites. Native programs run on
+- Linux gate at the tip of `main`: 1407 passed, 151 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). In October the runtime
   gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -656,8 +656,18 @@ pattern: the effects and pure schedulers in `elya/async`, any host binding in
 (result types, cancellation, a timer's host clock through `elya/clock`), then
 decide the API in a spec; prove it by rewriting the examples on it, in the
 evaluator and natively. The names carry the module's (part 3 D1). Row parameters
-are done (499c048): `tests/row_parameters/round_robin.elya` is 04's scheduler written
-once for any other effects; start from it.
+are done (499c048).
+**Part 1, the module, is done (faeec2a):** spec
+`docs/superpowers/specs/2026-10-31-elya-async-module-design.md`; `elya/async`
+(`Async(a, e)`, `async.scope`, `async.schedule`, `AsyncEnded`) and
+`elya/async_host` (`async_host.timed`). **Part 2 (this step's rest):** rewrite
+`examples/04_async.elya`, `06_structured.elya` and `08_timers.elya` on it (spec D5),
+outputs unchanged (snapshots `tests/snapshots/examples__0{4,6,8}_*.snap`), in the
+evaluator and natively. Their sources are also read by `tests/timers.rs` (08's
+scheduler with a test `main`), `crates/codegen/tests/native_trace.rs` (08's real
+clock recorded), `native_codegen.rs` and `tests/crosscheck.rs`: adapt those to the
+module, or keep a copy of the old scheduler where a test is about it. 08's
+`Clock` handlers become clocks passed to `async.schedule`.
 
 ### 2. Compiler scalability: no step quadratic in a program's size
 
@@ -706,7 +716,11 @@ effect-polymorphism corners ("upcast in a parameter position", "type variable
 only in an effect row", "effect-polymorphic function used at a user effect",
 "direct function used where an effectful one is expected", and since row
 variables, "calling convention disagrees with the callee" for a function whose
-named row says more than its body performs). For each: a
+named row says more than its body performs, and, found by the `elya/async`
+review (R1), for a scope written inline in a task that also performs the outer
+effect: `crates/codegen/tests/native_std_async.rs`'s
+`a_nested_scope_inline_is_refused_by_name_natively` pins it, and a 14-line
+program without the module fails the same way). For each: a
 program the evaluator runs, then lift it or say in a spec why it stays. The
 differential sweep is the measure: no refusal left that the evaluator runs.
 
