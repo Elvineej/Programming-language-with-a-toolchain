@@ -45,6 +45,7 @@ use elya::core::{let_spine, push_children, CoreExpr, CoreKind, CoreModule, CoreP
 use elya::types::{Ty, TyCon};
 
 use crate::cps::{self, contains_effect, is_tail_slot, needs_cps, ContSite, HandlerSite, Saved};
+use crate::scope::{Env, Scope};
 use crate::{
     bind_local, eq_operand_label, fn_type_of, gc_root_env, gc_unroot, internal, lower_expr, mangle,
     prim_values, repr_ty, value_to_word, word_to_value, CodegenError, LowerCtx, MAX_PARAMS, TAILCC,
@@ -109,9 +110,9 @@ pub(crate) fn prepass(core: &CoreModule, cps_fns: &HashSet<String>) -> R<()> {
         }
     }
     for f in &core.fns {
-        let mut scope: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+        let mut scope: Scope<String> = f.params.iter().map(|p| p.name.clone()).collect();
         check(&f.body, &mut scope, &fns, cps_fns)?;
-        let mut locals: Vec<(String, Option<Ty>)> = f
+        let mut locals: Scope<(String, Option<Ty>)> = f
             .params
             .iter()
             .map(|p| (p.name.clone(), Some(p.ty.clone())))
@@ -133,10 +134,10 @@ pub(crate) fn prepass(core: &CoreModule, cps_fns: &HashSet<String>) -> R<()> {
 /// are tracked from the instances' field types.
 fn check_local_conventions(
     e: &CoreExpr,
-    locals: &mut Vec<(String, Option<Ty>)>,
+    locals: &mut Scope<(String, Option<Ty>)>,
     types: &[elya::core::CoreType],
 ) -> R<()> {
-    let go = |c: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>| {
+    let go = |c: &CoreExpr, locals: &mut Scope<(String, Option<Ty>)>| {
         check_local_conventions(c, locals, types)
     };
     match &e.kind {
@@ -151,7 +152,7 @@ fn check_local_conventions(
         // agreeing outer conventions. `specialize` eta-expands every upcast of
         // a tracked binder, so this fires only if that pass missed one.
         CoreKind::Var(name) => {
-            if let Some((_, Some(bound))) = locals.iter().rev().find(|(n, _)| n == name) {
+            if let Some((_, Some(bound))) = locals.find(name) {
                 if !crate::specialize::conv_eq(bound, &e.ty) {
                     return Err(CodegenError::Unsupported(
                         "direct function used where an effectful one is expected",
@@ -162,7 +163,7 @@ fn check_local_conventions(
         }
         CoreKind::App(callee, args) => {
             if let CoreKind::Var(name) = &callee.kind {
-                if let Some((_, Some(bound))) = locals.iter().rev().find(|(n, _)| n == name) {
+                if let Some((_, Some(bound))) = locals.find(name) {
                     if needs_cps(&callee.ty) && !needs_cps(bound) {
                         return Err(CodegenError::Unsupported(
                             "effect-polymorphic function used at a user effect",
@@ -268,16 +269,16 @@ fn check_local_conventions(
 
 fn check(
     e: &CoreExpr,
-    scope: &mut Vec<String>,
+    scope: &mut Scope<String>,
     fns: &HashMap<&str, &elya::core::CoreFn>,
     cps_fns: &HashSet<String>,
 ) -> R<()> {
-    let go = |c: &CoreExpr, scope: &mut Vec<String>| check(c, scope, fns, cps_fns);
+    let go = |c: &CoreExpr, scope: &mut Scope<String>| check(c, scope, fns, cps_fns);
     match &e.kind {
         CoreKind::Lit(_) | CoreKind::Var(_) => Ok(()),
         CoreKind::App(callee, args) => {
             if let CoreKind::Var(g) = &callee.kind {
-                if !scope.iter().any(|s| s == g) {
+                if !scope.contains(g) {
                     if let Some(target) = fns.get(g.as_str()) {
                         check_reference(target, &callee.ty, cps_fns)?;
                     }
@@ -580,7 +581,7 @@ pub(crate) fn declare<'ctx>(
 struct St<'ctx> {
     /// Name view for the direct emitter: each name's innermost binding below
     /// `depth`, plus `$kont`.
-    env: HashMap<String, BasicValueEnum<'ctx>>,
+    env: Env<'ctx>,
     /// Bindings by BINDING index (the analysis's scope index), so two live
     /// bindings that share a name stay distinct (7b-2's binding identity).
     binds: BTreeMap<usize, (String, BasicValueEnum<'ctx>)>,
@@ -595,7 +596,7 @@ struct St<'ctx> {
 
 impl<'ctx> St<'ctx> {
     fn new(kont: PointerValue<'ctx>) -> Self {
-        let mut env = HashMap::new();
+        let mut env = Env::new();
         env.insert(KONT.to_string(), kont.into());
         St {
             env,
@@ -2020,7 +2021,7 @@ pub(crate) fn emit_cps_lifted<'ctx>(
             .ok_or_else(|| internal("a capture is not in the lambda's scope"))?;
         st.binds.insert(at, (name.clone(), v));
     }
-    st.depth = region.scope.len();
+    st.depth = region.depth;
     st.rebuild_env();
     for (i, p) in site.params.iter().enumerate() {
         let v = func
@@ -2042,7 +2043,7 @@ pub(crate) fn emit_handle_site<'ctx>(
     b: &Builder<'ctx>,
     lc: &LowerCtx<'_, 'ctx>,
     e: &CoreExpr,
-    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    env: &mut Env<'ctx>,
 ) -> R<BasicValueEnum<'ctx>> {
     let key = e as *const CoreExpr as usize;
     if lc.fx.leaking.contains(&key) {
@@ -2301,7 +2302,7 @@ fn handler_env<'ctx>(
     cx: &Cx<'_, '_, 'ctx>,
     hf: PointerValue<'ctx>,
     h: &HandlerSite,
-) -> R<HashMap<String, BasicValueEnum<'ctx>>> {
+) -> R<Env<'ctx>> {
     let mut binds: Vec<(usize, String, BasicValueEnum<'ctx>)> = Vec::new();
     for (j, (sv, ty)) in h.saved.iter().enumerate() {
         let Saved::Var { name, binding } = sv else {
@@ -2315,7 +2316,7 @@ fn handler_env<'ctx>(
         ));
     }
     binds.sort_by_key(|(i, _, _)| *i);
-    let mut env = HashMap::new();
+    let mut env = Env::new();
     for (_, n, v) in binds {
         let _ = bind_local(&mut env, &n, v);
     }
@@ -2393,7 +2394,7 @@ fn clause_tail<'ctx>(
     cx: &Cx<'_, '_, 'ctx>,
     e: &CoreExpr,
     answer: &Ty,
-    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    env: &mut Env<'ctx>,
 ) -> R<()> {
     match &e.kind {
         // A block in a loop (spec 2026-10-30-elya-long-blocks D1).
@@ -2544,7 +2545,7 @@ fn resume_prologue<'ctx>(
     cx: &Cx<'_, '_, 'ctx>,
     v: BasicValueEnum<'ctx>,
     arg_ty: &Ty,
-    env: &HashMap<String, BasicValueEnum<'ctx>>,
+    env: &Env<'ctx>,
     multi: bool,
 ) -> R<(
     IntValue<'ctx>,
@@ -2585,7 +2586,7 @@ pub(crate) fn emit_resume_call<'ctx>(
     lc: &LowerCtx<'_, 'ctx>,
     e: &CoreExpr,
     arg: &CoreExpr,
-    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    env: &mut Env<'ctx>,
 ) -> R<BasicValueEnum<'ctx>> {
     if lc.fx.cps_resumes.contains(&(e as *const CoreExpr as usize)) {
         return Err(CodegenError::Unsupported(
@@ -2606,7 +2607,7 @@ fn resume_nested<'ctx>(
     e: &CoreExpr,
     v: BasicValueEnum<'ctx>,
     arg_ty: &Ty,
-    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    env: &mut Env<'ctx>,
 ) -> R<BasicValueEnum<'ctx>> {
     let cx = Cx { ctx, func, b, lc };
     let multi = lc.fx.multi_resumes.contains(&key_of(e));

@@ -30,6 +30,7 @@ use elya::core::{
 use elya::span::Span;
 use elya::types::{EffectLabel, EffectRow, RowTail, RowVar, Ty, TyCon};
 
+use crate::scope::{Named, Scope};
 use crate::CodegenError;
 
 type R<T> = Result<T, CodegenError>;
@@ -483,6 +484,12 @@ struct Local {
     generic: Option<LocalGeneric>,
 }
 
+impl Named for Local {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 struct LocalGeneric {
     ty: Ty,
     /// key -> (clone binder name, substitution), in creation order.
@@ -498,9 +505,9 @@ impl Mono<'_> {
         Ok(format!("{base}.mono.{}", self.clones))
     }
 
-    fn resolve(&mut self, x: &str, at: &Ty, locals: &mut [Local]) -> R<String> {
-        if let Some(i) = locals.iter().rposition(|l| l.name == x) {
-            let Some(g) = locals[i].generic.as_ref() else {
+    fn resolve(&mut self, x: &str, at: &Ty, locals: &mut Scope<Local>) -> R<String> {
+        if let Some(i) = locals.rposition(x) {
+            let Some(g) = locals.get(i).generic.as_ref() else {
                 return Ok(x.to_string());
             };
             let s = inst_subst(&g.ty, at);
@@ -509,7 +516,8 @@ impl Mono<'_> {
                 return Ok(n.clone());
             }
             let name = self.fresh(x)?;
-            locals[i]
+            locals
+                .get_mut(i)
                 .generic
                 .as_mut()
                 .expect("checked above")
@@ -531,7 +539,7 @@ impl Mono<'_> {
         Ok(name)
     }
 
-    fn rewrite(&mut self, e: &CoreExpr, locals: &mut Vec<Local>) -> R<CoreExpr> {
+    fn rewrite(&mut self, e: &CoreExpr, locals: &mut Scope<Local>) -> R<CoreExpr> {
         let plain = |name: &str| Local {
             name: name.to_string(),
             generic: None,
@@ -628,7 +636,7 @@ impl Mono<'_> {
         })
     }
 
-    fn rewrite_all(&mut self, cs: &[CoreExpr], locals: &mut Vec<Local>) -> R<Rc<[CoreExpr]>> {
+    fn rewrite_all(&mut self, cs: &[CoreExpr], locals: &mut Scope<Local>) -> R<Rc<[CoreExpr]>> {
         let mut out = Vec::with_capacity(cs.len());
         for c in cs {
             out.push(self.rewrite(c, locals)?);
@@ -643,7 +651,7 @@ impl Mono<'_> {
     /// original was -- in the scope the original's value sees -- and the
     /// original is dropped: every use now names a clone. Any other `let`'s value
     /// is rewritten where it stands.
-    fn rewrite_block(&mut self, e: &CoreExpr, locals: &mut Vec<Local>) -> R<CoreExpr> {
+    fn rewrite_block(&mut self, e: &CoreExpr, locals: &mut Scope<Local>) -> R<CoreExpr> {
         // The scope is restored on every path, an error's too, as the
         // recursion restored it (the review's F6).
         let depth = locals.len();
@@ -652,7 +660,7 @@ impl Mono<'_> {
         out
     }
 
-    fn rewrite_spine(&mut self, e: &CoreExpr, locals: &mut Vec<Local>) -> R<CoreExpr> {
+    fn rewrite_spine(&mut self, e: &CoreExpr, locals: &mut Scope<Local>) -> R<CoreExpr> {
         enum Bound<'e> {
             Plain(Span, Ty, String, CoreExpr),
             Generic(Span, Ty, &'e CoreExpr),
@@ -723,7 +731,7 @@ impl Mono<'_> {
             })
             .collect();
         let body = map_expr(&f.body, &|t| apply(t, s));
-        let mut locals: Vec<Local> = params
+        let mut locals: Scope<Local> = params
             .iter()
             .map(|p| Local {
                 name: p.name.clone(),

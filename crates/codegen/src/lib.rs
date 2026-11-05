@@ -26,6 +26,8 @@ mod cps_emit;
 mod mono;
 mod patterns;
 mod reflect;
+pub mod scope;
+use scope::Env;
 mod specialize;
 mod spill;
 
@@ -369,7 +371,7 @@ fn emit_lifted<'ctx>(
         .get_nth_param(0)
         .ok_or_else(|| internal("lifted body has no environment parameter"))?
         .into_pointer_value();
-    let mut env: HashMap<String, BasicValueEnum<'ctx>> = HashMap::new();
+    let mut env: Env<'ctx> = Env::new();
     for (i, (name, ty)) in site.captures.iter().enumerate() {
         let cs = unsafe { b.build_gep(i64t, clos, &[i64t.const_int((i + 2) as u64, false)], "cs") }
             .map_err(internal)?;
@@ -404,7 +406,7 @@ fn emit_body<'ctx>(
         .ok_or(CodegenError::Unsupported("undeclared function"))?;
     let entry = ctx.append_basic_block(func, "entry");
     b.position_at_end(entry);
-    let mut env: HashMap<String, BasicValueEnum<'ctx>> = HashMap::new();
+    let mut env: Env<'ctx> = Env::new();
     for (i, p) in f.params.iter().enumerate() {
         let v = func
             .get_nth_param(i as u32)
@@ -1035,7 +1037,7 @@ fn word_to_value<'ctx>(
 
 /// The prefix of the hidden keys `bind_local` parks shadowed values under. No
 /// source identifier can begin with `$`, so `Var` lookup never sees one.
-const SHADOW: &str = "$shadow:";
+pub(crate) const SHADOW: &str = "$shadow:";
 
 /// What `unbind_local` needs to undo a `bind_local`.
 struct Shadowed(Option<String>);
@@ -1046,15 +1048,11 @@ struct Shadowed(Option<String>);
 /// `env` under a hidden key, so every allocation inside the inner scope roots
 /// it, and `unbind_local` restores it exactly. Bindings nest LIFO, so the
 /// count of hidden keys present is a unique, deterministic suffix.
-fn bind_local<'ctx>(
-    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
-    x: &str,
-    v: BasicValueEnum<'ctx>,
-) -> Shadowed {
+fn bind_local<'ctx>(env: &mut Env<'ctx>, x: &str, v: BasicValueEnum<'ctx>) -> Shadowed {
     match env.insert(x.to_string(), v) {
         None => Shadowed(None),
         Some(prev) => {
-            let n = env.keys().filter(|k| k.starts_with(SHADOW)).count();
+            let n = env.hidden();
             let key = format!("{SHADOW}{n:06}:{x}");
             env.insert(key.clone(), prev);
             Shadowed(Some(key))
@@ -1062,7 +1060,7 @@ fn bind_local<'ctx>(
     }
 }
 
-fn unbind_local<'ctx>(env: &mut HashMap<String, BasicValueEnum<'ctx>>, x: &str, s: Shadowed) {
+fn unbind_local<'ctx>(env: &mut Env<'ctx>, x: &str, s: Shadowed) {
     match s.0 {
         None => {
             env.remove(x);
@@ -1077,19 +1075,19 @@ fn unbind_local<'ctx>(env: &mut HashMap<String, BasicValueEnum<'ctx>>, x: &str, 
 
 /// Root every heap binding currently in scope, returning how many went on.
 ///
-/// The keys are SORTED first. `HashMap` iteration order varies between
-/// processes, so without this the same input would emit different IR run to
-/// run — reproducibility is nearly free here and expensive to retrofit.
+/// In name order (`Env::pointers`): the same input emits the same IR, run to
+/// run, whatever a `HashMap` would iterate in -- reproducibility is nearly free
+/// here and expensive to retrofit.
 fn gc_root_env<'ctx>(
     b: &Builder<'ctx>,
     lc: &LowerCtx<'_, 'ctx>,
-    env: &HashMap<String, BasicValueEnum<'ctx>>,
+    env: &Env<'ctx>,
 ) -> Result<usize, CodegenError> {
-    let mut names: Vec<&String> = env.keys().collect();
-    names.sort();
+    // The pointers alone, in name order: what rooting every name in name
+    // order pushed, since `gc_root` pushes pointers only (scalability D12).
     let mut n = 0usize;
-    for name in names {
-        if gc_root(b, lc, env[name])? {
+    for v in env.pointers() {
+        if gc_root(b, lc, v)? {
             n += 1;
         }
     }
@@ -1126,7 +1124,7 @@ fn build_elya_call<'ctx>(
     lc: &LowerCtx<'_, 'ctx>,
     callee: &CoreExpr,
     args: &[CoreExpr],
-    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    env: &mut Env<'ctx>,
     tail: bool,
 ) -> Result<CallSiteValue<'ctx>, CodegenError> {
     // §9: dispatch is by BINDING, not by type. A callee that is not a name at
@@ -1163,7 +1161,7 @@ fn build_direct_call<'ctx>(
     lc: &LowerCtx<'_, 'ctx>,
     target: FunctionValue<'ctx>,
     args: &[CoreExpr],
-    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    env: &mut Env<'ctx>,
     tail: bool,
 ) -> Result<CallSiteValue<'ctx>, CodegenError> {
     // Roots, in two layers, and the layering is the whole subtlety.
@@ -1219,7 +1217,7 @@ fn build_closure_call<'ctx>(
     lc: &LowerCtx<'_, 'ctx>,
     callee: &CoreExpr,
     args: &[CoreExpr],
-    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    env: &mut Env<'ctx>,
     tail: bool,
 ) -> Result<CallSiteValue<'ctx>, CodegenError> {
     let i64t = ctx.i64_type();
@@ -1288,8 +1286,8 @@ pub(crate) fn lower_block<'ctx, T>(
     b: &Builder<'ctx>,
     lc: &LowerCtx<'_, 'ctx>,
     e: &CoreExpr,
-    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
-    rest: impl FnOnce(&CoreExpr, &mut HashMap<String, BasicValueEnum<'ctx>>) -> Result<T, CodegenError>,
+    env: &mut Env<'ctx>,
+    rest: impl FnOnce(&CoreExpr, &mut Env<'ctx>) -> Result<T, CodegenError>,
 ) -> Result<T, CodegenError> {
     let (spine, body) = let_spine(e);
     let mut bound = Vec::with_capacity(spine.len());
@@ -1328,7 +1326,7 @@ fn lower_tail<'ctx>(
     b: &Builder<'ctx>,
     lc: &LowerCtx<'_, 'ctx>,
     e: &CoreExpr,
-    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    env: &mut Env<'ctx>,
 ) -> Result<(), CodegenError> {
     match &e.kind {
         CoreKind::If(cond, then_e, else_e) => {
@@ -1401,7 +1399,7 @@ fn lower_match<'ctx>(
     scrutinee: &CoreExpr,
     arms: &[elya::core::CoreArm],
     phi_ty: Option<BasicTypeEnum<'ctx>>,
-    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    env: &mut Env<'ctx>,
 ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
     // N6 §8.4: a scrutinee must be an ADT (a pointer with a real tag word). A
     // non-Con scrutinee panics `.into_pointer_value()` today; a Str scrutinee
@@ -1555,7 +1553,7 @@ fn arm_body<'ctx>(
     b: &Builder<'ctx>,
     lc: &LowerCtx<'_, 'ctx>,
     body: &CoreExpr,
-    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    env: &mut Env<'ctx>,
     join: Option<inkwell::basic_block::BasicBlock<'ctx>>,
 ) -> Result<Option<Incoming<'ctx>>, CodegenError> {
     let Some(join) = join else {
@@ -1721,7 +1719,7 @@ fn lower_expr<'ctx>(
     b: &Builder<'ctx>,
     lc: &LowerCtx<'_, 'ctx>,
     e: &CoreExpr,
-    env: &mut HashMap<String, BasicValueEnum<'ctx>>,
+    env: &mut Env<'ctx>,
 ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
     // Check for "function used as a value" BEFORE repr_ty, because a function
     // name in value position has a function type that repr_ty will reject as

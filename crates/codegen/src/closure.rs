@@ -12,6 +12,8 @@ use std::rc::Rc;
 use elya::core::{let_spine, CoreExpr, CoreKind, CoreModule, CoreParam, CorePat};
 use elya::types::Ty;
 
+use crate::scope::Scope;
+
 /// The synthetic binder for a handler clause's continuation (5b-8 D12). A
 /// `resume` makes it free; the clause that owns the continuation binds it. So a
 /// lambda that resumes -- and may run after its `handle` has returned --
@@ -80,7 +82,7 @@ pub fn free_vars(e: &CoreExpr) -> BTreeMap<String, Ty> {
 /// `free_vars`, with an initial set of already-bound names (the CPS passes
 /// bind a clause's parameters or a `let`'s name this way).
 pub fn free_vars_under(e: &CoreExpr, bound: &[String]) -> BTreeMap<String, Ty> {
-    let mut scope: Vec<String> = bound.to_vec();
+    let mut scope: Scope<String> = bound.iter().cloned().collect();
     let mut out = BTreeMap::new();
     fv_walk(e, &mut scope, &mut out);
     out
@@ -90,14 +92,14 @@ pub fn free_vars_under(e: &CoreExpr, bound: &[String]) -> BTreeMap<String, Ty> {
 /// wrong answer that the collector turns into a use-after-free; over-capture is
 /// benign retention. So a new `CoreKind` variant must fail the build here rather
 /// than fall into a `_ => {}` and go silently uncaptured.
-fn fv_walk(e: &CoreExpr, scope: &mut Vec<String>, out: &mut BTreeMap<String, Ty>) {
+fn fv_walk(e: &CoreExpr, scope: &mut Scope<String>, out: &mut BTreeMap<String, Ty>) {
     match &e.kind {
         CoreKind::Lit(_) => {}
         CoreKind::Var(x) => {
-            // From the innermost binding out: most uses are of a binding a
-            // statement or two back, and a long block's scope is as long as the
-            // block (the same answer; `any` has no order).
-            if !scope.iter().rev().any(|b| b == x) {
+            // Found without searching (spec 2026-10-31-elya-scalability
+            // D12): a name bound above a long block was searched past every
+            // binding in it at each use.
+            if !scope.contains(x) {
                 out.entry(x.clone()).or_insert_with(|| e.ty.clone());
             }
         }
@@ -180,7 +182,7 @@ fn fv_walk(e: &CoreExpr, scope: &mut Vec<String>, out: &mut BTreeMap<String, Ty>
         // D12: a resume uses the enclosing clause's continuation, so the
         // continuation is free here exactly like a variable occurrence.
         CoreKind::Resume(v) => {
-            if !scope.iter().any(|b| b == CONT) {
+            if !scope.contains(CONT) {
                 out.entry(CONT.to_string())
                     .or_insert_with(|| cont_ty(&v.ty, &e.ty));
             }
@@ -195,10 +197,10 @@ fn fv_walk(e: &CoreExpr, scope: &mut Vec<String>, out: &mut BTreeMap<String, Ty>
     }
 }
 
-pub(crate) fn pat_binders(p: &CorePat, scope: &mut Vec<String>) {
+pub(crate) fn pat_binders(p: &CorePat, scope: &mut impl Extend<String>) {
     match p {
         CorePat::Wild | CorePat::Lit(_) => {}
-        CorePat::Var(x) => scope.push(x.clone()),
+        CorePat::Var(x) => scope.extend(std::iter::once(x.clone())),
         CorePat::Ctor(_, subs) => {
             for s in subs.iter() {
                 pat_binders(s, scope);
@@ -222,7 +224,7 @@ pub fn collect_lambdas(core: &CoreModule, first_tag: usize) -> Vec<LambdaSite> {
         // ("free anywhere in the function, so module-level") dropped a local
         // that shadows a top-level function the same function also calls, and
         // the lifted body then called the top-level one.
-        let mut scope: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+        let mut scope: Scope<String> = f.params.iter().map(|p| p.name.clone()).collect();
         let mut n = 0usize;
         collect_in(&f.body, &f.name, &mut n, &mut scope, first_tag, &mut out);
     }
@@ -233,7 +235,7 @@ fn collect_in(
     e: &CoreExpr,
     enclosing: &str,
     n: &mut usize,
-    scope: &mut Vec<String>,
+    scope: &mut Scope<String>,
     first_tag: usize,
     out: &mut Vec<LambdaSite>,
 ) {
@@ -241,7 +243,7 @@ fn collect_in(
         CoreKind::Lambda(params, body) => {
             let captures: Vec<(String, Ty)> = free_vars(e)
                 .into_iter()
-                .filter(|(name, _)| scope.iter().any(|b| b == name))
+                .filter(|(name, _)| scope.contains(name))
                 .collect();
             let symbol = format!("{enclosing}.lambda.{n}");
             *n += 1;

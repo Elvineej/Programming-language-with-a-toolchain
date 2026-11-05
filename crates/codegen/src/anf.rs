@@ -33,6 +33,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::scope::Scope;
 use elya::core::{
     let_spine, push_children, rebuild_spine, CoreArm, CoreClause, CoreExpr, CoreFn, CoreHandle,
     CoreKind, CoreModule, CoreParam, CorePerform, CoreReturn,
@@ -317,8 +318,8 @@ impl Anf<'_> {
     /// function sharing `y`'s name no longer blocks it (D2: captures are decided
     /// by scope since 2026-10-23), and a body that binds `y` again has those
     /// binders renamed first (D1: capture-avoiding substitution).
-    fn substitutes(&self, x: &str, v: &CoreExpr, y: &str, locals: &[String]) -> bool {
-        x != y && locals.iter().any(|l| l == y) && (has_open_row(&v.ty) || is_operation(&v.ty))
+    fn substitutes(&self, x: &str, v: &CoreExpr, y: &str, locals: &Scope<String>) -> bool {
+        x != y && locals.contains(y) && (has_open_row(&v.ty) || is_operation(&v.ty))
     }
 
     /// D1: `e` with every binder of `name` in it (a `let`, a lambda's or a
@@ -466,11 +467,11 @@ impl Anf<'_> {
         cs.iter().map(|c| self.fresh_binders(c, name)).collect()
     }
 
-    fn expr(&mut self, e: &CoreExpr, locals: &mut Vec<String>) -> CoreExpr {
+    fn expr(&mut self, e: &CoreExpr, locals: &mut Scope<String>) -> CoreExpr {
         let kind = match &e.kind {
             CoreKind::Lit(_) => return e.clone(),
             CoreKind::Var(x) => {
-                if self.top.contains_key(x) && !locals.iter().any(|l| l == x) {
+                if self.top.contains_key(x) && !locals.contains(x) {
                     if let Some(w) = self.wrap(e, x) {
                         return w;
                     }
@@ -625,7 +626,7 @@ impl Anf<'_> {
         }
     }
 
-    fn all(&mut self, cs: &[CoreExpr], locals: &mut Vec<String>) -> Rc<[CoreExpr]> {
+    fn all(&mut self, cs: &[CoreExpr], locals: &mut Scope<String>) -> Rc<[CoreExpr]> {
         cs.iter().map(|c| self.expr(c, locals)).collect()
     }
 }
@@ -810,7 +811,7 @@ pub(crate) fn run(core: &CoreModule) -> CoreModule {
         .fns
         .iter()
         .map(|f| {
-            let mut locals: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+            let mut locals: Scope<String> = f.params.iter().map(|p| p.name.clone()).collect();
             CoreFn {
                 name: f.name.clone(),
                 params: f.params.clone(),

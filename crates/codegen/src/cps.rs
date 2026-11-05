@@ -9,6 +9,7 @@ use elya::core::{let_spine, push_children, CoreExpr, CoreKind, CoreModule};
 use elya::types::{EffectRow, RowTail, Ty};
 
 use crate::closure::{cont_ty, free_vars_under, pat_binders, CONT};
+use crate::scope::Scope;
 
 /// The one effect label the back end treats as builtin. Sound as a *name* test
 /// only because a user-declared `effect IO` is refused (E0209 at resolve since
@@ -129,19 +130,24 @@ pub fn collect_handlers(core: &CoreModule) -> Vec<HandlerSite> {
 /// parameters. A lambda body continues its enclosing scope's binding indices,
 /// so an effectful lifted body must place each capture at the index of the
 /// innermost binding of that name here -- the index every site inside the
-/// body saved it under -- and bind its parameters from `scope.len()` on.
+/// body saved it under -- and bind its parameters from `depth` on. Only the
+/// names free in the lambda are kept: a copy of the whole scope per lambda
+/// was lambdas times scope (spec 2026-10-31-elya-scalability D12).
 pub struct LambdaRegion {
-    pub scope: Vec<String>,
+    pub depth: usize,
+    bindings: HashMap<String, usize>,
 }
 
 impl LambdaRegion {
-    /// The binding index of `name` as seen from inside the lambda.
+    /// The binding index of `name` as seen from inside the lambda: `None` for
+    /// a name not free in it (or bound nowhere in its scope).
     pub fn binding_of(&self, name: &str) -> Option<usize> {
-        self.scope.iter().rposition(|n| n == name)
+        self.bindings.get(name).copied()
     }
 }
 
-/// Every lambda's region, by the lambda node's address (`LambdaSite::key`).
+/// Every effectful lambda's region, by the lambda node's address
+/// (`LambdaSite::key`); only an effectful lambda's lifted body reads one.
 pub fn collect_lambda_regions(core: &CoreModule) -> HashMap<usize, LambdaRegion> {
     collect(core).lambdas
 }
@@ -161,7 +167,7 @@ fn collect(core: &CoreModule) -> Out {
         lambdas: HashMap::new(),
     };
     for f in &core.fns {
-        let mut scope: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+        let mut scope: Scope<String> = f.params.iter().map(|p| p.name.clone()).collect();
         let mut path = Vec::new();
         walk(&f.body, &f.name, &mut scope, &mut path, &mut out);
     }
@@ -171,12 +177,12 @@ fn collect(core: &CoreModule) -> Out {
 /// The locals a handler frame carries: free in the body, the clause bodies
 /// (params and `$cont` bound) or the return body (binder bound), and bound in
 /// `scope` -- keyed by binding, outermost first.
-fn handler_saved(h: &elya::core::CoreHandle, scope: &[String]) -> Vec<(Saved, Ty)> {
+fn handler_saved(h: &elya::core::CoreHandle, scope: &Scope<String>) -> Vec<(Saved, Ty)> {
     let mut vars: std::collections::BTreeMap<usize, (String, Ty)> =
         std::collections::BTreeMap::new();
     let mut need = |fv: std::collections::BTreeMap<String, Ty>| {
         for (n, t) in fv {
-            if let Some(b) = scope.iter().rposition(|x| *x == n) {
+            if let Some(b) = scope.rposition(&n) {
                 vars.entry(b).or_insert((n, t));
             }
         }
@@ -493,7 +499,7 @@ fn in_tail(path: &[Step]) -> bool {
 fn walk<'a>(
     e: &'a CoreExpr,
     owner: &str,
-    scope: &mut Vec<String>,
+    scope: &mut Scope<String>,
     path: &mut Vec<Step<'a>>,
     out: &mut Out,
 ) {
@@ -514,7 +520,7 @@ fn walk<'a>(
     }
     let visit = |child: &'a CoreExpr,
                  slot: usize,
-                 scope: &mut Vec<String>,
+                 scope: &mut Scope<String>,
                  path: &mut Vec<Step<'a>>,
                  out: &mut Out| {
         path.push(Step {
@@ -587,12 +593,21 @@ fn walk<'a>(
         CoreKind::Resume(v) => visit(v, 0, scope, path, out),
         // New regions: each starts with an empty path and the scope it sees.
         CoreKind::Lambda(params, body) => {
-            out.lambdas.insert(
-                e as *const CoreExpr as usize,
-                LambdaRegion {
-                    scope: scope.clone(),
-                },
-            );
+            // A pure lambda's body is direct code: no region reads its scope
+            // (the review of part 3a: its free variables cost a walk of the
+            // body at every level of a nest of lambdas).
+            if needs_cps(&e.ty) {
+                out.lambdas.insert(
+                    e as *const CoreExpr as usize,
+                    LambdaRegion {
+                        depth: scope.len(),
+                        bindings: crate::closure::free_vars(e)
+                            .into_keys()
+                            .filter_map(|n| scope.rposition(&n).map(|b| (n, b)))
+                            .collect(),
+                    },
+                );
+            }
             let depth = scope.len();
             for p in params.iter() {
                 scope.push(p.name.clone());
@@ -628,14 +643,14 @@ fn walk<'a>(
 }
 
 /// What the rest of the region needs once the site's call returns.
-fn saved_at(path: &[Step], scope: &[String]) -> Vec<(Saved, Ty)> {
+fn saved_at(path: &[Step], scope: &Scope<String>) -> Vec<(Saved, Ty)> {
     let mut temps: Vec<(Saved, Ty)> = Vec::new();
     let mut vars: std::collections::BTreeMap<usize, (String, Ty)> =
         std::collections::BTreeMap::new();
     // A name free in something an ancestor still has to run refers to the
     // binding visible AT that ancestor -- the innermost one below its depth.
     let mut need = |name: &str, ty: &Ty, depth: usize| {
-        if let Some(b) = scope[..depth].iter().rposition(|n| n == name) {
+        if let Some(b) = scope.rposition_below(name, depth) {
             vars.entry(b)
                 .or_insert_with(|| (name.to_string(), ty.clone()));
         }

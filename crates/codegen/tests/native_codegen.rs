@@ -1893,6 +1893,18 @@ const SHADOWING: &[(&str, &str)] = &[
          \x20 r + head(s)\n\
          }\n",
     ),
+    (
+        // From the review of scalability part 3a (D12): an `Int` shadowed by
+        // a heap value in an inner block; the name is a root once it holds a
+        // pointer (rooted only when first bound, it was freed under `churn`).
+        "an-int-shadowed-by-a-heap-value",
+        "fn f(x: Int) -> Int {\n\
+         \x20 let s = x\n\
+         \x20 let r = { let s = Cons(42, Nil)  let z = churn(30000, 0)  head(s) + z }\n\
+         \x20 r + s\n\
+         }\n\
+         pub fn main() -> Int { f(1) }\n",
+    ),
 ];
 
 #[test]

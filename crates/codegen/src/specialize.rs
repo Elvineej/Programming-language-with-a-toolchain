@@ -32,6 +32,7 @@ use elya::core::{
 use elya::types::{EffectLabel, EffectRow, RowTail, RowVar, Ty};
 
 use crate::cps::needs_cps;
+use crate::scope::{Named, Scope};
 use crate::CodegenError;
 
 type R<T> = Result<T, CodegenError>;
@@ -308,6 +309,12 @@ struct Local {
     generic: Option<LocalGeneric>,
 }
 
+impl Named for Local {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 struct LocalGeneric {
     ty: Ty,
     /// key -> (clone binder name, substitution), in creation order.
@@ -337,7 +344,7 @@ impl<'a> Specializer<'a> {
         Ok(name)
     }
 
-    fn rewrite(&mut self, e: &CoreExpr, locals: &mut Vec<Local>) -> R<CoreExpr> {
+    fn rewrite(&mut self, e: &CoreExpr, locals: &mut Scope<Local>) -> R<CoreExpr> {
         let kind = match &e.kind {
             CoreKind::Lit(_) => return Ok(e.clone()),
             CoreKind::Var(x) => CoreKind::Var(self.resolve(x, &e.ty, locals)?),
@@ -445,7 +452,7 @@ impl<'a> Specializer<'a> {
         })
     }
 
-    fn rewrite_all(&mut self, cs: &[CoreExpr], locals: &mut Vec<Local>) -> R<Rc<[CoreExpr]>> {
+    fn rewrite_all(&mut self, cs: &[CoreExpr], locals: &mut Scope<Local>) -> R<Rc<[CoreExpr]>> {
         let mut out = Vec::with_capacity(cs.len());
         for c in cs {
             out.push(self.rewrite(c, locals)?);
@@ -455,9 +462,9 @@ impl<'a> Specializer<'a> {
 
     /// The name a reference should use: a clone's when the reference
     /// instantiates a row variable at a user effect, else its own.
-    fn resolve(&mut self, x: &str, at: &Ty, locals: &mut [Local]) -> R<String> {
-        if let Some(i) = locals.iter().rposition(|l| l.name == x) {
-            let Some(g) = locals[i].generic.as_ref() else {
+    fn resolve(&mut self, x: &str, at: &Ty, locals: &mut Scope<Local>) -> R<String> {
+        if let Some(i) = locals.rposition(x) {
+            let Some(g) = locals.get(i).generic.as_ref() else {
                 return Ok(x.to_string());
             };
             let s = user_subst(&g.ty, at);
@@ -469,7 +476,8 @@ impl<'a> Specializer<'a> {
                 return Ok(n.clone());
             }
             let name = self.fresh(x)?;
-            locals[i]
+            locals
+                .get_mut(i)
                 .generic
                 .as_mut()
                 .expect("checked above")
@@ -494,7 +502,7 @@ impl<'a> Specializer<'a> {
     /// A `let` of a row-polymorphic lambda: rewrite the rest of the block first
     /// (which records the instantiations its uses need), then bind one clone per
     /// instantiation right after the original, in the same scope.
-    fn rewrite_block(&mut self, e: &CoreExpr, locals: &mut Vec<Local>) -> R<CoreExpr> {
+    fn rewrite_block(&mut self, e: &CoreExpr, locals: &mut Scope<Local>) -> R<CoreExpr> {
         // The scope is restored on every path, an error's too, as the
         // recursion restored it (the review's F6).
         let depth = locals.len();
@@ -503,7 +511,7 @@ impl<'a> Specializer<'a> {
         out
     }
 
-    fn rewrite_spine(&mut self, e: &CoreExpr, locals: &mut Vec<Local>) -> R<CoreExpr> {
+    fn rewrite_spine(&mut self, e: &CoreExpr, locals: &mut Scope<Local>) -> R<CoreExpr> {
         let (spine, body) = let_spine(e);
         let mut bound = Vec::with_capacity(spine.len());
         for l in &spine {
@@ -582,7 +590,7 @@ pub(crate) fn specialize_rows(core: &CoreModule) -> R<CoreModule> {
 fn rewrite_fn(sp: &mut Specializer<'_>, name: String, f: &CoreFn, s: &RowSubst) -> R<CoreFn> {
     let params = subst_params(&f.params, s);
     let body = subst_expr(&f.body, s);
-    let mut locals: Vec<Local> = params
+    let mut locals: Scope<Local> = params
         .iter()
         .map(|p| Local {
             name: p.name.clone(),
@@ -949,11 +957,11 @@ impl Adapter<'_> {
     /// Walks with every tracked binder's type (the binders
     /// `check_local_conventions` tracks); a VALUE use whose type disagrees in
     /// convention with its binder's is coerced. A callee is not a value use.
-    fn walk(&mut self, e: &CoreExpr, locals: &mut Vec<(String, Option<Ty>)>) -> R<CoreExpr> {
+    fn walk(&mut self, e: &CoreExpr, locals: &mut Scope<(String, Option<Ty>)>) -> R<CoreExpr> {
         let kind = match &e.kind {
             CoreKind::Lit(_) => return Ok(e.clone()),
             CoreKind::Var(x) => {
-                if let Some((_, Some(bound))) = locals.iter().rev().find(|(n, _)| n == x) {
+                if let Some((_, Some(bound))) = locals.find(x) {
                     if !conv_eq(bound, &e.ty) {
                         let bound = bound.clone();
                         let var = CoreExpr {
@@ -973,7 +981,7 @@ impl Adapter<'_> {
                     // upcast of its RESULT on it (`if c { f() } else { .. }`;
                     // the review's finding 2: 11 for 1511). The call keeps the
                     // binder's own convention and its result is coerced.
-                    if let Some((_, Some(bound))) = locals.iter().rev().find(|(n, _)| n == x) {
+                    if let Some((_, Some(bound))) = locals.find(x) {
                         if let (Ty::Fn(bp, _, br), Ty::Fn(up, _, ur)) = (bound, &f.ty) {
                             if !conv_eq(bound, &f.ty)
                                 && coercible(bound, &f.ty)
@@ -1119,7 +1127,7 @@ impl Adapter<'_> {
     fn walk_all(
         &mut self,
         cs: &[CoreExpr],
-        locals: &mut Vec<(String, Option<Ty>)>,
+        locals: &mut Scope<(String, Option<Ty>)>,
     ) -> R<Rc<[CoreExpr]>> {
         let mut out = Vec::with_capacity(cs.len());
         for c in cs {
@@ -1141,7 +1149,7 @@ pub(crate) fn adapt_upcasts(core: &CoreModule) -> R<CoreModule> {
     };
     let mut fns = Vec::with_capacity(core.fns.len());
     for f in &core.fns {
-        let mut locals: Vec<(String, Option<Ty>)> = f
+        let mut locals: Scope<(String, Option<Ty>)> = f
             .params
             .iter()
             .map(|p| (p.name.clone(), Some(p.ty.clone())))

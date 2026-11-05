@@ -1,7 +1,9 @@
 # Compiler scalability: no step quadratic in a program's size
 
-**Status:** part 1 (inference) and part 2 (the evaluators) done; part 3 (the
-native passes) in progress (2026-10-31, on `main`, an interactive session). HANDOFF step 1, the maintainer's priority (2026-10-30: "compiler
+**Status:** part 1 (inference) and part 2 (the evaluators) done (033ee61);
+part 3a (the native passes find bindings without searching, D12) done; the
+rest of part 3 (rooting, CPS joins, site paths) measured, to be designed
+(2026-11-05, on `main`, an interactive session). HANDOFF step 1, the maintainer's priority (2026-10-30: "compiler
 scalability is still fragile"). The design choices are Claude's under the
 maintainer's delegation (rule 2).
 
@@ -181,7 +183,12 @@ shadowed value counted every key.
   - a site in an `if` arm copies the rest of its block twice over: a join (the
     conditional itself a site whose frame the arms continue to);
   - a site's path holds every `let` above it (its resumption reads that path
-    quadratically) and its saved set reads the whole rest of its block.
+    quadratically) and its saved set reads the whole rest of its block;
+  - anf's rule 4 renames the rest of a block at each alias of a
+    row-polymorphic local (`let k{i} = k{i-1}`): emit 0.16 / 0.61 / 2.38 s at
+    200 / 400 / 800, `anf::run` 82% of it (found by the review of part 3a;
+    older than it). Carry the renaming down the walk instead. The front end
+    on the same shape: 0.61 / 4.06 / 26.7 s, a part 1 matter.
 
 ## 4. Not in this step
 
@@ -229,3 +236,14 @@ Parts 1 and 2:
   After: ratios 1.95 to 2.00, and 0.96 to 1.00 per type node.
 - Probe for D2's invariant: no quantified type variable bound, a quantified row
   variable bound only to the closed empty row, over the whole suite.
+
+Part 3a (D12):
+- Emit times (debug, `emit_ir`) at 4000 / 8000 / 16000 statements: a parameter
+  down a block 0.36 / 0.69 / 1.48 s (0.83 / 2.63 / 9.23 before); closures calling
+  a value 0.91 / 1.94 / 3.96 s (14.2 s at 4000 before, 283 s at 16 000).
+- Nothing else changed: the IR of every module the codegen suite compiles,
+  dumped by content hash before and after, the same 583 modules.
+- Tests: `crates/codegen/tests/native_scalability.rs` (IR lines and the
+  bindings examined, `elya_codegen::scope::probes()`, at n and 2n). Controls:
+  K12, `Scope` searching from the innermost binding out, fails all three (ratio
+  4.00); K13, rooting reading every name in scope, fails the two with calls.
