@@ -17,12 +17,15 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 - **The maintainer's working copy is on their PC, `E:\Elya\Elya-project\Programming-language-with-a-toolchain`**
   (2026-11-05: "keep working on the project in E: from now on"; working notes
   beside it). A cloud session cannot open that drive in a shell, only write
-  files to it: it builds and gates in its own workspace and, at each
-  checkpoint, writes the changed files, a pack of the new commits, the moved
-  refs and the index into that clone, so it stays a complete repository.
+  files to it, and not into `.git`: it builds and gates in its own workspace,
+  pushes to GitHub, and at each checkpoint writes the changed files into that
+  clone's working tree. `E:\Elya\elya-sync.bat` (fetch, set back a file
+  that already holds what `origin/main` holds, fast-forward `main`; log
+  `E:\Elya\elya-sync.log`) brings its history up; `E:\Elya\elya-test.bat`
+  runs the gate there (log `E:\Elya\elya-test.log`). Neither has run yet.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1431 passed, 153 suites. Native programs run on
+- Linux gate at the tip of `main`: 1436 passed, 154 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). In October the runtime
   gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -682,26 +685,30 @@ fragile"). Spec `docs/superpowers/specs/2026-10-31-elya-scalability-design.md`.
   type, the members of a large recursive group with local `let`s), and
   generalization reads each; levels would remove it.
 - **Left, measured (part 3, natively):**
-  - the native passes searched their scope from the innermost binding out
-    (mono, specialize, the upcast adapter, the convention check, anf, the
-    closure and CPS analyses), and rooting sorted every name in scope at every
-    call: a parameter used down 16 000 statements took 9.2 s to emit (0.8 at
-    4000). Written and measured (part 3a, local branch
-    `wip/scalability-part-3a`, to rebase on 033ee61 and gate): a `Scope` that
-    finds a name without searching, an environment that keeps its pointers
-    apart; the IR of all 583 modules the codegen suite compiles byte for byte
-    the same; a parameter down 16 000 statements emits in 1.5 s, 16 000
-    closures in 4.0 s (283 s before);
+  - **Part 3a done** (dfe9c10, 2026-11-05): the native passes find a name
+    without searching (`crates/codegen/src/scope.rs`: `Scope`, and `Env`,
+    which keeps its pointers apart). A parameter down 16 000 statements emits
+    in 1.5 s (9.2 s before), 16 000 closures in 4.0 s (283 s). The IR of every
+    module the suite compiles is the same byte for byte (583 modules; the
+    review: 405 more and 3200 random programs).
+    `crates/codegen/tests/native_scalability.rs` pins it (probes and IR
+    lines, not timings: a pass that searches a list of its own is not seen).
   - **rooting at every allocation pushes every pointer in scope**: a block of
-    2000 string statements emits 8M IR lines (2M at 1000). Needs liveness (root
-    what is used later) or rooting once at the binding; a GC-discipline change
-    (the shadow stack's pushes and pops, CPS frames, `musttail`);
+    2000 string statements emits 8M IR lines (2M at 1000). Written and tested
+    (part 3b, `land/part-3b`, under review): a block's binding is a root until
+    its last reader (spec D13), and an `ELYA_GC_STRESS` mode that collects at
+    every allocation and catches a root naming a freed block; 2000 strings
+    emit 18K lines. What stays: values all live to a block's end are rooted
+    at every allocation (n^2);
   - a site in an `if` arm copies the rest of its block into its continuation
     as well as after the branch: sites times length (84K / 280K / 1009K IR
     lines at 2000 / 4000 / 8000 statements, one such site per 1000). A join
     (the conditional itself a site whose frame the arms continue to);
   - a site's path holds every `let` above it, its resumption reads that path
-    quadratically, and its saved set reads the whole rest of its block.
+    quadratically, and its saved set reads the whole rest of its block;
+  - anf's rule 4 renames the rest of a block at each alias of a
+    row-polymorphic local: 2.4 s to emit 800 aliases (found by part 3a's
+    review); the front end on the same shape 26.7 s.
 
 ### 2. The affine guarantee across functions
 
