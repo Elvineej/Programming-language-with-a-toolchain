@@ -1,9 +1,10 @@
 # Compiler scalability: no step quadratic in a program's size
 
 **Status:** part 1 (inference) and part 2 (the evaluators) done (033ee61);
-part 3a (the native passes find bindings without searching, D12) done; the
-rest of part 3 (rooting, CPS joins, site paths) measured, to be designed
-(2026-11-05, on `main`, an interactive session). HANDOFF step 1, the maintainer's priority (2026-10-30: "compiler
+part 3a (the native passes find bindings without searching, D12) and part 3b
+(a block's binding is a root until its last reader, D13) done; the rest of
+part 3 (CPS joins, site paths) measured, to be designed (2026-11-05, on
+`main`, an interactive session). HANDOFF step 1, the maintainer's priority (2026-10-30: "compiler
 scalability is still fragile"). The design choices are Claude's under the
 maintainer's delegation (rule 2).
 
@@ -176,10 +177,47 @@ shadowed value counted every key.
   order and counts its hidden keys: rooting pushes the pointers in name order,
   as it pushed them from the sorted names (`gc_root` pushes pointers only), so
   the IR is the same byte for byte.
+- **D13. A block's binding is a root until its last reader.** Rooting at an
+  allocation or a call pushed every pointer in scope, read again or not: a
+  block of strings, each made from the one before, was n^2 IR (table above).
+  `Deaths` reads off a block's syntax, for each of its bindings, the last
+  statement that reads it: a name free in the statement (`free_vars`, which
+  knows every binder and counts a lambda's captures) whose innermost binding
+  above it is that one. Once that statement is bound, the binding is retired:
+  out of `Env`'s pointers (`Env::retire`) and, in the CPS emitter, out of the
+  bindings `root_live` pushes. What the block's end reads, the block never
+  retires. A retired binding stays retired when a later binding of its name
+  parks it and when it is restored (`bind_local`, `unbind_local`): its value
+  may be freed already, and rooting it again would hand the collector a freed
+  block. A binding from outside the block, shadowed in it, stays as its own
+  block left it.
+  - Sound because the emitter reads a block's binding only through a `Var`
+    of it or a capture, both counted, and what a site saves (`saved_at`,
+    `handler_saved`) is what the rest reads, by the same syntax: no retired
+    binding is read, saved or rooted again. A stress mode checks it:
+    `ELYA_GC_STRESS=N` collects at every Nth allocation; what it frees it
+    poisons and keeps, never handed out again, so a value read after its
+    last root reads poison at once, not its old words; and a block it freed,
+    met while marking (a root, the current handler, a field), stops the
+    program (`gc_gray_push`; `gc_mark` unchanged).
+  - Cost: `free_vars` of each statement once per enclosing block, nesting
+    depth times size, as the closure pass's captures already are (the
+    review: 300 nested blocks over 4000 statements, 0.36 to 2.89 s; the
+    parser's 1024 levels bound it). A resumption lowers the rest of its
+    block again and reads its deaths again: a third more on a shape already
+    quadratic through its saved sets (a site every 10 statements, 5.56 to
+    7.49 s at 4000), which D11 is to take.
+  - Not taken: rooting once at the binding (pushed when bound, popped at its
+    scope's end, a site rooting its own operands alone). It would be linear
+    even where everything stays live (below), but every exit (`ret`,
+    `musttail`, the CPS jumps) would pop what its function holds: a
+    GC-discipline change across both emitters, and it keeps a dead binding
+    to its scope's end, which liveness frees.
+  - What stays: a block whose values all stay live to its end
+    (`let s{i} = "b" <> int.to_string(i)`, summed after) roots every one so
+    far at every allocation: IR in proportion to the live pointers at each
+    site, n^2 here.
 - **Next (measured, to be designed):**
-  - rooting at every allocation and call pushes every pointer in scope, live
-    or not: a block of strings is n^2 IR. Root what is used later (liveness),
-    or once at the binding: a GC-discipline change;
   - a site in an `if` arm copies the rest of its block twice over: a join (the
     conditional itself a site whose frame the arms continue to);
   - a site's path holds every `let` above it (its resumption reads that path
@@ -247,3 +285,20 @@ Part 3a (D12):
   bindings examined, `elya_codegen::scope::probes()`, at n and 2n). Controls:
   K12, `Scope` searching from the innermost binding out, fails all three (ratio
   4.00); K13, rooting reading every name in scope, fails the two with calls.
+
+Part 3b (D13):
+- IR lines (debug, `emit_ir`) at 250 / 500 / 1000 statements, before: a block
+  of strings 126K / 503K / 2.0M; under one name the same; in an effectful
+  function 128K / 506K / 2.0M; a site every 100 statements 49K / 108K / 216K;
+  every string live to the end 317K / 1.26M / 5.0M. After: 2.4K / 4.6K / 9.1K;
+  the same; 3.5K / 6.7K / 13.2K; 4.9K / 10.3K / 21.1K; and every string live
+  the same as before, 316,607 / 1,258,107 at 250 / 500 (what liveness
+  cannot shorten). At 2000 / 4000 / 8000: strings 18K / 36K /
+  72K lines, emit 0.28 / 0.41 / 0.95 s (8.0M lines and 17.6 s at 2000 before).
+- Tests: `crates/codegen/tests/native_scalability.rs` (+4, red first at 3.96 to
+  3.98), `crates/codegen/tests/native_gc_stress.rs` (programs under
+  `ELYA_GC_STRESS=1` answering as the evaluator does), two unit tests in
+  `lib.rs`. Controls K15 to K21, K28, K29 (the plan). The review: 1205
+  sweep programs, 1200 generated and 26 adversarial ones under stress,
+  base and change alike; of 600 modules' IR, 505 the same byte for byte and
+  95 differing only by `gc_push` / `gc_pop` calls removed.

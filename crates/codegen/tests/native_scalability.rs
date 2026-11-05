@@ -1,8 +1,8 @@
 //! The native passes scale with the program (2026-10-31, spec
-//! `docs/superpowers/specs/2026-10-31-elya-scalability-design.md` D12): a name
-//! bound above a long block is found without searching the block, a lambda
-//! keeps only the bindings it captures, and rooting reads the pointers in
-//! scope alone.
+//! `docs/superpowers/specs/2026-10-31-elya-scalability-design.md` D12, D13): a
+//! name bound above a long block is found without searching the block, a lambda
+//! keeps only the bindings it captures, rooting reads the pointers in scope
+//! alone, and of a block's own bindings only those still to be read.
 //!
 //! Timing-free: `elya_codegen::scope::probes()`, the bindings name lookups and
 //! rooting examine on this thread, measured around `emit_ir` at `n` and `2n`.
@@ -93,4 +93,80 @@ fn closures_down_a_block(n: usize) -> String {
 #[test]
 fn closures_down_a_long_block_compile_linearly() {
     assert_linear("closures down a block", closures_down_a_block, 300);
+}
+
+/// A block of strings, each made from the one before (D13): every `<>`
+/// allocates, and rooting pushed every string so far.
+fn strings_down_a_block(n: usize) -> String {
+    let mut src = String::from("pub fn main() -> Int {\n  let s0 = \"a\"\n");
+    for i in 1..n {
+        src.push_str(&format!("  let s{i} = s{} <> \"b\"\n", i - 1));
+    }
+    src.push_str(&format!("  string.length(s{})\n}}\n", n - 1));
+    src
+}
+
+#[test]
+fn a_block_of_strings_compiles_linearly() {
+    assert_linear("strings down a block", strings_down_a_block, 300);
+}
+
+/// The same under one name: each binding shadows, and parks, the one before.
+fn strings_under_one_name(n: usize) -> String {
+    let mut src = String::from("pub fn main() -> Int {\n  let s = \"a\"\n");
+    for _ in 1..n {
+        src.push_str("  let s = s <> \"b\"\n");
+    }
+    src.push_str("  string.length(s)\n}\n");
+    src
+}
+
+#[test]
+fn a_block_of_strings_under_one_name_compiles_linearly() {
+    assert_linear("strings under one name", strings_under_one_name, 300);
+}
+
+/// Strings no one reads, each shadowing the last: each binding is retired at
+/// its own statement and then parked, retired, by the next.
+fn unread_strings_under_one_name(n: usize) -> String {
+    let mut src = String::from("pub fn main() -> Int {\n");
+    for i in 0..n {
+        src.push_str(&format!("  let s = int.to_string({i})\n"));
+    }
+    src.push_str("  string.length(s)\n}\n");
+    src
+}
+
+#[test]
+fn unread_strings_under_one_name_compile_linearly() {
+    assert_linear(
+        "unread strings under one name",
+        unread_strings_under_one_name,
+        300,
+    );
+}
+
+/// The strings block in an effectful function, a site at its end: the CPS
+/// emitter lowers the block and roots what its bindings hold.
+fn strings_in_an_effectful_function(n: usize) -> String {
+    let mut src = String::from(
+        "effect E { fn op(x: Int) -> Int }\nfn f() / {E} -> Int {\n  let s0 = \"a\"\n",
+    );
+    for i in 1..n {
+        src.push_str(&format!("  let s{i} = s{} <> \"b\"\n", i - 1));
+    }
+    src.push_str(&format!(
+        "  op(string.length(s{}))\n}}\npub fn main() -> Int {{ handle {{ f() }} with {{ E.op(x) -> resume(x + 1) }} }}\n",
+        n - 1
+    ));
+    src
+}
+
+#[test]
+fn a_block_of_strings_in_an_effectful_function_compiles_linearly() {
+    assert_linear(
+        "strings in an effectful function",
+        strings_in_an_effectful_function,
+        300,
+    );
 }

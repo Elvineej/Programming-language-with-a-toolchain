@@ -1048,13 +1048,21 @@ struct Shadowed(Option<String>);
 /// `env` under a hidden key, so every allocation inside the inner scope roots
 /// it, and `unbind_local` restores it exactly. Bindings nest LIFO, so the
 /// count of hidden keys present is a unique, deterministic suffix.
+///
+/// A retired outer binding (`Deaths`) stays retired, parked and restored: its
+/// value may be freed already, and rooting it again would hand the collector
+/// a freed block.
 fn bind_local<'ctx>(env: &mut Env<'ctx>, x: &str, v: BasicValueEnum<'ctx>) -> Shadowed {
+    let rooted = env.rooted(x);
     match env.insert(x.to_string(), v) {
         None => Shadowed(None),
         Some(prev) => {
             let n = env.hidden();
             let key = format!("{SHADOW}{n:06}:{x}");
             env.insert(key.clone(), prev);
+            if !rooted {
+                env.retire(&key);
+            }
             Shadowed(Some(key))
         }
     }
@@ -1066,8 +1074,12 @@ fn unbind_local<'ctx>(env: &mut Env<'ctx>, x: &str, s: Shadowed) {
             env.remove(x);
         }
         Some(key) => {
+            let rooted = env.rooted(&key);
             if let Some(prev) = env.remove(&key) {
                 env.insert(x.to_string(), prev);
+                if !rooted {
+                    env.retire(x);
+                }
             }
         }
     }
@@ -1278,8 +1290,9 @@ fn build_closure_call<'ctx>(
 /// A block's `let`s lowered in a loop, each bound as it is lowered, then `rest`
 /// on the expression that ends the block; the bindings are undone after, in
 /// reverse, on every path (spec 2026-10-30-elya-long-blocks D1: a block's
-/// length is not a recursion depth). A shadowed outer binding stays rooted
-/// meanwhile (`bind_local`).
+/// length is not a recursion depth). A shadowed outer binding stays as its own
+/// block left it meanwhile, rooted or retired (`bind_local`); a binding of the
+/// block itself is rooted until the statement that reads it last (`Deaths`).
 pub(crate) fn lower_block<'ctx, T>(
     ctx: &'ctx Context,
     func: FunctionValue<'ctx>,
@@ -1290,12 +1303,17 @@ pub(crate) fn lower_block<'ctx, T>(
     rest: impl FnOnce(&CoreExpr, &mut Env<'ctx>) -> Result<T, CodegenError>,
 ) -> Result<T, CodegenError> {
     let (spine, body) = let_spine(e);
+    let mut dies = Deaths::of(&spine, body);
     let mut bound = Vec::with_capacity(spine.len());
     let mut failed = None;
-    for l in &spine {
+    for (k, l) in spine.iter().enumerate() {
         // A bound value is NOT in tail position; only the block's end can be.
         match lower_expr(ctx, func, b, lc, l.value, env) {
-            Ok(v) => bound.push((l.name, bind_local(env, l.name, v))),
+            Ok(v) => {
+                let shadowed = bind_local(env, l.name, v);
+                dies.after(k, l.name, &shadowed, |key, _| env.retire(key));
+                bound.push((l.name, shadowed));
+            }
             Err(err) => {
                 failed = Some(err);
                 break;
@@ -1310,6 +1328,89 @@ pub(crate) fn lower_block<'ctx, T>(
         unbind_local(env, x, shadowed);
     }
     out
+}
+
+/// When each binding of a block is read for the last time (spec
+/// 2026-10-31-elya-scalability D13). Rooting at an allocation or a call pushed
+/// every pointer in scope, read again or not: a block of strings, each made
+/// from the one before, was n^2 IR. A binding that no later statement and not
+/// the block's end reads is retired (`Env::retire`) once the statement that
+/// reads it last is bound: rooted until then, not after.
+///
+/// Read off the syntax: statement `k` reads binding `i` when a name free in it
+/// (`free_vars`, which knows every binder, a lambda's captures included) is
+/// bound by `i`, the innermost binding of that name above `k`. The emitter
+/// reads a block's binding only through a `Var` of it, so nothing reads a
+/// retired one. A binding from outside the block, shadowed in it, stays as its
+/// own block left it, rooted or retired, under its hidden key.
+pub(crate) struct Deaths<'s> {
+    /// The block's names, by binding.
+    names: Vec<&'s str>,
+    /// `at[k]`: the bindings statement `k` reads last.
+    at: Vec<Vec<usize>>,
+    /// The hidden key a binding's value was parked under when a later one
+    /// shadowed it.
+    parked: Vec<Option<String>>,
+    /// Each name's innermost binding so far.
+    latest: HashMap<&'s str, usize>,
+}
+
+impl<'s> Deaths<'s> {
+    pub(crate) fn of(spine: &[elya::core::SpineLet<'s>], body: &CoreExpr) -> Self {
+        let n = spine.len();
+        let mut last: Vec<usize> = (0..n).collect();
+        let mut latest: HashMap<&'s str, usize> = HashMap::new();
+        let read =
+            |e: &CoreExpr, k: usize, latest: &HashMap<&'s str, usize>, last: &mut [usize]| {
+                for x in closure::free_vars(e).keys() {
+                    if let Some(&i) = latest.get(x.as_str()) {
+                        last[i] = k;
+                    }
+                }
+            };
+        for (k, l) in spine.iter().enumerate() {
+            read(l.value, k, &latest, &mut last);
+            latest.insert(l.name, k);
+        }
+        // The block's end reads `n`: what it reads is never retired here.
+        read(body, n, &latest, &mut last);
+        let mut at = vec![Vec::new(); n];
+        for (i, &k) in last.iter().enumerate() {
+            if k < n {
+                at[k].push(i);
+            }
+        }
+        Deaths {
+            names: spine.iter().map(|l| l.name).collect(),
+            at,
+            parked: vec![None; n],
+            latest: HashMap::new(),
+        }
+    }
+
+    /// Statement `k`, which binds `name`, is bound (`shadowed` is what its
+    /// `bind_local` parked): `retire(key, i)` for each binding `i` it read
+    /// last, `key` where the name environment holds it now.
+    pub(crate) fn after(
+        &mut self,
+        k: usize,
+        name: &'s str,
+        shadowed: &Shadowed,
+        mut retire: impl FnMut(&str, usize),
+    ) {
+        if let (Some(key), Some(&j)) = (&shadowed.0, self.latest.get(name)) {
+            // Binding `j` of this block is parked under `key` now (retired
+            // already, it stays so: `bind_local`).
+            self.parked[j] = Some(key.clone());
+        }
+        self.latest.insert(name, k);
+        for i in std::mem::take(&mut self.at[k]) {
+            match &self.parked[i] {
+                Some(key) => retire(key, i),
+                None => retire(self.names[i], i),
+            }
+        }
+    }
 }
 
 /// §4.3: the tail half of the emission split. `lower_expr` produces a VALUE;
@@ -1864,7 +1965,8 @@ fn lower_expr<'ctx>(
             None => Err(CodegenError::Unsupported("unbound var")),
         },
         // Any shadowed binding is restored -- `let x = 1; let x = x + 1` stays
-        // correct -- and kept ROOTED meanwhile (`bind_local`).
+        // correct -- and kept as it was meanwhile, rooted, or retired once
+        // nothing reads it (`bind_local`, `Deaths`).
         CoreKind::Let(..) => lower_block(ctx, func, b, lc, e, env, |body, env| {
             lower_expr(ctx, func, b, lc, body, env)
         }),
@@ -3926,5 +4028,64 @@ mod tests {
         tags.sort_unstable();
         assert_eq!(tags, (d.handler_lo..d.cont_tag).collect::<Vec<_>>());
         assert!(d.site_tags.values().all(|t| *t < d.handler_lo));
+    }
+
+    fn var(x: &str) -> CoreExpr {
+        CoreExpr {
+            span: Span::EMPTY,
+            ty: Ty::Base(TyCon::Int),
+            kind: CoreKind::Var(x.to_string()),
+        }
+    }
+
+    fn let_(x: &str, v: CoreExpr, body: CoreExpr) -> CoreExpr {
+        CoreExpr {
+            span: Span::EMPTY,
+            ty: body.ty.clone(),
+            kind: CoreKind::Let(x.to_string(), Rc::new(v), Rc::new(body)),
+        }
+    }
+
+    /// D13: each binding of a block dies after the statement that reads it
+    /// last; one the block's end reads, never; one nothing reads, after its
+    /// own statement. A read finds the innermost binding of its name above it.
+    #[test]
+    fn a_block_binding_dies_after_its_last_reader() {
+        // let x = 1; let y = x; let x = x; let z = x; y
+        let e = let_(
+            "x",
+            int_lit(1),
+            let_(
+                "y",
+                var("x"),
+                let_("x", var("x"), let_("z", var("x"), var("y"))),
+            ),
+        );
+        let (spine, body) = let_spine(&e);
+        let d = Deaths::of(&spine, body);
+        // The first `x` is read last by statement 2 (`let x = x`), the second
+        // by statement 3; `y` by the end; `z` by nothing.
+        assert_eq!(d.at, vec![vec![], vec![], vec![0], vec![2, 3]]);
+    }
+
+    /// D13: a retired binding stays retired while a later binding of its name
+    /// parks it and after the restore; a rooted one stays rooted.
+    #[test]
+    fn parking_keeps_a_binding_retired_or_rooted() {
+        let ctx = Context::create();
+        let p: BasicValueEnum = ctx.ptr_type(AddressSpace::default()).const_null().into();
+        for retired in [true, false] {
+            let mut env = Env::new();
+            env.insert("s".to_string(), p);
+            if retired {
+                env.retire("s");
+            }
+            let shadowed = bind_local(&mut env, "s", p);
+            assert!(env.rooted("s"), "the new binding is a root");
+            assert_eq!(env.pointers().count(), if retired { 1 } else { 2 });
+            unbind_local(&mut env, "s", shadowed);
+            assert_eq!(env.rooted("s"), !retired);
+            assert_eq!(env.pointers().count(), usize::from(!retired));
+        }
     }
 }

@@ -50,7 +50,7 @@ use crate::{
     bind_local, eq_operand_label, fn_type_of, gc_root_env, gc_unroot, internal, lower_expr, mangle,
     prim_values, repr_ty, value_to_word, word_to_value, CodegenError, LowerCtx, MAX_PARAMS, TAILCC,
 };
-use crate::{unbind_local, Shadowed};
+use crate::{unbind_local, Deaths, Shadowed};
 
 fn key_of(e: &CoreExpr) -> usize {
     e as *const CoreExpr as usize
@@ -632,6 +632,15 @@ impl<'ctx> St<'ctx> {
         self.binds.remove(&at);
         self.depth = at;
         unbind_local(&mut self.env, x, shadowed);
+    }
+
+    /// A binding no code still to come reads (`Deaths`, spec
+    /// 2026-10-31-elya-scalability D13): `key` is no root of the name view,
+    /// and binding `at` is out of the bindings `root_live` pushes (no saved
+    /// set names it: what a site saves is read after it).
+    fn retire(&mut self, key: &str, at: usize) {
+        self.env.retire(key);
+        self.binds.remove(&at);
     }
 }
 
@@ -1550,11 +1559,19 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             // that suspends (`None`: the rest is a continuation's) ends it.
             CoreKind::Let(..) => {
                 let (spine, body) = let_spine(e);
-                let mut bound = Vec::with_capacity(spine.len());
+                let mut dies = Deaths::of(&spine, body);
+                let mut bound: Vec<(&str, (usize, Shadowed))> = Vec::with_capacity(spine.len());
                 let mut ended = None;
-                for l in &spine {
+                for (k, l) in spine.iter().enumerate() {
                     match self.expr(st, l.value) {
-                        Ok(Some(val)) => bound.push((l.name, st.bind(l.name, val))),
+                        Ok(Some(val)) => {
+                            let saved = st.bind(l.name, val);
+                            // D13: what this statement read last is no root now.
+                            dies.after(k, l.name, &saved.1, |key, i| {
+                                st.retire(key, if i == k { saved.0 } else { bound[i].1 .0 })
+                            });
+                            bound.push((l.name, saved));
+                        }
                         other => {
                             ended = Some(other);
                             break;
@@ -1893,11 +1910,19 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             // that suspends (`None`: the rest is a continuation's) ends it.
             CoreKind::Let(..) => {
                 let (spine, body) = let_spine(e);
-                let mut bound = Vec::with_capacity(spine.len());
+                let mut dies = Deaths::of(&spine, body);
+                let mut bound: Vec<(&str, (usize, Shadowed))> = Vec::with_capacity(spine.len());
                 let mut ended = None;
-                for l in &spine {
+                for (k, l) in spine.iter().enumerate() {
                     match self.expr(st, l.value) {
-                        Ok(Some(val)) => bound.push((l.name, st.bind(l.name, val))),
+                        Ok(Some(val)) => {
+                            let saved = st.bind(l.name, val);
+                            // D13: what this statement read last is no root now.
+                            dies.after(k, l.name, &saved.1, |key, i| {
+                                st.retire(key, if i == k { saved.0 } else { bound[i].1 .0 })
+                            });
+                            bound.push((l.name, saved));
+                        }
                         Ok(None) => {
                             ended = Some(Ok(()));
                             break;

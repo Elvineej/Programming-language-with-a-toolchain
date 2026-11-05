@@ -219,6 +219,20 @@ impl<'ctx> Env<'ctx> {
     pub(crate) fn hidden(&self) -> usize {
         self.hidden
     }
+
+    /// Stop rooting `k`'s value (spec 2026-10-31-elya-scalability D13): the
+    /// code still to come never reads that binding, so a collection may free
+    /// what it holds. The name still finds it; a later `insert` of the key
+    /// roots it again.
+    pub(crate) fn retire(&mut self, k: &str) {
+        self.ptrs.remove(k);
+    }
+
+    /// Whether `k` holds a pointer that rooting pushes: bound, a pointer,
+    /// not retired.
+    pub(crate) fn rooted(&self, k: &str) -> bool {
+        self.ptrs.contains(k)
+    }
 }
 
 impl<'ctx> std::ops::Index<&str> for Env<'ctx> {

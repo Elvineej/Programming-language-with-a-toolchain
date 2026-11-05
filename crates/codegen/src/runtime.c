@@ -71,6 +71,12 @@ static int64_t gc_allocated = 0, gc_collections = 0, gc_freed = 0, gc_live = 0;
  * interrupted (spec 2026-10-22-elya-multi-shot-sharing, the review's note 1). */
 static int64_t gc_copy_collections = 0;
 static int gc_in_cont_copy = 0;
+/* ELYA_GC_STRESS=N collects at every Nth allocation, whatever the heap holds
+ * (spec 2026-10-31-elya-scalability D13): a value the codegen failed to root
+ * is then freed while still in use, at once, so a missed root shows as a wrong
+ * answer or a crash in the corpus instead of hiding until a heap grows. Off
+ * unless set; read once, at `elya_gc_init`. */
+static int64_t gc_stress = 0, gc_stress_count = 0;
 
 typedef struct Block {
     intptr_t meta; /* (size << 1) | mark, where size counts VISIBLE words */
@@ -88,6 +94,8 @@ enum { GC_MAX_WORDS = 16 };
 static Block *gc_free_lists[GC_MAX_WORDS] = {0};
 
 #define GC_MARK_BIT 1
+/* A block stress mode freed: no live block's meta is negative. */
+#define GC_FREED ((intptr_t)-2)
 
 /* Pinned by measurement, not by taste. Built with collection disabled, the ADT
  * corpus reports its whole lifetime allocation at exit: option_extract 2 words,
@@ -121,6 +129,10 @@ void elya_eq_init(const int64_t *masks, int64_t n) {
 void elya_gc_init(const int64_t *descriptors, int64_t n_ctors) {
     gc_descriptors = (int64_t *)descriptors;
     gc_n_ctors = n_ctors;
+    {
+        const char *stress = getenv("ELYA_GC_STRESS");
+        gc_stress = stress ? atoll(stress) : 0;
+    }
 #ifdef _WIN32
     /* The shim calls this first, so stdout is byte-exact for the WHOLE run --
      * including main's value line, which a program that never prints would
@@ -171,6 +183,14 @@ static void gc_gray_push(void *p) {
         return;
     }
     Block *b = gc_block_of(p);
+    if (gc_stress > 0 && b->meta < 0) {
+        /* Stress mode: nothing reachable is a block a collection freed
+         * (spec 2026-10-31-elya-scalability D13): a root, the current
+         * handler or a field that names one holds a value read after its
+         * last root. Checked as it is grayed, so gc_mark is unchanged. */
+        fputs("elya: gc stress: a reachable value names a freed block\n", stderr);
+        exit(1);
+    }
     if (b->meta & GC_MARK_BIT) {
         return; /* already marked: shared structure and cycles both terminate */
     }
@@ -225,7 +245,19 @@ static void gc_sweep(void) {
         } else {
             *prev = next; /* move it off the in-use list */
             intptr_t size = b->meta >> 1;
-            if (size > 0 && size < GC_MAX_WORDS) {
+            if (gc_stress > 0) {
+                /* Stress mode keeps what it frees, poisoned and never handed
+                 * out again (D13): a value read after it was freed reads an
+                 * address no machine maps, not its old words or another
+                 * object's, and anything that still reaches it is caught as
+                 * it is grayed (gc_gray_push). */
+                int64_t *payload = gc_payload(b);
+                for (intptr_t i = 0; i < size; i++) {
+                    payload[i] = (int64_t)0xDEADBEEFDEADBEEFULL;
+                }
+                b->meta = GC_FREED;
+                b->next = NULL;
+            } else if (size > 0 && size < GC_MAX_WORDS) {
                 /* Thread the free link through the dead tag slot. Safe
                  * precisely because the object is dead: nothing reads that
                  * word again until elya_alloc re-zeroes it. */
@@ -273,6 +305,9 @@ void *elya_alloc(int64_t words) {
      * 45 collections to build a 1M list, 183 for a 1M-deep effectful loop).
      * Small programs see the old 64K floor unchanged. */
     if (gc_allocated >= (gc_live > GC_THRESHOLD_WORDS ? gc_live : GC_THRESHOLD_WORDS)) {
+        gc_collect();
+    } else if (gc_stress > 0 && ++gc_stress_count >= gc_stress) {
+        gc_stress_count = 0;
         gc_collect();
     }
     gc_allocated += words;
