@@ -406,6 +406,20 @@ pub struct Infer {
     /// callee's row equal to the caller's), and flushed -- labels only -- before
     /// a lambda's ambient closes and when the group is done.
     pending_incl: Vec<(RowVar, RowVar, Span)>,
+    /// The inclusions (indices into `pending_incl`) that may add something
+    /// now: new ones, and those whose callee tail has been bound or has
+    /// stopped being phantom since they were last flushed. Every other one
+    /// would find nothing new, so a flush visits these alone (spec
+    /// 2026-10-31-elya-scalability D4: each lambda's end re-read every
+    /// inclusion of its group).
+    incl_dirty: BTreeSet<usize>,
+    /// The residual tail each flushed inclusion's callee row ended in, to the
+    /// inclusions waiting on it: binding it, or its phantom mark going, makes
+    /// them dirty.
+    incl_watch: HashMap<RowVar, Vec<usize>>,
+    /// Inclusions settled for good: a conflict reported, or an ambient
+    /// poisoned.
+    incl_dead: HashSet<usize>,
     /// Recursion through a handle body (2026-10-15): `(member ambient, handle
     /// body ambient)` -- a call of a function of the SCC group being inferred,
     /// made directly in a handle's body, performs the member's row, so the body
@@ -502,6 +516,20 @@ pub struct Infer {
     /// 2026-10-30-elya-row-variables D3).
     kinds: Kinds,
     pub diags: Vec<Diagnostic>,
+    /// The work inference has done, timing-free (spec
+    /// 2026-10-31-elya-scalability D6): every node `resolve` builds, every row
+    /// it reads and link it follows, every node a free-variable, occurs or
+    /// substitution walk visits, every level of `unify` and every row
+    /// unification, every link `settle_duplicates` walks, every inclusion a
+    /// flush takes and every environment entry generalization reads.
+    /// `tests/infer_complexity.rs` pins its growth.
+    steps: std::cell::Cell<u64>,
+    /// Every variable a scheme has quantified: D2 rests on none of them ever
+    /// coming to hold a variable, which `bind` and `bind_row` assert in a
+    /// debug build (the review's finding 1: an enclosing clause's `resume`
+    /// types were quantified, and bound later).
+    quantified: HashSet<u32>,
+    quantified_rows: HashSet<RowVar>,
 }
 
 impl Infer {
@@ -515,6 +543,9 @@ impl Infer {
             lambda_depth: 0,
             phantom: HashSet::new(),
             pending_incl: Vec::new(),
+            incl_dirty: BTreeSet::new(),
+            incl_watch: HashMap::new(),
+            incl_dead: HashSet::new(),
             pending_member_incl: Vec::new(),
             group_ambs: Vec::new(),
             group_params: Vec::new(),
@@ -539,7 +570,15 @@ impl Infer {
             eq_reported: HashSet::new(),
             kinds: Kinds::default(),
             diags: Vec::new(),
+            steps: std::cell::Cell::new(0),
+            quantified: HashSet::new(),
+            quantified_rows: HashSet::new(),
         }
+    }
+
+    /// One step of work (`steps`).
+    fn step(&self) {
+        self.steps.set(self.steps.get() + 1);
     }
 
     /// The function's row variable named `name` (D2): the same one at every
@@ -843,34 +882,35 @@ impl Infer {
     /// labels found along the chain (union; earliest provenance span wins). The
     /// result's tail is the first `Closed`/`ErrorRow`/unbound-`Open` reached.
     pub fn resolve_row(&self, r: &EffectRow) -> EffectRow {
-        let mut labels = r.labels.clone();
-        let mut tail = r.tail.clone();
-        loop {
-            // Borrow `tail` (don't move it) to find the next link, if any.
-            let next = match &tail {
-                RowTail::Open(v) => match &self.row_subst[*v as usize] {
-                    Some(bound) => {
-                        for (k, l) in &bound.labels {
-                            labels.entry(k.clone()).or_insert_with(|| l.clone());
-                        }
-                        Some(bound.tail.clone())
-                    }
-                    None => None, // unbound: this open tail is the residual
-                },
-                RowTail::Closed | RowTail::ErrorRow => None,
-            };
-            match next {
-                Some(t) => tail = t,
-                None => break,
-            }
-        }
-        // Resolve each label's type arguments (Slice 4c-2), so downstream
+        self.step();
+        // Each label's type arguments are resolved (Slice 4c-2), so downstream
         // consumers (printing, arg reconciliation, generalization) see the
-        // substituted types rather than raw variables.
-        for l in labels.values_mut() {
-            for a in l.args.iter_mut() {
-                *a = self.resolve(a);
+        // substituted types rather than raw variables. Resolved where they
+        // are read, never copied first: copying a label and then resolving
+        // the copy copied everything under it twice at every level, size
+        // times depth (spec 2026-10-31-elya-scalability D1).
+        let resolved = |l: &EffectLabel| EffectLabel {
+            args: l.args.iter().map(|a| self.resolve(a)).collect(),
+            span: l.span,
+        };
+        let mut labels: BTreeMap<String, EffectLabel> = r
+            .labels
+            .iter()
+            .map(|(k, l)| (k.clone(), resolved(l)))
+            .collect();
+        let mut tail = r.tail.clone();
+        // The first label of each effect along the chain is kept.
+        while let RowTail::Open(v) = tail {
+            self.step();
+            let Some(bound) = &self.row_subst[v as usize] else {
+                break; // unbound: this open tail is the residual
+            };
+            for (k, l) in &bound.labels {
+                if !labels.contains_key(k) {
+                    labels.insert(k.clone(), resolved(l));
+                }
             }
+            tail = bound.tail.clone();
         }
         EffectRow { labels, tail }
     }
@@ -890,10 +930,13 @@ impl Infer {
             .collect();
         let mut pairs: Vec<(String, Vec<Ty>, Vec<Ty>)> = Vec::new();
         let mut tail = r.tail.clone();
+        let mut chain: Vec<RowVar> = Vec::new();
         while let RowTail::Open(v) = tail {
+            self.step();
             let Some(bound) = self.row_subst[v as usize].clone() else {
                 break;
             };
+            chain.push(v);
             for (k, l) in &bound.labels {
                 match seen.get(k) {
                     Some(first) => {
@@ -916,10 +959,33 @@ impl Infer {
         for (k, a, b) in pairs {
             self.unify_effect_args(&k, &a, &b, span);
         }
+        // Each variable of the chain bound straight to what it resolves to
+        // (path compression): an ambient grows a link at a time (a call
+        // relays its callee's tail), and every read walked the whole chain
+        // (spec 2026-10-31-elya-scalability D5). Its duplicates are settled
+        // above, so keeping the first of each, as `resolve_row` does, drops
+        // nothing.
+        if chain.len() > 1 {
+            let end = tail;
+            let mut suffix: BTreeMap<String, EffectLabel> = BTreeMap::new();
+            for &v in chain.iter().rev() {
+                let bound = self.row_subst[v as usize].as_ref().expect("bound");
+                let mut merged = bound.labels.clone();
+                for (k, l) in &suffix {
+                    merged.entry(k.clone()).or_insert_with(|| l.clone());
+                }
+                suffix = merged.clone();
+                self.row_subst[v as usize] = Some(EffectRow {
+                    labels: merged,
+                    tail: end.clone(),
+                });
+            }
+        }
     }
 
     /// Follow bound variables to a representative, recursively (deep).
     pub fn resolve(&self, t: &Ty) -> Ty {
+        self.step();
         match t {
             Ty::Var(v) => match &self.subst[*v as usize] {
                 Some(bound) => self.resolve(bound),
@@ -947,22 +1013,23 @@ impl Infer {
         // one call and a plain walk of its result decide it: resolving again
         // at every level was polynomial in a type's depth (the review's F3:
         // 8.4 s became 43.8 s on a hundred nested performs).
-        fn walk(v: u32, t: &Ty) -> bool {
+        fn walk(inf: &Infer, v: u32, t: &Ty) -> bool {
+            inf.step();
             match t {
                 Ty::Var(u) => *u == v,
                 Ty::Base(_) | Ty::Error => false,
                 Ty::Fn(ps, row, r) => {
-                    ps.iter().any(|p| walk(v, p))
-                        || walk(v, r)
+                    ps.iter().any(|p| walk(inf, v, p))
+                        || walk(inf, v, r)
                         || row
                             .labels
                             .values()
-                            .any(|l| l.args.iter().any(|a| walk(v, a)))
+                            .any(|l| l.args.iter().any(|a| walk(inf, v, a)))
                 }
-                Ty::Tuple(xs) | Ty::Con(_, xs) => xs.iter().any(|x| walk(v, x)),
+                Ty::Tuple(xs) | Ty::Con(_, xs) => xs.iter().any(|x| walk(inf, v, x)),
             }
         }
-        walk(v, &self.resolve(t))
+        walk(self, v, &self.resolve(t))
     }
 
     fn bind(&mut self, v: u32, t: &Ty, span: Span) {
@@ -979,6 +1046,10 @@ impl Infer {
             self.subst[v as usize] = Some(Ty::Error);
             return;
         }
+        debug_assert!(
+            !self.quantified.contains(&v),
+            "a quantified type variable was bound (spec 2026-10-31-elya-scalability D2)"
+        );
         self.subst[v as usize] = Some(t.clone());
         if let Some(origin) = self.eq_vars.get(&v).copied() {
             self.require_data(t, span, Some(origin));
@@ -1043,8 +1114,32 @@ impl Infer {
     }
 
     pub fn unify(&mut self, a: &Ty, b: &Ty, span: Span) {
-        let a = self.resolve(a);
-        let b = self.resolve(b);
+        self.unify_heads(a.clone(), b.clone(), span);
+    }
+
+    /// `t` with the variables at its head followed to what they are bound to;
+    /// what is under the head stays as it is, followed when it is reached.
+    fn head_of(&self, mut t: Ty) -> Ty {
+        while let Ty::Var(v) = t {
+            self.step();
+            match &self.subst[v as usize] {
+                Some(bound) => t = bound.clone(),
+                None => break,
+            }
+        }
+        t
+    }
+
+    /// `unify` on types it owns, one level at a time: each side's head is
+    /// followed through the substitution as it stands when that level is
+    /// reached (a binding made for an earlier argument is seen by a later
+    /// one), and nothing is resolved twice. Resolving both sides whole at
+    /// every level was size times depth (spec 2026-10-31-elya-scalability D3:
+    /// two towers of arrows, as an `if`'s arms make, unified).
+    fn unify_heads(&mut self, a: Ty, b: Ty, span: Span) {
+        self.step();
+        let a = self.head_of(a);
+        let b = self.head_of(b);
         match (a, b) {
             (Ty::Error, _) | (_, Ty::Error) => {}
             (Ty::Var(x), Ty::Var(y)) if x == y => {}
@@ -1059,10 +1154,10 @@ impl Infer {
                         ),
                     );
                 } else {
-                    for (x, y) in p1.iter().zip(&p2) {
-                        self.unify(x, y, span);
+                    for (x, y) in p1.into_iter().zip(p2) {
+                        self.unify_heads(x, y, span);
                     }
-                    self.unify(&r1, &r2, span);
+                    self.unify_heads(*r1, *r2, span);
                     // The two arrows' effect rows must reconcile. A closing
                     // conflict (both rows closed but differing) is E0423.
                     if let Err(c) = self.unify_row(&row1, &row2, span) {
@@ -1077,14 +1172,14 @@ impl Infer {
                 }
             }
             (Ty::Tuple(x), Ty::Tuple(y)) if x.len() == y.len() => {
-                for (p, q) in x.iter().zip(&y) {
-                    self.unify(p, q, span);
+                for (p, q) in x.into_iter().zip(y) {
+                    self.unify_heads(p, q, span);
                 }
             }
             // Nominal: same constructor name + arity, then unify args pairwise.
             (Ty::Con(n1, a1), Ty::Con(n2, a2)) if n1 == n2 && a1.len() == a2.len() => {
-                for (p, q) in a1.iter().zip(&a2) {
-                    self.unify(p, q, span);
+                for (p, q) in a1.into_iter().zip(a2) {
+                    self.unify_heads(p, q, span);
                 }
             }
             (x, y) => {
@@ -1110,6 +1205,7 @@ impl Infer {
         r2: &EffectRow,
         span: Span,
     ) -> Result<(), RowConflict> {
+        self.step();
         let (given1, given2) = (r1, r2);
         self.settle_duplicates(given1, span);
         self.settle_duplicates(given2, span);
@@ -1253,7 +1349,8 @@ impl Infer {
     /// in a row's labels' arguments, at any depth.
     fn mentions_row(&self, v: RowVar, t: &Ty) -> bool {
         // One deep `resolve`, then a plain walk (as in `occurs`).
-        fn walk(v: RowVar, t: &Ty) -> bool {
+        fn walk(inf: &Infer, v: RowVar, t: &Ty) -> bool {
+            inf.step();
             match t {
                 Ty::Var(_) | Ty::Base(_) | Ty::Error => false,
                 Ty::Fn(ps, row, r) => {
@@ -1261,14 +1358,14 @@ impl Infer {
                         || row
                             .labels
                             .values()
-                            .any(|l| l.args.iter().any(|a| walk(v, a)))
-                        || ps.iter().any(|p| walk(v, p))
-                        || walk(v, r)
+                            .any(|l| l.args.iter().any(|a| walk(inf, v, a)))
+                        || ps.iter().any(|p| walk(inf, v, p))
+                        || walk(inf, v, r)
                 }
-                Ty::Tuple(xs) | Ty::Con(_, xs) => xs.iter().any(|x| walk(v, x)),
+                Ty::Tuple(xs) | Ty::Con(_, xs) => xs.iter().any(|x| walk(inf, v, x)),
             }
         }
-        walk(v, &self.resolve(t))
+        walk(self, v, &self.resolve(t))
     }
 
     /// Bind row variable `v := r`, with an occurs-check (`E0424`): `v` may not
@@ -1299,15 +1396,85 @@ impl Infer {
                 labels: BTreeMap::new(),
                 tail: RowTail::ErrorRow,
             });
+            self.wake_inclusions(v);
             return;
         }
+        // A quantified row is only ever closed, empty (a local `let`'s phantom
+        // tail when its group ends), which holds nothing (D2).
+        debug_assert!(
+            !self.quantified_rows.contains(&v)
+                || (resolved.labels.is_empty() && resolved.tail == RowTail::Closed),
+            "a quantified row variable came to hold a row (spec 2026-10-31-elya-scalability D2)"
+        );
         // A meaningful variable bound to `{.. | w}` hands its meaning to `w`.
         if !self.phantom.contains(&v) {
             if let RowTail::Open(w) = resolved.tail {
-                self.phantom.remove(&w);
+                self.unmark_phantom(w);
             }
         }
         self.row_subst[v as usize] = Some(resolved);
+        self.wake_inclusions(v);
+    }
+
+    /// Every row variable bound to a row with no labels of its own (a link
+    /// one unification of two tails made) bound straight past such links, to
+    /// the first variable down its chain that holds labels or is unbound, or
+    /// to the chain's end, closed or poisoned (spec 2026-10-31-elya-scalability D5): what
+    /// each resolves to is unchanged and no label is dropped. Run before the
+    /// zonk, which resolves every node's type once: a row a node recorded
+    /// early started a chain that grew a link per call (`settle_duplicates`
+    /// compresses the chains it walks, from the ambient, not the variables
+    /// left behind it), and each such node was resolved through all of it.
+    fn compress_rows(&mut self) {
+        let mut target: Vec<Option<RowTail>> = vec![None; self.row_subst.len()];
+        for v in 0..self.row_subst.len() {
+            let mut run: Vec<usize> = Vec::new();
+            let mut cur = v;
+            let end = loop {
+                self.step();
+                if let Some(t) = &target[cur] {
+                    break t.clone();
+                }
+                match &self.row_subst[cur] {
+                    Some(bound) if bound.labels.is_empty() => {
+                        run.push(cur);
+                        match &bound.tail {
+                            RowTail::Open(w) => cur = *w as usize,
+                            other => break other.clone(),
+                        }
+                    }
+                    _ => break RowTail::Open(cur as RowVar),
+                }
+            };
+            for u in run {
+                target[u] = Some(end.clone());
+                self.row_subst[u] = Some(EffectRow {
+                    labels: BTreeMap::new(),
+                    tail: end.clone(),
+                });
+            }
+        }
+    }
+
+    /// `v` was bound, or stopped being phantom: the inclusions whose callee
+    /// row ended in it may add something again (D4).
+    fn wake_inclusions(&mut self, v: RowVar) {
+        if let Some(ix) = self.incl_watch.remove(&v) {
+            self.incl_dirty.extend(ix);
+        }
+    }
+
+    /// `w` is meaningful from now on (`phantom`).
+    fn unmark_phantom(&mut self, w: RowVar) {
+        if self.phantom.remove(&w) {
+            self.wake_inclusions(w);
+        }
+    }
+
+    /// Record an inclusion `src ⊆ dst` (`pending_incl`), dirty until flushed.
+    fn push_inclusion(&mut self, src: RowVar, dst: RowVar, span: Span) {
+        self.incl_dirty.insert(self.pending_incl.len());
+        self.pending_incl.push((src, dst, span));
     }
 
     /// Add each pending callee tail's CURRENT labels to its ambient, to a
@@ -1316,13 +1483,25 @@ impl Infer {
     fn flush_inclusions(&mut self) {
         loop {
             let mut changed = false;
-            for (src, dst, span) in self.pending_incl.clone() {
+            // The dirty inclusions in index order, one marked during this pass
+            // at a later index taken in this pass: the order of a full pass,
+            // without the ones that could add nothing (D4).
+            let mut cursor = 0;
+            while let Some(&i) = self.incl_dirty.range(cursor..).next() {
+                self.incl_dirty.remove(&i);
+                cursor = i + 1;
+                if self.incl_dead.contains(&i) {
+                    continue;
+                }
+                self.step();
+                let (src, dst, span) = self.pending_incl[i];
                 let have = self.resolve_row(&EffectRow::open(dst));
                 // A poisoned row (a reported conflict, E0424) absorbs every
                 // label: nothing to add, so it is settled. Adding to it
                 // "succeeded" every pass, and the fixpoint never ended (spec
                 // 2026-10-30-elya-occurs-in-rows, the review's F1).
                 if have.tail == RowTail::ErrorRow {
+                    self.incl_dead.insert(i);
                     continue;
                 }
                 let want = self.resolve_row(&EffectRow::open(src));
@@ -1354,9 +1533,19 @@ impl Infer {
                     if r.is_ok() {
                         changed = true;
                     } else {
-                        self.pending_incl.retain(|p| *p != (src, dst, span));
+                        for (j, p) in self.pending_incl.iter().enumerate() {
+                            if *p == (src, dst, span) {
+                                self.incl_dead.insert(j);
+                            }
+                        }
                     }
                     self.surface_conflict(r);
+                }
+                // Until what it read changes: its callee row's tail now.
+                if !self.incl_dead.contains(&i) {
+                    if let RowTail::Open(w) = self.resolve_row(&EffectRow::open(src)).tail {
+                        self.incl_watch.entry(w).or_default().push(i);
+                    }
                 }
             }
             let mut relayed = Vec::new();
@@ -1364,6 +1553,7 @@ impl Infer {
                 free_row_vars(self, &p, &mut relayed);
             }
             for (src, dst, span) in self.pending_member_incl.clone() {
+                self.step();
                 let have = self.resolve_row(&EffectRow::open(dst));
                 // Settled when poisoned, as above.
                 if have.tail == RowTail::ErrorRow {
@@ -1408,7 +1598,7 @@ impl Infer {
                     self.surface_conflict(r);
                 }
             }
-            if !changed {
+            if !changed && self.incl_dirty.is_empty() {
                 break;
             }
         }
@@ -1448,8 +1638,12 @@ impl Infer {
             return (Vec::new(), op.params.clone(), op.ret.clone());
         }
         let (args, m, rm) = self.fresh_effect_args(op);
-        let params = op.params.iter().map(|t| subst_vars(t, &m, &rm)).collect();
-        let ret = subst_vars(&op.ret, &m, &rm);
+        let params = op
+            .params
+            .iter()
+            .map(|t| subst_vars(t, &(&m, &rm), &self.steps))
+            .collect();
+        let ret = subst_vars(&op.ret, &(&m, &rm), &self.steps);
         (args, params, ret)
     }
 
@@ -1557,17 +1751,23 @@ impl Infer {
     /// fresh tail. Parameter rows are contravariant and stay as they are
     /// (opening one would let an effectful argument into a pure parameter).
     fn open_covariant(&mut self, t: &Ty) -> Ty {
-        match self.resolve(t) {
-            Ty::Fn(ps, row, r) => {
-                let mut row = self.resolve_row(&row);
-                if row.tail == RowTail::Closed {
-                    row.tail = RowTail::Open(self.fresh_phantom_row());
+        // Resolved once, then walked down the results: resolving again at
+        // every arrow was size times depth (spec 2026-10-31-elya-scalability
+        // D1: a tower of `fn() -> fn() -> ..` read at each level).
+        fn open(inf: &mut Infer, t: Ty) -> Ty {
+            match t {
+                Ty::Fn(ps, mut row, r) => {
+                    if row.tail == RowTail::Closed {
+                        row.tail = RowTail::Open(inf.fresh_phantom_row());
+                    }
+                    let r = open(inf, *r);
+                    Ty::Fn(ps, row, Box::new(r))
                 }
-                let r = self.open_covariant(&r);
-                Ty::Fn(ps, row, Box::new(r))
+                other => other,
             }
-            other => other,
         }
+        let resolved = self.resolve(t);
+        open(self, resolved)
     }
 
     /// A row conflict on the way INTO an ambient -- a perform, a call or a
@@ -1811,25 +2011,56 @@ impl TyPrinter {
 #[derive(Default)]
 pub struct TyEnv {
     scopes: Vec<HashMap<String, Scheme>>,
+    /// Per scope, each name whose scheme leaves a type or row variable
+    /// unquantified (a parameter, a monomorphic `let`, a member of the group
+    /// being inferred), with those variables as a type to resolve: what the
+    /// environment leaves free is what these resolve to now. A closed scheme
+    /// can gain no free variable (a quantified one is never bound to a type
+    /// or row holding one), so generalizing walks these alone, not every
+    /// scheme in scope (spec 2026-10-31-elya-scalability D2: each `let` and
+    /// each top-level group re-read all of them).
+    open: Vec<HashMap<String, Ty>>,
 }
 
 impl TyEnv {
     pub fn new() -> TyEnv {
         TyEnv {
             scopes: vec![HashMap::new()],
+            open: vec![HashMap::new()],
         }
     }
     fn push(&mut self) {
         self.scopes.push(HashMap::new());
+        self.open.push(HashMap::new());
     }
     fn pop(&mut self) {
         self.scopes.pop();
+        self.open.pop();
     }
-    pub fn insert(&mut self, name: &str, s: Scheme) {
+    /// Bind `name` in the innermost scope; `left_free` is what its scheme
+    /// leaves unquantified (`Infer::bind_name` computes it).
+    fn insert(&mut self, name: &str, s: Scheme, left_free: Option<Ty>) {
+        let open = self.open.last_mut().unwrap();
+        match left_free {
+            Some(t) => {
+                open.insert(name.to_string(), t);
+            }
+            None => {
+                open.remove(name);
+            }
+        }
         self.scopes.last_mut().unwrap().insert(name.to_string(), s);
     }
     pub fn lookup(&self, name: &str) -> Option<&Scheme> {
         self.scopes.iter().rev().find_map(|s| s.get(name))
+    }
+    /// Every binding that leaves a variable free: its name, its scheme, and
+    /// those variables (as a type to resolve).
+    fn open_entries(&self) -> impl Iterator<Item = (&String, &Scheme, &Ty)> {
+        self.scopes
+            .iter()
+            .zip(&self.open)
+            .flat_map(|(scope, open)| open.iter().map(move |(n, t)| (n, &scope[n], t)))
     }
 }
 
@@ -1848,6 +2079,26 @@ fn binop_type(op: BinOp) -> (Ty, Ty, Ty) {
 }
 
 impl Infer {
+    /// Bind `name` to `s` in `env`'s innermost scope, noting the variables
+    /// `s` leaves unquantified (D2).
+    fn bind_name(&self, env: &mut TyEnv, name: &str, s: Scheme) {
+        let resolved = self.resolve(&s.ty);
+        let mut tys = Vec::new();
+        free_vars(self, &resolved, &mut tys);
+        tys.retain(|v| !s.vars.contains(v));
+        let mut rows = Vec::new();
+        free_row_vars(self, &resolved, &mut rows);
+        rows.retain(|v| !s.row_vars.contains(v));
+        let left_free = if tys.is_empty() && rows.is_empty() {
+            None
+        } else {
+            let mut parts: Vec<Ty> = tys.into_iter().map(Ty::Var).collect();
+            parts.extend(rows.into_iter().map(|r| phantom(EffectRow::open(r))));
+            Some(Ty::Tuple(parts))
+        };
+        env.insert(name, s, left_free);
+    }
+
     pub fn instantiate(&mut self, s: &Scheme) -> Ty {
         if s.vars.is_empty() && s.row_vars.is_empty() {
             return s.ty.clone();
@@ -1879,7 +2130,7 @@ impl Infer {
             }
             row_mapping.insert(*v, fresh);
         }
-        subst_vars(&s.ty, &mapping, &row_mapping)
+        subst_vars(&s.ty, &(&mapping, &row_mapping), &self.steps)
     }
 
     /// `E0433`: an n-ary constructor used unapplied or partially applied.
@@ -1929,7 +2180,7 @@ impl Infer {
                             ty: self.resolve(&t),
                         }
                     };
-                    env.insert(name, scheme);
+                    self.bind_name(env, name, scheme);
                 }
                 Stmt::Expr(e) => {
                     self.infer_expr(e, env, amb);
@@ -2127,7 +2378,8 @@ impl Infer {
                     self.check_pattern(&arm.node.pat, &s, env, &mut bindings);
                     env.push();
                     for (name, ty) in bindings {
-                        env.insert(
+                        self.bind_name(
+                            env,
                             &name,
                             Scheme {
                                 vars: Vec::new(),
@@ -2148,7 +2400,8 @@ impl Infer {
                 let mut param_tys = Vec::with_capacity(params.len());
                 for p in params {
                     let pv = self.fresh();
-                    env.insert(
+                    self.bind_name(
+                        env,
                         &p.node.name,
                         Scheme {
                             vars: Vec::new(),
@@ -2575,7 +2828,7 @@ impl Infer {
                 free_row_vars(self, &p, &mut in_params);
             }
             if self.phantom.contains(&v) && !in_params.contains(&v) {
-                self.pending_incl.push((v, amb, span));
+                self.push_inclusion(v, amb, span);
                 eff.tail = RowTail::Closed;
             } else if !in_params.contains(&v) {
                 if let Some(m) = self.member_in_handle_body(v, amb) {
@@ -2698,7 +2951,8 @@ impl Infer {
         match &handler.ret {
             Some(ret) => {
                 env.push();
-                env.insert(
+                self.bind_name(
+                    env,
                     &ret.binder,
                     Scheme {
                         vars: Vec::new(),
@@ -2742,9 +2996,9 @@ impl Infer {
                     (
                         op.params
                             .iter()
-                            .map(|t| subst_vars(t, &m, &eff_rows))
+                            .map(|t| subst_vars(t, &(&m, &eff_rows), &self.steps))
                             .collect::<Vec<_>>(),
-                        subst_vars(&op.ret, &m, &eff_rows),
+                        subst_vars(&op.ret, &(&m, &eff_rows), &self.steps),
                     )
                 }
                 None => (Vec::new(), Ty::Error),
@@ -2757,7 +3011,8 @@ impl Infer {
                 // Core lowering then READS it out of the frozen table, the same
                 // lookup it makes for a lambda parameter, instead of guessing it.
                 self.node_types.insert(p.span, pty.clone());
-                env.insert(
+                self.bind_name(
+                    env,
                     &p.node.name,
                     Scheme {
                         vars: Vec::new(),
@@ -2899,7 +3154,8 @@ impl Infer {
         match &handler.ret {
             Some(ret) => {
                 env.push();
-                env.insert(
+                self.bind_name(
+                    env,
                     &ret.binder,
                     Scheme {
                         vars: Vec::new(),
@@ -2949,7 +3205,8 @@ impl Infer {
             env.push();
             for p in clause.params.iter() {
                 self.node_types.insert(p.span, op_ty.clone());
-                env.insert(
+                self.bind_name(
+                    env,
                     &p.node.name,
                     Scheme {
                         vars: Vec::new(),
@@ -3054,12 +3311,13 @@ impl Infer {
             where_ = Some("the handle's result type".to_string());
         }
         if where_.is_none() {
-            'outer: for scope in &env.scopes {
-                for (name, scheme) in scope {
-                    if self.mentions_con(&scheme.ty, sk) {
-                        where_ = Some(format!("`{name}`, bound outside the clause"));
-                        break 'outer;
-                    }
+            // Only what a binding leaves free can have come to hold the
+            // clause's answer type, made after it was bound (D2).
+            for (name, _, left) in env.open_entries() {
+                self.step();
+                if self.mentions_con(left, sk) {
+                    where_ = Some(format!("`{name}`, bound outside the clause"));
+                    break;
                 }
             }
         }
@@ -3086,6 +3344,7 @@ impl Infer {
 
     /// Whether the resolved `t` mentions the nominal type `name`, rows included.
     fn mentions_con(&self, t: &Ty, name: &str) -> bool {
+        self.step();
         match self.resolve(t) {
             Ty::Con(n, args) => n == name || args.iter().any(|a| self.mentions_con(a, name)),
             Ty::Fn(ps, row, r) => {
@@ -3143,7 +3402,7 @@ impl Infer {
                         .params
                         .iter()
                         .chain(std::iter::once(&op.ret))
-                        .map(|t| subst_vars(t, &m, &rm))
+                        .map(|t| subst_vars(t, &(&m, &rm), &self.steps))
                         .collect();
                     if let Some(why) = tys.iter().find_map(|t| self.not_data(t, &mut Vec::new())) {
                         self.diags.push(
@@ -3256,12 +3515,45 @@ impl Infer {
         for t in self.ann_vars.values().cloned().collect::<Vec<_>>() {
             free_vars(self, &t, &mut in_env);
         }
+        // So are the enclosing clauses' `resume` types: a resumption's argument
+        // and answer are one type for its clause. Generalized by a `let` in the
+        // clause, a later `resume` bound them (spec 2026-10-31-elya-scalability,
+        // the review's finding 1: an `Int` and a `String` met, checked clean).
+        // Only an accident kept it out before: another binding's scheme
+        // happened to mention them.
+        let resumes: Vec<(Ty, Ty, [RowVar; 3])> = self
+            .resume_stack
+            .iter()
+            .map(|r| {
+                (
+                    r.arg.clone(),
+                    r.result.clone(),
+                    [r.body_amb, r.ret_amb, r.clauses_row],
+                )
+            })
+            .collect();
+        for (arg, result, rows) in &resumes {
+            free_vars(self, arg, &mut in_env);
+            free_vars(self, result, &mut in_env);
+            // A row's labels' arguments are types too.
+            for &r in rows {
+                free_vars(self, &phantom(EffectRow::open(r)), &mut in_env);
+            }
+        }
+        let in_env: HashSet<u32> = in_env.into_iter().collect();
         let vars: Vec<u32> = in_ty.into_iter().filter(|v| !in_env.contains(v)).collect();
 
         let mut row_in_ty = Vec::new();
         free_row_vars(self, &resolved, &mut row_in_ty);
         let mut row_in_env = Vec::new();
         env_free_row_vars(self, env, &mut row_in_env);
+        for (arg, result, rows) in &resumes {
+            free_row_vars(self, arg, &mut row_in_env);
+            free_row_vars(self, result, &mut row_in_env);
+            for &r in rows {
+                free_row_vars(self, &phantom(EffectRow::open(r)), &mut row_in_env);
+            }
+        }
         // The function's named rows are one row for the whole function (D2), as
         // its annotation type variables are (above).
         for v in self.ann_rows.values().copied().collect::<Vec<_>>() {
@@ -3290,10 +3582,13 @@ impl Infer {
                 row_in_env.push(v);
             }
         }
+        let row_in_env: HashSet<RowVar> = row_in_env.into_iter().collect();
         let row_vars: Vec<RowVar> = row_in_ty
             .into_iter()
             .filter(|v| !row_in_env.contains(v))
             .collect();
+        self.quantified.extend(vars.iter().copied());
+        self.quantified_rows.extend(row_vars.iter().copied());
         Scheme {
             ty: resolved,
             vars,
@@ -3734,105 +4029,116 @@ fn decl_type_arg(
     elaborate_adt_ty(inf, a, cx)
 }
 
+/// Collect the free *type* variables of `t`, each once, in the order met --
+/// including any that appear ONLY inside an effect argument (the `s` of
+/// `{State(s)}`), which must still be generalized; row variables are
+/// collected separately (`free_row_vars`). `t` is resolved once and the result
+/// walked: resolving again at every node was size times depth (spec
+/// 2026-10-31-elya-scalability D1).
 fn free_vars(inf: &Infer, t: &Ty, acc: &mut Vec<u32>) {
-    match inf.resolve(t) {
-        Ty::Var(v) => {
-            if !acc.contains(&v) {
-                acc.push(v);
-            }
-        }
-        Ty::Base(_) | Ty::Error => {}
-        Ty::Fn(ps, row, r) => {
-            // Row variables are generalized separately; this collects free *type*
-            // variables — including any that appear ONLY inside an effect argument
-            // (e.g. the `s` of `{State(s)}`), which must still be generalized.
-            for p in &ps {
-                free_vars(inf, p, acc);
-            }
-            for l in row.labels.values() {
-                for a in &l.args {
-                    free_vars(inf, a, acc);
+    fn walk(inf: &Infer, t: &Ty, acc: &mut Vec<u32>, seen: &mut HashSet<u32>) {
+        inf.step();
+        match t {
+            Ty::Var(v) => {
+                if seen.insert(*v) {
+                    acc.push(*v);
                 }
             }
-            free_vars(inf, &r, acc);
-        }
-        Ty::Tuple(xs) => {
-            for x in &xs {
-                free_vars(inf, x, acc);
+            Ty::Base(_) | Ty::Error => {}
+            Ty::Fn(ps, row, r) => {
+                for p in ps {
+                    walk(inf, p, acc, seen);
+                }
+                for l in row.labels.values() {
+                    for a in &l.args {
+                        walk(inf, a, acc, seen);
+                    }
+                }
+                walk(inf, r, acc, seen);
             }
-        }
-        Ty::Con(_, args) => {
-            for a in &args {
-                free_vars(inf, a, acc);
+            Ty::Tuple(xs) | Ty::Con(_, xs) => {
+                for x in xs {
+                    walk(inf, x, acc, seen);
+                }
             }
         }
     }
+    let mut seen: HashSet<u32> = acc.iter().copied().collect();
+    walk(inf, &inf.resolve(t), acc, &mut seen);
 }
 
+/// What the environment leaves free: the variables its open entries (D2)
+/// resolve to now, less each entry's own quantified ones.
 fn env_free_vars(inf: &Infer, env: &TyEnv, acc: &mut Vec<u32>) {
-    for scope in &env.scopes {
-        for scheme in scope.values() {
-            let mut fv = Vec::new();
-            free_vars(inf, &scheme.ty, &mut fv);
-            for v in fv {
-                if !scheme.vars.contains(&v) && !acc.contains(&v) {
-                    acc.push(v);
-                }
+    for (_, scheme, left) in env.open_entries() {
+        inf.step();
+        let mut fv = Vec::new();
+        free_vars(inf, left, &mut fv);
+        for v in fv {
+            if !scheme.vars.contains(&v) && !acc.contains(&v) {
+                acc.push(v);
             }
         }
     }
 }
 
 /// Collect the free effect-row variables of a type (the open tails of its
-/// arrows). The type is resolved first, so tails are their residual variables.
+/// arrows, those in its labels' arguments included), each once, in the order
+/// met. Resolved once and walked, as `free_vars` is (D1).
 fn free_row_vars(inf: &Infer, t: &Ty, acc: &mut Vec<RowVar>) {
-    match inf.resolve(t) {
-        Ty::Fn(ps, row, r) => {
-            for p in &ps {
-                free_row_vars(inf, p, acc);
+    fn walk(inf: &Infer, t: &Ty, acc: &mut Vec<RowVar>, seen: &mut HashSet<RowVar>) {
+        inf.step();
+        match t {
+            Ty::Fn(ps, row, r) => {
+                for p in ps {
+                    walk(inf, p, acc, seen);
+                }
+                if let RowTail::Open(v) = row.tail {
+                    if seen.insert(v) {
+                        acc.push(v);
+                    }
+                }
+                // An effect argument may itself be a function type carrying a row.
+                for l in row.labels.values() {
+                    for a in &l.args {
+                        walk(inf, a, acc, seen);
+                    }
+                }
+                walk(inf, r, acc, seen);
             }
-            if let RowTail::Open(v) = row.tail {
-                if !acc.contains(&v) {
-                    acc.push(v);
+            Ty::Tuple(xs) | Ty::Con(_, xs) => {
+                for x in xs {
+                    walk(inf, x, acc, seen);
                 }
             }
-            // An effect argument may itself be a function type carrying a row.
-            for l in row.labels.values() {
-                for a in &l.args {
-                    free_row_vars(inf, a, acc);
-                }
-            }
-            free_row_vars(inf, &r, acc);
+            Ty::Var(_) | Ty::Base(_) | Ty::Error => {}
         }
-        Ty::Tuple(xs) => {
-            for x in &xs {
-                free_row_vars(inf, x, acc);
-            }
-        }
-        Ty::Con(_, args) => {
-            for a in &args {
-                free_row_vars(inf, a, acc);
-            }
-        }
-        _ => {}
     }
+    let mut seen: HashSet<RowVar> = acc.iter().copied().collect();
+    walk(inf, &inf.resolve(t), acc, &mut seen);
 }
 
+/// The row variables the environment leaves free (D2), as `env_free_vars`.
 fn env_free_row_vars(inf: &Infer, env: &TyEnv, acc: &mut Vec<RowVar>) {
-    for scope in &env.scopes {
-        for scheme in scope.values() {
-            let mut fv = Vec::new();
-            free_row_vars(inf, &scheme.ty, &mut fv);
-            for v in fv {
-                if !scheme.row_vars.contains(&v) && !acc.contains(&v) {
-                    acc.push(v);
-                }
+    for (_, scheme, left) in env.open_entries() {
+        inf.step();
+        let mut fv = Vec::new();
+        free_row_vars(inf, left, &mut fv);
+        for v in fv {
+            if !scheme.row_vars.contains(&v) && !acc.contains(&v) {
+                acc.push(v);
             }
         }
     }
 }
 
-fn subst_vars(t: &Ty, m: &HashMap<u32, Ty>, rm: &HashMap<RowVar, RowVar>) -> Ty {
+/// A substitution for `subst_vars`: type variables to types, row variables to
+/// row variables.
+type Subst<'a> = (&'a HashMap<u32, Ty>, &'a HashMap<RowVar, RowVar>);
+
+fn subst_vars(t: &Ty, m: &Subst, steps: &std::cell::Cell<u64>) -> Ty {
+    steps.set(steps.get() + 1);
+    let (m, rm) = (m.0, m.1);
     match t {
         Ty::Var(v) => m.get(v).cloned().unwrap_or(Ty::Var(*v)),
         Ty::Base(c) => Ty::Base(*c),
@@ -3848,22 +4154,28 @@ fn subst_vars(t: &Ty, m: &HashMap<u32, Ty>, rm: &HashMap<RowVar, RowVar>) -> Ty 
                     (
                         k.clone(),
                         EffectLabel {
-                            args: l.args.iter().map(|a| subst_vars(a, m, rm)).collect(),
+                            args: l
+                                .args
+                                .iter()
+                                .map(|a| subst_vars(a, &(m, rm), steps))
+                                .collect(),
                             span: l.span,
                         },
                     )
                 })
                 .collect();
             Ty::Fn(
-                ps.iter().map(|p| subst_vars(p, m, rm)).collect(),
+                ps.iter().map(|p| subst_vars(p, &(m, rm), steps)).collect(),
                 EffectRow { labels, tail },
-                Box::new(subst_vars(r, m, rm)),
+                Box::new(subst_vars(r, &(m, rm), steps)),
             )
         }
-        Ty::Tuple(xs) => Ty::Tuple(xs.iter().map(|x| subst_vars(x, m, rm)).collect()),
+        Ty::Tuple(xs) => Ty::Tuple(xs.iter().map(|x| subst_vars(x, &(m, rm), steps)).collect()),
         Ty::Con(n, args) => Ty::Con(
             n.clone(),
-            args.iter().map(|a| subst_vars(a, m, rm)).collect(),
+            args.iter()
+                .map(|a| subst_vars(a, &(m, rm), steps))
+                .collect(),
         ),
         Ty::Error => Ty::Error,
     }
@@ -3943,10 +4255,21 @@ type InferAllOut = (
     HashMap<String, Ty>,
 );
 
+/// The work inference does on `module` (`Infer::steps`), timing-free, the
+/// zonk of every node's type included (the back end's inference): what
+/// `tests/infer_complexity.rs` measures (spec 2026-10-31-elya-scalability D6).
+pub fn inference_steps(module: &Module) -> u64 {
+    infer_all_counted(module, true).1
+}
+
+fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
+    infer_all_counted(module, want_types).0
+}
+
 /// Type every top-level function, processing mutually-recursive groups (SCCs of
 /// the call graph) in dependency order so each group is generalized before later
 /// groups use it — giving proper let-polymorphism across the top level.
-fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
+fn infer_all_counted(module: &Module, want_types: bool) -> (InferAllOut, u64) {
     let mut inf = Infer::new();
     // Names of `linear`-declared types — set before inference so `ty_is_linear`
     // sees them while recording affine binding sites (Slice 4d-2).
@@ -4053,7 +4376,8 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                 } else {
                     Ty::Fn(field_tys, EffectRow::pure(), Box::new(result.clone()))
                 };
-                env.insert(
+                inf.bind_name(
+                    &mut env,
                     &vd.name,
                     Scheme {
                         vars: var_ids.clone(),
@@ -4162,7 +4486,8 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             let params: Vec<Ty> = f.params.iter().map(|_| inf.fresh()).collect();
             let amb_f = inf.fresh_row();
             let result = inf.fresh();
-            env.insert(
+            inf.bind_name(
+                &mut env,
                 &f.name,
                 Scheme {
                     vars: Vec::new(),
@@ -4231,7 +4556,8 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
                 // end of this function maps over the whole table, so these
                 // resolve for free.
                 inf.node_types.insert(p.span, pty.clone());
-                env.insert(
+                inf.bind_name(
+                    &mut env,
                     &p.node.name,
                     Scheme {
                         vars: Vec::new(),
@@ -4263,7 +4589,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
             for (src, _, _) in inf.pending_incl.clone() {
                 if let RowTail::Open(w) = inf.resolve_row(&EffectRow::open(src)).tail {
                     if in_params.contains(&w) {
-                        inf.phantom.remove(&w);
+                        inf.unmark_phantom(w);
                     }
                 }
             }
@@ -4335,6 +4661,9 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
         //      is closed (Koka's close-at-generalization; value uses re-open).
         inf.flush_inclusions();
         inf.pending_incl.clear();
+        inf.incl_dirty.clear();
+        inf.incl_watch.clear();
+        inf.incl_dead.clear();
         inf.pending_member_incl.clear();
         inf.group_ambs.clear();
         inf.group_params.clear();
@@ -4349,16 +4678,18 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
         //      open here is generalized: its instantiations are checked.
         inf.check_generic_rows();
         // 3. generalize each member and re-insert its polytype for later groups.
+        let outside = group_env_free(&inf, &env, group, &fns);
         for &i in group {
             let f = fns[i];
             let (params, amb_f, result) = member_ty[&i].clone();
             let fnty = Ty::Fn(params, EffectRow::open(amb_f), Box::new(result));
-            let scheme = generalize_toplevel(&mut inf, &fnty, &env, group, &fns);
-            env.insert(&f.name, scheme.clone());
+            let scheme = generalize_toplevel(&mut inf, &fnty, &outside);
+            inf.bind_name(&mut env, &f.name, scheme.clone());
             schemes_out.push((f.name.clone(), display_scheme(&inf, &scheme)));
             fn_types.push((f.name.clone(), scheme.ty.clone()));
         }
     }
+    inf.compress_rows();
     let fn_types: HashMap<String, Ty> = fn_types
         .into_iter()
         .map(|(n, t)| (n, inf.resolve(&t)))
@@ -4375,12 +4706,16 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
     } else {
         BTreeMap::new()
     };
+    let steps = inf.steps.get();
     (
-        schemes_out,
-        inf.diags,
-        inf.affine_sites,
-        node_types,
-        fn_types,
+        (
+            schemes_out,
+            inf.diags,
+            inf.affine_sites,
+            node_types,
+            fn_types,
+        ),
+        steps,
     )
 }
 
@@ -4533,47 +4868,51 @@ fn is_syntactic_value(e: &Expr) -> bool {
     )
 }
 
-fn generalize_toplevel(
-    inf: &mut Infer,
-    fnty: &Ty,
+/// What the environment leaves free outside a top-level group (D2): its open
+/// entries, the group's own members skipped. The same for every member
+/// (generalizing binds nothing), so read once per group: per member, a large
+/// group read itself once per member (the review's finding 3).
+fn group_env_free(
+    inf: &Infer,
     env: &TyEnv,
     group: &[usize],
     fns: &[&FnDecl],
+) -> (HashSet<u32>, HashSet<RowVar>) {
+    let group_names: HashSet<&str> = group.iter().map(|&i| fns[i].name.as_str()).collect();
+    let mut in_env = HashSet::new();
+    let mut row_in_env = HashSet::new();
+    for (n, scheme, left) in env.open_entries() {
+        inf.step();
+        if group_names.contains(n.as_str()) {
+            continue;
+        }
+        let mut fv = Vec::new();
+        free_vars(inf, left, &mut fv);
+        in_env.extend(fv.into_iter().filter(|v| !scheme.vars.contains(v)));
+        let mut rfv = Vec::new();
+        free_row_vars(inf, left, &mut rfv);
+        row_in_env.extend(rfv.into_iter().filter(|v| !scheme.row_vars.contains(v)));
+    }
+    (in_env, row_in_env)
+}
+
+fn generalize_toplevel(
+    inf: &mut Infer,
+    fnty: &Ty,
+    (in_env, row_in_env): &(HashSet<u32>, HashSet<RowVar>),
 ) -> Scheme {
-    let group_names: Vec<&str> = group.iter().map(|&i| fns[i].name.as_str()).collect();
     let resolved = inf.resolve(fnty);
     let mut in_ty = Vec::new();
     free_vars(inf, &resolved, &mut in_ty);
     let mut row_in_ty = Vec::new();
     free_row_vars(inf, &resolved, &mut row_in_ty);
-    let mut in_env = Vec::new();
-    let mut row_in_env = Vec::new();
-    for scope in &env.scopes {
-        for (n, scheme) in scope {
-            if group_names.contains(&n.as_str()) {
-                continue;
-            }
-            let mut fv = Vec::new();
-            free_vars(inf, &scheme.ty, &mut fv);
-            for v in fv {
-                if !scheme.vars.contains(&v) && !in_env.contains(&v) {
-                    in_env.push(v);
-                }
-            }
-            let mut rfv = Vec::new();
-            free_row_vars(inf, &scheme.ty, &mut rfv);
-            for v in rfv {
-                if !scheme.row_vars.contains(&v) && !row_in_env.contains(&v) {
-                    row_in_env.push(v);
-                }
-            }
-        }
-    }
     let vars: Vec<u32> = in_ty.into_iter().filter(|v| !in_env.contains(v)).collect();
     let row_vars: Vec<RowVar> = row_in_ty
         .into_iter()
         .filter(|v| !row_in_env.contains(v))
         .collect();
+    inf.quantified.extend(vars.iter().copied());
+    inf.quantified_rows.extend(row_vars.iter().copied());
     Scheme {
         ty: resolved,
         vars,

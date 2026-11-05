@@ -17,6 +17,13 @@
 //!   n-frame segment twice, 2n work, which is linear either way.)
 //! - K4: remove `KontNode`'s iterative `Drop` -> the abandoned-continuation guard
 //!   overflows the test thread's stack.
+//!
+//! The lookups (spec `docs/superpowers/specs/2026-10-31-elya-scalability-design.md`
+//! D7, D8), each reverted with `cmp` after:
+//! - K8: `Env::bind` in place whoever else holds the scope -> the in-place
+//!   guard fails (1275 for 375; and 6008 for 6007, checked alone);
+//! - K9: `Env::bind` never in place -> both lookup tests fail (ratios 3.96 and
+//!   3.99).
 
 use elya::parse::parse_module;
 use elya::Session;
@@ -149,4 +156,66 @@ fn an_abandoned_continuation_a_hundred_thousand_deep_drops() {
                Ask.ask() -> 7\n    return(x) -> x\n  }\n}\n";
     let (_, v) = cost_and_value(src);
     assert_eq!(v, "Int(7)");
+}
+
+/// A parameter used down a block of `n` `let`s (spec
+/// `docs/superpowers/specs/2026-10-31-elya-scalability-design.md` D7, D8):
+/// each `let` made a scope, and every use of the parameter below walked them.
+fn a_name_down_a_block(n: u64) -> String {
+    let mut src = String::from("fn f(x: Int) -> Int {\n  let a0 = x\n");
+    for i in 1..n {
+        src.push_str(&format!("  let a{i} = (a{} + x) % 1000003\n", i - 1));
+    }
+    src.push_str(&format!(
+        "  a{}\n}}\npub fn main() -> Int {{ f(7) }}\n",
+        n - 1
+    ));
+    src
+}
+
+#[test]
+fn a_name_used_down_a_long_block_costs_linearly() {
+    let (a, b) = assert_linear("a name down a block", a_name_down_a_block, 1000);
+    assert_eq!((a.as_str(), b.as_str()), ("Int(7000)", "Int(14000)"));
+}
+
+#[test]
+fn the_tree_oracle_looks_a_name_up_down_a_long_block_linearly() {
+    let cost = |n| {
+        let src = a_name_down_a_block(n);
+        let (m, d) = parse_module(&Session::new(), &src);
+        assert!(d.is_empty(), "parse: {d:?}");
+        elya::eval::run_module_tree(&m).unwrap().cost()
+    };
+    let (c1, c2) = (cost(1000), cost(2000));
+    assert!(
+        c2 <= 2 * c1 + SLACK,
+        "tree: cost(1000) = {c1}, cost(2000) = {c2}, ratio {:.2} (linear is 2.00)",
+        c2 as f64 / c1 as f64
+    );
+}
+
+/// A binding made in place (D7) is seen by no one who could tell: a closure
+/// that captured the scope before a later `let` keeps what it saw, in both
+/// evaluators; a resumption entered twice binds its own names each time.
+#[test]
+fn a_binding_made_in_place_is_seen_by_no_one_else() {
+    let captured = "pub fn main() / {IO} {\n  let x = 1\n  let y = 2\n  \
+                    let f = fn() { x + y }\n  let y = 5\n  let x = 7\n  \
+                    io.println(int.to_string(f() * 100 + x * 10 + y))\n}\n";
+    let (m, d) = parse_module(&Session::new(), captured);
+    assert!(d.is_empty(), "parse: {d:?}");
+    let (interp, _) = elya::eval::cek::run_module_value(&m).unwrap();
+    assert_eq!(interp.output(), "375\n", "the machine");
+    let tree = elya::eval::run_module_tree(&m).unwrap();
+    assert_eq!(tree.output(), "375\n", "the tree oracle");
+    // Each resumption reads the outer `a`, never the one the other bound.
+    let resumed = "effect multi Flip { fn flip() -> Bool }\n\
+                   pub fn main() -> Int {\n  let a = 5\n  handle {\n    \
+                   let t = if flip() { 1 } else { 2 }\n    let a = a + t\n    a\n  \
+                   } with multi {\n    \
+                   Flip.flip() -> resume(True) * 1000 + resume(False)\n    \
+                   return(x) -> x\n  }\n}\n";
+    let (_, v) = cost_and_value(resumed);
+    assert_eq!(v, "Int(6007)");
 }

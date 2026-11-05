@@ -195,9 +195,29 @@ impl Env {
         })))
     }
 
+    /// `self` with `name` bound to `v`: in place when nothing else holds
+    /// this environment's innermost scope (no closure captured it, no
+    /// continuation holds it), where the binding can be seen by no one else;
+    /// else in a new scope. A block's `let`s made a chain of one scope per
+    /// binding, and each name used below them walked it all (spec
+    /// 2026-10-31-elya-scalability D7).
+    pub fn bind(mut self, name: &str, v: Value) -> Env {
+        if let Some(scope) = self.0.as_mut().and_then(Rc::get_mut) {
+            scope.vars.insert(name.to_string(), v);
+            return self;
+        }
+        self.extend(&[(name.to_string(), v)])
+    }
+
     pub fn get(&self, name: &str) -> Option<Value> {
+        self.get_counting(name, &mut 0)
+    }
+
+    /// [`Env::get`], adding the scopes it visited to `visited`.
+    pub fn get_counting(&self, name: &str, visited: &mut u64) -> Option<Value> {
         let mut cur = self.0.as_deref();
         while let Some(scope) = cur {
+            *visited += 1;
             if let Some(v) = scope.vars.get(name) {
                 return Some(v.clone());
             }
@@ -243,6 +263,8 @@ pub struct Interp {
     peak_kont: usize,
     steps: u64,
     kont_work: u64,
+    /// Scopes a name's lookup visited (spec 2026-10-31-elya-scalability D8).
+    env_work: u64,
 }
 
 impl Interp {
@@ -254,6 +276,7 @@ impl Interp {
             peak_kont: 0,
             steps: 0,
             kont_work: 0,
+            env_work: 0,
         }
     }
     pub fn output(&self) -> &str {
@@ -268,10 +291,11 @@ impl Interp {
     }
     /// The machine's work, timing-free: steps taken plus every continuation node
     /// a whole-continuation operation visited or copied (the depth probe, a
-    /// perform's search and capture, a resume's re-installation). A program that
-    /// does linear work costs linearly; `tests/eval_complexity.rs` pins it.
+    /// perform's search and capture, a resume's re-installation), plus every
+    /// scope a name's lookup visited. A program that does linear work costs
+    /// linearly; `tests/eval_complexity.rs` pins it.
     pub fn cost(&self) -> u64 {
-        self.steps + self.kont_work
+        self.steps + self.kont_work + self.env_work
     }
     fn note_kont_work(&mut self, n: usize) {
         self.kont_work += n as u64;
@@ -587,7 +611,7 @@ pub mod tree {
             match &st.node {
                 Stmt::Let { name, value, .. } => {
                     let v = eval_expr(interp, value, &local, fns)?;
-                    local = local.extend(&[(name.clone(), v)]);
+                    local = local.bind(name, v);
                 }
                 Stmt::Expr(e) => {
                     eval_expr(interp, e, &local, fns)?;
@@ -616,7 +640,7 @@ pub mod tree {
             // Only in a module with a parse error, which is never run.
             Expr::Error => Err(rt(span, "a statement that did not parse")),
             Expr::Var(name) => {
-                if let Some(v) = env.get(name) {
+                if let Some(v) = env.get_counting(name, &mut interp.env_work) {
                     Ok(v)
                 } else if is_ctor_name(name) {
                     Ok(Value::Ctor(name.clone(), CtorArgs(Rc::new(Vec::new()))))
@@ -1217,7 +1241,7 @@ pub mod cek {
             Expr::Unit => State::Return(Value::Unit, k),
             Expr::Error => return Err(rt(span, "a statement that did not parse")),
             Expr::Var(name) => {
-                let v = if let Some(v) = env.get(name) {
+                let v = if let Some(v) = env.get_counting(name, &mut interp.env_work) {
                     v
                 } else if is_ctor_name(name) {
                     Value::Ctor(name.clone(), CtorArgs(Rc::new(Vec::new()))) // nullary constructor
@@ -1509,7 +1533,7 @@ pub mod cek {
                 tail,
                 env,
             } => {
-                let env2 = env.extend(&[(name, v)]);
+                let env2 = env.bind(&name, v);
                 step_block(stmts, cursor, tail, env2, rest)
             }
             Frame::SeqDrop {

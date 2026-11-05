@@ -418,3 +418,43 @@ fn an_escaped_resume_carries_a_clause_parameters_row() {
     let err = elya::check_source("t.elya", src).expect_err("World escapes its handler");
     assert!(err.contains("E0420"), "{err}");
 }
+
+/// A `let` inside a clause does not generalize the clause's `resume` types:
+/// the resumption's argument and answer are ONE type for the clause, as an
+/// annotation variable is for a function (spec
+/// 2026-10-31-elya-scalability, the review's finding 1). `h` generalized the
+/// answer type, `resume(fn(z) { z })` then bound it, and an `Int` and a
+/// `String` met in it: `check` called these clean and `run` stopped with
+/// "type error in binary operator". The first two were refused before the
+/// spec's D2 only because `g`'s scheme happened to mention the answer type.
+#[test]
+fn a_let_in_a_clause_does_not_generalize_the_resume_types() {
+    let clause = |body: &str| {
+        format!(
+            "effect Get(t) {{ fn get(n: Int) -> t }}\n\
+             fn f() -> String {{\n  let r = handle {{\n    let x = get(1)\n    \
+             let y = get(2)\n    x\n  }} with {{\n    Get.get(n) -> {{\n{body}\n    }}\n  }}\n  \
+             \"done\"\n}}\npub fn main() / {{IO}} {{ io.println(f()) }}\n"
+        )
+    };
+    let tail = "      if n == 1 {\n        let s = h(0)(\"s\")\n        fn(z) { z }\n      \
+                } else {\n        fn(k) { k + 1 }\n      }";
+    let with_g = clause(&format!(
+        "      let g = fn(y) {{ resume(y) }}\n      let h = fn(q) {{ resume(fn(z) {{ z }}) }}\n{tail}"
+    ));
+    let without_g = clause(&format!(
+        "      let h = fn(q) {{ resume(fn(z) {{ z }}) }}\n{tail}"
+    ));
+    for src in [with_g, without_g] {
+        let e = check_err(&src);
+        assert!(e.contains("E0400"), "{e}\n{src}");
+    }
+    // The same, the answer used at two types directly.
+    let twice = "effect Get(t) { fn get() -> t }\n\
+                 fn f() -> Int {\n  let r = handle { get() } with {\n    Get.get() -> {\n      \
+                 let g = fn(y) { resume(y) }\n      let h = fn(q) { resume(fn(z) { z }) }\n      \
+                 let a = h(0)(1)\n      let b = h(0)(\"s\")\n      fn(n) { n }\n    }\n  }\n  0\n}\n\
+                 pub fn main() -> Int { f() }\n";
+    let e = check_err(twice);
+    assert!(e.contains("E0400"), "{e}");
+}
