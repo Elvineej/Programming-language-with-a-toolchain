@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-11-05 16:55 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
+## 2026-11-05 21:35 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -13,7 +13,7 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   work continues on `main`.
 - At the maintainer's "continue when the limit resets, no stops", this session keeps
   two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
-  after the usage limit (primary)" about 5 h ahead (trig_012WFJHxdZgSbHq5NwMX3uFD) and
+  after the usage limit (primary)" about 5 h ahead (trig_016aRs1XFpMLiLoW1H27yAHa) and
   "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
 - **Done: strings by byte, one trace line format, `replay.parse`** (HANDOFF step 1;
   spec 2026-10-24-elya-trace-text, the scheduled run's spec and plan; implementation
@@ -139,8 +139,12 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   in it. **Decisions (mine; please review):** the environment's open entries
   (D2) rather than levels; a quantified variable never bound, asserted in
   debug builds; inference measured with the zonk.
-- Next: part 3a (rebase, gate, commit), then the native items in the spec's
-  section 3 (rooting by liveness, CPS joins, site paths).
+- Now: part 3a (the native passes find bindings without searching, D12):
+  reviewed (IR byte-identical over 405 suite modules and 3200 random programs;
+  nothing blocking, two test gaps being closed test-first), then the gate.
+  Part 3b (a block's binding is a root until its last reader, D13, and an
+  `ELYA_GC_STRESS` mode) written and tested, after it. Then CPS joins and site
+  paths. (A pause from 17:40 to 21:30: the usage limit.)
 - Windows-gate debt: 20a4804, fa24c18, and since then 499c048 and ba8b629
   (the next Windows run on `main` covers them).
 
