@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-10-31 23:31 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 01:22, re-dated at each checkpoint)
+## 2026-11-05 16:55 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -121,14 +121,26 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   `modules.rs`'s single-file guard from 10 examples to 8). The review found no
   blocking defect; its order finding was fixed test-first (a scope's deadlock
   ids sorted). Gate 1409 / 151 (predicted 1409).
-- HANDOFF step 1, compiler scalability (the maintainer's priority), in progress:
-  spec `docs/superpowers/specs/2026-10-31-elya-scalability-design.md`. Parts 1
-  and 2 (inference and the evaluators) are written and gated (1429 / 153, as
-  predicted; nine negative controls each fail their tests), not yet committed:
-  the independent review stopped at the usage limit and resumes after it. Part
-  3a (the native passes find bindings without searching) is written in the
-  scratchpad worktree `p3`: the IR of all 583 modules the codegen suite compiles
-  is byte-identical before and after.
+- (2026-10-31 23:31) The usage limit stopped the review; the session resumed
+  on 2026-11-05 (the resumes of 11-01 arrived then).
+- At the maintainer's "move everything of this project into E:" and "keep
+  working on the project in E: from now on" (2026-11-05): a full clone (every
+  branch, the work in progress on two local branches) and the working notes
+  went to `E:\Elya`; see HANDOFF's State for how it is kept in sync. The
+  maintainer asked for the tests on that PC too: a runner,
+  `E:\Elya\elya-test.bat`, logs to `E:\Elya\elya-test.log` (computer use on
+  the PC still read as off, so it was not started from here).
+- **Done: scalability parts 1 and 2** (HANDOFF step 1; spec
+  2026-10-31-elya-scalability; 033ee61): inference costs in proportion to the
+  program plus its types, the evaluators to their steps. Gate 1431 / 153
+  (predicted 1429, +2 for the review's test). Twelve controls each fail their
+  tests. The review (a differential run over 1259 programs) found one blocking
+  defect, fixed test-first: a clause's `resume` types generalized by a `let`
+  in it. **Decisions (mine; please review):** the environment's open entries
+  (D2) rather than levels; a quantified variable never bound, asserted in
+  debug builds; inference measured with the zonk.
+- Next: part 3a (rebase, gate, commit), then the native items in the spec's
+  section 3 (rooting by liveness, CPS joins, site paths).
 - Windows-gate debt: 20a4804, fa24c18, and since then 499c048 and ba8b629
   (the next Windows run on `main` covers them).
 
