@@ -25,7 +25,9 @@
 //! - K7, `open_covariant` resolving at every arrow (D1): the chain and two
 //!   towers fail;
 //! - K10, no `compress_rows` before the zonk (D5): closures calling a value
-//!   fail (ratio 3.35).
+//!   fail (ratio 3.35);
+//! - K26, a row variable bound to the younger one it meets (D15): aliases of
+//!   a function parameter fail (2.87).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -289,4 +291,121 @@ fn two_towers(n: usize) -> String {
 #[test]
 fn two_towers_unified_cost_in_proportion_to_their_types() {
     assert_in_proportion("two towers", two_towers, 30);
+}
+
+/// `n` closures over a function parameter: each closure's type mentions the
+/// parameter's, so each stays open in the environment, and every `let` after
+/// it asked what the environment leaves free (D14).
+fn closures_over_a_function_parameter(n: usize) -> String {
+    let body = (1..n)
+        .map(|i| format!("  let g{i} = fn() {{ k() + {i} }}"))
+        .collect();
+    lines(
+        &["fn f(k) {".to_string()],
+        body,
+        &[
+            &format!("  g{}()", n - 1),
+            "}",
+            "pub fn main() -> Int { f(fn() { 1 }) }",
+        ],
+    )
+}
+
+#[test]
+fn closures_over_a_function_parameter_infer_linearly() {
+    assert_linear(
+        "closures over a function parameter",
+        closures_over_a_function_parameter,
+        200,
+    );
+}
+
+/// `let k{i} = k{i-1}`, each alias called: a value of the parameter's type,
+/// open, under every later `let` (D14).
+fn aliases_of_a_function_parameter(n: usize) -> String {
+    let body = (1..n)
+        .flat_map(|i| {
+            [
+                format!("  let k{i} = k{}", i - 1),
+                format!("  let a{i} = (k{i}() + a{}) % 1000003", i - 1),
+            ]
+        })
+        .collect();
+    lines(
+        &[
+            "fn f(k) {".to_string(),
+            "  let k0 = k".to_string(),
+            "  let a0 = 0".to_string(),
+        ],
+        body,
+        &[
+            &format!("  a{}", n - 1),
+            "}",
+            "pub fn main() -> Int { f(fn() { 1 }) }",
+        ],
+    )
+}
+
+#[test]
+fn aliases_of_a_function_parameter_infer_linearly() {
+    assert_linear(
+        "aliases of a function parameter",
+        aliases_of_a_function_parameter,
+        200,
+    );
+}
+
+/// Non-value `let`s of function type, each beside a generalized one: each
+/// non-value binding stays open (its phantom rows until the group ends), and
+/// every generalized `let` after it asked about it (D14; D2's limit, the part 1
+/// review's finding 2).
+fn open_lets_beside_generalized_ones(n: usize) -> String {
+    let body = (0..n)
+        .flat_map(|i| {
+            [
+                format!("  let r{i} = id(fn(y) {{ y }})"),
+                format!("  let g{i} = fn(z) {{ z }}"),
+            ]
+        })
+        .collect();
+    lines(
+        &[
+            "fn id(x) { x }".to_string(),
+            "pub fn main() -> Int {".to_string(),
+        ],
+        body,
+        &[&format!("  r{}(g{}(1))", n - 1, n - 1), "}"],
+    )
+}
+
+#[test]
+fn open_lets_beside_generalized_ones_infer_linearly() {
+    assert_linear(
+        "open lets beside generalized ones",
+        open_lets_beside_generalized_ones,
+        200,
+    );
+}
+
+/// One recursive group of `n` functions, each binding a local `let`: every
+/// member is open while the group is inferred (D14; D2's limit).
+fn a_recursive_group_with_local_lets(n: usize) -> String {
+    let body = (0..n)
+        .map(|i| {
+            format!(
+                "fn f{i}(x: Int) -> Int {{ let t = fn(z) {{ z }}  if x == 0 {{ t(0) }} else {{ f{}(x - 1) }} }}",
+                (i + 1) % n
+            )
+        })
+        .collect();
+    lines(&[], body, &["pub fn main() -> Int { f0(3) }"])
+}
+
+#[test]
+fn a_recursive_group_with_local_lets_infers_linearly() {
+    assert_linear(
+        "a recursive group with local lets",
+        a_recursive_group_with_local_lets,
+        200,
+    );
 }

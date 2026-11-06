@@ -1,10 +1,11 @@
 # Compiler scalability: no step quadratic in a program's size
 
 **Status:** part 1 (inference) and part 2 (the evaluators) done (033ee61);
-part 3a (the native passes find bindings without searching, D12) and part 3b
-(a block's binding is a root until its last reader, D13) done; the rest of
-part 3 (CPS joins, site paths) measured, to be designed (2026-11-05, on
-`main`, an interactive session). HANDOFF step 1, the maintainer's priority (2026-10-30: "compiler
+part 3a (the native passes find bindings without searching, D12), part 3b
+(a block's binding is a root until its last reader, D13) and part 4
+(generalization by levels, D14-D16) done; the rest of part 3 (CPS joins,
+site paths) measured, to be designed (2026-11-05, on `main`, an interactive
+session). HANDOFF step 1, the maintainer's priority (2026-10-30: "compiler
 scalability is still fragile"). The design choices are Claude's under the
 maintainer's delegation (rule 2).
 
@@ -85,8 +86,9 @@ local `let`'s phantom tail closed when its group ends), which holds nothing.
   entry's own quantified variables), so `generalize`, `generalize_toplevel` and
   the skolem-escape check (E0435) walk those entries alone. A closed scheme can
   gain nothing free (the invariant above), so skipping it changes no answer.
-  - Rejected: levels (OCaml's ranks): every variable's creation and every
-    binding would carry a level, a larger change resting on the same invariant;
+  - Rejected at first: levels (OCaml's ranks): every variable's creation and
+    every binding would carry a level, a larger change resting on the same
+    invariant (taken in part 4, D14: what D2 kept below cost cubic time);
     shared, hash-consed types (`Rc`): every consumer of `Ty`, the back end's
     included, would change.
 - **D3. `unify` follows heads, not whole types.** Each level follows its two
@@ -130,6 +132,67 @@ local `let`'s phantom tail closed when its group ends), which holds nothing.
   measured without it, closures calling a value looked linear). The tests also count
   allocations (a counting allocator in the test binary, per thread): copying
   (D1's `resolve_row`) visits nothing it would not anyway, but allocates.
+
+## 1b. Decisions, part 4: generalization by levels (2026-11-05)
+
+Measured (release CLI, `elya check`, at main af3be7e): closures over a function
+parameter (`fn f(k) { let g{i} = fn() { k() + i } .. }`) 1.65 / 18.1 s at 1000
+/ 2000, killed at 4000 (memory, 78 s); aliases of one, each called (`let k{i} =
+k{i-1}`), 2.1 / 14.4 / 110 s at 1000 / 2000 / 4000: cubic. Non-value `let`s of
+function type beside generalized ones (D2's limit, section 4) 0.46 / 2.7 /
+15.3 s; one recursive group whose members each bind a local `let` 2.7 / 21.5 s,
+over 120 s at 4000. Three causes, each a decision.
+
+- **D14. A `let` quantifies what its value made, by level.** Each type and
+  row variable records the depth of `let` values it was made inside (`level`,
+  `row_level`, `cur_level`: a `let`'s value, its annotation's check included,
+  is inferred one level in). Binding a variable to a type (`bind`, `bind_row`)
+  lowers every unbound variable the type mentions to the bound variable's
+  level: what it stood for is where it was. A non-value `let`, not
+  generalized, lowers its type's variables to the `let`'s own level: they are
+  the environment's from then on. A generalized `let` quantifies the
+  variables its type mentions above its level, less those kept monomorphic
+  for reasons of their own (the function's annotation variables and named
+  rows, the enclosing clauses' `resume` types, the rows of handles still
+  being filled, the generic sites not yet checked: read as before). What the
+  `let` leaves unquantified is then lowered to its level: the environment's
+  from then on (a variable kept monomorphic above it, left there, was
+  quantified by a later `let`: the review's finding). What the environment
+  leaves free sits at the `let`'s level or below, so no binding in scope is
+  read. D2's open entries stay, for the skolem-escape check (E0435) and a
+  top-level group's outside, and as the check: under
+  `elya::types::check_levels` (or `ELYA_CHECK_LEVELS` set) every `let` is
+  generalized both ways and a difference panics. Run over the root and
+  codegen suites: none (only the new complexity tests failed, by design:
+  D2's walk is what they measure). D2's invariant is unchanged (asserted in
+  debug builds).
+  - Found with it (the review), older than levels: the rows inside an
+    annotation variable's type were not kept. `let f: b = fn(x) { x + 1 }`
+    makes `b`, one type for the whole function, an arrow with a row, and
+    `f`'s scheme quantified that row; `Ask` arriving in it later (`b` met
+    the type of a function performing `Ask`, inside a handle) bound a
+    quantified row (a debug build stopped at D2's assertion), and a release
+    build checked `f(1)` outside the handle clean. Kept now, with the
+    annotation variables' type variables: such a program is refused, E0420
+    (three of the review's programs; none in the suite or the 1000 programs
+    of its generator).
+  - Also: the environment's free variables collected through a set, not a
+    list (`acc.contains`): every entry's variables were checked against all
+    met before them (the cross-check and E0435 still read them).
+- **D15. A row variable unified with another is bound to the older.** A call
+  unifies its callee's row with the call's fresh one; binding the callee's to
+  the fresh one made a parameter's row grow a link at every call (`1 -> 2 ->
+  4 -> 6 ..`), and each closure's row, bound to the end then, was read through
+  every link after it: entries times links at every `let`, the cubic. Bound
+  younger to older (the larger index to the smaller), the old variable stays
+  the representative. Nothing else differs: a meaningful variable bound to a
+  phantom one hands its meaning on either way (`bind_row`).
+- **D16. A flush reads the group's parameters only for a member inclusion.**
+  Every flush (every lambda's end) read every parameter of the recursive
+  group being inferred, to test member inclusions for a relay; with none
+  pending it now reads none. With member inclusions pending (recursion
+  through a lambda or a handle body) it still reads them all: flushes times
+  the group's parameters, recorded in section 4.
 
 ## 2. Decisions, part 2: the evaluators
 
@@ -236,17 +299,16 @@ shadowed value counted every key.
   nested in lambdas: depth times calls); `generalize` reads the pending clause
   rows, deferred rows and generic sites at every `let`. Both bounded by what is
   open at once, not by the program; measured clean on every shape above.
-- **A limit D2 keeps (the review's finding 2):** generalization reads every
-  binding still open, so bindings that stay open pile up: a block of non-value
-  `let`s of function type (`let r = id(fn(y) { y })`, its phantom rows open
-  until the group ends) under generalized `let`s is quadratic (4000 of each:
-  16.2 s, 14.8 s before D2), and so is a large recursive group whose members
-  each bind a local `let` (every member is open while the group is inferred).
-  Levels (OCaml's ranks) would remove it: each variable created at the
-  current depth of `let`s, lowered when bound into a shallower type, and
-  generalized when deeper than the `let` being closed, with no walk of the
-  environment. Not taken here: every creation and binding of a variable
-  changes.
+- **A limit D2 kept (the review's finding 2), removed by D14:** generalization
+  read every binding still open, so bindings that stay open piled up: a block
+  of non-value `let`s of function type (`let r = id(fn(y) { y })`, its phantom
+  rows open until the group ends) under generalized `let`s was quadratic (4000
+  of each: 16.2 s, 14.8 s before D2), and so was a large recursive group whose
+  members each bind a local `let`. Levels read none (part 4: 0.12 s and
+  0.28 s at 4000).
+- What part 4 keeps: E0435's check and a top-level group's outside read the
+  open entries (once per `with any` clause, once per group); a flush with
+  member inclusions pending reads the group's parameters (D16).
 - One top-level group's outside is read once for the whole group (the
   review's finding 3: per member, a group of 4000 took 35 s), its members'
   names in a set.
@@ -302,3 +364,25 @@ Part 3b (D13):
   sweep programs, 1200 generated and 26 adversarial ones under stress,
   base and change alike; of 600 modules' IR, 505 the same byte for byte and
   95 differing only by `gc_push` / `gc_pop` calls removed.
+
+Part 4 (D14-D16), release CLI, `elya check`, at 1000 / 2000 / 4000, before (main
+af3be7e) and after: closures over a function parameter 1.65 / 18.1 s / killed
+(78 s) and 0.04 / 0.05 / 0.07 s; aliases of one 2.1 / 14.4 / 110 s and 0.02 /
+0.04 / 0.18 s; non-value lets beside generalized ones 0.46 / 2.7 / 15.3 s and
+0.03 / 0.11 / 0.12 s; a recursive group with local lets 2.7 / 21.5 / over 120 s
+and 0.04 / 0.19 / 0.28 s. Tests: `tests/infer_complexity.rs` (+4, red first:
+7.55 and 7.35 for the first two, the cubic; 3.29 for the group under D14 and
+D15 alone), `tests/levels_agree.rs` (new, 6: the examples, the ui tests, the
+row-parameter program, ten programs written for levels, the open shapes and
+eight of the review's, all under `check_levels`; an annotation variable's
+row one row for the function; an effect hidden through an annotated `let`
+still refused). Controls: K23 a non-value `let` not lowering its type
+(fails the written programs: a closure over its value quantified `L(b)`'s
+`b`); K24 `bind` not lowering (the written programs and the open shapes);
+K25 `bind_row` not lowering (the same); K26 rows bound older to younger
+(aliases, 2.87); K27 quantifying at the `let`'s own level too (both); K30 a
+`let` not lowering what it leaves unquantified, K32 its annotation checked
+outside its level, K33 `resume` types not kept (the review's programs); K31
+an annotation variable's rows not kept (those and both refusals). The
+review: 1000 generated programs agree and check as before levels; the
+codegen suite under `ELYA_CHECK_LEVELS` passes (322).

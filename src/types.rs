@@ -530,6 +530,35 @@ pub struct Infer {
     /// types were quantified, and bound later).
     quantified: HashSet<u32>,
     quantified_rows: HashSet<RowVar>,
+    /// Each type variable's level, and each row variable's (spec
+    /// 2026-10-31-elya-scalability D14): the depth of `let` values it was
+    /// made inside, lowered to a variable's own when it is bound to a type
+    /// that mentions it. A `let` at depth `d` quantifies what its type
+    /// mentions above `d` and nothing else: what the environment leaves free
+    /// sits at `d` or below. Asking the environment instead read every
+    /// binding in scope that leaves a variable free, at every `let`.
+    level: Vec<u32>,
+    row_level: Vec<u32>,
+    cur_level: u32,
+    /// Generalization also asks the environment (D2) and asserts both agree
+    /// (`check_levels`, or `ELYA_CHECK_LEVELS` set: every inference checked).
+    levels_check: bool,
+}
+
+thread_local! {
+    static CHECK_LEVELS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with every `let`'s generalization on this thread computed both
+/// ways, by levels (D14) and by asking the environment (D2), and a panic if
+/// they differ: `tests/levels_agree.rs` runs the corpus under it. A check, not
+/// an interface.
+#[doc(hidden)]
+pub fn check_levels<R>(f: impl FnOnce() -> R) -> R {
+    let before = CHECK_LEVELS.with(|c| c.replace(true));
+    let out = f();
+    CHECK_LEVELS.with(|c| c.set(before));
+    out
 }
 
 impl Infer {
@@ -573,6 +602,11 @@ impl Infer {
             steps: std::cell::Cell::new(0),
             quantified: HashSet::new(),
             quantified_rows: HashSet::new(),
+            level: Vec::new(),
+            row_level: Vec::new(),
+            cur_level: 0,
+            levels_check: CHECK_LEVELS.with(|c| c.get())
+                || std::env::var_os("ELYA_CHECK_LEVELS").is_some(),
         }
     }
 
@@ -868,6 +902,7 @@ impl Infer {
     pub fn fresh(&mut self) -> Ty {
         let id = self.subst.len() as u32;
         self.subst.push(None);
+        self.level.push(self.cur_level);
         Ty::Var(id)
     }
 
@@ -875,7 +910,56 @@ impl Infer {
     pub fn fresh_row(&mut self) -> RowVar {
         let id = self.row_subst.len() as u32;
         self.row_subst.push(None);
+        self.row_level.push(self.cur_level);
         id
+    }
+
+    /// Every unbound variable `t` mentions, types and rows, at most at level
+    /// `lvl` from now on (D14).
+    fn lower_levels(&mut self, t: &Ty, lvl: u32) {
+        let t = self.resolve(t);
+        self.lower_walk(&t, lvl);
+    }
+
+    /// `lower_levels` on a resolved type.
+    fn lower_walk(&mut self, t: &Ty, lvl: u32) {
+        self.step();
+        match t {
+            Ty::Var(u) => {
+                let l = &mut self.level[*u as usize];
+                if *l > lvl {
+                    *l = lvl;
+                }
+            }
+            Ty::Base(_) | Ty::Error => {}
+            Ty::Fn(ps, row, r) => {
+                for p in ps {
+                    self.lower_walk(p, lvl);
+                }
+                self.lower_row_walk(row, lvl);
+                self.lower_walk(r, lvl);
+            }
+            Ty::Tuple(xs) | Ty::Con(_, xs) => {
+                for x in xs {
+                    self.lower_walk(x, lvl);
+                }
+            }
+        }
+    }
+
+    /// `lower_levels` on a resolved row: its labels' arguments and its tail.
+    fn lower_row_walk(&mut self, row: &EffectRow, lvl: u32) {
+        for l in row.labels.values() {
+            for a in &l.args {
+                self.lower_walk(a, lvl);
+            }
+        }
+        if let RowTail::Open(w) = row.tail {
+            let l = &mut self.row_level[w as usize];
+            if *l > lvl {
+                *l = lvl;
+            }
+        }
     }
 
     /// Deep-zonk a row: follow the tail through `row_subst`, accumulating the
@@ -1050,6 +1134,9 @@ impl Infer {
             !self.quantified.contains(&v),
             "a quantified type variable was bound (spec 2026-10-31-elya-scalability D2)"
         );
+        // What `v` stood for is where `v` was (D14).
+        let lvl = self.level[v as usize];
+        self.lower_levels(t, lvl);
         self.subst[v as usize] = Some(t.clone());
         if let Some(origin) = self.eq_vars.get(&v).copied() {
             self.require_data(t, span, Some(origin));
@@ -1334,8 +1421,14 @@ impl Infer {
         match (t1, t2) {
             (RowTail::ErrorRow, _) | (_, RowTail::ErrorRow) => {}
             (RowTail::Open(a), RowTail::Open(b)) => {
-                if a != b {
-                    self.bind_row(*a, &EffectRow::open(*b), span);
+                // The younger bound to the older (spec
+                // 2026-10-31-elya-scalability D14): a call binds its callee's
+                // row to the call's fresh one, and binding the older let a
+                // parameter's row grow a link at every call, each read of it
+                // walking all of them.
+                let (young, old) = if a > b { (*a, *b) } else { (*b, *a) };
+                if young != old {
+                    self.bind_row(young, &EffectRow::open(old), span);
                 }
             }
             (RowTail::Open(a), RowTail::Closed) | (RowTail::Closed, RowTail::Open(a)) => {
@@ -1412,6 +1505,9 @@ impl Infer {
                 self.unmark_phantom(w);
             }
         }
+        // And its level, as `bind` does (D14).
+        let lvl = self.row_level[v as usize];
+        self.lower_row_walk(&resolved, lvl);
         self.row_subst[v as usize] = Some(resolved);
         self.wake_inclusions(v);
     }
@@ -1548,9 +1644,15 @@ impl Infer {
                     }
                 }
             }
+            // The group's parameters' rows, read only when a member inclusion
+            // needs them: every flush read every member's parameters, and a
+            // flush ends every lambda, a large group's members' lambdas
+            // included (D14's recursive group, ratio 3.29 a doubling).
             let mut relayed = Vec::new();
-            for p in self.group_params.clone() {
-                free_row_vars(self, &p, &mut relayed);
+            if !self.pending_member_incl.is_empty() {
+                for p in self.group_params.clone() {
+                    free_row_vars(self, &p, &mut relayed);
+                }
             }
             for (src, dst, span) in self.pending_member_incl.clone() {
                 self.step();
@@ -2160,8 +2262,12 @@ impl Infer {
         for st in b.stmts.iter() {
             match &st.node {
                 Stmt::Let { name, ann, value } => {
+                    // The value one level in (D14): what it makes there and
+                    // nothing outside comes to mention is its own.
+                    self.cur_level += 1;
                     let t = self.infer_expr(value, env, amb);
                     self.check_ann(ann, &t, true);
+                    self.cur_level -= 1;
                     // Record an affine binding site (Slice 4d-2): a `let` whose
                     // value has a `linear`-declared type. Keyed by the value span,
                     // which the affine pass reads to recognise the binding.
@@ -2174,6 +2280,10 @@ impl Infer {
                     let scheme = if is_syntactic_value(&value.node) {
                         self.generalize(&t, env)
                     } else {
+                        // Not generalized, so its variables are the
+                        // environment's from here on: at this level.
+                        let lvl = self.cur_level;
+                        self.lower_levels(&t, lvl);
                         Scheme {
                             vars: Vec::new(),
                             row_vars: Vec::new(),
@@ -3505,8 +3615,87 @@ impl Infer {
         let resolved = self.resolve(t);
         let mut in_ty = Vec::new();
         free_vars(self, &resolved, &mut in_ty);
+        let mut row_in_ty = Vec::new();
+        free_row_vars(self, &resolved, &mut row_in_ty);
+        let (kept, kept_rows) = self.kept_monomorphic();
+        // What the environment leaves free sits at this level or below
+        // (D14): the value's own variables are those above it.
+        let lvl = self.cur_level;
+        let vars: Vec<u32> = in_ty
+            .iter()
+            .copied()
+            .filter(|v| self.level[*v as usize] > lvl && !kept.contains(v))
+            .collect();
+        let row_vars: Vec<RowVar> = row_in_ty
+            .iter()
+            .copied()
+            .filter(|v| self.row_level[*v as usize] > lvl && !kept_rows.contains(v))
+            .collect();
+        if self.levels_check {
+            // D2's answer: the variables the environment's open entries
+            // resolve to now.
+            let mut in_env = Vec::new();
+            env_free_vars(self, env, &mut in_env);
+            let in_env: HashSet<u32> = in_env.into_iter().collect();
+            let mut row_in_env = Vec::new();
+            env_free_row_vars(self, env, &mut row_in_env);
+            let row_in_env: HashSet<RowVar> = row_in_env.into_iter().collect();
+            let by_env: Vec<u32> = in_ty
+                .iter()
+                .copied()
+                .filter(|v| !in_env.contains(v) && !kept.contains(v))
+                .collect();
+            let rows_by_env: Vec<RowVar> = row_in_ty
+                .iter()
+                .copied()
+                .filter(|v| !row_in_env.contains(v) && !kept_rows.contains(v))
+                .collect();
+            assert_eq!(
+                (&vars, &row_vars),
+                (&by_env, &rows_by_env),
+                "levels (left) and the environment (right) generalize {} differently \
+                 at level {lvl} (spec 2026-10-31-elya-scalability D14)",
+                display_scheme(
+                    self,
+                    &Scheme {
+                        vars: Vec::new(),
+                        row_vars: Vec::new(),
+                        ty: resolved.clone(),
+                    }
+                ),
+            );
+        }
+        // What the `let` leaves unquantified is the environment's from now on,
+        // at this level: a variable kept monomorphic above it (an annotation
+        // variable's row, a `resume` type) was quantified by a later `let`
+        // otherwise (the review of part 4).
+        let quantified: HashSet<u32> = vars.iter().copied().collect();
+        for v in &in_ty {
+            if !quantified.contains(v) && self.level[*v as usize] > lvl {
+                self.level[*v as usize] = lvl;
+            }
+        }
+        let quantified_rows: HashSet<RowVar> = row_vars.iter().copied().collect();
+        for v in &row_in_ty {
+            if !quantified_rows.contains(v) && self.row_level[*v as usize] > lvl {
+                self.row_level[*v as usize] = lvl;
+            }
+        }
+        self.quantified.extend(vars.iter().copied());
+        self.quantified_rows.extend(row_vars.iter().copied());
+        Scheme {
+            ty: resolved,
+            vars,
+            row_vars,
+        }
+    }
+
+    /// What a `let` never quantifies besides what the environment leaves
+    /// free: the function's annotation variables and named rows, the
+    /// enclosing clauses' `resume` types, the rows of handles still being
+    /// filled, and those a `with any` handler handles, not yet checked.
+    fn kept_monomorphic(&mut self) -> (HashSet<u32>, HashSet<RowVar>) {
         let mut in_env = Vec::new();
-        env_free_vars(self, env, &mut in_env);
         // The function's annotation variables are part of the environment: a
         // lowercase name is ONE type for the whole function, so an inner `let`
         // must not quantify it (the annotations review's F1: a later binding
@@ -3540,13 +3729,12 @@ impl Infer {
                 free_vars(self, &phantom(EffectRow::open(r)), &mut in_env);
             }
         }
-        let in_env: HashSet<u32> = in_env.into_iter().collect();
-        let vars: Vec<u32> = in_ty.into_iter().filter(|v| !in_env.contains(v)).collect();
-
-        let mut row_in_ty = Vec::new();
-        free_row_vars(self, &resolved, &mut row_in_ty);
         let mut row_in_env = Vec::new();
-        env_free_row_vars(self, env, &mut row_in_env);
+        // The rows inside the annotation variables' types too: `let f: b =
+        // fn(x) { .. }` makes `b` an arrow with a row (the review of part 4).
+        for t in self.ann_vars.values().cloned().collect::<Vec<_>>() {
+            free_row_vars(self, &t, &mut row_in_env);
+        }
         for (arg, result, rows) in &resumes {
             free_row_vars(self, arg, &mut row_in_env);
             free_row_vars(self, result, &mut row_in_env);
@@ -3582,18 +3770,10 @@ impl Infer {
                 row_in_env.push(v);
             }
         }
-        let row_in_env: HashSet<RowVar> = row_in_env.into_iter().collect();
-        let row_vars: Vec<RowVar> = row_in_ty
-            .into_iter()
-            .filter(|v| !row_in_env.contains(v))
-            .collect();
-        self.quantified.extend(vars.iter().copied());
-        self.quantified_rows.extend(row_vars.iter().copied());
-        Scheme {
-            ty: resolved,
-            vars,
-            row_vars,
-        }
+        (
+            in_env.into_iter().collect(),
+            row_in_env.into_iter().collect(),
+        )
     }
 
     /// Close a function's ambient residual tail *unless* that tail is relayed
@@ -4070,12 +4250,16 @@ fn free_vars(inf: &Infer, t: &Ty, acc: &mut Vec<u32>) {
 /// What the environment leaves free: the variables its open entries (D2)
 /// resolve to now, less each entry's own quantified ones.
 fn env_free_vars(inf: &Infer, env: &TyEnv, acc: &mut Vec<u32>) {
+    // Each variable once, by a set: asked of the list, every entry's
+    // variables were checked against all those met before it, entries times
+    // variables (D14).
+    let mut seen: HashSet<u32> = acc.iter().copied().collect();
     for (_, scheme, left) in env.open_entries() {
         inf.step();
         let mut fv = Vec::new();
         free_vars(inf, left, &mut fv);
         for v in fv {
-            if !scheme.vars.contains(&v) && !acc.contains(&v) {
+            if !scheme.vars.contains(&v) && seen.insert(v) {
                 acc.push(v);
             }
         }
@@ -4120,12 +4304,13 @@ fn free_row_vars(inf: &Infer, t: &Ty, acc: &mut Vec<RowVar>) {
 
 /// The row variables the environment leaves free (D2), as `env_free_vars`.
 fn env_free_row_vars(inf: &Infer, env: &TyEnv, acc: &mut Vec<RowVar>) {
+    let mut seen: HashSet<RowVar> = acc.iter().copied().collect();
     for (_, scheme, left) in env.open_entries() {
         inf.step();
         let mut fv = Vec::new();
         free_row_vars(inf, left, &mut fv);
         for v in fv {
-            if !scheme.row_vars.contains(&v) && !acc.contains(&v) {
+            if !scheme.row_vars.contains(&v) && seen.insert(v) {
                 acc.push(v);
             }
         }
