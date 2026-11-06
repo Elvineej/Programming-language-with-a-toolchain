@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-11-06 10:35 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
+## 2026-11-06 13:17 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -161,12 +161,16 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   programs that checked clean are refused (E0420), as "an annotation
   variable is one type for the function" says.
 - **HANDOFF step 1 (scalability) moved to Done**; what it left is the new
-  step 5. Now: the new step 1, the affine guarantee across functions
-  (measured: eight double uses accepted, two sound programs refused).
+  step 5. Now: the new step 1, the affine guarantee across functions;
+  measured again wider: 17 double uses accepted, 3 sound programs refused.
+  Spec 2026-11-06-elya-affine-across-functions (D1-D8: duplicable types as
+  marks on type variables, counting by arm and by a closure's calls, holds on
+  row variables for multi-shot points; new E0437) and its plan committed;
+  red tests next.
   (Pauses from 17:40 to 21:30, 02:41 to 04:18 and 07:40 to 09:30: the usage
   limit and a restart.)
-- The E: clone's working files are at c604eac (the computer is not linked
-  now: part 4 goes there when it is); its history waits on
+- The E: clone's working files are at b08164a (written 2026-11-06); its
+  history waits on
   `E:\Elya\elya-sync.bat`.
 - Windows-gate debt: 20a4804, fa24c18, and since then 499c048 and ba8b629
   (the next Windows run on `main` covers them).
