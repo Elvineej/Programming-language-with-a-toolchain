@@ -25,7 +25,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   runs the gate there (log `E:\Elya\elya-test.log`). Neither has run yet.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1436 passed, 154 suites. Native programs run on
+- Linux gate at the tip of `main`: 1443 passed, 155 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). In October the runtime
   gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -693,13 +693,20 @@ fragile"). Spec `docs/superpowers/specs/2026-10-31-elya-scalability-design.md`.
     review: 405 more and 3200 random programs).
     `crates/codegen/tests/native_scalability.rs` pins it (probes and IR
     lines, not timings: a pass that searches a list of its own is not seen).
-  - **rooting at every allocation pushes every pointer in scope**: a block of
-    2000 string statements emits 8M IR lines (2M at 1000). Written and tested
-    (part 3b, `land/part-3b`, under review): a block's binding is a root until
-    its last reader (spec D13), and an `ELYA_GC_STRESS` mode that collects at
-    every allocation and catches a root naming a freed block; 2000 strings
-    emit 18K lines. What stays: values all live to a block's end are rooted
-    at every allocation (n^2);
+  - **Part 3b done** (c604eac, 2026-11-05): a block's binding is a root
+    until its last reader (spec D13): 2000 string statements emit 18K IR
+    lines (8M before). `ELYA_GC_STRESS=N` (runtime.c, off unless set)
+    collects at every Nth allocation, keeps what it frees poisoned, and stops
+    a program in which anything reachable names a freed block;
+    `crates/codegen/tests/native_gc_stress.rs` runs twelve programs under it.
+    What stays: values all live to a block's end are rooted at every
+    allocation (n^2; rooting once at the binding would not be, spec D13);
+  - **Part 4 written, gated (1457 / 157), under review** (local branch
+    `wip/scalability-part-4`, uncommitted in the scratchpad worktree `w4`):
+    a `let` generalizes by level, not by reading the environment (spec
+    D14-D16, found by part 3a's review). Closures over a function parameter
+    were cubic in the front end (4000: killed at 78 s; now 0.07 s);
+    aliases of one 110 s to 0.18 s; D2's recorded limits linear too;
   - a site in an `if` arm copies the rest of its block into its continuation
     as well as after the branch: sites times length (84K / 280K / 1009K IR
     lines at 2000 / 4000 / 8000 statements, one such site per 1000). A join

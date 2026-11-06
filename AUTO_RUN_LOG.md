@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-11-05 21:50 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
+## 2026-11-06 04:20 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -13,7 +13,7 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   work continues on `main`.
 - At the maintainer's "continue when the limit resets, no stops", this session keeps
   two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
-  after the usage limit (primary)" about 5 h ahead (trig_016aRs1XFpMLiLoW1H27yAHa) and
+  after the usage limit (primary)" about 5 h ahead (trig_01PzpjXgBE5s9V65ED5juMBz) and
   "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
 - **Done: strings by byte, one trace line format, `replay.parse`** (HANDOFF step 1;
   spec 2026-10-24-elya-trace-text, the scheduled run's spec and plan; implementation
@@ -144,10 +144,17 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   review's test). The review (IR byte-identical over 405 suite modules, 3200
   random programs) found nothing blocking; its two test gaps closed
   test-first (an `Env` unit test, a shadowing row; control K22 fails both).
-- Now: part 3b (a block's binding is a root until its last reader, D13, and an
-  `ELYA_GC_STRESS` mode), on `land/part-3b`, under review. Then CPS joins and
-  site paths. (A pause from 17:40 to 21:30: the usage limit.)
-- The E: clone's working files are at dfe9c10; its history waits on
+- **Done: scalability part 3b** (HANDOFF step 1; c604eac): a block's binding
+  is a root until its last reader (D13), and the `ELYA_GC_STRESS` mode. Gate
+  1443 / 155 (predicted). The review (2400 programs under stress, base and
+  change alike; 600 modules' IR) found nothing unsound; its findings fixed
+  test-first (the CPS value-position loop untested: controls K28, K29; the
+  stress check widened to everything grayed; fmt; figures).
+- Now: part 4 (generalization by levels, D14-D16; found by part 3a's
+  review: closures over a function parameter cubic in the front end), gated
+  1457 / 157, under review. Then the remaining native items. (Pauses from
+  17:40 to 21:30 and from 02:41 to 04:18: the usage limit.)
+- The E: clone's working files are at c604eac; its history waits on
   `E:\Elya\elya-sync.bat`.
 - Windows-gate debt: 20a4804, fa24c18, and since then 499c048 and ba8b629
   (the next Windows run on `main` covers them).
