@@ -3,7 +3,7 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-11-05, an interactive session on `main`)
+## State at handoff (updated 2026-11-06, an interactive session on `main`)
 
 - **Work lands on `main` directly** (the maintainer, 2026-10-30: "Commit in the main
   tho"). `main` has everything: #24 (2026-10-24), then `auto/elya`'s 15 commits since,
@@ -25,7 +25,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   runs the gate there (log `E:\Elya\elya-test.log`). Neither has run yet.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1443 passed, 155 suites. Native programs run on
+- Linux gate at the tip of `main`: 1463 passed, 157 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). In October the runtime
   gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -666,58 +666,33 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
     effect that leaked into the tasks' row (now two functions). Nested scopes
     written inline are refused natively by name: older, step 4's.
 
+- **Compiler scalability: no step quadratic in a program's size** (2026-10-31 to
+  2026-11-06, on `main`; step 1): spec
+  `docs/superpowers/specs/2026-10-31-elya-scalability-design.md`.
+  - Parts 1 and 2 (033ee61): inference in proportion to the program plus its
+    types, the evaluators to their steps (`tests/infer_complexity.rs`,
+    `tests/eval_complexity.rs`).
+  - Part 3a (dfe9c10): the native passes find a name without searching (`Scope`,
+    `Env`); a parameter down 16 000 statements emits in 1.5 s (9.2 s).
+  - Part 3b (c604eac): a block's binding is a root until its last reader; 2000
+    string statements emit 18K IR lines (8M). `ELYA_GC_STRESS=N` collects at
+    every Nth allocation and stops a program in which anything reachable names
+    a freed block (`crates/codegen/tests/native_gc_stress.rs`).
+  - Part 4 (60c108b): a `let` generalizes by level, not by reading the
+    environment (D14-D16). Closures over a function parameter were cubic in the
+    front end (4000: killed at 78 s; now 0.07 s). The environment's answer is
+    kept as a check (`elya::types::check_levels`, `ELYA_CHECK_LEVELS=1`);
+    `tests/levels_agree.rs`. Found with it, older: an annotation variable's
+    rows were quantifiable (three programs that checked clean are now refused,
+    E0420, as "one type for the function" says).
+  - **Decisions (mine; please review):** levels after all (D2's open entries
+    first, then levels when the review found the cubic); liveness, not rooting
+    once at the binding (spec D13); a stress mode in the runtime, outside
+    `gc_mark`. What it left is step 5.
+
 ## The next five steps
 
-### 1. Compiler scalability: no step quadratic in a program's size
-
-The maintainer's priority (2026-10-30: "compiler scalability is still
-fragile"). Spec `docs/superpowers/specs/2026-10-31-elya-scalability-design.md`.
-- **Parts 1 and 2 done** (033ee61, 2026-10-31): inference costs in
-  proportion to the program plus the types it writes (a chain of closures:
-  link `i`'s type is `i` arrows, n^2 in all), the evaluators in proportion to
-  their steps. At ten times the sizes measured here before (debug CLI): 1000
-  chained closures 10 s (6.5 s at 100 before), 50 000 statements using a
-  parameter, run, 2 s (4.5 s at 5 000), 500 nested performs 5 s (8.4 s at 100;
-  the parser stops at 1024 levels), 40 000 functions, lets or closures 3 to 6 s
-  each (they were quadratic too: 4000 functions took 13.5 s natively).
-  `tests/infer_complexity.rs` and `tests/eval_complexity.rs` pin them. Kept
-  (spec section 4): bindings left open pile up (non-value `let`s of function
-  type, the members of a large recursive group with local `let`s), and
-  generalization reads each; levels would remove it.
-- **Left, measured (part 3, natively):**
-  - **Part 3a done** (dfe9c10, 2026-11-05): the native passes find a name
-    without searching (`crates/codegen/src/scope.rs`: `Scope`, and `Env`,
-    which keeps its pointers apart). A parameter down 16 000 statements emits
-    in 1.5 s (9.2 s before), 16 000 closures in 4.0 s (283 s). The IR of every
-    module the suite compiles is the same byte for byte (583 modules; the
-    review: 405 more and 3200 random programs).
-    `crates/codegen/tests/native_scalability.rs` pins it (probes and IR
-    lines, not timings: a pass that searches a list of its own is not seen).
-  - **Part 3b done** (c604eac, 2026-11-05): a block's binding is a root
-    until its last reader (spec D13): 2000 string statements emit 18K IR
-    lines (8M before). `ELYA_GC_STRESS=N` (runtime.c, off unless set)
-    collects at every Nth allocation, keeps what it frees poisoned, and stops
-    a program in which anything reachable names a freed block;
-    `crates/codegen/tests/native_gc_stress.rs` runs twelve programs under it.
-    What stays: values all live to a block's end are rooted at every
-    allocation (n^2; rooting once at the binding would not be, spec D13);
-  - **Part 4 written, gated (1457 / 157), under review** (local branch
-    `wip/scalability-part-4`, uncommitted in the scratchpad worktree `w4`):
-    a `let` generalizes by level, not by reading the environment (spec
-    D14-D16, found by part 3a's review). Closures over a function parameter
-    were cubic in the front end (4000: killed at 78 s; now 0.07 s);
-    aliases of one 110 s to 0.18 s; D2's recorded limits linear too;
-  - a site in an `if` arm copies the rest of its block into its continuation
-    as well as after the branch: sites times length (84K / 280K / 1009K IR
-    lines at 2000 / 4000 / 8000 statements, one such site per 1000). A join
-    (the conditional itself a site whose frame the arms continue to);
-  - a site's path holds every `let` above it, its resumption reads that path
-    quadratically, and its saved set reads the whole rest of its block;
-  - anf's rule 4 renames the rest of a block at each alias of a
-    row-polymorphic local: 2.4 s to emit 800 aliases (found by part 3a's
-    review); the front end on the same shape 26.7 s.
-
-### 2. The affine guarantee across functions
+### 1. The affine guarantee across functions
 
 The maintainer's priority (2026-10-30: "the affine resource guarantee is
 incomplete"). `linear` values are checked within one function body (slice
@@ -730,7 +705,17 @@ multiplicity, inferred or annotated, checked at every call; branch-sensitive
 counting (the maximum over arms, not the sum); and what crosses a lambda, a
 handler clause and a resume.
 
-### 3. Native compilation without its implementation limits
+Measured (2026-11-06, `elya check` at main; `linear type File { File(Int) }`):
+eight programs that consume a `File` twice check clean and run (a parameter
+used twice, annotated or not; a closure capturing it called twice; a closure
+returning it; a container of it, `Box(File)`, not itself `linear`, consumed
+twice; recursion re-using a parameter; an alias of a parameter; a match
+binder used twice), and two sound ones are refused, E0428 (one use in each
+arm of an `if`, of a `match`). Refused correctly: a value passed twice to one
+call, used in a body and a clause. The programs are to go into the spec's
+table.
+
+### 2. Native compilation without its implementation limits
 
 The maintainer's priority (2026-10-30: "native compilation has restrictive
 implementation limits"). Inventory every refusal natively against the
@@ -748,7 +733,7 @@ program without the module fails the same way). For each: a
 program the evaluator runs, then lift it or say in a spec why it stays. The
 differential sweep is the measure: no refusal left that the evaluator runs.
 
-### 4. Reading text from outside
+### 3. Reading text from outside
 
 Back from "Also open" (it was step 3 until the maintainer's priorities moved it,
 2026-10-30). `replay.parse` reads a trace the program already holds as a `String`. No Elya
@@ -761,7 +746,7 @@ Then decide in a spec: the builtins (`io.read_file`, `io.read_line`?) and their
 effect (`IO`, which the host records like `time.*`, or a capability of their own
 under `elya/host`); and both back ends, recording and replaying a read the same way.
 
-### 5. Abstract types: a module's types its importers cannot open
+### 4. Abstract types: a module's types its importers cannot open
 
 Found by `elya/async`'s review (R4, 2026-10-31): a task id is an `Int`, so an id
 from one scope names a task of another (with the same result type, an inner scope
@@ -775,6 +760,25 @@ what an importer may still do with its values (pass, store, compare?), the
 diagnostics, and both back ends (natively nothing should change: types are
 instances by then). Prove it on `elya/async`: `async_spawn` answers an
 `AsyncTask(a)`.
+
+### 5. Native IR in proportion to the program: what scalability left
+
+From step 1 (spec 2026-10-31-elya-scalability, section 3's "Next" list and
+D13's "What stays"), each measured, none designed:
+- a site in an `if` arm copies the rest of its block into its continuation as
+  well as after the branch: sites times length (84K / 280K / 1009K IR lines at
+  2000 / 4000 / 8000 statements, one such site per 1000). A join: the
+  conditional a site whose frame the arms continue to;
+- a site's path holds every `let` above it (its resumption reads that path
+  quadratically, and reads its block's deaths again), and its saved set reads
+  the whole rest of its block;
+- anf's rule 4 renames the rest of a block at each alias of a row-polymorphic
+  local (2.4 s to emit 800, debug): carry the renaming down the walk;
+- values all live to a block's end are rooted at every allocation (n^2);
+  rooting once at the binding would not be (a GC-discipline change, every exit
+  pops what its function holds).
+Each: a test that fails at n and 2n first (`native_scalability.rs`), then the
+design in the spec.
 
 ## Also open, unscheduled
 

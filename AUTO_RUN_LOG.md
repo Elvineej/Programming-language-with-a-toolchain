@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-11-06 04:20 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
+## 2026-11-06 10:35 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -13,7 +13,7 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   work continues on `main`.
 - At the maintainer's "continue when the limit resets, no stops", this session keeps
   two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
-  after the usage limit (primary)" about 5 h ahead (trig_01PzpjXgBE5s9V65ED5juMBz) and
+  after the usage limit (primary)" about 5 h ahead (trig_01WyXi2uvHFnTw3TEU4FtMAY) and
   "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
 - **Done: strings by byte, one trace line format, `replay.parse`** (HANDOFF step 1;
   spec 2026-10-24-elya-trace-text, the scheduled run's spec and plan; implementation
@@ -150,11 +150,23 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   change alike; 600 modules' IR) found nothing unsound; its findings fixed
   test-first (the CPS value-position loop untested: controls K28, K29; the
   stress check widened to everything grayed; fmt; figures).
-- Now: part 4 (generalization by levels, D14-D16; found by part 3a's
-  review: closures over a function parameter cubic in the front end), gated
-  1457 / 157, under review. Then the remaining native items. (Pauses from
-  17:40 to 21:30 and from 02:41 to 04:18: the usage limit.)
-- The E: clone's working files are at c604eac; its history waits on
+- **Done: scalability part 4** (HANDOFF step 1; 60c108b): a `let`
+  generalizes by level, not by reading the environment (D14-D16). Closures
+  over a function parameter were cubic in the front end (4000: killed at
+  78 s, now 0.07 s). Gate 1463 / 157 (predicted 1457, +6 for the review's
+  tests). The review (1000 generated programs, mutants) found 42 programs
+  generalized differently: a kept variable left above its `let`'s level, and,
+  older than levels, an annotation variable's rows quantifiable (D2 broke its
+  own assertion there); both fixed test-first. Behavior change: three
+  programs that checked clean are refused (E0420), as "an annotation
+  variable is one type for the function" says.
+- **HANDOFF step 1 (scalability) moved to Done**; what it left is the new
+  step 5. Now: the new step 1, the affine guarantee across functions
+  (measured: eight double uses accepted, two sound programs refused).
+  (Pauses from 17:40 to 21:30, 02:41 to 04:18 and 07:40 to 09:30: the usage
+  limit and a restart.)
+- The E: clone's working files are at c604eac (the computer is not linked
+  now: part 4 goes there when it is); its history waits on
   `E:\Elya\elya-sync.bat`.
 - Windows-gate debt: 20a4804, fa24c18, and since then 499c048 and ba8b629
   (the next Windows run on `main` covers them).
