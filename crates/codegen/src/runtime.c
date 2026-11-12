@@ -18,102 +18,44 @@
 #include <time.h>
 #endif
 
-/* The Elya native runtime: a stop-the-world, non-moving mark-sweep collector.
- * Single-threaded throughout — Elya has no native concurrency yet, so none of
- * this state needs synchronisation. (The program runs on a thread of its own,
- * `elya_start`, but only one thread ever runs Elya code, and the main thread
- * reads the collector's state only after joining it.)
- *
- * Object layout (5b-5 plan, pinned). `elya_alloc(words)` reserves `words + 2`
- * and returns a pointer to word 2, so the collector's prefix sits IN FRONT of
- * the tag and the visible `[tag][fields]` layout the Ctor arm emits is frozen:
- *
- *   [ word0: (size<<1)|mark ] [ word1: in-use next-link ] [ tag ] [ field_0 ] ...
- *      ^ internal                ^ internal                 ^ what elya_alloc returns
- *
- * Two prefix words rather than one because the list link needs a full pointer.
- */
+/* The Elya native runtime. The collector is gc.c (spec
+ * 2026-11-12-elya-paged-collector), included here so a program is one
+ * translation unit; this file gives it its platform hooks (hosted). Single-
+ * threaded throughout: one thread runs Elya code (`elya_start`), and the main
+ * thread reads the collector's state only after joining it. */
 
-/* [2*i] = arity, [2*i+1] = ptr_mask. Bit i of the mask is set iff field i
- * holds a heap pointer, so the mark phase knows which words to trace without
- * ever guessing. This precision is the point: a conservative stack scan could
- * read an Int as a pointer and make native MORE undefined than the evaluator,
- * which 5b-1 §3.4 forbids.
- *
- * `arity` is the count of traced-candidate words FOLLOWING the tag, NOT the
- * block's size: gc_sweep reads the size out of Block::meta and never consults a
- * descriptor, so a row may legitimately describe fewer words than the block
- * holds. N6's string row is exactly that case — [0, 0] for a block whose bytes
- * follow the tag but are not words to trace. */
-static int64_t *gc_descriptors = NULL;
-static int64_t gc_n_ctors = 0;
+/* The platform layer, hosted (D1, D9): memory from the operating system. */
+void elya_platform_fail(const char *message) {
+    fputs(message, stderr);
+    exit(1);
+}
 
-/* The shadow stack of live roots. Written by elya_gc_push/pop; read by mark.
- * The codegen brackets every allocation and every non-tail call with pushes and
- * pops, so when gc_mark runs this array holds exactly the heap values the
- * program can still reach a name for. */
-static void **gc_shadow = NULL;
-static int64_t gc_shadow_top = 0, gc_shadow_cap = 0;
+void *elya_platform_pages(size_t bytes, size_t align) {
+    size_t want = bytes + (align > 4096 ? align : 0);
+#ifdef _WIN32
+    char *m = (char *)VirtualAlloc(NULL, want, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    char *m = (char *)mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == (char *)MAP_FAILED) {
+        m = NULL;
+    }
+#endif
+    if (!m) {
+        return NULL;
+    }
+    return (void *)(((uintptr_t)m + align - 1) & ~(uintptr_t)(align - 1));
+}
 
-/* gc_allocated counts WORDS handed out since the last collection, not objects.
- * Words are the memory-pressure proxy the threshold is denominated in: a
- * one-word `Nil` should not push toward a collection as hard as a sixteen-word
- * record does.
- *
- * gc_live is the odd one out: a LEVEL, not a flow. gc_collections and gc_freed
- * only ever climb; gc_live is recomputed from scratch by every sweep and
- * answers "how much is still reachable", which is the one place a
- * refcounting/tracing divergence could ever show up (5b-6 §11, obligation T7). */
-static int64_t gc_allocated = 0, gc_collections = 0, gc_freed = 0, gc_live = 0;
-/* Collections that ran inside a multi-shot copy (elya_cont_copy sets the
- * flag), reported as `mid_copy=` (a name without `collections=` in it, which
- * a test reads as a substring) with the other counters: a test asserts the copy really is
- * interrupted (spec 2026-10-22-elya-multi-shot-sharing, the review's note 1). */
-static int64_t gc_copy_collections = 0;
-static int gc_in_cont_copy = 0;
-/* ELYA_GC_STRESS=N collects at every Nth allocation, whatever the heap holds
- * (spec 2026-10-31-elya-scalability D13): a value the codegen failed to root
- * is then freed while still in use, at once, so a missed root shows as a wrong
- * answer or a crash in the corpus instead of hiding until a heap grows. Off
- * unless set; read once, at `elya_gc_init`. */
-static int64_t gc_stress = 0, gc_stress_count = 0;
+void elya_platform_release(void *p, size_t bytes) {
+#ifdef _WIN32
+    (void)bytes;
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
+    munmap(p, bytes);
+#endif
+}
 
-typedef struct Block {
-    intptr_t meta; /* (size << 1) | mark, where size counts VISIBLE words */
-    struct Block *next;
-} Block;
-
-/* Every block that is currently handed out. A block lives on exactly one of
- * this list or its size's free list, never both — that is what makes handing
- * the same block out twice impossible by construction rather than by care.
- * (The plan calls this the all-blocks list; sweep "moves" dead blocks off it,
- * so at rest it holds precisely the in-use ones.) */
-static Block *gc_all_blocks = NULL;
-
-enum { GC_MAX_WORDS = 16 };
-static Block *gc_free_lists[GC_MAX_WORDS] = {0};
-
-#define GC_MARK_BIT 1
-/* A block stress mode freed: no live block's meta is negative. */
-#define GC_FREED ((intptr_t)-2)
-
-/* Pinned by measurement, not by taste. Built with collection disabled, the ADT
- * corpus reports its whole lifetime allocation at exit: option_extract 2 words,
- * recursive_nat 7, three_way 2, nested_match 5. The arithmetic, control-flow and
- * tail-call corpora allocate nothing at all. Seven words is therefore the FLOOR
- * this constant has to clear -- below it, ordinary programs would start
- * collecting incidentally and "no collection during an ordinary build" would
- * stop proving anything.
- *
- * The pin is 1<<16 words, half a mebibyte of payload and some nine thousand
- * times that floor, so the no-trip question is not a close call. The upper end
- * is purely an amortisation choice: at three words an iteration a
- * million-iteration allocating loop still collects about forty-five times. */
-enum { GC_THRESHOLD_WORDS = 1 << 16 };
-
-static int64_t *gc_payload(Block *b) { return (int64_t *)(b + 1); }
-
-static Block *gc_block_of(void *payload) { return (Block *)((int64_t *)payload - 2); }
+#include "gc.c"
 
 /* One float mask per declared constructor tag: bit i set iff field i is a
  * `Float` (spec 2026-10-23-elya-float-natively D2). Read by `elya_eq` only; the
@@ -127,11 +69,9 @@ void elya_eq_init(const int64_t *masks, int64_t n) {
 }
 
 void elya_gc_init(const int64_t *descriptors, int64_t n_ctors) {
-    gc_descriptors = (int64_t *)descriptors;
-    gc_n_ctors = n_ctors;
     {
         const char *stress = getenv("ELYA_GC_STRESS");
-        gc_stress = stress ? atoll(stress) : 0;
+        elya_gc_setup(descriptors, n_ctors, stress ? atoll(stress) : 0);
     }
 #ifdef _WIN32
     /* The shim calls this first, so stdout is byte-exact for the WHOLE run --
@@ -144,196 +84,6 @@ void elya_gc_init(const int64_t *descriptors, int64_t n_ctors) {
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
 #endif
-}
-
-void elya_gc_push(void *root) {
-    if (gc_shadow_top == gc_shadow_cap) {
-        int64_t cap = gc_shadow_cap ? gc_shadow_cap * 2 : 256;
-        void **grown = (void **)realloc(gc_shadow, (size_t)cap * sizeof(void *));
-        if (!grown) {
-            fputs("elya: out of memory growing the shadow stack\n", stderr);
-            exit(1);
-        }
-        gc_shadow = grown;
-        gc_shadow_cap = cap;
-    }
-    gc_shadow[gc_shadow_top++] = root;
-}
-
-void elya_gc_pop(void) {
-    if (gc_shadow_top > 0) {
-        gc_shadow_top--;
-    }
-}
-
-/* The mark phase: an EXPLICIT worklist, never function recursion.
- *
- * This is the CtorArgs lesson applied to the collector as a hard constraint.
- * The evaluator's Drop already paid for it once on million-element Cons
- * chains: a recursive walk of a deep chain overflows the HOST stack, which
- * turns a routine collection into a process crash. A million-element chain is
- * a million worklist entries in heap memory here, and the host stack stays
- * flat. Schorr-Waite pointer reversal would remove the worklist's own space
- * cost; it is deferred as a later optimisation, not needed for correctness. */
-static void **gc_gray = NULL;
-static int64_t gc_gray_top = 0, gc_gray_cap = 0;
-
-static void gc_gray_push(void *p) {
-    if (!p) {
-        return;
-    }
-    Block *b = gc_block_of(p);
-    if (gc_stress > 0 && b->meta < 0) {
-        /* Stress mode: nothing reachable is a block a collection freed
-         * (spec 2026-10-31-elya-scalability D13): a root, the current
-         * handler or a field that names one holds a value read after its
-         * last root. Checked as it is grayed, so gc_mark is unchanged. */
-        fputs("elya: gc stress: a reachable value names a freed block\n", stderr);
-        exit(1);
-    }
-    if (b->meta & GC_MARK_BIT) {
-        return; /* already marked: shared structure and cycles both terminate */
-    }
-    b->meta |= GC_MARK_BIT;
-    if (gc_gray_top == gc_gray_cap) {
-        int64_t cap = gc_gray_cap ? gc_gray_cap * 2 : 256;
-        void **grown = (void **)realloc(gc_gray, (size_t)cap * sizeof(void *));
-        if (!grown) {
-            fputs("elya: out of memory growing the mark worklist\n", stderr);
-            exit(1);
-        }
-        gc_gray = grown;
-        gc_gray_cap = cap;
-    }
-    gc_gray[gc_gray_top++] = p;
-}
-
-static void gc_mark(void) {
-    for (int64_t i = 0; i < gc_shadow_top; i++) {
-        gc_gray_push(gc_shadow[i]);
-    }
-    while (gc_gray_top > 0) {
-        int64_t *obj = (int64_t *)gc_gray[--gc_gray_top];
-        int64_t tag = obj[0];
-        if (tag < 0 || tag >= gc_n_ctors) {
-            continue; /* not a constructor we have a descriptor for */
-        }
-        int64_t arity = gc_descriptors[2 * tag];
-        int64_t mask = gc_descriptors[2 * tag + 1];
-        for (int64_t f = 0; f < arity; f++) {
-            if ((mask >> f) & 1) {
-                gc_gray_push((void *)(intptr_t)obj[1 + f]);
-            }
-        }
-    }
-}
-
-static void gc_sweep(void) {
-    Block **prev = &gc_all_blocks;
-    Block *b = gc_all_blocks;
-    /* Reset per cycle: gc_live is what survived THIS collection, not a running
-     * total the way gc_freed is. */
-    gc_live = 0;
-    while (b) {
-        Block *next = b->next;
-        if (b->meta & GC_MARK_BIT) {
-            /* The shift drops the mark bit, so this reads the same size whether
-             * it runs before or after the clear below. */
-            gc_live += b->meta >> 1;
-            b->meta &= ~(intptr_t)GC_MARK_BIT; /* clear for the next cycle */
-            prev = &b->next;
-        } else {
-            *prev = next; /* move it off the in-use list */
-            intptr_t size = b->meta >> 1;
-            if (gc_stress > 0) {
-                /* Stress mode keeps what it frees, poisoned and never handed
-                 * out again (D13): a value read after it was freed reads an
-                 * address no machine maps, not its old words or another
-                 * object's, and anything that still reaches it is caught as
-                 * it is grayed (gc_gray_push). */
-                int64_t *payload = gc_payload(b);
-                for (intptr_t i = 0; i < size; i++) {
-                    payload[i] = (int64_t)0xDEADBEEFDEADBEEFULL;
-                }
-                b->meta = GC_FREED;
-                b->next = NULL;
-            } else if (size > 0 && size < GC_MAX_WORDS) {
-                /* Thread the free link through the dead tag slot. Safe
-                 * precisely because the object is dead: nothing reads that
-                 * word again until elya_alloc re-zeroes it. */
-                *(Block **)gc_payload(b) = gc_free_lists[size];
-                gc_free_lists[size] = b;
-            } else {
-                free(b); /* no free list this wide: hand it back to malloc */
-            }
-            gc_freed++;
-        }
-        b = next;
-    }
-}
-
-/* Defined with the handler protocol below. */
-extern void *elya_current_handler;
-
-static void gc_collect(void) {
-    gc_collections++;
-    /* The current handler is a root (spec 2026-10-22-elya-multi-shot-sharing
-     * D3): a handle's body ends at the shared end frame, not at its handler
-     * frame, so the running chain no longer reaches the frame that is current.
-     * Grayed here, before the shadow stack, so gc_mark itself is unchanged. */
-    gc_gray_push(elya_current_handler);
-    if (gc_in_cont_copy) {
-        gc_copy_collections++;
-    }
-    gc_mark();
-    gc_sweep();
-    gc_allocated = 0;
-}
-
-/* Allocate `words` 8-byte words, zeroed. The zeroing is the contract the Ctor
- * arm relies on, so a recycled block is re-zeroed on the way out. */
-void *elya_alloc(int64_t words) {
-    /* Roots for a collection triggered HERE are already on the shadow stack:
-     * allocation sites push live heap bindings, and constructors also push
-     * just-lowered fields. Marking runs before the block is handed out, so
-     * the new object is never itself a mark target -- nothing yet points at
-     * it. */
-    /* Collect when allocation since the last collection reaches the larger of
-     * the fixed floor and the last measured live set: the heap doubles
-     * between collections, so a growing live set is marked O(log n) times,
-     * not every 64K words (which made total marking quadratic -- measured:
-     * 45 collections to build a 1M list, 183 for a 1M-deep effectful loop).
-     * Small programs see the old 64K floor unchanged. */
-    if (gc_allocated >= (gc_live > GC_THRESHOLD_WORDS ? gc_live : GC_THRESHOLD_WORDS)) {
-        gc_collect();
-    } else if (gc_stress > 0 && ++gc_stress_count >= gc_stress) {
-        gc_stress_count = 0;
-        gc_collect();
-    }
-    gc_allocated += words;
-
-    if (words > 0 && words < GC_MAX_WORDS && gc_free_lists[words]) {
-        Block *b = gc_free_lists[words];
-        gc_free_lists[words] = *(Block **)gc_payload(b);
-        int64_t *payload = gc_payload(b);
-        for (int64_t i = 0; i < words; i++) {
-            payload[i] = 0;
-        }
-        b->meta = (intptr_t)words << 1;
-        b->next = gc_all_blocks;
-        gc_all_blocks = b;
-        return payload;
-    }
-
-    Block *b = (Block *)calloc((size_t)words + 2, 8);
-    if (!b) {
-        fputs("elya: out of memory\n", stderr);
-        exit(1);
-    }
-    b->meta = (intptr_t)words << 1;
-    b->next = gc_all_blocks;
-    gc_all_blocks = b;
-    return gc_payload(b);
 }
 
 /* Copy static literal bytes into a tagged heap block. The extra byte reserves
@@ -1759,21 +1509,18 @@ void *elya_current_handler = 0;
  * frame points at a handler frame, and a multi-shot resume can share every
  * site frame of its chain.
  *
- * A static block shaped like a heap one (header, then `[tag][code]`): its mark
- * bit is set and it is never on gc_all_blocks, so marking it stops at once and
- * the sweep never frees it. Its tag is no constructor's, so nothing reads past
+ * A static block `[tag][code]` outside the heap: the collector neither marks
+ * nor frees what the heap does not hold (spec 2026-11-12-elya-paged-collector
+ * D3). Its tag is no constructor's, so nothing reads past
  * the code word. The code word is set at start-up by elya_handle_end_init,
  * which the generated `main` calls after elya_gc_init: the runtime refers to
  * no generated symbol, so a C harness can link it alone. */
-static struct {
-    Block header;
-    int64_t words[2];
-} elya_handle_end_block = {{(2 << 1) | GC_MARK_BIT, NULL}, {-1, 0}};
+static int64_t elya_handle_end_block[2] = {-1, 0};
 
-void *elya_handle_end = &elya_handle_end_block.words[0];
+void *elya_handle_end = &elya_handle_end_block[0];
 
 void elya_handle_end_init(void *code) {
-    elya_handle_end_block.words[1] = (int64_t)(intptr_t)code;
+    elya_handle_end_block[1] = (int64_t)(intptr_t)code;
 }
 
 /* 5b-8 D13: one-shot is enforced natively. A second resume stops here -- a
@@ -1922,7 +1669,7 @@ void *elya_cont_copy(void *cont, int64_t hlo, int64_t hhi) {
     gc_in_cont_copy = 1;
     int64_t i = 0;
     for (int64_t *f = inner; i < n; f = (int64_t *)(intptr_t)f[CONT_PARENT]) {
-        int64_t words = (int64_t)(gc_block_of(f)->meta >> 1);
+        int64_t words = elya_gc_words(f);
         int64_t *p = (int64_t *)elya_alloc(words);
         memcpy(p, f, (size_t)words * 8);
         copy[i] = p;

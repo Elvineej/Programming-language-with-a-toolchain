@@ -3062,13 +3062,46 @@ pub fn compile_module(core: &CoreModule, obj_path: &Path) -> Result<(), CodegenE
         .map_err(internal)
 }
 
+/// The runtime (runtime.c, and the collector it includes, gc.c), compiled
+/// optimised once per process and reused by its every link (spec
+/// 2026-11-12-elya-paged-collector). Into a directory this process creates
+/// (fails if it exists): no other process or user shares or plants the object,
+/// and links on several threads wait for one compilation (the review's race).
+fn runtime_object() -> Result<std::path::PathBuf, CodegenError> {
+    static OBJECT: std::sync::OnceLock<Result<std::path::PathBuf, String>> =
+        std::sync::OnceLock::new();
+    let made = OBJECT.get_or_init(|| {
+        let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime.c");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("elya-runtime-{}-{nanos}", std::process::id()));
+        std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
+        let obj = dir.join("runtime.o");
+        let mut cmd = std::process::Command::new("clang");
+        cmd.arg("-c").arg("-O2").arg(&runtime).arg("-o").arg(&obj);
+        #[cfg(target_os = "linux")]
+        cmd.arg("-fno-pie");
+        #[cfg(unix)]
+        cmd.arg("-pthread");
+        let out = cmd.output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+        }
+        Ok(obj)
+    });
+    made.clone()
+        .map_err(|stderr| CodegenError::Link { code: None, stderr })
+}
+
 /// Object file -> executable, via `clang` (hardcoded, §3.6: LLVM is already a
 /// hard prerequisite and clang ships with it). Non-zero exit surfaces clang's
 /// stderr in [`CodegenError::Link`].
 pub fn link(obj: &Path, exe: &Path) -> Result<(), CodegenError> {
     // N4 (spec §2.1): the runtime is a C file clang compiles and links alongside
     // the object, so the two `ccc` externals resolve.
-    let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime.c");
+    let runtime = runtime_object()?;
     let mut cmd = std::process::Command::new("clang");
     cmd.arg(obj).arg(&runtime).arg("-o").arg(exe);
     // `compile_module` emits with `RelocMode::Default`, which on Linux is
