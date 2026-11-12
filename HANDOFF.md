@@ -3,7 +3,7 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-11-06, an interactive session on `main`)
+## State at handoff (updated 2026-11-12, an interactive session on `main`)
 
 - **Work lands on `main` directly** (the maintainer, 2026-10-30: "Commit in the main
   tho"). `main` has everything: #24 (2026-10-24), then `auto/elya`'s 15 commits since,
@@ -23,9 +23,14 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that already holds what `origin/main` holds, fast-forward `main`; log
   `E:\Elya\elya-sync.log`) brings its history up; `E:\Elya\elya-test.bat`
   runs the gate there (log `E:\Elya\elya-test.log`). Neither has run yet.
+  The PC's linked shell (a Linux VM, 2026-11-12) cannot mount `E:` either, and
+  cannot reach rust-lang.org: a session puts Ubuntu's `rustc-1.91` and
+  `cargo-1.91` (`apt-get download`, `dpkg -x`, no root) under its home and
+  clones from GitHub there; the root crate builds and passes (no LLVM 18 in
+  that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1463 passed, 157 suites. Native programs run on
+- Linux gate at the tip of `main`: 1497 passed, 157 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). In October the runtime
   gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -690,30 +695,44 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
     once at the binding (spec D13); a stress mode in the runtime, outside
     `gc_mark`. What it left is step 5.
 
+- **The affine guarantee across functions** (2026-11-12, cf3f028): spec
+  `docs/superpowers/specs/2026-11-06-elya-affine-across-functions-design.md`, plan
+  beside it. Measured first: 17 programs reading a `linear` value twice checked clean
+  and ran, 3 sound ones were refused. Now: duplicable types required by marks on type
+  variables (`bind` checks, `instantiate` copies: a generic function's duplication is
+  in its type); counts by arm and by how often a closure or clause runs (a syntactic
+  pass, `src/affine.rs`, before inference); multi-shot points holding by row, the
+  requirement riding on row variables; `with any` operations take duplicable
+  arguments; new E0437. The review found two holes (a call's waiting operands; a local
+  generic held on an outer row) and a false refusal, fixed test-first. Gate 1497.
+
 ## The next five steps
 
-### 1. The affine guarantee across functions
+### 1. A collector for bare metal and for large programs alike
 
-The maintainer's priority (2026-10-30: "the affine resource guarantee is
-incomplete"). `linear` values are checked within one function body (slice
-4d-2, E0428 and E0429; README "Affine resources"); the 4d-2 spec tracks two
-approximations: a callee that duplicates an affine parameter is not caught at
-its callers, and the check is insensitive to branches (a use in each arm of an
-`if` counts twice). Measure each with programs (accepted that should not be,
-refused that should not be), then decide in a spec: a parameter's
-multiplicity, inferred or annotated, checked at every call; branch-sensitive
-counting (the maximum over arms, not the sum); and what crosses a lambda, a
-handler clause and a resume.
-
-Measured (2026-11-06, `elya check` at main; `linear type File { File(Int) }`):
-eight programs that consume a `File` twice check clean and run (a parameter
-used twice, annotated or not; a closure capturing it called twice; a closure
-returning it; a container of it, `Box(File)`, not itself `linear`, consumed
-twice; recursion re-using a parameter; an alias of a parameter; a match
-binder used twice), and two sound ones are refused, E0428 (one use in each
-arm of an `if`, of a `match`). Refused correctly: a value passed twice to one
-call, used in a body and a clause. The programs are to go into the spec's
-table.
+The maintainer's priority (2026-11-12: "make a gc that is able to use it in bare metal
+aswell effienctly"; "this language covers from bare metal to python so make
+everything more efficient and high quality"). Governing constraint: ONE collector for
+both ends, not a bare-metal variant. Today (`crates/codegen/src/runtime.c`): mark-sweep,
+a `calloc` per object, a two-word header (`meta`, `next`) on every block, all live
+blocks on one list, free lists for sizes under 16 words; the runtime calls libc about
+170 times (`exit`, `fprintf`, `getenv`, `pthread`, `mmap`, `sigaction`). Direction
+(to decide in a spec, measured first, benchmarks in the scratchpad's `gcb/`):
+- the heap as pages of one size class each, mark bits in a bitmap per page, no
+  per-object header word for the list; pages from ONE page source: a fixed region
+  given at start (`elya_heap_init(base, size)` or a static array) on bare metal,
+  the OS (`mmap`/`VirtualAlloc`) growing on demand above it;
+- lazy sweeping and a fixed-size mark stack with an overflow rescan: the collector
+  allocates nothing and its pauses are bounded;
+- a platform layer: the runtime's few needs from outside (pages, bytes out, stop)
+  behind hooks, libc's on a host, the board's on bare metal; the collector compiles
+  `-ffreestanding -nostdlib` with only those undefined;
+- later layers the pages leave room for: a nursery for the high end; freeing at a
+  `linear` value's last use (the affine guarantee) for the low end.
+Measure: allocation-heavy programs (time, peak memory, collections) before and
+after; the codegen suite and `ELYA_GC_STRESS` on the new heap; a freestanding
+build; a QEMU bare-metal run if QEMU installs. `gc_mark` changes by design here:
+name it in the commit.
 
 ### 2. Native compilation without its implementation limits
 

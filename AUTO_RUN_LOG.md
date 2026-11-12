@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-11-06 13:17 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
+## 2026-11-12 22:40 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -165,8 +165,14 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   measured again wider: 17 double uses accepted, 3 sound programs refused.
   Spec 2026-11-06-elya-affine-across-functions (D1-D8: duplicable types as
   marks on type variables, counting by arm and by a closure's calls, holds on
-  row variables for multi-shot points; new E0437) and its plan committed;
-  red tests next.
+  row variables for multi-shot points; new E0437) and its plan committed.
+  **Done: the affine guarantee across functions** (cf3f028, 2026-11-12): all 17
+  refused, the 3 sound ones accepted; the review's two holes and one false
+  refusal fixed test-first; gate 1497 / 157 (predicted 1497). The worktree and
+  the first red tests were lost to a container restart (2026-11-06 to 11-12)
+  and rebuilt from the session's record. Now: the new step 1, at the
+  maintainer's request (2026-11-12): one collector for bare metal and for large
+  programs alike.
   (Pauses from 17:40 to 21:30, 02:41 to 04:18 and 07:40 to 09:30: the usage
   limit and a restart.)
 - The E: clone's working files are at b08164a (written 2026-11-06); its
