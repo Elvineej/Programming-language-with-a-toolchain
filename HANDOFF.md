@@ -30,12 +30,13 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1497 passed, 157 suites. Native programs run on
+- Linux gate at the tip of `main`: 1504 passed, 158 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). In October the runtime
   gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
-  current handler as a root); `gc_mark` is unchanged (637 bytes of source).
+  current handler as a root). Since 2026-11-12 the collector is `gc.c` (paged, freestanding;
+  spec 2026-11-12-elya-paged-collector), the runtime compiled `-O2` once per process.
   `elya_eq` takes a fourth argument (the first closure tag) since 2026-10-23.
 - Interactive sessions use the same `AUTO_RUN_LOG.md` lock: an IN PROGRESS entry
   under 3 hours old makes a scheduled run exit.
@@ -729,10 +730,17 @@ blocks on one list, free lists for sizes under 16 words; the runtime calls libc 
   `-ffreestanding -nostdlib` with only those undefined;
 - later layers the pages leave room for: a nursery for the high end; freeing at a
   `linear` value's last use (the affine guarantee) for the low end.
-Measure: allocation-heavy programs (time, peak memory, collections) before and
-after; the codegen suite and `ELYA_GC_STRESS` on the new heap; a freestanding
-build; a QEMU bare-metal run if QEMU installs. `gc_mark` changes by design here:
-name it in the commit.
+**Part 1 done** (3ad459a, 2026-11-12): `crates/codegen/src/gc.c`, pages and spans of
+31 size classes, side tables, lazy sweeping, a bounded worklist with page rescans, one
+page source (OS chunks hosted, `elya_heap_init` on a board); builds freestanding for
+x86-64, Cortex-M4, RISC-V 32; faster on every program measured, half the memory on
+large live sets (one recorded exception, `big_live`, spec). The runtime compiled -O2
+once per process. Gate 1504.
+**Next, part 2:** the rest of the runtime behind the platform layer (bytes out, stop,
+the start thread, the clock, signals: about 170 libc calls), a freestanding runtime
+build, and an Elya program run on an emulated board (QEMU, if it installs; else a
+host harness linking the freestanding runtime). Then the nursery (D10) measured on
+churn-heavy programs, and `big_live`'s size-mix memory.
 
 ### 2. Native compilation without its implementation limits
 

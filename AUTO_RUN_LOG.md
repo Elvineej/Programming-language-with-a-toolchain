@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-11-12 22:40 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
+## 2026-11-13 00:10 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -173,6 +173,9 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   and rebuilt from the session's record. Now: the new step 1, at the
   maintainer's request (2026-11-12): one collector for bare metal and for large
   programs alike.
+  **Done: part 1 of it** (3ad459a): the paged, freestanding collector; the
+  review's eight findings fixed test-first; gate 1504 / 158 (predicted 1504).
+  Now: part 2, the platform layer for the rest of the runtime.
   (Pauses from 17:40 to 21:30, 02:41 to 04:18 and 07:40 to 09:30: the usage
   limit and a restart.)
 - The E: clone's working files are at b08164a (written 2026-11-06); its
