@@ -256,17 +256,26 @@ pub fn main() {
 }
 ```
 
-Use-at-most-once is enforced today (`E0428`, `tests/affine.rs`), and so is the
-payoff that motivated it: an affine value may not be **captured into a
-multiply-resuming continuation** (`E0429`) — the double-free that a tracing GC
-cannot catch. Each rule is checked both ways — the violation fires, and the
-legitimate neighbouring program still compiles.
+The guarantee holds across the whole program (`tests/affine.rs`): a value of a
+`linear` type, or one holding it (`Box(File)`), is used at most once on every
+run.
 
-The guarantee is scoped honestly: it is **intra-function local** and models
-create-and-consume within a single function body. Two deliberate
-over-/under-approximations (a callee that duplicates an affine parameter; whole-
-body branch-insensitivity) are tracked obligations to be tightened when the
-analysis goes inter-procedural — see the Slice 4d-2 design spec.
+- **Within a function** (`E0428`), counting each arm of an `if` or `match`
+  apart, a closure as often as it is called, and an operation clause as often
+  as it may run (once per perform).
+- **Through generic and higher-order functions** (`E0437`): a function that
+  uses its argument twice says so in its type, and the call that hands it a
+  `linear` value is refused, however many calls deep, and whether the function
+  is called, passed, returned or stored.
+- **Across multi-shot continuations** (`E0429`, or `E0437` through a generic
+  function): a value used after a perform of a `multi` effect, direct or in a
+  callee, would be used again by each resume — the double-free that a tracing
+  GC cannot catch.
+
+What is refused although sound, by choice: a closure capturing an affine value
+can only be called by name (not passed on or aliased); a `multi` effect handled
+one-shot still counts as multi-shot; an operation clause counts as running many
+times. See the design spec `2026-11-06-elya-affine-across-functions`.
 
 ## License
 

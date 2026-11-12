@@ -409,3 +409,38 @@ fn a_recursive_group_with_local_lets_infers_linearly() {
         200,
     );
 }
+
+/// Affine bindings down a block, each consumed by a closure called once, in a
+/// program declaring a `multi` effect: the affine pass's counts and held sets
+/// (spec 2026-11-06-elya-affine-across-functions D2, D3) stay in proportion.
+fn affine_bindings_down_a_block(n: usize) -> String {
+    let body = (0..n)
+        .flat_map(|i| {
+            [
+                format!("  let f{i} = File({i})"),
+                format!("  let g{i} = fn() {{ read(f{i}) }}"),
+                format!("  let n{} = n{i} + g{i}()", i + 1),
+            ]
+        })
+        .collect();
+    lines(
+        &[
+            "linear type File { File(Int) }".to_string(),
+            "fn read(f: File) -> Int { match f { File(n) -> n } }".to_string(),
+            "effect multi Flip { fn flip() -> Bool }".to_string(),
+            "pub fn main() -> Int {".to_string(),
+            "  let n0 = 0".to_string(),
+        ],
+        body,
+        &[&format!("  n{n}"), "}"],
+    )
+}
+
+#[test]
+fn affine_bindings_down_a_block_infer_linearly() {
+    assert_linear(
+        "affine bindings down a block",
+        affine_bindings_down_a_block,
+        200,
+    );
+}

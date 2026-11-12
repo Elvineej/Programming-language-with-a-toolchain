@@ -54,11 +54,13 @@ pub fn front_end_with(
             .is_some_and(|l| program.refused.contains(&l.span))
     }));
     if diags.is_empty() {
-        let (idiags, affine_sites, fns) = types::infer_with_interfaces(&session, &module);
+        let (idiags, affine_diags, fns) = types::infer_with_interfaces(&session, &module);
         diags.extend(idiags);
         if !diags.iter().any(|d| d.severity == Severity::Error) {
             diags.extend(exhaust::check(&module));
-            diags.extend(affine::check(&module, &affine_sites));
+            // The affine guarantee (spec 2026-11-06-elya-affine-across-functions
+            // D7): found during inference, reported here as before.
+            diags.extend(affine_diags);
             // Modules part 2: what each import grants (spec 2026-10-24).
             diags.extend(modules::check_grants(&program.grants, &module, &fns));
         }

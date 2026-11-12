@@ -121,6 +121,11 @@ fn affine_multi_capture() {
 }
 
 #[test]
+fn affine_through_generic() {
+    check_fixture("affine_through_generic.elya");
+}
+
+#[test]
 fn nonexhaustive_list() {
     check_fixture("nonexhaustive_list.elya");
 }

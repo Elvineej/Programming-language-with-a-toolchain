@@ -3,7 +3,7 @@
 use crate::ast::{
     BinOp, Block, Decl, Expr, FnDecl, Handler, Module, PatLit, Pattern, Stmt, TypeAnn, UnOp,
 };
-use crate::diag::Diagnostic;
+use crate::diag::{Diagnostic, Severity};
 use crate::span::{Span, Spanned};
 use crate::Session;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -390,6 +390,53 @@ struct GenericSite {
 /// A declared type's parameter variables and each constructor's field types.
 type AdtFields = (Vec<u32>, Vec<Vec<Ty>>);
 
+/// Why a type must be duplicable (spec 2026-11-06-elya-affine-across-functions
+/// D1-D6), named in its error.
+#[derive(Clone, Debug)]
+struct DupMark {
+    /// The binding's name (empty for an operation, D5).
+    name: String,
+    /// The use that requires it: the one that made it many, the first after
+    /// the point, or the `with any` handle.
+    at: Span,
+    kind: DupKind,
+    /// The instantiation it came through, the latest (E0437).
+    via: Option<Span>,
+}
+
+#[derive(Clone, Debug)]
+enum DupKind {
+    Many(crate::affine::Why),
+    /// Held by a point; the `multi` effect once known.
+    Held {
+        point: Span,
+        effect: Option<String>,
+    },
+    /// An operation handled by `with any` (D5).
+    AnyOp {
+        op: String,
+    },
+}
+
+impl DupMark {
+    fn through(&self, at: Span) -> DupMark {
+        DupMark {
+            via: Some(at),
+            ..self.clone()
+        }
+    }
+}
+
+/// What rides on a row variable: a held type (D3), or, with no type, a `with
+/// any` handler's requirement that every operation the row takes have
+/// duplicable arguments (D5).
+#[derive(Clone, Debug)]
+struct Hold {
+    ty: Option<Ty>,
+    skip: Vec<u32>,
+    mark: DupMark,
+}
+
 pub struct Infer {
     subst: Vec<Option<Ty>>,
     row_subst: Vec<Option<EffectRow>>,
@@ -470,8 +517,9 @@ pub struct Infer {
     /// Names of declared types with no constructors (2026-10-16): the only
     /// scrutinee types an empty `match` may have.
     empty_types: HashSet<String>,
-    /// Spans of bindings whose inferred type is linear (affine binding sites),
-    /// exposed to the `affine::check` pass. The one bounded reach for 4d-2.
+    /// Spans of `let`s whose inferred type is linear (Slice 4d-2's affine
+    /// binding sites), still exposed by `infer_with_sites`; the guarantee
+    /// itself is `dup_vars` and `row_holds` (2026-11-06).
     affine_sites: HashSet<Span>,
     /// Every expression node's inferred type, zonked at the end of inference
     /// (Slice 5a-1). The Core IR arc's feeder; recorded unconditionally, exposed
@@ -512,6 +560,30 @@ pub struct Infer {
     eq_vars: HashMap<u32, Span>,
     /// The `==` sites already reported, so a site is blamed once.
     eq_reported: HashSet<Span>,
+    /// The affine pass's facts (spec 2026-11-06-elya-affine-across-functions
+    /// D2, D3): the bindings used many times, and what each point holds.
+    affine: crate::affine::Facts,
+    /// Duplicable type variables (D1): each must become a duplicable type, a
+    /// binding of a type mentioning it being used more than once or held
+    /// across a multi-shot point. Binding one checks what it is bound to
+    /// (marking the variables in it); instantiating a scheme that quantifies
+    /// one marks the fresh copy, the instantiation named (E0437).
+    dup_vars: HashMap<u32, DupMark>,
+    /// Held types riding on a row variable (D3): when it takes a `multi`
+    /// effect they must be duplicable; bound to a row ending in another
+    /// variable, they move there; instantiating a scheme that quantifies it
+    /// copies them.
+    row_holds: HashMap<RowVar, Vec<Hold>>,
+    /// Each local binding's name and type, by its binder, with the variables
+    /// a generalized `let` quantified (not checked, D8).
+    binders: HashMap<Span, (String, Ty, Vec<u32>)>,
+    /// Whether each declared type's fields hold a type that is not duplicable
+    /// (its parameters taken as duplicable): the type named, cached.
+    decl_dup: HashMap<String, Option<String>>,
+    /// E0428, E0429 and E0437, reported apart from the others (D7).
+    pub affine_diags: Vec<Diagnostic>,
+    /// The uses (or instantiations) already blamed, so each is blamed once.
+    dup_reported: HashSet<Span>,
     /// Every declaration's parameters and their kinds (spec
     /// 2026-10-30-elya-row-variables D3).
     kinds: Kinds,
@@ -597,6 +669,13 @@ impl Infer {
             adt_fields: HashMap::new(),
             eq_vars: HashMap::new(),
             eq_reported: HashSet::new(),
+            affine: crate::affine::Facts::default(),
+            dup_vars: HashMap::new(),
+            row_holds: HashMap::new(),
+            binders: HashMap::new(),
+            decl_dup: HashMap::new(),
+            affine_diags: Vec::new(),
+            dup_reported: HashSet::new(),
             kinds: Kinds::default(),
             diags: Vec::new(),
             steps: std::cell::Cell::new(0),
@@ -1141,6 +1220,360 @@ impl Infer {
         if let Some(origin) = self.eq_vars.get(&v).copied() {
             self.require_data(t, span, Some(origin));
         }
+        if let Some(m) = self.dup_vars.get(&v).cloned() {
+            self.require_dup(t, &m, &[]);
+        }
+    }
+
+    /// Note a local binding (spec 2026-11-06-elya-affine-across-functions D2):
+    /// its type, read by the points that hold it; used many times, its type
+    /// must be duplicable (a generalized `let`'s quantified variables aside, D8).
+    fn note_binder(&mut self, key: Span, name: &str, s: &Scheme) {
+        self.binders
+            .insert(key, (name.to_string(), s.ty.clone(), s.vars.clone()));
+        if let Some(m) = self.affine.many.get(&key).copied() {
+            let mark = DupMark {
+                name: name.to_string(),
+                at: m.at,
+                kind: DupKind::Many(m.why),
+                via: None,
+            };
+            self.require_dup(&s.ty, &mark, &s.vars);
+        }
+    }
+
+    /// The `multi` effect a row has, if any (D3).
+    fn multi_label(&self, row: &EffectRow) -> Option<String> {
+        row.labels
+            .keys()
+            .find(|l| self.effect_multi.get(*l).copied().unwrap_or(false))
+            .cloned()
+    }
+
+    /// A point whose row is `row` (D3): what it holds must be duplicable if
+    /// the row has a `multi` effect, or when its tail variable takes one.
+    fn hold_point(&mut self, at: Span, row: &EffectRow) {
+        let Some(held) = self.affine.held.get(&at).cloned() else {
+            return;
+        };
+        let row = self.resolve_row(row);
+        let multi = self.multi_label(&row);
+        let tail = match row.tail {
+            RowTail::Open(w) => Some(w),
+            _ => None,
+        };
+        if multi.is_none() && tail.is_none() {
+            return;
+        }
+        for (b, use_at) in held {
+            // A binding, or a value already computed for a call that a later
+            // argument's point re-runs (the review's U-A): an expression's.
+            let Some((name, ty, skip)) = self.binders.get(&b).cloned().or_else(|| {
+                self.node_types
+                    .get(&b)
+                    .map(|t| (String::new(), t.clone(), Vec::new()))
+            }) else {
+                continue;
+            };
+            if self.dup_known(&ty) {
+                continue;
+            }
+            let mark = DupMark {
+                name,
+                at: use_at,
+                kind: DupKind::Held {
+                    point: at,
+                    effect: multi.clone(),
+                },
+                via: None,
+            };
+            match (&multi, tail) {
+                (Some(_), _) => self.require_dup(&ty, &mark, &skip),
+                (None, Some(w)) => self.row_holds.entry(w).or_default().push(Hold {
+                    ty: Some(ty),
+                    skip,
+                    mark,
+                }),
+                (None, None) => {}
+            }
+        }
+    }
+
+    /// A `handle` and the `resume`s in its clauses: points whose rows are what
+    /// escapes it (D3).
+    fn hold_handle(&mut self, at: Span, rows: &[EffectRow]) {
+        let resumes = self.affine.resumes.get(&at).cloned().unwrap_or_default();
+        for row in rows {
+            self.hold_point(at, row);
+            for r in &resumes {
+                self.hold_point(*r, row);
+            }
+        }
+    }
+
+    /// A row variable holding `hs` was bound to `row` (D3).
+    fn apply_holds(&mut self, hs: Vec<Hold>, row: &EffectRow) {
+        let row = self.resolve_row(row);
+        let multi = self.multi_label(&row);
+        let mut rest = Vec::new();
+        for h in hs {
+            match (&h.ty, &multi) {
+                (None, _) => {
+                    self.require_dup_ops(&row, &h.mark);
+                    rest.push(h);
+                }
+                (Some(t), Some(e)) => {
+                    let mut mark = h.mark.clone();
+                    if let DupKind::Held { effect, .. } = &mut mark.kind {
+                        *effect = Some(e.clone());
+                    }
+                    self.require_dup(t, &mark, &h.skip);
+                }
+                (Some(_), None) => rest.push(h),
+            }
+        }
+        if let RowTail::Open(w) = row.tail {
+            if !rest.is_empty() {
+                self.row_holds.entry(w).or_default().extend(rest);
+            }
+        }
+    }
+
+    /// D5: every operation of each label `row` has, but `IO`'s, takes
+    /// duplicable arguments (`op.perform` performs it again).
+    fn require_dup_ops(&mut self, row: &EffectRow, mark: &DupMark) {
+        for (label, l) in &row.labels {
+            if label == "IO" {
+                continue;
+            }
+            let mut ops: Vec<(String, OpInfo)> = self
+                .ops
+                .iter()
+                .filter(|(_, o)| &o.effect == label)
+                .map(|(n, o)| (n.clone(), o.clone()))
+                .collect();
+            ops.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, op) in ops {
+                let m: HashMap<u32, Ty> = op
+                    .effect_params
+                    .iter()
+                    .cloned()
+                    .zip(l.args.iter().cloned())
+                    .collect();
+                let rm = HashMap::new();
+                let mut mark = mark.clone();
+                mark.kind = DupKind::AnyOp {
+                    op: format!("{label}.{name}"),
+                };
+                for t in &op.params {
+                    let t = subst_vars(t, &(&m, &rm), &self.steps);
+                    self.require_dup(&t, &mark, &[]);
+                }
+            }
+        }
+    }
+
+    /// D5 at a `with any` handle: the row it handles, now and as its tail is
+    /// filled (where its function is instantiated, a forwarded row too).
+    fn hold_any_ops(&mut self, at: Span, handled: &EffectRow) {
+        let row = self.resolve_row(handled);
+        let mark = DupMark {
+            name: String::new(),
+            at,
+            kind: DupKind::AnyOp { op: String::new() },
+            via: None,
+        };
+        self.require_dup_ops(&row, &mark);
+        if let RowTail::Open(w) = row.tail {
+            self.row_holds.entry(w).or_default().push(Hold {
+                ty: None,
+                skip: Vec::new(),
+                mark,
+            });
+        }
+    }
+
+    /// Whether `t` is duplicable already, nothing in it to mark.
+    fn dup_known(&mut self, t: &Ty) -> bool {
+        match self.resolve(t) {
+            Ty::Base(_) | Ty::Error | Ty::Fn(..) => true,
+            Ty::Var(_) => false,
+            Ty::Tuple(xs) => xs.iter().all(|x| self.dup_known(x)),
+            Ty::Con(n, args) => {
+                n == "$Op"
+                    || (!self.linear_types.contains(&n)
+                        && self.decl_not_dup(&n).is_none()
+                        && args.iter().all(|a| self.dup_known(a)))
+            }
+        }
+    }
+
+    /// D1: `t` must be duplicable: no `linear` type in it, nor in its declared
+    /// types' fields; its variables (but `skip`) marked.
+    fn require_dup(&mut self, t: &Ty, mark: &DupMark, skip: &[u32]) {
+        self.step();
+        match self.resolve(t) {
+            Ty::Base(_) | Ty::Error | Ty::Fn(..) => {}
+            Ty::Var(v) => {
+                if !skip.contains(&v) {
+                    self.dup_vars.entry(v).or_insert_with(|| mark.clone());
+                }
+            }
+            Ty::Tuple(xs) => {
+                for x in &xs {
+                    self.require_dup(x, mark, skip);
+                }
+            }
+            Ty::Con(n, args) => {
+                // An operation value holds its arguments, which D5 checks.
+                if n == "$Op" {
+                    return;
+                }
+                if self.linear_types.contains(&n) {
+                    self.dup_violation(mark, &n);
+                    return;
+                }
+                if let Some(inner) = self.decl_not_dup(&n) {
+                    self.dup_violation(mark, &inner);
+                    return;
+                }
+                for a in &args {
+                    self.require_dup(a, mark, skip);
+                }
+            }
+        }
+    }
+
+    /// The `linear` type a declared type's fields hold, its parameters taken
+    /// as duplicable (its arguments are checked where it is used).
+    fn decl_not_dup(&mut self, name: &str) -> Option<String> {
+        if let Some(r) = self.decl_dup.get(name) {
+            return r.clone();
+        }
+        let r = self.decl_not_dup_in(name, &mut Vec::new());
+        self.decl_dup.insert(name.to_string(), r.clone());
+        r
+    }
+
+    fn decl_not_dup_in(&self, name: &str, seen: &mut Vec<String>) -> Option<String> {
+        if seen.iter().any(|n| n == name) {
+            return None;
+        }
+        seen.push(name.to_string());
+        let (_, ctors) = self.adt_fields.get(name)?;
+        ctors
+            .iter()
+            .flatten()
+            .find_map(|f| self.shape_not_dup(f, seen))
+    }
+
+    fn shape_not_dup(&self, t: &Ty, seen: &mut Vec<String>) -> Option<String> {
+        match t {
+            Ty::Base(_) | Ty::Error | Ty::Fn(..) | Ty::Var(_) => None,
+            Ty::Tuple(xs) => xs.iter().find_map(|x| self.shape_not_dup(x, seen)),
+            Ty::Con(n, _) if n == "$Op" => None,
+            Ty::Con(n, _) if self.linear_types.contains(n) => Some(n.clone()),
+            Ty::Con(n, args) => args
+                .iter()
+                .find_map(|a| self.shape_not_dup(a, seen))
+                .or_else(|| self.decl_not_dup_in(n, seen)),
+        }
+    }
+
+    /// D6: a value holding the `linear` type `what` would be duplicated.
+    fn dup_violation(&mut self, m: &DupMark, what: &str) {
+        let key = m.via.unwrap_or(m.at);
+        if !self.dup_reported.insert(key) {
+            return;
+        }
+        use crate::affine::Why;
+        let who = if m.name.is_empty() {
+            "an affine value".to_string()
+        } else {
+            format!("affine value `{}`", m.name)
+        };
+        let holds = if m.name.is_empty() {
+            format!("this value holds a `{what}`, which is `linear`")
+        } else if self.linear_types.contains(what) && m.via.is_none() {
+            format!("`{}` is a `{what}`, which is `linear`", m.name)
+        } else {
+            format!("`{}` holds a `{what}`, which is `linear`", m.name)
+        };
+        let d = match (&m.kind, m.via) {
+            (DupKind::AnyOp { op }, _) => Diagnostic::error(
+                "E0437",
+                "an operation taking an affine value cannot be handled by `with any`",
+            )
+            .with_label(m.at, format!("`{op}` is handled here generically"))
+            .with_help(format!(
+                "`op.perform` performs an operation again, with its arguments: `{op}` takes a `{what}`, which is `linear` (used at most once); handle it by name instead"
+            )),
+            (DupKind::Many(why), None) => {
+                let (label, extra) = match why {
+                    Why::Twice => ("second use here", None),
+                    Why::Closure(l) => (
+                        "used in a closure that may run more than once",
+                        Some((*l, "this closure is passed on, or called more than once")),
+                    ),
+                    Why::Clause(c) => (
+                        "used in an operation clause",
+                        Some((*c, "this clause runs once per perform")),
+                    ),
+                };
+                let mut d = Diagnostic::error(
+                    "E0428",
+                    format!("{who} used more than once"),
+                )
+                .with_label(m.at, label);
+                if let Some((s, t)) = extra {
+                    d = d.with_label(s, t);
+                }
+                d.with_help(format!(
+                    "{holds}: an affine value may be used at most once; consume it in one place"
+                ))
+            }
+            (DupKind::Held { point, effect }, None) => {
+                let what_point = match effect {
+                    Some(e) => format!("this may resume more than once: it performs `{e}`, a `multi` effect"),
+                    None => "this may resume more than once".to_string(),
+                };
+                Diagnostic::error(
+                    "E0429",
+                    format!("{who} may be captured by a multi-shot handler"),
+                )
+                .with_label(m.at, "used after a multi-shot perform")
+                .with_label(*point, what_point)
+                .with_help(format!(
+                    "{holds}: a multi-shot resume runs what follows the perform again, using it again; consume it before the perform"
+                ))
+            }
+            (DupKind::Many(_), Some(v)) => Diagnostic::error(
+                "E0437",
+                "this would use an affine value more than once",
+            )
+            .with_label(v, format!("a `{what}` reaches a generic function here"))
+            .with_label(m.at, format!("`{}` is used more than once here", m.name))
+            .with_help(format!(
+                "{holds}, and the function this calls (or one it calls) uses it more than once: an affine value may be used at most once"
+            )),
+            (DupKind::Held { point, effect }, Some(v)) => {
+                let what_point = match effect {
+                    Some(e) => format!("this call may resume more than once: here it performs `{e}`, a `multi` effect"),
+                    None => "this call may resume more than once".to_string(),
+                };
+                Diagnostic::error(
+                    "E0437",
+                    "this would keep an affine value across a multi-shot perform",
+                )
+                .with_label(v, format!("a `{what}` reaches a generic function here"))
+                .with_label(m.at, format!("`{}` is used after a call", m.name))
+                .with_label(*point, what_point)
+                .with_help(format!(
+                    "{holds}, and the function this calls uses it after a call that may resume more than once: what follows would run again"
+                ))
+            }
+        };
+        self.affine_diags.push(d);
     }
 
     /// E0436 (structural equality, D1): `t` is compared with `==`, so it must be
@@ -1489,6 +1922,7 @@ impl Infer {
                 labels: BTreeMap::new(),
                 tail: RowTail::ErrorRow,
             });
+            self.row_holds.remove(&v);
             self.wake_inclusions(v);
             return;
         }
@@ -1508,7 +1942,12 @@ impl Infer {
         // And its level, as `bind` does (D14).
         let lvl = self.row_level[v as usize];
         self.lower_row_walk(&resolved, lvl);
+        let holds = self.row_holds.remove(&v);
+        let row = holds.as_ref().map(|_| resolved.clone());
         self.row_subst[v as usize] = Some(resolved);
+        if let (Some(hs), Some(row)) = (holds, row) {
+            self.apply_holds(hs, &row);
+        }
         self.wake_inclusions(v);
     }
 
@@ -2210,6 +2649,9 @@ impl Infer {
             if let (Some(origin), Ty::Var(f)) = (self.eq_vars.get(v).copied(), fresh) {
                 self.eq_vars.insert(*f, origin);
             }
+            if let (Some(m), Ty::Var(f)) = (self.dup_vars.get(v).cloned(), fresh) {
+                self.dup_vars.insert(*f, m.through(self.cur_span));
+            }
         }
         let mut row_mapping: HashMap<RowVar, RowVar> = HashMap::new();
         for v in &s.row_vars {
@@ -2231,6 +2673,24 @@ impl Infer {
                 });
             }
             row_mapping.insert(*v, fresh);
+        }
+        for v in &s.row_vars {
+            if let Some(hs) = self.row_holds.get(v).cloned() {
+                let f = row_mapping[v];
+                let copies: Vec<Hold> = hs
+                    .into_iter()
+                    .map(|h| Hold {
+                        // Resolved first: a variable bound since the hold was
+                        // made stands for what the scheme quantified.
+                        ty: h.ty.map(|t| {
+                            subst_vars(&self.resolve(&t), &(&mapping, &row_mapping), &self.steps)
+                        }),
+                        skip: h.skip,
+                        mark: h.mark.through(self.cur_span),
+                    })
+                    .collect();
+                self.row_holds.entry(f).or_default().extend(copies);
+            }
         }
         subst_vars(&s.ty, &(&mapping, &row_mapping), &self.steps)
     }
@@ -2290,6 +2750,7 @@ impl Infer {
                             ty: self.resolve(&t),
                         }
                     };
+                    self.note_binder(value.span, name, &scheme);
                     self.bind_name(env, name, scheme);
                 }
                 Stmt::Expr(e) => {
@@ -2487,16 +2948,14 @@ impl Infer {
                     let mut bindings = Vec::new();
                     self.check_pattern(&arm.node.pat, &s, env, &mut bindings);
                     env.push();
-                    for (name, ty) in bindings {
-                        self.bind_name(
-                            env,
-                            &name,
-                            Scheme {
-                                vars: Vec::new(),
-                                row_vars: Vec::new(),
-                                ty,
-                            },
-                        );
+                    for (name, ty, at) in bindings {
+                        let scheme = Scheme {
+                            vars: Vec::new(),
+                            row_vars: Vec::new(),
+                            ty,
+                        };
+                        self.note_binder(at, &name, &scheme);
+                        self.bind_name(env, &name, scheme);
                     }
                     let body_ty = self.infer_expr(&arm.node.body, env, amb);
                     self.unify(&body_ty, &result, arm.node.body.span);
@@ -2510,15 +2969,13 @@ impl Infer {
                 let mut param_tys = Vec::with_capacity(params.len());
                 for p in params {
                     let pv = self.fresh();
-                    self.bind_name(
-                        env,
-                        &p.node.name,
-                        Scheme {
-                            vars: Vec::new(),
-                            row_vars: Vec::new(),
-                            ty: pv.clone(),
-                        },
-                    );
+                    let scheme = Scheme {
+                        vars: Vec::new(),
+                        row_vars: Vec::new(),
+                        ty: pv.clone(),
+                    };
+                    self.note_binder(p.span, &p.node.name, &scheme);
+                    self.bind_name(env, &p.node.name, scheme);
                     // 5b-6 §4 (obligation T3): record the parameter's type at its
                     // own span, exactly as a top-level fn parameter is recorded.
                     // The back end then READS a lambda parameter's type instead of
@@ -2591,11 +3048,11 @@ impl Infer {
         pat: &Spanned<Pattern>,
         expected: &Ty,
         env: &TyEnv,
-        bindings: &mut Vec<(String, Ty)>,
+        bindings: &mut Vec<(String, Ty, Span)>,
     ) {
         match &pat.node {
             Pattern::Wild => {}
-            Pattern::Var(x) => bindings.push((x.clone(), expected.clone())),
+            Pattern::Var(x) => bindings.push((x.clone(), expected.clone(), pat.span)),
             Pattern::Lit(l) => {
                 let lit_ty = match l {
                     PatLit::Int(_) => Ty::int(),
@@ -2760,6 +3217,7 @@ impl Infer {
                     let performed = self.resolve_row(&EffectRow::open(h));
                     let r = self.add_row(amb, &performed, span);
                     self.surface_conflict(r);
+                    self.hold_point(span, &performed);
                 }
                 self.node_types
                     .insert(callee.span, Ty::Fn(params, row, Box::new(ret.clone())));
@@ -2897,6 +3355,21 @@ impl Infer {
                     let r = self.add_effect(amb, &op.effect, eff_args, span);
                     self.surface_conflict(r);
                 }
+                let mut performed = BTreeMap::new();
+                performed.insert(
+                    op.effect.clone(),
+                    EffectLabel {
+                        args: Vec::new(),
+                        span: callee.span,
+                    },
+                );
+                self.hold_point(
+                    span,
+                    &EffectRow {
+                        labels: performed,
+                        tail: RowTail::Closed,
+                    },
+                );
                 return op_ret;
             }
         }
@@ -2926,6 +3399,7 @@ impl Infer {
         let expected = Ty::Fn(arg_ts, EffectRow::open(call_row), Box::new(result.clone()));
         self.unify(&f, &expected, span);
         let mut eff = self.resolve_row(&EffectRow::open(call_row));
+        self.hold_point(span, &eff);
         // Sub-effecting: a PHANTOM callee tail (an upcast, see `phantom`) that
         // nothing in the environment shares is not unified with the ambient --
         // that would make this use's row EQUAL to the caller's and merge rows
@@ -3061,15 +3535,13 @@ impl Infer {
         match &handler.ret {
             Some(ret) => {
                 env.push();
-                self.bind_name(
-                    env,
-                    &ret.binder,
-                    Scheme {
-                        vars: Vec::new(),
-                        row_vars: Vec::new(),
-                        ty: body_ty.clone(),
-                    },
-                );
+                let scheme = Scheme {
+                    vars: Vec::new(),
+                    row_vars: Vec::new(),
+                    ty: body_ty.clone(),
+                };
+                self.note_binder(ret.body.span, &ret.binder, &scheme);
+                self.bind_name(env, &ret.binder, scheme);
                 self.regions.push((ret_amb, false));
                 let ret_ty = self.infer_expr(&ret.body, env, ret_amb);
                 self.regions.pop();
@@ -3121,15 +3593,13 @@ impl Infer {
                 // Core lowering then READS it out of the frozen table, the same
                 // lookup it makes for a lambda parameter, instead of guessing it.
                 self.node_types.insert(p.span, pty.clone());
-                self.bind_name(
-                    env,
-                    &p.node.name,
-                    Scheme {
-                        vars: Vec::new(),
-                        row_vars: Vec::new(),
-                        ty: pty,
-                    },
-                );
+                let scheme = Scheme {
+                    vars: Vec::new(),
+                    row_vars: Vec::new(),
+                    ty: pty,
+                };
+                self.note_binder(p.span, &p.node.name, &scheme);
+                self.bind_name(env, &p.node.name, scheme);
             }
             // The clause body runs at the handler's *outer* ambient; `resume`
             // there takes B and yields R.
@@ -3236,6 +3706,11 @@ impl Infer {
             let r = self.add_row(amb, &residual, span);
             self.surface_conflict(r);
         }
+        let mut rows = vec![residual, self.resolve_row(&EffectRow::open(ret_amb))];
+        for ca in &clause_ambs {
+            rows.push(self.resolve_row(&EffectRow::open(*ca)));
+        }
+        self.hold_handle(span, &rows);
         result
     }
 
@@ -3264,15 +3739,13 @@ impl Infer {
         match &handler.ret {
             Some(ret) => {
                 env.push();
-                self.bind_name(
-                    env,
-                    &ret.binder,
-                    Scheme {
-                        vars: Vec::new(),
-                        row_vars: Vec::new(),
-                        ty: body_ty.clone(),
-                    },
-                );
+                let scheme = Scheme {
+                    vars: Vec::new(),
+                    row_vars: Vec::new(),
+                    ty: body_ty.clone(),
+                };
+                self.note_binder(ret.body.span, &ret.binder, &scheme);
+                self.bind_name(env, &ret.binder, scheme);
                 self.regions.push((ret_amb, false));
                 let ret_ty = self.infer_expr(&ret.body, env, ret_amb);
                 self.regions.pop();
@@ -3315,15 +3788,13 @@ impl Infer {
             env.push();
             for p in clause.params.iter() {
                 self.node_types.insert(p.span, op_ty.clone());
-                self.bind_name(
-                    env,
-                    &p.node.name,
-                    Scheme {
-                        vars: Vec::new(),
-                        row_vars: Vec::new(),
-                        ty: op_ty.clone(),
-                    },
-                );
+                let scheme = Scheme {
+                    vars: Vec::new(),
+                    row_vars: Vec::new(),
+                    ty: op_ty.clone(),
+                };
+                self.note_binder(p.span, &p.node.name, &scheme);
+                self.bind_name(env, &p.node.name, scheme);
             }
             let clause_amb = self.fresh_row();
             clause_ambs.push(clause_amb);
@@ -3409,6 +3880,14 @@ impl Infer {
         for (sk, sp) in new_skolems {
             self.check_skolem_escape(&sk, sp, &result, env, amb);
         }
+        self.hold_any_ops(span, &handled);
+        // What it holds, by what escapes it: `IO`, its return clause's row
+        // and its clauses' (a forwarded operation's among them).
+        let mut rows = vec![self.resolve_row(&EffectRow::open(ret_amb))];
+        for ca in &clause_ambs {
+            rows.push(self.resolve_row(&EffectRow::open(*ca)));
+        }
+        self.hold_handle(span, &rows);
         result
     }
 
@@ -3769,6 +4248,22 @@ impl Infer {
             if let RowTail::Open(v) = self.resolve_row(&site.tail).tail {
                 row_in_env.push(v);
             }
+        }
+        // A type held on a row variable this `let` leaves to its scope is the
+        // scope's (spec 2026-11-06-elya-affine-across-functions D3; the review's
+        // U-B): quantified, an instance used before the row took a `multi`
+        // effect escaped the requirement.
+        let lvl = self.cur_level;
+        let held: Vec<Ty> = self
+            .row_holds
+            .iter()
+            .filter(|(w, _)| {
+                self.row_level[**w as usize] <= lvl && self.row_subst[**w as usize].is_none()
+            })
+            .flat_map(|(_, hs)| hs.iter().filter_map(|h| h.ty.clone()))
+            .collect();
+        for t in &held {
+            free_vars(self, t, &mut in_env);
         }
         (
             in_env.into_iter().collect(),
@@ -4375,26 +4870,27 @@ pub fn infer_schemes(
     _session: &Session,
     module: &Module,
 ) -> (Vec<(String, String)>, Vec<Diagnostic>) {
-    let (schemes, diags, _sites, _typed, _fns) = infer_all(module, false);
-    (schemes, diags)
+    let (schemes, diags, _sites, _typed, _fns, affine) = infer_all(module, false);
+    (schemes, with_affine(diags, affine))
 }
 
-/// Inference plus the affine binding-site set (Slice 4d-2): which let-bindings /
-/// params have a `linear`-declared type. The one bounded reach the `affine::check`
-/// pass consumes; the affine *logic* lives entirely in that pass.
+/// Inference plus the affine binding-site set (Slice 4d-2): which `let`s have a
+/// `linear`-declared type.
 pub fn infer_with_sites(_session: &Session, module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
-    let (_schemes, diags, sites, _typed, _fns) = infer_all(module, false);
-    (diags, sites)
+    let (_schemes, diags, sites, _typed, _fns, affine) = infer_all(module, false);
+    (with_affine(diags, affine), sites)
 }
 
-/// [`infer_with_sites`] plus every top-level function's generalized type, by
-/// name: a module's interface (spec 2026-10-24-elya-modules-part-2 D1).
+/// Inference's diagnostics, the affine ones apart (spec
+/// 2026-11-06-elya-affine-across-functions D7: reported after exhaustiveness),
+/// and every top-level function's generalized type, by name: a module's
+/// interface (spec 2026-10-24-elya-modules-part-2 D1).
 pub fn infer_with_interfaces(
     _session: &Session,
     module: &Module,
-) -> (Vec<Diagnostic>, HashSet<Span>, HashMap<String, Ty>) {
-    let (_schemes, diags, sites, _typed, fns) = infer_all(module, false);
-    (diags, sites, fns)
+) -> (Vec<Diagnostic>, Vec<Diagnostic>, HashMap<String, Ty>) {
+    let (_schemes, diags, _sites, _typed, fns, affine) = infer_all(module, false);
+    (diags, affine, fns)
 }
 
 /// Inference plus the per-node type table (Slice 5a-1): every expression node's
@@ -4405,7 +4901,8 @@ pub fn infer_with_types(
     _session: &Session,
     module: &Module,
 ) -> (Vec<Diagnostic>, BTreeMap<Span, String>) {
-    let (_schemes, diags, _sites, typed, _fns) = infer_all(module, true);
+    let (_schemes, diags, _sites, typed, _fns, affine) = infer_all(module, true);
+    let diags = with_affine(diags, affine);
     let mut names = Names::default();
     let mut rendered: BTreeMap<Span, String> = BTreeMap::new();
     for (span, ty) in &typed {
@@ -4424,8 +4921,8 @@ pub fn infer_typed_table(
     _session: &Session,
     module: &Module,
 ) -> (Vec<Diagnostic>, BTreeMap<Span, Ty>) {
-    let (_schemes, diags, _sites, typed, _fns) = infer_all(module, true);
-    (diags, typed)
+    let (_schemes, diags, _sites, typed, _fns, affine) = infer_all(module, true);
+    (with_affine(diags, affine), typed)
 }
 
 /// Result of a full-module inference pass: generalized top-level schemes (name →
@@ -4438,7 +4935,17 @@ type InferAllOut = (
     HashSet<Span>,
     BTreeMap<Span, Ty>,
     HashMap<String, Ty>,
+    Vec<Diagnostic>,
 );
+
+/// The affine diagnostics after the others, when those have no error (D7: as
+/// the front end reports them).
+fn with_affine(mut diags: Vec<Diagnostic>, affine: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    if !diags.iter().any(|d| d.severity == Severity::Error) {
+        diags.extend(affine);
+    }
+    diags
+}
 
 /// The work inference does on `module` (`Infer::steps`), timing-free, the
 /// zonk of every node's type included (the back end's inference): what
@@ -4456,6 +4963,7 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
 /// groups use it — giving proper let-polymorphism across the top level.
 fn infer_all_counted(module: &Module, want_types: bool) -> (InferAllOut, u64) {
     let mut inf = Infer::new();
+    inf.affine = crate::affine::analyze(module);
     // Names of `linear`-declared types — set before inference so `ty_is_linear`
     // sees them while recording affine binding sites (Slice 4d-2).
     for d in &module.decls {
@@ -4741,15 +5249,13 @@ fn infer_all_counted(module: &Module, want_types: bool) -> (InferAllOut, u64) {
                 // end of this function maps over the whole table, so these
                 // resolve for free.
                 inf.node_types.insert(p.span, pty.clone());
-                inf.bind_name(
-                    &mut env,
-                    &p.node.name,
-                    Scheme {
-                        vars: Vec::new(),
-                        row_vars: Vec::new(),
-                        ty: pty.clone(),
-                    },
-                );
+                let scheme = Scheme {
+                    vars: Vec::new(),
+                    row_vars: Vec::new(),
+                    ty: pty.clone(),
+                };
+                inf.note_binder(p.span, &p.node.name, &scheme);
+                inf.bind_name(&mut env, &p.node.name, scheme);
             }
             inf.param_tys = params.clone();
             let body_ty = inf.infer_block(&f.body.node, &mut env, amb_f);
@@ -4899,6 +5405,7 @@ fn infer_all_counted(module: &Module, want_types: bool) -> (InferAllOut, u64) {
             inf.affine_sites,
             node_types,
             fn_types,
+            inf.affine_diags,
         ),
         steps,
     )

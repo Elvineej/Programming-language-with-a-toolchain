@@ -1,0 +1,7 @@
+linear type File { File(Int) }
+fn read(f: File) -> Int { match f { File(n) -> n } }
+fn twice(g, x) { g(x) + g(x) }
+pub fn main() -> Int {
+  twice(read, File(1))
+}
+//~ ERROR[E0437] more than once

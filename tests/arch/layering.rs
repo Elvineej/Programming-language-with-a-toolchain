@@ -21,7 +21,9 @@ fn layer(module: &str) -> Option<i32> {
         ("types", 4),
         ("core", 5),
         ("exhaust", 5),
-        ("affine", 5),
+        // The affine pass reads the syntax before inference, which imposes
+        // what it finds (spec 2026-11-06-elya-affine-across-functions D7).
+        ("affine", 3),
         ("eval", 6),
     ]);
     map.get(module).copied()
