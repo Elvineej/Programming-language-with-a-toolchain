@@ -3,7 +3,7 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-11-12, an interactive session on `main`)
+## State at handoff (updated 2026-11-13, an interactive session on `main`)
 
 - **Work lands on `main` directly** (the maintainer, 2026-10-30: "Commit in the main
   tho"). `main` has everything: #24 (2026-10-24), then `auto/elya`'s 15 commits since,
@@ -30,13 +30,22 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1504 passed, 158 suites. Native programs run on
+- Linux gate at the tip of `main`: 1510 passed, 159 suites. Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). In October the runtime
   gained `elya_cont_copy` (multi-shot), the string functions and the two time
   functions, and a handle's body ends at the shared end frame (`gc_collect` grays the
   current handler as a root). Since 2026-11-12 the collector is `gc.c` (paged, freestanding;
   spec 2026-11-12-elya-paged-collector), the runtime compiled `-O2` once per process.
+  Since 2026-11-13 `runtime.c` is freestanding too: the machine only through
+  `elya_platform_*` hooks (`platform_hosted.c` on a host; a board gives `write` and
+  `exit`), Float text by `float_fmt.c` / `float_parse.c`, no C library function in
+  the IR (spec 2026-11-13-elya-platform-layer).
+- **Work is divided with ChatGPT** (the maintainer, 2026-11-13): Claude gives the
+  ChatGPT (Codex) app on the PC self-contained jobs in `E:\Elya\chatgpt-jobs\<job>`,
+  never the repository itself, picks its reasoning effort by the job's difficulty,
+  and checks every result here before it lands (the spec names what was checked).
+  The PC has no LLVM 18 and no QEMU: its jobs cannot build the native back end.
   `elya_eq` takes a fourth argument (the first closure tag) since 2026-10-23.
 - Interactive sessions use the same `AUTO_RUN_LOG.md` lock: an IN PROGRESS entry
   under 3 hours old makes a scheduled run exit.
@@ -736,13 +745,25 @@ page source (OS chunks hosted, `elya_heap_init` on a board); builds freestanding
 x86-64, Cortex-M4, RISC-V 32; faster on every program measured, half the memory on
 large live sets (one recorded exception, `big_live`, spec). The runtime compiled -O2
 once per process. Gate 1504.
-**Next, part 2:** the rest of the runtime behind the platform layer (bytes out, stop,
-the start thread, the clock, signals: about 170 libc calls), a freestanding runtime
-build, and an Elya program run on an emulated board (QEMU, if it installs; else a
-host harness linking the freestanding runtime). Then the nursery (D10) measured on
-churn-heavy programs, and `big_live`'s size-mix memory.
+**Part 2 done** (8d08c11, 2026-11-13): the whole runtime freestanding behind
+`elya_platform_*`; Elya programs linked with a board and no C library write what
+the hosted build writes (x86-64, the test machine's processor); working memory from
+the one heap; Float text 57 times faster. Gate 1510.
+**Next, part 3:** code generation for a target triple (`compile_module` takes the
+host's today), and an Elya program on a Cortex-M3 and a RISC-V board under QEMU
+(ChatGPT's start-up code and linker scripts, run here with a C `entry`, are in the
+scratchpad's `cj/job3` and on the PC at `E:\Elya\chatgpt-jobs\job3`; QEMU 8.2 is
+installed in the cloud workspace). Then part 2's review findings if any are open,
+the nursery (D10) measured on churn-heavy programs, and `big_live`'s size-mix
+memory.
 
 ### 2. Native compilation without its implementation limits
+
+**First, found 2026-11-13:** `compile_module` emits at `OptimizationLevel::None`
+and runs no LLVM pass. Measure the benchmarks with the `default<O2>` pipeline
+(the shadow stack and the frames are explicit memory, so the passes are safe in
+principle; tail calls and the stack tests are what to watch), and make optimised
+code the default if the suite holds.
 
 The maintainer's priority (2026-10-30: "native compilation has restrictive
 implementation limits"). Inventory every refusal natively against the

@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-11-13 00:10 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
+## 2026-11-13 11:00 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -15,6 +15,17 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
   after the usage limit (primary)" about 5 h ahead (trig_01WyXi2uvHFnTw3TEU4FtMAY) and
   "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
+- **Done: the runtime behind a platform layer** (HANDOFF step 1, part 2; spec
+  2026-11-13-elya-platform-layer; 8d08c11). Gate 1510 / 159 (predicted 1510).
+  - `runtime.c` freestanding; `platform_hosted.c`; a board gives `write` and `exit`.
+  - Programs with a board and no C library write what the hosted build writes.
+  - Float text and parsing written by ChatGPT to Claude's briefs, checked here
+    (20M and 3M cases against Rust); 57 times faster than the `strtod` loop.
+  - **Decisions (mine; please review):** working memory from the collector's heap
+    on a board, never collecting; hosted keeps `realloc`; ChatGPT's work goes in
+    only after an independent check here, and its files say who wrote them.
+  - ChatGPT also: two QEMU boards (run here, land with part 3); a review of the
+    whole project and a fuzzing job were started and stopped at its usage limit.
 - **Done: strings by byte, one trace line format, `replay.parse`** (HANDOFF step 1;
   spec 2026-10-24-elya-trace-text, the scheduled run's spec and plan; implementation
   20a4804).
