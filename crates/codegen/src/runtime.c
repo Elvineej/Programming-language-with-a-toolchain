@@ -405,10 +405,17 @@ int64_t elya_eq(void *a, void *b, int64_t string_tag, int64_t first_closure_tag)
             elya_platform_exit(1);
         }
         int64_t arity = gc_descriptors[2 * tag];
-        int64_t mask = gc_descriptors[2 * tag + 1];
-        int64_t fmask = tag < eq_n_masks ? eq_float_masks[tag] : 0;
+        /* A constructor's float mask, or (more than 64 fields) where its mask
+         * words begin, as its descriptor row. */
+        const int64_t *fmask = tag < eq_n_masks ? eq_float_masks + tag : NULL;
+        if (fmask && arity > 64) {
+            fmask = eq_float_masks + *fmask;
+        }
         for (int64_t f = 0; f < arity; f++) {
-            EQ_PUSH(x[1 + f], y[1 + f], ((mask >> f) & 1) ? 1 : (((fmask >> f) & 1) ? 2 : 0));
+            EQ_PUSH(x[1 + f], y[1 + f],
+                    gc_field_is_heap(tag, f)
+                        ? 1
+                        : ((fmask && (((uint64_t)fmask[f >> 6] >> (f & 63)) & 1)) ? 2 : 0));
         }
     }
 #undef EQ_PUSH

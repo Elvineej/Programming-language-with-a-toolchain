@@ -2230,7 +2230,10 @@ fn lower_expr<'ctx>(
 /// are the single source of truth for 7b-3's emitter (plan: "frame_tag comes
 /// from descriptor_rows, never recomputed").
 pub(crate) struct Descriptors {
+    /// `n_rows` pairs `[arity, mask]`, then the mask words of the rows wider
+    /// than 64 (`push_row`).
     pub(crate) rows: Vec<u64>,
+    pub(crate) n_rows: usize,
     pub(crate) frame_tag: usize,
     /// Continuation site key (`ContSite::key`) -> the tag its frames carry.
     pub(crate) site_tags: std::collections::BTreeMap<usize, usize>,
@@ -2242,6 +2245,37 @@ pub(crate) struct Descriptors {
     pub(crate) handler_lo: usize,
     /// D13: the continuation object's tag.
     pub(crate) cont_tag: usize,
+}
+
+/// Which words of a value are heap values: one bit a word after the tag.
+struct PtrMask(Vec<u64>);
+
+impl PtrMask {
+    /// The mask of a value of `arity` words, the bits of `low` set.
+    fn new(arity: usize, low: u64) -> Self {
+        let mut words = vec![0; arity.div_ceil(64).max(1)];
+        words[0] = low;
+        PtrMask(words)
+    }
+    fn set(&mut self, i: usize) {
+        self.0[i / 64] |= 1 << (i % 64);
+    }
+}
+
+/// Appends the row `[arity, mask]`. A value of 64 words or fewer carries its
+/// mask in the row; a wider one carries, in the mask's place, where its mask
+/// words begin (`wide` holds them until every row is in: `descriptor_rows`
+/// appends them after the rows and writes each offset). The collector reads a
+/// row by its arity (`gc_field_is_heap`, gc.c). Before this a bit past 63 was
+/// shifted out of range here and in C (found by ChatGPT's review).
+fn push_row(desc: &mut Vec<u64>, wide: &mut Vec<(usize, Vec<u64>)>, arity: usize, mask: PtrMask) {
+    desc.push(arity as u64);
+    if arity <= 64 {
+        desc.push(mask.0[0]);
+    } else {
+        wide.push((desc.len(), mask.0));
+        desc.push(0);
+    }
 }
 
 fn descriptor_rows(
@@ -2257,21 +2291,17 @@ fn descriptor_rows(
     // 0 indexes straight into this table. Bit `i` of the mask is set iff field
     // `i` is a heap pointer, which is what lets the mark phase trace precisely
     // instead of guessing: an `Int` field is never mistaken for a pointer.
-    let mut desc: Vec<u64> = core
-        .types
-        .iter()
-        .flat_map(|t| t.ctors.iter())
-        .flat_map(|c| {
-            let arity = c.fields.len() as u64;
-            let mut mask = 0u64;
-            for (i, f) in c.fields.iter().enumerate() {
-                if is_heap_ty(f) {
-                    mask |= 1 << i;
-                }
+    let mut desc: Vec<u64> = Vec::new();
+    let mut wide: Vec<(usize, Vec<u64>)> = Vec::new();
+    for c in core.types.iter().flat_map(|t| t.ctors.iter()) {
+        let mut mask = PtrMask::new(c.fields.len(), 0);
+        for (i, f) in c.fields.iter().enumerate() {
+            if is_heap_ty(f) {
+                mask.set(i);
             }
-            [arity, mask].into_iter()
-        })
-        .collect();
+        }
+        push_row(&mut desc, &mut wide, c.fields.len(), mask);
+    }
     // One SYNTHETIC constructor row per lambda site, continuing the tag
     // numbering. This is what keeps `gc_mark` byte-identical: a closure is just
     // an object whose descriptor happens to have been synthesized rather than
@@ -2288,16 +2318,16 @@ fn descriptor_rows(
             ));
         }
         // arity = 1 (the code pointer) + the captures.
-        desc.push(1 + site.captures.len() as u64);
         // Bit 0 is CLEAR: word 1 is a code pointer into the text segment, not a
         // heap object. Bit j+1 is set iff capture j is a heap value.
-        let mut mask: u64 = 0;
+        let arity = 1 + site.captures.len();
+        let mut mask = PtrMask::new(arity, 0);
         for (j, (_, ty)) in site.captures.iter().enumerate() {
             if is_heap_ty(ty) {
-                mask |= 1 << (j + 1);
+                mask.set(j + 1);
             }
         }
-        desc.push(mask);
+        push_row(&mut desc, &mut wide, arity, mask);
     }
     // N6 (§1.2): ONE string row — arity 0, mask 0. Nothing after the tag is a
     // heap reference, so the mark phase traces nothing for a string. The tag is
@@ -2332,26 +2362,29 @@ fn descriptor_rows(
                      // compare against (unlike the lambda tags, assigned in `collect_lambdas`).
                      // A handler frame takes its own row, appended after the site rows
                      // (below).
-    let frame_row = |saved: &[(cps::Saved, Ty)], desc: &mut Vec<u64>| -> usize {
+    let frame_row = |saved: &[(cps::Saved, Ty)],
+                     desc: &mut Vec<u64>,
+                     wide: &mut Vec<(usize, Vec<u64>)>|
+     -> usize {
         if saved.is_empty() {
             return frame_tag;
         }
         let tag = desc.len() / 2;
-        desc.push(2 + saved.len() as u64);
         // Bit 0 clear (code pointer), bit 1 set (`next`), bit j+2 set iff saved
         // value j is a heap value -- the lambda rows' convention shifted by one.
-        let mut mask: u64 = 0b10;
+        let arity = 2 + saved.len();
+        let mut mask = PtrMask::new(arity, 0b10);
         for (j, (_, ty)) in saved.iter().enumerate() {
             if is_heap_ty(ty) {
-                mask |= 1 << (j + 2);
+                mask.set(j + 2);
             }
         }
-        desc.push(mask);
+        push_row(desc, wide, arity, mask);
         tag
     };
     let mut site_tags = std::collections::BTreeMap::new();
     for site in sites {
-        site_tags.insert(site.key, frame_row(&site.saved, &mut desc));
+        site_tags.insert(site.key, frame_row(&site.saved, &mut desc, &mut wide));
     }
     // Task 8: a handler frame is `[tag][code_ptr = the return clause][next]
     // [table][parent][saved..]`. `next` is null for a direct handle and the
@@ -2365,14 +2398,14 @@ fn descriptor_rows(
     let handler_lo = desc.len() / 2;
     for h in handlers {
         handler_tags.insert(h.key, desc.len() / 2);
-        desc.push(4 + h.saved.len() as u64);
-        let mut mask: u64 = 0b1010;
+        let arity = 4 + h.saved.len();
+        let mut mask = PtrMask::new(arity, 0b1010);
         for (j, (_, ty)) in h.saved.iter().enumerate() {
             if is_heap_ty(ty) {
-                mask |= 1 << (j + 4);
+                mask.set(j + 4);
             }
         }
-        desc.push(mask);
+        push_row(&mut desc, &mut wide, arity, mask);
     }
     // D13: ONE row for the continuation object a clause receives,
     // `[tag][k][h][innermost]`: `k` is the captured frame chain (traced, bit
@@ -2389,8 +2422,16 @@ fn descriptor_rows(
     }
     desc.push(3);
     desc.push(0b101);
+    // The wide rows' mask words follow the rows; each such row's second word
+    // is where its own begin.
+    let n_rows = desc.len() / 2;
+    for (slot, words) in wide {
+        desc[slot] = desc.len() as u64;
+        desc.extend(words);
+    }
     Ok(Descriptors {
         rows: desc,
+        n_rows,
         frame_tag,
         site_tags,
         handler_tags,
@@ -2858,7 +2899,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let main_int = module.add_function("elya_main_int", main_int_ty, None);
 
     let desc = descriptors.rows.clone();
-    let n_ctors = (desc.len() / 2) as u64;
+    let n_ctors = descriptors.n_rows as u64;
     let desc_const = i64t.const_array(
         &desc
             .iter()
@@ -2875,19 +2916,29 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     desc_global.set_unnamed_addr(true);
     // One float mask per declared constructor, in tag order (D2); never empty, so
     // the global always has an address.
-    let mut float_masks: Vec<u64> = core
-        .types
-        .iter()
-        .flat_map(|t| t.ctors.iter())
-        .map(|c| {
-            c.fields
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| matches!(f, Ty::Base(TyCon::Float)))
-                .fold(0u64, |m, (i, _)| m | (1 << i))
-        })
-        .collect();
+    // A constructor of more than 64 fields carries, in its mask's place, where
+    // its mask words begin, after the masks (as its descriptor row does).
+    let mut float_masks: Vec<u64> = Vec::new();
+    let mut wide_floats: Vec<(usize, Vec<u64>)> = Vec::new();
+    for c in core.types.iter().flat_map(|t| t.ctors.iter()) {
+        let mut mask = PtrMask::new(c.fields.len(), 0);
+        for (i, f) in c.fields.iter().enumerate() {
+            if matches!(f, Ty::Base(TyCon::Float)) {
+                mask.set(i);
+            }
+        }
+        if c.fields.len() <= 64 {
+            float_masks.push(mask.0[0]);
+        } else {
+            wide_floats.push((float_masks.len(), mask.0));
+            float_masks.push(0);
+        }
+    }
     let n_masks = float_masks.len() as u64;
+    for (slot, words) in wide_floats {
+        float_masks[slot] = float_masks.len() as u64;
+        float_masks.extend(words);
+    }
     if float_masks.is_empty() {
         float_masks.push(0);
     }

@@ -35,7 +35,15 @@ static int canary_ok(void) {
     for (int i = 0; i < 1024; i++) if (statics.canary[i] || statics.after[i]) return 0;
     return 1;
 }
+#ifdef HOSTED_PAGES
+/* A host's page source, for the tests of growth. */
+void *elya_platform_pages(size_t bytes, size_t align) {
+    char *m = (char *)malloc(bytes + align);
+    return m ? (void *)(((uintptr_t)m + align - 1) & ~(uintptr_t)(align - 1)) : 0;
+}
+#else
 void *elya_platform_pages(size_t bytes, size_t align) { (void)bytes; (void)align; return 0; }
+#endif
 void elya_platform_release(void *p, size_t bytes) { (void)p; (void)bytes; }
 void elya_platform_fail(const char *m) { fputs(m, stdout); fflush(stdout); exit(3); }
 static unsigned char region[REGION] __attribute__((aligned(4096)));
@@ -70,12 +78,14 @@ int main(int argc, char **argv) {
     (void)argc;
     /* The shadow stack is the region's too on a board: give it one up front. */
     gc_shadow = (void **)shadow_store; gc_shadow_cap = 1024;
+#ifndef HOSTED_PAGES
     elya_heap_init(region, sizeof region);
+#endif
     elya_current_handler = &statics.blk[0];
     elya_gc_setup(descriptors, 4, 0);
     long keep = atol(argv[1]), rounds = atol(argv[2]);
     int64_t total = 0;
-    int64_t *kept = argc > 3 && argv[3][0] != 'i' && argv[3][0] != 'W' ? tree(atoi(argv[3])) : 0;
+    int64_t *kept = argc > 3 && argv[3][0] >= '0' && argv[3][0] <= '9' ? tree(atoi(argv[3])) : 0;
     elya_gc_push(kept);
     if (argc > 3 && argv[3][0] == 'L') {
         /* Large objects: `keep` words each, kept two at a time and checked
@@ -110,6 +120,46 @@ int main(int argc, char **argv) {
         }
         gc_collect();
         printf("total=0 collections=%lld overflows=%lld\n", (long long)gc_collections, (long long)gc_overflows);
+        return 0;
+    }
+    if (argc > 3 && argv[3][0] == 'K') {
+        /* The classes: each medium one fills its span; what an object of r
+         * words takes of a span, over its size, at worst and on average (in
+         * thousandths), for r from 129 words to the last class. */
+        int64_t bad = 0, worst = 0, sum = 0, n = 0;
+        int last = gc_n_classes - 1;
+        for (int c = GC_SMALL_CLASSES; c <= last; c++) {
+            size_t room = ((size_t)gc_class_pages[c] * ELYA_PAGE_BYTES - GC_PAGE_HEADER) / 8;
+            size_t k = room / gc_class_words[c];
+            bad += k < 2 || room / k != gc_class_words[c] || gc_class_words[c] <= gc_class_words[c - 1];
+        }
+        for (int64_t r = 129; r <= (int64_t)gc_class_words[last]; r++) {
+            int c = GC_SMALL_CLASSES;
+            while ((int64_t)gc_class_words[c] < r) c++;
+            size_t room = ((size_t)gc_class_pages[c] * ELYA_PAGE_BYTES - GC_PAGE_HEADER) / 8;
+            int64_t per = (int64_t)((size_t)gc_class_pages[c] * ELYA_PAGE_BYTES / (room / gc_class_words[c]));
+            int64_t ratio = per * 1000 / (8 * r);
+            if (ratio > worst) worst = ratio;
+            sum += ratio; n++;
+        }
+        printf("total=%lld classes=%d last=%u worst=%lld mean=%lld\n", (long long)bad, gc_n_classes,
+               gc_class_words[last], (long long)worst, (long long)(sum / n));
+        return 0;
+    }
+    if (argc > 3 && argv[3][0] == 'G') {
+        /* One object of `keep` words from a growing heap: both ends written. */
+        int64_t *big = (int64_t *)elya_alloc(keep);
+        big[0] = 1; big[keep - 1] = 2;
+        printf("total=0 words=%lld\n", (long long)elya_gc_words(big));
+        return 0;
+    }
+    if (argc > 3 && argv[3][0] == 'A') {
+        /* A working block freed is not counted toward the next collection. */
+        void *w = elya_gc_scratch(0, 1 << 20);
+        elya_gc_scratch(w, 0);
+        int64_t before = gc_collections;
+        (void)cons(1, 0);
+        printf("total=%lld\n", (long long)(gc_collections - before));
         return 0;
     }
     if (argc > 3 && argv[3][0] == 'W') {
@@ -321,6 +371,69 @@ fn working_memory_is_held_from_the_heap_and_given_back() {
         assert_eq!(code, 0, "{bytes}: {out}");
         assert!(out.starts_with("total=0 "), "{bytes}: {out}");
     }
+}
+
+/// The medium classes are made for the page size: each fills its span exactly,
+/// and an object's share of a span is at most a third over its size (a tenth
+/// on average) at 4 KiB, 1 KiB and 512-byte pages. The first table's fixed
+/// sizes in two-slot spans were 99% over at worst, 29% on average (ChatGPT's
+/// review measured it: a 5 KB string took 8 KiB).
+#[test]
+fn medium_classes_fill_their_spans() {
+    for page in ["4096", "1024", "512"] {
+        let define = format!("-DELYA_PAGE_BYTES={page}");
+        let (code, out) = run_board_with(
+            &format!("classes-{page}"),
+            4 << 20,
+            1,
+            1,
+            &[&define],
+            Some("K"),
+        );
+        assert_eq!(code, 0, "{page}: {out}");
+        assert!(out.starts_with("total=0 "), "{page}: {out}");
+        let field = |name: &str| -> i64 {
+            out.split_whitespace()
+                .find_map(|w| w.strip_prefix(name))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("{name} in {out}"))
+        };
+        assert!(field("worst=") <= 1340, "{page}: {out}");
+        assert!(field("mean=") <= 1110, "{page}: {out}");
+        assert!(field("last=") >= 500, "{page}: {out}");
+    }
+}
+
+/// An object just under a chunk's size grows the heap by a chunk that holds it
+/// (ChatGPT's review: 8,386,026 words needed 16,380 pages, the 64 MiB chunk
+/// chosen held 16,376, and the allocation failed "out of memory"). The sizes
+/// around each chunk size from 1 MiB to 64 MiB.
+#[test]
+fn an_object_just_under_a_chunk_grows_a_chunk_that_holds_it() {
+    for chunk in [1usize << 20, 4 << 20, 16 << 20, 64 << 20] {
+        for under in [0usize, 1, 2, 3, 5, 9, 17] {
+            let words = (chunk - under * 4096) / 8 - 40;
+            let (code, out) = run_board_with(
+                &format!("grow-{chunk}-{under}"),
+                4096,
+                words as u64,
+                1,
+                &["-DHOSTED_PAGES"],
+                Some("G"),
+            );
+            assert_eq!(code, 0, "{words}: {out}");
+            assert!(out.starts_with("total=0 "), "{words}: {out}");
+        }
+    }
+}
+
+/// A working block is not counted toward the next collection (ChatGPT's
+/// review: 1 MiB asked and freed made the next one-word allocation collect).
+#[test]
+fn a_working_block_brings_no_collection_nearer() {
+    let (code, out) = run_board_with("scratch-count", 4 << 20, 1, 1, &[], Some("A"));
+    assert_eq!(code, 0, "{out}");
+    assert!(out.starts_with("total=0"), "{out}");
 }
 
 /// A list of 100K cells, each holding a leaf before its tail, marked with a

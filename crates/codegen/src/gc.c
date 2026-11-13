@@ -87,15 +87,18 @@ static int64_t gc_n_ctors = 0;
 
 /* ---- size classes (D2) ---- */
 
-/* Small classes in one page; medium ones (above 128 words) in a span of
- * several pages holding at least four (spans, the review's waste: a 5 KB
- * string took two whole pages). Each step is at most a quarter over the last,
- * so rounding wastes under 20%. Above the last class, an object is a run of
- * its own. */
-static const uint32_t gc_class_words[] = {
-    1,   2,   3,   4,   5,   6,   8,   10,   12,   16,   24,   32,   48,   64,  96,
-    128, 160, 192, 256, 320, 384, 512, 640, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096};
-enum { GC_N_CLASSES = sizeof(gc_class_words) / sizeof(gc_class_words[0]) };
+/* Small classes (to 128 words) in one page, four slots at least. Medium
+ * ones are made by `gc_make_classes` for the page size in use: each fills a
+ * span of at most eight pages exactly (its slots times its size is the span,
+ * less the header), an eighth or more above the last. At 4 KiB pages that is
+ * 23 classes to 3828 words; an object's slot is 9% over its size on average
+ * and 32% at worst (the first table, fixed sizes in spans of two slots, was
+ * 29% and 99%: found by ChatGPT's review, measured by it, the rule made here).
+ * Above the last class an object is a run of its own, rounded to a page. */
+enum { GC_SMALL_CLASSES = 16, GC_N_CLASSES = 56 };
+static uint32_t gc_class_words[GC_N_CLASSES] = {1,  2,  3,  4,  5,  6,  8,  10,
+                                                12, 16, 24, 32, 48, 64, 96, 128};
+static int gc_n_classes = GC_SMALL_CLASSES;
 
 /* ---- pages ---- */
 
@@ -128,6 +131,11 @@ typedef struct Page {
 
 /* Slots start here, 8-aligned. */
 #define GC_PAGE_HEADER ((sizeof(Page) + 7) & ~(size_t)7)
+
+/* A page holds its header and four one-word slots at least; smaller, the
+ * span arithmetic below would wrap (ChatGPT's review). */
+typedef char gc_page_holds_its_header[ELYA_PAGE_BYTES >= GC_PAGE_HEADER + 32 ? 1 : -1];
+typedef char gc_page_is_a_power_of_two[(ELYA_PAGE_BYTES & (ELYA_PAGE_BYTES - 1)) == 0 ? 1 : -1];
 
 static inline int64_t *page_slots(Page *p) { return (int64_t *)((char *)p + GC_PAGE_HEADER); }
 
@@ -281,8 +289,13 @@ static void gc_release_pages(Page *pg, size_t n) {
 
 /* Hosted: ask the platform for another chunk, larger each time (D1). */
 static int gc_grow(size_t at_least) {
+    /* A chunk of `bytes` holds at least bytes / (PAGE + 2) - 1 pages (two
+     * table bytes a page, and the first page aligned): enough of them for
+     * what is asked (found by ChatGPT's review: `at_least` plus two pages was
+     * not, and an object just under a chunk's size failed "out of memory"
+     * with memory to be had). */
     size_t bytes = gc_next_chunk;
-    while (bytes < at_least + 2 * ELYA_PAGE_BYTES) {
+    while (bytes / (ELYA_PAGE_BYTES + 2) < at_least / ELYA_PAGE_BYTES + 2) {
         if (bytes > ((size_t)-1) / 4) {
             return 0;
         }
@@ -311,7 +324,7 @@ typedef struct {
 
 static Class gc_classes[GC_N_CLASSES];
 static Page *gc_large = NULL; /* every large run's head */
-/* Pages in each class's span: the fewest holding four slots (two, medium). */
+/* Pages in each class's span. */
 static uint32_t gc_class_pages[GC_N_CLASSES];
 
 /* Words -> class index for the small classes, filled by gc_setup. */
@@ -325,7 +338,7 @@ static inline int gc_class_of(int64_t words) {
         c = gc_class_for[words];
     } else {
         c = -1;
-        for (int i = 0; i < GC_N_CLASSES; i++) {
+        for (int i = GC_SMALL_CLASSES; i < gc_n_classes; i++) {
             if ((int64_t)gc_class_words[i] >= words) {
                 c = i;
                 break;
@@ -540,6 +553,17 @@ static Page *gc_rescan_pages = NULL;
 /* Objects the full worklist left to a rescan, since start (for tests). */
 static int64_t gc_overflows = 0;
 
+/* Whether word `f` (after the tag) of a value tagged `tag` is a heap value.
+ * A row is `[arity, mask]`; a value of more than 64 words has, in the mask's
+ * place, where its mask words begin in the table (lib.rs `push_row`). */
+static inline int gc_field_is_heap(int64_t tag, int64_t f) {
+    const int64_t *row = gc_descriptors + 2 * tag;
+    if (row[0] <= 64) {
+        return (int)(((uint64_t)row[1] >> f) & 1);
+    }
+    return (int)(((uint64_t)gc_descriptors[row[1] + (f >> 6)] >> (f & 63)) & 1);
+}
+
 /* An object's words (a large object's own; a small one's slot), for
  * elya_cont_copy (D8). */
 int64_t elya_gc_words(void *p) {
@@ -587,11 +611,10 @@ static void gc_scan(int64_t *obj) {
         return; /* not a constructor we have a descriptor for */
     }
     int64_t arity = gc_descriptors[2 * tag];
-    int64_t mask = gc_descriptors[2 * tag + 1];
     /* Last field first: popped last, so a list's tail (its last field) is
      * taken after its head's leaf, and the worklist stays short. */
     for (int64_t f = arity; f-- > 0;) {
-        if ((mask >> f) & 1) {
+        if (gc_field_is_heap(tag, f)) {
             gc_gray_push((void *)(intptr_t)obj[1 + f]);
         }
     }
@@ -642,7 +665,7 @@ extern void *elya_current_handler;
 
 /* Finish the last collection's sweeping, so every mark bit is clear. */
 static void gc_finish_sweeping(void) {
-    for (int k = 0; k < GC_N_CLASSES; k++) {
+    for (int k = 0; k < gc_n_classes; k++) {
         Class *c = &gc_classes[k];
         while (c->unswept) {
             Page *pg = c->unswept;
@@ -702,7 +725,7 @@ static void gc_collect(void) {
     gc_sweep_large();
     /* Every class's pages wait to be swept, lazily (D6); its current page's
      * free list is dropped: its unmarked slots are found again by its sweep. */
-    for (int k = 0; k < GC_N_CLASSES; k++) {
+    for (int k = 0; k < gc_n_classes; k++) {
         Class *c = &gc_classes[k];
         Page *all = c->swept;
         c->swept = NULL;
@@ -718,21 +741,49 @@ static void gc_collect(void) {
     gc_allocated = 0;
 }
 
-void elya_gc_setup(const int64_t *descriptors, int64_t n_ctors, int64_t stress) {
-    gc_descriptors = (int64_t *)descriptors;
-    gc_n_ctors = n_ctors;
-    gc_stress = stress;
-    for (int i = 0; i < GC_N_CLASSES; i++) {
+/* The classes' spans, and the medium classes themselves (see above). */
+static void gc_make_classes(void) {
+    for (int i = 0; i < GC_SMALL_CLASSES; i++) {
         size_t m = 1;
-        /* Four slots a span for the small classes, two for the medium ones:
-         * a span a size mix leaves part-used strands less (the review's
-         * big_live). */
-        size_t want = gc_class_words[i] <= 128 ? 4 : 2;
-        while ((m * ELYA_PAGE_BYTES - GC_PAGE_HEADER) / ((size_t)gc_class_words[i] * 8) < want) {
+        while ((m * ELYA_PAGE_BYTES - GC_PAGE_HEADER) / ((size_t)gc_class_words[i] * 8) < 4) {
             m++;
         }
         gc_class_pages[i] = (uint32_t)m;
     }
+    gc_n_classes = GC_SMALL_CLASSES;
+    size_t w = 128;
+    while (gc_n_classes < GC_N_CLASSES) {
+        size_t target = w + w / 8 + 1, best = 0, best_m = 0;
+        if (target > 4096) {
+            break;
+        }
+        /* The span, of eight pages at most (more only if fewer hold no two
+         * slots), whose exact fill is nearest above the target. */
+        for (size_t m = 1; m <= 64; m++) {
+            size_t room = (m * ELYA_PAGE_BYTES - GC_PAGE_HEADER) / 8, k = room / target;
+            if (k >= 2 && k <= GC_MAX_SLOTS && (best == 0 || room / k < best)) {
+                best = room / k;
+                best_m = m;
+            }
+            if (m >= 8 && best) {
+                break;
+            }
+        }
+        if (!best) {
+            break;
+        }
+        gc_class_words[gc_n_classes] = (uint32_t)best;
+        gc_class_pages[gc_n_classes] = (uint32_t)best_m;
+        gc_n_classes++;
+        w = best;
+    }
+}
+
+void elya_gc_setup(const int64_t *descriptors, int64_t n_ctors, int64_t stress) {
+    gc_descriptors = (int64_t *)descriptors;
+    gc_n_ctors = n_ctors;
+    gc_stress = stress;
+    gc_make_classes();
     for (int64_t w = 0; w <= 128; w++) {
         int c = 0;
         while ((int64_t)gc_class_words[c] < w) {
@@ -800,7 +851,9 @@ void *elya_alloc(int64_t words) {
     if (words < 1) {
         words = 1;
     }
-    gc_allocated += words;
+    if (!gc_no_collect) {
+        gc_allocated += words;
+    }
     int cls = gc_class_of(words);
     if (cls < 0) {
         return gc_alloc_large(words);
