@@ -462,8 +462,19 @@ static Page *gc_new_small_page(int cls) {
 
 /* The shadow stack (codegen pushes every live heap binding around allocations
  * and calls). Hosted it doubles; on a board the page source's region bounds it. */
+#ifdef ELYA_FREESTANDING
+/* A board's first roots are a fixed array (D5): no page source is asked until
+ * it is full, and then one that gives nothing is the out-of-memory failure. */
+#ifndef ELYA_SHADOW_ROOTS
+#define ELYA_SHADOW_ROOTS 1024
+#endif
+static void *gc_shadow_fixed[ELYA_SHADOW_ROOTS];
+static void **gc_shadow = gc_shadow_fixed;
+static int64_t gc_shadow_top = 0, gc_shadow_cap = ELYA_SHADOW_ROOTS;
+#else
 static void **gc_shadow = NULL;
 static int64_t gc_shadow_top = 0, gc_shadow_cap = 0;
+#endif
 
 void elya_gc_push(void *root) {
     if (gc_shadow_top == gc_shadow_cap) {
@@ -474,7 +485,10 @@ void elya_gc_push(void *root) {
         }
         if (gc_shadow) {
             memcpy(grown, gc_shadow, (size_t)gc_shadow_top * sizeof(void *));
-            elya_platform_release(gc_shadow, (size_t)gc_shadow_cap * sizeof(void *));
+#ifdef ELYA_FREESTANDING
+            if (gc_shadow != gc_shadow_fixed)
+#endif
+                elya_platform_release(gc_shadow, (size_t)gc_shadow_cap * sizeof(void *));
         }
         gc_shadow = grown;
         gc_shadow_cap = cap;
@@ -587,9 +601,20 @@ static void gc_rescan(void) {
     gc_overflow = 0;
 }
 
+/* Working memory held from the heap (`elya_gc_scratch`): a list of blocks,
+ * each `[-1][prev][next][bytes...]`, roots while held. The tag is no
+ * constructor's, so the bytes are never scanned. */
+static int64_t *gc_scratch_held = NULL;
+/* Set while a working block is allocated: its caller's values may be on no
+ * root, so nothing is collected under it. */
+static int gc_no_collect = 0;
+
 static void gc_mark(void) {
     for (int64_t i = 0; i < gc_shadow_top; i++) {
         gc_gray_push(gc_shadow[i]);
+    }
+    for (int64_t *b = gc_scratch_held; b; b = (int64_t *)(intptr_t)b[2]) {
+        gc_gray_push(b);
     }
     gc_drain();
     gc_rescan();
@@ -644,6 +669,9 @@ static void gc_sweep_large(void) {
 }
 
 static void gc_collect(void) {
+    if (gc_no_collect) {
+        return;
+    }
     gc_collections++;
     gc_finish_sweeping();
     gc_live = 0;
@@ -744,7 +772,9 @@ static void *gc_alloc_large(int64_t words) {
 void *elya_alloc(int64_t words) {
     /* Roots for a collection triggered here are already on the shadow stack;
      * the new object is not yet a mark target. */
-    if (gc_allocated >= (gc_live > GC_THRESHOLD_WORDS ? gc_live : GC_THRESHOLD_WORDS)) {
+    if (gc_no_collect) {
+        /* a working block: no collection, and none counted toward the next */
+    } else if (gc_allocated >= (gc_live > GC_THRESHOLD_WORDS ? gc_live : GC_THRESHOLD_WORDS)) {
         gc_collect();
     } else if (gc_stress > 0 && ++gc_stress_count >= gc_stress) {
         gc_stress_count = 0;
@@ -794,4 +824,61 @@ void *elya_alloc(int64_t words) {
         s[i] = 0;
     }
     return s;
+}
+
+/* Working memory outside the program's values, from the same heap (spec
+ * 2026-11-13-elya-platform-layer D5): `realloc`'s contract ((NULL, n) a new
+ * block, (p, n) p grown, (p, 0) p freed, NULL returned). A board has one
+ * memory; this is how the runtime's own lists and texts live in it. A block is
+ * kept while held; freed, a large one's pages return at once and a small one
+ * is the collector's. Allocating one never collects (the caller's values may
+ * be on no root), so it needs pages free now; none is the out-of-memory
+ * failure. */
+void *elya_gc_scratch(void *p, size_t bytes) {
+    int64_t *old = p ? (int64_t *)p - 3 : NULL;
+    int64_t *fresh = NULL;
+    if (bytes) {
+        if (bytes > ((size_t)-1) / 2) {
+            elya_platform_fail("elya: out of memory\n");
+        }
+        gc_no_collect = 1;
+        fresh = (int64_t *)elya_alloc(3 + (int64_t)((bytes + 7) / 8));
+        gc_no_collect = 0;
+        fresh[0] = -1;
+        fresh[1] = 0;
+        fresh[2] = (int64_t)(intptr_t)gc_scratch_held;
+        if (gc_scratch_held) {
+            gc_scratch_held[1] = (int64_t)(intptr_t)fresh;
+        }
+        gc_scratch_held = fresh;
+        if (old) {
+            size_t had = ((size_t)elya_gc_words(old) - 3) * 8;
+            memcpy(fresh + 3, old + 3, had < bytes ? had : bytes);
+        }
+    }
+    if (old) {
+        int64_t *prev = (int64_t *)(intptr_t)old[1], *next = (int64_t *)(intptr_t)old[2];
+        if (prev) {
+            prev[2] = (int64_t)(intptr_t)next;
+        } else {
+            gc_scratch_held = next;
+        }
+        if (next) {
+            next[1] = (int64_t)(intptr_t)prev;
+        }
+        /* A block with pages of its own gives them back now: the next
+         * working block may be allocated before any collection. (A small
+         * one waits for the collector, as any dead object does.) */
+        Page *pg = gc_page_of(old);
+        if (pg && pg->large && gc_stress == 0) {
+            for (Page **link = &gc_large; *link; link = &(*link)->next) {
+                if (*link == pg) {
+                    *link = pg->next;
+                    gc_release_pages(pg, pg->npages);
+                    break;
+                }
+            }
+        }
+    }
+    return fresh ? (void *)(fresh + 3) : NULL;
 }

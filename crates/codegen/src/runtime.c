@@ -1,61 +1,194 @@
+#include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <errno.h>
-#include <math.h>
-#ifdef _WIN32
-#include <fcntl.h>
-#include <io.h>
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
-#include <errno.h>
-#include <pthread.h>
-#include <setjmp.h>
-#include <signal.h>
-#include <sys/mman.h>
-#include <time.h>
-#endif
 
 /* The Elya native runtime. The collector is gc.c (spec
  * 2026-11-12-elya-paged-collector), included here so a program is one
- * translation unit; this file gives it its platform hooks (hosted). Single-
- * threaded throughout: one thread runs Elya code (`elya_start`), and the main
- * thread reads the collector's state only after joining it. */
+ * translation unit. Single-threaded throughout: one thread runs Elya code
+ * (`elya_start`), and the main thread reads the collector's state only after
+ * joining it.
+ *
+ * This file is freestanding (spec 2026-11-13-elya-platform-layer): it includes
+ * <stdint.h>, <stddef.h> and <stdarg.h> and reaches the machine only through
+ * the `elya_platform_*` hooks below (and memcpy/memset/memcmp, which a
+ * freestanding C compiler may call by itself). Hosted (the default), the hooks
+ * are platform_hosted.c, included at the end; with ELYA_FREESTANDING a board
+ * gives `write` and `exit` and may give the rest (weak defaults at the end). */
 
-/* The platform layer, hosted (D1, D9): memory from the operating system. */
-void elya_platform_fail(const char *message) {
-    fputs(message, stderr);
-    exit(1);
-}
+int memcmp(const void *, const void *, size_t);
 
-void *elya_platform_pages(size_t bytes, size_t align) {
-    size_t want = bytes + (align > 4096 ? align : 0);
-#ifdef _WIN32
-    char *m = (char *)VirtualAlloc(NULL, want, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-#else
-    char *m = (char *)mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (m == (char *)MAP_FAILED) {
-        m = NULL;
-    }
-#endif
-    if (!m) {
-        return NULL;
-    }
-    return (void *)(((uintptr_t)m + align - 1) & ~(uintptr_t)(align - 1));
-}
+/* ---- the platform layer (D1) ---- */
 
-void elya_platform_release(void *p, size_t bytes) {
-#ifdef _WIN32
-    (void)bytes;
-    VirtualFree(p, 0, MEM_RELEASE);
-#else
-    munmap(p, bytes);
-#endif
-}
+/* Bytes out: stream 1 is the program's output, 2 its failures. */
+void elya_platform_write(int stream, const char *bytes, size_t n);
+/* What stream 1 holds is out before a failure's line. */
+void elya_platform_flush(void);
+/* Stop the program with this status; does not return. */
+void elya_platform_exit(int code) __attribute__((noreturn));
+/* Once, before anything is written. */
+void elya_platform_init(void);
+/* A setting by name, or NULL (a board has none). */
+const char *elya_platform_getenv(const char *name);
+/* Working memory outside the heap, `realloc`'s contract: (NULL, n) a new
+ * block, (p, n) p grown, (p, 0) p freed; NULL when there is none. */
+void *elya_platform_scratch(void *p, size_t bytes);
+/* A clock that never goes back, in milliseconds; a wait of at least `ms`. */
+int64_t elya_platform_now_ms(void);
+void elya_platform_sleep_ms(int64_t ms);
+/* The trace file (record and replay): each returns 0 (NULL, -1) on a failure
+ * `elya_platform_error` then names. */
+int elya_platform_trace_create(const char *path);
+int elya_platform_trace_append(const char *bytes, size_t n);
+void *elya_platform_file_open(const char *path);
+int64_t elya_platform_file_read(void *file, char *into, int64_t n);
+void elya_platform_file_close(void *file);
+const char *elya_platform_error(void);
 
 #include "gc.c"
+
+/* A failure the collector names: the line, status 1. */
+void elya_platform_fail(const char *message) {
+    size_t n = 0;
+    while (message[n]) {
+        n++;
+    }
+    elya_platform_flush();
+    elya_platform_write(2, message, n);
+    elya_platform_exit(1);
+}
+
+/* ---- text without a C library: `%s`, `%.*s`, `%d`, `%lld`, `%llu`, `%%` ---- */
+
+static int64_t rt_strlen(const char *s) {
+    int64_t n = 0;
+    while (s[n]) {
+        n++;
+    }
+    return n;
+}
+
+/* `[-]digits` as atoll reads it (no overflow check: settings and exponents). */
+static int64_t rt_atoll(const char *s) {
+    int neg = 0;
+    if (*s == '-' || *s == '+') {
+        neg = *s == '-';
+        s++;
+    }
+    uint64_t v = 0;
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10 + (uint64_t)(*s - '0');
+        s++;
+    }
+    return (int64_t)(neg ? 0 - v : v);
+}
+
+/* A sink: a buffer of `cap` bytes (stream 0; `n` counts what was asked, as
+ * snprintf's result does) or a stream, written in pieces. */
+typedef struct {
+    int stream;
+    char *buf;
+    size_t cap, n;
+} RtSink;
+
+static void rt_emit(RtSink *k, const char *p, size_t n) {
+    if (k->stream) {
+        elya_platform_write(k->stream, p, n);
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            if (k->n + i + 1 < k->cap) {
+                k->buf[k->n + i] = p[i];
+            }
+        }
+    }
+    k->n += n;
+}
+
+static void rt_emit_u64(RtSink *k, uint64_t v, int neg) {
+    char d[24];
+    int at = (int)sizeof d;
+    do {
+        d[--at] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v);
+    if (neg) {
+        d[--at] = '-';
+    }
+    rt_emit(k, d + at, sizeof d - (size_t)at);
+}
+
+static void rt_vformat(RtSink *k, const char *fmt, va_list ap) {
+    const char *run = fmt;
+    for (const char *c = fmt;; c++) {
+        if (*c != '%' && *c != 0) {
+            continue;
+        }
+        rt_emit(k, run, (size_t)(c - run));
+        if (*c == 0) {
+            break;
+        }
+        c++;
+        if (c[0] == 's') {
+            const char *s = va_arg(ap, const char *);
+            rt_emit(k, s, (size_t)rt_strlen(s));
+        } else if (c[0] == '.' && c[1] == '*' && c[2] == 's') {
+            int n = va_arg(ap, int);
+            const char *s = va_arg(ap, const char *);
+            rt_emit(k, s, (size_t)n);
+            c += 2;
+        } else if (c[0] == 'd') {
+            int v = va_arg(ap, int);
+            rt_emit_u64(k, v < 0 ? 0 - (uint64_t)(int64_t)v : (uint64_t)v, v < 0);
+        } else if (c[0] == 'l' && c[1] == 'l' && c[2] == 'd') {
+            long long v = va_arg(ap, long long);
+            rt_emit_u64(k, v < 0 ? 0 - (uint64_t)v : (uint64_t)v, v < 0);
+            c += 2;
+        } else if (c[0] == 'l' && c[1] == 'l' && c[2] == 'u') {
+            rt_emit_u64(k, (uint64_t)va_arg(ap, unsigned long long), 0);
+            c += 2;
+        } else {
+            rt_emit(k, c, 1); /* `%%` */
+        }
+        run = c + 1;
+    }
+}
+
+static int rt_vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap) {
+    RtSink k = {0, buf, cap, 0};
+    rt_vformat(&k, fmt, ap);
+    if (cap) {
+        buf[k.n < cap ? k.n : cap - 1] = 0;
+    }
+    return (int)k.n;
+}
+
+static int rt_snprintf(char *buf, size_t cap, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = rt_vsnprintf(buf, cap, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+static void rt_printf(int stream, const char *fmt, ...) {
+    RtSink k = {stream, NULL, 0, 0};
+    va_list ap;
+    va_start(ap, fmt);
+    rt_vformat(&k, fmt, ap);
+    va_end(ap);
+}
+
+/* The first `c` in [p, p+n), or NULL. */
+static const char *rt_memchr(const char *p, int c, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] == (char)c) {
+            return p + i;
+        }
+    }
+    return NULL;
+}
+
+static void rt_puts(int stream, const char *s) { elya_platform_write(stream, s, (size_t)rt_strlen(s)); }
+
 
 /* One float mask per declared constructor tag: bit i set iff field i is a
  * `Float` (spec 2026-10-23-elya-float-natively D2). Read by `elya_eq` only; the
@@ -70,20 +203,10 @@ void elya_eq_init(const int64_t *masks, int64_t n) {
 
 void elya_gc_init(const int64_t *descriptors, int64_t n_ctors) {
     {
-        const char *stress = getenv("ELYA_GC_STRESS");
-        elya_gc_setup(descriptors, n_ctors, stress ? atoll(stress) : 0);
+        const char *stress = elya_platform_getenv("ELYA_GC_STRESS");
+        elya_gc_setup(descriptors, n_ctors, stress ? rt_atoll(stress) : 0);
     }
-#ifdef _WIN32
-    /* The shim calls this first, so stdout is byte-exact for the WHOLE run --
-     * including main's value line, which a program that never prints would
-     * otherwise write in text mode as "\r\n" (found by the Windows gate on the
-     * non-printing CPS-rooting corpus, 2026-10-04). elya_println keeps its own
-     * call; it is now redundant but harmless. stderr too (2026-10-30): a
-     * failure is one line, "elya: ...\n", which text mode wrote as "\r\n"
-     * (the Windows gate on main: three native_any.rs tests read a stray "\r"). */
-    _setmode(_fileno(stdout), _O_BINARY);
-    _setmode(_fileno(stderr), _O_BINARY);
-#endif
+    elya_platform_init();
 }
 
 /* Copy static literal bytes into a tagged heap block. The extra byte reserves
@@ -134,9 +257,9 @@ int64_t elya_str_length(void *s) { return ((int64_t *)s)[1]; }
 int64_t elya_str_byte_at(void *s, int64_t i) {
     int64_t len = ((int64_t *)s)[1];
     if (i < 0 || i >= len) {
-        fprintf(stderr, "elya: string.byte_at: index %lld is outside a string of %lld bytes\n",
+        rt_printf(2, "elya: string.byte_at: index %lld is outside a string of %lld bytes\n",
                 (long long)i, (long long)len);
-        exit(1);
+        elya_platform_exit(1);
     }
     return ((const unsigned char *)&((int64_t *)s)[2])[i];
 }
@@ -152,15 +275,15 @@ static int elya_str_boundary(const unsigned char *b, int64_t len, int64_t i) {
 void *elya_str_slice(int64_t tag, void *s, int64_t from, int64_t to) {
     int64_t len = ((int64_t *)s)[1];
     if (!(0 <= from && from <= to && to <= len)) {
-        fprintf(stderr, "elya: string.slice: %lld..%lld is not a range in a string of %lld bytes\n",
+        rt_printf(2, "elya: string.slice: %lld..%lld is not a range in a string of %lld bytes\n",
                 (long long)from, (long long)to, (long long)len);
-        exit(1);
+        elya_platform_exit(1);
     }
     const unsigned char *b = (const unsigned char *)&((int64_t *)s)[2];
     if (!elya_str_boundary(b, len, from) || !elya_str_boundary(b, len, to)) {
-        fprintf(stderr, "elya: string.slice: %lld..%lld splits a UTF-8 character\n",
+        rt_printf(2, "elya: string.slice: %lld..%lld splits a UTF-8 character\n",
                 (long long)from, (long long)to);
-        exit(1);
+        elya_platform_exit(1);
     }
     int64_t n = to - from;
     elya_gc_push(s);
@@ -198,10 +321,10 @@ int64_t elya_eq(void *a, void *b, int64_t string_tag, int64_t first_closure_tag)
     do {                                                                               \
         if (top + 3 > cap) {                                                           \
             cap = cap ? cap * 2 : 96;                                                  \
-            int64_t *grown = (int64_t *)realloc(work, (size_t)cap * sizeof *work);     \
+            int64_t *grown = (int64_t *)elya_platform_scratch(work, (size_t)cap * sizeof *work);     \
             if (!grown) {                                                              \
-                fputs("elya: out of memory comparing values\n", stderr);               \
-                exit(1);                                                               \
+                rt_puts(2, "elya: out of memory comparing values\n");               \
+                elya_platform_exit(1);                                                               \
             }                                                                          \
             work = grown;                                                              \
         }                                                                              \
@@ -242,9 +365,8 @@ int64_t elya_eq(void *a, void *b, int64_t string_tag, int64_t first_closure_tag)
         }
         int64_t tag = x[0];
         if (tag >= first_closure_tag && tag < string_tag) {
-            fputs("elya: `==` reached a value that is not data (E0436 should have rejected it)\n",
-                  stderr);
-            exit(1);
+            rt_puts(2, "elya: `==` reached a value that is not data (E0436 should have rejected it)\n");
+            elya_platform_exit(1);
         }
         if (x[0] != y[0]) {
             equal = 0;
@@ -258,8 +380,8 @@ int64_t elya_eq(void *a, void *b, int64_t string_tag, int64_t first_closure_tag)
             continue;
         }
         if (tag < 0 || tag >= gc_n_ctors) {
-            fputs("elya: ==: a value without a descriptor\n", stderr);
-            exit(1);
+            rt_puts(2, "elya: ==: a value without a descriptor\n");
+            elya_platform_exit(1);
         }
         int64_t arity = gc_descriptors[2 * tag];
         int64_t mask = gc_descriptors[2 * tag + 1];
@@ -269,7 +391,7 @@ int64_t elya_eq(void *a, void *b, int64_t string_tag, int64_t first_closure_tag)
         }
     }
 #undef EQ_PUSH
-    free(work);
+    elya_platform_scratch(work, 0);
     return equal;
 }
 
@@ -277,7 +399,7 @@ int64_t elya_eq(void *a, void *b, int64_t string_tag, int64_t first_closure_tag)
  * included (20 characters at most). */
 void *elya_int_to_string(int64_t tag, int64_t n) {
     char buf[32];
-    int len = snprintf(buf, sizeof buf, "%lld", (long long)n);
+    int len = rt_snprintf(buf, sizeof buf, "%lld", (long long)n);
     return elya_str_lit(tag, buf, (int64_t)len);
 }
 
@@ -293,130 +415,35 @@ void *elya_int_to_string(int64_t tag, int64_t n) {
  * fall outside; then the one candidate on the other side, the closest string's
  * neighbour in the last digit, is tried. */
 
-/* Does D (n digits, a decimal point after the first) times 10^e read back as x? */
-static int float_reads_back(const char *d, int n, int e, double x) {
-    char buf[64];
-    int k = 0;
-    buf[k++] = d[0];
-    buf[k++] = '.';
-    for (int i = 1; i < n; i++) {
-        buf[k++] = d[i];
-    }
-    k += snprintf(buf + k, sizeof buf - (size_t)k, "e%d", e);
-    return strtod(buf, NULL) == x;
-}
+/* Float text without a C library (spec 2026-11-13-elya-platform-layer D6):
+ * the shortest digits that read back (float_fmt.c) and the nearest double of
+ * a text (float_parse.c). */
+#include "float_fmt.c"
+#include "float_parse.c"
 
-/* Writes `bits`' literal text to `out` (room for 1100 bytes); returns its length. */
+/* Writes `bits`' literal text to `out` (room for 1100 bytes); returns its
+ * length: `nan`, `inf`, `-inf`, else the shortest decimal that reads back, in
+ * plain notation with a point (`1.0`, `-0.0`, `0.000001`, `1e21` in full), as
+ * the evaluator writes it. */
 int64_t elya_float_text(int64_t bits, char *out) {
     double x;
     memcpy(&x, &bits, sizeof x);
-    if (isnan(x)) {
+    if (__builtin_isnan(x)) {
         memcpy(out, "nan", 3);
         return 3;
     }
-    int64_t k = 0;
-    if (signbit(x)) {
-        out[k++] = '-';
-        x = -x;
+    int64_t n = (int64_t)elya_fmt_f64(x, out);
+    if (__builtin_isinf(x)) {
+        return n;
     }
-    if (isinf(x)) {
-        memcpy(out + k, "inf", 3);
-        return k + 3;
-    }
-    if (x == 0.0) {
-        memcpy(out + k, "0.0", 3);
-        return k + 3;
-    }
-    /* The exact decimal expansion (a double has at most 767 significant
-     * digits), then each length's candidate rounded from it half UP, as Rust
-     * rounds a tie (2^-25 is ...953125 and writes ...95313, where `%.*e`'s
-     * half-even would give ...95312). */
-    char ex[800];
-    snprintf(ex, sizeof ex, "%.780e", x);
-    char all[790];
-    int na = 0;
-    const char *c = ex;
-    for (; *c && *c != 'e'; c++) {
-        if (*c >= '0' && *c <= '9') {
-            all[na++] = *c;
+    for (int64_t i = 0; i < n; i++) {
+        if (out[i] == '.') {
+            return n;
         }
     }
-    int e0 = atoi(c + 1);
-    char d[24];
-    int n = 0, e = 0;
-    for (int p = 1; p <= 17 && n == 0; p++) {
-        uint64_t v = 0;
-        for (int i = 0; i < p; i++) {
-            v = v * 10 + (uint64_t)(all[i] - '0');
-        }
-        /* Below, at, or above x: the digits after the first p. */
-        int up = all[p] >= '5';
-        int exact = 1;
-        for (int i = p; i < na; i++) {
-            if (all[i] != '0') {
-                exact = 0;
-                break;
-            }
-        }
-        if (up) {
-            v += 1;
-        }
-        for (int attempt = 0; attempt < 2 && n == 0; attempt++) {
-            if (attempt == 1) {
-                /* The neighbour on the far side of x from the closest string. */
-                if (exact) {
-                    break;
-                }
-                if (up) {
-                    v -= 1; /* the truncated string: below x */
-                } else {
-                    v += 1; /* one above the truncated string: above x */
-                }
-            }
-            char nd[24];
-            int nm = snprintf(nd, sizeof nd, "%llu", (unsigned long long)v);
-            /* A carry (999 -> 1000) moves the exponent. */
-            int ne = e0 + (nm - p);
-            if (v != 0 && float_reads_back(nd, nm, ne, x)) {
-                memcpy(d, nd, (size_t)nm);
-                n = nm;
-                e = ne;
-            }
-        }
-    }
-    if (n == 0) {
-        /* 17 digits always read back; unreachable. */
-        n = 1;
-        d[0] = '0';
-    }
-    while (n > 1 && d[n - 1] == '0') {
-        n--;
-    }
-    /* Plain decimal: the value is d[0].d[1..n] * 10^e. */
-    if (e >= n - 1) {
-        memcpy(out + k, d, (size_t)n);
-        k += n;
-        for (int i = 0; i < e - (n - 1); i++) {
-            out[k++] = '0';
-        }
-        memcpy(out + k, ".0", 2);
-        k += 2;
-    } else if (e >= 0) {
-        memcpy(out + k, d, (size_t)(e + 1));
-        k += e + 1;
-        out[k++] = '.';
-        memcpy(out + k, d + e + 1, (size_t)(n - e - 1));
-        k += n - e - 1;
-    } else {
-        out[k++] = '0';
-        out[k++] = '.';
-        for (int i = 0; i < -e - 1; i++) {
-            out[k++] = '0';
-        }
-        memcpy(out + k, d, (size_t)n);
-        k += n;
-    }
-    return k;
+    out[n] = '.';
+    out[n + 1] = '0';
+    return n + 2;
 }
 
 /* `float.to_string` (D5): the literal text, as a fresh string. */
@@ -437,8 +464,8 @@ void *elya_float_to_string(int64_t tag, int64_t bits) {
 enum { ANY_INT, ANY_BOOL, ANY_UNIT, ANY_STRING, ANY_FN, ANY_ADT, ANY_UNBUILT, ANY_FLOAT };
 
 static void any_oom(void) {
-    fputs("elya: out of memory\n", stderr);
-    exit(1);
+    rt_puts(2, "elya: out of memory\n");
+    elya_platform_exit(1);
 }
 
 static void *any_grow(void *p, int64_t *cap, int64_t need, size_t elem) {
@@ -449,7 +476,7 @@ static void *any_grow(void *p, int64_t *cap, int64_t need, size_t elem) {
     while (c < need) {
         c *= 2;
     }
-    void *q = realloc(p, (size_t)c * elem);
+    void *q = elya_platform_scratch(p, (size_t)c * elem);
     if (!q) {
         any_oom();
     }
@@ -468,7 +495,7 @@ static void any_put(AnyBuf *b, const char *s, int64_t n) {
     b->len += n;
 }
 
-static void any_puts(AnyBuf *b, const char *s) { any_put(b, s, (int64_t)strlen(s)); }
+static void any_puts(AnyBuf *b, const char *s) { any_put(b, s, (int64_t)rt_strlen(s)); }
 
 /* The constructor entry of `tag` in the declared-type node `node`, or -1. */
 static int64_t any_ctor(const int64_t *t, int64_t node, int64_t tag) {
@@ -484,8 +511,8 @@ static int64_t any_ctor(const int64_t *t, int64_t node, int64_t tag) {
 }
 
 static void any_internal(const char *what) {
-    fprintf(stderr, "elya: internal: %s\n", what);
-    exit(1);
+    rt_printf(2, "elya: internal: %s\n", what);
+    elya_platform_exit(1);
 }
 
 /* `value` (a word of the type `node`) in literal syntax, as a fresh string.
@@ -510,7 +537,7 @@ void *elya_any_show(int64_t string_tag, const int64_t *t, const char *names, int
         char num[32];
         switch (t[it.node]) {
         case ANY_INT:
-            any_put(&out, num, snprintf(num, sizeof num, "%lld", (long long)it.value));
+            any_put(&out, num, rt_snprintf(num, sizeof num, "%lld", (long long)it.value));
             break;
         case ANY_FLOAT: {
             char fbuf[1100];
@@ -544,9 +571,9 @@ void *elya_any_show(int64_t string_tag, const int64_t *t, const char *names, int
         case ANY_FN:
             /* The program's output first, as from the evaluator (the
              * main-values review's L1). */
-            fflush(stdout);
-            fprintf(stderr, "elya: %sa function%s\n", before, after);
-            exit(1);
+            elya_platform_flush();
+            rt_printf(2, "elya: %sa function%s\n", before, after);
+            elya_platform_exit(1);
         case ANY_ADT: {
             int64_t *p = (int64_t *)(intptr_t)it.value;
             int64_t c = any_ctor(t, it.node, p[0]);
@@ -572,9 +599,9 @@ void *elya_any_show(int64_t string_tag, const int64_t *t, const char *names, int
             any_internal("op: a value of a type with no instance");
         }
     }
-    free(stack);
+    elya_platform_scratch(stack, 0);
     void *s = elya_str_lit(string_tag, out.p ? out.p : "", out.len);
-    free(out.p);
+    elya_platform_scratch(out.p, 0);
     return s;
 }
 
@@ -593,9 +620,8 @@ int64_t elya_any_check(const int64_t *t, int64_t node, int64_t value) {
         Item it = stack[--top];
         switch (t[it.node]) {
         case ANY_FN:
-            fputs("elya: `==` reached a value that is not data (E0436 should have rejected it)\n",
-                  stderr);
-            exit(1);
+            rt_puts(2, "elya: `==` reached a value that is not data (E0436 should have rejected it)\n");
+            elya_platform_exit(1);
         case ANY_ADT: {
             int64_t *p = (int64_t *)(intptr_t)it.value;
             int64_t c = any_ctor(t, it.node, p[0]);
@@ -617,8 +643,8 @@ int64_t elya_any_check(const int64_t *t, int64_t node, int64_t value) {
              * false (spec 2026-10-23-elya-float-natively D2). */
             double v;
             memcpy(&v, &it.value, sizeof v);
-            if (isnan(v)) {
-                free(stack);
+            if (__builtin_isnan(v)) {
+                elya_platform_scratch(stack, 0);
                 return 0;
             }
             break;
@@ -627,14 +653,14 @@ int64_t elya_any_check(const int64_t *t, int64_t node, int64_t value) {
             break;
         }
     }
-    free(stack);
+    elya_platform_scratch(stack, 0);
     return 1;
 }
 
 /* `op.decode`'s refusal of an answer at an effect's own parameter (D4). */
 void elya_any_fail(const char *msg) {
-    fprintf(stderr, "elya: %s\n", msg);
-    exit(1);
+    rt_printf(2, "elya: %s\n", msg);
+    elya_platform_exit(1);
 }
 
 /* A parsed literal: the evaluator's `Value`s a literal can denote. */
@@ -674,7 +700,7 @@ static void any_ws(AnyParser *p) {
 }
 
 static int any_starts(AnyParser *p, const char *w) {
-    int64_t k = (int64_t)strlen(w);
+    int64_t k = (int64_t)rt_strlen(w);
     return p->n - p->i >= k && memcmp(p->s + p->i, w, (size_t)k) == 0;
 }
 
@@ -733,7 +759,7 @@ static int64_t any_parse(AnyParser *p, const char **err) {
             int64_t len = 0, bcap = 0;
             for (;;) {
                 if (p->i >= p->n) {
-                    free(bytes);
+                    elya_platform_scratch(bytes, 0);
                     *err = "an unterminated string";
                     goto fail;
                 }
@@ -745,7 +771,7 @@ static int64_t any_parse(AnyParser *p, const char **err) {
                 if (d == '\\') {
                     p->i++;
                     if (p->i >= p->n) {
-                        free(bytes);
+                        elya_platform_scratch(bytes, 0);
                         *err = "an unterminated string";
                         goto fail;
                     }
@@ -758,7 +784,7 @@ static int64_t any_parse(AnyParser *p, const char **err) {
                     case 't': out = '\t'; break;
                     case 'r': out = '\r'; break;
                     default:
-                        free(bytes);
+                        elya_platform_scratch(bytes, 0);
                         *err = "an unknown escape";
                         goto fail;
                     }
@@ -774,7 +800,7 @@ static int64_t any_parse(AnyParser *p, const char **err) {
         } else if (c == '-' || any_digit(c)) {
             if (any_starts(p, "-inf")) {
                 p->i += 4;
-                double ninf = -INFINITY;
+                double ninf = -__builtin_inf();
                 int64_t nb;
                 memcpy(&nb, &ninf, sizeof nb);
                 v = any_new(p, (AnyLit){LIT_FLOAT, nb, NULL, 0, NULL, 0});
@@ -799,22 +825,33 @@ static int64_t any_parse(AnyParser *p, const char **err) {
                         *err = "a malformed number";
                         goto fail;
                     }
-                    /* `strtod` rounds correctly, as Rust's `from_str` (D4). */
-                    char nbuf[512];
-                    char *big = NULL;
+                    /* Correctly rounded, as Rust's `from_str` (D4), which also
+                     * takes `5.` and `-.5`: the parser wants a digit on both
+                     * sides of the point. */
+                    const char *at = p->s + start;
                     int64_t len = p->i - start;
-                    char *at = nbuf;
-                    if (len + 1 > (int64_t)sizeof nbuf) {
-                        big = (char *)malloc((size_t)len + 1);
-                        if (!big) {
+                    int neg = at[0] == '-';
+                    double fv = 0.0;
+                    if (at[len - 1] == '.') {
+                        len--; /* `5.` is `5` */
+                    }
+                    if (at[neg] == '.') {
+                        at += neg; /* `-.5`: `.5` read as `0.5`, then the sign */
+                        len -= neg;
+                        char *zero = (char *)elya_platform_scratch(NULL, (size_t)len + 1);
+                        if (!zero) {
                             any_oom();
                         }
-                        at = big;
+                        zero[0] = '0';
+                        memcpy(zero + 1, at, (size_t)len);
+                        elya_parse_f64(zero, (size_t)len + 1, &fv);
+                        elya_platform_scratch(zero, 0);
+                        if (neg) {
+                            fv = -fv;
+                        }
+                    } else {
+                        elya_parse_f64(at, (size_t)len, &fv);
                     }
-                    memcpy(at, p->s + start, (size_t)len);
-                    at[len] = 0;
-                    double fv = strtod(at, NULL);
-                    free(big);
                     int64_t fb;
                     memcpy(&fb, &fv, sizeof fb);
                     v = any_new(p, (AnyLit){LIT_FLOAT, fb, NULL, 0, NULL, 0});
@@ -829,13 +866,13 @@ static int64_t any_parse(AnyParser *p, const char **err) {
             }
         } else if (c == 'i' && any_starts(p, "inf")) {
             p->i += 3;
-            double pinf = INFINITY;
+            double pinf = __builtin_inf();
             int64_t pb;
             memcpy(&pb, &pinf, sizeof pb);
             v = any_new(p, (AnyLit){LIT_FLOAT, pb, NULL, 0, NULL, 0});
         } else if (c == 'n' && any_starts(p, "nan")) {
             p->i += 3;
-            double qnan = NAN;
+            double qnan = __builtin_nan("");
             int64_t qb;
             memcpy(&qb, &qnan, sizeof qb);
             v = any_new(p, (AnyLit){LIT_FLOAT, qb, NULL, 0, NULL, 0});
@@ -872,7 +909,7 @@ static int64_t any_parse(AnyParser *p, const char **err) {
          * constructor whose `)` follows. */
         for (;;) {
             if (nopen == 0) {
-                free(open);
+                elya_platform_scratch(open, 0);
                 return v;
             }
             Open *o = &open[nopen - 1];
@@ -895,20 +932,20 @@ static int64_t any_parse(AnyParser *p, const char **err) {
     }
 fail:
     for (int64_t k = 0; k < nopen; k++) {
-        free(open[k].args);
+        elya_platform_scratch(open[k].args, 0);
     }
-    free(open);
+    elya_platform_scratch(open, 0);
     return -1;
 }
 
 static void any_free(AnyParser *p) {
     for (int64_t k = 0; k < p->nlits; k++) {
         if (p->lits[k].kind == LIT_STR) {
-            free(p->lits[k].s);
+            elya_platform_scratch(p->lits[k].s, 0);
         }
-        free(p->lits[k].kids);
+        elya_platform_scratch(p->lits[k].kids, 0);
     }
-    free(p->lits);
+    elya_platform_scratch(p->lits, 0);
 }
 
 /* Does literal `lit` denote a value of the type `node`? Iterative. */
@@ -959,16 +996,16 @@ static int any_conforms(AnyParser *p, const int64_t *t, const char *names, int64
             any_internal("op.decode: a type with no instance");
         }
     }
-    free(work);
+    elya_platform_scratch(work, 0);
     return ok;
 }
 
 static void any_decode_fail(const char *why1, const char *text, int64_t tlen, const char *why2,
                             const char *opname) {
-    fprintf(stderr, "elya: op.decode: %s", why1);
-    fwrite(text, 1, (size_t)tlen, stderr);
-    fprintf(stderr, "%s, for an answer of `%s`\n", why2, opname);
-    exit(1);
+    rt_printf(2, "elya: op.decode: %s", why1);
+    elya_platform_write(2, text, (size_t)tlen);
+    rt_printf(2, "%s, for an answer of `%s`\n", why2, opname);
+    elya_platform_exit(1);
 }
 
 /* `op.decode`: parse the whole text, then refuse input after the value, then
@@ -984,24 +1021,26 @@ int64_t elya_any_decode(int64_t string_tag, const int64_t *t, const char *names,
     const char *err = NULL;
     int64_t root = any_parse(&p, &err);
     if (root < 0) {
-        fprintf(stderr, "elya: op.decode: `");
-        fwrite(src, 1, (size_t)tlen, stderr);
-        fprintf(stderr, "` is not a literal (%s), for an answer of `%s`\n", err, opname);
-        exit(1);
+        rt_printf(2, "elya: op.decode: `");
+        elya_platform_write(2, src, (size_t)tlen);
+        rt_printf(2, "` is not a literal (%s), for an answer of `%s`\n", err, opname);
+        elya_platform_exit(1);
     }
     any_ws(&p);
     if (p.i != p.n) {
         any_decode_fail("`", src, tlen, "` has input after its value", opname);
     }
-    int64_t *centry = (int64_t *)calloc((size_t)(p.nlits ? p.nlits : 1), sizeof(int64_t));
+    size_t centry_bytes = (size_t)(p.nlits ? p.nlits : 1) * sizeof(int64_t);
+    int64_t *centry = (int64_t *)elya_platform_scratch(NULL, centry_bytes);
     if (!centry) {
         any_oom();
     }
+    memset(centry, 0, centry_bytes);
     if (!any_conforms(&p, t, names, root, node, &centry)) {
-        fprintf(stderr, "elya: op.decode: `");
-        fwrite(src, 1, (size_t)tlen, stderr);
-        fprintf(stderr, "` is not a value of type `%s`, for an answer of `%s`\n", display, opname);
-        exit(1);
+        rt_printf(2, "elya: op.decode: `");
+        elya_platform_write(2, src, (size_t)tlen);
+        rt_printf(2, "` is not a value of type `%s`, for an answer of `%s`\n", display, opname);
+        elya_platform_exit(1);
     }
     /* Build, post-order. `done` holds built words; a heap one is also on the
      * shadow stack, in the same order, until its parent is built. */
@@ -1075,26 +1114,16 @@ int64_t elya_any_decode(int64_t string_tag, const int64_t *t, const char *names,
     if (done[0].heap) {
         elya_gc_pop();
     }
-    free(steps);
-    free(done);
-    free(centry);
+    elya_platform_scratch(steps, 0);
+    elya_platform_scratch(done, 0);
+    elya_platform_scratch(centry, 0);
     any_free(&p);
     return result;
 }
 
 /* Time, the first I/O source (spec 2026-10-15-elya-async-step2-timers, D3).
  * `time.now_ms`: monotonic milliseconds since the first reading. `time.sleep_ms`:
- * a wait of at least `ms` (none when `ms <= 0`); an interrupted nanosleep goes on
- * with what remains. Neither allocates. */
-static int64_t elya_time_raw_ms(void) {
-#ifdef _WIN32
-    return (int64_t)GetTickCount64();
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
-#endif
-}
+ * a wait of at least `ms` (none when `ms <= 0`). Neither allocates. */
 
 /* ---- Record and replay natively (spec 2026-10-17-elya-native-record-replay).
  * `ELYA_RECORD=<file>` writes the host's answers as the evaluator's trace,
@@ -1105,7 +1134,6 @@ static int64_t elya_time_raw_ms(void) {
 
 enum { TRACE_LIVE, TRACE_RECORD, TRACE_REPLAY };
 static int elya_trace_mode = TRACE_LIVE;
-static FILE *elya_trace_out;
 static const char *elya_trace_path;
 
 /* A piece of the trace text: bytes and a length (a NUL byte is a character, as
@@ -1176,19 +1204,19 @@ static TraceStr trace_trim(const char *b, const char *e) {
 }
 
 static int trace_is(TraceStr s, const char *lit) {
-    int64_t n = (int64_t)strlen(lit);
+    int64_t n = (int64_t)rt_strlen(lit);
     return s.n == n && memcmp(s.p, lit, (size_t)n) == 0;
 }
 
-static void trace_put(TraceStr s) { fwrite(s.p, 1, (size_t)s.n, stderr); }
+static void trace_put(TraceStr s) { elya_platform_write(2, s.p, (size_t)s.n); }
 
 static void trace_bad(const char *msg, int64_t line) {
     if (line > 0) {
-        fprintf(stderr, "elya: trace line %lld: %s\n", (long long)line, msg);
+        rt_printf(2, "elya: trace line %lld: %s\n", (long long)line, msg);
     } else {
-        fprintf(stderr, "elya: %s\n", msg);
+        rt_printf(2, "elya: %s\n", msg);
     }
-    exit(1);
+    elya_platform_exit(1);
 }
 
 /* Is [p, p+n) UTF-8, as Rust's `read_to_string` requires (the review's M3)? */
@@ -1245,7 +1273,7 @@ static void trace_parse(const char *t, int64_t n) {
     const char *line = t;
     int64_t index = -1; /* -1: the header */
     while (line < end) {
-        const char *nl = memchr(line, '\n', (size_t)(end - line));
+        const char *nl = rt_memchr(line, '\n', (size_t)(end - line));
         const char *le = nl ? nl : end;
         const char *next = nl ? nl + 1 : end;
         if (le > line && le[-1] == '\r') {
@@ -1291,56 +1319,65 @@ static void trace_parse(const char *t, int64_t n) {
 }
 
 /* A failed write of the trace (a full disk): the CLI's exit 2 (the review's M1). */
-static void trace_wrote(void) {
-    if (fflush(elya_trace_out) != 0 || ferror(elya_trace_out)) {
-        fprintf(stderr, "elya: cannot write the trace `%s`: %s\n", elya_trace_path, strerror(errno));
-        exit(2);
+static void trace_wrote(int ok) {
+    if (!ok) {
+        rt_printf(2, "elya: cannot write the trace `%s`: %s\n", elya_trace_path, elya_platform_error());
+        elya_platform_exit(2);
     }
+}
+
+/* One line of the trace, written through (an entry is on disk before the
+ * program goes on). */
+static void trace_line(const char *fmt, ...) {
+    char line[160];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = rt_vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    trace_wrote(elya_platform_trace_append(line, (size_t)n));
 }
 
 /* Before the program runs: the environment, the trace file (D1, D3). */
 static void elya_trace_init(void) {
-    const char *rec = getenv("ELYA_RECORD");
-    const char *rep = getenv("ELYA_REPLAY");
+    const char *rec = elya_platform_getenv("ELYA_RECORD");
+    const char *rep = elya_platform_getenv("ELYA_REPLAY");
     if (rec && rep) {
-        fputs("elya: ELYA_RECORD and ELYA_REPLAY cannot both be set\n", stderr);
-        exit(2);
+        rt_puts(2, "elya: ELYA_RECORD and ELYA_REPLAY cannot both be set\n");
+        elya_platform_exit(2);
     }
     if (rec) {
         elya_trace_path = rec;
-        elya_trace_out = fopen(rec, "wb");
-        if (!elya_trace_out) {
-            fprintf(stderr, "elya: cannot write the trace `%s`: %s\n", rec, strerror(errno));
-            exit(2);
+        if (!elya_platform_trace_create(rec)) {
+            rt_printf(2, "elya: cannot write the trace `%s`: %s\n", rec, elya_platform_error());
+            elya_platform_exit(2);
         }
-        fputs(ELYA_TRACE_HEADER "\n", elya_trace_out);
-        trace_wrote();
+        trace_line("%s\n", ELYA_TRACE_HEADER);
         elya_trace_mode = TRACE_RECORD;
     } else if (rep) {
-        FILE *f = fopen(rep, "rb");
+        void *f = elya_platform_file_open(rep);
         if (!f) {
-            fprintf(stderr, "elya: cannot read the trace `%s`: %s\n", rep, strerror(errno));
-            exit(2);
+            rt_printf(2, "elya: cannot read the trace `%s`: %s\n", rep, elya_platform_error());
+            elya_platform_exit(2);
         }
         char *buf = NULL;
         int64_t len = 0, cap = 0;
         for (;;) {
             buf = (char *)any_grow(buf, &cap, len + 4096, 1);
-            size_t got = fread(buf + len, 1, 4096, f);
-            len += (int64_t)got;
+            int64_t got = elya_platform_file_read(f, buf + len, 4096);
+            if (got < 0) {
+                rt_printf(2, "elya: cannot read the trace `%s`: %s\n", rep, elya_platform_error());
+                elya_platform_exit(2);
+            }
+            len += got;
             if (got < 4096) {
                 break;
             }
         }
-        if (ferror(f)) {
-            fprintf(stderr, "elya: cannot read the trace `%s`: %s\n", rep, strerror(errno));
-            exit(2);
-        }
-        fclose(f);
+        elya_platform_file_close(f);
         if (!trace_utf8((const unsigned char *)buf, len)) {
-            fprintf(stderr, "elya: cannot read the trace `%s`: stream did not contain valid UTF-8\n",
+            rt_printf(2, "elya: cannot read the trace `%s`: stream did not contain valid UTF-8\n",
                     rep);
-            exit(2);
+            elya_platform_exit(2);
         }
         trace_parse(buf ? buf : "", len);
         elya_trace_mode = TRACE_REPLAY;
@@ -1357,14 +1394,14 @@ void elya_trace_finish(void) {
     if (elya_trace_mode == TRACE_REPLAY && elya_trace_next < elya_trace_n) {
         int64_t left = elya_trace_n - elya_trace_next;
         TraceEntry *e = &elya_trace_entries[elya_trace_next];
-        fflush(stdout);
-        fprintf(stderr, "elya: replay: `main` returned with %lld unread trace %s, from entry %lld (`",
+        elya_platform_flush();
+        rt_printf(2, "elya: replay: `main` returned with %lld unread trace %s, from entry %lld (`",
                 (long long)left, left == 1 ? "entry" : "entries", (long long)elya_trace_next + 1);
         trace_put(e->q);
-        fputs(" = ", stderr);
+        rt_puts(2, " = ");
         trace_put(e->a);
-        fputs("`): the run asked less than the recording\n", stderr);
-        exit(1);
+        rt_puts(2, "`): the run asked less than the recording\n");
+        elya_platform_exit(1);
     }
 }
 
@@ -1372,30 +1409,30 @@ void elya_trace_finish(void) {
 static TraceStr trace_answer(const char *q) {
     int64_t n = elya_trace_next + 1;
     if (elya_trace_next >= elya_trace_n) {
-        fflush(stdout);
-        fprintf(stderr, "elya: replay diverged at entry %lld: the program asked `%s`, the trace has ended\n",
+        elya_platform_flush();
+        rt_printf(2, "elya: replay diverged at entry %lld: the program asked `%s`, the trace has ended\n",
                 (long long)n, q);
-        exit(1);
+        elya_platform_exit(1);
     }
     TraceEntry *e = &elya_trace_entries[elya_trace_next];
     if (!trace_is(e->q, q)) {
-        fflush(stdout);
-        fprintf(stderr, "elya: replay diverged at entry %lld: the program asked `%s`, the trace holds `",
+        elya_platform_flush();
+        rt_printf(2, "elya: replay diverged at entry %lld: the program asked `%s`, the trace holds `",
                 (long long)n, q);
         trace_put(e->q);
-        fputs("`\n", stderr);
-        exit(1);
+        rt_puts(2, "`\n");
+        elya_platform_exit(1);
     }
     elya_trace_next++;
     return e->a;
 }
 
 static void trace_wrong_type(TraceStr a, const char *ty) {
-    fflush(stdout);
-    fprintf(stderr, "elya: replay entry %lld: `", (long long)elya_trace_next);
+    elya_platform_flush();
+    rt_printf(2, "elya: replay entry %lld: `", (long long)elya_trace_next);
     trace_put(a);
-    fprintf(stderr, "` is not an answer of type %s\n", ty);
-    exit(1);
+    rt_printf(2, "` is not an answer of type %s\n", ty);
+    elya_platform_exit(1);
 }
 
 /* An answer read as Rust's `i64::from_str` reads it: `[+-]digits`, in range. */
@@ -1415,7 +1452,7 @@ static int trace_int(TraceStr a, int64_t *out) {
 
 static int64_t elya_time_live_now_ms(void) {
     static int64_t start = -1;
-    int64_t now = elya_time_raw_ms();
+    int64_t now = elya_platform_now_ms();
     if (start < 0) {
         start = now;
     }
@@ -1433,8 +1470,7 @@ int64_t elya_time_now_ms(void) {
     }
     int64_t v = elya_time_live_now_ms();
     if (elya_trace_mode == TRACE_RECORD) {
-        fprintf(elya_trace_out, "time.now_ms() = %lld\n", (long long)v);
-        trace_wrote();
+        trace_line("time.now_ms() = %lld\n", (long long)v);
     }
     return v;
 }
@@ -1444,7 +1480,7 @@ static void elya_time_live_sleep_ms(int64_t ms);
 void elya_time_sleep_ms(int64_t ms) {
     if (elya_trace_mode == TRACE_REPLAY) {
         char q[64];
-        snprintf(q, sizeof q, "time.sleep_ms(%lld)", (long long)ms);
+        rt_snprintf(q, sizeof q, "time.sleep_ms(%lld)", (long long)ms);
         TraceStr a = trace_answer(q);
         if (!trace_is(a, "Unit")) {
             trace_wrong_type(a, "Unit");
@@ -1453,38 +1489,20 @@ void elya_time_sleep_ms(int64_t ms) {
     }
     elya_time_live_sleep_ms(ms);
     if (elya_trace_mode == TRACE_RECORD) {
-        fprintf(elya_trace_out, "time.sleep_ms(%lld) = Unit\n", (long long)ms);
-        trace_wrote();
+        trace_line("time.sleep_ms(%lld) = Unit\n", (long long)ms);
     }
 }
 
 static void elya_time_live_sleep_ms(int64_t ms) {
-    if (ms <= 0) {
-        return;
+    if (ms > 0) {
+        elya_platform_sleep_ms(ms);
     }
-#ifdef _WIN32
-    /* `Sleep` may return before its interval, and `GetTickCount64` moves in
-     * 10-16 ms steps, so wait on the clock `time.now_ms` reads until it has
-     * moved by `ms` (the 2026-10-16 review). */
-    int64_t end = elya_time_raw_ms() + ms;
-    for (;;) {
-        int64_t left = end - elya_time_raw_ms();
-        if (left <= 0) {
-            break;
-        }
-        Sleep(left > 0x7fffffff ? 0x7fffffff : (DWORD)left);
-    }
-#else
-    struct timespec req = {(time_t)(ms / 1000), (long)((ms % 1000) * 1000000L)};
-    while (nanosleep(&req, &req) == -1 && errno == EINTR) {
-    }
-#endif
 }
 
 /* The deterministic failed-match trap. Spec 5b-4 §5: never `unreachable`. */
 void elya_match_fail(void) {
-    fputs("elya: match failed (no arm matched)\n", stderr);
-    exit(1);
+    rt_puts(2, "elya: match failed (no arm matched)\n");
+    elya_platform_exit(1);
 }
 
 /* 5b-8 Task 8: the handler the running computation performs to. A handle
@@ -1527,33 +1545,33 @@ void elya_handle_end_init(void *code) {
  * named message and a non-zero exit, never a re-run. The evaluator's E0425
  * words (spec 2026-10-22 D1). */
 void elya_resume_twice(void) {
-    fputs("elya: a one-shot continuation was resumed twice\n", stderr);
-    exit(1);
+    rt_puts(2, "elya: a one-shot continuation was resumed twice\n");
+    elya_platform_exit(1);
 }
 
 /* `Int` arithmetic is exact or fails by name (spec
  * 2026-10-10-elya-checked-integer-arithmetic, D3): the same words, and the
  * same exit status, as the evaluator's E0300. */
 void elya_int_overflow(void) {
-    fputs("elya: integer overflow\n", stderr);
-    exit(1);
+    rt_puts(2, "elya: integer overflow\n");
+    elya_platform_exit(1);
 }
 
 void elya_div_zero(void) {
-    fputs("elya: division by zero\n", stderr);
-    exit(1);
+    rt_puts(2, "elya: division by zero\n");
+    elya_platform_exit(1);
 }
 
 void elya_rem_zero(void) {
-    fputs("elya: remainder by zero\n", stderr);
-    exit(1);
+    rt_puts(2, "elya: remainder by zero\n");
+    elya_platform_exit(1);
 }
 
 /* A shift amount outside 0..=63 (spec 2026-10-17-elya-unary-and-wrapping D2):
  * the evaluator's words. */
 void elya_shift_range(const char *name, int64_t n) {
-    fprintf(stderr, "elya: int.%s: a shift by %lld is outside 0..=63\n", name, (long long)n);
-    exit(1);
+    rt_printf(2, "elya: int.%s: a shift by %lld is outside 0..=63\n", name, (long long)n);
+    elya_platform_exit(1);
 }
 
 /* `float.truncate` (round == 0) and `float.round` (round == 1) (spec
@@ -1563,8 +1581,8 @@ int64_t elya_float_to_int(const char *name, int64_t bits, int64_t round_half_awa
     double x;
     memcpy(&x, &bits, sizeof x);
     if (x != x) {
-        fprintf(stderr, "elya: float.%s: NaN has no Int value\n", name);
-        exit(1);
+        rt_printf(2, "elya: float.%s: NaN has no Int value\n", name);
+        elya_platform_exit(1);
     }
     /* Every double at or past 2^52 is an integer, and the doubles next to
      * +-2^63 are 1024 or 2048 apart, so truncating or rounding x lands in
@@ -1573,8 +1591,8 @@ int64_t elya_float_to_int(const char *name, int64_t bits, int64_t round_half_awa
     if (!(x >= -9223372036854775808.0 && x < 9223372036854775808.0)) {
         char buf[1100];
         int64_t len = elya_float_text(bits, buf);
-        fprintf(stderr, "elya: float.%s: %.*s is outside Int's range\n", name, (int)len, buf);
-        exit(1);
+        rt_printf(2, "elya: float.%s: %.*s is outside Int's range\n", name, (int)len, buf);
+        elya_platform_exit(1);
     }
     int64_t t = (int64_t)x; /* toward zero */
     if (round_half_away) {
@@ -1591,16 +1609,16 @@ int64_t elya_float_to_int(const char *name, int64_t bits, int64_t round_half_awa
 /* A perform whose handler has no clause for it. The type checker makes this
  * unreachable; a guard, never `unreachable`. */
 void elya_unhandled_effect(void) {
-    fputs("elya: perform: the handler has no clause for this operation\n", stderr);
-    exit(1);
+    rt_puts(2, "elya: perform: the handler has no clause for this operation\n");
+    elya_platform_exit(1);
 }
 
 /* Gated OFF by default, and that is load-bearing: every existing execution
  * test asserts stderr is empty, so an unconditional dump would break the whole
  * corpus at once. */
 void elya_gc_report(void) {
-    if (getenv("ELY_GC_STATS")) {
-        fprintf(stderr,
+    if (elya_platform_getenv("ELY_GC_STATS")) {
+        rt_printf(2,
                 "elya-gc: collections=%lld freed=%lld live=%lld words_since_gc=%lld "
                 "mid_copy=%lld\n",
                 (long long)gc_collections, (long long)gc_freed, (long long)gc_live,
@@ -1611,14 +1629,11 @@ void elya_gc_report(void) {
 /* N6 §6.2: stdout is the program-output channel; stderr remains reserved for
  * collector diagnostics and runtime failures. */
 void elya_println(void *s) {
-#ifdef _WIN32
-    _setmode(_fileno(stdout), _O_BINARY);
-#endif
     int64_t *p = (int64_t *)s;
     int64_t len = p[1];
     const char *bytes = (const char *)&p[2];
-    fwrite(bytes, 1, (size_t)len, stdout);
-    fputc('\n', stdout);
+    elya_platform_write(1, bytes, (size_t)len);
+    elya_platform_write(1, "\n", 1);
 }
 
 /* Native multi-shot (spec 2026-10-10, D1/D4; copy rule revised by spec
@@ -1638,8 +1653,8 @@ void elya_println(void *s) {
  * what it still needs; the continuation and every copy are rooted here while
  * the copy allocates. */
 static void elya_chain_broken(void) {
-    fputs("elya: resume: a continuation's handler chain does not reach its handler\n", stderr);
-    exit(1);
+    rt_puts(2, "elya: resume: a continuation's handler chain does not reach its handler\n");
+    elya_platform_exit(1);
 }
 
 #define CONT_PARENT 4
@@ -1660,10 +1675,10 @@ void *elya_cont_copy(void *cont, int64_t hlo, int64_t hhi) {
             break;
         }
     }
-    int64_t **copy = (int64_t **)malloc((size_t)n * sizeof(int64_t *));
+    int64_t **copy = (int64_t **)elya_platform_scratch(NULL, (size_t)n * sizeof(int64_t *));
     if (!copy) {
-        fputs("elya: out of memory copying a continuation\n", stderr);
-        exit(1);
+        rt_puts(2, "elya: out of memory copying a continuation\n");
+        elya_platform_exit(1);
     }
     elya_gc_push(cont);
     gc_in_cont_copy = 1;
@@ -1688,185 +1703,68 @@ void *elya_cont_copy(void *cont, int64_t hlo, int64_t hhi) {
     for (i = 0; i <= n; i++) {
         elya_gc_pop();
     }
-    free(copy);
+    elya_platform_scratch(copy, 0);
     return fresh;
 }
 
-/* The program's own stack (spec 2026-10-16-elya-native-stack). `@main` calls
- * `elya_start` with `@elya_entry`, which calls `main`'s function; it runs on a
- * thread whose stack is a fixed, documented size (D1: 1 GiB, or ELYA_STACK_MIB,
- * D2), reserved, not committed, so a shallow program pays nothing. Reaching its
- * end is a NAMED failure, never a bare signal (D5). The collector never looks at
- * the machine stack (its roots are the shadow stack), so it is unaffected. */
-#define ELYA_STACK_DEFAULT_MIB 1024
-#define ELYA_STACK_MAX_MIB 1048576
+/* `main`'s `Int` (or `Unit`) value line, written by the `@main` shim. */
+void elya_main_int(int64_t v) { rt_printf(1, "%lld\n", (long long)v); }
 
-typedef int64_t (*elya_entry_fn)(void);
-static elya_entry_fn elya_entry_ptr;
-static int64_t elya_entry_result;
-static int64_t elya_stack_mib = ELYA_STACK_DEFAULT_MIB;
-
-/* Output already written stays written (flushed first), then the one line,
- * exit status 1 like every runtime trap. */
-static void elya_stack_overflowed(void) {
-    fflush(stdout);
-    fprintf(stderr, "elya: native stack overflow: recursion deeper than the %lld MiB stack\n",
-            (long long)elya_stack_mib);
-    fflush(stderr);
-    exit(1);
-}
-
-static void elya_stack_unavailable(void) {
-    fprintf(stderr, "elya: cannot reserve a stack of %lld MiB (ELYA_STACK_MIB sets a smaller one)\n",
-            (long long)elya_stack_mib);
-    exit(1);
-}
-
-/* D2: a whole number of MiB, 1 to ELYA_STACK_MAX_MIB, or the default when the
- * variable is unset. Anything else stops here, before the program runs. */
-static int64_t elya_stack_size_mib(void) {
-    const char *s = getenv("ELYA_STACK_MIB");
-    if (!s) {
-        return ELYA_STACK_DEFAULT_MIB;
-    }
-    int64_t v = 0;
-    int ok = *s != '\0';
-    for (const char *p = s; ok && *p; p++) {
-        if (*p < '0' || *p > '9') {
-            ok = 0;
-        } else {
-            v = v * 10 + (*p - '0');
-            if (v > ELYA_STACK_MAX_MIB) {
-                ok = 0;
-            }
-        }
-    }
-    if (!ok || v < 1) {
-        fputs("elya: ELYA_STACK_MIB must be a whole number of MiB from 1 to 1048576\n", stderr);
-        exit(1);
-    }
-    return v;
-}
-
-#ifdef _WIN32
-/* Room for the handler to run on the overflowed thread. */
-static DWORD WINAPI elya_program_thread(LPVOID arg) {
-    (void)arg;
-    ULONG guarantee = 64 * 1024;
-    SetThreadStackGuarantee(&guarantee);
-    elya_entry_result = elya_entry_ptr();
-    return 0;
-}
-
-static LONG CALLBACK elya_overflow_handler(PEXCEPTION_POINTERS e) {
-    if (e->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
-        elya_stack_overflowed();
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-
-int64_t elya_start(elya_entry_fn entry) {
-    elya_stack_mib = elya_stack_size_mib();
-    elya_trace_init();
-    elya_entry_ptr = entry;
-    AddVectoredExceptionHandler(1, elya_overflow_handler);
-    HANDLE t = CreateThread(NULL, (SIZE_T)elya_stack_mib << 20, elya_program_thread, NULL,
-                            STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    if (!t) {
-        elya_stack_unavailable();
-    }
-    WaitForSingleObject(t, INFINITE);
-    CloseHandle(t);
-    elya_trace_finish();
-    return elya_entry_result;
-}
+#ifndef ELYA_FREESTANDING
+#include "platform_hosted.c"
 #else
-#ifndef MAP_ANONYMOUS
-#define MAP_ANONYMOUS MAP_ANON
-#endif
-/* D5: 1 MiB of PROT_NONE below the stack, so no frame can step over it. */
-#define ELYA_GUARD_BYTES ((size_t)1 << 20)
-
-static char *elya_guard_lo;
-static char *elya_guard_hi;
-static sigjmp_buf elya_overflow_jump;
-static char elya_signal_stack[64 * 1024];
-
-/* On the alternate stack. A fault in the guard is the overflow: jump back to
- * the thread's entry, whose stack is intact, and report from there. Any other
- * fault is not ours to name: restore the default action and return, so the
- * faulting instruction runs again and the process dies by the signal, as it
- * always did. */
-static void elya_fault(int sig, siginfo_t *info, void *uc) {
-    (void)uc;
-    char *a = (char *)info->si_addr;
-    if (a >= elya_guard_lo && a < elya_guard_hi) {
-        siglongjmp(elya_overflow_jump, 1);
-    }
-    struct sigaction dfl;
-    memset(&dfl, 0, sizeof dfl);
-    dfl.sa_handler = SIG_DFL;
-    sigemptyset(&dfl.sa_mask);
-    sigaction(sig, &dfl, NULL);
-    /* A signal SENT (kill, raise: si_code <= 0) has no instruction to run
-     * again; send it once more, now to the default action (the 2026-10-16
-     * review, L1). It is blocked while this handler runs, so it is delivered,
-     * and kills, as the handler returns. */
-    if (info->si_code <= 0) {
-        raise(sig);
-    }
-}
-
-static void *elya_program_thread(void *arg) {
-    (void)arg;
-    stack_t ss;
-    ss.ss_sp = elya_signal_stack;
-    ss.ss_size = sizeof elya_signal_stack;
-    ss.ss_flags = 0;
-    if (sigaltstack(&ss, NULL) != 0) {
-        elya_stack_unavailable();
-    }
-    if (sigsetjmp(elya_overflow_jump, 1)) {
-        elya_stack_overflowed();
-    }
-    elya_entry_result = elya_entry_ptr();
+/* ---- freestanding (D3): a board gives `elya_platform_write` and
+ * `elya_platform_exit` (and the collector's region, `elya_heap_init`); what
+ * follows it may replace. No settings, working memory from the heap, a clock that
+ * stands still, no files. ---- */
+#define ELYA_WEAK __attribute__((weak))
+ELYA_WEAK void elya_platform_flush(void) {}
+ELYA_WEAK void elya_platform_init(void) {}
+ELYA_WEAK const char *elya_platform_getenv(const char *name) {
+    (void)name;
     return NULL;
 }
+/* Working memory from the one heap (gc.c). */
+ELYA_WEAK void *elya_platform_scratch(void *p, size_t bytes) { return elya_gc_scratch(p, bytes); }
+ELYA_WEAK void *elya_platform_pages(size_t bytes, size_t align) {
+    (void)bytes;
+    (void)align;
+    return NULL;
+}
+ELYA_WEAK void elya_platform_release(void *p, size_t bytes) {
+    (void)p;
+    (void)bytes;
+}
+ELYA_WEAK int64_t elya_platform_now_ms(void) { return 0; }
+ELYA_WEAK void elya_platform_sleep_ms(int64_t ms) { (void)ms; }
+ELYA_WEAK int elya_platform_trace_create(const char *path) {
+    (void)path;
+    return 0;
+}
+ELYA_WEAK int elya_platform_trace_append(const char *bytes, size_t n) {
+    (void)bytes;
+    (void)n;
+    return 0;
+}
+ELYA_WEAK void *elya_platform_file_open(const char *path) {
+    (void)path;
+    return NULL;
+}
+ELYA_WEAK int64_t elya_platform_file_read(void *file, char *into, int64_t n) {
+    (void)file;
+    (void)into;
+    (void)n;
+    return -1;
+}
+ELYA_WEAK void elya_platform_file_close(void *file) { (void)file; }
+ELYA_WEAK const char *elya_platform_error(void) { return "this platform has no files"; }
 
+/* The program runs on the stack the board's start-up code set. */
+typedef int64_t (*elya_entry_fn)(void);
 int64_t elya_start(elya_entry_fn entry) {
-    elya_stack_mib = elya_stack_size_mib();
     elya_trace_init();
-    elya_entry_ptr = entry;
-    size_t size = (size_t)elya_stack_mib << 20;
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
-#ifdef MAP_NORESERVE
-    flags |= MAP_NORESERVE;
-#endif
-    char *base = (char *)mmap(NULL, size + ELYA_GUARD_BYTES, PROT_READ | PROT_WRITE, flags, -1, 0);
-    if (base == (char *)MAP_FAILED) {
-        elya_stack_unavailable();
-    }
-    if (mprotect(base, ELYA_GUARD_BYTES, PROT_NONE) != 0) {
-        elya_stack_unavailable();
-    }
-    elya_guard_lo = base;
-    elya_guard_hi = base + ELYA_GUARD_BYTES;
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_sigaction = elya_fault;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL); /* macOS reports a guard page as SIGBUS */
-    pthread_attr_t attr;
-    pthread_t t;
-    if (pthread_attr_init(&attr) != 0 || pthread_attr_setstack(&attr, base + ELYA_GUARD_BYTES, size) != 0 ||
-        pthread_create(&t, &attr, elya_program_thread, NULL) != 0) {
-        elya_stack_unavailable();
-    }
-    pthread_attr_destroy(&attr);
-    pthread_join(t, NULL);
+    int64_t v = entry();
     elya_trace_finish();
-    return elya_entry_result;
+    return v;
 }
 #endif

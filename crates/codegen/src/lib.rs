@@ -146,8 +146,8 @@ fn eq_operand_label(op: BinOp) -> &'static str {
 /// with `elya_` an Elya function named `alloc`, `println` or `start` became
 /// the runtime's own C symbol and the link failed. No C identifier contains a
 /// dot, so no Elya name can collide with runtime.c (`elya_*`), with the
-/// symbols this back end generates (`@main`, `@elya_entry`, `@.fmt`) or with
-/// `@printf`. `main` mangles to `elya.main`.
+/// symbols this back end generates (`@main`, `@elya_entry`) or with
+/// the C library. `main` mangles to `elya.main`.
 fn mangle(name: &str) -> String {
     format!("elya.{name}")
 }
@@ -2521,7 +2521,7 @@ fn build_ctor_table(core: &CoreModule) -> HashMap<String, (usize, Vec<Ty>)> {
 }
 
 /// Build the verified LLVM module for `core` into `ctx`: `@elya.main` lowering
-/// the Core body, plus (Task 4) the printf declaration, format-string global,
+/// the Core body, plus (Task 4) the `elya_main_int` declaration
 /// and `@main` shim. Returns the handle so `emit_ir` and `compile_module` share
 /// one construction path.
 fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'ctx>, CodegenError> {
@@ -2846,23 +2846,16 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         .get("main")
         .ok_or(CodegenError::Unsupported("no `main`"))?;
 
-    // §3.5/§4: the print convention is ONE external symbol (printf) plus ONE
-    // generated shim (@main). The shim stays `ccc` — it is the C entry point —
-    // and its call to @elya.main is an ordinary call.
-    let printf_ty = i32t.fn_type(&[ptrt.into(), i64t.into()], true);
-    let printf = module.add_function("printf", printf_ty, None);
-
-    let fmt_bytes: &[u8] = b"%lld\n\0";
-    let fmt_const = i8t.const_array(
-        &fmt_bytes
-            .iter()
-            .map(|c| i8t.const_int(*c as u64, false))
-            .collect::<Vec<_>>(),
-    );
-    let fmt = module.add_global(fmt_const.get_type(), Some(AddressSpace::default()), ".fmt");
-    fmt.set_initializer(&fmt_const);
-    fmt.set_constant(true);
-    fmt.set_unnamed_addr(true);
+    // §3.5/§4: the print convention is ONE runtime function (`elya_main_int`,
+    // runtime.c: the digits and a newline through the platform layer, so a
+    // board needs no C library; spec 2026-11-13-elya-platform-layer D4) plus
+    // ONE generated shim (@main). The shim stays `ccc` — it is the C entry
+    // point — and its call to @elya.main is an ordinary call.
+    let main_int_ty = module
+        .get_context()
+        .void_type()
+        .fn_type(&[i64t.into()], false);
+    let main_int = module.add_function("elya_main_int", main_int_ty, None);
 
     let desc = descriptors.rows.clone();
     let n_ctors = (desc.len() / 2) as u64;
@@ -3013,8 +3006,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         .left()
         .ok_or_else(|| internal("elya_start did not return a value"))?;
     if !shows_value {
-        b.build_call(printf, &[fmt.as_pointer_value().into(), v.into()], "p")
-            .map_err(internal)?;
+        b.build_call(main_int, &[v.into()], "").map_err(internal)?;
     }
     // AFTER the answer, so a stats dump can never interleave with the value the
     // execution proofs assert on, and gated on ELY_GC_STATS inside the runtime

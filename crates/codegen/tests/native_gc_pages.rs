@@ -75,7 +75,7 @@ int main(int argc, char **argv) {
     elya_gc_setup(descriptors, 4, 0);
     long keep = atol(argv[1]), rounds = atol(argv[2]);
     int64_t total = 0;
-    int64_t *kept = argc > 3 && argv[3][0] != 'i' ? tree(atoi(argv[3])) : 0;
+    int64_t *kept = argc > 3 && argv[3][0] != 'i' && argv[3][0] != 'W' ? tree(atoi(argv[3])) : 0;
     elya_gc_push(kept);
     if (argc > 3 && argv[3][0] == 'L') {
         /* Large objects: `keep` words each, kept two at a time and checked
@@ -110,6 +110,36 @@ int main(int argc, char **argv) {
         }
         gc_collect();
         printf("total=0 collections=%lld overflows=%lld\n", (long long)gc_collections, (long long)gc_overflows);
+        return 0;
+    }
+    if (argc > 3 && argv[3][0] == 'W') {
+        /* Working memory from the heap: two blocks held across collections
+         * (one grown while held, its bytes kept), then freed; `rounds` times
+         * in a region far smaller than what was asked in all. */
+        int64_t bad = 0;
+        for (long r = 0; r < rounds; r++) {
+            /* A collection is due, and a working block is allocated: it
+             * does not collect (its caller's values may be on no root). */
+            gc_allocated = GC_THRESHOLD_WORDS + gc_live;
+            int64_t before = gc_collections;
+            unsigned char *a = (unsigned char *)elya_gc_scratch(0, (size_t)keep);
+            bad += gc_collections != before;
+            unsigned char *b = (unsigned char *)elya_gc_scratch(0, (size_t)keep * 3);
+            for (long i = 0; i < keep; i++) a[i] = (unsigned char)(r + i);
+            for (long i = 0; i < keep * 3; i++) b[i] = (unsigned char)(r ^ i);
+            for (long i = 0; i < 3000; i++) (void)cons(i, 0);
+            a = (unsigned char *)elya_gc_scratch(a, (size_t)keep * 2);
+            /* Regrown with no collection between: a large block's pages
+             * come back at once, or six of them would not fit. */
+            for (int k = 0; k < 6; k++) a = (unsigned char *)elya_gc_scratch(a, (size_t)keep * 2);
+            for (long i = 0; i < 3000; i++) (void)cons(i, 0);
+            gc_collect();
+            for (long i = 0; i < keep; i++) bad += a[i] != (unsigned char)(r + i);
+            for (long i = 0; i < keep * 3; i++) bad += b[i] != (unsigned char)(r ^ i);
+            if (elya_gc_scratch(a, 0) || elya_gc_scratch(b, 0)) bad++;
+        }
+        bad += gc_scratch_held != 0;
+        printf("total=%lld collections=%lld\n", (long long)bad, (long long)gc_collections);
         return 0;
     }
     if (argc > 3 && argv[3][0] == 'i') {
@@ -245,6 +275,27 @@ fn large_objects_keep_their_pages_and_reuse_freed_ones() {
         );
         assert_eq!(code, 0, "{words}: {out}");
         assert!(out.starts_with("total=0 "), "{words}: {out}");
+    }
+}
+
+/// The runtime's working memory from the same heap (spec
+/// 2026-11-13-elya-platform-layer D5): blocks of 1 KiB, 5 KiB and 40 KiB held
+/// across collections keep their bytes, a block grown while held keeps them,
+/// allocating one never collects, and freed blocks are the collector's again (400 rounds in a region one
+/// round nearly fills).
+#[test]
+fn working_memory_is_held_from_the_heap_and_given_back() {
+    for bytes in [1 << 10, 5 << 10, 40 << 10] {
+        let (code, out) = run_board_with(
+            &format!("scratch-{bytes}"),
+            512 << 10,
+            bytes,
+            400,
+            &[],
+            Some("W"),
+        );
+        assert_eq!(code, 0, "{bytes}: {out}");
+        assert!(out.starts_with("total=0 "), "{bytes}: {out}");
     }
 }
 
