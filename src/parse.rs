@@ -497,13 +497,98 @@ impl<'a> Parser<'a> {
     }
 
     fn atom(&mut self) -> Option<Spanned<Expr>> {
+        // This frame is on the parser's recursive path (a nested expression is
+        // an atom's): it dispatches, and each kind is read by a helper (a debug
+        // frame here was 4 KiB).
         let span = self.peek_span();
-        match self.peek()?.clone() {
+        match self.peek()? {
             TokenKind::KwIf => self.if_expr(),
             TokenKind::KwHandle => self.handle_expr(),
             TokenKind::KwFn => self.lambda_expr(),
             TokenKind::KwMatch => self.match_expr(),
             TokenKind::LBrace => self.block_expr(),
+            TokenKind::Minus => self.minus_atom(span),
+            // `-.e` (spec 2026-10-24-elya-float-part-2 D2).
+            TokenKind::MinusDot => self.unary_atom(span, UnOp::NegF),
+            TokenKind::Bang => self.unary_atom(span, UnOp::Not),
+            TokenKind::LParen => self.paren_atom(),
+            // `resume` is contextually reserved: `resume(EXPR)` is a dedicated node.
+            TokenKind::Lower(n) if n == "resume" => self.resume_atom(span),
+            _ => self.leaf_atom(span),
+        }
+    }
+
+    /// `-` and what follows it: a negative literal, or a negation.
+    fn minus_atom(&mut self, span: Span) -> Option<Spanned<Expr>> {
+        self.bump();
+        // A `-` directly before a numeric literal is part of it (D1).
+        let lit = self.peek_span();
+        match self.peek().cloned() {
+            Some(TokenKind::Int(m)) => {
+                self.bump();
+                let n = self.int_literal(true, m, span.merge(lit));
+                return Some(spanned(Expr::Int(n), span.merge(lit)));
+            }
+            Some(TokenKind::Float(x)) => {
+                self.bump();
+                return Some(spanned(Expr::Float(-x), span.merge(lit)));
+            }
+            _ => {}
+        }
+        self.unary_operand(span, UnOp::Neg)
+    }
+
+    /// A prefix operator (`-.`, `!`) and its operand.
+    fn unary_atom(&mut self, span: Span, op: UnOp) -> Option<Spanned<Expr>> {
+        self.bump();
+        self.unary_operand(span, op)
+    }
+
+    /// The operand of a prefix operator already read.
+    fn unary_operand(&mut self, span: Span, op: UnOp) -> Option<Spanned<Expr>> {
+        let e = self.expr(100)?;
+        let s = span.merge(e.span);
+        Some(spanned(
+            Expr::Unary {
+                op,
+                expr: Rc::new(e),
+            },
+            s,
+        ))
+    }
+
+    /// `( e )`.
+    fn paren_atom(&mut self) -> Option<Spanned<Expr>> {
+        self.bump();
+        let e = self.with_braces(false, |p| p.expr(0))?;
+        let end = self.peek_span();
+        if !self.eat(&TokenKind::RParen) {
+            self.error(end, "expected `)`");
+            return None;
+        }
+        Some(e)
+    }
+
+    /// `resume(e)`.
+    fn resume_atom(&mut self, span: Span) -> Option<Spanned<Expr>> {
+        self.bump(); // resume
+        if !self.eat(&TokenKind::LParen) {
+            self.error(self.peek_span(), "expected `(` after `resume`");
+            return None;
+        }
+        let arg = self.with_braces(false, |p| p.expr(0))?;
+        let end = self.peek_span();
+        if !self.eat(&TokenKind::RParen) {
+            self.error(end, "expected `)`");
+            return None;
+        }
+        Some(spanned(Expr::Resume { arg: Rc::new(arg) }, span.merge(end)))
+    }
+
+    /// An atom with nothing nested in it: a literal, a name, a qualified name.
+    #[inline(never)]
+    fn leaf_atom(&mut self, span: Span) -> Option<Spanned<Expr>> {
+        match self.peek()?.clone() {
             TokenKind::Int(m) => {
                 self.bump();
                 let n = self.int_literal(false, m, span);
@@ -528,82 +613,6 @@ impl<'a> Parser<'a> {
             TokenKind::Unit => {
                 self.bump();
                 Some(spanned(Expr::Unit, span))
-            }
-            TokenKind::Minus => {
-                self.bump();
-                // A `-` directly before a numeric literal is part of it (D1).
-                let lit = self.peek_span();
-                match self.peek().cloned() {
-                    Some(TokenKind::Int(m)) => {
-                        self.bump();
-                        let n = self.int_literal(true, m, span.merge(lit));
-                        return Some(spanned(Expr::Int(n), span.merge(lit)));
-                    }
-                    Some(TokenKind::Float(x)) => {
-                        self.bump();
-                        return Some(spanned(Expr::Float(-x), span.merge(lit)));
-                    }
-                    _ => {}
-                }
-                let e = self.expr(100)?;
-                let s = span.merge(e.span);
-                Some(spanned(
-                    Expr::Unary {
-                        op: UnOp::Neg,
-                        expr: Rc::new(e),
-                    },
-                    s,
-                ))
-            }
-            // `-.e` (spec 2026-10-24-elya-float-part-2 D2).
-            TokenKind::MinusDot => {
-                self.bump();
-                let e = self.expr(100)?;
-                let s = span.merge(e.span);
-                Some(spanned(
-                    Expr::Unary {
-                        op: UnOp::NegF,
-                        expr: Rc::new(e),
-                    },
-                    s,
-                ))
-            }
-            TokenKind::Bang => {
-                self.bump();
-                let e = self.expr(100)?;
-                let s = span.merge(e.span);
-                Some(spanned(
-                    Expr::Unary {
-                        op: UnOp::Not,
-                        expr: Rc::new(e),
-                    },
-                    s,
-                ))
-            }
-            TokenKind::LParen => {
-                self.bump();
-                let e = self.with_braces(false, |p| p.expr(0))?;
-                let end = self.peek_span();
-                if !self.eat(&TokenKind::RParen) {
-                    self.error(end, "expected `)`");
-                    return None;
-                }
-                Some(e)
-            }
-            // `resume` is contextually reserved: `resume(EXPR)` is a dedicated node.
-            TokenKind::Lower(ref n) if n == "resume" => {
-                self.bump(); // resume
-                if !self.eat(&TokenKind::LParen) {
-                    self.error(self.peek_span(), "expected `(` after `resume`");
-                    return None;
-                }
-                let arg = self.with_braces(false, |p| p.expr(0))?;
-                let end = self.peek_span();
-                if !self.eat(&TokenKind::RParen) {
-                    self.error(end, "expected `)`");
-                    return None;
-                }
-                Some(spanned(Expr::Resume { arg: Rc::new(arg) }, span.merge(end)))
             }
             TokenKind::Lower(name) => {
                 self.bump();
@@ -1804,24 +1813,9 @@ impl<'a> Parser<'a> {
                     Some(TokenKind::Lower(n)) => Some(n.clone()),
                     _ => None,
                 };
-                match self.let_stmt() {
-                    Some(st) => stmts.push(st),
-                    None => {
-                        let span = self.recover_statement(at, reported, first);
-                        let error = spanned(Expr::Error, span);
-                        stmts.push(spanned(
-                            match name {
-                                Some(name) => Stmt::Let {
-                                    name,
-                                    ann: None,
-                                    value: error,
-                                },
-                                None => Stmt::Expr(error),
-                            },
-                            span,
-                        ));
-                    }
-                }
+                let st = self.let_stmt();
+                let st = self.let_or_recovered(st, at, reported, first, name);
+                stmts.push(st);
             } else {
                 match self.expr(0) {
                     Some(e) => {
@@ -1844,25 +1838,7 @@ impl<'a> Parser<'a> {
         // 2026-10-24-elya-block-tails-and-exponents D1): one that ends in a `let`,
         // or has nothing in it, has none.
         if tail.is_none() && self.stop.is_none() && self.peek() == Some(&TokenKind::RBrace) {
-            match stmts.last() {
-                None => self.push(
-                    Diagnostic::error("E0103", "a block has no value")
-                        .with_label(start.merge(end), "an empty block")
-                        .with_help("write the value it has, `Unit` for none"),
-                ),
-                Some(st) if matches!(&st.node, Stmt::Let { value, .. } if !matches!(value.node, Expr::Error)) =>
-                {
-                    let at = st.span;
-                    self.push(
-                        Diagnostic::error("E0103", "a block cannot end with `let`")
-                            .with_label(at, "the block's last statement")
-                            .with_help(
-                                "end the block with its value: the bound name, another expression, or `Unit`",
-                            ),
-                    );
-                }
-                Some(_) => {}
-            }
+            self.check_block_value(start, end, stmts.last());
         }
         self.close_brace();
         Some(spanned(
@@ -1872,6 +1848,61 @@ impl<'a> Parser<'a> {
             },
             start.merge(end),
         ))
+    }
+
+    /// A `let` statement read, or (none read) the statement recovered as an
+    /// error, its name, when read, still bound (D2). Off the recursive path.
+    #[inline(never)]
+    fn let_or_recovered(
+        &mut self,
+        st: Option<Spanned<Stmt>>,
+        at: usize,
+        reported: usize,
+        first: Span,
+        name: Option<String>,
+    ) -> Spanned<Stmt> {
+        match st {
+            Some(st) => st,
+            None => {
+                let span = self.recover_statement(at, reported, first);
+                let error = spanned(Expr::Error, span);
+                spanned(
+                    match name {
+                        Some(name) => Stmt::Let {
+                            name,
+                            ann: None,
+                            value: error,
+                        },
+                        None => Stmt::Expr(error),
+                    },
+                    span,
+                )
+            }
+        }
+    }
+
+    /// E0103: a block that ends in a `let`, or has nothing in it, has no value.
+    #[inline(never)]
+    fn check_block_value(&mut self, start: Span, end: Span, last: Option<&Spanned<Stmt>>) {
+        match last {
+            None => self.push(
+                Diagnostic::error("E0103", "a block has no value")
+                    .with_label(start.merge(end), "an empty block")
+                    .with_help("write the value it has, `Unit` for none"),
+            ),
+            Some(st) if matches!(&st.node, Stmt::Let { value, .. } if !matches!(value.node, Expr::Error)) =>
+            {
+                let at = st.span;
+                self.push(
+                    Diagnostic::error("E0103", "a block cannot end with `let`")
+                        .with_label(at, "the block's last statement")
+                        .with_help(
+                            "end the block with its value: the bound name, another expression, or `Unit`",
+                        ),
+                );
+            }
+            Some(_) => {}
+        }
     }
 
     fn let_stmt(&mut self) -> Option<Spanned<Stmt>> {

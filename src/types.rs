@@ -2847,116 +2847,16 @@ impl Infer {
             Expr::Handle { body, handler } => self.infer_handle(body, handler, span, env, amb),
             Expr::Resume { arg } => {
                 let arg_ty = self.infer_expr(arg, env, amb);
-                match self.resume_stack.last().cloned() {
-                    Some(cx) => {
-                        // resume : (B) / ε -> R — takes the operation's result,
-                        // yields the handle's result, and runs the rest of the
-                        // handled body AND then the return clause, which may
-                        // still perform ε. Directly in the clause ε is already in
-                        // the ambient; inside a LAMBDA in the clause it is not,
-                        // and leaving it out typed such a lambda pure (found by
-                        // slice 5b-10, and again by the async-step-1 review for
-                        // relayed and return-clause effects).
-                        //
-                        // LABELS, never the bare tail: unifying with the body's
-                        // tail made this site's ambient EQUAL to it and merged
-                        // rows related only by inclusion (the first resume-row
-                        // review). Both rows are complete here: the body was
-                        // inferred and its inclusions flushed, the return clause
-                        // was inferred first and its residual closed. A tail
-                        // that is a RELAY -- a row variable of a parameter in
-                        // scope, which a caller instantiates -- IS unified,
-                        // exactly as a call through that parameter would be.
-                        self.unify(&arg_ty, &cx.arg, span);
-                        if self.lambda_depth > cx.lambda_depth {
-                            // Escaped: the rest of the body may re-enter any
-                            // clause, whose effects are not all known yet.
-                            let all = EffectRow::open(cx.clauses_row);
-                            let r = self.add_row(amb, &all, span);
-                            self.surface_conflict(r);
-                            // ... and it re-runs the body's recursive calls,
-                            // whose member rows may still grow: include them
-                            // here too, so a later label reaches this lambda or
-                            // is reported against its closed row (the
-                            // handle-recursion review's F2).
-                            let body_tail = self.resolve_row(&EffectRow::open(cx.body_amb)).tail;
-                            for (m, dst, sp) in self.pending_member_incl.clone() {
-                                if self.resolve_row(&EffectRow::open(dst)).tail == body_tail {
-                                    self.pending_member_incl.push((m, amb, sp));
-                                }
-                            }
-                        }
-                        let mut in_params = Vec::new();
-                        for p in self.param_tys.clone() {
-                            free_row_vars(self, &p, &mut in_params);
-                        }
-                        for (src, except, all) in [
-                            (cx.body_amb, cx.handled.clone(), cx.handles_all),
-                            (cx.ret_amb, None, false),
-                        ] {
-                            let now = self.resolve_row(&EffectRow::open(src));
-                            for (label, l) in now.labels.iter() {
-                                if except.as_deref() == Some(label.as_str())
-                                    || (all && label != "IO")
-                                {
-                                    continue;
-                                }
-                                let r = self.add_effect(amb, label, l.args.clone(), l.span);
-                                self.surface_conflict(r);
-                            }
-                            if let RowTail::Open(w) = now.tail {
-                                if in_params.contains(&w) && !all {
-                                    let relay = EffectRow {
-                                        labels: BTreeMap::new(),
-                                        tail: RowTail::Open(w),
-                                    };
-                                    let r = self.add_row(amb, &relay, span);
-                                    self.surface_conflict(r);
-                                }
-                            }
-                        }
-                        cx.result
-                    }
-                    // resume outside a handler is E0210 at resolve time.
-                    None => Ty::Error,
-                }
+                self.type_resume(arg_ty, span, amb)
             }
             Expr::Match { scrutinee, arms } => {
                 let s = self.infer_expr(scrutinee, env, amb);
                 let result = self.fresh();
-                // An empty match is exhaustive exactly when the scrutinee's type
-                // has no constructors; its result then has any type (spec
-                // 2026-10-16). `exhaust.rs` is type-free and leaves it here.
                 if arms.is_empty() {
-                    let st = self.resolve(&s);
-                    let empty = matches!(&st, Ty::Con(n, _) if self.empty_types.contains(n));
-                    if !empty && st != Ty::Error {
-                        self.diags.push(
-                            Diagnostic::error(
-                                "E0430",
-                                format!(
-                                    "a match with no arms needs a scrutinee whose type has no constructors; this is `{}`",
-                                    display_ty(self, &st)
-                                ),
-                            )
-                            .with_label(scrutinee.span, "a value of this type may exist")
-                            .with_help("add arms, or match a value of an empty type such as `type Never { }`"),
-                        );
-                    }
+                    self.check_empty_match(&s, scrutinee.span);
                 }
                 for arm in arms.iter() {
-                    let mut bindings = Vec::new();
-                    self.check_pattern(&arm.node.pat, &s, env, &mut bindings);
-                    env.push();
-                    for (name, ty, at) in bindings {
-                        let scheme = Scheme {
-                            vars: Vec::new(),
-                            row_vars: Vec::new(),
-                            ty,
-                        };
-                        self.note_binder(at, &name, &scheme);
-                        self.bind_name(env, &name, scheme);
-                    }
+                    self.bind_arm_pattern(&arm.node.pat, &s, env);
                     let body_ty = self.infer_expr(&arm.node.body, env, amb);
                     self.unify(&body_ty, &result, arm.node.body.span);
                     env.pop();
@@ -2964,80 +2864,223 @@ impl Infer {
                 result
             }
             Expr::Lambda { params, body } => {
-                // Each parameter gets a fresh monomorphic type variable.
-                env.push();
-                let mut param_tys = Vec::with_capacity(params.len());
-                for p in params {
-                    let pv = self.fresh();
-                    let scheme = Scheme {
-                        vars: Vec::new(),
-                        row_vars: Vec::new(),
-                        ty: pv.clone(),
-                    };
-                    self.note_binder(p.span, &p.node.name, &scheme);
-                    self.bind_name(env, &p.node.name, scheme);
-                    // 5b-6 §4 (obligation T3): record the parameter's type at its
-                    // own span, exactly as a top-level fn parameter is recorded.
-                    // The back end then READS a lambda parameter's type instead of
-                    // reconstructing it from call-site context.
-                    self.node_types.insert(p.span, pv.clone());
-                    self.check_ann(&p.node.ann, &pv, false);
-                    param_tys.push(pv);
-                }
-                // The lambda has its OWN latent effect row: infer the body under a
-                // fresh ambient. Creating the closure performs nothing, so the row
-                // is NOT added to the enclosing `amb`; only *calling* it pours the
-                // row in (infer_call). This mirrors top-level fn typing (spec §2.1).
-                let lam_amb = self.fresh_row();
-                let mark = self.param_tys.len();
-                self.param_tys.extend(param_tys.iter().cloned());
-                self.lambda_depth += 1;
-                self.regions.push((lam_amb, true));
+                let (param_tys, lam_amb, mark) = self.lambda_enter(params, env);
                 let body_ty = self.infer_block(&body.node, env, lam_amb);
-                self.regions.pop();
-                self.lambda_depth -= 1;
-                self.param_tys.truncate(mark);
-                env.pop();
-                // Fork A (4b-2 §2): close the lambda's residual tail unless it is
-                // relayed through a parameter — the same discipline top-level fns
-                // use. A concrete-effect lambda gets a minimal closed row (`{Log}`);
-                // a relay lambda keeps its open, row-polymorphic tail.
-                // Pending sub-effecting inclusions reach this ambient before it
-                // closes (a label arriving later is a surfaced conflict).
-                // A relay of an ENCLOSING function's (or lambda's) parameter
-                // keeps the tail open too (2026-10-09): `fn wrap(f) { fn(x) {
-                // f(x) } }` relays `f`'s row, and closing it forced `f` pure
-                // (PARKED by sub-effecting until native code could compile the
-                // effect-polymorphic result -- N7 part 1).
-                self.flush_inclusions();
-                let mut scope_params = self.param_tys.clone();
-                scope_params.extend(param_tys.iter().cloned());
-                // Recursion through a lambda (2026-10-15): a lambda that
-                // includes a group member's row cannot close yet -- the member
-                // may perform more later in its body. Closed with the group.
-                let lam_tail = self.resolve_row(&EffectRow::open(lam_amb)).tail;
-                let includes_member = self
-                    .pending_member_incl
-                    .clone()
-                    .into_iter()
-                    .any(|(_, dst, _)| self.resolve_row(&EffectRow::open(dst)).tail == lam_tail);
-                if includes_member && matches!(lam_tail, RowTail::Open(_)) {
-                    self.deferred_rows.push((lam_amb, scope_params));
-                } else {
-                    self.close_unrelayed_residual(lam_amb, &scope_params);
-                }
-                // Sub-effecting (the maintainer's decision, 2026-10-08): the
-                // VALUE's row is open even when the body's is closed -- a
-                // function that performs ε may stand where ε ∪ ρ is expected.
-                // The body's own ambient stays closed (nothing leaks in); only
-                // the type gains a fresh tail, the row-polymorphic upcast.
-                let mut row = self.resolve_row(&EffectRow::open(lam_amb));
-                if row.tail == RowTail::Closed {
-                    row.tail = RowTail::Open(self.fresh_phantom_row());
-                }
-                Ty::Fn(param_tys, row, Box::new(body_ty))
+                self.lambda_exit(param_tys, lam_amb, mark, body_ty, env)
             }
         }
+    }
+
+    /// `resume(arg)`, its argument inferred (off the recursive path, as are the
+    /// helpers below: `infer_expr_inner`'s frame holds only what every arm
+    /// needs).
+    #[inline(never)]
+    fn type_resume(&mut self, arg_ty: Ty, span: Span, amb: RowVar) -> Ty {
+        match self.resume_stack.last().cloned() {
+            Some(cx) => {
+                // resume : (B) / ε -> R — takes the operation's result,
+                // yields the handle's result, and runs the rest of the
+                // handled body AND then the return clause, which may
+                // still perform ε. Directly in the clause ε is already in
+                // the ambient; inside a LAMBDA in the clause it is not,
+                // and leaving it out typed such a lambda pure (found by
+                // slice 5b-10, and again by the async-step-1 review for
+                // relayed and return-clause effects).
+                //
+                // LABELS, never the bare tail: unifying with the body's
+                // tail made this site's ambient EQUAL to it and merged
+                // rows related only by inclusion (the first resume-row
+                // review). Both rows are complete here: the body was
+                // inferred and its inclusions flushed, the return clause
+                // was inferred first and its residual closed. A tail
+                // that is a RELAY -- a row variable of a parameter in
+                // scope, which a caller instantiates -- IS unified,
+                // exactly as a call through that parameter would be.
+                self.unify(&arg_ty, &cx.arg, span);
+                if self.lambda_depth > cx.lambda_depth {
+                    // Escaped: the rest of the body may re-enter any
+                    // clause, whose effects are not all known yet.
+                    let all = EffectRow::open(cx.clauses_row);
+                    let r = self.add_row(amb, &all, span);
+                    self.surface_conflict(r);
+                    // ... and it re-runs the body's recursive calls,
+                    // whose member rows may still grow: include them
+                    // here too, so a later label reaches this lambda or
+                    // is reported against its closed row (the
+                    // handle-recursion review's F2).
+                    let body_tail = self.resolve_row(&EffectRow::open(cx.body_amb)).tail;
+                    for (m, dst, sp) in self.pending_member_incl.clone() {
+                        if self.resolve_row(&EffectRow::open(dst)).tail == body_tail {
+                            self.pending_member_incl.push((m, amb, sp));
+                        }
+                    }
+                }
+                let mut in_params = Vec::new();
+                for p in self.param_tys.clone() {
+                    free_row_vars(self, &p, &mut in_params);
+                }
+                for (src, except, all) in [
+                    (cx.body_amb, cx.handled.clone(), cx.handles_all),
+                    (cx.ret_amb, None, false),
+                ] {
+                    let now = self.resolve_row(&EffectRow::open(src));
+                    for (label, l) in now.labels.iter() {
+                        if except.as_deref() == Some(label.as_str()) || (all && label != "IO") {
+                            continue;
+                        }
+                        let r = self.add_effect(amb, label, l.args.clone(), l.span);
+                        self.surface_conflict(r);
+                    }
+                    if let RowTail::Open(w) = now.tail {
+                        if in_params.contains(&w) && !all {
+                            let relay = EffectRow {
+                                labels: BTreeMap::new(),
+                                tail: RowTail::Open(w),
+                            };
+                            let r = self.add_row(amb, &relay, span);
+                            self.surface_conflict(r);
+                        }
+                    }
+                }
+                cx.result
+            }
+            // resume outside a handler is E0210 at resolve time.
+            None => Ty::Error,
+        }
+    }
+
+    /// A match with no arms: exhaustive exactly when the scrutinee's type has no
+    /// constructors; its result then has any type (spec 2026-10-16).
+    /// `exhaust.rs` is type-free and leaves it here.
+    #[inline(never)]
+    fn check_empty_match(&mut self, s: &Ty, scrutinee_span: Span) {
+        let st = self.resolve(s);
+        let empty = matches!(&st, Ty::Con(n, _) if self.empty_types.contains(n));
+        if !empty && st != Ty::Error {
+            self.diags.push(
+                Diagnostic::error(
+                    "E0430",
+                    format!(
+                        "a match with no arms needs a scrutinee whose type has no constructors; this is `{}`",
+                        display_ty(self, &st)
+                    ),
+                )
+                .with_label(scrutinee_span, "a value of this type may exist")
+                .with_help("add arms, or match a value of an empty type such as `type Never { }`"),
+            );
+        }
+    }
+
+    /// An arm's pattern checked against the scrutinee's type and its names bound
+    /// in a new scope (the caller pops it).
+    #[inline(never)]
+    fn bind_arm_pattern(&mut self, pat: &Spanned<Pattern>, s: &Ty, env: &mut TyEnv) {
+        let mut bindings = Vec::new();
+        self.check_pattern(pat, s, env, &mut bindings);
+        env.push();
+        for (name, ty, at) in bindings {
+            let scheme = Scheme {
+                vars: Vec::new(),
+                row_vars: Vec::new(),
+                ty,
+            };
+            self.note_binder(at, &name, &scheme);
+            self.bind_name(env, &name, scheme);
+        }
+    }
+
+    /// A lambda's parameters bound and its own ambient opened: (the parameters'
+    /// types, the ambient, the `param_tys` mark).
+    #[inline(never)]
+    fn lambda_enter(
+        &mut self,
+        params: &[Spanned<crate::ast::Param>],
+        env: &mut TyEnv,
+    ) -> (Vec<Ty>, RowVar, usize) {
+        // Each parameter gets a fresh monomorphic type variable.
+        env.push();
+        let mut param_tys = Vec::with_capacity(params.len());
+        for p in params {
+            let pv = self.fresh();
+            let scheme = Scheme {
+                vars: Vec::new(),
+                row_vars: Vec::new(),
+                ty: pv.clone(),
+            };
+            self.note_binder(p.span, &p.node.name, &scheme);
+            self.bind_name(env, &p.node.name, scheme);
+            // 5b-6 §4 (obligation T3): record the parameter's type at its
+            // own span, exactly as a top-level fn parameter is recorded.
+            // The back end then READS a lambda parameter's type instead of
+            // reconstructing it from call-site context.
+            self.node_types.insert(p.span, pv.clone());
+            self.check_ann(&p.node.ann, &pv, false);
+            param_tys.push(pv);
+        }
+        // The lambda has its OWN latent effect row: infer the body under a
+        // fresh ambient. Creating the closure performs nothing, so the row
+        // is NOT added to the enclosing `amb`; only *calling* it pours the
+        // row in (infer_call). This mirrors top-level fn typing (spec §2.1).
+        let lam_amb = self.fresh_row();
+        let mark = self.param_tys.len();
+        self.param_tys.extend(param_tys.iter().cloned());
+        self.lambda_depth += 1;
+        self.regions.push((lam_amb, true));
+        (param_tys, lam_amb, mark)
+    }
+
+    /// A lambda's body inferred: its scope closed and its type made.
+    #[inline(never)]
+    fn lambda_exit(
+        &mut self,
+        param_tys: Vec<Ty>,
+        lam_amb: RowVar,
+        mark: usize,
+        body_ty: Ty,
+        env: &mut TyEnv,
+    ) -> Ty {
+        self.regions.pop();
+        self.lambda_depth -= 1;
+        self.param_tys.truncate(mark);
+        env.pop();
+        // Fork A (4b-2 §2): close the lambda's residual tail unless it is
+        // relayed through a parameter — the same discipline top-level fns
+        // use. A concrete-effect lambda gets a minimal closed row (`{Log}`);
+        // a relay lambda keeps its open, row-polymorphic tail.
+        // Pending sub-effecting inclusions reach this ambient before it
+        // closes (a label arriving later is a surfaced conflict).
+        // A relay of an ENCLOSING function's (or lambda's) parameter
+        // keeps the tail open too (2026-10-09): `fn wrap(f) { fn(x) {
+        // f(x) } }` relays `f`'s row, and closing it forced `f` pure
+        // (PARKED by sub-effecting until native code could compile the
+        // effect-polymorphic result -- N7 part 1).
+        self.flush_inclusions();
+        let mut scope_params = self.param_tys.clone();
+        scope_params.extend(param_tys.iter().cloned());
+        // Recursion through a lambda (2026-10-15): a lambda that
+        // includes a group member's row cannot close yet -- the member
+        // may perform more later in its body. Closed with the group.
+        let lam_tail = self.resolve_row(&EffectRow::open(lam_amb)).tail;
+        let includes_member = self
+            .pending_member_incl
+            .clone()
+            .into_iter()
+            .any(|(_, dst, _)| self.resolve_row(&EffectRow::open(dst)).tail == lam_tail);
+        if includes_member && matches!(lam_tail, RowTail::Open(_)) {
+            self.deferred_rows.push((lam_amb, scope_params));
+        } else {
+            self.close_unrelayed_residual(lam_amb, &scope_params);
+        }
+        // Sub-effecting (the maintainer's decision, 2026-10-08): the
+        // VALUE's row is open even when the body's is closed -- a
+        // function that performs ε may stand where ε ∪ ρ is expected.
+        // The body's own ambient stays closed (nothing leaks in); only
+        // the type gains a fresh tail, the row-polymorphic upcast.
+        let mut row = self.resolve_row(&EffectRow::open(lam_amb));
+        if row.tail == RowTail::Closed {
+            row.tail = RowTail::Open(self.fresh_phantom_row());
+        }
+        Ty::Fn(param_tys, row, Box::new(body_ty))
     }
 
     /// Check a pattern against `expected`, collecting variable bindings. A
@@ -3112,284 +3155,361 @@ impl Infer {
         env: &mut TyEnv,
         amb: RowVar,
     ) -> Ty {
+        // This frame is on the checker's recursive path (a call's arguments are
+        // expressions): it infers the arguments and little else; each kind of
+        // call is typed by a helper of its own, off that path (this frame was
+        // 16 KiB in a debug build, and 60 nested calls overflowed a test
+        // thread's 2 MiB on Windows).
         // Builtins.
         if let Expr::Qualified { module, name } = &callee.node {
-            if module == "io" && name == "println" {
-                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
-                let want = Ty::Fn(vec![Ty::str()], EffectRow::pure(), Box::new(Ty::unit()));
-                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::unit()));
-                self.unify(&want, &got, span);
-                {
-                    let r = self.add_effect(amb, "IO", Vec::new(), span);
-                    self.surface_conflict(r);
-                } // io.println performs {IO}
-                let mut io_labels = BTreeMap::new();
-                io_labels.insert(
-                    "IO".to_string(),
-                    EffectLabel {
-                        args: Vec::new(),
-                        span: callee.span,
-                    },
-                );
-                self.node_types.insert(
-                    callee.span,
-                    Ty::Fn(
-                        vec![Ty::str()],
-                        EffectRow {
-                            labels: io_labels,
-                            tail: RowTail::Closed,
-                        },
-                        Box::new(Ty::unit()),
-                    ),
-                );
-                return Ty::unit();
+            if !Self::builtin_known(module, name) {
+                return Ty::Error; // unknown builtin is E0201 from resolution
             }
-            // `time.now_ms : fn() -> Int` and `time.sleep_ms : fn(Int) -> Unit`,
-            // both performing `IO` (spec 2026-10-15-elya-async-step2-timers D3).
-            if module == "time" && (name == "now_ms" || name == "sleep_ms") {
-                let (params, ret) = if name == "now_ms" {
-                    (Vec::new(), Ty::int())
-                } else {
-                    (vec![Ty::int()], Ty::unit())
-                };
-                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
-                let want = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(ret.clone()));
-                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
-                self.unify(&want, &got, span);
-                {
-                    let r = self.add_effect(amb, "IO", Vec::new(), span);
-                    self.surface_conflict(r);
-                }
-                let mut io_labels = BTreeMap::new();
-                io_labels.insert(
-                    "IO".to_string(),
-                    EffectLabel {
-                        args: Vec::new(),
-                        span: callee.span,
-                    },
-                );
-                self.node_types.insert(
-                    callee.span,
-                    Ty::Fn(
-                        params,
-                        EffectRow {
-                            labels: io_labels,
-                            tail: RowTail::Closed,
-                        },
-                        Box::new(ret.clone()),
-                    ),
-                );
-                return ret;
-            }
-            // The builtins on an operation of a `with any` clause (2026-10-16,
-            // D4). `o : Op(t, fn() / H -> t)`: `op.perform` performs `H`.
-            if module == "op"
-                && matches!(
-                    name.as_str(),
-                    "name" | "show" | "perform" | "encode" | "decode"
-                )
-            {
-                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
-                let t = self.fresh();
-                let h = self.fresh_row();
-                let op_ty = Ty::Con(
-                    "$Op".to_string(),
-                    vec![
-                        t.clone(),
-                        Ty::Fn(Vec::new(), EffectRow::open(h), Box::new(t.clone())),
-                    ],
-                );
-                let (params, ret) = match name.as_str() {
-                    "name" | "show" => (vec![op_ty], Ty::str()),
-                    "perform" => (vec![op_ty], t.clone()),
-                    "encode" => (vec![op_ty, t.clone()], Ty::str()),
-                    _ => (vec![op_ty, Ty::str()], t.clone()),
-                };
-                let row = if name == "perform" {
-                    EffectRow::open(h)
-                } else {
-                    EffectRow::pure()
-                };
-                let want = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(ret.clone()));
-                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
-                self.unify(&want, &got, span);
-                if name == "perform" {
-                    let performed = self.resolve_row(&EffectRow::open(h));
-                    let r = self.add_row(amb, &performed, span);
-                    self.surface_conflict(r);
-                    self.hold_point(span, &performed);
-                }
-                self.node_types
-                    .insert(callee.span, Ty::Fn(params, row, Box::new(ret.clone())));
-                return ret;
-            }
-            // `int.to_string : fn(Int) -> String`, pure (spec
-            // 2026-10-15-elya-native-strings D1).
-            // `float.to_string : fn(Float) -> String`, pure (spec
-            // 2026-10-23-elya-float-natively D5).
-            if (module == "int" || module == "float") && name == "to_string" {
-                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
-                let num = if module == "int" {
-                    Ty::int()
-                } else {
-                    Ty::float()
-                };
-                let want = Ty::Fn(vec![num], EffectRow::pure(), Box::new(Ty::str()));
-                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::str()));
-                self.unify(&want, &got, span);
-                self.node_types.insert(callee.span, want);
-                return Ty::str();
-            }
-            // `float.of_int : fn(Int) -> Float`, `float.truncate`/`round :
-            // fn(Float) -> Int`, pure (spec 2026-10-24-elya-float-part-2 D3, D4;
-            // a failure is not an effect, as with checked `Int` arithmetic).
-            if module == "float" && crate::resolve::FLOAT_CONVERSIONS.contains(&name.as_str()) {
-                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
-                let (from, to) = if name == "of_int" {
-                    (Ty::int(), Ty::float())
-                } else {
-                    (Ty::float(), Ty::int())
-                };
-                let want = Ty::Fn(vec![from], EffectRow::pure(), Box::new(to.clone()));
-                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(to.clone()));
-                self.unify(&want, &got, span);
-                self.node_types.insert(callee.span, want);
-                return to;
-            }
-            // A string by byte (spec 2026-10-24-elya-trace-text D1), pure: a
-            // failure is not an effect.
-            if module == "string" && crate::resolve::STRING_BUILTINS.contains(&name.as_str()) {
-                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
-                let (params, ret) = match name.as_str() {
-                    "length" => (vec![Ty::str()], Ty::int()),
-                    "byte_at" => (vec![Ty::str(), Ty::int()], Ty::int()),
-                    _ => (vec![Ty::str(), Ty::int(), Ty::int()], Ty::str()),
-                };
-                let want = Ty::Fn(params, EffectRow::pure(), Box::new(ret.clone()));
-                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
-                self.unify(&want, &got, span);
-                self.node_types.insert(callee.span, want);
-                return ret;
-            }
-            // Wrapping and bit arithmetic: `fn(Int, Int) -> Int`, pure (spec
-            // 2026-10-17-elya-unary-and-wrapping D2).
-            if module == "int" && crate::resolve::INT_BINARY_BUILTINS.contains(&name.as_str()) {
-                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
-                let want = Ty::Fn(
-                    vec![Ty::int(), Ty::int()],
-                    EffectRow::pure(),
-                    Box::new(Ty::int()),
-                );
-                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::int()));
-                self.unify(&want, &got, span);
-                self.node_types.insert(callee.span, want);
-                return Ty::int();
-            }
-            return Ty::Error; // unknown builtin is E0201 from resolution
+            let arg_ts = self.infer_args(args, env, amb);
+            return self.type_builtin_call(module, name, callee.span, arg_ts, span, amb);
         }
         // A constructor application: `Cons(h, t)`. Must be saturated (E0433).
         if let Expr::Var(name) = &callee.node {
             if let Some(&arity) = self.ctor_arity.get(name) {
-                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
-                if args.len() != arity {
-                    self.emit_unapplied_ctor(name, arity, span);
-                    return Ty::Error;
-                }
-                let Some(scheme) = env.lookup(name).cloned() else {
-                    return Ty::Error;
-                };
-                let (params, result) = match self.instantiate(&scheme) {
-                    Ty::Fn(ps, _r, r) => (ps, *r),
-                    other => (Vec::new(), other),
-                };
-                for (at, pt) in arg_ts.iter().zip(&params) {
-                    self.unify(at, pt, span);
-                }
-                return result;
+                let arg_ts = self.infer_args(args, env, amb);
+                return self.type_ctor_call(name, arity, args.len(), arg_ts, span, env);
             }
         }
-        // An operation call is a *perform*: it adds its effect to the ambient
-        // and yields the operation's declared result type. Locals first (slice
+        // An operation call is a *perform* (`type_perform`). Locals first (slice
         // 5c-2): a name bound in the environment is a call of that binding. Under
         // E0205 no top-level function shares an op's name, so the environment
         // can hold one only as a local, which shadows the op lexically.
         if let Expr::Var(name) = &callee.node {
-            let op = if env.lookup(name).is_none() {
-                self.ops.get(name).cloned()
-            } else {
-                None
-            };
-            if let Some(op) = op {
-                // Instantiate the effect's type params fresh (Slice 4c-2); the
-                // fresh args ride in the row, so a second perform of the same
-                // effect reconciles against them via `unify_row`.
-                let (eff_args, op_params, op_ret) = self.instantiate_op(&op);
-                let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
-                // Record the operation-reference callee node against its span
-                // (Slice 5a-1's recorder invariant). Only the args route through
-                // `infer_expr`, so without this the callee `Var` span is absent
-                // from `node_types` and Core lowering of the perform cannot type
-                // it. The callee denotes the operation as an arrow that performs
-                // its own effect: `fn(op_params) / {Effect(eff_args)} -> op_ret`.
-                let mut op_labels = BTreeMap::new();
-                op_labels.insert(
-                    op.effect.clone(),
-                    EffectLabel {
-                        args: eff_args.clone(),
-                        span: callee.span,
-                    },
-                );
-                let callee_ty = Ty::Fn(
-                    op_params.clone(),
-                    EffectRow {
-                        labels: op_labels,
-                        tail: RowTail::Closed,
-                    },
-                    Box::new(op_ret.clone()),
-                );
-                self.node_types.insert(callee.span, callee_ty);
-                let want = Ty::Fn(op_params, EffectRow::pure(), Box::new(op_ret.clone()));
-                let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(op_ret.clone()));
-                self.unify(&want, &got, span);
-                {
-                    let r = self.add_effect(amb, &op.effect, eff_args, span);
-                    self.surface_conflict(r);
-                }
-                let mut performed = BTreeMap::new();
-                performed.insert(
-                    op.effect.clone(),
-                    EffectLabel {
-                        args: Vec::new(),
-                        span: callee.span,
-                    },
-                );
-                self.hold_point(
-                    span,
-                    &EffectRow {
-                        labels: performed,
-                        tail: RowTail::Closed,
-                    },
-                );
-                return op_ret;
+            if env.lookup(name).is_none() && self.ops.contains_key(name) {
+                // The effect's type params instantiated fresh before the
+                // arguments are inferred (Slice 4c-2).
+                let instantiated = self.instantiate_named_op(name);
+                let arg_ts = self.infer_args(args, env, amb);
+                return self.type_perform(name, instantiated, callee.span, arg_ts, span, amb);
             }
         }
-        // Ordinary function call: unify the arrow's param/result types, then pour
-        // the callee's latent effect row into the ambient (`amb ⊇ ε_f`).
+        // Ordinary function call (`type_ordinary_call`).
         let f = match &callee.node {
             // A callee is not a value use: no sub-effecting opening (the call
             // pours exactly the callee's row into the ambient).
-            Expr::Var(name) => match env.lookup(name) {
-                Some(s) => {
-                    let s = s.clone();
-                    let t = self.instantiate(&s);
-                    self.node_types.insert(callee.span, t.clone());
-                    t
-                }
-                None => Ty::Error,
-            },
+            Expr::Var(name) => self.callee_scheme_type(name, callee.span, env),
             _ => self.infer_expr(callee, env, amb),
         };
-        let arg_ts: Vec<Ty> = args.iter().map(|a| self.infer_expr(a, env, amb)).collect();
+        let arg_ts = self.infer_args(args, env, amb);
+        self.type_ordinary_call(f, arg_ts, span, amb)
+    }
+
+    /// A call's arguments, left to right (a loop, not an iterator chain: each
+    /// adapter was a frame on the recursive path).
+    fn infer_args(&mut self, args: &[Spanned<Expr>], env: &mut TyEnv, amb: RowVar) -> Vec<Ty> {
+        let mut out = Vec::with_capacity(args.len());
+        for a in args {
+            out.push(self.infer_expr(a, env, amb));
+        }
+        out
+    }
+
+    /// Whether `module.name` is a builtin `type_builtin_call` types.
+    fn builtin_known(module: &str, name: &str) -> bool {
+        (module == "io" && name == "println")
+            || (module == "time" && (name == "now_ms" || name == "sleep_ms"))
+            || (module == "op" && matches!(name, "name" | "show" | "perform" | "encode" | "decode"))
+            || ((module == "int" || module == "float") && name == "to_string")
+            || (module == "float" && crate::resolve::FLOAT_CONVERSIONS.contains(&name))
+            || (module == "string" && crate::resolve::STRING_BUILTINS.contains(&name))
+            || (module == "int" && crate::resolve::INT_BINARY_BUILTINS.contains(&name))
+    }
+
+    /// A builtin's call, its arguments inferred.
+    #[inline(never)]
+    fn type_builtin_call(
+        &mut self,
+        module: &str,
+        name: &str,
+        callee_span: Span,
+        arg_ts: Vec<Ty>,
+        span: Span,
+        amb: RowVar,
+    ) -> Ty {
+        if module == "io" && name == "println" {
+            let want = Ty::Fn(vec![Ty::str()], EffectRow::pure(), Box::new(Ty::unit()));
+            let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::unit()));
+            self.unify(&want, &got, span);
+            {
+                let r = self.add_effect(amb, "IO", Vec::new(), span);
+                self.surface_conflict(r);
+            } // io.println performs {IO}
+            let mut io_labels = BTreeMap::new();
+            io_labels.insert(
+                "IO".to_string(),
+                EffectLabel {
+                    args: Vec::new(),
+                    span: callee_span,
+                },
+            );
+            self.node_types.insert(
+                callee_span,
+                Ty::Fn(
+                    vec![Ty::str()],
+                    EffectRow {
+                        labels: io_labels,
+                        tail: RowTail::Closed,
+                    },
+                    Box::new(Ty::unit()),
+                ),
+            );
+            return Ty::unit();
+        }
+        // `time.now_ms : fn() -> Int` and `time.sleep_ms : fn(Int) -> Unit`,
+        // both performing `IO` (spec 2026-10-15-elya-async-step2-timers D3).
+        if module == "time" && (name == "now_ms" || name == "sleep_ms") {
+            let (params, ret) = if name == "now_ms" {
+                (Vec::new(), Ty::int())
+            } else {
+                (vec![Ty::int()], Ty::unit())
+            };
+            let want = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(ret.clone()));
+            let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
+            self.unify(&want, &got, span);
+            {
+                let r = self.add_effect(amb, "IO", Vec::new(), span);
+                self.surface_conflict(r);
+            }
+            let mut io_labels = BTreeMap::new();
+            io_labels.insert(
+                "IO".to_string(),
+                EffectLabel {
+                    args: Vec::new(),
+                    span: callee_span,
+                },
+            );
+            self.node_types.insert(
+                callee_span,
+                Ty::Fn(
+                    params,
+                    EffectRow {
+                        labels: io_labels,
+                        tail: RowTail::Closed,
+                    },
+                    Box::new(ret.clone()),
+                ),
+            );
+            return ret;
+        }
+        // The builtins on an operation of a `with any` clause (2026-10-16,
+        // D4). `o : Op(t, fn() / H -> t)`: `op.perform` performs `H`.
+        if module == "op" && matches!(name, "name" | "show" | "perform" | "encode" | "decode") {
+            let t = self.fresh();
+            let h = self.fresh_row();
+            let op_ty = Ty::Con(
+                "$Op".to_string(),
+                vec![
+                    t.clone(),
+                    Ty::Fn(Vec::new(), EffectRow::open(h), Box::new(t.clone())),
+                ],
+            );
+            let (params, ret) = match name {
+                "name" | "show" => (vec![op_ty], Ty::str()),
+                "perform" => (vec![op_ty], t.clone()),
+                "encode" => (vec![op_ty, t.clone()], Ty::str()),
+                _ => (vec![op_ty, Ty::str()], t.clone()),
+            };
+            let row = if name == "perform" {
+                EffectRow::open(h)
+            } else {
+                EffectRow::pure()
+            };
+            let want = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(ret.clone()));
+            let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
+            self.unify(&want, &got, span);
+            if name == "perform" {
+                let performed = self.resolve_row(&EffectRow::open(h));
+                let r = self.add_row(amb, &performed, span);
+                self.surface_conflict(r);
+                self.hold_point(span, &performed);
+            }
+            self.node_types
+                .insert(callee_span, Ty::Fn(params, row, Box::new(ret.clone())));
+            return ret;
+        }
+        // `int.to_string : fn(Int) -> String`, pure (spec
+        // 2026-10-15-elya-native-strings D1).
+        // `float.to_string : fn(Float) -> String`, pure (spec
+        // 2026-10-23-elya-float-natively D5).
+        if (module == "int" || module == "float") && name == "to_string" {
+            let num = if module == "int" {
+                Ty::int()
+            } else {
+                Ty::float()
+            };
+            let want = Ty::Fn(vec![num], EffectRow::pure(), Box::new(Ty::str()));
+            let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::str()));
+            self.unify(&want, &got, span);
+            self.node_types.insert(callee_span, want);
+            return Ty::str();
+        }
+        // `float.of_int : fn(Int) -> Float`, `float.truncate`/`round :
+        // fn(Float) -> Int`, pure (spec 2026-10-24-elya-float-part-2 D3, D4;
+        // a failure is not an effect, as with checked `Int` arithmetic).
+        if module == "float" && crate::resolve::FLOAT_CONVERSIONS.contains(&name) {
+            let (from, to) = if name == "of_int" {
+                (Ty::int(), Ty::float())
+            } else {
+                (Ty::float(), Ty::int())
+            };
+            let want = Ty::Fn(vec![from], EffectRow::pure(), Box::new(to.clone()));
+            let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(to.clone()));
+            self.unify(&want, &got, span);
+            self.node_types.insert(callee_span, want);
+            return to;
+        }
+        // A string by byte (spec 2026-10-24-elya-trace-text D1), pure: a
+        // failure is not an effect.
+        if module == "string" && crate::resolve::STRING_BUILTINS.contains(&name) {
+            let (params, ret) = match name {
+                "length" => (vec![Ty::str()], Ty::int()),
+                "byte_at" => (vec![Ty::str(), Ty::int()], Ty::int()),
+                _ => (vec![Ty::str(), Ty::int(), Ty::int()], Ty::str()),
+            };
+            let want = Ty::Fn(params, EffectRow::pure(), Box::new(ret.clone()));
+            let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
+            self.unify(&want, &got, span);
+            self.node_types.insert(callee_span, want);
+            return ret;
+        }
+        // Wrapping and bit arithmetic: `fn(Int, Int) -> Int`, pure (spec
+        // 2026-10-17-elya-unary-and-wrapping D2).
+        if module == "int" && crate::resolve::INT_BINARY_BUILTINS.contains(&name) {
+            let want = Ty::Fn(
+                vec![Ty::int(), Ty::int()],
+                EffectRow::pure(),
+                Box::new(Ty::int()),
+            );
+            let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::int()));
+            self.unify(&want, &got, span);
+            self.node_types.insert(callee_span, want);
+            return Ty::int();
+        }
+        unreachable!("builtin_known and type_builtin_call disagree on {module}.{name}")
+    }
+
+    /// A constructor's call, its arguments inferred.
+    #[inline(never)]
+    fn type_ctor_call(
+        &mut self,
+        name: &str,
+        arity: usize,
+        nargs: usize,
+        arg_ts: Vec<Ty>,
+        span: Span,
+        env: &TyEnv,
+    ) -> Ty {
+        if nargs != arity {
+            self.emit_unapplied_ctor(name, arity, span);
+            return Ty::Error;
+        }
+        let Some(scheme) = env.lookup(name).cloned() else {
+            return Ty::Error;
+        };
+        let (params, result) = match self.instantiate(&scheme) {
+            Ty::Fn(ps, _r, r) => (ps, *r),
+            other => (Vec::new(), other),
+        };
+        for (at, pt) in arg_ts.iter().zip(&params) {
+            self.unify(at, pt, span);
+        }
+        result
+    }
+
+    /// The effect's type parameters and the operation's parameters and result,
+    /// instantiated fresh (`instantiate_op`).
+    #[inline(never)]
+    fn instantiate_named_op(&mut self, name: &str) -> (Vec<Ty>, Vec<Ty>, Ty) {
+        let op = self.ops[name].clone();
+        self.instantiate_op(&op)
+    }
+
+    /// An operation call is a *perform*: it adds its effect to the ambient and
+    /// yields the operation's declared result type; its arguments inferred.
+    #[inline(never)]
+    fn type_perform(
+        &mut self,
+        name: &str,
+        (eff_args, op_params, op_ret): (Vec<Ty>, Vec<Ty>, Ty),
+        callee_span: Span,
+        arg_ts: Vec<Ty>,
+        span: Span,
+        amb: RowVar,
+    ) -> Ty {
+        let op = self.ops[name].clone();
+        // Record the operation-reference callee node against its span
+        // (Slice 5a-1's recorder invariant). Only the args route through
+        // `infer_expr`, so without this the callee `Var` span is absent
+        // from `node_types` and Core lowering of the perform cannot type
+        // it. The callee denotes the operation as an arrow that performs
+        // its own effect: `fn(op_params) / {Effect(eff_args)} -> op_ret`.
+        let mut op_labels = BTreeMap::new();
+        op_labels.insert(
+            op.effect.clone(),
+            EffectLabel {
+                args: eff_args.clone(),
+                span: callee_span,
+            },
+        );
+        let callee_ty = Ty::Fn(
+            op_params.clone(),
+            EffectRow {
+                labels: op_labels,
+                tail: RowTail::Closed,
+            },
+            Box::new(op_ret.clone()),
+        );
+        self.node_types.insert(callee_span, callee_ty);
+        let want = Ty::Fn(op_params, EffectRow::pure(), Box::new(op_ret.clone()));
+        let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(op_ret.clone()));
+        self.unify(&want, &got, span);
+        {
+            let r = self.add_effect(amb, &op.effect, eff_args, span);
+            self.surface_conflict(r);
+        }
+        let mut performed = BTreeMap::new();
+        performed.insert(
+            op.effect.clone(),
+            EffectLabel {
+                args: Vec::new(),
+                span: callee_span,
+            },
+        );
+        self.hold_point(
+            span,
+            &EffectRow {
+                labels: performed,
+                tail: RowTail::Closed,
+            },
+        );
+        op_ret
+    }
+
+    /// A callee named by a variable: its scheme instantiated and recorded at the
+    /// callee's span.
+    #[inline(never)]
+    fn callee_scheme_type(&mut self, name: &str, callee_span: Span, env: &TyEnv) -> Ty {
+        match env.lookup(name) {
+            Some(s) => {
+                let s = s.clone();
+                let t = self.instantiate(&s);
+                self.node_types.insert(callee_span, t.clone());
+                t
+            }
+            None => Ty::Error,
+        }
+    }
+
+    /// Ordinary function call, its callee and arguments inferred: unify the
+    /// arrow's param/result types, then pour the callee's latent effect row into
+    /// the ambient (`amb ⊇ ε_f`).
+    #[inline(never)]
+    fn type_ordinary_call(&mut self, f: Ty, arg_ts: Vec<Ty>, span: Span, amb: RowVar) -> Ty {
         let result = self.fresh();
         // Phantom until the callee gives it meaning: unified with a meaningful
         // row (a relay, an in-progress row) it stops being phantom

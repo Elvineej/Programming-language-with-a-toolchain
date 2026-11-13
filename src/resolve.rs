@@ -467,60 +467,8 @@ impl Cx<'_> {
             | Expr::Bool(_)
             | Expr::Unit
             | Expr::Error => {}
-            Expr::Var(name) => {
-                self.check_name(name, span, scope);
-                // E0206 (slice 5c-3): an operation may only be called. Named
-                // anywhere else -- and not shadowed by a local -- it checked
-                // clean and failed at run time ("unbound variable"). The callee
-                // of a call never reaches here (see `Expr::Call`).
-                let local = scope.iter().any(|s| s.contains(name));
-                // A name that is also a top-level fn is already E0205; renaming
-                // the fn clears both, so E0206 there would be noise.
-                if self.ops.contains(name) && !local && !self.fns.contains(name) {
-                    // The wrapper passes the op's own arguments through.
-                    let n = self.op_arity.get(name).copied().unwrap_or(0);
-                    // a, b, … z, then a26, a27, … (from_u32 never fails here,
-                    // so the old fallback produced `{`, `|`, `}` past z).
-                    let ps: Vec<String> = (0..n)
-                        .map(|i| match char::from_u32('a' as u32 + i as u32) {
-                            Some(c) if i < 26 => c.to_string(),
-                            _ => format!("a{i}"),
-                        })
-                        .collect();
-                    let ps = ps.join(", ");
-                    self.diags.push(
-                        Diagnostic::error("E0206", format!("operation `{name}` used as a value"))
-                            .with_label(span, "an operation can only be called")
-                            .with_help(format!(
-                                "to pass it on, wrap it in a function: `fn({ps}) {{ {name}({ps}) }}`"
-                            )),
-                    );
-                }
-            }
-            Expr::Qualified { module, name } => {
-                // Not in call position (a callee is checked in the `Call` arm):
-                // a builtin can only be called, like an operation (E0206). The
-                // native-strings review (2026-10-15): `let f = int.to_string`
-                // passed `check`, then failed at run time.
-                let full = format!("{module}.{name}");
-                if !builtins().contains(&full.as_str()) {
-                    self.diags.push(
-                        Diagnostic::error("E0201", format!("unknown builtin `{full}`"))
-                            .with_label(span, "no such function"),
-                    );
-                } else {
-                    // At the builtin's own arity (the 2026-10-17 review's L1:
-                    // `fn(x) { int.xor(x) }` was itself an arity error).
-                    let ps = ["a", "b", "c"][..builtin_arity(&full)].join(", ");
-                    self.diags.push(
-                        Diagnostic::error("E0208", format!("builtin `{full}` used as a value"))
-                            .with_label(span, "a builtin can only be called")
-                            .with_help(format!(
-                                "to pass it on, wrap it in a function: `fn({ps}) {{ {full}({ps}) }}`"
-                            )),
-                    );
-                }
-            }
+            Expr::Var(name) => self.check_var(name, span, scope),
+            Expr::Qualified { module, name } => self.check_builtin_value(module, name, span),
             Expr::Call { callee, args } => {
                 // Locals before ops (5c-2): an op name bound by a local in scope
                 // is a call of the local.
@@ -535,13 +483,7 @@ impl Cx<'_> {
                     Expr::Var(name) => self.check_name(name, callee.span, scope),
                     // A called builtin only has to exist.
                     Expr::Qualified { module, name } => {
-                        let full = format!("{module}.{name}");
-                        if !builtins().contains(&full.as_str()) {
-                            self.diags.push(
-                                Diagnostic::error("E0201", format!("unknown builtin `{full}`"))
-                                    .with_label(callee.span, "no such function"),
-                            );
-                        }
+                        self.check_called_builtin(module, name, callee.span)
                     }
                     other => self.check_expr(other, callee.span, scope),
                 }
@@ -564,74 +506,10 @@ impl Cx<'_> {
                 self.check_block(&else_block.node, scope);
             }
             Expr::Block(b) => self.check_block(b, scope),
-            Expr::Handle { body, handler } => {
-                // The handled computation is not itself inside a clause, so a
-                // bare `resume` here is still an error (in_handler unchanged).
-                self.check_expr(&body.node, body.span, scope);
-                self.in_handler += 1;
-                let mut handled: HashSet<&str> = HashSet::new();
-                for c in &handler.clauses {
-                    let clause = &c.node;
-                    if handler.any {
-                        // `op(o)` names no operation: it is every one (the parser
-                        // admits nothing else in a `with any` handler).
-                        scope.push(HashSet::new());
-                        for p in &clause.params {
-                            scope.last_mut().unwrap().insert(p.node.name.clone());
-                        }
-                        self.check_expr(&clause.body.node, clause.body.span, scope);
-                        scope.pop();
-                        continue;
-                    }
-                    let malformed = self.check_clause_names_an_op(clause, c.span);
-                    // E0204 (5c-2): one clause per op. Op names are unique, so the
-                    // op name decides whatever the spelling. A clause already
-                    // reported (E0202 op, or E0203) is not judged again, and does
-                    // not count as the op's clause.
-                    let known = !malformed
-                        && self.op_effect.contains_key(&clause.op)
-                        && !self.dup_ops.contains(&clause.op);
-                    if known && !handled.insert(clause.op.as_str()) {
-                        self.diags.push(
-                            Diagnostic::error(
-                                "E0204",
-                                "a handler has more than one clause for an operation",
-                            )
-                            .with_label(
-                                c.span,
-                                format!(
-                                    "`{}` already has a clause in this handler; this one can never run",
-                                    clause.op
-                                ),
-                            ),
-                        );
-                    }
-                    scope.push(HashSet::new());
-                    for p in &clause.params {
-                        scope.last_mut().unwrap().insert(p.node.name.clone());
-                    }
-                    self.check_expr(&clause.body.node, clause.body.span, scope);
-                    scope.pop();
-                }
-                self.in_handler -= 1;
-                if !handler.any {
-                    self.check_handler_covers_its_effect(handler, span);
-                }
-                if let Some(ret) = &handler.ret {
-                    // The return clause runs after the computation completes;
-                    // `resume` is not in scope there.
-                    scope.push(HashSet::new());
-                    scope.last_mut().unwrap().insert(ret.binder.clone());
-                    self.check_expr(&ret.body.node, ret.body.span, scope);
-                    scope.pop();
-                }
-            }
+            Expr::Handle { body, handler } => self.check_handle(body, handler, span, scope),
             Expr::Resume { arg } => {
                 if self.in_handler == 0 {
-                    self.diags.push(
-                        Diagnostic::error("E0210", "`resume` used outside a handler")
-                            .with_label(span, "`resume` is only valid inside a handler clause"),
-                    );
+                    self.report_resume_outside(span);
                 }
                 self.check_expr(&arg.node, arg.span, scope);
             }
@@ -654,6 +532,164 @@ impl Cx<'_> {
                 scope.pop();
             }
         }
+    }
+
+    /// A name used as a value (off `check_expr`'s recursive path, as are the
+    /// helpers below: its frame holds only what every arm needs).
+    #[inline(never)]
+    fn check_var(&mut self, name: &str, span: Span, scope: &[HashSet<String>]) {
+        self.check_name(name, span, scope);
+        // E0206 (slice 5c-3): an operation may only be called. Named
+        // anywhere else -- and not shadowed by a local -- it checked
+        // clean and failed at run time ("unbound variable"). The callee
+        // of a call never reaches here (see `Expr::Call`).
+        let local = scope.iter().any(|s| s.contains(name));
+        // A name that is also a top-level fn is already E0205; renaming
+        // the fn clears both, so E0206 there would be noise.
+        if self.ops.contains(name) && !local && !self.fns.contains(name) {
+            // The wrapper passes the op's own arguments through.
+            let n = self.op_arity.get(name).copied().unwrap_or(0);
+            // a, b, … z, then a26, a27, … (from_u32 never fails here,
+            // so the old fallback produced `{`, `|`, `}` past z).
+            let ps: Vec<String> = (0..n)
+                .map(|i| match char::from_u32('a' as u32 + i as u32) {
+                    Some(c) if i < 26 => c.to_string(),
+                    _ => format!("a{i}"),
+                })
+                .collect();
+            let ps = ps.join(", ");
+            self.diags.push(
+                Diagnostic::error("E0206", format!("operation `{name}` used as a value"))
+                    .with_label(span, "an operation can only be called")
+                    .with_help(format!(
+                        "to pass it on, wrap it in a function: `fn({ps}) {{ {name}({ps}) }}`"
+                    )),
+            );
+        }
+    }
+
+    /// A builtin named not in call position.
+    #[inline(never)]
+    fn check_builtin_value(&mut self, module: &str, name: &str, span: Span) {
+        // Not in call position (a callee is checked in the `Call` arm):
+        // a builtin can only be called, like an operation (E0206). The
+        // native-strings review (2026-10-15): `let f = int.to_string`
+        // passed `check`, then failed at run time.
+        let full = format!("{module}.{name}");
+        if !builtins().contains(&full.as_str()) {
+            self.diags.push(
+                Diagnostic::error("E0201", format!("unknown builtin `{full}`"))
+                    .with_label(span, "no such function"),
+            );
+        } else {
+            // At the builtin's own arity (the 2026-10-17 review's L1:
+            // `fn(x) { int.xor(x) }` was itself an arity error).
+            let ps = ["a", "b", "c"][..builtin_arity(&full)].join(", ");
+            self.diags.push(
+                Diagnostic::error("E0208", format!("builtin `{full}` used as a value"))
+                    .with_label(span, "a builtin can only be called")
+                    .with_help(format!(
+                        "to pass it on, wrap it in a function: `fn({ps}) {{ {full}({ps}) }}`"
+                    )),
+            );
+        }
+    }
+
+    /// A called builtin only has to exist.
+    #[inline(never)]
+    fn check_called_builtin(&mut self, module: &str, name: &str, span: Span) {
+        let full = format!("{module}.{name}");
+        if !builtins().contains(&full.as_str()) {
+            self.diags.push(
+                Diagnostic::error("E0201", format!("unknown builtin `{full}`"))
+                    .with_label(span, "no such function"),
+            );
+        }
+    }
+
+    /// `handle body with handler`.
+    fn check_handle(
+        &mut self,
+        body: &Spanned<Expr>,
+        handler: &Handler,
+        span: Span,
+        scope: &mut Vec<HashSet<String>>,
+    ) {
+        // The handled computation is not itself inside a clause, so a
+        // bare `resume` here is still an error (in_handler unchanged).
+        self.check_expr(&body.node, body.span, scope);
+        self.in_handler += 1;
+        let mut handled: HashSet<&str> = HashSet::new();
+        for c in &handler.clauses {
+            let clause = &c.node;
+            if handler.any {
+                // `op(o)` names no operation: it is every one (the parser
+                // admits nothing else in a `with any` handler).
+                scope.push(HashSet::new());
+                for p in &clause.params {
+                    scope.last_mut().unwrap().insert(p.node.name.clone());
+                }
+                self.check_expr(&clause.body.node, clause.body.span, scope);
+                scope.pop();
+                continue;
+            }
+            let malformed = self.check_clause_names_an_op(clause, c.span);
+            // E0204 (5c-2): one clause per op. Op names are unique, so the
+            // op name decides whatever the spelling. A clause already
+            // reported (E0202 op, or E0203) is not judged again, and does
+            // not count as the op's clause.
+            let known = !malformed
+                && self.op_effect.contains_key(&clause.op)
+                && !self.dup_ops.contains(&clause.op);
+            if known && !handled.insert(clause.op.as_str()) {
+                self.report_duplicate_clause(&clause.op, c.span);
+            }
+            scope.push(HashSet::new());
+            for p in &clause.params {
+                scope.last_mut().unwrap().insert(p.node.name.clone());
+            }
+            self.check_expr(&clause.body.node, clause.body.span, scope);
+            scope.pop();
+        }
+        self.in_handler -= 1;
+        if !handler.any {
+            self.check_handler_covers_its_effect(handler, span);
+        }
+        if let Some(ret) = &handler.ret {
+            // The return clause runs after the computation completes;
+            // `resume` is not in scope there.
+            scope.push(HashSet::new());
+            scope.last_mut().unwrap().insert(ret.binder.clone());
+            self.check_expr(&ret.body.node, ret.body.span, scope);
+            scope.pop();
+        }
+    }
+
+    /// E0204 (5c-2): one clause per op.
+    #[inline(never)]
+    fn report_duplicate_clause(&mut self, op: &str, at: Span) {
+        self.diags.push(
+            Diagnostic::error(
+                "E0204",
+                "a handler has more than one clause for an operation",
+            )
+            .with_label(
+                at,
+                format!(
+                    "`{}` already has a clause in this handler; this one can never run",
+                    op
+                ),
+            ),
+        );
+    }
+
+    /// E0210.
+    #[inline(never)]
+    fn report_resume_outside(&mut self, span: Span) {
+        self.diags.push(
+            Diagnostic::error("E0210", "`resume` used outside a handler")
+                .with_label(span, "`resume` is only valid inside a handler clause"),
+        );
     }
 }
 
