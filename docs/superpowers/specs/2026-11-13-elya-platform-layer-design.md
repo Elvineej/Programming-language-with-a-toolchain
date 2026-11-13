@@ -52,9 +52,13 @@ working lists and texts (`==`'s worklist, `with any`'s writer and parser, a
 continuation's copy table) come from the collector's heap: `elya_gc_scratch`, a
 block `[-1][prev][next][bytes]` on a list of roots while held, its bytes never
 scanned. Allocating one never collects (the caller's values may be on no root);
-freed, a block with pages of its own returns them at once, a small one is the
-collector's. Hosted keeps `realloc` (`==` on data must not bring collections
-nearer). A board's first 1024 roots are a fixed array (`ELYA_SHADOW_ROOTS`).
+freed, it is free memory at once (section 6, B1): a run's pages go back, a slot
+goes on its page's free list and its page allocates next if it was swept since
+the last collection. Grown within its slot, it stays. Hosted keeps `realloc`
+(`==` on data must not bring collections nearer). `==` keeps its first 32
+pairs on the host stack, so most comparisons ask for none. A board's first 1024
+roots are a fixed array (`ELYA_SHADOW_ROOTS`); past it they grow in the heap, a
+held working block (section 6, R2).
 
 **D6. Float text in the runtime.** `float_fmt.c`: the shortest digits that read
 back (Ryu's method, 128-bit products from 64-bit halves), written as Rust's `{}`
@@ -69,8 +73,6 @@ same bytes.
 - A working block needs pages free when it is asked for (D5): a board whose
   region is full of garbage fails `with any` on a large value where a collection
   would have made room. Rooting the callers' values would lift it.
-- Growing a board's roots past the fixed array from a page source is written and
-  not tested (no board here has one).
 - Record and replay on a board need the board's file hooks; the defaults refuse.
 - No program has yet run on a board's own processor: the board tests run on the
   test machine's (x86-64, no C library, its own `_start`). Cross-target code
@@ -109,3 +111,53 @@ files are one translation unit here).
   not call).
 - **Found, not done here:** `compile_module` emits at `OptimizationLevel::None`
   and runs no LLVM pass at all. HANDOFF step 2 now starts there.
+
+## 6. The independent review (after 8d08c11), fixed test-first
+
+The review compared 51 programs native against the old runtime and the
+evaluator (stdout, stderr, status, merged order, plain and under stress), record
+and replay on nine traces, the working-memory allocator under a random model
+(ASan/UBSan, a 32-bit build), the freestanding build for six targets, and 3.6M
+floats: no difference there. It found:
+
+- **B1 (bug):** on a board, the runtime's freed working blocks were garbage only
+  a collection could free, and no collection runs under one: 250 `==` on
+  two-field values filled 256 KiB ("out of memory"), as did 300 `with any`
+  performs; a 40,000-cell search by `==` needed 64 MiB. Fixed (D5): a freed
+  block is free memory at once; `==`'s first 32 pairs on the host stack.
+- **R2 (risk):** a board giving no page source had 1024 roots in all (depth 600
+  failed in an empty 4 MiB region). Fixed (D5): the roots grow in the heap.
+- **N3:** `rt_atoll` did not skip leading white space as `atoll` did
+  (`ELYA_GC_STRESS=' 1'` turned stress off). Fixed.
+- **N4:** a failure's line was several writes, which another process's line on
+  a shared stderr could split. Fixed: one write when it fits 512 bytes.
+- Notes taken: `trace_line`'s length clamped to its buffer; two stale comments;
+  `elya_stack_unavailable` marked `noreturn` (a warning at `-Wall`). The order
+  of the hosted headers (after the runtime's own names) was suspected for
+  Windows and macOS; the runtime builds for Windows with MinGW's GCC and
+  Clang's `x86_64-w64-windows-gnu` here, and the Windows gate builds it with
+  MSVC's headers.
+
+Tests: `native_platform.rs` +4 (working memory on a board is not garbage: 10,000
+`==`, 2,000 on 300-cell lists equal and unequal, a 40,000-cell search in 4 MiB,
+3,000 `with any` performs, each against the hosted build; the roots grow in the
+region; what grown roots hold survives collections; settings read as the C
+library reads them); `a_board_out_of_roots_fails_by_name` now asks for more
+roots than a 64 KiB region holds (its expectation changed: the fixed array
+alone no longer runs out). `native_gc_pages.rs`: the working block is grown
+where it was regrown (a block grown within its slot stays).
+
+Controls (each reverted, compared byte for byte), each failing its tests: Q1 a
+freed slot not back on its page; Q2 an unswept page made current; Q3 the fixed
+roots not copied (survived until the grown roots were made to hold across
+collections); Q4 the roots' growth not named; Q5 a large block not given back;
+Q6 `==`'s first array not copied out (survived until lists unequal in their
+first element); Q7 a block kept in place when its slot is too small; Q8 white
+space not skipped (survived until the settings test).
+
+Gate predicted: 1516 + 4 = **1520 passed, 161 suites**; measured 1520, 161.
+
+The Windows gate, green again in the front end (12f91bd), then reached the
+collector's tests for the first time: `a_live_set_larger_than_the_region_fails_by_name`
+compared a line the test's own C harness writes in text mode (`\r\n`). The test
+now compares the line, not its ending.

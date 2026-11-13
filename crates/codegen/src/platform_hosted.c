@@ -157,7 +157,7 @@ static void elya_stack_overflowed(void) {
     exit(1);
 }
 
-static void elya_stack_unavailable(void) {
+__attribute__((noreturn)) static void elya_stack_unavailable(void) {
     fprintf(stderr, "elya: cannot reserve a stack of %lld MiB (ELYA_STACK_MIB sets a smaller one)\n",
             (long long)elya_stack_mib);
     exit(1);

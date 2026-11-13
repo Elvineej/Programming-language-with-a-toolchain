@@ -70,6 +70,9 @@ static int64_t rt_strlen(const char *s) {
 /* `[-]digits` as atoll reads it (no overflow check: settings and exponents). */
 static int64_t rt_atoll(const char *s) {
     int neg = 0;
+    while (*s == ' ' || (*s >= '\t' && *s <= '\r')) {
+        s++; /* as atoll (the review's N3: `ELYA_GC_STRESS=' 1'`) */
+    }
     if (*s == '-' || *s == '+') {
         neg = *s == '-';
         s++;
@@ -169,11 +172,22 @@ static int rt_snprintf(char *buf, size_t cap, const char *fmt, ...) {
     return n;
 }
 
+/* A line to a stream in one write when it fits 512 bytes (a failure's line
+ * is not interleaved with another process's on a shared stderr: the review's
+ * N4), else in pieces. */
 static void rt_printf(int stream, const char *fmt, ...) {
-    RtSink k = {stream, NULL, 0, 0};
-    va_list ap;
+    char line[512];
+    va_list ap, again;
     va_start(ap, fmt);
-    rt_vformat(&k, fmt, ap);
+    va_copy(again, ap);
+    int n = rt_vsnprintf(line, sizeof line, fmt, ap);
+    if ((size_t)n < sizeof line) {
+        elya_platform_write(stream, line, (size_t)n);
+    } else {
+        RtSink k = {stream, NULL, 0, 0};
+        rt_vformat(&k, fmt, again);
+    }
+    va_end(again);
     va_end(ap);
 }
 
@@ -314,17 +328,24 @@ int64_t elya_eq(void *a, void *b, int64_t string_tag, int64_t first_closure_tag)
      * evaluator's order, so the first difference or function reached is the
      * evaluator's too (a word field no longer decides before its later heap
      * siblings are walked: the review's F1). */
-    int64_t *work = NULL;
-    int64_t top = 0, cap = 0;
+    /* The first 32 triples on the host stack: most comparisons ask for no
+     * working memory at all (the review's B1, and a `realloc` per `==` hosted). */
+    int64_t first[96];
+    int64_t *work = first;
+    int64_t top = 0, cap = 96;
     int64_t equal = 1;
 #define EQ_PUSH(x, y, heap)                                                            \
     do {                                                                               \
         if (top + 3 > cap) {                                                           \
-            cap = cap ? cap * 2 : 96;                                                  \
-            int64_t *grown = (int64_t *)elya_platform_scratch(work, (size_t)cap * sizeof *work);     \
+            cap = cap * 2;                                                             \
+            int64_t *grown = (int64_t *)elya_platform_scratch(                         \
+                work == first ? NULL : work, (size_t)cap * sizeof *work);              \
             if (!grown) {                                                              \
-                rt_puts(2, "elya: out of memory comparing values\n");               \
-                elya_platform_exit(1);                                                               \
+                rt_puts(2, "elya: out of memory comparing values\n");                 \
+                elya_platform_exit(1);                                                 \
+            }                                                                          \
+            if (work == first) {                                                       \
+                memcpy(grown, first, sizeof first);                                    \
             }                                                                          \
             work = grown;                                                              \
         }                                                                              \
@@ -391,7 +412,9 @@ int64_t elya_eq(void *a, void *b, int64_t string_tag, int64_t first_closure_tag)
         }
     }
 #undef EQ_PUSH
-    elya_platform_scratch(work, 0);
+    if (work != first) {
+        elya_platform_scratch(work, 0);
+    }
     return equal;
 }
 
@@ -408,16 +431,10 @@ void *elya_int_to_string(int64_t tag, int64_t n) {
  * The shortest digit string that reads back to the same double, the closest
  * such string when several are equally short, written as a plain decimal (no
  * exponent), `.0` when integral; `inf`, `-inf`, `nan` (a NaN's sign is dropped).
- * That is the evaluator's text, Rust's `Display` plus `.0`. For each length p
- * from 1 to 17 the correctly rounded p-digit string (`%.*e`) is tried first:
- * if any p-digit string reads back, it does unless x sits next to a power of
- * two, where the gap below is half the gap above and the closest string can
- * fall outside; then the one candidate on the other side, the closest string's
- * neighbour in the last digit, is tried. */
-
-/* Float text without a C library (spec 2026-11-13-elya-platform-layer D6):
- * the shortest digits that read back (float_fmt.c) and the nearest double of
- * a text (float_parse.c). */
+ * That is the evaluator's text, Rust's `Display` plus `.0`. Without a C library
+ * (spec 2026-11-13-elya-platform-layer D6): the shortest digits that read back
+ * (float_fmt.c, Ryu's method) and the nearest double of a text (float_parse.c,
+ * Eisel-Lemire, then an exact comparison). */
 #include "float_fmt.c"
 #include "float_parse.c"
 
@@ -669,7 +686,7 @@ enum { LIT_INT, LIT_FLOAT, LIT_BOOL, LIT_UNIT, LIT_STR, LIT_CTOR };
 typedef struct {
     int kind;
     int64_t i;          /* Int, Bool; a Float's bits */
-    char *s;            /* String bytes (malloc'd); a constructor's name (into the text) */
+    char *s;            /* String bytes (working memory); a constructor's name (into the text) */
     int64_t slen;
     int64_t *kids;      /* a constructor's arguments, as indices */
     int64_t nkids;
@@ -1334,6 +1351,9 @@ static void trace_line(const char *fmt, ...) {
     va_start(ap, fmt);
     int n = rt_vsnprintf(line, sizeof line, fmt, ap);
     va_end(ap);
+    if ((size_t)n >= sizeof line) {
+        n = (int)sizeof line - 1; /* no line is near it (44 bytes at most) */
+    }
     trace_wrote(elya_platform_trace_append(line, (size_t)n));
 }
 

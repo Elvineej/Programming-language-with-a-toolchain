@@ -298,17 +298,73 @@ fn a_board_out_of_memory_fails_by_name() {
     );
 }
 
-/// More roots at once than a board's fixed array holds, with no page source
-/// to grow it from, is named, not a write past the array.
+/// A board's roots grow past the fixed array into its region (the review's R2:
+/// a board giving no page source had 1024 roots in all): a recursion 5000 deep
+/// writes what it writes hosted.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_board_grows_its_roots_in_its_region() {
+    let src = "type L { Nil, Cons(Int, L) }\n\
+               fn build(n) { if n == 0 { Nil } else { Cons(n, build(n - 1)) } }\n\
+               fn len(xs) { match xs { Nil -> 0  Cons(h, t) -> 1 + len(t) } }\n\
+               pub fn main() { len(build(5000)) }\n";
+    let [board, hosted] = board_and_hosted("roots", src, 1024 * 1024);
+    assert_eq!(hosted, (0, "5000\n".to_string(), String::new()));
+    assert_eq!(board, hosted);
+}
+
+/// Roots past the fixed array keep what they hold across collections: 5000
+/// frames each hold a cell of their own across the call below them, whose
+/// bottom makes 30,000 garbage cells (collections in 256 KiB), then each frame
+/// reads its cell.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_board_keeps_what_its_grown_roots_hold() {
+    let src = "type L { Nil, Cons(Int, L) }\n\
+               fn head(xs) { match xs { Nil -> 0  Cons(h, t) -> h } }\n\
+               fn churn(n, acc) { if n == 0 { acc } else { churn(n - 1, acc + head(Cons(n, Nil))) } }\n\
+               fn d(n, xs) { if n == 0 { churn(30000, 0) } else { d(n - 1, Cons(n, Nil)) + head(xs) } }\n\
+               pub fn main() { d(5000, Cons(0, Nil)) }\n";
+    let [board, hosted] = board_and_hosted("kept", src, 256 * 1024);
+    assert_eq!(hosted, (0, "462517499\n".to_string(), String::new()));
+    assert_eq!(board, hosted);
+}
+
+/// The runtime's settings are read as the C library read them: a leading space
+/// before a number is skipped (the review's N3: `ELYA_GC_STRESS=' 1'` turned
+/// stress mode off).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn settings_read_as_the_c_library_reads_them() {
+    let dir = temp_dir("settings");
+    let core = lower("type L { Nil, Cons(Int, L) }\npub fn main() { match Cons(1, Cons(2, Nil)) { Nil -> 0  Cons(h, t) -> h } }\n");
+    let obj = dir.join("program.o");
+    elya_codegen::compile_module(&core, &obj).expect("compile_module");
+    let exe = dir.join("hosted");
+    elya_codegen::link(&obj, &exe).expect("link");
+    for stress in [" 1", "\t1", "+1"] {
+        let out = Command::new(&exe)
+            .env("ELYA_GC_STRESS", stress)
+            .env("ELY_GC_STATS", "1")
+            .output()
+            .expect("run");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("collections=") && !err.contains("collections=0 "),
+            "ELYA_GC_STRESS={stress:?}: {err}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// More roots at once than the region holds is named, not a write past it.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn a_board_out_of_roots_fails_by_name() {
-    let src = "type List { Nil, Cons(Int, List) }\n\
-               fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }\n\
-               fn len(xs, acc) { match xs { Cons(_, t) -> len(t, acc + 1) Nil -> acc } }\n\
-               pub fn main() { len(build(50, Nil), 0) }\n";
-    let [board, hosted] = board_and_hosted_with("roots", src, 256 * 1024, "-DELYA_SHADOW_ROOTS=1");
-    assert_eq!(hosted, (0, "50\n".to_string(), String::new()));
+    let src = "fn d(n: Int, s: String) -> Int { if n == 0 { 0 } else { d(n - 1, s) + string.length(s) } }\n\
+               pub fn main() { d(30000, \"ab\") }\n";
+    let [board, hosted] = board_and_hosted("noroots", src, 64 * 1024);
+    assert_eq!(hosted, (0, "60000\n".to_string(), String::new()));
     assert_eq!(
         board,
         (
@@ -317,4 +373,69 @@ fn a_board_out_of_roots_fails_by_name() {
             "elya: out of memory growing the shadow stack\n".to_string()
         )
     );
+}
+
+/// The runtime's working memory is free again as soon as it is freed (the
+/// review's B1): `==` on data 10,000 times, a long list searched by `==`, and
+/// 3,000 operations shown and decoded by a `with any` handler, each in a region
+/// its live data barely touches. 250 `==` filled 256 KiB before.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn working_memory_on_a_board_is_not_garbage() {
+    let programs = [
+        (
+            "eq",
+            "type P { P(Int, Int) }\n\
+             fn go(n, a, b, acc) { if n == 0 { acc } else { if a == b { go(n - 1, a, b, acc + 1) } else { go(n - 1, a, b, acc) } } }\n\
+             pub fn main() { go(10000, P(1, 2), P(1, 2), 0) }\n",
+            256 * 1024,
+            "10000\n",
+        ),
+        (
+            "eq-lists",
+            "type L { Nil, Cons(Int, L) }\n\
+             fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }\n\
+             fn go(n, a, b, acc) { if n == 0 { acc } else { if a == b { go(n - 1, a, b, acc + 1) } else { go(n - 1, a, b, acc) } } }\n\
+             pub fn main() { go(2000, build(300, Nil), build(300, Nil), 0) }\n",
+            256 * 1024,
+            "2000\n",
+        ),
+        (
+            "eq-lists-differ",
+            "type L { Nil, Cons(Int, L) }\n\
+             fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(n, acc)) } }\n\
+             fn go(n, a, b, acc) { if n == 0 { acc } else { if a == b { go(n - 1, a, b, acc + 1) } else { go(n - 1, a, b, acc) } } }\n\
+             pub fn main() { go(2000, Cons(1, build(300, Nil)), Cons(2, build(300, Nil)), 0) }\n",
+            256 * 1024,
+            "0\n",
+        ),
+        (
+            "search",
+            "type P { P(Int, Int) }\n\
+             type L { Nil, Cons(P, L) }\n\
+             fn build(n, acc) { if n == 0 { acc } else { build(n - 1, Cons(P(n, n), acc)) } }\n\
+             fn count(xs, p, acc) { match xs { Nil -> acc  Cons(h, t) -> count(t, p, if h == p { acc + 1 } else { acc }) } }\n\
+             pub fn main() { count(build(40000, Nil), P(7, 7), 0) }\n",
+            4 * 1024 * 1024,
+            "1\n",
+        ),
+        (
+            "any",
+            "type S { Box(Int, Int), Dot }\n\
+             effect Q { fn mix(a: Int, c: S) -> Int }\n\
+             fn rec(body) { handle { body() } with any { op(o) -> { let v = op.decode(o, int.to_string(string.length(op.show(o))))  resume(v) } } }\n\
+             fn go(n, acc) { if n == 0 { acc } else { go(n - 1, acc + mix(n, Box(n, 1))) } }\n\
+             pub fn main() { rec(fn() { go(3000, 0) }) }\n",
+            256 * 1024,
+            "",
+        ),
+    ];
+    for (tag, src, region, want) in programs {
+        let [board, hosted] = board_and_hosted(tag, src, region);
+        assert_eq!(hosted.0, 0, "{tag}: hosted {hosted:?}");
+        if !want.is_empty() {
+            assert_eq!(hosted.1, want, "{tag}: hosted");
+        }
+        assert_eq!(board, hosted, "{tag}: the board");
+    }
 }

@@ -117,6 +117,30 @@ int main(int argc, char **argv) {
          * (one grown while held, its bytes kept), then freed; `rounds` times
          * in a region far smaller than what was asked in all. */
         int64_t bad = 0;
+        /* A block grown is as large as asked, whatever its slot's class. */
+        for (size_t n = 1; n < 3000; n += 7) {
+            void *p = elya_gc_scratch(0, n);
+            void *q = elya_gc_scratch(p, n + 40);
+            bad += ((size_t)elya_gc_words((int64_t *)q - 3) - 3) * 8 < n + 40;
+            elya_gc_scratch(q, 0);
+        }
+        /* A block freed on a page not swept since the last collection: that
+         * page is not allocated from before its sweep (the sweep would free
+         * what was), so an object made next keeps its words. */
+        for (int t = 0; t < 50; t++) {
+            void *held = elya_gc_scratch(0, 8);
+            gc_collect();
+            elya_gc_scratch(held, 0);
+            int64_t *x = (int64_t *)elya_alloc(4);
+            elya_gc_push(x);
+            x[0] = 0; x[1] = 2 * 0x5a5a5a5a + 1; x[2] = 2 * t + 1; x[3] = 1;
+            for (long i = 0; i < 4000; i++) {
+                int64_t *g = (int64_t *)elya_alloc(4);
+                g[0] = 0; g[1] = 1; g[2] = 1; g[3] = 1;
+            }
+            bad += x[1] != 2 * 0x5a5a5a5a + 1 || x[2] != 2 * t + 1;
+            elya_gc_pop();
+        }
         for (long r = 0; r < rounds; r++) {
             /* A collection is due, and a working block is allocated: it
              * does not collect (its caller's values may be on no root). */
@@ -129,9 +153,9 @@ int main(int argc, char **argv) {
             for (long i = 0; i < keep * 3; i++) b[i] = (unsigned char)(r ^ i);
             for (long i = 0; i < 3000; i++) (void)cons(i, 0);
             a = (unsigned char *)elya_gc_scratch(a, (size_t)keep * 2);
-            /* Regrown with no collection between: a large block's pages
-             * come back at once, or six of them would not fit. */
-            for (int k = 0; k < 6; k++) a = (unsigned char *)elya_gc_scratch(a, (size_t)keep * 2);
+            /* Grown six times with no collection between: a large block's
+             * pages come back at once, or the six would not fit. */
+            for (int k = 0; k < 6; k++) a = (unsigned char *)elya_gc_scratch(a, (size_t)keep * 2 + (size_t)(k + 1) * 4096);
             for (long i = 0; i < 3000; i++) (void)cons(i, 0);
             gc_collect();
             for (long i = 0; i < keep; i++) bad += a[i] != (unsigned char)(r + i);
@@ -288,7 +312,7 @@ fn working_memory_is_held_from_the_heap_and_given_back() {
     for bytes in [1 << 10, 5 << 10, 40 << 10] {
         let (code, out) = run_board_with(
             &format!("scratch-{bytes}"),
-            512 << 10,
+            768 << 10,
             bytes,
             400,
             &[],
@@ -322,7 +346,8 @@ fn a_list_with_leaves_marks_in_a_bounded_worklist() {
 fn a_live_set_larger_than_the_region_fails_by_name() {
     let (code, out) = run_board("oom", 64 << 10, 100_000, 1);
     assert_eq!(code, 3, "{out}");
-    assert_eq!(out, "elya: out of memory\n");
+    // The harness's hook writes through the C library, in text mode on Windows.
+    assert_eq!(out.replace("\r\n", "\n"), "elya: out of memory\n");
 }
 
 /// The collector builds freestanding for bare-metal targets, needing only the
