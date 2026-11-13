@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-11-13 11:00 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
+## 2026-11-13 14:10 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -15,6 +15,12 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
   after the usage limit (primary)" about 5 h ahead (trig_01WyXi2uvHFnTw3TEU4FtMAY) and
   "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
+- **Done: the front end's frames** (12f91bd; spec 2026-11-13-elya-front-end-frames).
+  The Windows gate had been red since cf3f028, unseen: fixed (a checker frame of
+  16 KiB), with a test of the stack itself. Gate 1516 / 161.
+- **Done: the platform layer's review** (6caabff): on a board, freed working
+  memory was garbage (250 `==` filled 256 KiB) and 1024 roots were all there
+  were; both fixed test-first, eight controls. Gate 1520 / 161 (predicted 1520).
 - **Done: the runtime behind a platform layer** (HANDOFF step 1, part 2; spec
   2026-11-13-elya-platform-layer; 8d08c11). Gate 1510 / 159 (predicted 1510).
   - `runtime.c` freestanding; `platform_hosted.c`; a board gives `write` and `exit`.

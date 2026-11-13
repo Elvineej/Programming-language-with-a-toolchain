@@ -30,7 +30,10 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1510 passed, 159 suites. Native programs run on
+- Linux gate at the tip of `main`: 1520 passed, 161 suites. **Look at the Windows
+  gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
+  unseen (a checker frame of 16 KiB overflowing a 2 MiB test thread; fixed in
+  12f91bd, spec 2026-11-13-elya-front-end-frames). Native programs run on
   their own 1 GiB stack (`elya_start`); the CLI compiles on a 1 GiB thread too
   (since 2026-10-24). In October the runtime
   gained `elya_cont_copy` (multi-shot), the string functions and the two time
@@ -46,6 +49,8 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   never the repository itself, picks its reasoning effort by the job's difficulty,
   and checks every result here before it lands (the spec names what was checked).
   The PC has no LLVM 18 and no QEMU: its jobs cannot build the native back end.
+  When the PC's link is down, ChatGPT on the web (the maintainer's browser, the
+  Claude extension) can read the public repository and review; it cannot write files.
   `elya_eq` takes a fourth argument (the first closure tag) since 2026-10-23.
 - Interactive sessions use the same `AUTO_RUN_LOG.md` lock: an IN PROGRESS entry
   under 3 hours old makes a scheduled run exit.
@@ -745,10 +750,11 @@ page source (OS chunks hosted, `elya_heap_init` on a board); builds freestanding
 x86-64, Cortex-M4, RISC-V 32; faster on every program measured, half the memory on
 large live sets (one recorded exception, `big_live`, spec). The runtime compiled -O2
 once per process. Gate 1504.
-**Part 2 done** (8d08c11, 2026-11-13): the whole runtime freestanding behind
+**Part 2 done** (8d08c11, its review's fixes 6caabff, 2026-11-13): the whole runtime freestanding behind
 `elya_platform_*`; Elya programs linked with a board and no C library write what
 the hosted build writes (x86-64, the test machine's processor); working memory from
-the one heap; Float text 57 times faster. Gate 1510.
+the one heap, free again as soon as freed; a board's roots grow in its region;
+Float text 57 times faster. Gate 1520.
 **Next, part 3:** code generation for a target triple (`compile_module` takes the
 host's today), and an Elya program on a Cortex-M3 and a RISC-V board under QEMU
 (ChatGPT's start-up code and linker scripts, run here with a C `entry`, are in the
