@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-11-14 02:20 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
+## 2026-11-14 02:42 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -15,6 +15,14 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
   after the usage limit (primary)" about 5 h ahead (trig_01WyXi2uvHFnTw3TEU4FtMAY) and
   "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
+- **Self-hosting is now HANDOFF step 1** (the maintainer, 2026-11-14 02:27:
+  "I want self-hosting to be the priority"); the road is spec
+  2026-11-14-elya-self-hosting. The collector is step 2, reading text (old
+  step 3) is self-hosting's part 1.
+- **Done: `elya build --target cortex-m3|riscv32`** (spec
+  2026-11-14-elya-build-target; a3bcca7). Gate 1536 / 166, configuration C 7 / 2
+  (predicted). The board's link is the library's (`link_for`); the board test
+  uses it. ChatGPT designed it (checked; two choices changed).
 - **Done: Elya on a RISC-V board** (spec 2026-11-14-elya-riscv-board; 6620efb).
   Gate 1533 / 164, and configuration C 5 / 1 (predicted).
   - LLVM 18 has no `tailcc` on RISC-V: every function one `fastcc` type of

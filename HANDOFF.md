@@ -30,9 +30,9 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1533 passed, 164 suites, and configuration C
+- Linux gate at the tip of `main`: 1536 passed, 166 suites, and configuration C
   (the boards on QEMU; `check.sh` fails without its tools unless
-  `ELYA_BOARDS=skip`) 5 passed, 1 suite. **Look at the Windows
+  `ELYA_BOARDS=skip`) 7 passed, 2 suites. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
   unseen (a checker frame of 16 KiB overflowing a 2 MiB test thread; fixed in
   12f91bd, spec 2026-11-13-elya-front-end-frames). Native programs run on
@@ -51,7 +51,11 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   a Cortex-M3 and a 32-bit RISC-V board under QEMU (`compile_module_for` with
   `Machine::cortex_m3()` or `Machine::rv32imac()`, the `boards` feature,
   `crates/codegen/boards/`; specs 2026-11-13-elya-boards,
-  2026-11-14-elya-riscv-board).
+  2026-11-14-elya-riscv-board), and since a3bcca7 `elya build --target
+  cortex-m3|riscv32` makes the ELF (`elya_codegen::link_for`; `docs/boards.md`).
+- **Self-hosting is the priority** (the maintainer, 2026-11-14: "Why are we
+  still using rust instead of our own language?", then "I want self-hosting to
+  be the priority"): step 1, the road in spec 2026-11-14-elya-self-hosting.
 - **Work is divided with ChatGPT** (the maintainer, 2026-11-13): Claude gives the
   ChatGPT (Codex) app on the PC self-contained jobs in `E:\Elya\chatgpt-jobs\<job>`,
   never the repository itself, picks its reasoning effort by the job's difficulty,
@@ -736,7 +740,34 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
 
 ## The next five steps
 
-### 1. A collector for bare metal and for large programs alike
+### 1. Elya written in Elya (self-hosting)
+
+The maintainer's priority (2026-11-14). The road is spec
+`docs/superpowers/specs/2026-11-14-elya-self-hosting-design.md` (R1-R4): Rust
+stays the bootstrap compiler; each piece is written in Elya and checked byte for
+byte against its Rust twin on every program the tests hold, then wired in when
+it is fast enough. Measured: nothing reads a file, standard input or the
+command line, writes a file or runs a program; `<>` makes building a large
+string quadratic (80,000 appends of 10 bytes: 1.44 s natively); no array or map.
+**Part 1, next: the world a compiler needs**, designed in spec
+`2026-11-14-elya-files-and-arguments-design.md`: six builtins performing `IO`
+(`io.read_file`, `io.file_exists`, `io.write_file`, `io.read_stdin`,
+`io.arg_count`, `io.arg`), failing by name (a missing file, invalid UTF-8, no
+such argument; a board has no files), recorded and replayed like `time.*`, on
+both back ends; `elya run <file> -- <args>`; `elya/files` with handlers and
+`elya/host`'s `files(body)`. Running a program (`io.run`) waits for part 5.
+This was step 3, "Reading text from outside" (whole files, not lines; a missing
+file a failure by name, asked first with `io.file_exists`, since a builtin
+cannot answer a program's own `Option` type).
+**Part 2:** a `linear` buffer and `linear` arrays, updated in place because the
+affine guarantee says no one else holds them; maps in Elya over arrays.
+**Part 3: the lexer in Elya**, `selfhost/lex.elya` (ChatGPT is writing a first
+version to Claude's brief, 2026-11-14: a dump of tokens and diagnostics in one
+agreed form, compared with `src/lex.rs`'s; E0002 left out, as Elya cannot
+parse a float yet). Then the parser, the checks, Core, and a back end writing
+LLVM IR as text for `clang`.
+
+### 2. A collector for bare metal and for large programs alike
 
 The maintainer's priority (2026-11-12: "make a gc that is able to use it in bare metal
 aswell effienctly"; "this language covers from bare metal to python so make
@@ -798,7 +829,7 @@ test reader that could stop on large output, the vector table).
   the mark bitmap (Demers et al. 1990), barriers at those three stores, and
   measuring survival by kind before building anything.
 
-### 2. Native compilation without its implementation limits
+### 3. Native compilation without its implementation limits
 
 **First, done** (fe2639d, spec 2026-11-13-elya-optimised-code): `default<O2>`
 on every program, functions over 10,000 instructions built as written. The
@@ -823,19 +854,6 @@ effect: `crates/codegen/tests/native_std_async.rs`'s
 program without the module fails the same way). For each: a
 program the evaluator runs, then lift it or say in a spec why it stays. The
 differential sweep is the measure: no refusal left that the evaluator runs.
-
-### 3. Reading text from outside
-
-Back from "Also open" (it was step 3 until the maintainer's priorities moved it,
-2026-10-30). `replay.parse` reads a trace the program already holds as a `String`. No Elya
-program can read a file or standard input (spec 2026-10-24-elya-trace-text D4).
-Measure what reading needs:
-- whole files or lines;
-- what a missing file or invalid UTF-8 is (a failure by name, or an answer);
-- how a replay answers a read (the trace holds the text it returned).
-Then decide in a spec: the builtins (`io.read_file`, `io.read_line`?) and their
-effect (`IO`, which the host records like `time.*`, or a capability of their own
-under `elya/host`); and both back ends, recording and replaying a read the same way.
 
 ### 4. Abstract types: a module's types its importers cannot open
 
