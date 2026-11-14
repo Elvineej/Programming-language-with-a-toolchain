@@ -793,6 +793,14 @@ programs and `scripts/bench.sh`) is to be run here and landed.
 
 ### 2. A collector for bare metal and for large programs alike
 
+**First here (2026-11-14, from a review the maintainer received and from the
+buffer's control K3):** a reclamation-sensitive stress mode. `ELYA_GC_STRESS`
+poisons freed slots and never reuses them, so a missing root whose slot would
+be reused goes unseen. Add a mode that gives a freed slot to the next
+allocation of its size class, run the native suites under it, and take the
+buffer's K3 (`elya_buffer_finish` without its root) as the first control.
+See docs/ROADMAP.md, "A second review".
+
 The maintainer's priority (2026-11-12: "make a gc that is able to use it in bare metal
 aswell effienctly"; "this language covers from bare metal to python so make
 everything more efficient and high quality"). Governing constraint: ONE collector for

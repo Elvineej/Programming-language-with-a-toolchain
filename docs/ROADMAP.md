@@ -119,6 +119,45 @@ that exists. A type-system feature is therefore cheapest either before the
 checker is ported (part 4) or after the switch. Borrowing goes in before;
 refinement types wait until after.
 
+## A second review: one research identity (2026-11-14)
+
+A second comment the maintainer received proposes one identity rather than six
+directions: *continuation-aware ownership and justified allocation
+optimisation for effect handlers*, with self-hosting and runtime correctness
+first, and GPU, distribution and further type-system features postponed. It
+agrees with the order above and sharpens it.
+
+**Taken as it stands.**
+
+- *Its P0, runtime correctness under reclamation.* It names a real gap, the
+  one the buffer's control K3 met the same day: `ELYA_GC_STRESS` poisons a
+  freed slot and never reuses it, so a missing root whose slot would be
+  reused is not caught. A second stress mode that hands a freed slot to the
+  very next allocation of its size class is the next collector job (HANDOFF
+  step 2), with the buffer's K3 as its first control.
+- *Its order:* P0, then self-hosting (arrays, parser, checker, each
+  cross-checked against Rust), then the rest. That is the plan.
+- *Its measurements:* allocated bytes and continuation capture/resume latency
+  beside wall time, and Koka and Effekt as the comparisons for effect-heavy
+  programs, C and Rust for the rest. Added to the benchmark suite's list.
+
+**Taken as the research line, after the switch.** Elya already refuses an
+affine value held across a multi-shot point (E0429) and copies continuation
+frames on a second resume; the line is to use the same facts to *choose*
+representations: a one-shot frame that cannot escape kept off the heap, a
+handler with a known target called directly, an affine value updated in
+place (the buffer is the first case). Its honesty about prior art stands:
+Effekt has constant-time one-shot capture and Koka has reuse, so the claim
+would be the combination with static ownership, measured, with a core
+calculus stated before anything is called proved.
+
+**Not taken yet.** A machine-checked semantics (its P2) and checked
+optimisations (P7) wait for a Core that has stopped moving, which is after
+the switch. Unforgeable capability values (P5): Elya's capabilities are
+effects granted per import, checked statically; a path-confining handler
+(`elya/files`' `under`) names a place and does not guard one, as its own
+comment says. Enforcement needs abstract types (HANDOFF step 4) first.
+
 ## Language decisions taken (2026-10-08/09)
 
 - **Partial handlers are an error** (`E0207`): a handler covers every operation of its
