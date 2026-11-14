@@ -132,9 +132,10 @@ agrees with the order above and sharpens it.
 - *Its P0, runtime correctness under reclamation.* It names a real gap, the
   one the buffer's control K3 met the same day: `ELYA_GC_STRESS` poisons a
   freed slot and never reuses it, so a missing root whose slot would be
-  reused is not caught. A second stress mode that hands a freed slot to the
-  very next allocation of its size class is the next collector job (HANDOFF
-  step 2), with the buffer's K3 as its first control.
+  reused is not caught. Looked at closely the same day: a stale read already
+  meets the poison and a stale reachable pointer already stops the mark; what
+  went unseen was a stale *write*. Freed blocks are now checked at every
+  sweep, which shows what reuse would, with certainty (HANDOFF step 2).
 - *Its order:* P0, then self-hosting (arrays, parser, checker, each
   cross-checked against Rust), then the rest. That is the plan.
 - *Its measurements:* allocated bytes and continuation capture/resume latency

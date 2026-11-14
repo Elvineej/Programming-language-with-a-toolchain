@@ -21,12 +21,13 @@ Base: `main` after the lexer in Elya lands (part 3, begun early).
      the bound of ten at 4x the appends (it was 8.3x: a copy of a few hundred
      kilobytes is fast), so the test now takes 8x the appends with a bound of
      fourteen. Linear measures 8; K2 then fails at 49.
-   - K3, `finish` not rooting the buffer: **not caught**. Under
-     `ELYA_GC_STRESS` a freed object is poisoned at the next sweep and never
-     reused, so nothing a test can arrange reads a reused slot. The rooting
-     stays, argued: in an ordinary run the string's allocation may sweep the
-     buffer's page and take its slot. A 64-byte case, where the two share a
-     size class, is in the test anyway.
+   - K3, `finish` not rooting the buffer: not caught, and it cannot be from
+     Elya code: both emitters root every operand across the call, so the
+     runtime's own root is a second one (kept for a caller in C). The first
+     note here blamed the stress mode for never reusing a freed slot; that was
+     wrong about this control, though the gap it named was real in another
+     form (a write through a stale pointer went unseen) and is closed since
+     (`gc_check_poison`, 2026-11-14).
    - K4, `Buffer` not linear: the E0428 cases check, so their test fails.
 6. Review; the gate.
 

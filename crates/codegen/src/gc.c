@@ -76,7 +76,11 @@ static int64_t gc_copy_collections = 0;
 static int gc_in_cont_copy = 0;
 /* ELYA_GC_STRESS=N (spec 2026-10-31-elya-scalability D13): a collection at
  * every Nth allocation; what it frees is poisoned and never handed out again,
- * and graying it stops the program. Set by runtime.c's elya_gc_init. */
+ * and graying it stops the program. A freed block is also checked at every
+ * later sweep: a write through a stale pointer changes the poison and stops
+ * the program too (2026-11-14: without this a stale write was silent here,
+ * and in an ordinary run corrupts whatever reuses the slot). Set by
+ * runtime.c's elya_gc_init. */
 static int64_t gc_stress = 0, gc_stress_count = 0;
 
 /* Collect when the words allocated since the last collection reach the larger
@@ -374,6 +378,15 @@ static void gc_poison(int64_t *s, uint32_t words) {
     }
 }
 
+/* Stress mode: a block a collection freed still holds its poison. */
+static void gc_check_poison(const int64_t *s, uint32_t words) {
+    for (uint32_t w = 0; w < words; w++) {
+        if (s[w] != (int64_t)0xDEADBEEFDEADBEEFULL) {
+            elya_platform_fail("elya: gc stress: a freed block was written\n");
+        }
+    }
+}
+
 /* Sweep one page of a class (D6): what the last mark did not reach is freed
  * (or, under stress, poisoned and kept), the free list rebuilt, the marks
  * cleared. Returns the slots still in use. */
@@ -405,6 +418,8 @@ static uint32_t gc_sweep_page(Page *pg) {
         if (!bit_get(pg->dead, i)) {
             *(void **)s = free;
             free = s;
+        } else {
+            gc_check_poison(s, pg->slot_words);
         }
     }
     for (uint32_t w = 0; w < GC_BITMAP_WORDS; w++) {
@@ -706,6 +721,7 @@ static void gc_sweep_large(void) {
             continue;
         }
         if (gc_stress > 0) {
+            gc_check_poison(page_slots(pg), pg->slot_words);
             link = &pg->next;
             continue;
         }
