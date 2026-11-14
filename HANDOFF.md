@@ -30,7 +30,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1564 passed, 169 suites, and configuration C
+- Linux gate at the tip of `main`: 1579 passed, 174 suites, and configuration C
   (the boards on QEMU; `check.sh` fails without its tools unless
   `ELYA_BOARDS=skip`) 8 passed, 2 suites. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
@@ -766,16 +766,25 @@ replay touches no file); `elya run <file> -- <args>`, a binary's own
 `elya/host`'s `files`; a board has no files, arguments or input. The Windows
 platform half (wide paths, `CommandLineToArgvW`) is ChatGPT's, checked by the
 Windows gate. Running a program (`io.run`) waits for part 5.
-**Part 2, next:** a `linear` buffer and `linear` arrays, updated in place because the
-affine guarantee says no one else holds them; maps in Elya over arrays. Measure
-first: the 80,000-append test, and what a compiler's tables need.
-**Part 3: the lexer in Elya**, `selfhost/lex.elya` (begun early, 2026-11-14:
-Codex writes it to Claude's brief on its branch `codex/selfhost-lex`, built and
-run in its cloud environment, with `tests/selfhost_lex.rs` comparing a dump of
-tokens and diagnostics with `src/lex.rs`'s on every `.elya` file; E0002 left
-out, as Elya cannot parse a float yet; check it, then cherry-pick its one
-commit. ChatGPT's chat wrote an earlier candidate it could not run.) Then the parser, the checks, Core, and a back end writing
-LLVM IR as text for `clang`.
+**Part 2a, done** (c4cfaa7, spec `2026-11-14-elya-buffer-design.md`): `Buffer`,
+a builtin linear type (`buffer.new`, `buffer.push`, `buffer.finish`), written
+in place because the affine guarantee says no one else holds it; 80,000
+appends 8 ms natively (1.667 s with `<>`); its name reserved (E0211).
+**Part 2b, next: arrays** (`linear` `Array(a)`, consuming updates as the
+buffer's) and maps over them. The question to settle first, by measurement
+and a spec: how an element is read without consuming the array (an answer of
+the pair, a borrow-like `array.get` for duplicable elements only, or a swap),
+and how a native array of pointers is traced (a row per array cannot say its
+length: `gc_scan` needs a kind for it). ChatGPT's survey (in its chat, "Write
+RISC V Board Files") lists the decisions.
+**Part 3, begun: the lexer in Elya**, `selfhost/lex.elya` (b004e29; Codex wrote
+it to Claude's brief, checked here): `tests/selfhost_lex.rs` compares its dump
+of tokens and diagnostics with `src/lex.rs`'s on every `.elya` file, byte for
+byte; E0002 left out, as Elya cannot parse a float yet. It writes with
+buffers. **Next in part 4: the parser in Elya**, the AST printed in one agreed
+form by both (a Codex job once the form is specified here).
+Codex's benchmark suite (`codex/bench`, pull request 27: eight checksum-checked
+programs and `scripts/bench.sh`) is to be run here and landed.
 
 ### 2. A collector for bare metal and for large programs alike
 

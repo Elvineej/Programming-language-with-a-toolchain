@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-11-14 03:53 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
+## 2026-11-14 12:15 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -15,6 +15,12 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
   after the usage limit (primary)" about 5 h ahead (trig_01WyXi2uvHFnTw3TEU4FtMAY) and
   "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
+- **Done: self-hosting part 2a, a linear Buffer** (spec 2026-11-14-elya-buffer;
+  c4cfaa7). Gate 1579 / 174, configuration C 8 / 2 (predicted). ChatGPT's
+  review found a forged-`Buffer` defect (a declared type of that name), fixed.
+- **Done: the lexer in Elya** (b004e29; Codex's, checked). Gate 1570 / 171.
+- The cloud disk filled once (two 10 GB target directories): one gate run was
+  void (a linker bus error, no test failed); keep one target directory.
 - **Done: self-hosting part 1, files, standard input and arguments** (spec
   2026-11-14-elya-files-and-arguments; b4dc3b3). Gate 1564 / 169, configuration C
   8 / 2 (predicted). Controls K1-K4. ChatGPT drafted `elya/files` (two changes)
