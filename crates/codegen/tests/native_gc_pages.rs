@@ -310,22 +310,22 @@ fn a_write_to_a_freed_block_is_caught_under_stress() {
     let stress = ["-DSTRESS=1"];
     let (code, out) = run_board_with("stale-read", 64 << 10, 0, 0, &stress, Some("P"));
     assert_eq!(
-        (code, out.as_str()),
-        (0, "poisoned=1 no stale write seen\n")
+        (code, out.trim_end()),
+        (0, "poisoned=1 no stale write seen")
     );
     for word in 0..3 {
         let (code, out) = run_board_with("stale-write", 64 << 10, 1, word, &stress, Some("P"));
         assert_eq!(
-            (code, out.as_str()),
-            (3, "elya: gc stress: a freed block was written\n"),
+            (code, out.trim_end()),
+            (3, "elya: gc stress: a freed block was written"),
             "word {word}"
         );
     }
     // Without stress the same writes pass unseen: the mode is what catches them.
     let (code, out) = run_board_with("stale-quiet", 64 << 10, 1, 1, &[], Some("P"));
     assert_eq!(
-        (code, out.as_str()),
-        (0, "poisoned=0 no stale write seen\n")
+        (code, out.trim_end()),
+        (0, "poisoned=0 no stale write seen")
     );
 }
 
