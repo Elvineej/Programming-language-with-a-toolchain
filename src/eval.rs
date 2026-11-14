@@ -259,8 +259,10 @@ pub enum World {
 /// without a process of its own.
 #[derive(Clone, Debug, Default)]
 pub struct Host {
-    /// The program's arguments (`io.arg`), not counting the program.
-    pub args: Vec<String>,
+    /// The program's arguments (`io.arg`), not counting the program, as the
+    /// operating system gave them: one that is not UTF-8 fails by name when
+    /// the program reads it, as natively.
+    pub args: Vec<std::ffi::OsString>,
     /// Standard input's bytes, when given here; `None` reads the process's own.
     pub stdin: Option<Vec<u8>>,
 }
@@ -2147,16 +2149,20 @@ fn io_builtin(
         ("io.arg_count", []) => Ok(Value::Int(
             i64::try_from(host.args.len()).unwrap_or(i64::MAX),
         )),
-        ("io.arg", [Value::Int(i)]) => usize::try_from(*i)
-            .ok()
-            .and_then(|k| host.args.get(k))
-            .map(|a| Value::Str(a.as_str().into()))
-            .ok_or_else(|| {
-                rt(
-                    span,
-                    format!("no argument {i} (the program has {})", host.args.len()),
-                )
-            }),
+        ("io.arg", [Value::Int(i)]) => {
+            let a = usize::try_from(*i)
+                .ok()
+                .and_then(|k| host.args.get(k))
+                .ok_or_else(|| {
+                    rt(
+                        span,
+                        format!("no argument {i} (the program has {})", host.args.len()),
+                    )
+                })?;
+            a.to_str()
+                .map(|a| Value::Str(a.into()))
+                .ok_or_else(|| rt(span, format!("argument {i} is not UTF-8")))
+        }
         _ => Err(rt(span, format!("{name}: wrong arguments"))),
     }
 }

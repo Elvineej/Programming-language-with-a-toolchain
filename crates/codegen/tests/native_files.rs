@@ -63,7 +63,7 @@ fn run(exe: &Path, args: &[&str], stdin: &[u8], env: &[(&str, &Path)]) -> Output
 /// what a native binary writes on stdout.
 fn evaluator(src: &str, args: &[&str], stdin: &[u8]) -> elya::RunOutcome {
     let host = Host {
-        args: args.iter().map(|a| a.to_string()).collect(),
+        args: args.iter().map(|a| a.into()).collect(),
         stdin: Some(stdin.to_vec()),
     };
     elya::run_source_outcome_host("t.elya", src, &mut |_| None, host)
@@ -167,6 +167,27 @@ fn a_native_binary_reads_its_own_arguments_and_input() {
         String::from_utf8_lossy(&out.stdout),
         "0: --x\n1: \ninput: \nagain: []\n2\n"
     );
+    // An argument that is not UTF-8 fails by name when it is read, not before,
+    // in both back ends.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::ffi::OsStr::from_bytes(b"\xff").to_os_string();
+        let out = Command::new(&exe).arg(&bad).output().expect("run");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+        assert_eq!(failure(&out), "argument 0 is not UTF-8");
+        let host = Host {
+            args: vec![bad.clone()],
+            stdin: Some(Vec::new()),
+        };
+        let e = elya::run_source_outcome_host("t.elya", ARGS, &mut |_| None, host)
+            .error
+            .expect("fails");
+        assert!(e.contains("argument 0 is not UTF-8"), "{e}");
+        let counts = build("pub fn main() { io.arg_count() }\n", &dir, "counts");
+        let out = Command::new(&counts).arg(&bad).output().expect("run");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 

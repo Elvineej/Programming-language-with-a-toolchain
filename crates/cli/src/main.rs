@@ -24,25 +24,34 @@ fn files(program: &str) -> impl FnMut(&str) -> Option<(String, String)> {
 const COMPILER_STACK: usize = 1 << 30;
 
 fn main() -> ExitCode {
-    // `std::env::args` panics on an argument that is not UTF-8: say so by name
-    // instead (a native binary fails only when the program reads it, spec
-    // 2026-11-14-elya-files-and-arguments D2).
+    // `elya run ... -- <args>`: what follows the first `--` is the program's
+    // (spec 2026-11-14-elya-files-and-arguments D4), never a flag of ours, and
+    // kept as the operating system gave it: like a native binary, the program
+    // fails by name only when it reads one that is not UTF-8 (the review's
+    // finding; `std::env::args` would panic). `elya`'s own must be UTF-8.
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let (ours, program) = match raw.iter().position(|a| a == "--") {
+        Some(i) if raw.get(1).is_some_and(|a| a == "run") => {
+            (&raw[..i], Some(raw[i + 1..].to_vec()))
+        }
+        _ => (&raw[..], None),
+    };
     let mut args: Vec<String> = Vec::new();
-    for (i, a) in std::env::args_os().enumerate() {
-        match a.into_string() {
-            Ok(a) => args.push(a),
-            Err(a) => {
+    for (i, a) in ours.iter().enumerate() {
+        match a.to_str() {
+            Some(a) => args.push(a.to_string()),
+            None => {
                 eprintln!("error: argument {i} is not UTF-8: {}", a.to_string_lossy());
                 return ExitCode::from(2);
             }
         }
     }
-    let shared = std::sync::Arc::new(args);
+    let shared = std::sync::Arc::new((args, program));
     let for_thread = std::sync::Arc::clone(&shared);
     let worker = std::thread::Builder::new()
         .name("elya".to_string())
         .stack_size(COMPILER_STACK)
-        .spawn(move || dispatch(&for_thread));
+        .spawn(move || dispatch(&for_thread.0, for_thread.1.clone()));
     match worker {
         Ok(handle) => match handle.join() {
             Ok(code) => code,
@@ -52,19 +61,12 @@ fn main() -> ExitCode {
         },
         // No room for the stack (a limit on address space): compile on the main
         // thread, as before D5, rather than refuse (the review's F3).
-        Err(_) => dispatch(&shared),
+        Err(_) => dispatch(&shared.0, shared.1.clone()),
     }
 }
 
-fn dispatch(args: &[String]) -> ExitCode {
-    // `elya run ... -- <args>`: what follows the first `--` is the program's
-    // (spec 2026-11-14-elya-files-and-arguments D4), never a flag of ours.
-    let (args, program) = match args.iter().position(|a| a == "--") {
-        Some(i) if args.get(1).map(String::as_str) == Some("run") => {
-            (&args[..i], Some(args[i + 1..].to_vec()))
-        }
-        _ => (args, None),
-    };
+/// `args` are `elya`'s own; `program`, what followed `--` after `run`.
+fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCode {
     let host = elya::eval::Host {
         args: program.clone().unwrap_or_default(),
         stdin: None,

@@ -63,10 +63,11 @@ answers is not done here).
 
 **D4. Arguments.** `elya run <file.elya> [-- <args>...]` gives the program what
 follows `--`; a native binary gives it its own arguments (the generated `main`
-takes `argc` and `argv`). A board has none: `io.arg_count()` is 0. `elya`
-itself refuses an argument that is not UTF-8 before anything runs (`error:
-argument <i> is not UTF-8`, exit 2), where Rust's `std::env::args` would
-panic; a native binary fails only when the program reads that argument.
+takes `argc` and `argv`). A board has none: `io.arg_count()` is 0. An
+argument that is not UTF-8 fails by name when the program reads it (`elya:
+argument <i> is not UTF-8`), on both back ends: `elya` keeps what follows `--`
+as the operating system gave it (Rust's `std::env::args` would have panicked
+before the program ran; the review's finding); its own arguments must be UTF-8.
 
 **D5. The platform layer gains six hooks, each with a weak default, so a
 board has no files and no input.** A program's paths are UTF-8, apart from

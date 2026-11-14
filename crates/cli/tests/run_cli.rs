@@ -378,18 +378,27 @@ fn elya_run_gives_the_program_what_follows_the_double_dash() {
     let bare = elya_run(&[prog.as_os_str(), "a".as_ref()]);
     assert_eq!(bare.status.code(), Some(2), "{bare:?}");
     assert!(String::from_utf8_lossy(&bare.stderr).contains("-- <args>"));
-    // An argument that is not UTF-8 is refused by name, not a panic (the
-    // review's finding; Unix lets one through).
+    // An argument that is not UTF-8 fails by name when the program reads it,
+    // as natively, and not before (the review's finding: it was a panic).
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        let bad = elya_run(&[
-            prog.as_os_str(),
-            "--".as_ref(),
-            std::ffi::OsStr::from_bytes(b"\xff"),
-        ]);
-        assert_eq!(bad.status.code(), Some(2), "{bad:?}");
-        assert!(String::from_utf8_lossy(&bad.stderr).contains("is not UTF-8"));
+        let bad = std::ffi::OsStr::from_bytes(b"\xff");
+        let reads = elya_run(&[prog.as_os_str(), "--".as_ref(), bad]);
+        assert_eq!(reads.status.code(), Some(1), "{reads:?}");
+        assert_eq!(String::from_utf8_lossy(&reads.stdout), "1\n");
+        assert!(String::from_utf8_lossy(&reads.stderr).contains("argument 0 is not UTF-8"));
+        let counts = dir.join("count.elya");
+        std::fs::write(
+            &counts,
+            "pub fn main() { io.println(int.to_string(io.arg_count())) }\n",
+        )
+        .expect("write program");
+        let fine = elya_run(&[counts.as_os_str(), "--".as_ref(), bad]);
+        assert!(fine.status.success(), "{fine:?}");
+        assert_eq!(String::from_utf8_lossy(&fine.stdout), "1\n");
+        let ours = elya_run(&[bad]);
+        assert_eq!(ours.status.code(), Some(2), "{ours:?}");
     }
     // `--value` takes them too.
     let value = elya_run(&[

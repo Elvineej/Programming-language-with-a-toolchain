@@ -24,7 +24,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 
 fn host(args: &[&str], stdin: &[u8]) -> Host {
     Host {
-        args: args.iter().map(|a| a.to_string()).collect(),
+        args: args.iter().map(|a| a.into()).collect(),
         stdin: Some(stdin.to_vec()),
     }
 }
