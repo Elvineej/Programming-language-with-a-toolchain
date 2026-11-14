@@ -152,7 +152,13 @@ fn ok(out: &str) -> Run {
 /// what the host writes, and stops with its status.
 #[test]
 fn programs_on_the_boards_write_what_they_write_hosted() {
-    let programs: [(&str, &str, Run); 11] = [
+    let buffer = format!("{}130\n", buffer_programs::builds_out());
+    let programs: [(&str, &str, Run); 12] = [
+        (
+            "buffer",
+            buffer_programs::BUILDS,
+            ok(&buffer),
+        ),
         (
             "sum",
             "fn remainder(x: Int, d: Int) -> Int { x - (x / d) * d }\n\
@@ -331,6 +337,10 @@ fn a_stack_overflow_on_the_boards_is_named() {
 /// The examples: async, structured concurrency, multi-shot search, replay,
 /// `with any` recording, failure as an effect, a CEK machine. Each writes on
 /// each board what it writes hosted.
+#[path = "../../../tests/programs/buffer.rs"]
+#[allow(dead_code)]
+mod buffer_programs;
+
 #[path = "../../../tests/programs/files_and_arguments.rs"]
 #[allow(dead_code)]
 mod programs;

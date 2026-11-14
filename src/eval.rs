@@ -15,6 +15,11 @@ pub enum Value {
     /// the length (the 2026-10-30 review's F2: `byte_at` in a loop copied the
     /// whole string at every read, so `replay.parse` was quadratic).
     Str(Rc<str>),
+    /// A linear text buffer (spec 2026-11-14-elya-buffer D3): `push` appends
+    /// through the `RefCell` whatever the count. The machine's own copies of
+    /// the `Rc` (an environment keeps a binding after its last use) are not
+    /// aliases a program can use: the affine guarantee forbids a second use.
+    Buffer(Rc<std::cell::RefCell<String>>),
     Bool(bool),
     Unit,
     /// A top-level function, referenced by name (Slice 2 has no lambdas).
@@ -537,6 +542,28 @@ pub(crate) fn float_conversion(
     }
 }
 
+/// `buffer.new`, `buffer.push`, `buffer.finish` (spec 2026-11-14-elya-buffer
+/// D2, D3): in place, amortised by `String`'s own growth.
+pub(crate) fn buffer_builtin(
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, RuntimeError> {
+    match (name, args) {
+        ("new", []) => Ok(Value::Buffer(Rc::new(std::cell::RefCell::new(
+            String::new(),
+        )))),
+        ("push", [Value::Buffer(b), Value::Str(s)]) => {
+            b.borrow_mut().push_str(s);
+            Ok(Value::Buffer(Rc::clone(b)))
+        }
+        ("finish", [Value::Buffer(b)]) => {
+            Ok(Value::Str(std::mem::take(&mut *b.borrow_mut()).into()))
+        }
+        _ => Err(rt(span, format!("buffer.{name}: a wrong argument"))),
+    }
+}
+
 /// `string.length`, `string.byte_at`, `string.slice` (spec
 /// 2026-10-24-elya-trace-text D1): a string by byte. Each failure is named; a
 /// slice may not split a UTF-8 character, so a `String` stays UTF-8.
@@ -778,6 +805,15 @@ pub mod tree {
                         }
                         return super::float_conversion(name, &vals, span);
                     }
+                    if module == "buffer"
+                        && crate::resolve::BUFFER_BUILTINS.contains(&name.as_str())
+                    {
+                        let mut vals = Vec::new();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        return super::buffer_builtin(name, &vals, span);
+                    }
                     if module == "string"
                         && crate::resolve::STRING_BUILTINS.contains(&name.as_str())
                     {
@@ -929,14 +965,15 @@ pub mod cek {
 
     #[derive(Clone, Debug)]
     enum CalleeSlot {
-        Pending,                                  // still evaluating the callee expression
-        Builtin(&'static str),                    // e.g. "io.println"
-        IntBinary(&'static str),                  // `int.<name>` of two Ints
-        FloatConversion(&'static str),            // `float.<name>` conversions
-        StringBuiltin(&'static str),              // `string.<name>` by byte
-        Value(Value),                             // an evaluated callee (a Value::Fn)
+        Pending,                       // still evaluating the callee expression
+        Builtin(&'static str),         // e.g. "io.println"
+        IntBinary(&'static str),       // `int.<name>` of two Ints
+        FloatConversion(&'static str), // `float.<name>` conversions
+        StringBuiltin(&'static str),
+        BufferBuiltin(&'static str), // `buffer.<name>` (spec 2026-11-14-elya-buffer)              // `string.<name>` by byte
+        Value(Value),                // an evaluated callee (a Value::Fn)
         Operation { effect: String, op: String }, // a perform of an effect op
-        Ctor { name: String },                    // a data-constructor application
+        Ctor { name: String },       // a data-constructor application
     }
 
     // Frames own their AST via cheap `Rc` clones (the 3a `Box`->`Rc` groundwork),
@@ -1390,6 +1427,19 @@ pub mod cek {
                             }
                         }
                     }
+                    Expr::Qualified { module, name } if module == "buffer" => {
+                        match crate::resolve::BUFFER_BUILTINS
+                            .iter()
+                            .position(|b| b == name)
+                        {
+                            Some(i) => {
+                                CalleeSlot::BufferBuiltin(crate::resolve::BUFFER_BUILTINS[i])
+                            }
+                            None => {
+                                return Err(rt(span, format!("unknown builtin `buffer.{name}`")))
+                            }
+                        }
+                    }
                     Expr::Qualified { module, name } if module == "string" => {
                         match crate::resolve::STRING_BUILTINS
                             .iter()
@@ -1472,6 +1522,15 @@ pub mod cek {
                     CalleeSlot::Builtin(b) if args.is_empty() => {
                         apply_callee(interp, fns, CalleeSlot::Builtin(b), Vec::new(), span, k)?
                     }
+                    // `buffer.new()` too.
+                    CalleeSlot::BufferBuiltin(b) if args.is_empty() => apply_callee(
+                        interp,
+                        fns,
+                        CalleeSlot::BufferBuiltin(b),
+                        Vec::new(),
+                        span,
+                        k,
+                    )?,
                     // Builtin or operation with args: evaluate the args, then apply.
                     other => {
                         if args.is_empty() {
@@ -1888,6 +1947,9 @@ pub mod cek {
             )),
             CalleeSlot::StringBuiltin(name) => {
                 Ok(State::Return(super::string_builtin(name, &args, span)?, k))
+            }
+            CalleeSlot::BufferBuiltin(name) => {
+                Ok(State::Return(super::buffer_builtin(name, &args, span)?, k))
             }
             CalleeSlot::Builtin("int.to_string") => {
                 let [Value::Int(n)] = &args[..] else {
