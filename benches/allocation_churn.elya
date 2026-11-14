@@ -1,0 +1,41 @@
+// Lists and full binary trees die after every round; neither is shared.
+// checksum: 961529344
+// Each round: list = 32896 + 256*s, tree = 3072 + 256*s; s = round % 17.
+type Cells { NoCells, Cell(Int, Cells) }
+type Tree { Leaf(Int), Branch(Tree, Tree) }
+
+fn cells(n: Int, seed: Int, acc: Cells) -> Cells {
+  if n == 0 { acc } else { cells(n - 1, seed, Cell(n + seed, acc)) }
+}
+
+fn cell_sum(xs: Cells, acc: Int) -> Int {
+  match xs {
+    NoCells -> acc
+    Cell(x, rest) -> cell_sum(rest, acc + x)
+  }
+}
+
+fn tree(depth: Int, seed: Int) -> Tree {
+  if depth == 0 { Leaf(seed) } else {
+    Branch(tree(depth - 1, seed + 1), tree(depth - 1, seed + 2))
+  }
+}
+
+fn tree_sum(t: Tree) -> Int {
+  match t {
+    Leaf(x) -> x
+    Branch(left, right) -> tree_sum(left) + tree_sum(right)
+  }
+}
+
+fn churn(round: Int, acc: Int) -> Int {
+  if round == 0 { acc } else {
+    let seed = round % 17
+    let xs = cells(256, seed, NoCells)
+    let t = tree(8, seed)
+    let answer = cell_sum(xs, 0) + tree_sum(t)
+    churn(round - 1, acc + answer)
+  }
+}
+
+pub fn main() -> Unit { io.println(int.to_string(churn(24000, 0))) }

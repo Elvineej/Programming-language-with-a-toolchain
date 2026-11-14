@@ -1,0 +1,43 @@
+// Each round allocates captured closures, maps by an indirect call,
+// composes two captured functions, and folds the resulting list through a HOF.
+// checksum: 2283500800
+// For x=1..128 and s=round%19: (3*(x+s)+7)*2-s = 6*x+5*s+14.
+type Cells { NoCells, Cell(Int, Cells) }
+
+fn range(n: Int, acc: Cells) -> Cells {
+  if n == 0 { acc } else { range(n - 1, Cell(n, acc)) }
+}
+
+fn map(xs: Cells, f: fn(Int) -> Int, acc: Cells) -> Cells {
+  match xs {
+    NoCells -> acc
+    Cell(x, rest) -> map(rest, f, Cell(f(x), acc))
+  }
+}
+
+fn fold(xs: Cells, f: fn(Int, Int) -> Int, acc: Int) -> Int {
+  match xs {
+    NoCells -> acc
+    Cell(x, rest) -> fold(rest, f, f(acc, x))
+  }
+}
+
+fn compose(f: fn(Int) -> Int, g: fn(Int) -> Int) -> fn(Int) -> Int {
+  fn(x) { g(f(x)) }
+}
+
+fn rounds(n: Int, xs: Cells, acc: Int) -> Int {
+  if n == 0 { acc } else {
+    let seed = n % 19
+    let a = fn(x) { 3 * (x + seed) + 7 }
+    let b = fn(x) { 2 * x - seed }
+    let f = compose(a, b)
+    let ys = map(xs, f, NoCells)
+    let answer = fold(ys, fn(total, x) { total + x }, 0)
+    rounds(n - 1, xs, acc + answer)
+  }
+}
+
+pub fn main() -> Unit {
+  io.println(int.to_string(rounds(40000, range(128, NoCells), 0)))
+}
