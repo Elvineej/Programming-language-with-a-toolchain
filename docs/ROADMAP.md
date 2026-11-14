@@ -66,6 +66,59 @@ already explicit in native code: every perform is a dispatch).
 Provenance and "why did this happen" (counterfactual) debugging through effects; effects
 on bare metal; linear ownership as an alternative to GC; content-addressed compilation.
 
+## A reviewer's six directions, weighed (2026-11-14)
+
+The maintainer received a comment proposing six directions and asked that it be
+taken into account. Each is set against what Elya has and what it would cost;
+the order below is the order of adoption, not the comment's.
+
+**Adopted now, inside the work in hand.**
+
+- *Ownership in a function's contract* (its direction 1: arguments borrowed,
+  consumed or reusable). Elya has consumed (`linear`, E0428/E0429/E0437) and
+  reusable; it has no *borrowed*. Self-hosting part 2b needs exactly that: an
+  array read must not consume the array. So borrowing is designed there, as a
+  parameter mode the affine checker understands, rather than as a special case
+  of `array.get`. The closures restriction the comment names (a closure
+  capturing an affine value is called by name only) is the next step after it:
+  a closure type that says it runs at most once.
+- *Differential tests, generated* (its foundation step). The house's oldest
+  check is that native code writes what the evaluator writes, on hand-written
+  programs. A generator of well-typed programs run through both back ends is a
+  Codex job (it has the cloud environment to run it).
+- *Published measurements* (its step 4). Codex's benchmark suite
+  (`scripts/bench.sh`, eight checksum-checked programs, both back ends) is the
+  start; compile time and binary size are added to it.
+
+**Next, after the self-hosted front end (parts 4-6).**
+
+- *The native type-polymorphism gap* (README: code polymorphic in a type
+  variable is refused natively). HANDOFF step 3 already; a self-hosted compiler
+  will need generic containers, so it is pulled forward if part 4 meets it.
+- *Reproducible concurrency* (its direction 4). Record and replay exist for the
+  host's answers on both back ends, and Elya's tasks are effects handled by a
+  scheduler written in Elya, so a schedule is already a value: recording the
+  scheduler's choices, exploring others within a bound and shrinking a failing
+  one build on what is there. This is the direction closest to an existing
+  strength (roadmap problem 3) and the first of the six to get a spec.
+- *An optimizer that explains itself* (its direction 3). The one-shot
+  continuation reuse and handler removal it lists are measurable against the
+  benchmarks; "why was this allocated" reports before checked evidence.
+
+**Later, and only behind explicit contracts.**
+
+- *Refinement types* (direction 2): a decidable core stays; bounds and units
+  as opt-in contracts, a solver timeout never a pass. Not before the switch.
+- *Tensors, devices, differentiation* (direction 5) and *checked assistance*
+  (direction 6): after arrays, borrowing and the polymorphism gap, which they
+  all stand on.
+
+**What decides the order.** Until the switch (self-hosting R4), every change
+to the language lands twice, in the Rust compiler and in its Elya twin once
+that exists. A type-system feature is therefore cheapest either before the
+checker is ported (part 4) or after the switch. Borrowing goes in before;
+refinement types wait until after.
+
 ## Language decisions taken (2026-10-08/09)
 
 - **Partial handlers are an error** (`E0207`): a handler covers every operation of its

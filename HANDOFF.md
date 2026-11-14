@@ -772,9 +772,12 @@ in place because the affine guarantee says no one else holds it; 80,000
 appends 8 ms natively (1.667 s with `<>`); its name reserved (E0211).
 **Part 2b, next: arrays** (`linear` `Array(a)`, consuming updates as the
 buffer's) and maps over them. The question to settle first, by measurement
-and a spec: how an element is read without consuming the array (an answer of
-the pair, a borrow-like `array.get` for duplicable elements only, or a swap),
-and how a native array of pointers is traced (a row per array cannot say its
+and a spec: how an element is read without consuming the array. The
+direction taken (docs/ROADMAP.md, "A reviewer's six directions", 2026-11-14):
+a *borrowed* parameter mode the affine checker understands, not a special
+case of `array.get`, and before part 4 ports the checker (R4: after that
+every type-system change lands twice). Also to decide:
+how a native array of pointers is traced (a row per array cannot say its
 length: `gc_scan` needs a kind for it). ChatGPT's survey (in its chat, "Write
 RISC V Board Files") lists the decisions.
 **Part 3, begun: the lexer in Elya**, `selfhost/lex.elya` (b004e29; Codex wrote
@@ -783,6 +786,8 @@ of tokens and diagnostics with `src/lex.rs`'s on every `.elya` file, byte for
 byte; E0002 left out, as Elya cannot parse a float yet. It writes with
 buffers. **Next in part 4: the parser in Elya**, the AST printed in one agreed
 form by both (a Codex job once the form is specified here).
+Codex jobs waiting: a generator of well-typed programs run through both back
+ends (differential testing; the roadmap section above), after the benchmarks.
 Codex's benchmark suite (`codex/bench`, pull request 27: eight checksum-checked
 programs and `scripts/bench.sh`) is to be run here and landed.
 
