@@ -1,0 +1,60 @@
+// Keep a 65,535-node tree alive while lists and small trees become garbage.
+// Revisit the retained tree during churn and checksum every leaf afterward.
+// checksum: 4288928266
+// Retained leaves are 32768..65535. Garbage round s contributes
+// (8256 + 128*s) + (576 + 64*s), plus one retained leaf.
+type Cells { NoCells, Cell(Int, Cells) }
+type Tree { Leaf(Int), Branch(Tree, Tree) }
+
+fn retained(depth: Int, seed: Int) -> Tree {
+  if depth == 0 { Leaf(seed) } else {
+    Branch(retained(depth - 1, seed * 2), retained(depth - 1, seed * 2 + 1))
+  }
+}
+
+fn garbage(depth: Int, seed: Int) -> Tree {
+  if depth == 0 { Leaf(seed) } else {
+    Branch(garbage(depth - 1, seed + 1), garbage(depth - 1, seed + 2))
+  }
+}
+
+fn cells(n: Int, seed: Int, acc: Cells) -> Cells {
+  if n == 0 { acc } else { cells(n - 1, seed, Cell(n + seed, acc)) }
+}
+
+fn cell_sum(xs: Cells, acc: Int) -> Int {
+  match xs {
+    NoCells -> acc
+    Cell(x, rest) -> cell_sum(rest, acc + x)
+  }
+}
+
+fn tree_sum(t: Tree) -> Int {
+  match t {
+    Leaf(x) -> x
+    Branch(left, right) -> tree_sum(left) + tree_sum(right)
+  }
+}
+
+fn leaf_at(t: Tree, bits: Int) -> Int {
+  match t {
+    Leaf(x) -> x
+    Branch(left, right) ->
+      if bits % 2 == 0 { leaf_at(left, bits / 2) } else { leaf_at(right, bits / 2) }
+  }
+}
+
+fn churn(round: Int, live: Tree, acc: Int) -> Int {
+  if round == 0 { acc + tree_sum(live) } else {
+    let seed = round % 17
+    let xs = cells(128, seed, NoCells)
+    let t = garbage(6, seed)
+    let answer = cell_sum(xs, 0) + tree_sum(t) + leaf_at(live, round)
+    churn(round - 1, live, acc + answer)
+  }
+}
+
+pub fn main() -> Unit {
+  let live = retained(15, 1)
+  io.println(int.to_string(churn(45000, live, 0)))
+}

@@ -1,0 +1,24 @@
+// The deliberately quadratic immutable <> baseline for a future Buffer.
+// Build only 4 KiB at a time; scan every byte with a position-weighted sum.
+// checksum: 818089984000
+// Each string is "ab" repeated 2048 times: weighted sum = 818089984.
+fn append(n: Int, acc: String) -> String {
+  if n == 0 { acc } else {
+    append(n - 1, acc <> (if n % 2 == 0 { "a" } else { "b" }))
+  }
+}
+
+fn checksum(s: String, i: Int, acc: Int) -> Int {
+  if i == string.length(s) { acc } else {
+    checksum(s, i + 1, acc + (i + 1) * string.byte_at(s, i))
+  }
+}
+
+fn rounds(n: Int, acc: Int) -> Int {
+  if n == 0 { acc } else {
+    let s = append(4096, "")
+    rounds(n - 1, acc + checksum(s, 0, 0))
+  }
+}
+
+pub fn main() -> Unit { io.println(int.to_string(rounds(1000, 0))) }

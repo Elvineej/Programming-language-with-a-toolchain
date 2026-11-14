@@ -81,6 +81,8 @@ against what the evaluator computes — both the value `main` returns and the
 exact text `io.println` wrote, compared byte for byte — so the two never drift
 apart silently.
 
+Run `sh scripts/bench.sh` for the checksum-checked native/evaluator benchmark suite (five runs per program), or `sh scripts/bench.sh --runs 3` to change the sample count. It builds the release compiler with `codegen`, prints a Markdown table, and saves timings under `benches/results/`; `sh scripts/bench.sh --compare <old.json>` measures a new run and reports ratios, marking slowdowns above 10%. Evaluator samples exceeding 30 seconds are explicitly skipped. See [benches/README.md](benches/README.md) for workloads, timing methods and result details.
+
 ## Local CI
 
 ```sh

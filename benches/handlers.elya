@@ -1,0 +1,41 @@
+// Handler dispatch/resume plus the scheduler from src/std/async.elya.
+// checksum: 146198893
+import elya/async
+
+effect Tick { fn tick(n: Int) -> Int }
+
+fn ticks(n: Int, total: Int) -> Int {
+  if n == 0 { total } else {
+    let v = tick(n % 97)
+    ticks(n - 1, total + v)
+  }
+}
+
+fn worker(n: Int, seed: Int, total: Int) -> Int {
+  if n == 0 { total } else {
+    let _ = async_yield()
+    worker(n - 1, seed, total + n + seed)
+  }
+}
+
+fn scopes(n: Int, total: Int) -> Int {
+  if n == 0 { total } else {
+    let ended = async.scope(fn() {
+      let a = async_spawn(fn() { worker(200, 7, 0) })
+      let b = async_spawn(fn() { worker(200, 13, 0) })
+      async_await(a) + async_await(b)
+    })
+    match ended {
+      AsyncFinished(v) -> scopes(n - 1, total + v)
+      AsyncDeadlocked(ids) -> 0 - 1
+    }
+  }
+}
+
+pub fn main() -> Unit {
+  let dispatched = handle { ticks(2000000, 0) } with {
+    Tick.tick(n) -> resume(n + 3)
+    return(v) -> v
+  }
+  io.println(int.to_string(dispatched + scopes(1000, 0)))
+}
