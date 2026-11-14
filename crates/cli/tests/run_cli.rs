@@ -359,7 +359,7 @@ fn elya_run_with_input(args: &[&std::ffi::OsStr], input: &[u8]) -> std::process:
 
 #[test]
 fn elya_run_gives_the_program_what_follows_the_double_dash() {
-    let dir = scratch("args");
+    let dir = scratch("double-dash");
     let prog = dir.join("echo.elya");
     std::fs::write(&prog, ECHO).expect("write program");
     let out = elya_run(&[
@@ -425,7 +425,7 @@ fn standard_input_reaches_elya_run() {
 
 #[test]
 fn a_recording_keeps_the_arguments_and_a_replay_takes_none() {
-    let dir = scratch("args-trace");
+    let dir = scratch("dash-trace");
     let prog = dir.join("echo.elya");
     std::fs::write(&prog, ECHO).expect("write program");
     let trace = dir.join("t.trace");
