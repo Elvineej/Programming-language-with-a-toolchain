@@ -122,6 +122,7 @@ fn write(info: &TypeInfo, v: &Value, out: &mut String) -> Result<(), &'static st
                 }
             }
             Value::Fn(_) | Value::Closure { .. } => return Err("a function"),
+            Value::Buffer(_) => return Err("a buffer"),
             Value::Resume(_) => return Err("a continuation"),
             Value::Op { .. } => return Err("an operation"),
         }

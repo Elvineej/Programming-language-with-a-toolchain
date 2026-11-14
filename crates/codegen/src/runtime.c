@@ -245,6 +245,58 @@ void *elya_str_lit(int64_t tag, const char *bytes, int64_t len) {
     return p;
 }
 
+/* A linear text buffer (spec 2026-11-14-elya-buffer D3): one object,
+ * `[tag][length][capacity][bytes]`, holding no pointers. It carries the string
+ * tag, whose descriptor row traces nothing, so the collector needs no row of
+ * its own; nothing reads a buffer as a string (`Buffer` is its own type, and
+ * neither `any` nor `==` takes it). The affine guarantee means the program
+ * holds the only reference: `push` writes in place when the text fits and
+ * answers the same object, else a new one of twice the capacity (the old one
+ * is garbage). Amortised O(|s|) a push, O(length) the finish. */
+#define ELYA_BUFFER_FIRST 64
+
+static int64_t *buffer_alloc(int64_t tag, int64_t cap) {
+    int64_t *p = (int64_t *)elya_alloc(3 + (cap + 7) / 8);
+    p[0] = tag;
+    p[1] = 0;
+    p[2] = cap;
+    return p;
+}
+
+void *elya_buffer_new(int64_t tag) { return buffer_alloc(tag, ELYA_BUFFER_FIRST); }
+
+void *elya_buffer_push(int64_t tag, void *buffer, void *text) {
+    int64_t *b = (int64_t *)buffer;
+    const int64_t *t = (const int64_t *)text;
+    int64_t len = b[1], n = t[1];
+    if (n <= b[2] - len) {
+        memcpy((char *)&b[3] + len, &t[2], (size_t)n);
+        b[1] = len + n;
+        return b;
+    }
+    int64_t cap = b[2] > INT64_MAX / 2 ? INT64_MAX : 2 * b[2];
+    if (cap - len < n) {
+        cap = len + n;
+    }
+    elya_gc_push(buffer);
+    elya_gc_push(text);
+    int64_t *grown = buffer_alloc(tag, cap);
+    elya_gc_pop();
+    elya_gc_pop();
+    memcpy(&grown[3], &b[3], (size_t)len);
+    memcpy((char *)&grown[3] + len, &t[2], (size_t)n);
+    grown[1] = len + n;
+    return grown;
+}
+
+void *elya_buffer_finish(int64_t string_tag, void *buffer) {
+    int64_t *b = (int64_t *)buffer;
+    elya_gc_push(buffer);
+    void *s = elya_str_lit(string_tag, (const char *)&b[3], b[1]);
+    elya_gc_pop();
+    return s;
+}
+
 /* Native strings (spec 2026-10-15-elya-native-strings, D2/D4). `a <> b` is a
  * fresh immutable string. Both operands are rooted while it allocates: callers
  * root them too (an operand is a temporary the emitter pushed), so this is
@@ -496,7 +548,7 @@ void *elya_float_to_string(int64_t tag, int64_t bits) {
  * value of exists. Every walk keeps its own stack: a million-cell list neither
  * recurses nor overflows. Failures carry the evaluator's words. */
 
-enum { ANY_INT, ANY_BOOL, ANY_UNIT, ANY_STRING, ANY_FN, ANY_ADT, ANY_UNBUILT, ANY_FLOAT };
+enum { ANY_INT, ANY_BOOL, ANY_UNIT, ANY_STRING, ANY_FN, ANY_ADT, ANY_UNBUILT, ANY_FLOAT, ANY_BUFFER };
 
 static void any_oom(void) {
     rt_puts(2, "elya: out of memory\n");
@@ -621,6 +673,10 @@ void *elya_any_show(int64_t string_tag, const int64_t *t, const char *names, int
             elya_platform_flush();
             rt_printf(2, "elya: %sa function%s\n", before, after);
             elya_platform_exit(1);
+        case ANY_BUFFER:
+            elya_platform_flush();
+            rt_printf(2, "elya: %sa buffer%s\n", before, after);
+            elya_platform_exit(1);
         case ANY_ADT: {
             int64_t *p = (int64_t *)(intptr_t)it.value;
             int64_t c = any_ctor(t, it.node, p[0]);
@@ -667,6 +723,7 @@ int64_t elya_any_check(const int64_t *t, int64_t node, int64_t value) {
         Item it = stack[--top];
         switch (t[it.node]) {
         case ANY_FN:
+        case ANY_BUFFER:
             rt_puts(2, "elya: `==` reached a value that is not data (E0436 should have rejected it)\n");
             elya_platform_exit(1);
         case ANY_ADT: {
@@ -1015,7 +1072,8 @@ static int any_conforms(AnyParser *p, const int64_t *t, const char *names, int64
         case ANY_BOOL: ok = l->kind == LIT_BOOL; break;
         case ANY_UNIT: ok = l->kind == LIT_UNIT; break;
         case ANY_STRING: ok = l->kind == LIT_STR; break;
-        case ANY_FN: ok = 0; break;
+        case ANY_FN:
+        case ANY_BUFFER: ok = 0; break;
         case ANY_ADT: {
             ok = 0;
             if (l->kind != LIT_CTOR) {

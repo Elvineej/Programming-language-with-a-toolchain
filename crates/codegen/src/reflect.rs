@@ -32,6 +32,8 @@ pub(crate) const KIND_ADT: i64 = 5;
 pub(crate) const KIND_UNBUILT: i64 = 6;
 /// A float: its bits (spec 2026-10-23-elya-float-natively D3, D4).
 pub(crate) const KIND_FLOAT: i64 = 7;
+/// A `Buffer` (spec 2026-11-14-elya-buffer D1): not data, stops by name.
+pub(crate) const KIND_BUFFER: i64 = 8;
 
 #[derive(Default)]
 pub(crate) struct Reflect {
@@ -88,6 +90,7 @@ impl Reflect {
             Ty::Base(TyCon::Unit) => self.words.push(KIND_UNIT),
             Ty::Base(TyCon::Str) => self.words.push(KIND_STRING),
             Ty::Fn(..) => self.words.push(KIND_FN),
+            Ty::Con(n, a) if a.is_empty() && n == "Buffer" => self.words.push(KIND_BUFFER),
             Ty::Con(n, a) if a.is_empty() => {
                 let Some(decl) = core.types.iter().find(|d| d.name == *n) else {
                     self.words.push(KIND_UNBUILT);

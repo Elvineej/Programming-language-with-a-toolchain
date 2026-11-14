@@ -1397,6 +1397,12 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             // Files, input and arguments (spec 2026-11-14-elya-files-and-arguments):
             // most allocate, so what this function needs is rooted across them,
             // the operands included.
+            n if crate::is_buffer_builtin(n) => {
+                let roots = self.root_live(st, vals)?;
+                let v = crate::buffer_builtin(self.ctx, self.b, self.lc, n, vals)?;
+                gc_unroot(self.b, self.lc, roots)?;
+                Ok(v)
+            }
             n if crate::is_io_builtin(n) => {
                 let roots = self.root_live(st, vals)?;
                 let v = crate::io_builtin(self.ctx, self.b, self.lc, n, vals)?;

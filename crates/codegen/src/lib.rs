@@ -787,6 +787,43 @@ pub(crate) fn io_builtin<'ctx>(
     }
 }
 
+/// `buffer.*` on lowered operands (spec 2026-11-14-elya-buffer D3), both
+/// emitters. Each allocates (a push only when the buffer grows); the runtime
+/// roots its operands, the caller whatever else is live.
+pub(crate) fn buffer_builtin<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    name: &str,
+    vals: &[BasicValueEnum<'ctx>],
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let tag = ctx.i64_type().const_int(lc.string_tag as u64, false);
+    let site = match (name, vals) {
+        ("buffer.new", []) => b.build_call(lc.buffer_new, &[tag.into()], "buf"),
+        ("buffer.push", [buf, s]) => b.build_call(
+            lc.buffer_push,
+            &[tag.into(), (*buf).into(), (*s).into()],
+            "buf",
+        ),
+        ("buffer.finish", [buf]) => {
+            b.build_call(lc.buffer_finish, &[tag.into(), (*buf).into()], "text")
+        }
+        _ => return Err(CodegenError::UnsupportedBuiltin(name.to_string())),
+    }
+    .map_err(internal)?;
+    site.try_as_basic_value()
+        .left()
+        .ok_or(CodegenError::Unsupported(
+            "a buffer builtin returned no value",
+        ))
+}
+
+/// `buffer.<name>`, one of [`elya::resolve::BUFFER_BUILTINS`].
+pub(crate) fn is_buffer_builtin(name: &str) -> bool {
+    name.strip_prefix("buffer.")
+        .is_some_and(|n| elya::resolve::BUFFER_BUILTINS.contains(&n))
+}
+
 /// The host's `io.*` builtins besides `println` ([`io_builtin`]): an unknown
 /// `io.<name>` is refused by name before its arguments are lowered.
 pub(crate) fn is_io_builtin(name: &str) -> bool {
@@ -816,6 +853,9 @@ pub(crate) fn is_native_builtin(name: &str) -> bool {
             | "io.read_stdin"
             | "io.arg_count"
             | "io.arg"
+            | "buffer.new"
+            | "buffer.push"
+            | "buffer.finish"
             | "any.show"
             | "any.decode"
             | "any.fail"
@@ -1981,6 +2021,21 @@ fn lower_expr<'ctx>(
             let x = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
             float_conversion(ctx, b, lc, builtin, x)
         }
+        CoreKind::Builtin(builtin, args) if is_buffer_builtin(builtin) => {
+            // As for `io.*`: each operand rooted while later ones are lowered,
+            // the environment across the call.
+            let mut vals = Vec::with_capacity(args.len());
+            let mut own = 0;
+            for a in args.iter() {
+                let v = lower_expr(ctx, func, b, lc, a, env)?;
+                own += usize::from(gc_root(b, lc, v)?);
+                vals.push(v);
+            }
+            let roots = gc_root_env(b, lc, env)?;
+            let v = buffer_builtin(ctx, b, lc, builtin, &vals)?;
+            gc_unroot(b, lc, roots + own)?;
+            Ok(v)
+        }
         CoreKind::Builtin(builtin, args) if is_io_builtin(builtin) => {
             // Each operand is rooted while later ones are lowered (they may
             // allocate), and the environment across the call.
@@ -2559,6 +2614,10 @@ struct LowerCtx<'a, 'ctx> {
     io_read_stdin: FunctionValue<'ctx>,
     io_arg_count: FunctionValue<'ctx>,
     io_arg: FunctionValue<'ctx>,
+    /// `elya_buffer_*` (spec 2026-11-14-elya-buffer).
+    buffer_new: FunctionValue<'ctx>,
+    buffer_push: FunctionValue<'ctx>,
+    buffer_finish: FunctionValue<'ctx>,
     println: FunctionValue<'ctx>,
     string_tag: usize,
     /// The first closure tag (closures follow the real constructors), for
@@ -2800,6 +2859,18 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         ptrt.fn_type(&[i64t.into(), i64t.into()], false),
         None,
     );
+    let buffer_new =
+        module.add_function("elya_buffer_new", ptrt.fn_type(&[i64t.into()], false), None);
+    let buffer_push = module.add_function(
+        "elya_buffer_push",
+        ptrt.fn_type(&[i64t.into(), ptrt.into(), ptrt.into()], false),
+        None,
+    );
+    let buffer_finish = module.add_function(
+        "elya_buffer_finish",
+        ptrt.fn_type(&[i64t.into(), ptrt.into()], false),
+        None,
+    );
     let args_init = module.add_function(
         "elya_args_init",
         ctx.void_type().fn_type(&[i32t.into(), ptrt.into()], false),
@@ -2959,6 +3030,9 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         io_read_stdin,
         io_arg_count,
         io_arg,
+        buffer_new,
+        buffer_push,
+        buffer_finish,
         println,
         string_tag,
         first_closure_tag: n_real_ctors,

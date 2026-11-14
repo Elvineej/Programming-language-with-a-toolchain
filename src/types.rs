@@ -115,6 +115,12 @@ impl Ty {
     pub fn bool() -> Ty {
         Ty::Base(TyCon::Bool)
     }
+    /// The builtin linear text buffer (spec 2026-11-14-elya-buffer D1): opaque,
+    /// used at most once, not data.
+    pub fn buffer() -> Ty {
+        Ty::Con("Buffer".to_string(), Vec::new())
+    }
+
     pub fn str() -> Ty {
         Ty::Base(TyCon::Str)
     }
@@ -802,7 +808,7 @@ impl Infer {
         }
         if matches!(
             t.name.as_str(),
-            "Int" | "Float" | "Bool" | "String" | "Unit"
+            "Int" | "Float" | "Bool" | "String" | "Unit" | "Buffer"
         ) && !t.args.is_empty()
         {
             self.diags.push(
@@ -817,6 +823,7 @@ impl Infer {
             "Bool" => Ty::bool(),
             "String" => Ty::str(),
             "Unit" => Ty::unit(),
+            "Buffer" => Ty::buffer(),
             other => match self.known_types.get(other).copied() {
                 Some(arity) => {
                     if t.args.len() != arity {
@@ -1618,6 +1625,7 @@ impl Infer {
             // argument is an index, not a field (N3: two operations compare by
             // what they are).
             Ty::Con(n, _) if n == "$Op" => None,
+            Ty::Con(n, _) if n == "Buffer" => Some("buffers".to_string()),
             Ty::Con(n, args) => {
                 let mut why = None;
                 for a in &args {
@@ -3212,11 +3220,23 @@ impl Infer {
     /// Whether `module.name` is a builtin `type_builtin_call` types.
     fn builtin_known(module: &str, name: &str) -> bool {
         Self::host_signature(module, name).is_some()
+            || Self::buffer_signature(module, name).is_some()
             || (module == "op" && matches!(name, "name" | "show" | "perform" | "encode" | "decode"))
             || ((module == "int" || module == "float") && name == "to_string")
             || (module == "float" && crate::resolve::FLOAT_CONVERSIONS.contains(&name))
             || (module == "string" && crate::resolve::STRING_BUILTINS.contains(&name))
             || (module == "int" && crate::resolve::INT_BINARY_BUILTINS.contains(&name))
+    }
+
+    /// A buffer builtin's parameters and result (spec 2026-11-14-elya-buffer
+    /// D2): pure.
+    fn buffer_signature(module: &str, name: &str) -> Option<(Vec<Ty>, Ty)> {
+        Some(match (module, name) {
+            ("buffer", "new") => (Vec::new(), Ty::buffer()),
+            ("buffer", "push") => (vec![Ty::buffer(), Ty::str()], Ty::buffer()),
+            ("buffer", "finish") => (vec![Ty::buffer()], Ty::str()),
+            _ => return None,
+        })
     }
 
     /// A host builtin's parameters and result: each performs `IO`.
@@ -3250,6 +3270,16 @@ impl Infer {
         // arguments (spec 2026-11-14-elya-files-and-arguments D1), and
         // `time.now_ms`/`time.sleep_ms` (spec 2026-10-15-elya-async-step2-timers
         // D3), each performing `IO`.
+        if let Some((params, ret)) = Self::buffer_signature(module, name) {
+            let want = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(ret.clone()));
+            let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
+            self.unify(&want, &got, span);
+            self.node_types.insert(
+                callee_span,
+                Ty::Fn(params, EffectRow::pure(), Box::new(ret.clone())),
+            );
+            return ret;
+        }
         if let Some((params, ret)) = Self::host_signature(module, name) {
             let want = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(ret.clone()));
             let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
@@ -4137,6 +4167,9 @@ impl Infer {
             return None;
         }
         seen.push(name.to_string());
+        if name == "Buffer" {
+            return Some("a `Buffer`".to_string());
+        }
         let Some((params, ctors)) = self.adt_fields.get(name).cloned() else {
             return Some(format!("the type `{name}`"));
         };
@@ -4719,6 +4752,7 @@ fn elaborate_adt_inner(inf: &mut Infer, ann: &Spanned<TypeAnn>, cx: &DeclCx) -> 
         "Bool" => Ty::bool(),
         "String" => Ty::str(),
         "Unit" => Ty::unit(),
+        "Buffer" => Ty::buffer(),
         other => match cx.known.get(other) {
             Some(&arity) => {
                 if t.args.len() != arity {
@@ -5067,6 +5101,8 @@ fn infer_all(module: &Module, want_types: bool) -> InferAllOut {
 fn infer_all_counted(module: &Module, want_types: bool) -> (InferAllOut, u64) {
     let mut inf = Infer::new();
     inf.affine = crate::affine::analyze(module);
+    // `Buffer` is linear wherever it is (spec 2026-11-14-elya-buffer D1).
+    inf.linear_types.insert("Buffer".to_string());
     // Names of `linear`-declared types — set before inference so `ty_is_linear`
     // sees them while recording affine binding sites (Slice 4d-2).
     for d in &module.decls {

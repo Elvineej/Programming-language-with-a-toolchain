@@ -1,35 +1,13 @@
 // Elya's byte lexer, matching src/lex.rs (logos 0.14), except E0002:
 // float range diagnostics require float parsing and are deliberately omitted.
-// Scanning is O(n). Fragments are consed in O(1), then joined by halves:
-// O(k + m log(k + 1)) time for k fragments and m output bytes, O(n + m)
-// live space and O(log(k + 1)) non-tail depth. With fixed-width byte offsets,
-// m = O(n), giving O(n log n) overall with immutable copying concatenation.
+// Written by Codex (OpenAI) to Claude's brief; its output is built in two
+// linear `Buffer`s (self-hosting part 2a), tokens and diagnostics, so the
+// whole lexer is O(n) (it joined lists by halves, O(n log n), before them).
 
-type Parts { End, Part(String, Parts) }
-type Joined { Joined(String, Parts) }
-type Output { Output(Parts, Int, Parts, Int) }
+// The tokens' lines and the diagnostics' lines, each in source order.
+type Output { Output(Buffer, Buffer) }
 type Number { Number(Int, Bool, Bool) }
 type Quoted { Quoted(Int, Bool) }
-
-// Parts are newest first; consume halves and concatenate in source order.
-fn halves(xs: Parts, n: Int) -> Joined {
-  if n == 0 { Joined("", xs) } else {
-    if n == 1 {
-      match xs { Part(s, rest) -> Joined(s, rest)  End -> Joined("", End) }
-    } else {
-      let h = n / 2
-      match halves(xs, h) {
-        Joined(a, rest) -> match halves(rest, n - h) {
-          Joined(b, tail) -> Joined(b <> a, tail)
-        }
-      }
-    }
-  }
-}
-
-fn joined(xs: Parts, n: Int) -> String {
-  match halves(xs, n) { Joined(s, rest) -> s }
-}
 
 fn at(s: String, i: Int) -> Int {
   if i < string.length(s) { string.byte_at(s, i) } else { 0 - 1 }
@@ -85,10 +63,10 @@ fn number(s: String, i: Int) -> Number {
   } else { Number(end, dotted, False) }
 }
 
-fn without_underscores(s: String, i: Int, end: Int, xs: Parts, n: Int) -> String {
-  if i == end { joined(xs, n) } else {
-    if at(s, i) == 95 { without_underscores(s, i + 1, end, xs, n) } else {
-      without_underscores(s, i + 1, end, Part(string.slice(s, i, i + 1), xs), n + 1)
+fn without_underscores(s: String, i: Int, end: Int, b: Buffer) -> String {
+  if i == end { buffer.finish(b) } else {
+    if at(s, i) == 95 { without_underscores(s, i + 1, end, b) } else {
+      without_underscores(s, i + 1, end, buffer.push(b, string.slice(s, i, i + 1)))
     }
   }
 }
@@ -111,11 +89,11 @@ fn quote_end(s: String, i: Int, valid: Bool) -> Quoted {
 }
 
 // Unescape and re-escape in one pass. Every slice ends on a UTF-8 boundary.
-fn quoted_text(s: String, i: Int, end: Int, xs: Parts, n: Int) -> String {
-  if i == end { "\"" <> joined(xs, n) <> "\"" } else {
+fn quoted_text(s: String, i: Int, end: Int, b: Buffer) -> String {
+  if i == end { buffer.finish(buffer.push(b, "\"")) } else {
     let c = at(s, i)
     if c == 92 {
-      quoted_text(s, i + 2, end, Part(string.slice(s, i, i + 2), xs), n + 1)
+      quoted_text(s, i + 2, end, buffer.push(b, string.slice(s, i, i + 2)))
     } else {
       let w = width(c)
       let text = if c == 10 { "\\n" } else {
@@ -123,7 +101,7 @@ fn quoted_text(s: String, i: Int, end: Int, xs: Parts, n: Int) -> String {
           if c == 13 { "\\r" } else { string.slice(s, i, i + w) }
         }
       }
-      quoted_text(s, i + w, end, Part(text, xs), n + 1)
+      quoted_text(s, i + w, end, buffer.push(b, text))
     }
   }
 }
@@ -158,18 +136,18 @@ fn operator(s: String) -> String {
 
 fn token(out: Output, kind: String, start: Int, end: Int, payload: String) -> Output {
   match out {
-    Output(ts, tn, ds, dn) -> {
+    Output(ts, ds) -> {
       let line = kind <> " " <> int.to_string(start) <> " " <> int.to_string(end) <> payload <> "\n"
-      Output(Part(line, ts), tn + 1, ds, dn)
+      Output(buffer.push(ts, line), ds)
     }
   }
 }
 
 fn error(out: Output, code: String, start: Int, end: Int) -> Output {
   match out {
-    Output(ts, tn, ds, dn) -> {
+    Output(ts, ds) -> {
       let line = "error " <> code <> " " <> int.to_string(start) <> " " <> int.to_string(end) <> "\n"
-      Output(ts, tn, Part(line, ds), dn + 1)
+      Output(ts, buffer.push(ds, line))
     }
   }
 }
@@ -196,7 +174,7 @@ fn punctuation(s: String, i: Int, out: Output) -> String {
 
 fn scan(s: String, i: Int, out: Output) -> String {
   if i == string.length(s) {
-    match out { Output(ts, tn, ds, dn) -> joined(ts, tn) <> joined(ds, dn) }
+    match out { Output(ts, ds) -> buffer.finish(buffer.push(ts, buffer.finish(ds))) }
   } else {
     let c = at(s, i)
     if c == 32 || c == 9 || c == 13 || c == 10 || c == 12 {
@@ -215,7 +193,7 @@ fn scan(s: String, i: Int, out: Output) -> String {
             match number(s, i) {
               Number(end, floating, exponent) -> {
                 let kind = if floating { "Float" } else { "Int" }
-                let next = token(out, kind, i, end, " " <> without_underscores(s, i, end, End, 0))
+                let next = token(out, kind, i, end, " " <> without_underscores(s, i, end, buffer.new()))
                 let next = if exponent { error(next, "E0003", i, end) } else { next }
                 scan(s, end, next)
               }
@@ -233,7 +211,7 @@ fn scan(s: String, i: Int, out: Output) -> String {
                 match quote_end(s, i + 1, True) {
                   Quoted(end, valid) -> {
                     let next = if valid {
-                      token(out, "Str", i, end, " " <> quoted_text(s, i + 1, end - 1, End, 0))
+                      token(out, "Str", i, end, " " <> quoted_text(s, i + 1, end - 1, buffer.push(buffer.new(), "\"")))
                     } else { error(out, "E0001", i, end) }
                     scan(s, end, next)
                   }
@@ -247,7 +225,7 @@ fn scan(s: String, i: Int, out: Output) -> String {
   }
 }
 
-pub fn lex_dump(src: String) -> String { scan(src, 0, Output(End, 0, End, 0)) }
+pub fn lex_dump(src: String) -> String { scan(src, 0, Output(buffer.new(), buffer.new())) }
 
 pub fn main() {
   let text = if io.arg_count() > 0 { io.read_file(io.arg(0)) } else { "pub fn main() { 1e19 + 2 }\n" }

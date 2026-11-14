@@ -31,6 +31,10 @@ pub const FLOAT_CONVERSIONS: &[&str] = &["of_int", "truncate", "round"];
 /// `slice : fn(String, Int, Int) -> String`, all pure.
 pub const STRING_BUILTINS: &[&str] = &["length", "byte_at", "slice"];
 
+/// `buffer.*` (spec 2026-11-14-elya-buffer D2): `new : fn() -> Buffer`,
+/// `push : fn(Buffer, String) -> Buffer`, `finish : fn(Buffer) -> String`.
+pub const BUFFER_BUILTINS: &[&str] = &["new", "push", "finish"];
+
 /// The host's `io.*` builtins besides `println` (spec
 /// 2026-11-14-elya-files-and-arguments D1), each performing `IO`:
 /// `read_file : fn(String) -> String`, `file_exists : fn(String) -> Bool`,
@@ -48,8 +52,8 @@ pub const IO_BUILTINS: &[&str] = &[
 /// How many arguments a builtin takes (every name in [`builtins`]).
 pub fn builtin_arity(full: &str) -> usize {
     match full {
-        "time.now_ms" | "io.read_stdin" | "io.arg_count" => 0,
-        "op.encode" | "op.decode" | "string.byte_at" | "io.write_file" => 2,
+        "time.now_ms" | "io.read_stdin" | "io.arg_count" | "buffer.new" => 0,
+        "op.encode" | "op.decode" | "string.byte_at" | "io.write_file" | "buffer.push" => 2,
         "string.slice" => 3,
         f if f
             .strip_prefix("int.")
@@ -72,6 +76,10 @@ pub fn builtins() -> &'static [&'static str] {
         "io.read_stdin",
         "io.arg_count",
         "io.arg",
+        // A linear text buffer (spec 2026-11-14-elya-buffer D2).
+        "buffer.new",
+        "buffer.push",
+        "buffer.finish",
         "int.to_string",
         // A float's literal text (2026-10-23, spec 2026-10-23-elya-float-natively D5).
         "float.to_string",
@@ -233,6 +241,18 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
             }
             Decl::Type(t) => {
                 dup("type", &t.name, d.span, &mut dup_diags);
+                // `Buffer` is the builtin's name (spec 2026-11-14-elya-buffer
+                // D1): a declared type of that name would be the same type to
+                // inference, and its values forged buffers (the review's P1).
+                if t.name == "Buffer" {
+                    dup_diags.push(
+                        Diagnostic::error("E0211", "`Buffer` is a builtin type")
+                            .with_label(d.span, "this declares a type named `Buffer`")
+                            .with_help(
+                                "`Buffer` is the linear text buffer of `buffer.new`, `buffer.push` and `buffer.finish`: give this type another name",
+                            ),
+                    );
+                }
                 for v in &t.variants {
                     dup("constructor", &v.node.name, v.span, &mut dup_diags);
                     ctor_names.insert(v.node.name.clone());
