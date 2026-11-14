@@ -428,7 +428,7 @@ pub(crate) struct HandlerFns<'ctx> {
     /// One per clause, in clause order: `(op args.., ptr cont, ptr frame) -> i64`.
     pub(crate) clauses: Vec<FunctionValue<'ctx>>,
     /// The static clause table, indexed by `op_ids`: a clause's code address,
-    /// or 0 where this handle has no clause for that op.
+    /// or null where this handle has no clause for that op.
     pub(crate) table: PointerValue<'ctx>,
 }
 
@@ -531,7 +531,10 @@ pub(crate) fn declare<'ctx>(
             return Err(internal("a handler key names a non-handle node"));
         };
         let mut clauses = Vec::with_capacity(hd.clauses.len());
-        let mut entries = vec![i64t.const_int(0, false); op_ids.len()];
+        // Code addresses as pointers, not words: a 32-bit machine relocates a
+        // pointer, and has no relocation for one widened to 64 bits (spec
+        // 2026-11-13-elya-boards D2).
+        let mut entries = vec![ptrt.const_null(); op_ids.len()];
         let mut filled = std::collections::HashSet::new();
         for (j, c) in hd.clauses.iter().enumerate() {
             let mut sig: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
@@ -553,11 +556,11 @@ pub(crate) fn declare<'ctx>(
             // slice 5c-2 a second clause for one op is E0204, so no source program
             // reaches this; it stays so the two layers agree by construction.
             if filled.insert(id) {
-                entries[id] = f.as_global_value().as_pointer_value().const_to_int(i64t);
+                entries[id] = f.as_global_value().as_pointer_value();
             }
             clauses.push(f);
         }
-        let arr = i64t.const_array(&entries);
+        let arr = ptrt.const_array(&entries);
         let g = module.add_global(arr.get_type(), Some(AddressSpace::default()), "ctab");
         g.set_initializer(&arr);
         g.set_constant(true);
@@ -951,16 +954,22 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             .b
             .build_int_to_ptr(table, self.ptrt(), "tab")
             .map_err(internal)?;
-        let entry = self.load_word(table, id)?;
-        let missing = self
-            .b
-            .build_int_compare(
-                inkwell::IntPredicate::EQ,
-                entry,
-                i64t.const_int(0, false),
-                "nc",
+        // SAFETY: `id` is below the table's length (`op_ids` sizes every table).
+        let slot = unsafe {
+            self.b.build_in_bounds_gep(
+                self.ptrt(),
+                table,
+                &[i64t.const_int(id as u64, false)],
+                "cs",
             )
-            .map_err(internal)?;
+        }
+        .map_err(internal)?;
+        let entry = self
+            .b
+            .build_load(self.ptrt(), slot, "ce")
+            .map_err(internal)?
+            .into_pointer_value();
+        let missing = self.b.build_is_null(entry, "nc").map_err(internal)?;
         self.b
             .build_conditional_branch(missing, up, ok)
             .map_err(internal)?;
@@ -985,10 +994,7 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
         sig.push(self.ptrt().into());
         sig.push(self.ptrt().into());
         let clause_ty = i64t.fn_type(&sig, false);
-        let fp = self
-            .b
-            .build_int_to_ptr(entry, self.ptrt(), "cl")
-            .map_err(internal)?;
+        let fp = entry;
         let mut vals: Vec<BasicMetadataValueEnum<'ctx>> =
             args.iter().map(|v| (*v).into()).collect();
         vals.push(cont.into());

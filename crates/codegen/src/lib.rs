@@ -20,6 +20,7 @@
 
 mod anf;
 mod any;
+mod arm_tail;
 mod closure;
 mod cps;
 mod cps_emit;
@@ -3111,25 +3112,131 @@ pub fn compile_module_with(
     obj_path: &Path,
     optimise: Optimise,
 ) -> Result<(), CodegenError> {
+    compile_module_for(core, obj_path, optimise, &Machine::host())
+}
+
+/// The machine code is generated for (spec 2026-11-13-elya-boards D1): the
+/// host, or a board's processor. A board's code is static (it is linked at a
+/// fixed address) and calls only the runtime built for the same processor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Machine {
+    /// An LLVM target triple; empty for the host's.
+    pub triple: String,
+    /// LLVM's name of the processor (`cortex-m3`), empty for a generic one.
+    pub cpu: String,
+    /// LLVM target features (`+m,+a,+c`).
+    pub features: String,
+}
+
+impl Machine {
+    /// The machine the compiler runs on.
+    pub fn host() -> Self {
+        Machine {
+            triple: String::new(),
+            cpu: String::new(),
+            features: String::new(),
+        }
+    }
+
+    /// A Cortex-M3 (ARMv7-M, Thumb-2, no FPU, AAPCS soft float): QEMU's
+    /// `mps2-an385`. Needs the `boards` feature, which links LLVM's ARM back
+    /// end.
+    pub fn cortex_m3() -> Self {
+        Machine {
+            triple: "thumbv7m-none-eabi".into(),
+            cpu: "cortex-m3".into(),
+            features: String::new(),
+        }
+    }
+
+    fn is_host(&self) -> bool {
+        self.triple.is_empty()
+    }
+
+    /// A 32-bit ARM, whose `tailcc` calls are padded (`arm_tail`, D4).
+    fn is_arm32(&self) -> bool {
+        ["thumb", "arm"]
+            .iter()
+            .any(|a| self.triple.starts_with(a) && !self.triple.starts_with("arm64"))
+    }
+}
+
+/// LLVM's ARM back end, in a build that links it (the `boards` feature: the
+/// maintainer's vcpkg LLVM has the x86 back end only, and a reference to
+/// another is an unresolved symbol at link time).
+#[cfg(feature = "boards")]
+fn boards_back_end() -> Result<(), CodegenError> {
+    Target::initialize_arm(&InitializationConfig::default());
+    Ok(())
+}
+
+#[cfg(not(feature = "boards"))]
+fn boards_back_end() -> Result<(), CodegenError> {
+    Err(CodegenError::Unsupported(
+        "a board (this build has no ARM back end: the `boards` feature)",
+    ))
+}
+
+/// `compile_module_with` for a chosen machine.
+pub fn compile_module_for(
+    core: &CoreModule,
+    obj_path: &Path,
+    optimise: Optimise,
+    for_machine: &Machine,
+) -> Result<(), CodegenError> {
     let ctx = Context::create();
     let module = build_module(&ctx, core)?;
 
-    Target::initialize_native(&InitializationConfig::default()).map_err(internal)?;
-    let triple = TargetMachine::get_default_triple();
+    let (triple, reloc) = if for_machine.is_host() {
+        Target::initialize_native(&InitializationConfig::default()).map_err(internal)?;
+        (TargetMachine::get_default_triple(), RelocMode::Default)
+    } else if for_machine.is_arm32() {
+        // Only 32-bit ARM: LLVM 18's RISC-V back end has no `tailcc` at all
+        // (`report_fatal_error("Unsupported calling convention")`, which would
+        // end the process), and every Elya call is one (spec D5).
+        boards_back_end()?;
+        (
+            inkwell::targets::TargetTriple::create(&for_machine.triple),
+            RelocMode::Static,
+        )
+    } else {
+        return Err(CodegenError::Unsupported(
+            "a machine other than the host or a 32-bit ARM",
+        ));
+    };
     let target = Target::from_triple(&triple).map_err(internal)?;
     let machine = target
         .create_target_machine(
             &triple,
-            "",
-            "",
+            &for_machine.cpu,
+            &for_machine.features,
             match optimise {
                 Optimise::Speed => OptimizationLevel::Default,
                 Optimise::None => OptimizationLevel::None,
             },
-            RelocMode::Default,
+            reloc,
             CodeModel::Default,
         )
-        .ok_or_else(|| internal("no host target machine"))?;
+        .ok_or_else(|| internal("no target machine"))?;
+    // The module is the machine's: its triple, and its data layout (a
+    // pointer's size and every type's alignment) before any pass reads it.
+    module.set_triple(&triple);
+    module.set_data_layout(&machine.get_target_data().get_data_layout());
+    // No Elya function unwinds (a failure stops the program). Said on a board,
+    // which links no unwinder (libgcc's would bring `abort`); a host's object
+    // keeps the unwind tables its debuggers and Windows' stack walks read.
+    if !for_machine.is_host() {
+        let ctx = module.get_context();
+        let nounwind = ctx.create_enum_attribute(
+            inkwell::attributes::Attribute::get_named_enum_kind_id("nounwind"),
+            0,
+        );
+        for f in module.get_functions() {
+            if f.count_basic_blocks() > 0 {
+                f.add_attribute(inkwell::attributes::AttributeLoc::Function, nounwind);
+            }
+        }
+    }
     if optimise == Optimise::Speed {
         // A function too long for a person to have written is left as written:
         // LLVM's instruction combiner is quadratic in a block chain's length
@@ -3164,6 +3271,13 @@ pub fn compile_module_with(
             )
             .map_err(internal)?;
         // A pass that broke the module is this back end's bug to hear of here.
+        module
+            .verify()
+            .map_err(|e| CodegenError::Verify(e.to_string()))?;
+    }
+    // Last, after the optimiser, so no pass sees (or removes) the padding.
+    if for_machine.is_arm32() {
+        arm_tail::pad_tail_calls(&ctx, &module)?;
         module
             .verify()
             .map_err(|e| CodegenError::Verify(e.to_string()))?;
