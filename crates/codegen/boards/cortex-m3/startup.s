@@ -10,8 +10,10 @@
 .cpu cortex-m3
 .thumb
 .section .vectors,"a",%progbits
+/* The initial stack, then 15 system exceptions and 48 interrupts (the
+ * AN385 has 45; QEMU models 32). None is enabled. */
 .word __handler_stack_top, Reset_Handler, Default_Handler, HardFault_Handler
-.rept 12 + 44
+.rept 12 + 48
 .word Default_Handler
 .endr
 

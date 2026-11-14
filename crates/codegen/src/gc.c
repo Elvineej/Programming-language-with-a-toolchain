@@ -31,6 +31,13 @@ void elya_platform_release(void *p, size_t bytes);
 /* Stop the program: out of memory, or a collector invariant broken. */
 void elya_platform_fail(const char *message);
 
+/* A pointer as the word a heap field holds, as LLVM's `ptrtoint` to i64 makes
+ * it: zero-extended (spec 2026-11-14-elya-riscv-board D3). `(int64_t)(intptr_t)`
+ * sign-extends on a 32-bit machine, and RISC-V's RAM starts at 0x80000000: the
+ * same pointer would be two different words, one written here, one by the
+ * program. */
+#define ELYA_WORD(p) ((int64_t)(uintptr_t)(p))
+
 #ifndef ELYA_PAGE_BYTES
 #define ELYA_PAGE_BYTES 4096
 #endif
@@ -918,9 +925,9 @@ void *elya_gc_scratch(void *p, size_t bytes) {
         gc_no_collect = 0;
         fresh[0] = -1;
         fresh[1] = 0;
-        fresh[2] = (int64_t)(intptr_t)gc_scratch_held;
+        fresh[2] = ELYA_WORD(gc_scratch_held);
         if (gc_scratch_held) {
-            gc_scratch_held[1] = (int64_t)(intptr_t)fresh;
+            gc_scratch_held[1] = ELYA_WORD(fresh);
         }
         gc_scratch_held = fresh;
         if (old) {
@@ -931,12 +938,12 @@ void *elya_gc_scratch(void *p, size_t bytes) {
     if (old) {
         int64_t *prev = (int64_t *)(intptr_t)old[1], *next = (int64_t *)(intptr_t)old[2];
         if (prev) {
-            prev[2] = (int64_t)(intptr_t)next;
+            prev[2] = ELYA_WORD(next);
         } else {
             gc_scratch_held = next;
         }
         if (next) {
-            next[1] = (int64_t)(intptr_t)prev;
+            next[1] = ELYA_WORD(prev);
         }
         /* A freed block is free memory at once: the next working block may
          * be allocated before any collection (none runs under one), and a

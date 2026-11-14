@@ -74,7 +74,7 @@ apart silently.
 ## Local CI
 
 ```sh
-sh scripts/check.sh         # fmt + clippy + tests, both feature configurations (POSIX / Git Bash)
+sh scripts/check.sh         # fmt + clippy + tests, both feature configurations, and the boards on QEMU (POSIX / Git Bash)
 pwsh scripts/check.ps1      # fmt + clippy + tests, both feature configurations (PowerShell)
 sh scripts/setup-hooks.sh   # install a pre-push hook that runs check.sh (optional)
 ```
@@ -129,8 +129,10 @@ Elya is a typed language on a CEK machine, built up through these slices:
 - ADTs and pattern matching, nested and literal patterns included (compiled to flat
   matches; a failed match traps); closures, including indirect
   tail calls; strings and `io.println`;
-- Elya's **own precise mark-sweep garbage collector**: non-moving, with a shadow
-  stack, compiler-generated descriptor tables and free lists;
+- Elya's **own precise garbage collector**: pages of one size class each, a mark
+  bitmap per page, lazy sweeping and a bounded worklist; non-moving, with a shadow
+  stack and compiler-generated descriptor tables; the whole runtime needs no C
+  library (a board gives it bytes out and a way to stop);
 - **one-shot effect handlers** (selective CPS): `handle`/`resume` anywhere in a
   clause, deep re-installation, O(1) handler lookup, one-shot enforced by a named
   trap, and a state-passing handler loop bounded at N = 1,000,000; effectful
@@ -139,7 +141,11 @@ Elya is a typed language on a CEK machine, built up through these slices:
   specialized per calling convention at the rows it is used with, and a pure
   closure used where an effectful one is expected gets an adapter;
 - **multi-shot handlers** (`with multi`): each resume re-enters a copy of the
-  captured frames, so backtracking and search handlers run natively.
+  captured frames, so backtracking and search handlers run natively;
+- **bare metal**: the same program built for a Cortex-M3 or a 32-bit RISC-V
+  (`compile_module_for`, the `boards` feature) runs on QEMU's `mps2-an385` and
+  `virt` boards with no C library, a guard below its stack, and writes what the
+  hosted build writes (`crates/codegen/boards/`).
 
 Every native program is checked against the reference evaluator, for both the
 value and the exact bytes printed. CI runs the full gate on Windows too.

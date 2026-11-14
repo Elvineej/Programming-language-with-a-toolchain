@@ -246,10 +246,104 @@ fn repad_call<'ctx>(
 
 #[cfg(test)]
 mod tests {
-    use super::stacked_bytes;
+    use super::{pad_tail_calls, stacked_bytes};
+    use crate::TAILCC;
+    use inkwell::attributes::{Attribute, AttributeLoc};
     use inkwell::context::Context;
-    use inkwell::types::BasicTypeEnum;
+    use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum};
+    use inkwell::values::{BasicMetadataValueEnum, LLVMTailCallKind};
     use inkwell::AddressSpace;
+
+    /// The rewrite at the IR level (the review of 52bf757 asked for it): a
+    /// function, a declaration, a direct and an indirect `musttail` call, an
+    /// ordinary call, the function's address in a constant, and a parameter's
+    /// attribute. Every `tailcc` signature of 8 stacked bytes gains the `i64`,
+    /// the module verifies, the constant names the new function, and the
+    /// attribute stays on its parameter.
+    #[test]
+    fn the_padding_rewrites_functions_calls_and_constants() {
+        let ctx = Context::create();
+        let m = ctx.create_module("m");
+        let (ptr, i64t) = (ctx.ptr_type(AddressSpace::default()), ctx.i64_type());
+        let shape: [BasicMetadataTypeEnum; 3] = [ptr.into(), i64t.into(), i64t.into()];
+        let ty = i64t.fn_type(&shape, false);
+        let tail = |name: &str| {
+            let f = m.add_function(name, ty, None);
+            f.set_call_conventions(TAILCC);
+            f
+        };
+        let callee = tail("callee");
+        let decl = tail("decl");
+        let direct = tail("direct");
+        let indirect = tail("indirect");
+        let noundef = ctx.create_enum_attribute(Attribute::get_named_enum_kind_id("noundef"), 0);
+        callee.add_attribute(AttributeLoc::Param(1), noundef);
+        let table = m.add_global(ptr.array_type(1), None, "table");
+        table.set_initializer(&ptr.const_array(&[callee.as_global_value().as_pointer_value()]));
+        let b = ctx.create_builder();
+        b.position_at_end(ctx.append_basic_block(callee, "e"));
+        b.build_return(Some(&callee.get_nth_param(2).expect("p")))
+            .expect("ret");
+        fn args(f: inkwell::values::FunctionValue<'_>) -> Vec<BasicMetadataValueEnum<'_>> {
+            f.get_param_iter().map(|p| p.into()).collect()
+        }
+        b.position_at_end(ctx.append_basic_block(direct, "e"));
+        let c = b.build_call(callee, &args(direct), "c").expect("call");
+        c.set_call_convention(TAILCC);
+        c.set_tail_call_kind(LLVMTailCallKind::LLVMTailCallKindMustTail);
+        b.build_return(Some(&c.try_as_basic_value().left().expect("v")))
+            .expect("ret");
+        b.position_at_end(ctx.append_basic_block(indirect, "e"));
+        let fp = b
+            .build_load(ptr, table.as_pointer_value(), "fp")
+            .expect("load")
+            .into_pointer_value();
+        let c = b
+            .build_indirect_call(ty, fp, &args(indirect), "c")
+            .expect("call");
+        c.set_call_convention(TAILCC);
+        c.set_tail_call_kind(LLVMTailCallKind::LLVMTailCallKindMustTail);
+        b.build_return(Some(&c.try_as_basic_value().left().expect("v")))
+            .expect("ret");
+        let plain = m.add_function("plain", i64t.fn_type(&[], false), None);
+        b.position_at_end(ctx.append_basic_block(plain, "e"));
+        let vals: [BasicMetadataValueEnum; 3] = [
+            ptr.const_null().into(),
+            i64t.const_int(1, false).into(),
+            i64t.const_int(2, false).into(),
+        ];
+        let c1 = b.build_call(callee, &vals, "c1").expect("call");
+        c1.set_call_convention(TAILCC);
+        let c2 = b.build_call(decl, &vals, "c2").expect("call");
+        c2.set_call_convention(TAILCC);
+        let sum = b
+            .build_int_add(
+                c1.try_as_basic_value().left().expect("v").into_int_value(),
+                c2.try_as_basic_value().left().expect("v").into_int_value(),
+                "s",
+            )
+            .expect("add");
+        b.build_return(Some(&sum)).expect("ret");
+        m.verify().expect("the module before");
+
+        assert_eq!(pad_tail_calls(&ctx, &m).expect("pads"), 4);
+        m.verify().expect("the module after");
+        for name in ["callee", "decl", "direct", "indirect"] {
+            let f = m.get_function(name).expect(name);
+            assert_eq!(f.count_params(), 4, "{name}");
+            assert_eq!(f.get_call_conventions(), TAILCC, "{name}");
+        }
+        let callee = m.get_function("callee").expect("callee");
+        assert!(callee
+            .get_enum_attribute(AttributeLoc::Param(1), noundef.get_enum_kind_id())
+            .is_some());
+        let ir = m.print_to_string().to_string();
+        assert!(
+            ir.contains("@table = global [1 x ptr] [ptr @callee]"),
+            "{ir}"
+        );
+        assert_eq!(ir.matches("i64 poison)").count(), 4, "{ir}");
+    }
 
     /// AAPCS's placement, case by case (spec 2026-11-13-elya-boards D4). The
     /// QEMU run of `native_boards` is what checks it against LLVM itself.

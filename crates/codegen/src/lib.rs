@@ -27,6 +27,7 @@ mod cps_emit;
 mod mono;
 mod patterns;
 mod reflect;
+mod rv_tail;
 pub mod scope;
 use scope::Env;
 mod specialize;
@@ -3149,8 +3150,25 @@ impl Machine {
         }
     }
 
+    /// A 32-bit RISC-V with multiply, atomics and compressed instructions, no
+    /// FPU (`rv32imac`, ABI `ilp32`): QEMU's `virt`. Its calls are LLVM's
+    /// `fastcc` of one type (`rv_tail`, spec 2026-11-14-elya-riscv-board).
+    /// Needs the `boards` feature.
+    pub fn rv32imac() -> Self {
+        Machine {
+            triple: "riscv32-unknown-none-elf".into(),
+            cpu: "generic-rv32".into(),
+            features: "+m,+a,+c".into(),
+        }
+    }
+
     fn is_host(&self) -> bool {
         self.triple.is_empty()
+    }
+
+    /// A 32-bit RISC-V, whose calls are made one type (`rv_tail`).
+    fn is_riscv32(&self) -> bool {
+        self.triple.starts_with("riscv32")
     }
 
     /// A 32-bit ARM, whose `tailcc` calls are padded (`arm_tail`, D4).
@@ -3161,19 +3179,20 @@ impl Machine {
     }
 }
 
-/// LLVM's ARM back end, in a build that links it (the `boards` feature: the
-/// maintainer's vcpkg LLVM has the x86 back end only, and a reference to
-/// another is an unresolved symbol at link time).
+/// LLVM's ARM and RISC-V back ends, in a build that links them (the `boards`
+/// feature: the maintainer's vcpkg LLVM has the x86 back end only, and a
+/// reference to another is an unresolved symbol at link time).
 #[cfg(feature = "boards")]
 fn boards_back_end() -> Result<(), CodegenError> {
     Target::initialize_arm(&InitializationConfig::default());
+    Target::initialize_riscv(&InitializationConfig::default());
     Ok(())
 }
 
 #[cfg(not(feature = "boards"))]
 fn boards_back_end() -> Result<(), CodegenError> {
     Err(CodegenError::Unsupported(
-        "a board (this build has no ARM back end: the `boards` feature)",
+        "a board (this build has no board back ends: the `boards` feature)",
     ))
 }
 
@@ -3218,10 +3237,7 @@ fn module_for<'ctx>(
     let (triple, reloc) = if for_machine.is_host() {
         Target::initialize_native(&InitializationConfig::default()).map_err(internal)?;
         (TargetMachine::get_default_triple(), RelocMode::Default)
-    } else if for_machine.is_arm32() {
-        // Only 32-bit ARM: LLVM 18's RISC-V back end has no `tailcc` at all
-        // (`report_fatal_error("Unsupported calling convention")`, which would
-        // end the process), and every Elya call is one (spec D5).
+    } else if for_machine.is_arm32() || for_machine.is_riscv32() {
         boards_back_end()?;
         (
             inkwell::targets::TargetTriple::create(&for_machine.triple),
@@ -3229,7 +3245,7 @@ fn module_for<'ctx>(
         )
     } else {
         return Err(CodegenError::Unsupported(
-            "a machine other than the host or a 32-bit ARM",
+            "a machine other than the host, a 32-bit ARM or a 32-bit RISC-V",
         ));
     };
     let target = Target::from_triple(&triple).map_err(internal)?;
@@ -3306,6 +3322,11 @@ fn module_for<'ctx>(
     // Last, after the optimiser, so no pass sees (or removes) the padding.
     if for_machine.is_arm32() {
         arm_tail::pad_tail_calls(ctx, &module)?;
+    }
+    if for_machine.is_riscv32() {
+        rv_tail::uniform_tail_calls(ctx, &module)?;
+    }
+    if !for_machine.is_host() {
         module
             .verify()
             .map_err(|e| CodegenError::Verify(e.to_string()))?;

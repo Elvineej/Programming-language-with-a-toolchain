@@ -1,7 +1,7 @@
 /* A Cortex-M3 board's platform (spec 2026-11-13-elya-boards D3): bytes out and
  * stop by Arm semihosting (QEMU passes them to its own stdout, stderr and exit
- * status), a guard below the stack, the collector's region after the static
- * data, then the program's `main`. Semihosting written by ChatGPT (OpenAI) to Claude's
+ * status), a clock, a guard below the stack, the collector's region after the
+ * static data, then the program's `main`. Semihosting written by ChatGPT (OpenAI) to Claude's
  * brief (CC0); reviewed here: the handles are opened once, not per write. */
 #include <stddef.h>
 #include <stdint.h>
@@ -132,6 +132,20 @@ void elya_board_fault(const uint32_t *frame) {
     at = elya_board_text(at, ")\n");
     elya_platform_write(2, line, (size_t)(at - line));
     elya_platform_exit(70);
+}
+
+/* The board's clock: the MPS2 FPGA's 100 Hz counter (FPGAIO CLK100HZ, counting
+ * from reset), so `time.now_ms` moves in steps of 10 ms and `time.sleep_ms`
+ * waits on it. A board without one keeps the runtime's clock that stands
+ * still. */
+#define FPGAIO_CLK100HZ (*(volatile uint32_t *)0x40028014)
+
+int64_t elya_platform_now_ms(void) { return (int64_t)FPGAIO_CLK100HZ * 10; }
+
+void elya_platform_sleep_ms(int64_t ms) {
+    int64_t until = elya_platform_now_ms() + ms;
+    while (elya_platform_now_ms() < until) {
+    }
 }
 
 void elya_board_main(void) {

@@ -1,12 +1,14 @@
-//! Elya programs compiled for a Cortex-M3 and run on QEMU's `mps2-an385`
-//! board (spec 2026-11-13-elya-boards): the program, the runtime built
+//! Elya programs compiled for two boards and run on QEMU (specs
+//! 2026-11-13-elya-boards, 2026-11-14-elya-riscv-board): a Cortex-M3
+//! (`mps2-an385`) and a 32-bit RISC-V (`virt`). The program, the runtime built
 //! freestanding for the same processor, and the board's start-up, linked with
 //! no C library, write what the hosted build writes, at both optimisation
 //! levels.
 //!
-//! The `boards` feature says a board can be run here, so each tool it needs is
-//! required, by name: `clang`, `ld.lld`, `qemu-system-arm`, and
-//! `arm-none-eabi-gcc` for its `libgcc` (64-bit division and soft floats).
+//! The `boards` feature says the boards can be run here, so each tool they need
+//! is required, by name: `clang`, `ld.lld`, `qemu-system-arm`,
+//! `qemu-system-riscv32`, and `arm-none-eabi-gcc` and `riscv64-unknown-elf-gcc`
+//! for their `libgcc` (64-bit division and soft floats).
 #![cfg(feature = "boards")]
 
 use elya_codegen::{CodegenError, Machine, Optimise};
@@ -51,29 +53,75 @@ fn run_ok(cmd: &mut Command, what: &str) {
     );
 }
 
-/// The board's pieces, built once: the runtime, the start-up, the board's
-/// hooks and the memory functions, each for the Cortex-M3, and `libgcc`.
+/// A board: the machine, how C is compiled for it, where its files are, the
+/// compiler whose `libgcc` it links, and how QEMU runs it.
+struct Spec {
+    name: &'static str,
+    machine: fn() -> Machine,
+    target: &'static [&'static str],
+    dir: &'static str,
+    gcc: &'static str,
+    gcc_target: &'static [&'static str],
+    qemu: &'static str,
+    qemu_args: &'static [&'static str],
+}
+
+const CORTEX_M3: Spec = Spec {
+    name: "cortex-m3",
+    machine: Machine::cortex_m3,
+    target: &[
+        "--target=thumbv7m-none-eabi",
+        "-mcpu=cortex-m3",
+        "-mfloat-abi=soft",
+    ],
+    dir: "cortex-m3",
+    gcc: "arm-none-eabi-gcc",
+    gcc_target: &["-mcpu=cortex-m3", "-mthumb"],
+    qemu: "qemu-system-arm",
+    qemu_args: &["-M", "mps2-an385"],
+};
+
+const RISCV32: Spec = Spec {
+    name: "riscv32",
+    machine: Machine::rv32imac,
+    target: &[
+        "--target=riscv32-unknown-elf",
+        "-march=rv32imac",
+        "-mabi=ilp32",
+    ],
+    dir: "riscv32",
+    gcc: "riscv64-unknown-elf-gcc",
+    gcc_target: &["-march=rv32imac", "-mabi=ilp32"],
+    qemu: "qemu-system-riscv32",
+    qemu_args: &["-M", "virt", "-bios", "none"],
+};
+
+const BOARDS: [&Spec; 2] = [&CORTEX_M3, &RISCV32];
+
+/// A board's pieces, built once: the runtime, the start-up, the board's hooks
+/// and the memory functions, each for its processor, and its `libgcc`.
 struct Board {
+    spec: &'static Spec,
     lld: String,
     qemu: String,
     objects: Vec<PathBuf>,
     libgcc: PathBuf,
 }
 
-const M3: [&str; 3] = [
-    "--target=thumbv7m-none-eabi",
-    "-mcpu=cortex-m3",
-    "-mfloat-abi=soft",
-];
-
-fn board() -> &'static Board {
-    static BOARD: OnceLock<Board> = OnceLock::new();
-    BOARD.get_or_init(|| {
+fn board(spec: &'static Spec) -> &'static Board {
+    static M3: OnceLock<Board> = OnceLock::new();
+    static RV: OnceLock<Board> = OnceLock::new();
+    let cell = if spec.name == CORTEX_M3.name {
+        &M3
+    } else {
+        &RV
+    };
+    cell.get_or_init(|| {
         let clang = first_on_path(&["clang", "clang-18"]);
         let lld = first_on_path(&["ld.lld", "ld.lld-18"]);
-        let qemu = first_on_path(&["qemu-system-arm"]);
-        let gcc = first_on_path(&["arm-none-eabi-gcc"]);
-        let dir = temp_dir("pieces");
+        let qemu = first_on_path(&[spec.qemu]);
+        let gcc = first_on_path(&[spec.gcc]);
+        let dir = temp_dir(spec.name);
         let boards = manifest().join("boards");
         let c = [
             "-DELYA_FREESTANDING",
@@ -86,8 +134,8 @@ fn board() -> &'static Board {
         let pieces: [(PathBuf, &[&str]); 4] = [
             (manifest().join("src/runtime.c"), &c),
             (boards.join("common/mem.c"), &c),
-            (boards.join("cortex-m3/board.c"), &c),
-            (boards.join("cortex-m3/startup.s"), &[]),
+            (boards.join(spec.dir).join("board.c"), &c),
+            (boards.join(spec.dir).join("startup.s"), &[]),
         ];
         let mut objects = Vec::new();
         for (src, flags) in pieces {
@@ -96,23 +144,30 @@ fn board() -> &'static Board {
                 .with_extension("o");
             run_ok(
                 Command::new(&clang)
-                    .args(M3)
+                    .args(spec.target)
                     .args(flags)
                     .arg("-c")
                     .arg(&src)
                     .arg("-o")
                     .arg(&obj),
-                &format!("clang {}", src.display()),
+                &format!("{}: clang {}", spec.name, src.display()),
             );
             objects.push(obj);
         }
         let out = Command::new(&gcc)
-            .args(["-mcpu=cortex-m3", "-mthumb", "-print-libgcc-file-name"])
+            .args(spec.gcc_target)
+            .arg("-print-libgcc-file-name")
             .output()
-            .expect("arm-none-eabi-gcc");
+            .expect("the board's gcc");
         let libgcc = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-        assert!(libgcc.is_file(), "no libgcc at {}", libgcc.display());
+        assert!(
+            libgcc.is_file(),
+            "{}: no libgcc at {}",
+            spec.name,
+            libgcc.display()
+        );
         Board {
+            spec,
             lld,
             qemu,
             objects,
@@ -131,31 +186,46 @@ fn lower(src: &str) -> elya::core::CoreModule {
 
 type Run = (i32, String, String);
 
+/// Runs to the end (300 s at most), reading its output while it runs: a pipe
+/// read only after the end would stop a program that writes more than the
+/// pipe holds (the review of 52bf757).
 fn wait(mut cmd: Command, what: &str) -> Run {
+    use std::io::Read;
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| panic!("{what}: {e}"));
+    let drain = |mut r: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            r.read_to_end(&mut bytes).ok();
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    };
+    let out = drain(Box::new(child.stdout.take().expect("stdout")));
+    let err = drain(Box::new(child.stderr.take().expect("stderr")));
     let deadline = Instant::now() + Duration::from_secs(300);
-    while child.try_wait().expect("wait").is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status;
+        }
         if Instant::now() > deadline {
             child.kill().ok();
+            child.wait().ok();
             panic!("{what}: still running after 300 s");
         }
         std::thread::sleep(Duration::from_millis(20));
-    }
-    let out = child.wait_with_output().expect("output");
+    };
     (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
+        status.code().unwrap_or(-1),
+        out.join().expect("stdout reader"),
+        err.join().expect("stderr reader"),
     )
 }
 
-/// `src` hosted, then on the board at each optimisation level.
-fn hosted_and_board(tag: &str, src: &str) -> (Run, [Run; 2]) {
-    let b = board();
+/// `src` hosted, then on every board at each optimisation level, named.
+fn hosted_and_boards(tag: &str, src: &str) -> (Run, Vec<(String, Run)>) {
     let dir = temp_dir(tag);
     let core = lower(src);
     let obj = dir.join("hosted.o");
@@ -163,37 +233,46 @@ fn hosted_and_board(tag: &str, src: &str) -> (Run, [Run; 2]) {
     let exe = dir.join("hosted");
     elya_codegen::link(&obj, &exe).expect("link");
     let hosted = wait(Command::new(&exe), &format!("{tag} hosted"));
-    let on_board = [("O2", Optimise::Speed), ("O0", Optimise::None)].map(|(level, opt)| {
-        let obj = dir.join(format!("board-{level}.o"));
-        elya_codegen::compile_module_for(&core, &obj, opt, &Machine::cortex_m3())
-            .unwrap_or_else(|e| panic!("{tag} {level}: {e}"));
-        let elf = dir.join(format!("board-{level}.elf"));
-        run_ok(
-            Command::new(&b.lld)
-                .arg("-T")
-                .arg(manifest().join("boards/cortex-m3/link.ld"))
-                .arg("-o")
-                .arg(&elf)
-                .args(&b.objects)
-                .arg(&obj)
-                .arg(&b.libgcc),
-            &format!("{tag} {level}: ld.lld"),
-        );
-        let mut qemu = Command::new(&b.qemu);
-        qemu.args(["-M", "mps2-an385", "-nographic", "-monitor", "none"])
-            .args(["-semihosting-config", "enable=on,target=native", "-kernel"])
-            .arg(&elf);
-        wait(qemu, &format!("{tag} {level}: qemu"))
-    });
+    let mut runs = Vec::new();
+    for spec in BOARDS {
+        let b = board(spec);
+        for (level, opt) in [("O2", Optimise::Speed), ("O0", Optimise::None)] {
+            let what = format!("{tag} on {} at {level}", spec.name);
+            let obj = dir.join(format!("{}-{level}.o", spec.name));
+            elya_codegen::compile_module_for(&core, &obj, opt, &(spec.machine)())
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let elf = dir.join(format!("{}-{level}.elf", spec.name));
+            run_ok(
+                Command::new(&b.lld)
+                    .arg("-T")
+                    .arg(manifest().join("boards").join(spec.dir).join("link.ld"))
+                    .arg("-o")
+                    .arg(&elf)
+                    .args(&b.objects)
+                    .arg(&obj)
+                    .arg(&b.libgcc),
+                &format!("{what}: ld.lld"),
+            );
+            let mut qemu = Command::new(&b.qemu);
+            qemu.args(b.spec.qemu_args)
+                // No `-nographic`: it gives QEMU the terminal, and makes its
+                // stdout non-blocking, so a full pipe failed a semihosting
+                // write (`output`, on RISC-V).
+                .args(["-display", "none", "-serial", "none", "-monitor", "none"])
+                .args(["-semihosting-config", "enable=on,target=native", "-kernel"])
+                .arg(&elf);
+            runs.push((what.clone(), wait(qemu, &what)));
+        }
+    }
     std::fs::remove_dir_all(&dir).ok();
-    (hosted, on_board)
+    (hosted, runs)
 }
 
-fn same_on_board(tag: &str, src: &str, want: Run) {
-    let (hosted, board) = hosted_and_board(tag, src);
+fn same_on_boards(tag: &str, src: &str, want: Run) {
+    let (hosted, runs) = hosted_and_boards(tag, src);
     assert_eq!(hosted, want, "{tag}: hosted");
-    for (level, run) in ["O2", "O0"].iter().zip(board) {
-        assert_eq!(run, hosted, "{tag}: the board, {level}");
+    for (what, run) in runs {
+        assert_eq!(run, hosted, "{what}");
     }
 }
 
@@ -201,11 +280,13 @@ fn ok(out: &str) -> Run {
     (0, out.to_string(), String::new())
 }
 
-/// Loops, recursion, data, closures, a handler with state, and a failure: the
-/// Cortex-M3 writes what the host writes, and stops with its status.
+/// Loops, recursion, data, closures, a handler with state, clauses of two and
+/// three Ints (whose calls the ARM padding changes, held in the clause table),
+/// 130 KiB of output (more than a pipe holds), and a failure: each board writes
+/// what the host writes, and stops with its status.
 #[test]
-fn programs_on_a_cortex_m3_write_what_they_write_hosted() {
-    let programs: [(&str, &str, Run); 9] = [
+fn programs_on_the_boards_write_what_they_write_hosted() {
+    let programs: [(&str, &str, Run); 11] = [
         (
             "sum",
             "fn remainder(x: Int, d: Int) -> Int { x - (x / d) * d }\n\
@@ -283,6 +364,20 @@ fn programs_on_a_cortex_m3_write_what_they_write_hosted() {
             ok("2000\n"),
         ),
         (
+            "clauses",
+            "effect Mix { fn two(a: Int, b: Int) -> Int  fn three(a: Int, b: Int, c: Int) -> Int }\n\
+             fn go(n: Int, acc: Int) -> Int { if n == 0 { acc } else { go(n - 1, acc + two(n, 1) + three(n, 2, 3)) } }\n\
+             pub fn main() -> Int { handle { go(1000, 0) } with { Mix.two(a, b) -> resume(a * b)  Mix.three(a, b, c) -> resume(a + b * c)  return(x) -> x } }\n",
+            ok("1007000\n"),
+        ),
+        (
+            "output",
+            "fn line(n: Int) -> Int { io.println(\"0123456789012345678901234567890123456789 \" <> int.to_string(n))  n }\n\
+             fn go(n: Int, acc: Int) -> Int { if n == 0 { acc } else { go(n - 1, acc + line(n)) } }\n\
+             pub fn main() -> Int { go(3000, 0) }\n",
+            (0, (1..=3000).rev().map(|n| format!("0123456789012345678901234567890123456789 {n}\n")).collect::<String>() + "4501500\n", String::new()),
+        ),
+        (
             "failure",
             "fn zero(n: Int) -> Int { n - n }\n\
              pub fn main() -> Int { io.println(\"before\")  9223372036854775807 + (1 / (1 + zero(5))) }\n",
@@ -294,18 +389,19 @@ fn programs_on_a_cortex_m3_write_what_they_write_hosted() {
         ),
     ];
     for (tag, src, want) in programs {
-        same_on_board(tag, src, want);
+        same_on_boards(tag, src, want);
     }
 }
 
 /// Every shape of call LLVM's ARM back end could disagree with itself about
-/// (spec D4): functions whose arguments stack 4, 8, 12, 16 and 24 bytes, with
+/// (spec 2026-11-13-elya-boards D4), and every way RISC-V's one function type
+/// carries words (spec 2026-11-14-elya-riscv-board D1): functions whose arguments stack 4, 8, 12, 16 and 24 bytes, with
 /// words, pointers and Bools in each position, each calling itself in tail
 /// position, each called by an ordinary call, a ring of tail calls between
 /// five different shapes, ordinary recursion 3,000 deep through stacked
 /// arguments, and a four-parameter closure called both ways.
 #[test]
-fn every_call_shape_on_a_cortex_m3_writes_what_it_writes_hosted() {
+fn every_call_shape_on_the_boards_writes_what_it_writes_hosted() {
     let src = "type L { Nil, Cons(Int, L) }\n\
         fn len(xs: L, acc: Int) -> Int { match xs { Nil -> acc  Cons(_, t) -> len(t, acc + 1) } }\n\
         fn not(f: Bool) -> Bool { if f { False } else { True } }\n\
@@ -335,23 +431,24 @@ fn every_call_shape_on_a_cortex_m3_writes_what_it_writes_hosted() {
           let d = show(ring1(1000, 1, 2)) + show(deep(3000, 1, 2)) + show(deep5(3000, 1, Nil, 2, 3))\n\
           a + b + c + d + show(callk(fn(a, b, c, d) { a * 1000 + b * 100 + c * 10 + d - k }, 100))\n\
         }\n";
-    same_on_board(
+    same_on_boards(
         "shapes",
         src,
         ok("2005\n300\n3664\n19\n149\n12530\n5050\n-52\n2552\n7009\n2999\n6006\n5623579\n5665810\n"),
     );
 }
 
-/// A recursion deeper than the board's stack stops at the guard below it with
-/// the hosted build's line and status (spec D3), after the output already
-/// written, at both levels: it never writes over the static data or the heap.
+/// A recursion deeper than a board's stack stops at the guard below it with
+/// the hosted build's line and status (boards spec D3), after the output
+/// already written, at both levels: it never writes over the static data or the
+/// heap.
 #[test]
-fn a_stack_overflow_on_a_cortex_m3_is_named() {
+fn a_stack_overflow_on_the_boards_is_named() {
     let src = "fn deep(n: Int, a: Int, b: Int) -> Int { if n == 0 { a - b } else { 1 + deep(n - 1, b, a + 1) } }\n\
                pub fn main() -> Int { io.println(\"before\")  deep(1000000, 1, 2) }\n";
-    let (hosted, board) = hosted_and_board("overflow", src);
+    let (hosted, runs) = hosted_and_boards("overflow", src);
     assert_eq!(hosted, ok("before\n999999\n"), "hosted");
-    for (level, run) in ["O2", "O0"].iter().zip(board) {
+    for (what, run) in runs {
         assert_eq!(
             run,
             (
@@ -360,25 +457,52 @@ fn a_stack_overflow_on_a_cortex_m3_is_named() {
                 "elya: native stack overflow: recursion deeper than the 1024 KiB stack\n"
                     .to_string()
             ),
-            "the board, {level}"
+            "{what}"
         );
     }
 }
 
-/// A machine with no Elya back end is refused by name, not by LLVM ending the
-/// process: LLVM 18's RISC-V back end has no `tailcc` (spec D5).
+/// The examples: async, structured concurrency, multi-shot search, replay,
+/// `with any` recording, failure as an effect, a CEK machine. Each writes on
+/// each board what it writes hosted.
 #[test]
-fn a_risc_v_board_is_refused_by_name() {
-    let dir = temp_dir("riscv");
+fn the_examples_on_the_boards_write_what_they_write_hosted() {
+    let dir = manifest().join("../../examples");
+    let mut names: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("examples")
+        .map(|e| e.expect("an example").path())
+        .filter(|p| p.extension().map(|e| e == "elya").unwrap_or(false))
+        .collect();
+    names.sort();
+    assert!(names.len() >= 10, "{names:?}");
+    for path in names {
+        let tag = path
+            .file_stem()
+            .expect("a name")
+            .to_string_lossy()
+            .into_owned();
+        let src = std::fs::read_to_string(&path).expect("read");
+        let (hosted, runs) = hosted_and_boards(&tag, &src);
+        assert_eq!(hosted.0, 0, "{tag}: hosted {hosted:?}");
+        for (what, run) in runs {
+            assert_eq!(run, hosted, "{what}");
+        }
+    }
+}
+
+/// A machine with no Elya back end is refused by name, not by LLVM.
+#[test]
+fn another_machine_is_refused_by_name() {
+    let dir = temp_dir("other");
     let core = lower("pub fn main() -> Int { 1 }\n");
-    let rv = Machine {
-        triple: "riscv32-unknown-none-elf".into(),
-        cpu: "generic-rv32".into(),
-        features: "+m,+a,+c".into(),
+    let other = Machine {
+        triple: "aarch64-unknown-none".into(),
+        cpu: String::new(),
+        features: String::new(),
     };
-    let r = elya_codegen::compile_module_for(&core, &dir.join("p.o"), Optimise::Speed, &rv);
+    let r = elya_codegen::compile_module_for(&core, &dir.join("p.o"), Optimise::Speed, &other);
     assert!(
-        matches!(r, Err(CodegenError::Unsupported(m)) if m.contains("32-bit ARM")),
+        matches!(r, Err(CodegenError::Unsupported(m)) if m.contains("32-bit RISC-V")),
         "{r:?}"
     );
     std::fs::remove_dir_all(&dir).ok();

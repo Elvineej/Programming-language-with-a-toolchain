@@ -17,6 +17,7 @@ elya = { path = "../.." }
 inkwell = { version = "0.5", default-features = false, features = ["llvm18-0", "target-x86"] }
 
 [features]
-# Code for boards (spec 2026-11-13-elya-boards): LLVM's ARM back end, which the
-# LLVM linked must have (the official releases do; a vcpkg x86-only one does not).
-boards = ["inkwell/target-arm"]
+# Code for boards (specs 2026-11-13-elya-boards, 2026-11-14-elya-riscv-board):
+# LLVM's ARM and RISC-V back ends, which the LLVM linked must have (the official
+# releases do; a vcpkg x86-only one does not).
+boards = ["inkwell/target-arm", "inkwell/target-riscv"]

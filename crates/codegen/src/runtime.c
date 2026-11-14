@@ -353,7 +353,7 @@ int64_t elya_eq(void *a, void *b, int64_t string_tag, int64_t first_closure_tag)
         work[top++] = (int64_t)(y);                                                    \
         work[top++] = (heap);                                                          \
     } while (0)
-    EQ_PUSH((intptr_t)a, (intptr_t)b, 1);
+    EQ_PUSH(ELYA_WORD(a), ELYA_WORD(b), 1);
     while (top > 0) {
         int64_t heap = work[--top];
         int64_t yw = work[--top];
@@ -1102,7 +1102,7 @@ int64_t elya_any_decode(int64_t string_tag, const int64_t *t, const char *names,
         case ANY_BOOL: d.word = l->i ? 1 : 0; break;
         case ANY_UNIT: d.word = 0; break;
         case ANY_STRING:
-            d.word = (int64_t)(intptr_t)elya_str_lit(string_tag, l->s ? l->s : "", l->slen);
+            d.word = ELYA_WORD(elya_str_lit(string_tag, l->s ? l->s : "", l->slen));
             d.heap = 1;
             break;
         case ANY_ADT: {
@@ -1120,7 +1120,7 @@ int64_t elya_any_decode(int64_t string_tag, const int64_t *t, const char *names,
             for (int q = 0; q < pops; q++) {
                 elya_gc_pop();
             }
-            d.word = (int64_t)(intptr_t)obj;
+            d.word = ELYA_WORD(obj);
             d.heap = 1;
             break;
         }
@@ -1565,7 +1565,7 @@ static int64_t elya_handle_end_block[2] = {-1, 0};
 void *elya_handle_end = &elya_handle_end_block[0];
 
 void elya_handle_end_init(void *code) {
-    elya_handle_end_block[1] = (int64_t)(intptr_t)code;
+    elya_handle_end_block[1] = ELYA_WORD(code);
 }
 
 /* 5b-8 D13: one-shot is enforced natively. A second resume stops here -- a
@@ -1719,13 +1719,13 @@ void *elya_cont_copy(void *cont, int64_t hlo, int64_t hhi) {
         i++;
     }
     for (i = 0; i + 1 < n; i++) {
-        copy[i][CONT_PARENT] = (int64_t)(intptr_t)copy[i + 1];
+        copy[i][CONT_PARENT] = ELYA_WORD(copy[i + 1]);
     }
     int64_t *fresh = (int64_t *)elya_alloc(4);
     fresh[0] = c[0];
     fresh[1] = c[1];
-    fresh[2] = (int64_t)(intptr_t)copy[n - 1];
-    fresh[3] = (int64_t)(intptr_t)copy[0];
+    fresh[2] = ELYA_WORD(copy[n - 1]);
+    fresh[3] = ELYA_WORD(copy[0]);
     gc_in_cont_copy = 0;
     for (i = 0; i <= n; i++) {
         elya_gc_pop();
