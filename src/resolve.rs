@@ -31,11 +31,25 @@ pub const FLOAT_CONVERSIONS: &[&str] = &["of_int", "truncate", "round"];
 /// `slice : fn(String, Int, Int) -> String`, all pure.
 pub const STRING_BUILTINS: &[&str] = &["length", "byte_at", "slice"];
 
+/// The host's `io.*` builtins besides `println` (spec
+/// 2026-11-14-elya-files-and-arguments D1), each performing `IO`:
+/// `read_file : fn(String) -> String`, `file_exists : fn(String) -> Bool`,
+/// `write_file : fn(String, String) -> Unit`, `read_stdin : fn() -> String`,
+/// `arg_count : fn() -> Int`, `arg : fn(Int) -> String`.
+pub const IO_BUILTINS: &[&str] = &[
+    "read_file",
+    "file_exists",
+    "write_file",
+    "read_stdin",
+    "arg_count",
+    "arg",
+];
+
 /// How many arguments a builtin takes (every name in [`builtins`]).
 pub fn builtin_arity(full: &str) -> usize {
     match full {
-        "time.now_ms" => 0,
-        "op.encode" | "op.decode" | "string.byte_at" => 2,
+        "time.now_ms" | "io.read_stdin" | "io.arg_count" => 0,
+        "op.encode" | "op.decode" | "string.byte_at" | "io.write_file" => 2,
         "string.slice" => 3,
         f if f
             .strip_prefix("int.")
@@ -50,6 +64,14 @@ pub fn builtin_arity(full: &str) -> usize {
 pub fn builtins() -> &'static [&'static str] {
     &[
         "io.println",
+        // Files, standard input and arguments (2026-11-14, spec
+        // 2026-11-14-elya-files-and-arguments D1).
+        "io.read_file",
+        "io.file_exists",
+        "io.write_file",
+        "io.read_stdin",
+        "io.arg_count",
+        "io.arg",
         "int.to_string",
         // A float's literal text (2026-10-23, spec 2026-10-23-elya-float-natively D5).
         "float.to_string",

@@ -361,9 +361,8 @@ impl<'a> Parser<'a> {
                 _ => true,
             }
         };
-        for i in start..self.pos {
-            let k = self.tokens[i].kind.clone();
-            push_or_pop(&mut open, &k);
+        for t in &self.tokens[start..self.pos] {
+            push_or_pop(&mut open, &t.kind);
         }
         let mut first = self.pos == start;
         while let Some(k) = self.peek().cloned() {

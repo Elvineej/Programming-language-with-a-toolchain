@@ -1,10 +1,12 @@
 // elya/host: the standard effects given their meaning by the host (spec
-// docs/superpowers/specs/2026-10-24-elya-capabilities-part-3-design.md). Its
-// handlers perform `IO`, so an import of it needs `/ {IO}`: only a file that
-// holds the host's `IO` can turn `Console` or `WallClock` into it.
+// docs/superpowers/specs/2026-10-24-elya-capabilities-part-3-design.md; the
+// files, spec 2026-11-14-elya-files-and-arguments D6). Its handlers perform
+// `IO`, so an import of it needs `/ {IO}`: only a file that holds the host's
+// `IO` can turn `Console`, `WallClock` or `Files` into it.
 
 import elya/console / {Console}
 import elya/clock / {WallClock}
+import elya/files / {Files}
 
 // `body`'s lines are printed.
 pub fn console(body) {
@@ -14,4 +16,13 @@ pub fn console(body) {
 // `body` reads the host's clock.
 pub fn clock(body) {
   handle { body() } with { WallClock.wall_clock_ms() -> resume(time.now_ms()) }
+}
+
+// `body`'s files are the host's.
+pub fn files(body) {
+  handle { body() } with {
+    Files.read_file(path) -> resume(io.read_file(path))
+    Files.write_file(path, text) -> resume(io.write_file(path, text))
+    Files.file_exists(path) -> resume(io.file_exists(path))
+  }
 }

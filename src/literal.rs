@@ -208,6 +208,23 @@ pub fn decode(info: &TypeInfo, op: &str, text: &str) -> Result<Value, String> {
     Ok(v)
 }
 
+/// A string literal's value, when `text` is exactly one: a replay's answer of
+/// type `String` (spec 2026-11-14-elya-files-and-arguments D3). The native
+/// runtime reads the same (`trace_string`).
+pub fn read_string(text: &str) -> Option<String> {
+    let mut p = Parser {
+        s: text.as_bytes(),
+        i: 0,
+    };
+    if p.peek() != Some(b'"') {
+        return None;
+    }
+    match p.string() {
+        Ok(Value::Str(s)) if p.i == p.s.len() => Some(s.to_string()),
+        _ => None,
+    }
+}
+
 pub(crate) fn mentions(ann: &TypeAnn, name: &str) -> bool {
     let mut stack = vec![ann];
     while let Some(a) = stack.pop() {

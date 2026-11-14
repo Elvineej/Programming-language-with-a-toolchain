@@ -1,0 +1,88 @@
+// elya/files: a program's files as an effect, and handlers that give a
+// dependency less than the host's `IO` (spec
+// docs/superpowers/specs/2026-11-14-elya-files-and-arguments-design.md D6).
+// First drafted by ChatGPT (OpenAI) to Claude's brief; checked and changed here.
+//
+// A module that reads or writes files performs `Files` and is granted
+// `/ {Files}`, never `IO`; whoever imports it decides what the files are. No
+// handler here performs anything but `Files`, so this module needs nothing
+// else granted (a handler that logs each use would need `Console` granted by
+// every importer: it is left to the program, over `elya/console`). The host's
+// handler is `elya/host`'s `files`.
+
+effect Files {
+  fn read_file(path: String) -> String
+  fn write_file(path: String, text: String) -> Unit
+  fn file_exists(path: String) -> Bool
+}
+
+// Files by path, the newest write in place.
+type FilesMap { FilesEmpty, FilesEntry(String, String, FilesMap) }
+
+// How a body run over a `FilesMap` ended: its value and the files it left, or
+// the read of a path the map does not hold, where it stopped (as a run on the
+// host stops there), and the files as they were then.
+type FilesRun(a) { FilesRun(a, FilesMap), FilesMissing(String, FilesMap) }
+
+// How a body run read-only ended: its value, or the path of its first write,
+// where it stopped.
+type FilesReadOnly(a) { FilesReadOnlyOk(a), FilesReadOnlyDenied(String) }
+
+fn files_has(files: FilesMap, path: String) -> Bool {
+  match files {
+    FilesEmpty -> False
+    FilesEntry(name, _, rest) -> if name == path { True } else { files_has(rest, path) }
+  }
+}
+
+fn files_get(files: FilesMap, path: String) -> String {
+  match files {
+    FilesEmpty -> ""
+    FilesEntry(name, text, rest) -> if name == path { text } else { files_get(rest, path) }
+  }
+}
+
+fn files_put(files: FilesMap, path: String, text: String) -> FilesMap {
+  match files {
+    FilesEmpty -> FilesEntry(path, text, FilesEmpty)
+    FilesEntry(name, old, rest) ->
+      if name == path { FilesEntry(name, text, rest) } else { FilesEntry(name, old, files_put(rest, path, text)) }
+  }
+}
+
+// `body` over the files `files` holds, in memory: `FilesRun(value, files
+// after)`, or `FilesMissing(path, files)` at the first read of a path it
+// does not hold.
+pub fn in_memory(files: FilesMap, body) {
+  let run = handle { body() } with {
+    Files.read_file(path) -> fn(now) {
+      if files_has(now, path) { resume(files_get(now, path))(now) } else { FilesMissing(path, now) }
+    }
+    Files.write_file(path, text) -> fn(now) { resume(Unit)(files_put(now, path, text)) }
+    Files.file_exists(path) -> fn(now) { resume(files_has(now, path))(now) }
+    return(x) -> fn(now) { FilesRun(x, now) }
+  }
+  run(files)
+}
+
+// `body` may read the files outside, and stops at its first write:
+// `FilesReadOnlyOk(value)` or `FilesReadOnlyDenied(path)`.
+pub fn read_only(body) {
+  handle { body() } with {
+    Files.read_file(path) -> resume(read_file(path))
+    Files.write_file(path, text) -> FilesReadOnlyDenied(path)
+    Files.file_exists(path) -> resume(file_exists(path))
+    return(x) -> FilesReadOnlyOk(x)
+  }
+}
+
+// `body`'s paths are `prefix` and the path, outside. The prefix is put in
+// front as text: a path holding `..` can leave it, so this names a place, it
+// does not guard one.
+pub fn under(prefix: String, body) {
+  handle { body() } with {
+    Files.read_file(path) -> resume(read_file(prefix <> path))
+    Files.write_file(path, text) -> resume(write_file(prefix <> path, text))
+    Files.file_exists(path) -> resume(file_exists(prefix <> path))
+  }
+}

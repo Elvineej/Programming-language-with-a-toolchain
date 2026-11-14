@@ -24,7 +24,19 @@ fn files(program: &str) -> impl FnMut(&str) -> Option<(String, String)> {
 const COMPILER_STACK: usize = 1 << 30;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
+    // `std::env::args` panics on an argument that is not UTF-8: say so by name
+    // instead (a native binary fails only when the program reads it, spec
+    // 2026-11-14-elya-files-and-arguments D2).
+    let mut args: Vec<String> = Vec::new();
+    for (i, a) in std::env::args_os().enumerate() {
+        match a.into_string() {
+            Ok(a) => args.push(a),
+            Err(a) => {
+                eprintln!("error: argument {i} is not UTF-8: {}", a.to_string_lossy());
+                return ExitCode::from(2);
+            }
+        }
+    }
     let shared = std::sync::Arc::new(args);
     let for_thread = std::sync::Arc::clone(&shared);
     let worker = std::thread::Builder::new()
@@ -45,6 +57,18 @@ fn main() -> ExitCode {
 }
 
 fn dispatch(args: &[String]) -> ExitCode {
+    // `elya run ... -- <args>`: what follows the first `--` is the program's
+    // (spec 2026-11-14-elya-files-and-arguments D4), never a flag of ours.
+    let (args, program) = match args.iter().position(|a| a == "--") {
+        Some(i) if args.get(1).map(String::as_str) == Some("run") => {
+            (&args[..i], Some(args[i + 1..].to_vec()))
+        }
+        _ => (args, None),
+    };
+    let host = elya::eval::Host {
+        args: program.clone().unwrap_or_default(),
+        stdin: None,
+    };
     match args.get(1).map(String::as_str) {
         Some("run")
             if matches!(
@@ -52,29 +76,37 @@ fn dispatch(args: &[String]) -> ExitCode {
                 Some("--record" | "--replay")
             ) =>
         {
-            trace_cmd(args)
+            if args[2] == "--replay" && program.is_some() {
+                eprintln!("error: a replay's arguments are its trace's: `--` and what follows it are for a live run");
+                eprintln!("usage: elya run --replay <trace> <file.elya>");
+                return ExitCode::from(2);
+            }
+            trace_cmd(args, host)
         }
-        Some("run") if args.get(2).map(String::as_str) == Some("--value") => value_cmd(args),
+        Some("run") if args.get(2).map(String::as_str) == Some("--value") => value_cmd(args, host),
         Some("run") if args.len() > 3 => {
-            eprintln!("usage: elya run <file.elya>  (flags go before the program: elya run --record <trace> <file.elya>)");
+            eprintln!("usage: elya run <file.elya> [-- <args>...]  (flags go before the program: elya run --record <trace> <file.elya>)");
             ExitCode::from(2)
         }
-        Some("run") => cmd(args, true),
-        Some("check") => cmd(args, false),
+        Some("run") => cmd(args, Some(host)),
+        Some("check") => cmd(args, None),
         #[cfg(feature = "codegen")]
         Some("build") => build_cmd(args),
         _ => {
             eprintln!("usage: elya <run|check|build> <file.elya>");
+            eprintln!("       elya run <file.elya> [-- <args>...]");
             eprintln!("       elya build <file.elya> [-o <out>] [--target host|cortex-m3|riscv32]");
-            eprintln!("       elya run --value <file.elya>");
-            eprintln!("       elya run --record <trace> <file.elya>");
+            eprintln!("       elya run --value <file.elya> [-- <args>...]");
+            eprintln!("       elya run --record <trace> <file.elya> [-- <args>...]");
             eprintln!("       elya run --replay <trace> <file.elya>");
             ExitCode::from(2)
         }
     }
 }
 
-fn cmd(args: &[String], run: bool) -> ExitCode {
+/// `elya check <file>` (`host` None) or `elya run <file>`, its program given
+/// `host`'s arguments.
+fn cmd(args: &[String], host: Option<elya::eval::Host>) -> ExitCode {
     let Some(path) = args.get(2) else {
         eprintln!("error: missing file path");
         return ExitCode::from(2);
@@ -86,9 +118,9 @@ fn cmd(args: &[String], run: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if run {
+    if let Some(host) = host {
         // D1: the output a failing run produced is printed before its error.
-        let o = elya::run_source_outcome_with(path, &text, &mut files(path));
+        let o = elya::run_source_outcome_host(path, &text, &mut files(path), host);
         print!("{}", o.output);
         match o.error {
             None => {
@@ -118,9 +150,9 @@ fn cmd(args: &[String], run: bool) -> ExitCode {
 /// `elya run --value <file.elya>` (spec 2026-10-16-elya-differential-sweep,
 /// D2): `elya run`, then main's value as the native shim prints it, so an
 /// evaluator run and a native run compare byte for byte.
-fn value_cmd(args: &[String]) -> ExitCode {
+fn value_cmd(args: &[String], host: elya::eval::Host) -> ExitCode {
     let (Some(path), None) = (args.get(3), args.get(4)) else {
-        eprintln!("usage: elya run --value <file.elya>");
+        eprintln!("usage: elya run --value <file.elya> [-- <args>...]");
         return ExitCode::from(2);
     };
     let text = match std::fs::read_to_string(path) {
@@ -130,7 +162,7 @@ fn value_cmd(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let o = elya::run_source_outcome_with(path, &text, &mut files(path));
+    let o = elya::run_source_outcome_host(path, &text, &mut files(path), host);
     print!("{}", o.output);
     if let Some(diags) = o.error {
         eprint!("{diags}");
@@ -300,7 +332,7 @@ fn build_cmd(args: &[String]) -> ExitCode {
 /// `elya run --record <trace> <file.elya>` and `elya run --replay <trace>
 /// <file.elya>` (spec 2026-10-16-elya-cli-record-replay): the trace is the
 /// host's answers; a replay reproduces the run or stops by name.
-fn trace_cmd(args: &[String]) -> ExitCode {
+fn trace_cmd(args: &[String], host: elya::eval::Host) -> ExitCode {
     // Exactly `run <flag> <trace> <file.elya>`: a flag after the program, an
     // extra argument, or a trace path that is a flag or the program itself
     // is a usage error (the record-replay review's findings).
@@ -325,7 +357,7 @@ fn trace_cmd(args: &[String]) -> ExitCode {
     // Spec 2026-10-23-elya-traced-run-output D1: the program's output on stdout,
     // failing or not, then the error on stderr, as `elya run` and a native binary.
     let o = if flag == "--record" {
-        let (log, o) = elya::record_source_with(path, &text, &mut files(path));
+        let (log, o) = elya::record_source_host(path, &text, &mut files(path), host);
         // Written even when the run fails: that run is the one to replay.
         if let Some(log) = log {
             if let Err(e) = std::fs::write(trace, log) {
