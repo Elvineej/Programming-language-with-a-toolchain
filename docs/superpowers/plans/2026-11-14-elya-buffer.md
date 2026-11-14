@@ -38,15 +38,17 @@ Base: `main` after the lexer in Elya lands (part 3, begun early).
   and for a type holding one, E0400, a `String` where a `Buffer` is wanted);
   linear time in the evaluator (200,000 appends within fourteen times
   25,000's).
-- `crates/codegen/tests/native_buffer.rs` (new, 2): the evaluator's output
-  natively, also with `ELYA_GC_STRESS=1`; linear natively (800,000 appends
-  under 2 s, within ten times 200,000's).
+- `crates/codegen/tests/native_buffer.rs` (new, 3): the evaluator's output
+  natively, also with `ELYA_GC_STRESS=1`; a buffer as main's value stopping
+  by name, the same words on both back ends (found while checking: natively
+  it was an internal error, so the reflection table gained `KIND_BUFFER`);
+  linear natively (800,000 appends under 2 s, within ten times 200,000's).
 - `crates/codegen/tests/native_boards.rs`: the same program on both boards (a
   twelfth program in an existing test).
 
 ## Predictions
 
-- Gate, configurations A and B: 1570 + 2 x 3 + 2 = **1578 passed, 174
+- Gate, configurations A and B: 1570 + 2 x 3 + 3 = **1579 passed, 174
   suites** (171 + 2 + 1). Configuration C: **8 passed, 2 suites** (unchanged:
   one more program inside an existing test).
 - No existing expectation changes.

@@ -548,7 +548,7 @@ void *elya_float_to_string(int64_t tag, int64_t bits) {
  * value of exists. Every walk keeps its own stack: a million-cell list neither
  * recurses nor overflows. Failures carry the evaluator's words. */
 
-enum { ANY_INT, ANY_BOOL, ANY_UNIT, ANY_STRING, ANY_FN, ANY_ADT, ANY_UNBUILT, ANY_FLOAT };
+enum { ANY_INT, ANY_BOOL, ANY_UNIT, ANY_STRING, ANY_FN, ANY_ADT, ANY_UNBUILT, ANY_FLOAT, ANY_BUFFER };
 
 static void any_oom(void) {
     rt_puts(2, "elya: out of memory\n");
@@ -673,6 +673,10 @@ void *elya_any_show(int64_t string_tag, const int64_t *t, const char *names, int
             elya_platform_flush();
             rt_printf(2, "elya: %sa function%s\n", before, after);
             elya_platform_exit(1);
+        case ANY_BUFFER:
+            elya_platform_flush();
+            rt_printf(2, "elya: %sa buffer%s\n", before, after);
+            elya_platform_exit(1);
         case ANY_ADT: {
             int64_t *p = (int64_t *)(intptr_t)it.value;
             int64_t c = any_ctor(t, it.node, p[0]);
@@ -719,6 +723,7 @@ int64_t elya_any_check(const int64_t *t, int64_t node, int64_t value) {
         Item it = stack[--top];
         switch (t[it.node]) {
         case ANY_FN:
+        case ANY_BUFFER:
             rt_puts(2, "elya: `==` reached a value that is not data (E0436 should have rejected it)\n");
             elya_platform_exit(1);
         case ANY_ADT: {
@@ -1067,7 +1072,8 @@ static int any_conforms(AnyParser *p, const int64_t *t, const char *names, int64
         case ANY_BOOL: ok = l->kind == LIT_BOOL; break;
         case ANY_UNIT: ok = l->kind == LIT_UNIT; break;
         case ANY_STRING: ok = l->kind == LIT_STR; break;
-        case ANY_FN: ok = 0; break;
+        case ANY_FN:
+        case ANY_BUFFER: ok = 0; break;
         case ANY_ADT: {
             ok = 0;
             if (l->kind != LIT_CTOR) {

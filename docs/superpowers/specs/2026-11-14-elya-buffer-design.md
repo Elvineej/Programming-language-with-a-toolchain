@@ -37,7 +37,9 @@ against the sources it cites where they decide anything below) and ranked
 **D1. `Buffer`, a builtin linear type, opaque:** no constructors, no
 patterns; `Buffer` names it in an annotation. It is not duplicable (E0428,
 E0429 apply as to any `linear type`), not comparable (`==` refuses it, as a
-function), and `any` cannot carry it (`op.encode` refuses it by name).
+function), its name is reserved (E0211: a declared `type Buffer` would be
+the same type to inference, and its values forged buffers natively; the
+review's finding), and `any` cannot carry it (`op.encode` refuses it by name).
 
 **D2. Three builtins, pure (no effect):**
 

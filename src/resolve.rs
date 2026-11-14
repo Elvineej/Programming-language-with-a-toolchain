@@ -241,6 +241,18 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
             }
             Decl::Type(t) => {
                 dup("type", &t.name, d.span, &mut dup_diags);
+                // `Buffer` is the builtin's name (spec 2026-11-14-elya-buffer
+                // D1): a declared type of that name would be the same type to
+                // inference, and its values forged buffers (the review's P1).
+                if t.name == "Buffer" {
+                    dup_diags.push(
+                        Diagnostic::error("E0211", "`Buffer` is a builtin type")
+                            .with_label(d.span, "this declares a type named `Buffer`")
+                            .with_help(
+                                "`Buffer` is the linear text buffer of `buffer.new`, `buffer.push` and `buffer.finish`: give this type another name",
+                            ),
+                    );
+                }
                 for v in &t.variants {
                     dup("constructor", &v.node.name, v.span, &mut dup_diags);
                     ctor_names.insert(v.node.name.clone());

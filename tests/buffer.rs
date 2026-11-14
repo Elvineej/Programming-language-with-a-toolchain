@@ -60,6 +60,12 @@ fn a_buffer_is_used_once_and_is_not_data() {
             "a `Buffer`",
         ),
         (
+            // The review's P1: a declared `Buffer` would forge one.
+            "type Buffer { Forged(Int, Int) }\npub fn main() -> String { buffer.finish(buffer.push(Forged(0, 64), \"hi\")) }\n",
+            "E0211",
+            "`Buffer` is a builtin type",
+        ),
+        (
             "pub fn main() -> Buffer(Int) { buffer.new() }\n",
             "E0400",
             "takes no type arguments",

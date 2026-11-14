@@ -49,6 +49,28 @@ fn buffers_natively_are_the_evaluators_under_a_collection_at_every_allocation() 
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A buffer is not data: as main's value it stops by name, the same words
+/// on both back ends (as a function does).
+#[test]
+fn a_buffer_as_mains_value_stops_by_name() {
+    let dir = temp_dir("main");
+    let src = "pub fn main() -> Buffer { buffer.push(buffer.new(), \"x\") }\n";
+    let out = Command::new(build(src, &dir, "main"))
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(e, "elya: main's value is a buffer, which is not data\n");
+    let o = elya::run_source_outcome_with("t.elya", src, &mut |_| None);
+    assert_eq!(
+        o.line,
+        Some(Err(
+            "main's value is a buffer, which is not data".to_string()
+        ))
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn building_text_with_a_buffer_is_linear_natively() {
     let dir = temp_dir("linear");
