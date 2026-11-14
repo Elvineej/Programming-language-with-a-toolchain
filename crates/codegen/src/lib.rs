@@ -3081,9 +3081,36 @@ pub fn emit_ir(core: &CoreModule) -> Result<String, CodegenError> {
     Ok(module.print_to_string().to_string())
 }
 
+/// The longest function, in LLVM instructions, the passes are run over.
+const OPTIMISE_AT_MOST: usize = 10_000;
+
+/// How much the generated code is optimised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Optimise {
+    /// LLVM's `default<O2>` passes and its optimising instruction selection:
+    /// what a program is built with.
+    Speed,
+    /// No pass: the IR as the back end wrote it (what every build was before
+    /// 2026-11-13). For looking at that IR's code, and for the tests that pin
+    /// it.
+    None,
+}
+
 /// Core -> object file on disk. The spine (§3.6): host triple only,
 /// `OptimizationLevel::None`, `verify()` before emission.
 pub fn compile_module(core: &CoreModule, obj_path: &Path) -> Result<(), CodegenError> {
+    compile_module_with(core, obj_path, Optimise::Speed)
+}
+
+/// `compile_module` at a chosen level (spec 2026-11-13-elya-optimised-code).
+/// The passes are safe by the back end's construction: every heap value live
+/// across a call is on the shadow stack, in memory LLVM does not own; the
+/// collector moves nothing; tail calls are `musttail`.
+pub fn compile_module_with(
+    core: &CoreModule,
+    obj_path: &Path,
+    optimise: Optimise,
+) -> Result<(), CodegenError> {
     let ctx = Context::create();
     let module = build_module(&ctx, core)?;
 
@@ -3095,11 +3122,52 @@ pub fn compile_module(core: &CoreModule, obj_path: &Path) -> Result<(), CodegenE
             &triple,
             "",
             "",
-            OptimizationLevel::None,
+            match optimise {
+                Optimise::Speed => OptimizationLevel::Default,
+                Optimise::None => OptimizationLevel::None,
+            },
             RelocMode::Default,
             CodeModel::Default,
         )
         .ok_or_else(|| internal("no host target machine"))?;
+    if optimise == Optimise::Speed {
+        // A function too long for a person to have written is left as written:
+        // LLVM's instruction combiner is quadratic in a block chain's length
+        // (measured: 117 s for one function of a 5,000-`let` block, 100,000
+        // instructions), and building stays linear in a program's size (the
+        // scalability work's rule). `optnone` asks `noinline` with it.
+        let ctx = module.get_context();
+        let attr = |name: &str| {
+            ctx.create_enum_attribute(
+                inkwell::attributes::Attribute::get_named_enum_kind_id(name),
+                0,
+            )
+        };
+        for f in module.get_functions() {
+            let instructions: usize = f
+                .get_basic_block_iter()
+                .map(|b| b.get_instructions().count())
+                .sum();
+            if instructions > OPTIMISE_AT_MOST {
+                f.add_attribute(inkwell::attributes::AttributeLoc::Function, attr("optnone"));
+                f.add_attribute(
+                    inkwell::attributes::AttributeLoc::Function,
+                    attr("noinline"),
+                );
+            }
+        }
+        module
+            .run_passes(
+                "default<O2>",
+                &machine,
+                inkwell::passes::PassBuilderOptions::create(),
+            )
+            .map_err(internal)?;
+        // A pass that broke the module is this back end's bug to hear of here.
+        module
+            .verify()
+            .map_err(|e| CodegenError::Verify(e.to_string()))?;
+    }
     machine
         .write_to_file(&module, FileType::Object, obj_path)
         .map_err(internal)

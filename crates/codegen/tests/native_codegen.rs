@@ -6055,12 +6055,13 @@ fn a_native_stack_overflow_is_named() {
 fn elya_stack_mib_sets_the_stack_and_is_checked() {
     let dir = temp_dir("deep-knob");
     let exe = compile_and_link(&lower_src(&deep_src("len", 200_000)), &dir, "len");
-    // Under 8 MiB, 200 000 frames overflow (measured limit about 130 000), by name.
-    let small = run_with_stack(&exe, "8");
+    // Under 2 MiB, 200 000 frames overflow, by name (8 MiB held about 130 000
+    // of the unoptimised frames; the optimised ones are smaller and all fit).
+    let small = run_with_stack(&exe, "2");
     assert_eq!(small.status.code(), Some(1), "{:?}", small.status);
     assert_eq!(
         String::from_utf8_lossy(&small.stderr).trim_end(),
-        OVERFLOW_LINE
+        "elya: native stack overflow: recursion deeper than the 2 MiB stack"
     );
     // Under the default they run.
     let big = run_default_stack(&exe);
