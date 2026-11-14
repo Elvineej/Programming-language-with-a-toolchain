@@ -3185,7 +3185,35 @@ pub fn compile_module_for(
     for_machine: &Machine,
 ) -> Result<(), CodegenError> {
     let ctx = Context::create();
-    let module = build_module(&ctx, core)?;
+    let (module, machine) = module_for(&ctx, core, optimise, for_machine)?;
+    machine
+        .write_to_file(&module, FileType::Object, obj_path)
+        .map_err(internal)
+}
+
+/// The IR `compile_module_for` turns into machine code: after the passes and,
+/// on a board, its calling convention's rewriting. What a test reads to see
+/// what the optimiser did, the same on every host (an object's size is not:
+/// Windows' unwind tables and alignment made `sum` larger optimised).
+pub fn emit_ir_for(
+    core: &CoreModule,
+    optimise: Optimise,
+    for_machine: &Machine,
+) -> Result<String, CodegenError> {
+    let ctx = Context::create();
+    let (module, _) = module_for(&ctx, core, optimise, for_machine)?;
+    Ok(module.print_to_string().to_string())
+}
+
+/// The module for a machine, ready for its code: built, given the machine's
+/// triple and data layout, optimised as asked, rewritten for a board.
+fn module_for<'ctx>(
+    ctx: &'ctx Context,
+    core: &CoreModule,
+    optimise: Optimise,
+    for_machine: &Machine,
+) -> Result<(Module<'ctx>, TargetMachine), CodegenError> {
+    let module = build_module(ctx, core)?;
 
     let (triple, reloc) = if for_machine.is_host() {
         Target::initialize_native(&InitializationConfig::default()).map_err(internal)?;
@@ -3277,14 +3305,12 @@ pub fn compile_module_for(
     }
     // Last, after the optimiser, so no pass sees (or removes) the padding.
     if for_machine.is_arm32() {
-        arm_tail::pad_tail_calls(&ctx, &module)?;
+        arm_tail::pad_tail_calls(ctx, &module)?;
         module
             .verify()
             .map_err(|e| CodegenError::Verify(e.to_string()))?;
     }
-    machine
-        .write_to_file(&module, FileType::Object, obj_path)
-        .map_err(internal)
+    Ok((module, machine))
 }
 
 /// The runtime (runtime.c, and the collector it includes, gc.c), compiled

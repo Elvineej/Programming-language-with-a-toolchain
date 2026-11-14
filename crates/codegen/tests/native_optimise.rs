@@ -164,28 +164,45 @@ fn optimised_and_unoptimised_code_write_the_same() {
     }
 }
 
-/// The passes ran: the counting loop and the trial division (a call inlined,
-/// locals out of their stack slots) are smaller objects optimised than as
-/// written.
+/// The passes ran: in the counting loop and the trial division, the call to
+/// `remainder` is inlined and the tail call to the function itself is a loop,
+/// as written they are calls. Read from the IR the object is made from, which
+/// is the same on every host (the object's size was the measure, and Windows'
+/// unwind tables made `sum` the larger optimised: the loop is inlined into
+/// `main` and `elya_entry` too).
 #[test]
-fn the_optimised_object_is_the_smaller() {
+fn the_passes_inline_and_loop() {
     for (tag, src, _) in PROGRAMS
         .iter()
-        .filter(|(tag, _, _)| ["fib", "sum", "primes"].contains(tag))
+        .filter(|(tag, _, _)| ["sum", "primes"].contains(tag))
     {
-        let dir = temp_dir(&format!("size-{tag}"));
+        let looping = if *tag == "sum" { "go" } else { "prime" };
         let core = lower(src);
-        let size = |o: Optimise| {
-            let obj = dir.join(format!("{o:?}.o"));
-            elya_codegen::compile_module_with(&core, &obj, o).expect("compile");
-            std::fs::metadata(&obj).expect("object").len()
+        let body = |o: Optimise| {
+            let ir =
+                elya_codegen::emit_ir_for(&core, o, &elya_codegen::Machine::host()).expect("emit");
+            let head = format!("@elya.{looping}(");
+            let start = ir
+                .lines()
+                .position(|l| l.starts_with("define") && l.contains(&head))
+                .unwrap_or_else(|| panic!("{tag}: no {head} in {ir}"));
+            let lines: Vec<&str> = ir
+                .lines()
+                .skip(start + 1)
+                .take_while(|l| *l != "}")
+                .collect();
+            lines.join("\n")
         };
-        let (fast, plain) = (size(Optimise::Speed), size(Optimise::None));
+        let (fast, plain) = (body(Optimise::Speed), body(Optimise::None));
+        let calls = |b: &str, f: &str| b.contains(&format!("@elya.{f}("));
         assert!(
-            fast < plain,
-            "{tag}: optimised {fast} bytes, unoptimised {plain}"
+            calls(&plain, "remainder") && calls(&plain, looping),
+            "{tag}: {plain}"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            !calls(&fast, "remainder") && !calls(&fast, looping),
+            "{tag}: {fast}"
+        );
     }
 }
 
