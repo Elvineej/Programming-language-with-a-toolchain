@@ -82,8 +82,24 @@ int main(int argc, char **argv) {
     elya_heap_init(region, sizeof region);
 #endif
     elya_current_handler = &statics.blk[0];
-    elya_gc_setup(descriptors, 4, 0);
+#ifndef STRESS
+#define STRESS 0
+#endif
+    elya_gc_setup(descriptors, 4, STRESS);
     long keep = atol(argv[1]), rounds = atol(argv[2]);
+    if (argc > 3 && argv[3][0] == 'P') {
+        /* Stress mode: a cell no root names is freed by the next allocation's
+         * collection. Read through the stale pointer, it holds the poison;
+         * written through it (`keep`), the next sweep stops the program. */
+        volatile int64_t *stale = (int64_t *)elya_alloc(3);
+        stale[0] = 1;
+        (void)elya_alloc(3);
+        int poisoned = stale[1] == (int64_t)0xDEADBEEFDEADBEEFULL;
+        if (keep) stale[rounds] = 7;
+        (void)elya_alloc(3);
+        printf("poisoned=%d no stale write seen\n", poisoned);
+        return 0;
+    }
     int64_t total = 0;
     int64_t *kept = argc > 3 && argv[3][0] >= '0' && argv[3][0] <= '9' ? tree(atoi(argv[3])) : 0;
     elya_gc_push(kept);
@@ -283,6 +299,34 @@ fn run_board_with(
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),
     )
+}
+
+/// Stress mode (a collection at every allocation): a freed block holds its
+/// poison, and a write through a stale pointer, to any of its words, stops
+/// the program at the next sweep (2026-11-14; it was silent before, and in an
+/// ordinary run corrupts whatever reuses the slot).
+#[test]
+fn a_write_to_a_freed_block_is_caught_under_stress() {
+    let stress = ["-DSTRESS=1"];
+    let (code, out) = run_board_with("stale-read", 64 << 10, 0, 0, &stress, Some("P"));
+    assert_eq!(
+        (code, out.trim_end()),
+        (0, "poisoned=1 no stale write seen")
+    );
+    for word in 0..3 {
+        let (code, out) = run_board_with("stale-write", 64 << 10, 1, word, &stress, Some("P"));
+        assert_eq!(
+            (code, out.trim_end()),
+            (3, "elya: gc stress: a freed block was written"),
+            "word {word}"
+        );
+    }
+    // Without stress the same writes pass unseen: the mode is what catches them.
+    let (code, out) = run_board_with("stale-quiet", 64 << 10, 1, 1, &[], Some("P"));
+    assert_eq!(
+        (code, out.trim_end()),
+        (0, "poisoned=0 no stale write seen")
+    );
 }
 
 /// 64 KiB, no other memory: 2000 lists of 1000 cells (about 6 MB in all) are

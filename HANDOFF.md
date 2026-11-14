@@ -30,7 +30,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1579 passed, 174 suites, and configuration C
+- Linux gate at the tip of `main`: 1580 passed, 174 suites, and configuration C
   (the boards on QEMU; `check.sh` fails without its tools unless
   `ELYA_BOARDS=skip`) 8 passed, 2 suites. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
@@ -793,13 +793,13 @@ programs and `scripts/bench.sh`) is to be run here and landed.
 
 ### 2. A collector for bare metal and for large programs alike
 
-**First here (2026-11-14, from a review the maintainer received and from the
-buffer's control K3):** a reclamation-sensitive stress mode. `ELYA_GC_STRESS`
-poisons freed slots and never reuses them, so a missing root whose slot would
-be reused goes unseen. Add a mode that gives a freed slot to the next
-allocation of its size class, run the native suites under it, and take the
-buffer's K3 (`elya_buffer_finish` without its root) as the first control.
-See docs/ROADMAP.md, "A second review".
+**Done here (2026-11-14, from a review the maintainer received):** under
+`ELYA_GC_STRESS` a freed block is poisoned and kept, and now checked at every
+later sweep: a write through a stale pointer stops the program (`elya: gc
+stress: a freed block was written`). This is what reuse would have shown, made
+certain; a mode that reuses freed slots was weighed and not built (a stale
+read already meets the poison, a stale reachable pointer already stops the
+mark). The buffer's control K3 was not this gap: the emitters root operands.
 
 The maintainer's priority (2026-11-12: "make a gc that is able to use it in bare metal
 aswell effienctly"; "this language covers from bare metal to python so make
