@@ -8,7 +8,9 @@
 
 uintptr_t elya_semihost(uintptr_t op, const uintptr_t *args);
 void elya_heap_init(void *base, size_t bytes);
-int main(void);
+/* The generated `main` takes the arguments; a board has none (spec
+ * 2026-11-14-elya-files-and-arguments D5). */
+int main(int argc, char **argv);
 
 extern unsigned char __heap_start[], __heap_end[];
 
@@ -151,7 +153,7 @@ void elya_platform_sleep_ms(int64_t ms) {
 void elya_board_main(void) {
     elya_board_guard();
     elya_heap_init(__heap_start, (size_t)(__heap_end - __heap_start));
-    elya_platform_exit(main());
+    elya_platform_exit(main(0, 0));
 }
 
 /* The ARM EABI's memory helpers, which a compiler for ARM calls where another

@@ -43,6 +43,17 @@ void *elya_platform_file_open(const char *path);
 int64_t elya_platform_file_read(void *file, char *into, int64_t n);
 void elya_platform_file_close(void *file);
 const char *elya_platform_error(void);
+/* A program's files, input and arguments (spec 2026-11-14-elya-files-and-arguments
+ * D5): its paths are UTF-8. `path_open` is read with `file_read`/`file_close`;
+ * `path_write` writes the whole file, 1 on success; `path_error` is D2's reason
+ * for the failure just met on `path`; `stdin_read` answers 0 at the end, -1 on
+ * a failure; `args` gives the arguments as UTF-8 (and their count). */
+void *elya_platform_path_open(const char *path);
+int elya_platform_path_exists(const char *path);
+int elya_platform_path_write(const char *path, const char *bytes, int64_t n);
+const char *elya_platform_path_error(const char *path);
+int64_t elya_platform_stdin_read(char *into, int64_t n);
+char **elya_platform_args(int argc, char **argv, int *count);
 
 #include "gc.c"
 
@@ -521,6 +532,31 @@ static void any_put(AnyBuf *b, const char *s, int64_t n) {
 
 static void any_puts(AnyBuf *b, const char *s) { any_put(b, s, (int64_t)rt_strlen(s)); }
 
+/* `n` bytes as a string literal, `literal.rs`'s `show`: five escapes, every
+ * other byte as it is. A run of plain bytes is copied at once. */
+static void any_put_lit(AnyBuf *b, const char *bytes, int64_t n) {
+    any_puts(b, "\"");
+    int64_t from = 0;
+    for (int64_t i = 0; i < n; i++) {
+        const char *esc = NULL;
+        switch (bytes[i]) {
+        case '"': esc = "\\\""; break;
+        case '\\': esc = "\\\\"; break;
+        case '\n': esc = "\\n"; break;
+        case '\t': esc = "\\t"; break;
+        case '\r': esc = "\\r"; break;
+        default: break;
+        }
+        if (esc) {
+            any_put(b, bytes + from, i - from);
+            any_puts(b, esc);
+            from = i + 1;
+        }
+    }
+    any_put(b, bytes + from, n - from);
+    any_puts(b, "\"");
+}
+
 /* The constructor entry of `tag` in the declared-type node `node`, or -1. */
 static int64_t any_ctor(const int64_t *t, int64_t node, int64_t tag) {
     int64_t n = t[node + 1];
@@ -576,20 +612,7 @@ void *elya_any_show(int64_t string_tag, const int64_t *t, const char *names, int
             break;
         case ANY_STRING: {
             int64_t *s = (int64_t *)(intptr_t)it.value;
-            int64_t len = s[1];
-            const unsigned char *bytes = (const unsigned char *)&s[2];
-            any_puts(&out, "\"");
-            for (int64_t i = 0; i < len; i++) {
-                switch (bytes[i]) {
-                case '"': any_puts(&out, "\\\""); break;
-                case '\\': any_puts(&out, "\\\\"); break;
-                case '\n': any_puts(&out, "\\n"); break;
-                case '\t': any_puts(&out, "\\t"); break;
-                case '\r': any_puts(&out, "\\r"); break;
-                default: any_put(&out, (const char *)&bytes[i], 1);
-                }
-            }
-            any_puts(&out, "\"");
+            any_put_lit(&out, (const char *)&s[2], s[1]);
             break;
         }
         case ANY_FN:
@@ -1433,19 +1456,24 @@ void elya_trace_finish(void) {
 }
 
 /* The next replayed answer to `q`, or a named divergence. */
-static TraceStr trace_answer(const char *q) {
+/* The answer to the question `q` (`qn` bytes: a string argument may hold a NUL
+ * byte), the next entry's, or the divergence by name. */
+static TraceStr trace_answer_n(const char *q, int64_t qn) {
     int64_t n = elya_trace_next + 1;
+    TraceStr asked = {q, qn};
     if (elya_trace_next >= elya_trace_n) {
         elya_platform_flush();
-        rt_printf(2, "elya: replay diverged at entry %lld: the program asked `%s`, the trace has ended\n",
-                (long long)n, q);
+        rt_printf(2, "elya: replay diverged at entry %lld: the program asked `", (long long)n);
+        trace_put(asked);
+        rt_puts(2, "`, the trace has ended\n");
         elya_platform_exit(1);
     }
     TraceEntry *e = &elya_trace_entries[elya_trace_next];
-    if (!trace_is(e->q, q)) {
+    if (!(e->q.n == qn && memcmp(e->q.p, q, (size_t)qn) == 0)) {
         elya_platform_flush();
-        rt_printf(2, "elya: replay diverged at entry %lld: the program asked `%s`, the trace holds `",
-                (long long)n, q);
+        rt_printf(2, "elya: replay diverged at entry %lld: the program asked `", (long long)n);
+        trace_put(asked);
+        rt_puts(2, "`, the trace holds `");
         trace_put(e->q);
         rt_puts(2, "`\n");
         elya_platform_exit(1);
@@ -1453,6 +1481,8 @@ static TraceStr trace_answer(const char *q) {
     elya_trace_next++;
     return e->a;
 }
+
+static TraceStr trace_answer(const char *q) { return trace_answer_n(q, (int64_t)rt_strlen(q)); }
 
 static void trace_wrong_type(TraceStr a, const char *ty) {
     elya_platform_flush();
@@ -1524,6 +1554,306 @@ static void elya_time_live_sleep_ms(int64_t ms) {
     if (ms > 0) {
         elya_platform_sleep_ms(ms);
     }
+}
+
+/* ---- Files, standard input and arguments (spec 2026-11-14-elya-files-and-arguments).
+ * Each builtin is the evaluator's (`eval.rs`, `io_builtin` and `host_builtin`):
+ * live through the platform's hooks (D5), failing by name in the same words
+ * (D2), recorded and replayed in the same trace (D3). A question holds its
+ * string arguments as literals, so it and its line are built in working memory,
+ * any length; a replay touches no file. Every string argument is rooted first:
+ * on a board working memory is the heap's. */
+
+static char **elya_args;
+static int elya_args_n;
+
+/* The generated `main`'s first call: the process's arguments (a board's
+ * start-up passes none). */
+void elya_args_init(int argc, char **argv) {
+    elya_args = argv ? elya_platform_args(argc, argv, &elya_args_n) : NULL;
+    if (!elya_args || elya_args_n < 0) {
+        elya_args_n = 0;
+    }
+}
+
+/* The program's arguments, not counting the program. */
+static int64_t io_arg_count(void) { return elya_args_n > 1 ? (int64_t)elya_args_n - 1 : 0; }
+
+static void io_fail(AnyBuf *m) {
+    any_puts(m, "\n");
+    elya_platform_flush();
+    elya_platform_write(2, m->p, (size_t)m->len);
+    elya_platform_exit(1);
+}
+
+/* `elya: cannot <verb> `<path>`: <reason>`, status 1. */
+static void io_fail_path(const char *verb, const int64_t *path, const char *reason) {
+    AnyBuf m = {0};
+    any_puts(&m, "elya: cannot ");
+    any_puts(&m, verb);
+    any_puts(&m, " `");
+    any_put(&m, (const char *)&path[2], path[1]);
+    any_puts(&m, "`: ");
+    any_puts(&m, reason);
+    io_fail(&m);
+}
+
+/* A path the C library can take: one with a NUL byte would be cut there. */
+static const char *io_path(const char *verb, const int64_t *path) {
+    const char *c = (const char *)&path[2];
+    if (rt_memchr(c, 0, (size_t)path[1])) {
+        io_fail_path(verb, path, "a path cannot hold a NUL byte");
+    }
+    return c;
+}
+
+/* `name(<path literal>)`. */
+static void io_question(AnyBuf *q, const char *name, const int64_t *path) {
+    any_puts(q, name);
+    any_puts(q, "(");
+    any_put_lit(q, (const char *)&path[2], path[1]);
+}
+
+/* A recorded entry: the question, then the answer `a` (`an` bytes, or as a
+ * string literal when `lit`), on one line written at once. */
+static void io_record(AnyBuf *q, const char *a, int64_t an, int lit) {
+    any_puts(q, " = ");
+    if (lit) {
+        any_put_lit(q, a, an);
+    } else {
+        any_put(q, a, an);
+    }
+    any_puts(q, "\n");
+    trace_wrote(elya_platform_trace_append(q->p, (size_t)q->len));
+}
+
+/* A replay's `String` answer: exactly one literal, as `literal::read_string`
+ * reads it, its bytes a fresh string. The trace is UTF-8 and the escapes are
+ * ASCII, so the bytes are. */
+static void *trace_string(int64_t tag, TraceStr a) {
+    AnyBuf out = {0};
+    int64_t i = 1;
+    if (a.n < 2 || a.p[0] != '"') {
+        trace_wrong_type(a, "String");
+    }
+    for (;;) {
+        if (i >= a.n) {
+            trace_wrong_type(a, "String");
+        }
+        char c = a.p[i];
+        if (c == '"') {
+            i++;
+            break;
+        }
+        if (c == '\\') {
+            char e = i + 1 < a.n ? a.p[i + 1] : 0;
+            c = e == '"' ? '"' : e == '\\' ? '\\' : e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : 0;
+            if (!c) {
+                trace_wrong_type(a, "String");
+            }
+            i++;
+        }
+        any_put(&out, &c, 1);
+        i++;
+    }
+    if (i != a.n) {
+        trace_wrong_type(a, "String");
+    }
+    void *r = elya_str_lit(tag, out.p ? out.p : "", out.len);
+    elya_platform_scratch(out.p, 0);
+    return r;
+}
+
+/* Everything a reader gives until its end, in working memory. */
+#define IO_CHUNK 65536
+
+void *elya_io_read_file(int64_t tag, void *path) {
+    int64_t *p = (int64_t *)path;
+    elya_gc_push(path);
+    AnyBuf q = {0};
+    io_question(&q, "io.read_file", p);
+    any_puts(&q, ")");
+    void *r;
+    if (elya_trace_mode == TRACE_REPLAY) {
+        r = trace_string(tag, trace_answer_n(q.p, q.len));
+    } else {
+        const char *c = io_path("read", p);
+        void *f = elya_platform_path_open(c);
+        if (!f) {
+            io_fail_path("read", p, elya_platform_path_error(c));
+        }
+        AnyBuf data = {0};
+        for (;;) {
+            data.p = (char *)any_grow(data.p, &data.cap, data.len + IO_CHUNK + 1, 1);
+            int64_t got = elya_platform_file_read(f, data.p + data.len, IO_CHUNK);
+            if (got < 0) {
+                /* The reason before the close, which may change it. */
+                const char *why = elya_platform_path_error(c);
+                elya_platform_file_close(f);
+                io_fail_path("read", p, why);
+            }
+            if (got == 0) {
+                break;
+            }
+            data.len += got;
+        }
+        elya_platform_file_close(f);
+        if (!trace_utf8((const unsigned char *)data.p, data.len)) {
+            AnyBuf m = {0};
+            any_puts(&m, "elya: `");
+            any_put(&m, c, p[1]);
+            any_puts(&m, "` is not UTF-8");
+            io_fail(&m);
+        }
+        r = elya_str_lit(tag, data.p, data.len);
+        if (elya_trace_mode == TRACE_RECORD) {
+            elya_gc_push(r);
+            io_record(&q, data.p, data.len, 1);
+            elya_gc_pop();
+        }
+        elya_platform_scratch(data.p, 0);
+    }
+    elya_platform_scratch(q.p, 0);
+    elya_gc_pop();
+    return r;
+}
+
+int64_t elya_io_file_exists(void *path) {
+    int64_t *p = (int64_t *)path;
+    elya_gc_push(path);
+    AnyBuf q = {0};
+    io_question(&q, "io.file_exists", p);
+    any_puts(&q, ")");
+    int64_t r;
+    if (elya_trace_mode == TRACE_REPLAY) {
+        TraceStr a = trace_answer_n(q.p, q.len);
+        r = trace_is(a, "True");
+        if (!r && !trace_is(a, "False")) {
+            trace_wrong_type(a, "Bool");
+        }
+    } else {
+        const char *c = (const char *)&p[2];
+        r = !rt_memchr(c, 0, (size_t)p[1]) && elya_platform_path_exists(c);
+        if (elya_trace_mode == TRACE_RECORD) {
+            io_record(&q, r ? "True" : "False", r ? 4 : 5, 0);
+        }
+    }
+    elya_platform_scratch(q.p, 0);
+    elya_gc_pop();
+    return r;
+}
+
+void elya_io_write_file(void *path, void *text) {
+    int64_t *p = (int64_t *)path;
+    int64_t *t = (int64_t *)text;
+    elya_gc_push(path);
+    elya_gc_push(text);
+    AnyBuf q = {0};
+    io_question(&q, "io.write_file", p);
+    any_puts(&q, ", ");
+    any_put_lit(&q, (const char *)&t[2], t[1]);
+    any_puts(&q, ")");
+    if (elya_trace_mode == TRACE_REPLAY) {
+        TraceStr a = trace_answer_n(q.p, q.len);
+        if (!trace_is(a, "Unit")) {
+            trace_wrong_type(a, "Unit");
+        }
+    } else {
+        const char *c = io_path("write", p);
+        if (!elya_platform_path_write(c, (const char *)&t[2], t[1])) {
+            io_fail_path("write", p, elya_platform_path_error(c));
+        }
+        if (elya_trace_mode == TRACE_RECORD) {
+            io_record(&q, "Unit", 4, 0);
+        }
+    }
+    elya_platform_scratch(q.p, 0);
+    elya_gc_pop();
+    elya_gc_pop();
+}
+
+void *elya_io_read_stdin(int64_t tag) {
+    static const char q[] = "io.read_stdin()";
+    if (elya_trace_mode == TRACE_REPLAY) {
+        return trace_string(tag, trace_answer(q));
+    }
+    AnyBuf data = {0};
+    for (;;) {
+        data.p = (char *)any_grow(data.p, &data.cap, data.len + IO_CHUNK + 1, 1);
+        int64_t got = elya_platform_stdin_read(data.p + data.len, IO_CHUNK);
+        if (got < 0) {
+            elya_platform_flush();
+            rt_printf(2, "elya: cannot read standard input: %s\n", elya_platform_error());
+            elya_platform_exit(1);
+        }
+        if (got == 0) {
+            break;
+        }
+        data.len += got;
+    }
+    if (!trace_utf8((const unsigned char *)data.p, data.len)) {
+        elya_platform_flush();
+        rt_puts(2, "elya: standard input is not UTF-8\n");
+        elya_platform_exit(1);
+    }
+    void *r = elya_str_lit(tag, data.p, data.len);
+    if (elya_trace_mode == TRACE_RECORD) {
+        AnyBuf line = {0};
+        elya_gc_push(r);
+        any_puts(&line, q);
+        io_record(&line, data.p, data.len, 1);
+        elya_gc_pop();
+        elya_platform_scratch(line.p, 0);
+    }
+    elya_platform_scratch(data.p, 0);
+    return r;
+}
+
+int64_t elya_io_arg_count(void) {
+    if (elya_trace_mode == TRACE_REPLAY) {
+        TraceStr a = trace_answer("io.arg_count()");
+        int64_t v;
+        if (!trace_int(a, &v)) {
+            trace_wrong_type(a, "Int");
+        }
+        return v;
+    }
+    int64_t v = io_arg_count();
+    if (elya_trace_mode == TRACE_RECORD) {
+        trace_line("io.arg_count() = %lld\n", (long long)v);
+    }
+    return v;
+}
+
+void *elya_io_arg(int64_t tag, int64_t i) {
+    char q[64];
+    rt_snprintf(q, sizeof q, "io.arg(%lld)", (long long)i);
+    if (elya_trace_mode == TRACE_REPLAY) {
+        return trace_string(tag, trace_answer(q));
+    }
+    if (i < 0 || i >= io_arg_count()) {
+        elya_platform_flush();
+        rt_printf(2, "elya: no argument %lld (the program has %lld)\n", (long long)i,
+                  (long long)io_arg_count());
+        elya_platform_exit(1);
+    }
+    const char *a = elya_args[i + 1];
+    int64_t n = (int64_t)rt_strlen(a);
+    if (!trace_utf8((const unsigned char *)a, n)) {
+        elya_platform_flush();
+        rt_printf(2, "elya: argument %lld is not UTF-8\n", (long long)i);
+        elya_platform_exit(1);
+    }
+    void *r = elya_str_lit(tag, a, n);
+    if (elya_trace_mode == TRACE_RECORD) {
+        AnyBuf line = {0};
+        elya_gc_push(r);
+        any_puts(&line, q);
+        io_record(&line, a, n, 1);
+        elya_gc_pop();
+        elya_platform_scratch(line.p, 0);
+    }
+    return r;
 }
 
 /* The deterministic failed-match trap. Spec 5b-4 §5: never `unreachable`. */
@@ -1785,6 +2115,34 @@ ELYA_WEAK int64_t elya_platform_file_read(void *file, char *into, int64_t n) {
 }
 ELYA_WEAK void elya_platform_file_close(void *file) { (void)file; }
 ELYA_WEAK const char *elya_platform_error(void) { return "this platform has no files"; }
+ELYA_WEAK void *elya_platform_path_open(const char *path) {
+    (void)path;
+    return NULL;
+}
+ELYA_WEAK int elya_platform_path_exists(const char *path) {
+    (void)path;
+    return 0;
+}
+ELYA_WEAK int elya_platform_path_write(const char *path, const char *bytes, int64_t n) {
+    (void)path;
+    (void)bytes;
+    (void)n;
+    return 0;
+}
+ELYA_WEAK const char *elya_platform_path_error(const char *path) {
+    (void)path;
+    return "this platform has no files";
+}
+/* No input: at its end at once. */
+ELYA_WEAK int64_t elya_platform_stdin_read(char *into, int64_t n) {
+    (void)into;
+    (void)n;
+    return 0;
+}
+ELYA_WEAK char **elya_platform_args(int argc, char **argv, int *count) {
+    *count = argc;
+    return argv;
+}
 
 /* The program runs on the stack the board's start-up code set. */
 typedef int64_t (*elya_entry_fn)(void);

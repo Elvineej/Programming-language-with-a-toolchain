@@ -254,11 +254,42 @@ pub enum World {
     },
 }
 
+/// The live host's inputs besides the clock and the file system (spec
+/// 2026-11-14-elya-files-and-arguments D4, D6): what a caller gives a program
+/// without a process of its own.
+#[derive(Clone, Debug, Default)]
+pub struct Host {
+    /// The program's arguments (`io.arg`), not counting the program, as the
+    /// operating system gave them: one that is not UTF-8 fails by name when
+    /// the program reads it, as natively.
+    pub args: Vec<std::ffi::OsString>,
+    /// Standard input's bytes, when given here; `None` reads the process's own.
+    pub stdin: Option<Vec<u8>>,
+}
+
+/// The `io.*` builtins the host answers besides `io.println`
+/// ([`crate::resolve::IO_BUILTINS`], qualified).
+const IO_HOST: &[&str] = &[
+    "io.read_file",
+    "io.file_exists",
+    "io.write_file",
+    "io.read_stdin",
+    "io.arg_count",
+    "io.arg",
+];
+
+/// The qualified name of the host's `io.<name>`, if it is one.
+fn io_host(name: &str) -> Option<&'static str> {
+    IO_HOST.iter().copied().find(|b| &b[3..] == name)
+}
+
 pub struct Interp {
     /// The module's constructors and operation signatures, for `op.decode`.
     types: Rc<crate::literal::TypeInfo>,
-    /// Who answers `time.*` (record and replay).
+    /// Who answers `time.*` and `io.*` (record and replay).
     pub world: World,
+    /// What the live host gives besides the clock and the files.
+    pub host: Host,
     output: String,
     peak_kont: usize,
     steps: u64,
@@ -272,6 +303,7 @@ impl Interp {
         Interp {
             types: Rc::new(crate::literal::TypeInfo::default()),
             world: World::Live,
+            host: Host::default(),
             output: String::new(),
             peak_kont: 0,
             steps: 0,
@@ -584,7 +616,16 @@ pub fn run_module_in(module: &Module, world: World) -> Result<(Interp, Value), R
 /// [`run_module_in`] keeping the interpreter (its output and world) when the
 /// run fails.
 pub fn run_module_keeping(module: &Module, world: World) -> (Interp, Result<Value, RuntimeError>) {
-    cek::run_module_keeping(module, world)
+    cek::run_module_keeping_host(module, world, Host::default())
+}
+
+/// [`run_module_keeping`] with the live host's arguments and input given.
+pub fn run_module_keeping_host(
+    module: &Module,
+    world: World,
+    host: Host,
+) -> (Interp, Result<Value, RuntimeError>) {
+    cek::run_module_keeping_host(module, world, host)
 }
 
 pub mod tree {
@@ -700,6 +741,13 @@ pub mod tree {
                             vals.push(eval_expr(interp, a, env, fns)?);
                         }
                         return super::time_builtin(name, &vals, span);
+                    }
+                    if let Some(full) = io_host(name).filter(|_| module == "io") {
+                        let mut vals = Vec::new();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        return super::host_builtin(interp, full, &vals, span);
                     }
                     if module == "int" && name == "to_string" {
                         let mut vals = Vec::new();
@@ -1094,10 +1142,20 @@ pub mod cek {
         module: &Module,
         world: super::World,
     ) -> (Interp, Result<Value, RuntimeError>) {
+        run_module_keeping_host(module, world, super::Host::default())
+    }
+
+    /// [`run_module_keeping`] with the live host's arguments and input given.
+    pub fn run_module_keeping_host(
+        module: &Module,
+        world: super::World,
+        host: super::Host,
+    ) -> (Interp, Result<Value, RuntimeError>) {
         let fns = fn_table(module);
         let ops = op_table(module);
         let mut interp = Interp::new();
         interp.world = world;
+        interp.host = host;
         interp.types = Rc::new(crate::literal::TypeInfo::of(module));
         let Some(main) = fns.get("main").copied() else {
             return (interp, Err(rt(Span::EMPTY, "no `main` function found")));
@@ -1353,6 +1411,14 @@ pub mod cek {
                     }
                     Expr::Qualified { module, name } if module == "time" && name == "sleep_ms" => {
                         CalleeSlot::Builtin("time.sleep_ms")
+                    }
+                    Expr::Qualified { module, name }
+                        if module == "io" && super::io_host(name).is_some() =>
+                    {
+                        match super::io_host(name) {
+                            Some(full) => CalleeSlot::Builtin(full),
+                            None => return Err(rt(span, format!("unknown builtin `io.{name}`"))),
+                        }
                     }
                     Expr::Qualified { module, name } if module == "op" => match name.as_str() {
                         "name" => CalleeSlot::Builtin("op.name"),
@@ -1807,7 +1873,9 @@ pub mod cek {
                 interp.println(s);
                 Ok(State::Return(Value::Unit, k))
             }
-            CalleeSlot::Builtin(b @ ("time.now_ms" | "time.sleep_ms")) => {
+            CalleeSlot::Builtin(b)
+                if b == "time.now_ms" || b == "time.sleep_ms" || super::IO_HOST.contains(&b) =>
+            {
                 let v = super::host_builtin(interp, b, &args, span)?;
                 Ok(State::Return(v, k))
             }
@@ -1940,7 +2008,8 @@ pub mod cek {
 
 /// A host builtin's answer under the interpreter's `World`: live, live and
 /// written down, or read back from a trace (spec
-/// 2026-10-16-elya-cli-record-replay §2).
+/// 2026-10-16-elya-cli-record-replay §2; the `io.*` ones, spec
+/// 2026-11-14-elya-files-and-arguments D3).
 fn host_builtin(
     interp: &mut Interp,
     name: &str,
@@ -1956,9 +2025,9 @@ fn host_builtin(
     }
     q.push(')');
     match &mut interp.world {
-        World::Live => time_builtin(&name["time.".len()..], args, span),
+        World::Live => live_builtin(&mut interp.host, name, args, span),
         World::Record(log) => {
-            let v = time_builtin(&name["time.".len()..], args, span)?;
+            let v = live_builtin(&mut interp.host, name, args, span)?;
             let a = crate::literal::show(&interp.types, &v).map_err(|e| rt(span, e))?;
             log.push((q, a));
             Ok(v)
@@ -1980,20 +2049,145 @@ fn host_builtin(
             *next += 1;
             // Decoded at the builtin's own result type: a trace cannot inject
             // a value of another type.
-            match name {
-                "time.now_ms" => answer.trim().parse::<i64>().map(Value::Int).map_err(|_| {
+            let a = answer.trim();
+            let (ty, v) = match name {
+                "time.now_ms" | "io.arg_count" => ("Int", a.parse::<i64>().ok().map(Value::Int)),
+                "io.file_exists" => (
+                    "Bool",
+                    match a {
+                        "True" => Some(Value::Bool(true)),
+                        "False" => Some(Value::Bool(false)),
+                        _ => None,
+                    },
+                ),
+                "io.read_file" | "io.read_stdin" | "io.arg" => (
+                    "String",
+                    crate::literal::read_string(a).map(|s| Value::Str(s.into())),
+                ),
+                _ => ("Unit", (a == "Unit").then_some(Value::Unit)),
+            };
+            v.ok_or_else(|| {
+                rt(
+                    span,
+                    format!("replay entry {n}: `{answer}` is not an answer of type {ty}"),
+                )
+            })
+        }
+    }
+}
+
+/// A host builtin answered by the live host.
+fn live_builtin(
+    host: &mut Host,
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, RuntimeError> {
+    match name.strip_prefix("time.") {
+        Some(t) => time_builtin(t, args, span),
+        None => io_builtin(host, name, args, span),
+    }
+}
+
+/// The host's files, standard input and arguments (spec
+/// 2026-11-14-elya-files-and-arguments D1, D2), failing by name in the native
+/// runtime's words (`runtime.c`, `elya_io_*`).
+fn io_builtin(
+    host: &mut Host,
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, RuntimeError> {
+    // The C library would cut a path at a NUL byte: refused first, by name.
+    let path = |verb: &str, p: &str| {
+        if p.contains('\0') {
+            Err(rt(
+                span,
+                format!("cannot {verb} `{p}`: a path cannot hold a NUL byte"),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    match (name, args) {
+        ("io.read_file", [Value::Str(p)]) => {
+            path("read", p)?;
+            let bytes = std::fs::read(&**p)
+                .map_err(|e| rt(span, format!("cannot read `{p}`: {}", file_reason(p, &e))))?;
+            String::from_utf8(bytes)
+                .map(|s| Value::Str(s.into()))
+                .map_err(|_| rt(span, format!("`{p}` is not UTF-8")))
+        }
+        ("io.file_exists", [Value::Str(p)]) => Ok(Value::Bool(
+            !p.contains('\0') && std::path::Path::new(&**p).is_file(),
+        )),
+        ("io.write_file", [Value::Str(p), Value::Str(text)]) => {
+            path("write", p)?;
+            std::fs::write(&**p, text.as_bytes())
+                .map_err(|e| rt(span, format!("cannot write `{p}`: {}", file_reason(p, &e))))?;
+            Ok(Value::Unit)
+        }
+        ("io.read_stdin", []) => {
+            let bytes = match &mut host.stdin {
+                // Given: all of it once, then nothing, as a stream at its end.
+                Some(given) => std::mem::take(given),
+                None => {
+                    let mut b = Vec::new();
+                    std::io::Read::read_to_end(&mut std::io::stdin(), &mut b).map_err(|e| {
+                        rt(
+                            span,
+                            format!("cannot read standard input: {}", os_words(&e)),
+                        )
+                    })?;
+                    b
+                }
+            };
+            String::from_utf8(bytes)
+                .map(|s| Value::Str(s.into()))
+                .map_err(|_| rt(span, "standard input is not UTF-8"))
+        }
+        ("io.arg_count", []) => Ok(Value::Int(
+            i64::try_from(host.args.len()).unwrap_or(i64::MAX),
+        )),
+        ("io.arg", [Value::Int(i)]) => {
+            let a = usize::try_from(*i)
+                .ok()
+                .and_then(|k| host.args.get(k))
+                .ok_or_else(|| {
                     rt(
                         span,
-                        format!("replay entry {n}: `{answer}` is not an answer of type Int"),
+                        format!("no argument {i} (the program has {})", host.args.len()),
                     )
-                }),
-                _ if answer.trim() == "Unit" => Ok(Value::Unit),
-                _ => Err(rt(
-                    span,
-                    format!("replay entry {n}: `{answer}` is not an answer of type Unit"),
-                )),
-            }
+                })?;
+            a.to_str()
+                .map(|a| Value::Str(a.into()))
+                .ok_or_else(|| rt(span, format!("argument {i} is not UTF-8")))
         }
+        _ => Err(rt(span, format!("{name}: wrong arguments"))),
+    }
+}
+
+/// Why a file operation on `path` failed (spec D2): the same words natively.
+/// A directory is asked of the file system after the failure, so it reads the
+/// same where opening one succeeds (Linux) and where it does not (Windows).
+fn file_reason(path: &str, e: &std::io::Error) -> String {
+    if std::path::Path::new(path).is_dir() {
+        return "it is a directory".to_string();
+    }
+    match e.kind() {
+        std::io::ErrorKind::NotFound => "no such file or directory".to_string(),
+        std::io::ErrorKind::PermissionDenied => "permission denied".to_string(),
+        _ => os_words(e),
+    }
+}
+
+/// The operating system's words for `e`, without Rust's ` (os error N)`: the C
+/// library's `strerror`, which the native runtime writes.
+fn os_words(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    match s.rfind(" (os error ") {
+        Some(i) if s.ends_with(')') => s[..i].to_string(),
+        _ => s,
     }
 }
 

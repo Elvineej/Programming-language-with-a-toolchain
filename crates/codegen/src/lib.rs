@@ -745,6 +745,55 @@ pub(crate) fn time_builtin<'ctx>(
     }
 }
 
+/// `io.*` besides `println` on lowered operands (spec
+/// 2026-11-14-elya-files-and-arguments), both emitters. The runtime roots its
+/// string operands; the caller roots whatever else is live, as for a string's
+/// slice: all but `file_exists`, `write_file` and `arg_count` allocate.
+pub(crate) fn io_builtin<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    name: &str,
+    vals: &[BasicValueEnum<'ctx>],
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    let tag = i64t.const_int(lc.string_tag as u64, false);
+    let call = |f: FunctionValue<'ctx>, args: &[inkwell::values::BasicMetadataValueEnum<'ctx>]| {
+        b.build_call(f, args, "io").map_err(internal)
+    };
+    let value = |site: inkwell::values::CallSiteValue<'ctx>| {
+        site.try_as_basic_value()
+            .left()
+            .ok_or(CodegenError::Unsupported("an io builtin returned no value"))
+    };
+    match (name, vals) {
+        ("io.read_file", [p]) => value(call(lc.io_read_file, &[tag.into(), (*p).into()])?),
+        ("io.file_exists", [p]) => {
+            let w = value(call(lc.io_file_exists, &[(*p).into()])?)?.into_int_value();
+            Ok(
+                b.build_int_compare(IntPredicate::NE, w, i64t.const_zero(), "exists")
+                    .map_err(internal)?
+                    .into(),
+            )
+        }
+        ("io.write_file", [p, t]) => {
+            call(lc.io_write_file, &[(*p).into(), (*t).into()])?;
+            Ok(i64t.const_int(0, false).into())
+        }
+        ("io.read_stdin", []) => value(call(lc.io_read_stdin, &[tag.into()])?),
+        ("io.arg_count", []) => value(call(lc.io_arg_count, &[])?),
+        ("io.arg", [i]) => value(call(lc.io_arg, &[tag.into(), (*i).into()])?),
+        _ => Err(CodegenError::UnsupportedBuiltin(name.to_string())),
+    }
+}
+
+/// The host's `io.*` builtins besides `println` ([`io_builtin`]): an unknown
+/// `io.<name>` is refused by name before its arguments are lowered.
+pub(crate) fn is_io_builtin(name: &str) -> bool {
+    name.strip_prefix("io.")
+        .is_some_and(|n| elya::resolve::IO_BUILTINS.contains(&n))
+}
+
 /// The builtins the native back end implements. `any.*` are the `with any`
 /// expansion's (spec 2026-10-17), never written in source.
 pub(crate) fn is_native_builtin(name: &str) -> bool {
@@ -761,6 +810,12 @@ pub(crate) fn is_native_builtin(name: &str) -> bool {
             | "string.slice"
             | "time.now_ms"
             | "time.sleep_ms"
+            | "io.read_file"
+            | "io.file_exists"
+            | "io.write_file"
+            | "io.read_stdin"
+            | "io.arg_count"
+            | "io.arg"
             | "any.show"
             | "any.decode"
             | "any.fail"
@@ -1926,6 +1981,21 @@ fn lower_expr<'ctx>(
             let x = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
             float_conversion(ctx, b, lc, builtin, x)
         }
+        CoreKind::Builtin(builtin, args) if is_io_builtin(builtin) => {
+            // Each operand is rooted while later ones are lowered (they may
+            // allocate), and the environment across the call.
+            let mut vals = Vec::with_capacity(args.len());
+            let mut own = 0;
+            for a in args.iter() {
+                let v = lower_expr(ctx, func, b, lc, a, env)?;
+                own += usize::from(gc_root(b, lc, v)?);
+                vals.push(v);
+            }
+            let roots = gc_root_env(b, lc, env)?;
+            let v = io_builtin(ctx, b, lc, builtin, &vals)?;
+            gc_unroot(b, lc, roots + own)?;
+            Ok(v)
+        }
         CoreKind::Builtin(builtin, args) if builtin.starts_with("string.") => {
             // The string is rooted while later operands are lowered (they may
             // allocate), and the environment across a slice's allocation.
@@ -2482,6 +2552,13 @@ struct LowerCtx<'a, 'ctx> {
     /// Time (2026-10-15): `time.now_ms`, `time.sleep_ms`.
     time_now_ms: FunctionValue<'ctx>,
     time_sleep_ms: FunctionValue<'ctx>,
+    /// `elya_io_*` (spec 2026-11-14-elya-files-and-arguments).
+    io_read_file: FunctionValue<'ctx>,
+    io_file_exists: FunctionValue<'ctx>,
+    io_write_file: FunctionValue<'ctx>,
+    io_read_stdin: FunctionValue<'ctx>,
+    io_arg_count: FunctionValue<'ctx>,
+    io_arg: FunctionValue<'ctx>,
     println: FunctionValue<'ctx>,
     string_tag: usize,
     /// The first closure tag (closures follow the real constructors), for
@@ -2696,6 +2773,38 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let time_now_ms = module.add_function("elya_time_now_ms", time_now_ms_ty, None); // ccc
     let time_sleep_ms_ty = ctx.void_type().fn_type(&[i64t.into()], false);
     let time_sleep_ms = module.add_function("elya_time_sleep_ms", time_sleep_ms_ty, None); // ccc
+                                                                                           // Files, standard input and arguments, all `ccc`.
+    let io_read_file = module.add_function(
+        "elya_io_read_file",
+        ptrt.fn_type(&[i64t.into(), ptrt.into()], false),
+        None,
+    );
+    let io_file_exists = module.add_function(
+        "elya_io_file_exists",
+        i64t.fn_type(&[ptrt.into()], false),
+        None,
+    );
+    let io_write_file = module.add_function(
+        "elya_io_write_file",
+        ctx.void_type().fn_type(&[ptrt.into(), ptrt.into()], false),
+        None,
+    );
+    let io_read_stdin = module.add_function(
+        "elya_io_read_stdin",
+        ptrt.fn_type(&[i64t.into()], false),
+        None,
+    );
+    let io_arg_count = module.add_function("elya_io_arg_count", i64t.fn_type(&[], false), None);
+    let io_arg = module.add_function(
+        "elya_io_arg",
+        ptrt.fn_type(&[i64t.into(), i64t.into()], false),
+        None,
+    );
+    let args_init = module.add_function(
+        "elya_args_init",
+        ctx.void_type().fn_type(&[i32t.into(), ptrt.into()], false),
+        None,
+    );
     let println_ty = ctx.void_type().fn_type(&[ptrt.into()], false);
     let println = module.add_function("elya_println", println_ty, None); // ccc
     let fail_ty = ctx.void_type().fn_type(&[], false);
@@ -2844,6 +2953,12 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         float_to_string,
         time_now_ms,
         time_sleep_ms,
+        io_read_file,
+        io_file_exists,
+        io_write_file,
+        io_read_stdin,
+        io_arg_count,
+        io_arg,
         println,
         string_tag,
         first_closure_tag: n_real_ctors,
@@ -3022,9 +3137,19 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let start_ty = i64t.fn_type(&[ptrt.into()], false);
     let start = module.add_function("elya_start", start_ty, None); // ccc
 
-    let shim = module.add_function("main", i32t.fn_type(&[], false), None);
+    // `main(argc, argv)`: the program's arguments (spec
+    // 2026-11-14-elya-files-and-arguments D4); a board's start-up passes none.
+    let shim = module.add_function(
+        "main",
+        i32t.fn_type(&[i32t.into(), ptrt.into()], false),
+        None,
+    );
     let shim_entry = ctx.append_basic_block(shim, "entry");
     b.position_at_end(shim_entry);
+    let (argc, argv) = match (shim.get_nth_param(0), shim.get_nth_param(1)) {
+        (Some(c), Some(v)) => (c, v),
+        _ => return Err(internal("main has no parameters")),
+    };
     // BEFORE @elya.main: the collector cannot interpret a single object until it
     // has the table, so handing it over is the first thing the process does.
     b.build_call(
@@ -3053,6 +3178,9 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         "",
     )
     .map_err(internal)?;
+    // The arguments before the program runs; nothing here allocates.
+    b.build_call(args_init, &[argc.into(), argv.into()], "")
+        .map_err(internal)?;
     // The program runs on its own stack (spec 2026-10-16-elya-native-stack):
     // `elya_start` (runtime.c) reserves it, runs `@elya_entry` on a thread that
     // owns it, names an overflow of it, and hands back main's value here, on

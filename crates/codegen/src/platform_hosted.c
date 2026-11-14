@@ -6,11 +6,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#include <wchar.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
+/* `CommandLineToArgvW`, for the arguments as UTF-8 (MSVC's linker reads the
+ * request; MinGW links shell32 by default). */
+#ifdef _MSC_VER
+#pragma comment(lib, "shell32.lib")
+#endif
 #else
 #include <pthread.h>
 #include <setjmp.h>
@@ -56,6 +65,9 @@ void elya_platform_init(void) {
      * (the Windows gate on main: three native_any.rs tests read a stray "\r"). */
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
+    /* Standard input as Rust reads a pipe: bytes, `\r\n` kept (spec
+     * 2026-11-14-elya-files-and-arguments D5). */
+    _setmode(_fileno(stdin), _O_BINARY);
 #endif
 }
 
@@ -132,6 +144,150 @@ int64_t elya_platform_file_read(void *file, char *into, int64_t n) {
 void elya_platform_file_close(void *file) { fclose((FILE *)file); }
 
 const char *elya_platform_error(void) { return strerror(errno); }
+
+/* ---- A program's files, input and arguments (spec
+ * 2026-11-14-elya-files-and-arguments D5). Paths are UTF-8; on Windows the
+ * wide functions take them, so a path outside the ANSI code page means what it
+ * means to Rust's standard library. The Windows half was written by ChatGPT
+ * (OpenAI) to Claude's brief, checked here and by the Windows gate. */
+#ifdef _WIN32
+/* The path as the wide functions take it (malloc'd), or NULL with errno set. */
+static wchar_t *elya_wide_path(const char *path) {
+    int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+    if (len == 0) {
+        errno = GetLastError() == ERROR_NO_UNICODE_TRANSLATION ? EILSEQ : EINVAL;
+        return NULL;
+    }
+    wchar_t *wide = (wchar_t *)malloc((size_t)len * sizeof(*wide));
+    if (!wide) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, len) == 0) {
+        DWORD error = GetLastError();
+        free(wide);
+        errno = error == ERROR_NO_UNICODE_TRANSLATION ? EILSEQ : EINVAL;
+        return NULL;
+    }
+    return wide;
+}
+
+static FILE *elya_path_fopen(const char *path, const wchar_t *mode) {
+    wchar_t *wide = elya_wide_path(path);
+    if (!wide) {
+        return NULL;
+    }
+    FILE *f = _wfopen(wide, mode);
+    int saved = errno;
+    free(wide);
+    errno = saved;
+    return f;
+}
+
+/* The file's kind (`_S_IFREG`, `_S_IFDIR`), or 0 when it cannot be asked. */
+static int elya_path_kind(const char *path) {
+    wchar_t *wide = elya_wide_path(path);
+    if (!wide) {
+        return 0;
+    }
+    struct __stat64 st;
+    int found = _wstat64(wide, &st);
+    free(wide);
+    return found == 0 ? (int)(st.st_mode & _S_IFMT) : 0;
+}
+
+void *elya_platform_path_open(const char *path) { return elya_path_fopen(path, L"rb"); }
+int elya_platform_path_exists(const char *path) { return elya_path_kind(path) == _S_IFREG; }
+static int elya_path_is_dir(const char *path) { return elya_path_kind(path) == _S_IFDIR; }
+static FILE *elya_path_create(const char *path) { return elya_path_fopen(path, L"wb"); }
+
+/* The narrow `argv` is in the ANSI code page: the command line, as UTF-8. */
+char **elya_platform_args(int argc, char **argv, int *count) {
+    *count = argc;
+    int n = 0;
+    wchar_t **wide = CommandLineToArgvW(GetCommandLineW(), &n);
+    if (!wide) {
+        return argv;
+    }
+    char **utf8 = (char **)calloc((size_t)n + 1, sizeof(*utf8));
+    if (!utf8) {
+        LocalFree(wide);
+        return argv;
+    }
+    for (int i = 0; i < n; i++) {
+        int len = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide[i], -1, NULL, 0, NULL, NULL);
+        utf8[i] = len > 0 ? (char *)malloc((size_t)len) : NULL;
+        if (!utf8[i] ||
+            WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide[i], -1, utf8[i], len, NULL,
+                                NULL) == 0) {
+            for (int k = 0; k <= i; k++) {
+                free(utf8[k]);
+            }
+            free(utf8);
+            LocalFree(wide);
+            return argv;
+        }
+    }
+    LocalFree(wide);
+    *count = n;
+    return utf8;
+}
+#else
+void *elya_platform_path_open(const char *path) { return fopen(path, "rb"); }
+
+int elya_platform_path_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static int elya_path_is_dir(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static FILE *elya_path_create(const char *path) { return fopen(path, "wb"); }
+
+char **elya_platform_args(int argc, char **argv, int *count) {
+    *count = argc;
+    return argv;
+}
+#endif
+
+/* The first failure of the writes or the close is the one kept: a write's
+ * failure can surface only at the close. */
+int elya_platform_path_write(const char *path, const char *bytes, int64_t n) {
+    FILE *f = elya_path_create(path);
+    if (!f) {
+        return 0;
+    }
+    int failure = 0;
+    if (n > 0 && fwrite(bytes, 1, (size_t)n, f) != (size_t)n) {
+        failure = errno ? errno : EIO;
+    }
+    errno = 0;
+    if (fclose(f) != 0 && failure == 0) {
+        failure = errno ? errno : EIO;
+    }
+    errno = failure;
+    return failure == 0;
+}
+
+/* D2's reason, the evaluator's words: a directory is asked after the failure,
+ * which keeps its errno. */
+const char *elya_platform_path_error(const char *path) {
+    int e = errno;
+    const char *reason = elya_path_is_dir(path) ? "it is a directory"
+                         : e == ENOENT          ? "no such file or directory"
+                         : (e == EACCES || e == EPERM) ? "permission denied"
+                                                      : strerror(e);
+    errno = e;
+    return reason;
+}
+
+int64_t elya_platform_stdin_read(char *into, int64_t n) {
+    size_t got = fread(into, 1, (size_t)n, stdin);
+    return ferror(stdin) ? -1 : (int64_t)got;
+}
 
 /* The program's own stack (spec 2026-10-16-elya-native-stack). `@main` calls
  * `elya_start` with `@elya_entry`, which calls `main`'s function; it runs on a

@@ -329,3 +329,143 @@ fn elya_runs_without_room_for_its_own_stack() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- Arguments and standard input (spec 2026-11-14-elya-files-and-arguments D4) ----
+
+/// Every argument on its line, after their count.
+const ECHO: &str = "fn show(i: Int, n: Int) -> Int {\n  if i < n { io.println(io.arg(i))  show(i + 1, n) } else { n }\n}\n\
+                    pub fn main() { io.println(int.to_string(io.arg_count()))  let _ = show(0, io.arg_count())  0 }\n";
+
+/// `elya run` with `input` on standard input.
+fn elya_run_with_input(args: &[&std::ffi::OsStr], input: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .arg("run")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn elya run");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input)
+        .expect("write stdin");
+    child.wait_with_output().expect("wait")
+}
+
+#[test]
+fn elya_run_gives_the_program_what_follows_the_double_dash() {
+    let dir = scratch("double-dash");
+    let prog = dir.join("echo.elya");
+    std::fs::write(&prog, ECHO).expect("write program");
+    let out = elya_run(&[
+        prog.as_os_str(),
+        "--".as_ref(),
+        "a".as_ref(),
+        "b c".as_ref(),
+        "--x".as_ref(),
+        "--".as_ref(),
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "4\na\nb c\n--x\n--\n");
+    let none = elya_run(&[prog.as_os_str()]);
+    assert_eq!(String::from_utf8_lossy(&none.stdout), "0\n");
+    // Arguments without `--` are still a usage error, not the program's.
+    let bare = elya_run(&[prog.as_os_str(), "a".as_ref()]);
+    assert_eq!(bare.status.code(), Some(2), "{bare:?}");
+    assert!(String::from_utf8_lossy(&bare.stderr).contains("-- <args>"));
+    // An argument that is not UTF-8 fails by name when the program reads it,
+    // as natively, and not before (the review's finding: it was a panic).
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::ffi::OsStr::from_bytes(b"\xff");
+        let reads = elya_run(&[prog.as_os_str(), "--".as_ref(), bad]);
+        assert_eq!(reads.status.code(), Some(1), "{reads:?}");
+        assert_eq!(String::from_utf8_lossy(&reads.stdout), "1\n");
+        assert!(String::from_utf8_lossy(&reads.stderr).contains("argument 0 is not UTF-8"));
+        let counts = dir.join("count.elya");
+        std::fs::write(
+            &counts,
+            "pub fn main() { io.println(int.to_string(io.arg_count())) }\n",
+        )
+        .expect("write program");
+        let fine = elya_run(&[counts.as_os_str(), "--".as_ref(), bad]);
+        assert!(fine.status.success(), "{fine:?}");
+        assert_eq!(String::from_utf8_lossy(&fine.stdout), "1\n");
+        let ours = elya_run(&[bad]);
+        assert_eq!(ours.status.code(), Some(2), "{ours:?}");
+    }
+    // `--value` takes them too.
+    let value = elya_run(&[
+        "--value".as_ref(),
+        prog.as_os_str(),
+        "--".as_ref(),
+        "z".as_ref(),
+    ]);
+    assert_eq!(String::from_utf8_lossy(&value.stdout), "1\nz\n0\n");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn standard_input_reaches_elya_run() {
+    let dir = scratch("stdin");
+    let prog = dir.join("cat.elya");
+    std::fs::write(
+        &prog,
+        "pub fn main() -> Int { let s = io.read_stdin()  io.println(s)  string.length(s) }\n",
+    )
+    .expect("write program");
+    let out = elya_run_with_input(
+        &["--value".as_ref(), prog.as_os_str()],
+        "héllo\r\nend".as_bytes(),
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "héllo\r\nend\n11\n");
+    let bad = elya_run_with_input(&[prog.as_os_str()], b"\xff");
+    assert_eq!(bad.status.code(), Some(1), "{bad:?}");
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("standard input is not UTF-8"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_recording_keeps_the_arguments_and_a_replay_takes_none() {
+    let dir = scratch("dash-trace");
+    let prog = dir.join("echo.elya");
+    std::fs::write(&prog, ECHO).expect("write program");
+    let trace = dir.join("t.trace");
+    let rec = elya_run(&[
+        "--record".as_ref(),
+        trace.as_os_str(),
+        prog.as_os_str(),
+        "--".as_ref(),
+        "one".as_ref(),
+    ]);
+    assert!(rec.status.success(), "{rec:?}");
+    assert_eq!(String::from_utf8_lossy(&rec.stdout), "1\none\n");
+    let text = std::fs::read_to_string(&trace).expect("trace written");
+    assert_eq!(
+        text,
+        "elya trace 1\nio.arg_count() = 1\nio.arg_count() = 1\nio.arg(0) = \"one\"\n"
+    );
+    let rep = elya_run(&["--replay".as_ref(), trace.as_os_str(), prog.as_os_str()]);
+    assert!(rep.status.success(), "{rep:?}");
+    assert_eq!(rep.stdout, rec.stdout);
+    let refused = elya_run(&[
+        "--replay".as_ref(),
+        trace.as_os_str(),
+        prog.as_os_str(),
+        "--".as_ref(),
+        "one".as_ref(),
+    ]);
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("a replay's arguments are its trace's"),
+        "{refused:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

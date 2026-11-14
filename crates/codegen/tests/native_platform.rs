@@ -100,7 +100,7 @@ const BOARD: &str = r#"
 #include <stddef.h>
 #include <stdint.h>
 void elya_heap_init(void *base, size_t bytes);
-int main(void);
+int main(int argc, char **argv);
 static long sys3(long n, long a, long b, long c) {
     long r;
     __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
@@ -132,7 +132,7 @@ __attribute__((no_builtin)) int memcmp(const void *x, const void *y, size_t n) {
 static unsigned char region[REGION] __attribute__((aligned(4096)));
 void board_start(void) {
     elya_heap_init(region, sizeof region);
-    elya_platform_exit(main() == 0 ? 0 : 70);
+    elya_platform_exit(main(0, 0) == 0 ? 0 : 70);
 }
 __asm__(".globl _start\n_start:\n xor %ebp, %ebp\n and $-16, %rsp\n call board_start\n");
 "#;
@@ -279,6 +279,37 @@ fn a_failure_on_a_board_is_the_hosted_line_and_status() {
         )
     );
     assert_eq!(board, hosted);
+}
+
+#[path = "../../../tests/programs/files_and_arguments.rs"]
+#[allow(dead_code)]
+mod programs;
+
+/// A board has no files, no arguments and empty input (spec
+/// 2026-11-14-elya-files-and-arguments D5): the hooks' defaults, by name.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_board_has_no_files_no_arguments_and_no_input() {
+    use programs::{NO_WORLD, NO_WORLD_FAILURE, NO_WORLD_OUT};
+    let [board, hosted] = board_and_hosted("no-world", NO_WORLD, 256 * 1024);
+    assert_eq!(
+        board,
+        (
+            1,
+            NO_WORLD_OUT.to_string(),
+            format!("elya: {NO_WORLD_FAILURE}\n")
+        )
+    );
+    // Hosted, the same questions have the host's answers (there is no
+    // `a.txt` where the test runs).
+    assert_eq!(
+        hosted,
+        (
+            1,
+            NO_WORLD_OUT.to_string(),
+            "elya: cannot read `a.txt`: no such file or directory\n".to_string()
+        )
+    );
 }
 
 /// A live set larger than the board's region is the out-of-memory line, status
