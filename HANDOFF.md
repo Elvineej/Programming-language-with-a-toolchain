@@ -30,9 +30,9 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1536 passed, 166 suites, and configuration C
+- Linux gate at the tip of `main`: 1564 passed, 169 suites, and configuration C
   (the boards on QEMU; `check.sh` fails without its tools unless
-  `ELYA_BOARDS=skip`) 7 passed, 2 suites. **Look at the Windows
+  `ELYA_BOARDS=skip`) 8 passed, 2 suites. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
   unseen (a checker frame of 16 KiB overflowing a 2 MiB test thread; fixed in
   12f91bd, spec 2026-11-13-elya-front-end-frames). Native programs run on
@@ -68,6 +68,13 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   thinking effort High on that account); the easier parts to it, the harder
   here, and its answers checked against the source (spec 2026-11-13-elya-boards
   section 3 shows why: two of its research claims were wrong).
+  **Codex in the cloud** (since 2026-11-14, the maintainer connected GitHub): the
+  ChatGPT Codex Connector is installed on this repository alone, and a cloud
+  environment "Programming-language-with-a-toolchain" has Rust, LLVM 18, QEMU and
+  both board toolchains, so Codex jobs build and run everything (GPT-6.1 Sol,
+  effort Ultra, the most offered). Its work goes on `codex/*` branches as pull
+  requests; Claude checks and lands it. The chat (GitHub connector) can read
+  and review but not run.
   `elya_eq` takes a fourth argument (the first closure tag) since 2026-10-23.
 - Interactive sessions use the same `AUTO_RUN_LOG.md` lock: an IN PROGRESS entry
   under 3 hours old makes a scheduled run exit.
@@ -746,25 +753,28 @@ The maintainer's priority (2026-11-14). The road is spec
 `docs/superpowers/specs/2026-11-14-elya-self-hosting-design.md` (R1-R4): Rust
 stays the bootstrap compiler; each piece is written in Elya and checked byte for
 byte against its Rust twin on every program the tests hold, then wired in when
-it is fast enough. Measured: nothing reads a file, standard input or the
-command line, writes a file or runs a program; `<>` makes building a large
+it is fast enough. Measured before part 1: nothing read a file, standard
+input or the command line, wrote a file or ran a program; `<>` makes building a large
 string quadratic (80,000 appends of 10 bytes: 1.44 s natively); no array or map.
-**Part 1, next: the world a compiler needs**, designed in spec
-`2026-11-14-elya-files-and-arguments-design.md`: six builtins performing `IO`
-(`io.read_file`, `io.file_exists`, `io.write_file`, `io.read_stdin`,
-`io.arg_count`, `io.arg`), failing by name (a missing file, invalid UTF-8, no
-such argument; a board has no files), recorded and replayed like `time.*`, on
-both back ends; `elya run <file> -- <args>`; `elya/files` with handlers and
-`elya/host`'s `files(body)`. Running a program (`io.run`) waits for part 5.
-This was step 3, "Reading text from outside" (whole files, not lines; a missing
-file a failure by name, asked first with `io.file_exists`, since a builtin
-cannot answer a program's own `Option` type).
-**Part 2:** a `linear` buffer and `linear` arrays, updated in place because the
-affine guarantee says no one else holds them; maps in Elya over arrays.
-**Part 3: the lexer in Elya**, `selfhost/lex.elya` (ChatGPT is writing a first
-version to Claude's brief, 2026-11-14: a dump of tokens and diagnostics in one
-agreed form, compared with `src/lex.rs`'s; E0002 left out, as Elya cannot
-parse a float yet). Then the parser, the checks, Core, and a back end writing
+**Part 1, done** (b4dc3b3, spec `2026-11-14-elya-files-and-arguments-design.md`,
+plan beside it): `io.read_file`, `io.file_exists`, `io.write_file`,
+`io.read_stdin`, `io.arg_count`, `io.arg`, performing `IO`, failing by name in
+the same words on both back ends (a directory, a missing file, a NUL byte in a
+path, not UTF-8, no such argument), recorded and replayed like `time.*` (a
+replay touches no file); `elya run <file> -- <args>`, a binary's own
+`main(argc, argv)`; `elya/files` (`in_memory`, `read_only`, `under`) and
+`elya/host`'s `files`; a board has no files, arguments or input. The Windows
+platform half (wide paths, `CommandLineToArgvW`) is ChatGPT's, checked by the
+Windows gate. Running a program (`io.run`) waits for part 5.
+**Part 2, next:** a `linear` buffer and `linear` arrays, updated in place because the
+affine guarantee says no one else holds them; maps in Elya over arrays. Measure
+first: the 80,000-append test, and what a compiler's tables need.
+**Part 3: the lexer in Elya**, `selfhost/lex.elya` (begun early, 2026-11-14:
+Codex writes it to Claude's brief on its branch `codex/selfhost-lex`, built and
+run in its cloud environment, with `tests/selfhost_lex.rs` comparing a dump of
+tokens and diagnostics with `src/lex.rs`'s on every `.elya` file; E0002 left
+out, as Elya cannot parse a float yet; check it, then cherry-pick its one
+commit. ChatGPT's chat wrote an earlier candidate it could not run.) Then the parser, the checks, Core, and a back end writing
 LLVM IR as text for `clang`.
 
 ### 2. A collector for bare metal and for large programs alike
