@@ -788,8 +788,11 @@ buffers. **Next in part 4: the parser in Elya**, the AST printed in one agreed
 form by both (a Codex job once the form is specified here).
 Codex jobs waiting: a generator of well-typed programs run through both back
 ends (differential testing; the roadmap section above), after the benchmarks.
-Codex's benchmark suite (`codex/bench`, pull request 27: eight checksum-checked
-programs and `scripts/bench.sh`) is to be run here and landed.
+The benchmark suite is in (`scripts/bench.sh`, `benches/`; Codex's, checked):
+run it before and after a change that should move a number, and compare on one
+machine only (its two committed baselines are Codex's machine's).
+Part 2b's design is spec `2026-11-14-elya-arrays-and-borrowing-design.md`;
+ChatGPT is trying to break its borrowing rules before any code.
 
 ### 2. A collector for bare metal and for large programs alike
 
