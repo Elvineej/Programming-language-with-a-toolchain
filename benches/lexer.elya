@@ -1,0 +1,21 @@
+// Elya lexer over the whole async module, including its comments, 60 times.
+// checksum: 29819953033
+import support/lex / {IO}
+
+fn digest(s: String, i: Int, h: Int) -> Int {
+  if i == string.length(s) { h } else {
+    digest(s, i + 1, (h * 257 + string.byte_at(s, i)) % 1000000007)
+  }
+}
+
+fn rounds(s: String, n: Int, total: Int) -> Int {
+  if n == 0 { total } else {
+    let dump = lex.lex_dump(s)
+    rounds(s, n - 1, total + digest(dump, 0, n))
+  }
+}
+
+pub fn main() -> Unit {
+  let source = io.read_file("benches/fixtures/async.elya.txt")
+  io.println(int.to_string(rounds(source, 60, 0)))
+}

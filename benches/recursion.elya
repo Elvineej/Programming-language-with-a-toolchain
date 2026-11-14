@@ -1,0 +1,19 @@
+// checksum: 30002934520
+// 768 live non-tail calls: each frame carries its seed across the recursive
+// call, then mixes the answer while unwinding. The outer loop varies the seed.
+fn descend(depth: Int, seed: Int) -> Int {
+  if depth == 0 { seed } else {
+    let child = descend(depth - 1, (seed * 17 + depth) % 1000003)
+    (child + depth * 3 + seed) % 1000003
+  }
+}
+
+fn rounds(n: Int, sum: Int) -> Int {
+  if n == 0 { sum } else {
+    rounds(n - 1, sum + descend(768, n))
+  }
+}
+
+pub fn main() -> Unit {
+  io.println(int.to_string(rounds(60000, 0)))
+}

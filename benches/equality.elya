@@ -1,0 +1,24 @@
+// checksum: 222000
+// Three independently allocated 8192-cell lists. The unequal list differs only
+// in its last element, forcing both equality and inequality to walk the data.
+type EqList { EqNil, EqCons(Int, EqList) }
+
+fn prefix(n: Int, tail: EqList) -> EqList {
+  if n == 0 { tail } else { prefix(n - 1, EqCons(n, tail)) }
+}
+
+fn compare(rounds: Int, a: EqList, b: EqList, c: EqList, sum: Int) -> Int {
+  if rounds == 0 { sum } else {
+    let equal = if a == b { 1 } else { 0 }
+    let unequal = if a != c { 10 } else { 0 }
+    let false_equal = if b == c { 0 } else { 100 }
+    compare(rounds - 1, a, b, c, sum + equal + unequal + false_equal)
+  }
+}
+
+pub fn main() -> Unit {
+  let a = prefix(8191, EqCons(8192, EqNil))
+  let b = prefix(8191, EqCons(8192, EqNil))
+  let c = prefix(8191, EqCons(8193, EqNil))
+  io.println(int.to_string(compare(2000, a, b, c, 0)))
+}
