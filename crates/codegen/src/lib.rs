@@ -21,6 +21,8 @@
 mod anf;
 mod any;
 mod arm_tail;
+mod boards;
+pub use boards::{link_for, Board};
 mod closure;
 mod cps;
 mod cps_emit;
@@ -77,7 +79,14 @@ pub enum CodegenError {
         code: Option<i32>,
         stderr: String,
     },
+    /// A board's link could not be made: a tool missing or failing, by name
+    /// (spec 2026-11-14-elya-build-target D2).
+    Board(String),
 }
+
+/// Whether this build compiles for boards (the `boards` feature: LLVM's ARM
+/// and RISC-V back ends). The CLI asks before it compiles anything.
+pub const BOARDS: bool = cfg!(feature = "boards");
 
 impl std::fmt::Display for CodegenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -91,6 +100,7 @@ impl std::fmt::Display for CodegenError {
             CodegenError::Link { code, stderr } => {
                 write!(f, "codegen: clang exited {code:?}: {stderr}")
             }
+            CodegenError::Board(e) => write!(f, "codegen: {e}"),
         }
     }
 }

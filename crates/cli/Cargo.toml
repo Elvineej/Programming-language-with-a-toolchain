@@ -17,3 +17,6 @@ elya-codegen = { path = "../codegen", optional = true }
 
 [features]
 codegen = ["dep:elya-codegen"]
+# `elya build --target <board>` (spec 2026-11-14-elya-build-target): LLVM's ARM
+# and RISC-V back ends, which the LLVM linked must have.
+boards = ["codegen", "elya-codegen/boards"]

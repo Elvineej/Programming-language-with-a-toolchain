@@ -284,3 +284,86 @@ fn elya_build_of_a_2000_line_main_runs() {
     assert_eq!(lines[1999], "1999");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `--target` (spec 2026-11-14-elya-build-target): an unknown machine is a
+/// usage error naming the ones there are, a flag given twice or with no value
+/// is the usage line, and `--target host` is the plain build. All before the
+/// source is read: none of these writes a file.
+#[test]
+fn the_target_flag_is_checked_first() {
+    let dir = temp_dir("target-flag");
+    let src = dir.join("prog.elya");
+    std::fs::write(&src, "pub fn main() { 40 + 2 }\n").expect("write source");
+    let build = |args: &[&std::ffi::OsStr]| {
+        Command::new(env!("CARGO_BIN_EXE_elya"))
+            .arg("build")
+            .args(args)
+            .output()
+            .expect("spawn elya build")
+    };
+    let out = build(&[src.as_os_str(), "--target".as_ref(), "nonsense".as_ref()]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "error: unknown target `nonsense`: the targets are host, cortex-m3, riscv32\n"
+    );
+    for args in [
+        vec![src.as_os_str(), "--target".as_ref()],
+        vec![
+            src.as_os_str(),
+            "--target".as_ref(),
+            "host".as_ref(),
+            "--target".as_ref(),
+            "host".as_ref(),
+        ],
+        vec![src.as_os_str(), src.as_os_str()],
+    ] {
+        let out = build(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).starts_with("usage: elya build"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 1);
+    let exe = dir
+        .join("host-prog")
+        .with_extension(std::env::consts::EXE_EXTENSION);
+    elya_build(&[
+        "--target".as_ref(),
+        "host".as_ref(),
+        src.as_os_str(),
+        "-o".as_ref(),
+        exe.as_os_str(),
+    ]);
+    assert_runs(&exe, "42");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A board named to an elya built without the boards feature is refused by
+/// name, saying how to get one, before anything is compiled.
+#[cfg(not(feature = "boards"))]
+#[test]
+fn a_board_needs_the_boards_feature() {
+    let dir = temp_dir("no-boards");
+    let src = dir.join("prog.elya");
+    std::fs::write(&src, "pub fn main() { 1 }\n").expect("write source");
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .args([
+            "build".as_ref(),
+            src.as_os_str(),
+            "--target".as_ref(),
+            "cortex-m3".as_ref(),
+        ])
+        .output()
+        .expect("spawn elya build");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "error: `--target cortex-m3` needs an elya built with the boards feature \
+         (cargo build -p elya-cli --features boards)\n"
+    );
+    assert!(!dir.join("prog.elf").exists());
+    std::fs::remove_dir_all(&dir).ok();
+}

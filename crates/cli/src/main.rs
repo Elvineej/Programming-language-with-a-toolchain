@@ -65,6 +65,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         Some("build") => build_cmd(args),
         _ => {
             eprintln!("usage: elya <run|check|build> <file.elya>");
+            eprintln!("       elya build <file.elya> [-o <out>] [--target host|cortex-m3|riscv32]");
             eprintln!("       elya run --value <file.elya>");
             eprintln!("       elya run --record <trace> <file.elya>");
             eprintln!("       elya run --replay <trace> <file.elya>");
@@ -157,23 +158,68 @@ fn surface_warnings(path: &str, text: &str) {
     }
 }
 
-/// `elya build <file.elya> [-o <out>]` (Slice 5b-1 §7): the front end runs
-/// exactly as `elya check` — same diagnostics, same warning surfacing — and only
-/// then does the program go to Core, to an object, and through clang. Default
-/// output is the input stem plus the platform exe suffix.
+/// `elya build <file.elya> [-o <out>] [--target <machine>]` (Slice 5b-1 §7;
+/// spec 2026-11-14-elya-build-target): the front end runs exactly as `elya
+/// check` — same diagnostics, same warning surfacing — and only then does the
+/// program go to Core, to an object, and through the link. Default output is
+/// the input stem plus the platform exe suffix, or `.elf` for a board.
 #[cfg(feature = "codegen")]
 fn build_cmd(args: &[String]) -> ExitCode {
-    let Some(path) = args.get(2) else {
+    const USAGE: &str =
+        "usage: elya build <file.elya> [-o <out>] [--target host|cortex-m3|riscv32]";
+    let mut path: Option<&String> = None;
+    let mut out_path: Option<std::path::PathBuf> = None;
+    let mut target: Option<&str> = None;
+    let mut rest = args.iter().skip(2);
+    while let Some(a) = rest.next() {
+        match a.as_str() {
+            "-o" if out_path.is_none() => match rest.next() {
+                Some(o) => out_path = Some(std::path::PathBuf::from(o)),
+                None => {
+                    eprintln!("{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--target" if target.is_none() => match rest.next() {
+                Some(t) => target = Some(t),
+                None => {
+                    eprintln!("{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            _ if path.is_none() && !a.starts_with('-') => path = Some(a),
+            _ => {
+                eprintln!("{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(path) = path else {
         eprintln!("error: missing file path");
         return ExitCode::from(2);
     };
-    let out_path = match (args.get(3).map(String::as_str), args.get(4)) {
-        (Some("-o"), Some(o)) => Some(std::path::PathBuf::from(o)),
-        (None, _) => None,
-        _ => {
-            eprintln!("usage: elya build <file.elya> [-o <out>]");
-            return ExitCode::from(2);
-        }
+    // The machine is settled before anything is read: a board this compiler
+    // cannot build for is a usage error, not a late link failure.
+    let board = match target {
+        None | Some("host") => None,
+        Some(name) => match elya_codegen::Board::named(name) {
+            Some(b) if elya_codegen::BOARDS => Some(b),
+            Some(_) => {
+                eprintln!(
+                    "error: `--target {name}` needs an elya built with the boards feature \
+                     (cargo build -p elya-cli --features boards)"
+                );
+                return ExitCode::from(2);
+            }
+            None => {
+                let names: Vec<&str> = elya_codegen::Board::ALL.iter().map(|b| b.name()).collect();
+                eprintln!(
+                    "error: unknown target `{name}`: the targets are host, {}",
+                    names.join(", ")
+                );
+                return ExitCode::from(2);
+            }
+        },
     };
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -213,18 +259,35 @@ fn build_cmd(args: &[String]) -> ExitCode {
     };
 
     let exe = out_path.unwrap_or_else(|| {
-        std::path::PathBuf::from(path).with_extension(std::env::consts::EXE_EXTENSION)
+        let ext = if board.is_some() {
+            "elf"
+        } else {
+            std::env::consts::EXE_EXTENSION
+        };
+        std::path::PathBuf::from(path).with_extension(ext)
     });
     let obj = std::env::temp_dir().join(format!(
         "elya-build-{}-{}.o",
         std::process::id(),
         exe.file_stem().and_then(|s| s.to_str()).unwrap_or("out")
     ));
-    if let Err(e) = elya_codegen::compile_module(&core, &obj) {
+    let compiled = match board {
+        None => elya_codegen::compile_module(&core, &obj),
+        Some(b) => elya_codegen::compile_module_for(
+            &core,
+            &obj,
+            elya_codegen::Optimise::Speed,
+            &b.machine(),
+        ),
+    };
+    if let Err(e) = compiled {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
     }
-    let linked = elya_codegen::link(&obj, &exe);
+    let linked = match board {
+        None => elya_codegen::link(&obj, &exe),
+        Some(b) => elya_codegen::link_for(&obj, &exe, b),
+    };
     let _ = std::fs::remove_file(&obj);
     if let Err(e) = linked {
         eprintln!("error: {e}");

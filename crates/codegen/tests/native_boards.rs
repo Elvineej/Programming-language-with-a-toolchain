@@ -6,12 +6,12 @@
 //! levels.
 //!
 //! The `boards` feature says the boards can be run here, so each tool they need
-//! is required, by name: `clang`, `ld.lld`, `qemu-system-arm`,
-//! `qemu-system-riscv32`, and `arm-none-eabi-gcc` and `riscv64-unknown-elf-gcc`
-//! for their `libgcc` (64-bit division and soft floats).
+//! is required, by name: `qemu-system-arm` and `qemu-system-riscv32` here, and
+//! for the link (`elya_codegen::link_for`) `clang`, `ld.lld`, and
+//! `arm-none-eabi-gcc` and `riscv64-unknown-elf-gcc` for their `libgcc`.
 #![cfg(feature = "boards")]
 
-use elya_codegen::{CodegenError, Machine, Optimise};
+use elya_codegen::{Board, CodegenError, Machine, Optimise};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -44,136 +44,16 @@ fn first_on_path(names: &[&str]) -> String {
     panic!("the `boards` tests need one of {names:?} on PATH");
 }
 
-fn run_ok(cmd: &mut Command, what: &str) {
-    let out = cmd.output().unwrap_or_else(|e| panic!("{what}: {e}"));
-    assert!(
-        out.status.success(),
-        "{what}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-/// A board: the machine, how C is compiled for it, where its files are, the
-/// compiler whose `libgcc` it links, and how QEMU runs it.
-struct Spec {
-    name: &'static str,
-    machine: fn() -> Machine,
-    target: &'static [&'static str],
-    dir: &'static str,
-    gcc: &'static str,
-    gcc_target: &'static [&'static str],
-    qemu: &'static str,
-    qemu_args: &'static [&'static str],
-}
-
-const CORTEX_M3: Spec = Spec {
-    name: "cortex-m3",
-    machine: Machine::cortex_m3,
-    target: &[
-        "--target=thumbv7m-none-eabi",
-        "-mcpu=cortex-m3",
-        "-mfloat-abi=soft",
-    ],
-    dir: "cortex-m3",
-    gcc: "arm-none-eabi-gcc",
-    gcc_target: &["-mcpu=cortex-m3", "-mthumb"],
-    qemu: "qemu-system-arm",
-    qemu_args: &["-M", "mps2-an385"],
-};
-
-const RISCV32: Spec = Spec {
-    name: "riscv32",
-    machine: Machine::rv32imac,
-    target: &[
-        "--target=riscv32-unknown-elf",
-        "-march=rv32imac",
-        "-mabi=ilp32",
-    ],
-    dir: "riscv32",
-    gcc: "riscv64-unknown-elf-gcc",
-    gcc_target: &["-march=rv32imac", "-mabi=ilp32"],
-    qemu: "qemu-system-riscv32",
-    qemu_args: &["-M", "virt", "-bios", "none"],
-};
-
-const BOARDS: [&Spec; 2] = [&CORTEX_M3, &RISCV32];
-
-/// A board's pieces, built once: the runtime, the start-up, the board's hooks
-/// and the memory functions, each for its processor, and its `libgcc`.
-struct Board {
-    spec: &'static Spec,
-    lld: String,
-    qemu: String,
-    objects: Vec<PathBuf>,
-    libgcc: PathBuf,
-}
-
-fn board(spec: &'static Spec) -> &'static Board {
-    static M3: OnceLock<Board> = OnceLock::new();
-    static RV: OnceLock<Board> = OnceLock::new();
-    let cell = if spec.name == CORTEX_M3.name {
-        &M3
-    } else {
-        &RV
+/// The QEMU that runs a board's programs (the board's own link is the
+/// library's, `link_for`, which `elya build --target` uses too).
+fn qemu(board: Board) -> &'static str {
+    static ARM: OnceLock<String> = OnceLock::new();
+    static RV: OnceLock<String> = OnceLock::new();
+    let (cell, name) = match board {
+        Board::CortexM3 => (&ARM, "qemu-system-arm"),
+        Board::Riscv32 => (&RV, "qemu-system-riscv32"),
     };
-    cell.get_or_init(|| {
-        let clang = first_on_path(&["clang", "clang-18"]);
-        let lld = first_on_path(&["ld.lld", "ld.lld-18"]);
-        let qemu = first_on_path(&[spec.qemu]);
-        let gcc = first_on_path(&[spec.gcc]);
-        let dir = temp_dir(spec.name);
-        let boards = manifest().join("boards");
-        let c = [
-            "-DELYA_FREESTANDING",
-            "-ffreestanding",
-            "-nostdlib",
-            "-O2",
-            "-Wall",
-            "-Werror",
-        ];
-        let pieces: [(PathBuf, &[&str]); 4] = [
-            (manifest().join("src/runtime.c"), &c),
-            (boards.join("common/mem.c"), &c),
-            (boards.join(spec.dir).join("board.c"), &c),
-            (boards.join(spec.dir).join("startup.s"), &[]),
-        ];
-        let mut objects = Vec::new();
-        for (src, flags) in pieces {
-            let obj = dir
-                .join(src.file_name().expect("a file"))
-                .with_extension("o");
-            run_ok(
-                Command::new(&clang)
-                    .args(spec.target)
-                    .args(flags)
-                    .arg("-c")
-                    .arg(&src)
-                    .arg("-o")
-                    .arg(&obj),
-                &format!("{}: clang {}", spec.name, src.display()),
-            );
-            objects.push(obj);
-        }
-        let out = Command::new(&gcc)
-            .args(spec.gcc_target)
-            .arg("-print-libgcc-file-name")
-            .output()
-            .expect("the board's gcc");
-        let libgcc = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-        assert!(
-            libgcc.is_file(),
-            "{}: no libgcc at {}",
-            spec.name,
-            libgcc.display()
-        );
-        Board {
-            spec,
-            lld,
-            qemu,
-            objects,
-            libgcc,
-        }
-    })
+    cell.get_or_init(|| first_on_path(&[name]))
 }
 
 fn lower(src: &str) -> elya::core::CoreModule {
@@ -234,34 +114,20 @@ fn hosted_and_boards(tag: &str, src: &str) -> (Run, Vec<(String, Run)>) {
     elya_codegen::link(&obj, &exe).expect("link");
     let hosted = wait(Command::new(&exe), &format!("{tag} hosted"));
     let mut runs = Vec::new();
-    for spec in BOARDS {
-        let b = board(spec);
+    for board in Board::ALL {
         for (level, opt) in [("O2", Optimise::Speed), ("O0", Optimise::None)] {
-            let what = format!("{tag} on {} at {level}", spec.name);
-            let obj = dir.join(format!("{}-{level}.o", spec.name));
-            elya_codegen::compile_module_for(&core, &obj, opt, &(spec.machine)())
+            let what = format!("{tag} on {} at {level}", board.name());
+            let obj = dir.join(format!("{}-{level}.o", board.name()));
+            elya_codegen::compile_module_for(&core, &obj, opt, &board.machine())
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
-            let elf = dir.join(format!("{}-{level}.elf", spec.name));
-            run_ok(
-                Command::new(&b.lld)
-                    .arg("-T")
-                    .arg(manifest().join("boards").join(spec.dir).join("link.ld"))
-                    .arg("-o")
-                    .arg(&elf)
-                    .args(&b.objects)
-                    .arg(&obj)
-                    .arg(&b.libgcc),
-                &format!("{what}: ld.lld"),
-            );
-            let mut qemu = Command::new(&b.qemu);
-            qemu.args(b.spec.qemu_args)
-                // No `-nographic`: it gives QEMU the terminal, and makes its
-                // stdout non-blocking, so a full pipe failed a semihosting
-                // write (`output`, on RISC-V).
-                .args(["-display", "none", "-serial", "none", "-monitor", "none"])
-                .args(["-semihosting-config", "enable=on,target=native", "-kernel"])
-                .arg(&elf);
-            runs.push((what.clone(), wait(qemu, &what)));
+            let elf = dir.join(format!("{}-{level}.elf", board.name()));
+            elya_codegen::link_for(&obj, &elf, board).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let command = board.qemu_command();
+            let mut words = command.split_whitespace();
+            let _program = words.next();
+            let mut qemu_cmd = Command::new(qemu(board));
+            qemu_cmd.args(words).arg(&elf);
+            runs.push((what.clone(), wait(qemu_cmd, &what)));
         }
     }
     std::fs::remove_dir_all(&dir).ok();
@@ -482,10 +348,23 @@ fn the_examples_on_the_boards_write_what_they_write_hosted() {
             .to_string_lossy()
             .into_owned();
         let src = std::fs::read_to_string(&path).expect("read");
-        let (hosted, runs) = hosted_and_boards(&tag, &src);
-        assert_eq!(hosted.0, 0, "{tag}: hosted {hosted:?}");
-        for (what, run) in runs {
-            assert_eq!(run, hosted, "{what}");
+        // The timers example's real-clock half orders three requests by
+        // deadlines 10 ms apart, each counted from its own task's start, so a
+        // machine slowed by the other tests can reorder them (HANDOFF, "Also
+        // open"). This test failed once, unrecorded, in its first ten runs and
+        // not in 26 since, under load; that example is the one whose output
+        // depends on timing. It runs again, twice at most, before a difference
+        // fails the test.
+        let tries = if tag == "08_timers" { 3 } else { 1 };
+        for attempt in 1..=tries {
+            let (hosted, runs) = hosted_and_boards(&tag, &src);
+            assert_eq!(hosted.0, 0, "{tag}: hosted {hosted:?}");
+            let differs = runs.iter().find(|(_, run)| *run != hosted);
+            match differs {
+                None => break,
+                Some((what, run)) if attempt == tries => assert_eq!(*run, hosted, "{what}"),
+                Some((what, _)) => eprintln!("{what}: differs at try {attempt}, running again"),
+            }
         }
     }
 }

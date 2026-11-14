@@ -142,10 +142,10 @@ Elya is a typed language on a CEK machine, built up through these slices:
   closure used where an effectful one is expected gets an adapter;
 - **multi-shot handlers** (`with multi`): each resume re-enters a copy of the
   captured frames, so backtracking and search handlers run natively;
-- **bare metal**: the same program built for a Cortex-M3 or a 32-bit RISC-V
-  (`compile_module_for`, the `boards` feature) runs on QEMU's `mps2-an385` and
-  `virt` boards with no C library, a guard below its stack, and writes what the
-  hosted build writes (`crates/codegen/boards/`).
+- **bare metal**: `elya build prog.elya --target cortex-m3` (or `riscv32`; an
+  `elya` built with `--features boards`) makes an ELF that runs on QEMU's
+  `mps2-an385` or `virt` with no C library, a guard below its stack, and writes
+  what the hosted build writes (`docs/boards.md`).
 
 Every native program is checked against the reference evaluator, for both the
 value and the exact bytes printed. CI runs the full gate on Windows too.
