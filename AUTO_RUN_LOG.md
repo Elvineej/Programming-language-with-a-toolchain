@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-11-13 14:10 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
+## 2026-11-14 01:58 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -15,6 +15,29 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
   after the usage limit (primary)" about 5 h ahead (trig_01WyXi2uvHFnTw3TEU4FtMAY) and
   "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
+- **Done: Elya on a Cortex-M3 board** (HANDOFF step 1, part 3; spec
+  2026-11-13-elya-boards; 52bf757). Gate 1531 / 164, and configuration C 4 / 1
+  (predicted).
+  - Nine programs and every call shape write on QEMU's `mps2-an385` what they
+    write hosted, at O2 and O0.
+  - Found: LLVM 18's ARM back end pops a `tailcc` callee's stacked arguments
+    rounded to 8 and has its caller expect 16 (still on LLVM main); padded
+    around after the optimiser (`arm_tail.rs`). An eleven-line reproducer is in
+    the spec.
+  - Found: with the stack above the heap, a recursion past it wrote over the
+    heap; now the stack sits above an MPU guard and overflows by name.
+  - **Decisions (mine; please review):** the board is `mps2-an385` (64 KiB of
+    RAM did not hold a merge sort of 2,000); RISC-V refused by name until a
+    calling convention of its own (LLVM 18 has no `tailcc` there); the ARM back
+    end only with the `boards` feature (the maintainer's LLVM has x86 only).
+  - ChatGPT: the board files (checked, changed here), and research on LLVM's
+    bare-metal support, which missed the bug and was wrong about RISC-V, and
+    found the pointer-word sign extension (HANDOFF step 1, next).
+- **Done: optimised native code** (fe2639d; spec 2026-11-13-elya-optimised-code).
+  `default<O2>`; a function over 10,000 instructions built as written (the
+  instruction combiner took 117 s on one). Gate 1530 / 163.
+- **Done: the collector after ChatGPT's review** (467a22e): chunk growth, values
+  over 64 words, size classes, scratch counting, small pages.
 - **Done: the front end's frames** (12f91bd; spec 2026-11-13-elya-front-end-frames).
   The Windows gate had been red since cf3f028, unseen: fixed (a checker frame of
   16 KiB), with a test of the stack itself. Gate 1516 / 161.

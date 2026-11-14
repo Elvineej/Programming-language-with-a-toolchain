@@ -3,7 +3,7 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-11-13, an interactive session on `main`)
+## State at handoff (updated 2026-11-14, an interactive session on `main`)
 
 - **Work lands on `main` directly** (the maintainer, 2026-10-30: "Commit in the main
   tho"). `main` has everything: #24 (2026-10-24), then `auto/elya`'s 15 commits since,
@@ -30,7 +30,8 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1520 passed, 161 suites. **Look at the Windows
+- Linux gate at the tip of `main`: 1531 passed, 164 suites, and configuration C
+  (boards, where QEMU is installed) 4 passed, 1 suite. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
   unseen (a checker frame of 16 KiB overflowing a 2 MiB test thread; fixed in
   12f91bd, spec 2026-11-13-elya-front-end-frames). Native programs run on
@@ -43,14 +44,23 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   Since 2026-11-13 `runtime.c` is freestanding too: the machine only through
   `elya_platform_*` hooks (`platform_hosted.c` on a host; a board gives `write` and
   `exit`), Float text by `float_fmt.c` / `float_parse.c`, no C library function in
-  the IR (spec 2026-11-13-elya-platform-layer).
+  the IR (spec 2026-11-13-elya-platform-layer). Since fe2639d native code is
+  optimised (`default<O2>`; spec 2026-11-13-elya-optimised-code). Since 52bf757 an
+  Elya program runs on a Cortex-M3 board under QEMU (`compile_module_for` with
+  `Machine::cortex_m3()`, the `boards` feature, `crates/codegen/boards/`; spec
+  2026-11-13-elya-boards).
 - **Work is divided with ChatGPT** (the maintainer, 2026-11-13): Claude gives the
   ChatGPT (Codex) app on the PC self-contained jobs in `E:\Elya\chatgpt-jobs\<job>`,
   never the repository itself, picks its reasoning effort by the job's difficulty,
   and checks every result here before it lands (the spec names what was checked).
   The PC has no LLVM 18 and no QEMU: its jobs cannot build the native back end.
-  When the PC's link is down, ChatGPT on the web (the maintainer's browser, the
-  Claude extension) can read the public repository and review; it cannot write files.
+  When the PC's link is down, or Codex is out of credit (the maintainer,
+  2026-11-14: "switch to chat"), ChatGPT on the web (the maintainer's browser, the
+  Claude extension) can read the public repository and review; it cannot write
+  files. Every job at the most effort offered (the maintainer, 2026-11-14: GPT-6,
+  thinking effort High on that account); the easier parts to it, the harder
+  here, and its answers checked against the source (spec 2026-11-13-elya-boards
+  section 3 shows why: two of its research claims were wrong).
   `elya_eq` takes a fourth argument (the first closure tag) since 2026-10-23.
 - Interactive sessions use the same `AUTO_RUN_LOG.md` lock: an IN PROGRESS entry
   under 3 hours old makes a scheduled run exit.
@@ -755,21 +765,34 @@ once per process. Gate 1504.
 the hosted build writes (x86-64, the test machine's processor); working memory from
 the one heap, free again as soon as freed; a board's roots grow in its region;
 Float text 57 times faster. Gate 1520.
-**Next, part 3:** code generation for a target triple (`compile_module` takes the
-host's today), and an Elya program on a Cortex-M3 and a RISC-V board under QEMU
-(ChatGPT's start-up code and linker scripts, run here with a C `entry`, are in the
-scratchpad's `cj/job3` and on the PC at `E:\Elya\chatgpt-jobs\job3`; QEMU 8.2 is
-installed in the cloud workspace). Then part 2's review findings if any are open,
-the nursery (D10) measured on churn-heavy programs, and `big_live`'s size-mix
-memory.
+**ChatGPT's review of the collector** (467a22e): chunk growth, values over 64
+words, size classes, scratch counting, small pages; fixed test-first.
+**Part 3 done** (52bf757, 2026-11-14; spec 2026-11-13-elya-boards): code for a
+Cortex-M3 (`Machine`, `compile_module_for`), nine programs and every call shape
+writing on QEMU's `mps2-an385` what they write hosted, at O2 and O0; LLVM 18's
+ARM `tailcc` pop mismatch found and padded around (`arm_tail.rs`); the stack
+above an MPU guard, a stack overflow by name. Gate configuration C.
+**Next:**
+- pointer words zero-extended in the C runtime (`(int64_t)(intptr_t)p`
+  sign-extends on a 32-bit machine where LLVM's `ptrtoint` zero-extends;
+  ChatGPT's finding, harmless below 2 GiB; spec boards section 3);
+- RISC-V: LLVM 18 has no `tailcc` there (spec D5): a calling convention whose
+  tail calls LLVM can guarantee (one signature for every transfer, or a
+  dispatch loop), designed and measured in a spec of its own;
+- the LLVM bug upstream (the spec's eleven-line reproducer; filing it is the
+  maintainer's call);
+- the nursery (D10) measured on churn-heavy programs, and `big_live`'s
+  size-mix memory.
 
 ### 2. Native compilation without its implementation limits
 
-**First, found 2026-11-13:** `compile_module` emits at `OptimizationLevel::None`
-and runs no LLVM pass. Measure the benchmarks with the `default<O2>` pipeline
-(the shadow stack and the frames are explicit memory, so the passes are safe in
-principle; tail calls and the stack tests are what to watch), and make optimised
-code the default if the suite holds.
+**First, done** (fe2639d, spec 2026-11-13-elya-optimised-code): `default<O2>`
+on every program, functions over 10,000 instructions built as written. The
+arithmetic benchmarks reach C; what it left, in the spec's order: a closure's
+call (13x C) and a perform (42x), allocation and the shadow stack's pushes at
+every call (`queens` 5x), one trap block per checked operation, and the
+benchmark suite and its runner in the repository (ChatGPT wrote the suite; it is
+in the scratchpad's `bench/` and on the PC at `E:\Elya\chatgpt-jobs\bench`).
 
 The maintainer's priority (2026-10-30: "native compilation has restrictive
 implementation limits"). Inventory every refusal natively against the
