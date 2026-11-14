@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-11-14 01:58 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
+## 2026-11-14 02:20 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -15,6 +15,19 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
   after the usage limit (primary)" about 5 h ahead (trig_01WyXi2uvHFnTw3TEU4FtMAY) and
   "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
+- **Done: Elya on a RISC-V board** (spec 2026-11-14-elya-riscv-board; 6620efb).
+  Gate 1533 / 164, and configuration C 5 / 1 (predicted).
+  - LLVM 18 has no `tailcc` on RISC-V: every function one `fastcc` type of
+    twelve 32-bit words, so every `musttail` is valid and a tail call.
+  - Every board test and the ten examples run on both boards at O2 and O0.
+  - **Decisions (mine; please review):** one function type rather than a
+    dispatch loop or a global argument area; QEMU's `virt` with a locked PMP
+    guard; `check.sh` fails without the boards' tools (`ELYA_BOARDS=skip`).
+  - ChatGPT: the board's files (checked, run here), the review of 52bf757 (three
+    findings, all real, fixed), and research confirming the ARM bug.
+- **Done: the Windows gate** (fad7056): red since fe2639d, where `sum`'s optimised
+  object is the larger (COFF's unwind tables); the passes are now seen in the
+  IR (`emit_ir_for`). Named changed expectation.
 - **Done: Elya on a Cortex-M3 board** (HANDOFF step 1, part 3; spec
   2026-11-13-elya-boards; 52bf757). Gate 1531 / 164, and configuration C 4 / 1
   (predicted).

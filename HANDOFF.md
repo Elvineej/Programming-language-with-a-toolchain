@@ -30,8 +30,9 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1531 passed, 164 suites, and configuration C
-  (boards, where QEMU is installed) 4 passed, 1 suite. **Look at the Windows
+- Linux gate at the tip of `main`: 1533 passed, 164 suites, and configuration C
+  (the boards on QEMU; `check.sh` fails without its tools unless
+  `ELYA_BOARDS=skip`) 5 passed, 1 suite. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
   unseen (a checker frame of 16 KiB overflowing a 2 MiB test thread; fixed in
   12f91bd, spec 2026-11-13-elya-front-end-frames). Native programs run on
@@ -45,10 +46,12 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   `elya_platform_*` hooks (`platform_hosted.c` on a host; a board gives `write` and
   `exit`), Float text by `float_fmt.c` / `float_parse.c`, no C library function in
   the IR (spec 2026-11-13-elya-platform-layer). Since fe2639d native code is
-  optimised (`default<O2>`; spec 2026-11-13-elya-optimised-code). Since 52bf757 an
-  Elya program runs on a Cortex-M3 board under QEMU (`compile_module_for` with
-  `Machine::cortex_m3()`, the `boards` feature, `crates/codegen/boards/`; spec
-  2026-11-13-elya-boards).
+  optimised (`default<O2>`; spec 2026-11-13-elya-optimised-code; the Windows
+  gate was red from it until fad7056). Since 52bf757 and 6620efb an Elya program runs on
+  a Cortex-M3 and a 32-bit RISC-V board under QEMU (`compile_module_for` with
+  `Machine::cortex_m3()` or `Machine::rv32imac()`, the `boards` feature,
+  `crates/codegen/boards/`; specs 2026-11-13-elya-boards,
+  2026-11-14-elya-riscv-board).
 - **Work is divided with ChatGPT** (the maintainer, 2026-11-13): Claude gives the
   ChatGPT (Codex) app on the PC self-contained jobs in `E:\Elya\chatgpt-jobs\<job>`,
   never the repository itself, picks its reasoning effort by the job's difficulty,
@@ -772,17 +775,28 @@ Cortex-M3 (`Machine`, `compile_module_for`), nine programs and every call shape
 writing on QEMU's `mps2-an385` what they write hosted, at O2 and O0; LLVM 18's
 ARM `tailcc` pop mismatch found and padded around (`arm_tail.rs`); the stack
 above an MPU guard, a stack overflow by name. Gate configuration C.
+**The RISC-V board done** (6620efb, 2026-11-14; spec 2026-11-14-elya-riscv-board):
+LLVM 18 has no `tailcc` on RISC-V, so every Elya function there is one
+`fastcc` type of twelve 32-bit words (`rv_tail.rs`), every `musttail` valid
+and a tail call; QEMU's `virt` with a locked PMP guard; pointers one word in the
+runtime (`ELYA_WORD`); every board test and the ten examples on both boards;
+ChatGPT's review of 52bf757 fixed (a gate that passed without the boards, a
+test reader that could stop on large output, the vector table).
 **Next:**
-- pointer words zero-extended in the C runtime (`(int64_t)(intptr_t)p`
-  sign-extends on a 32-bit machine where LLVM's `ptrtoint` zero-extends;
-  ChatGPT's finding, harmless below 2 GiB; spec boards section 3);
-- RISC-V: LLVM 18 has no `tailcc` there (spec D5): a calling convention whose
-  tail calls LLVM can guarantee (one signature for every transfer, or a
-  dispatch loop), designed and measured in a spec of its own;
-- the LLVM bug upstream (the spec's eleven-line reproducer; filing it is the
-  maintainer's call);
+- the LLVM bug upstream (the boards spec's eleven-line reproducer; filing it is
+  the maintainer's call; ChatGPT drafted the report);
+- `elya build --target cortex-m3|riscv32`: the CLI does not reach
+  `compile_module_for` yet; a board's link (its files, `libgcc`) in the
+  compiler, not only in the tests;
 - the nursery (D10) measured on churn-heavy programs, and `big_live`'s
-  size-mix memory.
+  size-mix memory. ChatGPT's audit (2026-11-14, to verify first): Elya data is
+  written only at initialisation except three stores, each able to make an old
+  object point to a young one: an answering handler's `HF_NEXT` and
+  `HF_PARENT` at a resume (`cps_emit.rs`), and a copied frame's `CONT_PARENT`
+  in `elya_cont_copy` (`runtime.c`); `gc_collect` finishes sweeping before
+  every mark (a minor must not); its proposal: sticky age bits per slot beside
+  the mark bitmap (Demers et al. 1990), barriers at those three stores, and
+  measuring survival by kind before building anything.
 
 ### 2. Native compilation without its implementation limits
 
