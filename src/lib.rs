@@ -101,11 +101,22 @@ pub fn run_source_outcome(name: &str, text: &str) -> RunOutcome {
 
 /// [`run_source_outcome`] over a whole program (modules part 1 D7).
 pub fn run_source_outcome_with(name: &str, text: &str, read: &mut modules::Reader) -> RunOutcome {
+    run_source_outcome_host(name, text, read, eval::Host::default())
+}
+
+/// [`run_source_outcome_with`] with the live host's arguments and input (spec
+/// 2026-11-14-elya-files-and-arguments D4).
+pub fn run_source_outcome_host(
+    name: &str,
+    text: &str,
+    read: &mut modules::Reader,
+    host: eval::Host,
+) -> RunOutcome {
     let (module, diags, sm) = front_end_with(name, text, read);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
         return RunOutcome::refused(rendered);
     }
-    let (interp, result) = eval::run_module_keeping(&module, eval::World::Live);
+    let (interp, result) = eval::run_module_keeping_host(&module, eval::World::Live, host);
     RunOutcome::of(interp.output().to_string(), interp.types(), result, &sm)
 }
 
@@ -171,11 +182,24 @@ pub fn record_source_with(
     text: &str,
     read: &mut modules::Reader,
 ) -> (Option<String>, RunOutcome) {
+    record_source_host(name, text, read, eval::Host::default())
+}
+
+/// [`record_source_with`] with the live host's arguments and input: the
+/// answers it gives are the trace's (spec 2026-11-14-elya-files-and-arguments
+/// D3).
+pub fn record_source_host(
+    name: &str,
+    text: &str,
+    read: &mut modules::Reader,
+    host: eval::Host,
+) -> (Option<String>, RunOutcome) {
     let (module, diags, sm) = front_end_with(name, text, read);
     if let Some(rendered) = fail_if_errors(&diags, &sm) {
         return (None, RunOutcome::refused(rendered));
     }
-    let (interp, result) = eval::run_module_keeping(&module, eval::World::Record(Vec::new()));
+    let (interp, result) =
+        eval::run_module_keeping_host(&module, eval::World::Record(Vec::new()), host);
     let mut trace = format!("{TRACE_HEADER}\n");
     if let eval::World::Record(log) = &interp.world {
         for (q, a) in log {

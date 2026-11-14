@@ -24,7 +24,17 @@ links `llvm_sys`), and `elya-cli` (the `elya` binary).
 cargo build -p elya-cli                                 # the compiler; no LLVM in this graph
 cargo run -p elya-cli -- run examples/01_hello.elya     # prints: Hello, Elya!
 cargo run -p elya-cli -- check examples/02_arith.elya   # front-end only (parse + resolve + type-check)
+cargo run -p elya-cli -- run prog.elya -- a "b c"       # the program's arguments follow `--`
 ```
+
+A program reads and writes files, reads standard input and its command line:
+`io.read_file(path)`, `io.file_exists(path)`, `io.write_file(path, text)`,
+`io.read_stdin()`, `io.arg_count()` and `io.arg(i)` perform `IO`, and a failure
+stops the run by name (`elya: cannot read `a.txt`: no such file or directory`),
+the same words natively. A compiled binary takes its own arguments and input. A
+dependency is written against `elya/files` (a `Files` effect) and granted that,
+never `IO`; `elya/host`'s `files` gives it the host's files, and `elya/files`
+has handlers in memory, read-only and under a directory.
 
 Native compilation is opt-in behind `--features codegen`, so a default build
 needs no LLVM at all. With it, `elya build` compiles a program to a real native
@@ -240,8 +250,8 @@ replay: same score
 replay of the changed game: diverged at an 8-sided roll
 ```
 
-The host's own answers (`time.now_ms`, `time.sleep_ms`) are recorded from outside the
-program: `elya run --record t.trace prog.elya` writes them, `elya run --replay t.trace
+The host's own answers (`time.now_ms`, `time.sleep_ms`, and the files, input and
+arguments a program reads) are recorded from outside the program: `elya run --record t.trace prog.elya` writes them, `elya run --replay t.trace
 prog.elya` reproduces the run from them, and a compiled binary does the same under
 `ELYA_RECORD=t.trace ./prog` and `ELYA_REPLAY=t.trace ./prog`. The trace is the same
 text either way, so a run recorded natively replays in the evaluator and the reverse.

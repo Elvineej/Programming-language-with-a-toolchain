@@ -331,6 +331,38 @@ fn a_stack_overflow_on_the_boards_is_named() {
 /// The examples: async, structured concurrency, multi-shot search, replay,
 /// `with any` recording, failure as an effect, a CEK machine. Each writes on
 /// each board what it writes hosted.
+#[path = "../../../tests/programs/files_and_arguments.rs"]
+#[allow(dead_code)]
+mod programs;
+
+/// A board has no files, no arguments and empty input (spec
+/// 2026-11-14-elya-files-and-arguments D5), by name, at both levels.
+#[test]
+fn a_board_has_no_files_no_arguments_and_no_input() {
+    use programs::{NO_WORLD, NO_WORLD_FAILURE, NO_WORLD_OUT};
+    let (hosted, runs) = hosted_and_boards("no-world", NO_WORLD);
+    assert_eq!(
+        hosted,
+        (
+            1,
+            NO_WORLD_OUT.to_string(),
+            "elya: cannot read `a.txt`: no such file or directory\n".to_string()
+        ),
+        "hosted"
+    );
+    for (what, run) in runs {
+        assert_eq!(
+            run,
+            (
+                1,
+                NO_WORLD_OUT.to_string(),
+                format!("elya: {NO_WORLD_FAILURE}\n")
+            ),
+            "{what}"
+        );
+    }
+}
+
 #[test]
 fn the_examples_on_the_boards_write_what_they_write_hosted() {
     let dir = manifest().join("../../examples");

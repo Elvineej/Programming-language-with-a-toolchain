@@ -3211,13 +3211,28 @@ impl Infer {
 
     /// Whether `module.name` is a builtin `type_builtin_call` types.
     fn builtin_known(module: &str, name: &str) -> bool {
-        (module == "io" && name == "println")
-            || (module == "time" && (name == "now_ms" || name == "sleep_ms"))
+        Self::host_signature(module, name).is_some()
             || (module == "op" && matches!(name, "name" | "show" | "perform" | "encode" | "decode"))
             || ((module == "int" || module == "float") && name == "to_string")
             || (module == "float" && crate::resolve::FLOAT_CONVERSIONS.contains(&name))
             || (module == "string" && crate::resolve::STRING_BUILTINS.contains(&name))
             || (module == "int" && crate::resolve::INT_BINARY_BUILTINS.contains(&name))
+    }
+
+    /// A host builtin's parameters and result: each performs `IO`.
+    fn host_signature(module: &str, name: &str) -> Option<(Vec<Ty>, Ty)> {
+        Some(match (module, name) {
+            ("io", "println") => (vec![Ty::str()], Ty::unit()),
+            ("io", "read_file") => (vec![Ty::str()], Ty::str()),
+            ("io", "file_exists") => (vec![Ty::str()], Ty::bool()),
+            ("io", "write_file") => (vec![Ty::str(), Ty::str()], Ty::unit()),
+            ("io", "read_stdin") => (Vec::new(), Ty::str()),
+            ("io", "arg_count") => (Vec::new(), Ty::int()),
+            ("io", "arg") => (vec![Ty::int()], Ty::str()),
+            ("time", "now_ms") => (Vec::new(), Ty::int()),
+            ("time", "sleep_ms") => (vec![Ty::int()], Ty::unit()),
+            _ => return None,
+        })
     }
 
     /// A builtin's call, its arguments inferred.
@@ -3231,43 +3246,11 @@ impl Infer {
         span: Span,
         amb: RowVar,
     ) -> Ty {
-        if module == "io" && name == "println" {
-            let want = Ty::Fn(vec![Ty::str()], EffectRow::pure(), Box::new(Ty::unit()));
-            let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(Ty::unit()));
-            self.unify(&want, &got, span);
-            {
-                let r = self.add_effect(amb, "IO", Vec::new(), span);
-                self.surface_conflict(r);
-            } // io.println performs {IO}
-            let mut io_labels = BTreeMap::new();
-            io_labels.insert(
-                "IO".to_string(),
-                EffectLabel {
-                    args: Vec::new(),
-                    span: callee_span,
-                },
-            );
-            self.node_types.insert(
-                callee_span,
-                Ty::Fn(
-                    vec![Ty::str()],
-                    EffectRow {
-                        labels: io_labels,
-                        tail: RowTail::Closed,
-                    },
-                    Box::new(Ty::unit()),
-                ),
-            );
-            return Ty::unit();
-        }
-        // `time.now_ms : fn() -> Int` and `time.sleep_ms : fn(Int) -> Unit`,
-        // both performing `IO` (spec 2026-10-15-elya-async-step2-timers D3).
-        if module == "time" && (name == "now_ms" || name == "sleep_ms") {
-            let (params, ret) = if name == "now_ms" {
-                (Vec::new(), Ty::int())
-            } else {
-                (vec![Ty::int()], Ty::unit())
-            };
+        // The host's builtins: `io.println`, files, standard input and
+        // arguments (spec 2026-11-14-elya-files-and-arguments D1), and
+        // `time.now_ms`/`time.sleep_ms` (spec 2026-10-15-elya-async-step2-timers
+        // D3), each performing `IO`.
+        if let Some((params, ret)) = Self::host_signature(module, name) {
             let want = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(ret.clone()));
             let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
             self.unify(&want, &got, span);

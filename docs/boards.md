@@ -49,8 +49,11 @@ fails (the program stops with status 70).
 - A clock: `time.now_ms` counts from the MPS2 FPGA's 100 Hz counter on the
   Cortex-M3 (steps of 10 ms) and from `mtime` on RISC-V; `time.sleep_ms` waits
   on it.
-- No files, no environment variables, no settings (`ELYA_GC_STRESS` and the
-  like are a host's).
+- No files, no arguments, no input, no environment variables, no settings
+  (`ELYA_GC_STRESS` and the like are a host's): `io.file_exists` answers
+  `False`, `io.arg_count()` 0, `io.read_stdin()` the empty string, and
+  `io.read_file` and `io.write_file` stop with
+  `elya: cannot read `<path>`: this platform has no files`, status 1.
 - A recursion deeper than the stack stops with
   `elya: native stack overflow: recursion deeper than the 1024 KiB stack`,
   status 1, as on a host: a 4 KiB guard below the stack (the MPU on the
