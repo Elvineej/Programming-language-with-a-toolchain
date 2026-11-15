@@ -133,14 +133,21 @@ fn reading_an_array_by_index_is_linear_natively() {
     let dir = temp_dir("linear");
     let time = |n: u32| {
         let exe = build(&reads(n), &dir, &format!("a{n}"));
-        let t = std::time::Instant::now();
-        let out = Command::new(&exe).output().expect("run");
-        let took = t.elapsed().as_secs_f64();
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim_end(),
-            reads_value(n.into())
-        );
-        took
+        // The faster of three runs: a first run's page faults on a fresh
+        // large heap can cost more than the reads (Codex measured the ratio
+        // past ten on a loaded machine, PR #28).
+        (0..3)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                let out = Command::new(&exe).output().expect("run");
+                let took = t.elapsed().as_secs_f64();
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout).trim_end(),
+                    reads_value(n.into())
+                );
+                took
+            })
+            .fold(f64::INFINITY, f64::min)
     };
     // A list's `nth` for every index is quadratic: 40,000 elements took
     // 3.3 s (the plan's measurement), the array 6 ms. A read is a load.

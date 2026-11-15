@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-11-15 02:30 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
+## 2026-11-15 10:40 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -15,6 +15,10 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
   after the usage limit (primary)" about 5 h ahead (trig_01WyXi2uvHFnTw3TEU4FtMAY) and
   "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
+- **Done: the parser in Elya (part 4a)**, Codex's PR #28: 831 inputs agree
+  with src/parse.rs; also the tokens as an array (ChatGPT), fewer native roots
+  (map 4.5 s to 3.0 s), `elya parse --dump` and `elya check --dump`, and the
+  array timing test made robust (Codex saw it fail under load).
 - **Done: `elya/map`** (spec D7; ChatGPT wrote it, Codex was out of usage).
   Gate 1614 / 180 (predicted). Controls K1-K3. Also: round three of the borrow
   review as tests, and `native_boards`' runner given empty input (the no-world

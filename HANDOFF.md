@@ -30,7 +30,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1629 passed, 185 suites, and configuration C
+- Linux gate at the tip of `main`: 1632 passed, 188 suites, and configuration C
   (the boards on QEMU; `check.sh` fails without its tools unless
   `ELYA_BOARDS=skip`) 8 passed, 2 suites. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
@@ -791,9 +791,14 @@ beside it): the print form both parsers write is `elya::ast_dump` (`elya parse
 --dump <file>`), complete to every flag and span, pinned in
 `tests/ast_dump.rs`; next, Codex's job (brief in the plan's steps 2 and 3):
 the lexer's tokens as an array, then `selfhost/parse.elya`, compared byte for
-byte on every clean program (4a), errors and recovery after (4b). Codex has
-4a (sent 2026-11-15 03:46, branch `codex/parse-elya`). The checker's
-verdict has its print form too, `elya check --dump` (spec D6). The roadmap's "continuation-aware ownership" line takes
+byte on every clean program (4a), errors and recovery after (4b). **4a done**
+(Codex, PR #28, landed by cherry-pick): `selfhost/parse.elya` agrees with
+`src/parse.rs` on 831 inputs (every repository file, 712 programs from the
+tests, 80 focused ones) and natively on its own 56 KB source, in 66 ms
+against Rust's 2.7 ms (lex, parse and dump): the switch will need that gap
+closed (step 3, step 2's nursery). Next: **4b**, errors and recovery, then
+modules and resolution. The checker's verdict has its print form too, `elya
+check --dump` (spec D6). The roadmap's "continuation-aware ownership" line takes
 the review's longer proposals (loans through continuations, once-callable
 function types).
 **Part 3, begun: the lexer in Elya**, `selfhost/lex.elya` (b004e29; Codex wrote

@@ -1,0 +1,1405 @@
+// Elya parser, self-hosting part 4a. Clean-program oracle: src/parse.rs.
+// Every span and flag is retained; recovery and full diagnostics are part 4b.
+import lex / {IO}
+
+// The surface AST mirrors src/ast.rs. Sp stores the parser's byte offsets.
+// Lists are immutable and duplicable; only the lexer's token array is linear.
+type List(a) { Nil, Cons(a, List(a)) }
+type Maybe(a) { No, Yes(a) }
+type Sp(a) { Sp(a, Int, Int) }
+type Parsed(a) { Parsed(a, Int), ParseError(String, Int, Int) }
+
+type Module { Module(List(Sp(Import)), List(Sp(Decl))) }
+type Import { Import(List(String), Maybe(String), Maybe(List(Sp(String)))) }
+type Decl {
+  DFn(Bool, String, List(Sp(Param)), Maybe(RowAnn), Maybe(Sp(TypeAnn)), Sp(Block)),
+  DEffect(String, List(String), Bool, List(Sp(OpSig))),
+  DType(String, List(String), Bool, List(Sp(VariantDecl)))
+}
+type Param { Param(String, Maybe(Sp(TypeAnn)), Bool) }
+type TypeAnn { TypeAnn(String, List(Sp(TypeAnn)), Maybe(RowAnn)) }
+type RowAnn { RowAnn(List(LabelAnn), Maybe(Sp(String))) }
+type LabelAnn { LabelAnn(Sp(String), Maybe(List(Sp(TypeAnn)))) }
+type OpSig { OpSig(String, List(Sp(Param)), List(Sp(TypeAnn)), Sp(TypeAnn)) }
+type VariantDecl { VariantDecl(String, List(Sp(TypeAnn))) }
+type OpClause { OpClause(Maybe(String), String, List(Sp(Param)), Sp(Expr)) }
+type ReturnClause { ReturnClause(String, Sp(Expr)) }
+type Handler { Handler(Bool, Bool, List(Sp(OpClause)), Maybe(ReturnClause)) }
+type Block { Block(List(Sp(Stmt)), Maybe(Sp(Expr))) }
+type Stmt { SLet(String, Maybe(Sp(TypeAnn)), Sp(Expr)), SExpr(Sp(Expr)) }
+type Pattern {
+  PWild, PVar(String), PCtor(String, List(Sp(Pattern))),
+  PInt(Int), PBool(Bool), PStr(String), PUnit
+}
+type MatchArm { MatchArm(Sp(Pattern), Sp(Expr)) }
+type Expr {
+  EInt(Int), EFloat, EStr(String), EBool(Bool), EUnit, EVar(String),
+  EQualified(String, String), ECall(Sp(Expr), List(Sp(Expr))),
+  EUnary(String, Sp(Expr)), EBinary(String, Sp(Expr), Sp(Expr)),
+  EIf(Sp(Expr), Sp(Block), Sp(Block)), EBlock(Block),
+  EHandle(Sp(Expr), Handler), EResume(Sp(Expr)),
+  EMatch(Sp(Expr), List(Sp(MatchArm))), ELambda(List(Sp(Param)), Sp(Block)), EError
+}
+
+fn reverse_into(xs: List(a), acc: List(a)) -> List(a) {
+  match xs { Nil -> acc Cons(x, rest) -> reverse_into(rest, Cons(x, acc)) }
+}
+fn rev(xs: List(a)) -> List(a) { reverse_into(xs, Nil) }
+fn count_from(xs: List(a), n: Int) -> Int {
+  match xs { Nil -> n Cons(_, rest) -> count_from(rest, n + 1) }
+}
+fn count(xs: List(a)) -> Int { count_from(xs, 0) }
+fn sp_start(x: Sp(a)) -> Int { match x { Sp(_, start, _) -> start } }
+fn sp_end(x: Sp(a)) -> Int { match x { Sp(_, _, end) -> end } }
+fn sp_node(x: Sp(a)) -> a { match x { Sp(node, _, _) -> node } }
+fn respan(x: Sp(a), start: Int, end: Int) -> Sp(a) {
+  match x { Sp(node, _, _) -> Sp(node, start, end) }
+}
+
+
+// Token storage stays in parse_dump. Every reader borrows that same array.
+fn tk(borrow ts: Array(Token), src: String, i: Int) -> Int {
+  if i >= array.length(ts) { -1 } else {
+    match array.get(ts, i) { Token(k, _, _, _) -> k }
+  }
+}
+fn ts_start(borrow ts: Array(Token), src: String, i: Int) -> Int {
+  if i >= array.length(ts) { string.length(src) } else {
+    match array.get(ts, i) { Token(_, s, _, _) -> s }
+  }
+}
+fn ts_end(borrow ts: Array(Token), src: String, i: Int) -> Int {
+  if i >= array.length(ts) { string.length(src) } else {
+    match array.get(ts, i) { Token(_, _, e, _) -> e }
+  }
+}
+fn payload(borrow ts: Array(Token), src: String, i: Int) -> String {
+  if i >= array.length(ts) { "" } else {
+    match array.get(ts, i) { Token(_, _, _, p) -> p }
+  }
+}
+fn err(borrow ts: Array(Token), src: String, i: Int) -> Parsed(a) {
+  ParseError("E0100", ts_start(ts, src, i), ts_end(ts, src, i))
+}
+fn has_newline(src: String, i: Int, end: Int) -> Bool {
+  if i >= end { False } else {
+    if string.byte_at(src, i) == 10 { True } else { has_newline(src, i + 1, end) }
+  }
+}
+fn newline_before(borrow ts: Array(Token), src: String, i: Int) -> Bool {
+  if i == 0 || i >= array.length(ts) { False } else {
+    has_newline(src, ts_end(ts, src, i - 1), ts_start(ts, src, i))
+  }
+}
+// Accumulate negatively so the magnitude of Int's minimum never overflows.
+fn magnitude(text: String, i: Int, n: Int) -> Int {
+  if i == string.length(text) { n } else {
+    magnitude(text, i + 1, int.wrapping_sub(int.wrapping_mul(n, 10), string.byte_at(text, i) - 48))
+  }
+}
+fn number_value(text: String, negative: Bool) -> Int {
+  let n = magnitude(text, 0, 0)
+  if negative { n } else { int.wrapping_sub(0, n) }
+}
+
+
+// Type, row, parameter and pattern readers. Every cursor is a token index;
+// ts remains in its owner and is only borrowed at each call.
+fn parse_type(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(TypeAnn)) {
+  let k = tk(ts, src, i)
+  let start = ts_start(ts, src, i)
+  let end = ts_end(ts, src, i)
+  if k == 4 {
+    if tk(ts, src, i + 1) != 59 { err(ts, src, i + 1) } else {
+      match function_type_inputs(ts, src, i + 2, Nil) {
+        Parsed(args, next) -> {
+          if tk(ts, src, next) == 49 {
+            match parse_row(ts, src, next + 1, True) {
+              Parsed(row, after) -> finish_function_type(ts, src, after, start, args, Yes(row))
+              ParseError(code, a, b) -> ParseError(code, a, b)
+            }
+          } else { finish_function_type(ts, src, next, start, args, No) }
+        }
+        ParseError(code, a, b) -> ParseError(code, a, b)
+      }
+    }
+  } else {
+    if k == 59 {
+      if tk(ts, src, i + 1) == 60 {
+        Parsed(Sp(TypeAnn("Unit", Nil, No), start, end), i + 2)
+      } else {
+        match parse_type(ts, src, i + 1) {
+          Parsed(inner, next) -> {
+            if tk(ts, src, next) == 60 { Parsed(inner, next + 1) } else { err(ts, src, next) }
+          }
+          ParseError(code, a, b) -> ParseError(code, a, b)
+        }
+      }
+    } else {
+      if k == 24 || k == 25 || k == 23 {
+        let name = if k == 23 { "Unit" } else { payload(ts, src, i) }
+        if tk(ts, src, i + 1) == 59 {
+          match parse_type_args(ts, src, i + 2) {
+            Parsed(args, next) -> Parsed(Sp(TypeAnn(name, args, No), start, end), next)
+            ParseError(code, a, b) -> ParseError(code, a, b)
+          }
+        } else { Parsed(Sp(TypeAnn(name, Nil, No), start, end), i + 1) }
+      } else { err(ts, src, i) }
+    }
+  }
+}
+
+// Function-type inputs are annotations, rather than general row arguments.
+fn function_type_inputs(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(TypeAnn))) -> Parsed(List(Sp(TypeAnn))) {
+  if tk(ts, src, i) == 60 { Parsed(rev(acc), i + 1) } else {
+    match parse_type(ts, src, i) {
+      Parsed(ann, next) -> {
+        if tk(ts, src, next) == 57 {
+          function_type_more(ts, src, next + 1, Cons(ann, acc))
+        } else {
+          if tk(ts, src, next) == 60 { Parsed(rev(Cons(ann, acc)), next + 1) } else { err(ts, src, next) }
+        }
+      }
+      ParseError(code, a, b) -> ParseError(code, a, b)
+    }
+  }
+}
+
+fn function_type_more(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(TypeAnn))) -> Parsed(List(Sp(TypeAnn))) {
+  if tk(ts, src, i) == 60 { err(ts, src, i) } else { function_type_inputs(ts, src, i, acc) }
+}
+
+fn type_result(args: List(Sp(TypeAnn)), ret: Sp(TypeAnn)) -> List(Sp(TypeAnn)) {
+  reverse_into(rev(args), Cons(ret, Nil))
+}
+
+fn finish_function_type(borrow ts: Array(Token), src: String, i: Int, start: Int, args: List(Sp(TypeAnn)), row: Maybe(RowAnn)) -> Parsed(Sp(TypeAnn)) {
+  if tk(ts, src, i) != 38 { err(ts, src, i) } else {
+    match parse_type(ts, src, i + 1) {
+      Parsed(ret, next) -> Parsed(Sp(TypeAnn("fn", type_result(args, ret), row), start, sp_end(ret)), next)
+      ParseError(code, a, b) -> ParseError(code, a, b)
+    }
+  }
+}
+
+fn parse_type_arg(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(TypeAnn)) {
+  if tk(ts, src, i) == 61 {
+    let start = ts_start(ts, src, i)
+    let end = ts_end(ts, src, i)
+    match parse_row(ts, src, i, True) {
+      Parsed(row, next) -> {
+        let result = Sp(TypeAnn("$Row", Nil, No), start, end)
+        Parsed(Sp(TypeAnn("fn", Cons(result, Nil), Yes(row)), start, end), next)
+      }
+      ParseError(code, a, b) -> ParseError(code, a, b)
+    }
+  } else { parse_type(ts, src, i) }
+}
+
+fn parse_type_args(borrow ts: Array(Token), src: String, i: Int) -> Parsed(List(Sp(TypeAnn))) {
+  if tk(ts, src, i) == 60 { Parsed(Nil, i + 1) } else { type_args_items(ts, src, i, Nil) }
+}
+
+fn type_args_items(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(TypeAnn))) -> Parsed(List(Sp(TypeAnn))) {
+  match parse_type_arg(ts, src, i) {
+    Parsed(ann, next) -> {
+      if tk(ts, src, next) == 57 { type_args_items(ts, src, next + 1, Cons(ann, acc)) } else {
+        // The bootstrap parser consumes this closing paren only when present.
+        let after = if tk(ts, src, next) == 60 { next + 1 } else { next }
+        Parsed(rev(Cons(ann, acc)), after)
+      }
+    }
+    ParseError(code, a, b) -> ParseError(code, a, b)
+  }
+}
+
+fn parse_row(borrow ts: Array(Token), src: String, i: Int, tail: Bool) -> Parsed(RowAnn) {
+  if tk(ts, src, i) != 61 { err(ts, src, i) } else {
+    let first = i + 1
+    if tk(ts, src, first) == 24 && tk(ts, src, first + 1) == 62 {
+      if !tail || payload(ts, src, first) == "_" { err(ts, src, first) } else {
+        let name = Sp(payload(ts, src, first), ts_start(ts, src, first), ts_end(ts, src, first))
+        Parsed(RowAnn(Nil, Yes(name)), first + 2)
+      }
+    } else { row_items(ts, src, first, tail, Nil) }
+  }
+}
+
+fn row_items(borrow ts: Array(Token), src: String, i: Int, tail: Bool, acc: List(LabelAnn)) -> Parsed(RowAnn) {
+  let k = tk(ts, src, i)
+  if k == 62 { Parsed(RowAnn(rev(acc), No), i + 1) } else {
+    if k == 44 { row_tail(ts, src, i + 1, tail, acc) } else {
+      if k != 25 { err(ts, src, i) } else {
+        let name = Sp(payload(ts, src, i), ts_start(ts, src, i), ts_end(ts, src, i))
+        if tk(ts, src, i + 1) == 59 {
+          if tail {
+            match parse_type_args(ts, src, i + 2) {
+              Parsed(args, next) -> row_after_item(ts, src, next, tail, Cons(LabelAnn(name, Yes(args)), acc))
+              ParseError(code, a, b) -> ParseError(code, a, b)
+            }
+          } else {
+            match skip_row_parens(ts, src, i + 2, 1) {
+              Parsed(ignored, next) -> row_after_item(ts, src, next, tail, Cons(LabelAnn(name, No), acc))
+              ParseError(code, a, b) -> ParseError(code, a, b)
+            }
+          }
+        } else { row_after_item(ts, src, i + 1, tail, Cons(LabelAnn(name, No), acc)) }
+      }
+    }
+  }
+}
+
+fn row_after_item(borrow ts: Array(Token), src: String, i: Int, tail: Bool, acc: List(LabelAnn)) -> Parsed(RowAnn) {
+  if tk(ts, src, i) == 57 {
+    // A trailing comma is an error in Rust's row reader.
+    if tk(ts, src, i + 1) == 62 { err(ts, src, i + 1) } else { row_items(ts, src, i + 1, tail, acc) }
+  } else {
+    if tk(ts, src, i) == 44 { row_tail(ts, src, i + 1, tail, acc) } else {
+      if tk(ts, src, i) == 62 { Parsed(RowAnn(rev(acc), No), i + 1) } else { err(ts, src, i) }
+    }
+  }
+}
+
+fn row_tail(borrow ts: Array(Token), src: String, i: Int, tail: Bool, acc: List(LabelAnn)) -> Parsed(RowAnn) {
+  if !tail || tk(ts, src, i) != 24 || payload(ts, src, i) == "_" { err(ts, src, i) } else {
+    let name = Sp(payload(ts, src, i), ts_start(ts, src, i), ts_end(ts, src, i))
+    if tk(ts, src, i + 1) == 62 { Parsed(RowAnn(rev(acc), Yes(name)), i + 2) } else { err(ts, src, i + 1) }
+  }
+}
+
+fn skip_row_parens(borrow ts: Array(Token), src: String, i: Int, depth: Int) -> Parsed(Int) {
+  let k = tk(ts, src, i)
+  if k == 0 - 1 { err(ts, src, i) } else {
+    if k == 60 && depth == 1 { Parsed(0, i + 1) } else {
+      let next_depth = if k == 59 { depth + 1 } else { if k == 60 { depth - 1 } else { depth } }
+      skip_row_parens(ts, src, i + 1, next_depth)
+    }
+  }
+}
+
+fn parse_params(borrow ts: Array(Token), src: String, i: Int) -> Parsed(List(Sp(Param))) {
+  if tk(ts, src, i) == 60 { Parsed(Nil, i + 1) } else { param_items(ts, src, i, Nil) }
+}
+
+fn param_items(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(Param))) -> Parsed(List(Sp(Param))) {
+  let borrowed = tk(ts, src, i) == 24 && payload(ts, src, i) == "borrow" && tk(ts, src, i + 1) == 24
+  let at = if borrowed { i + 1 } else { i }
+  if tk(ts, src, at) != 24 { err(ts, src, at) } else {
+    let name = payload(ts, src, at)
+    let start = ts_start(ts, src, at)
+    let end = ts_end(ts, src, at)
+    if tk(ts, src, at + 1) == 58 {
+      match parse_type(ts, src, at + 2) {
+        Parsed(ann, next) -> param_after(ts, src, next, Cons(Sp(Param(name, Yes(ann), borrowed), start, end), acc))
+        ParseError(code, a, b) -> ParseError(code, a, b)
+      }
+    } else { param_after(ts, src, at + 1, Cons(Sp(Param(name, No, borrowed), start, end), acc)) }
+  }
+}
+
+fn param_after(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(Param))) -> Parsed(List(Sp(Param))) {
+  if tk(ts, src, i) == 57 { param_items(ts, src, i + 1, acc) } else {
+    if tk(ts, src, i) == 60 { Parsed(rev(acc), i + 1) } else { err(ts, src, i) }
+  }
+}
+
+fn parse_pattern(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Pattern)) {
+  let k = tk(ts, src, i)
+  let start = ts_start(ts, src, i)
+  let end = ts_end(ts, src, i)
+  if k == 25 {
+    let name = payload(ts, src, i)
+    if tk(ts, src, i + 1) == 59 {
+      match pattern_args(ts, src, i + 2) {
+        Parsed(args, next) -> Parsed(Sp(PCtor(name, args), start, ts_end(ts, src, next - 1)), next)
+        ParseError(code, a, b) -> ParseError(code, a, b)
+      }
+    } else { Parsed(Sp(PCtor(name, Nil), start, end), i + 1) }
+  } else {
+    if k == 24 {
+      let name = payload(ts, src, i)
+      let node = if name == "_" { PWild } else { PVar(name) }
+      Parsed(Sp(node, start, end), i + 1)
+    } else {
+      if k == 0 { Parsed(Sp(PInt(number_value(payload(ts, src, i), False)), start, end), i + 1) } else {
+        if k == 47 {
+          if tk(ts, src, i + 1) == 0 {
+            Parsed(Sp(PInt(number_value(payload(ts, src, i + 1), True)), start, ts_end(ts, src, i + 1)), i + 2)
+          } else { err(ts, src, i + 1) }
+        } else {
+          if k == 2 { Parsed(Sp(PStr(payload(ts, src, i)), start, end), i + 1) } else {
+            if k == 21 || k == 22 { Parsed(Sp(PBool(k == 21), start, end), i + 1) } else {
+              if k == 23 { Parsed(Sp(PUnit, start, end), i + 1) } else { err(ts, src, i) }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn pattern_args(borrow ts: Array(Token), src: String, i: Int) -> Parsed(List(Sp(Pattern))) {
+  if tk(ts, src, i) == 60 { Parsed(Nil, i + 1) } else { pattern_arg_items(ts, src, i, Nil) }
+}
+
+fn pattern_arg_items(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(Pattern))) -> Parsed(List(Sp(Pattern))) {
+  match parse_pattern(ts, src, i) {
+    Parsed(pat, next) -> {
+      if tk(ts, src, next) == 57 { pattern_arg_items(ts, src, next + 1, Cons(pat, acc)) } else {
+        if tk(ts, src, next) == 60 { Parsed(rev(Cons(pat, acc)), next + 1) } else { err(ts, src, next) }
+      }
+    }
+    ParseError(code, a, b) -> ParseError(code, a, b)
+  }
+}
+
+
+// Expressions use the Rust parser's binding powers and layout flag. Postfix
+// calls bind even at min_bp=100; parentheses preserve the inner node's span.
+fn infix_power(kind: Int) -> Int {
+  match kind {
+    43 -> 10
+    42 -> 20
+    34 -> 30
+    35 -> 30
+    52 -> 30
+    36 -> 30
+    53 -> 30
+    37 -> 30
+    30 -> 30
+    31 -> 30
+    32 -> 30
+    33 -> 30
+    40 -> 40
+    46 -> 50
+    47 -> 50
+    26 -> 50
+    27 -> 50
+    48 -> 60
+    49 -> 60
+    50 -> 60
+    28 -> 60
+    29 -> 60
+    _ -> 0 - 1
+  }
+}
+
+fn infix_symbol(kind: Int) -> String {
+  match kind {
+    43 -> "||"
+    42 -> "&&"
+    34 -> "=="
+    35 -> "!="
+    52 -> "<"
+    36 -> "<="
+    53 -> ">"
+    37 -> ">="
+    30 -> "<."
+    31 -> "<=."
+    32 -> ">."
+    33 -> ">=."
+    40 -> "<>"
+    46 -> "+"
+    47 -> "-"
+    26 -> "+."
+    27 -> "-."
+    48 -> "*"
+    49 -> "/"
+    50 -> "%"
+    28 -> "*."
+    29 -> "/."
+    _ -> "?"
+  }
+}
+
+fn parse_expr(borrow ts: Array(Token), src: String, i: Int, min_bp: Int, braces: Bool) -> Parsed(Sp(Expr)) {
+  match parse_atom(ts, src, i, braces) {
+    ParseError(code, s, e) -> ParseError(code, s, e)
+    Parsed(lhs, next) -> parse_expr_chain(ts, src, next, min_bp, braces, lhs)
+  }
+}
+
+fn parse_expr_chain(borrow ts: Array(Token), src: String, i: Int, min_bp: Int, braces: Bool, lhs: Sp(Expr)) -> Parsed(Sp(Expr)) {
+  let kind = tk(ts, src, i)
+  if kind == 59 {
+    if braces && newline_before(ts, src, i) { Parsed(lhs, i) } else {
+      match parse_call_args(ts, src, i + 1, Nil) {
+        ParseError(code, s, e) -> ParseError(code, s, e)
+        Parsed(args, next) -> {
+          let call = Sp(ECall(lhs, args), sp_start(lhs), ts_end(ts, src, next - 1))
+          parse_expr_chain(ts, src, next, min_bp, braces, call)
+        }
+      }
+    }
+  } else {
+    let power = infix_power(kind)
+    if power < min_bp { Parsed(lhs, i) } else {
+      if braces && newline_before(ts, src, i) {
+        if (kind == 47 || kind == 27) && ts_end(ts, src, i) == ts_start(ts, src, i + 1) {
+          Parsed(lhs, i)
+        } else { ParseError("E0101", ts_start(ts, src, i), ts_end(ts, src, i)) }
+      } else {
+        match parse_expr(ts, src, i + 1, power + 1, braces) {
+          ParseError(code, s, e) -> ParseError(code, s, e)
+          Parsed(rhs, next) -> {
+            let combined = Sp(EBinary(infix_symbol(kind), lhs, rhs), sp_start(lhs), sp_end(rhs))
+            parse_expr_chain(ts, src, next, min_bp, braces, combined)
+          }
+        }
+      }
+    }
+  }
+}
+
+// i follows '('; the returned cursor follows its closing ')'. A trailing
+// comma is rejected, as in src/parse.rs's finish_call.
+fn parse_call_args(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(Expr))) -> Parsed(List(Sp(Expr))) {
+  if tk(ts, src, i) == 60 { Parsed(rev(acc), i + 1) } else {
+    parse_call_arg(ts, src, i, acc)
+  }
+}
+
+fn parse_call_arg(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(Expr))) -> Parsed(List(Sp(Expr))) {
+  match parse_expr(ts, src, i, 0, False) {
+    ParseError(code, s, e) -> ParseError(code, s, e)
+    Parsed(arg, next) -> {
+      if tk(ts, src, next) == 57 { parse_call_arg(ts, src, next + 1, Cons(arg, acc)) } else {
+        if tk(ts, src, next) == 60 { Parsed(rev(Cons(arg, acc)), next + 1) } else { err(ts, src, next) }
+      }
+    }
+  }
+}
+
+fn parse_atom(borrow ts: Array(Token), src: String, i: Int, braces: Bool) -> Parsed(Sp(Expr)) {
+  let kind = tk(ts, src, i)
+  let start = ts_start(ts, src, i)
+  let end = ts_end(ts, src, i)
+  match kind {
+    0 -> Parsed(Sp(EInt(number_value(payload(ts, src, i), False)), start, end), i + 1)
+    1 -> Parsed(Sp(EFloat, start, end), i + 1)
+    2 -> Parsed(Sp(EStr(payload(ts, src, i)), start, end), i + 1)
+    21 -> Parsed(Sp(EBool(True), start, end), i + 1)
+    22 -> Parsed(Sp(EBool(False), start, end), i + 1)
+    23 -> Parsed(Sp(EUnit, start, end), i + 1)
+    24 -> {
+      if payload(ts, src, i) == "resume" { parse_resume(ts, src, i) } else {
+        if tk(ts, src, i + 1) == 56 {
+          if tk(ts, src, i + 2) == 24 {
+            Parsed(Sp(EQualified(payload(ts, src, i), payload(ts, src, i + 2)), start, ts_end(ts, src, i + 2)), i + 3)
+          } else { err(ts, src, i + 2) }
+        } else { Parsed(Sp(EVar(payload(ts, src, i)), start, end), i + 1) }
+      }
+    }
+    25 -> Parsed(Sp(EVar(payload(ts, src, i)), start, end), i + 1)
+    47 -> {
+      if tk(ts, src, i + 1) == 0 {
+        Parsed(Sp(EInt(number_value(payload(ts, src, i + 1), True)), start, ts_end(ts, src, i + 1)), i + 2)
+      } else {
+        if tk(ts, src, i + 1) == 1 {
+          Parsed(Sp(EFloat, start, ts_end(ts, src, i + 1)), i + 2)
+        } else { parse_unary(ts, src, i, "-", braces) }
+      }
+    }
+    27 -> parse_unary(ts, src, i, "-.", braces)
+    54 -> parse_unary(ts, src, i, "!", braces)
+    59 -> {
+      match parse_expr(ts, src, i + 1, 0, False) {
+        ParseError(code, s, e) -> ParseError(code, s, e)
+        Parsed(inner, next) -> {
+          if tk(ts, src, next) == 60 { Parsed(inner, next + 1) } else { err(ts, src, next) }
+        }
+      }
+    }
+    61 -> {
+      match parse_block(ts, src, i) {
+        ParseError(code, s, e) -> ParseError(code, s, e)
+        Parsed(block, next) -> Parsed(Sp(EBlock(sp_node(block)), sp_start(block), sp_end(block)), next)
+      }
+    }
+    7 -> parse_if(ts, src, i, braces)
+    4 -> parse_lambda(ts, src, i)
+    11 -> parse_match(ts, src, i, braces)
+    16 -> parse_handle(ts, src, i, braces)
+    _ -> err(ts, src, i)
+  }
+}
+
+fn parse_unary(borrow ts: Array(Token), src: String, i: Int, op: String, braces: Bool) -> Parsed(Sp(Expr)) {
+  match parse_expr(ts, src, i + 1, 100, braces) {
+    ParseError(code, s, e) -> ParseError(code, s, e)
+    Parsed(operand, next) -> Parsed(Sp(EUnary(op, operand), ts_start(ts, src, i), sp_end(operand)), next)
+  }
+}
+
+fn parse_resume(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Expr)) {
+  if tk(ts, src, i + 1) != 59 { err(ts, src, i + 1) } else {
+    match parse_expr(ts, src, i + 2, 0, False) {
+      ParseError(code, s, e) -> ParseError(code, s, e)
+      Parsed(arg, next) -> {
+        if tk(ts, src, next) != 60 { err(ts, src, next) } else {
+          Parsed(Sp(EResume(arg), ts_start(ts, src, i), ts_end(ts, src, next)), next + 1)
+        }
+      }
+    }
+  }
+}
+
+fn parse_if(borrow ts: Array(Token), src: String, i: Int, braces: Bool) -> Parsed(Sp(Expr)) {
+  match parse_expr(ts, src, i + 1, 0, braces) {
+    ParseError(code, s, e) -> ParseError(code, s, e)
+    Parsed(cond, next) -> {
+      match parse_block(ts, src, next) {
+        ParseError(code, s, e) -> ParseError(code, s, e)
+        Parsed(then_block, after_then) -> {
+          if tk(ts, src, after_then) != 8 { err(ts, src, after_then) } else {
+            match parse_block(ts, src, after_then + 1) {
+              ParseError(code, s, e) -> ParseError(code, s, e)
+              Parsed(else_block, after_else) -> {
+                Parsed(Sp(EIf(cond, then_block, else_block), ts_start(ts, src, i), sp_end(else_block)), after_else)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_block(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Block)) {
+  if tk(ts, src, i) != 61 { err(ts, src, i) } else {
+    parse_block_items(ts, src, i + 1, ts_start(ts, src, i), Nil)
+  }
+}
+
+fn parse_block_items(borrow ts: Array(Token), src: String, i: Int, start: Int, stmts: List(Sp(Stmt))) -> Parsed(Sp(Block)) {
+  if tk(ts, src, i) == 62 {
+    match stmts {
+      Nil -> ParseError("E0103", start, ts_end(ts, src, i))
+      Cons(last, _) -> ParseError("E0103", sp_start(last), sp_end(last))
+    }
+  } else {
+    if tk(ts, src, i) == 5 {
+      match parse_let(ts, src, i) {
+        ParseError(code, s, e) -> ParseError(code, s, e)
+        Parsed(stmt, next) -> parse_block_items(ts, src, next, start, Cons(stmt, stmts))
+      }
+    } else {
+      match parse_expr(ts, src, i, 0, True) {
+        ParseError(code, s, e) -> ParseError(code, s, e)
+        Parsed(expr, next) -> {
+          if tk(ts, src, next) == 62 {
+            Parsed(Sp(Block(rev(stmts), Yes(expr)), start, ts_end(ts, src, next)), next + 1)
+          } else {
+            let stmt = Sp(SExpr(expr), sp_start(expr), sp_end(expr))
+            parse_block_items(ts, src, next, start, Cons(stmt, stmts))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_let(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Stmt)) {
+  if tk(ts, src, i + 1) != 24 { err(ts, src, i + 1) } else {
+    let name = payload(ts, src, i + 1)
+    if tk(ts, src, i + 2) == 58 {
+      match parse_type(ts, src, i + 3) {
+        ParseError(code, s, e) -> ParseError(code, s, e)
+        Parsed(ann, next) -> parse_let_value(ts, src, next, ts_start(ts, src, i), name, Yes(ann))
+      }
+    } else { parse_let_value(ts, src, i + 2, ts_start(ts, src, i), name, No) }
+  }
+}
+
+fn parse_let_value(borrow ts: Array(Token), src: String, i: Int, start: Int, name: String, ann: Maybe(Sp(TypeAnn))) -> Parsed(Sp(Stmt)) {
+  if tk(ts, src, i) != 51 { err(ts, src, i) } else {
+    match parse_expr(ts, src, i + 1, 0, True) {
+      ParseError(code, s, e) -> ParseError(code, s, e)
+      Parsed(value, next) -> Parsed(Sp(SLet(name, ann, value), start, sp_end(value)), next)
+    }
+  }
+}
+
+fn parse_lambda(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Expr)) {
+  if tk(ts, src, i + 1) != 59 { err(ts, src, i + 1) } else {
+    match parse_lambda_params(ts, src, i + 2, Nil, True) {
+      ParseError(code, s, e) -> ParseError(code, s, e)
+      Parsed(params, next) -> {
+        match parse_block(ts, src, next) {
+          ParseError(code, s, e) -> ParseError(code, s, e)
+          Parsed(body, after) -> Parsed(Sp(ELambda(params, body), ts_start(ts, src, i), sp_end(body)), after)
+        }
+      }
+    }
+  }
+}
+
+// Lambdas accept name annotations, while handler clause binders are bare.
+// Neither grammar accepts a contextual `borrow` prefix.
+fn parse_lambda_params(borrow ts: Array(Token), src: String, i: Int, params: List(Sp(Param)), ann_allowed: Bool) -> Parsed(List(Sp(Param))) {
+  if tk(ts, src, i) == 60 { Parsed(rev(params), i + 1) } else {
+    parse_lambda_param(ts, src, i, params, ann_allowed)
+  }
+}
+
+fn parse_lambda_param(borrow ts: Array(Token), src: String, i: Int, params: List(Sp(Param)), ann_allowed: Bool) -> Parsed(List(Sp(Param))) {
+  if tk(ts, src, i) != 24 { err(ts, src, i) } else {
+    if ann_allowed && tk(ts, src, i + 1) == 58 {
+      match parse_type(ts, src, i + 2) {
+        ParseError(code, s, e) -> ParseError(code, s, e)
+        Parsed(ann, next) -> {
+          let param = Sp(Param(payload(ts, src, i), Yes(ann), False), ts_start(ts, src, i), ts_end(ts, src, i))
+          parse_lambda_param_end(ts, src, next, Cons(param, params), ann_allowed)
+        }
+      }
+    } else {
+      let param = Sp(Param(payload(ts, src, i), No, False), ts_start(ts, src, i), ts_end(ts, src, i))
+      parse_lambda_param_end(ts, src, i + 1, Cons(param, params), ann_allowed)
+    }
+  }
+}
+
+fn parse_lambda_param_end(borrow ts: Array(Token), src: String, i: Int, params: List(Sp(Param)), ann_allowed: Bool) -> Parsed(List(Sp(Param))) {
+  if tk(ts, src, i) == 57 { parse_lambda_param(ts, src, i + 1, params, ann_allowed) } else {
+    if tk(ts, src, i) == 60 { Parsed(rev(params), i + 1) } else { err(ts, src, i) }
+  }
+}
+
+fn parse_match(borrow ts: Array(Token), src: String, i: Int, braces: Bool) -> Parsed(Sp(Expr)) {
+  match parse_expr(ts, src, i + 1, 0, braces) {
+    ParseError(code, s, e) -> ParseError(code, s, e)
+    Parsed(scrutinee, next) -> {
+      if tk(ts, src, next) != 61 { err(ts, src, next) } else {
+        match parse_match_arms(ts, src, next + 1, Nil) {
+          ParseError(code, s, e) -> ParseError(code, s, e)
+          Parsed(arms, after) -> Parsed(Sp(EMatch(scrutinee, arms), ts_start(ts, src, i), ts_end(ts, src, after - 1)), after)
+        }
+      }
+    }
+  }
+}
+
+fn parse_match_arms(borrow ts: Array(Token), src: String, i: Int, arms: List(Sp(MatchArm))) -> Parsed(List(Sp(MatchArm))) {
+  if tk(ts, src, i) == 62 { Parsed(rev(arms), i + 1) } else {
+    match parse_pattern(ts, src, i) {
+      ParseError(code, s, e) -> ParseError(code, s, e)
+      Parsed(pattern, next) -> {
+        if tk(ts, src, next) != 38 { err(ts, src, next) } else {
+          match parse_expr(ts, src, next + 1, 0, True) {
+            ParseError(code, s, e) -> ParseError(code, s, e)
+            Parsed(body, after) -> {
+              let arm = Sp(MatchArm(pattern, body), ts_start(ts, src, i), sp_end(body))
+              parse_match_arms(ts, src, after, Cons(arm, arms))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_handle(borrow ts: Array(Token), src: String, i: Int, braces: Bool) -> Parsed(Sp(Expr)) {
+  match parse_expr(ts, src, i + 1, 0, braces) {
+    ParseError(code, s, e) -> ParseError(code, s, e)
+    Parsed(body, next) -> {
+      if tk(ts, src, next) != 17 { err(ts, src, next) } else {
+        let is_multi = tk(ts, src, next + 1) == 18
+        let after_multi = if is_multi { next + 2 } else { next + 1 }
+        let any = tk(ts, src, after_multi) == 24 && payload(ts, src, after_multi) == "any"
+        let brace = if any { after_multi + 1 } else { after_multi }
+        if is_multi && any { err(ts, src, after_multi) } else {
+          if tk(ts, src, brace) != 61 { err(ts, src, brace) } else {
+            match parse_handler_items(ts, src, brace + 1, is_multi, any, Nil, No) {
+              ParseError(code, s, e) -> ParseError(code, s, e)
+              Parsed(handler, after) -> Parsed(Sp(EHandle(body, handler), ts_start(ts, src, i), ts_end(ts, src, after - 1)), after)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn any_clause_ok(clause: Sp(OpClause)) -> Bool {
+  match sp_node(clause) {
+    OpClause(qualifier, op, params, _) -> {
+      match qualifier {
+        Yes(_) -> False
+        No -> op == "op" && count(params) == 1
+      }
+    }
+  }
+}
+
+fn parse_handler_items(borrow ts: Array(Token), src: String, i: Int, is_multi: Bool, any: Bool, clauses: List(Sp(OpClause)), ret: Maybe(ReturnClause)) -> Parsed(Handler) {
+  if tk(ts, src, i) == 62 {
+    if any && count(clauses) == 0 { err(ts, src, i) } else { Parsed(Handler(is_multi, any, rev(clauses), ret), i + 1) }
+  } else {
+    if tk(ts, src, i) == 47 && newline_before(ts, src, i) {
+      ParseError("E0101", ts_start(ts, src, i), ts_end(ts, src, i))
+    } else {
+      if tk(ts, src, i) == 19 {
+        match parse_return_clause(ts, src, i) {
+          ParseError(code, s, e) -> ParseError(code, s, e)
+          Parsed(return_clause, next) -> parse_handler_items(ts, src, next, is_multi, any, clauses, Yes(return_clause))
+        }
+      } else {
+        match parse_op_clause(ts, src, i) {
+          ParseError(code, s, e) -> ParseError(code, s, e)
+          Parsed(clause, next) -> {
+            if any && (!any_clause_ok(clause) || count(clauses) != 0) { err(ts, src, i) } else {
+              parse_handler_items(ts, src, next, is_multi, any, Cons(clause, clauses), ret)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_return_clause(borrow ts: Array(Token), src: String, i: Int) -> Parsed(ReturnClause) {
+  if tk(ts, src, i + 1) != 59 { err(ts, src, i + 1) } else {
+    if tk(ts, src, i + 2) != 24 { err(ts, src, i + 2) } else {
+      if tk(ts, src, i + 3) != 60 { err(ts, src, i + 3) } else {
+        if tk(ts, src, i + 4) != 38 { err(ts, src, i + 4) } else {
+          match parse_expr(ts, src, i + 5, 0, True) {
+            ParseError(code, s, e) -> ParseError(code, s, e)
+            Parsed(body, next) -> Parsed(ReturnClause(payload(ts, src, i + 2), body), next)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_op_clause(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(OpClause)) {
+  if tk(ts, src, i) == 25 {
+    if tk(ts, src, i + 1) != 56 { err(ts, src, i + 1) } else {
+      if tk(ts, src, i + 2) != 24 { err(ts, src, i + 2) } else {
+        parse_op_clause_params(ts, src, i + 3, ts_start(ts, src, i), Yes(payload(ts, src, i)), payload(ts, src, i + 2))
+      }
+    }
+  } else {
+    if tk(ts, src, i) != 24 { err(ts, src, i) } else {
+      parse_op_clause_params(ts, src, i + 1, ts_start(ts, src, i), No, payload(ts, src, i))
+    }
+  }
+}
+
+fn parse_op_clause_params(borrow ts: Array(Token), src: String, i: Int, start: Int, qualifier: Maybe(String), op: String) -> Parsed(Sp(OpClause)) {
+  if tk(ts, src, i) != 59 { err(ts, src, i) } else {
+    match parse_lambda_params(ts, src, i + 1, Nil, False) {
+      ParseError(code, s, e) -> ParseError(code, s, e)
+      Parsed(params, next) -> {
+        if tk(ts, src, next) != 38 { err(ts, src, next) } else {
+          match parse_expr(ts, src, next + 1, 0, True) {
+            ParseError(code, s, e) -> ParseError(code, s, e)
+            Parsed(body, after) -> Parsed(Sp(OpClause(qualifier, op, params, body), start, sp_end(body)), after)
+          }
+        }
+      }
+    }
+  }
+}
+
+
+fn parse_module(borrow ts: Array(Token), src: String, i: Int, imports: List(Sp(Import)), decls: List(Sp(Decl))) -> Parsed(Module) {
+  let k = tk(ts, src, i)
+  if k == -1 { Parsed(Module(rev(imports), rev(decls)), i) } else {
+    if k == 6 {
+      match parse_import(ts, src, i) {
+        Parsed(im, j) -> parse_module(ts, src, j, Cons(im, imports), decls)
+        ParseError(c, s, e) -> ParseError(c, s, e)
+      }
+    } else {
+      let parsed = if k == 3 || k == 4 {
+        parse_fn(ts, src, if k == 3 { i + 1 } else { i }, k == 3)
+      } else {
+        if k == 13 { parse_effect_decl(ts, src, i) } else {
+          if k == 9 || k == 10 { parse_type_decl(ts, src, i) } else { err(ts, src, i) }
+        }
+      }
+      match parsed {
+        Parsed(d, j) -> parse_module(ts, src, j, imports, Cons(d, decls))
+        ParseError(c, s, e) -> ParseError(c, s, e)
+      }
+    }
+  }
+}
+
+fn parse_fn(borrow ts: Array(Token), src: String, i: Int, is_pub: Bool) -> Parsed(Sp(Decl)) {
+  if tk(ts, src, i) != 4 { err(ts, src, i) } else {
+    if tk(ts, src, i + 1) != 24 { err(ts, src, i + 1) } else {
+      if tk(ts, src, i + 2) != 59 { err(ts, src, i + 2) } else {
+        match parse_params(ts, src, i + 3) {
+          ParseError(c, s, e) -> ParseError(c, s, e)
+          Parsed(params, j) -> {
+            let row = if tk(ts, src, j) == 49 {
+              match parse_row(ts, src, j + 1, True) {
+                Parsed(r, next) -> Parsed(Yes(r), next)
+                ParseError(c, s, e) -> ParseError(c, s, e)
+              }
+            } else { Parsed(No, j) }
+            match row {
+              ParseError(c, s, e) -> ParseError(c, s, e)
+              Parsed(r, next) -> {
+                let ret = if tk(ts, src, next) == 38 {
+                  match parse_type(ts, src, next + 1) {
+                    Parsed(t, after) -> Parsed(Yes(t), after)
+                    ParseError(c, s, e) -> ParseError(c, s, e)
+                  }
+                } else { Parsed(No, next) }
+                match ret {
+                  ParseError(c, s, e) -> ParseError(c, s, e)
+                  Parsed(t, after) -> {
+                    match parse_block(ts, src, after) {
+                      ParseError(c, s, e) -> ParseError(c, s, e)
+                      Parsed(b, end) -> Parsed(Sp(DFn(is_pub, payload(ts, src, i + 1), params, r, t, b), ts_start(ts, src, i), sp_end(b)), end)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_names(borrow ts: Array(Token), src: String, i: Int, names: List(String)) -> Parsed(List(String)) {
+  if tk(ts, src, i) != 24 { err(ts, src, i) } else {
+    let names = Cons(payload(ts, src, i), names)
+    if tk(ts, src, i + 1) == 57 { parse_names(ts, src, i + 2, names) } else {
+      if tk(ts, src, i + 1) == 60 { Parsed(rev(names), i + 2) } else { err(ts, src, i + 1) }
+    }
+  }
+}
+fn decl_names(borrow ts: Array(Token), src: String, i: Int) -> Parsed(List(String)) {
+  if tk(ts, src, i) != 59 { Parsed(Nil, i) } else {
+    if tk(ts, src, i + 1) == 60 { Parsed(Nil, i + 2) } else { parse_names(ts, src, i + 1, Nil) }
+  }
+}
+fn parse_effect_decl(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Decl)) {
+  let is_multi = tk(ts, src, i + 1) == 18
+  let n = if is_multi { i + 2 } else { i + 1 }
+  if tk(ts, src, n) != 25 { err(ts, src, n) } else {
+    match decl_names(ts, src, n + 1) {
+      ParseError(c, s, e) -> ParseError(c, s, e)
+      Parsed(params, j) -> {
+        if tk(ts, src, j) != 61 { err(ts, src, j) } else {
+          match parse_ops(ts, src, j + 1, Nil) {
+            ParseError(c, s, e) -> ParseError(c, s, e)
+            Parsed(ops, end) -> Parsed(Sp(DEffect(payload(ts, src, n), params, is_multi, ops), ts_start(ts, src, i), ts_end(ts, src, end - 1)), end)
+          }
+        }
+      }
+    }
+  }
+}
+fn parse_ops(borrow ts: Array(Token), src: String, i: Int, ops: List(Sp(OpSig))) -> Parsed(List(Sp(OpSig))) {
+  if tk(ts, src, i) == 62 { Parsed(rev(ops), i + 1) } else {
+    if tk(ts, src, i) != 4 { err(ts, src, i) } else {
+      match parse_op(ts, src, i) {
+        ParseError(c, s, e) -> ParseError(c, s, e)
+        Parsed(op, j) -> parse_ops(ts, src, j, Cons(op, ops))
+      }
+    }
+  }
+}
+type OpParams { OpParams(List(Sp(Param)), List(Sp(TypeAnn))) }
+fn parse_op_params(borrow ts: Array(Token), src: String, i: Int, ps: List(Sp(Param)), tys: List(Sp(TypeAnn))) -> Parsed(OpParams) {
+  if tk(ts, src, i) == 60 { Parsed(OpParams(rev(ps), rev(tys)), i + 1) } else {
+    if tk(ts, src, i) != 24 { err(ts, src, i) } else {
+      if tk(ts, src, i + 1) != 58 { err(ts, src, i + 1) } else {
+        match parse_type(ts, src, i + 2) {
+          ParseError(c, s, e) -> ParseError(c, s, e)
+          Parsed(t, j) -> {
+            let p = Sp(Param(payload(ts, src, i), No, False), ts_start(ts, src, i), ts_end(ts, src, i))
+            if tk(ts, src, j) == 57 {
+              if tk(ts, src, j + 1) == 60 { err(ts, src, j + 1) } else { parse_op_params(ts, src, j + 1, Cons(p, ps), Cons(t, tys)) }
+            } else {
+              if tk(ts, src, j) == 60 { Parsed(OpParams(rev(Cons(p, ps)), rev(Cons(t, tys))), j + 1) } else { err(ts, src, j) }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+fn parse_op(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(OpSig)) {
+  if tk(ts, src, i + 1) != 24 { err(ts, src, i + 1) } else {
+    if tk(ts, src, i + 2) != 59 { err(ts, src, i + 2) } else {
+      match parse_op_params(ts, src, i + 3, Nil, Nil) {
+        ParseError(c, s, e) -> ParseError(c, s, e)
+        Parsed(pars, j) -> {
+          if tk(ts, src, j) != 38 { err(ts, src, j) } else {
+            match parse_type(ts, src, j + 1) {
+              ParseError(c, s, e) -> ParseError(c, s, e)
+              Parsed(ret, end) -> {
+                match pars {
+                  OpParams(ps, tys) -> Parsed(Sp(OpSig(payload(ts, src, i + 1), ps, tys, ret), ts_start(ts, src, i), sp_end(ret)), end)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_type_decl(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Decl)) {
+  let is_linear = tk(ts, src, i) == 10
+  let t = if is_linear { i + 1 } else { i }
+  if tk(ts, src, t) != 9 { err(ts, src, t) } else {
+    if tk(ts, src, t + 1) != 25 { err(ts, src, t + 1) } else {
+      match decl_names(ts, src, t + 2) {
+        ParseError(c, s, e) -> ParseError(c, s, e)
+        Parsed(params, j) -> {
+          if tk(ts, src, j) != 61 { err(ts, src, j) } else {
+            match parse_variants(ts, src, j + 1, Nil) {
+              ParseError(c, s, e) -> ParseError(c, s, e)
+              Parsed(variants, end) -> Parsed(Sp(DType(payload(ts, src, t + 1), params, is_linear, variants), ts_start(ts, src, i), ts_end(ts, src, end - 1)), end)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+fn parse_variants(borrow ts: Array(Token), src: String, i: Int, vs: List(Sp(VariantDecl))) -> Parsed(List(Sp(VariantDecl))) {
+  if tk(ts, src, i) == 62 { Parsed(rev(vs), i + 1) } else {
+    if tk(ts, src, i) != 25 { err(ts, src, i) } else {
+      let fields = if tk(ts, src, i + 1) == 59 {
+        parse_variant_fields(ts, src, i + 2, Nil)
+      } else { Parsed(Nil, i + 1) }
+      match fields {
+        ParseError(c, s, e) -> ParseError(c, s, e)
+        Parsed(fs, j) -> {
+          let v = Sp(VariantDecl(payload(ts, src, i), fs), ts_start(ts, src, i), ts_end(ts, src, j - 1))
+          if tk(ts, src, j) == 57 {
+            if tk(ts, src, j + 1) == 62 { err(ts, src, j + 1) } else { parse_variants(ts, src, j + 1, Cons(v, vs)) }
+          } else {
+            if tk(ts, src, j) == 62 { Parsed(rev(Cons(v, vs)), j + 1) } else { err(ts, src, j) }
+          }
+        }
+      }
+    }
+  }
+}
+fn parse_variant_fields(borrow ts: Array(Token), src: String, i: Int, fs: List(Sp(TypeAnn))) -> Parsed(List(Sp(TypeAnn))) {
+  if tk(ts, src, i) == 60 { Parsed(rev(fs), i + 1) } else {
+    match parse_type(ts, src, i) {
+      ParseError(c, s, e) -> ParseError(c, s, e)
+      Parsed(t, j) -> {
+        if tk(ts, src, j) == 57 {
+          if tk(ts, src, j + 1) == 60 { err(ts, src, j + 1) } else { parse_variant_fields(ts, src, j + 1, Cons(t, fs)) }
+        } else {
+          if tk(ts, src, j) == 60 { Parsed(rev(Cons(t, fs)), j + 1) } else { err(ts, src, j) }
+        }
+      }
+    }
+  }
+}
+
+type ImportPath { ImportPath(List(String), Int) }
+fn parse_import_path(borrow ts: Array(Token), src: String, i: Int, path: List(String)) -> Parsed(ImportPath) {
+  if tk(ts, src, i) != 24 { err(ts, src, i) } else {
+    let path = Cons(payload(ts, src, i), path)
+    if tk(ts, src, i + 1) == 49 && tk(ts, src, i + 2) != 61 {
+      parse_import_path(ts, src, i + 2, path)
+    } else { Parsed(ImportPath(rev(path), ts_end(ts, src, i)), i + 1) }
+  }
+}
+fn import_labels(labels: List(LabelAnn)) -> List(Sp(String)) {
+  match labels { Nil -> Nil Cons(LabelAnn(n, _), rest) -> Cons(n, import_labels(rest)) }
+}
+fn last_label_end(labels: List(Sp(String)), end: Int) -> Int {
+  match labels { Nil -> end Cons(l, ls) -> last_label_end(ls, sp_end(l)) }
+}
+fn parse_import(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Import)) {
+  match parse_import_path(ts, src, i + 1, Nil) {
+    ParseError(c, s, e) -> ParseError(c, s, e)
+    Parsed(ImportPath(path, end), j) -> {
+      let alias = if tk(ts, src, j) == 24 && payload(ts, src, j) == "as" {
+        if tk(ts, src, j + 1) == 24 { Parsed(Yes(payload(ts, src, j + 1)), j + 2) } else { err(ts, src, j + 1) }
+      } else { Parsed(No, j) }
+      match alias {
+        ParseError(c, s, e) -> ParseError(c, s, e)
+        Parsed(a, next) -> {
+          let end = if next == j { end } else { ts_end(ts, src, next - 1) }
+          if tk(ts, src, next) == 49 {
+            let open_end = ts_end(ts, src, next + 1)
+            match parse_row(ts, src, next + 1, False) {
+              ParseError(c, s, e) -> ParseError(c, s, e)
+              Parsed(RowAnn(labels, _), after) -> {
+                let allows = import_labels(labels)
+                Parsed(Sp(Import(path, a, Yes(allows)), ts_start(ts, src, i), last_label_end(allows, open_end)), after)
+              }
+            }
+          } else { Parsed(Sp(Import(path, a, No), ts_start(ts, src, i), end), next) }
+        }
+      }
+    }
+  }
+}
+
+
+// Pre-order, complete AST dump: the byte-for-byte form in src/ast_dump.rs.
+// A single Buffer is threaded through every traversal and list loop.
+fn dump_line(b: Buffer, depth: Int, kind: String, start: Int, end: Int, text: String) -> Buffer {
+  let b = buffer.push(buffer.push(buffer.push(b, int.to_string(depth)), " "), kind)
+  let b = buffer.push(b, " ")
+  let b = if start < 0 {
+    buffer.push(b, "- -")
+  } else {
+    buffer.push(buffer.push(buffer.push(b, int.to_string(start)), " "), int.to_string(end))
+  }
+  let b = if string.length(text) == 0 { b } else {
+    buffer.push(buffer.push(b, " "), text)
+  }
+  buffer.push(b, "\n")
+}
+
+fn dump_words2(a: String, b: String) -> String {
+  buffer.finish(buffer.push(buffer.push(buffer.push(buffer.new(), a), " "), b))
+}
+fn dump_words3(a: String, b: String, c: String) -> String {
+  buffer.finish(buffer.push(buffer.push(buffer.push(buffer.push(buffer.push(buffer.new(), a), " "), b), " "), c))
+}
+fn dump_flag(on: Bool, word: String) -> String { if on { word } else { "-" } }
+fn dump_bool(on: Bool) -> String { if on { "True" } else { "False" } }
+fn dump_maybe_name(name: Maybe(String)) -> String {
+  match name { No -> "-" Yes(n) -> n }
+}
+fn dump_join_loop(xs: List(String), separator: String, first: Bool, b: Buffer) -> Buffer {
+  match xs {
+    Nil -> b
+    Cons(x, rest) -> {
+      let b = if first { b } else { buffer.push(b, separator) }
+      dump_join_loop(rest, separator, False, buffer.push(b, x))
+    }
+  }
+}
+fn dump_join(xs: List(String), separator: String, empty: String) -> String {
+  match xs {
+    Nil -> empty
+    Cons(_, _) -> buffer.finish(dump_join_loop(xs, separator, True, buffer.new()))
+  }
+}
+fn dump_optional_count(xs: Maybe(List(a))) -> Int {
+  match xs { No -> -1 Yes(items) -> count(items) }
+}
+
+fn dump_module(m: Module, src: String) -> String {
+  match m {
+    Module(imports, decls) -> {
+      let b = dump_line(buffer.new(), 0, "Module", -1, -1, "")
+      let b = dump_imports(imports, src, b)
+      buffer.finish(dump_decls(decls, src, b))
+    }
+  }
+}
+fn dump_imports(xs: List(Sp(Import)), src: String, b: Buffer) -> Buffer {
+  match xs {
+    Nil -> b
+    Cons(Sp(Import(path, alias, effects), start, end), rest) -> {
+      let text = dump_words3(dump_join(path, "/", ""), dump_maybe_name(alias), int.to_string(dump_optional_count(effects)))
+      let b = dump_line(b, 1, "Import", start, end, text)
+      let b = match effects { No -> b Yes(es) -> dump_allow(es, b) }
+      dump_imports(rest, src, b)
+    }
+  }
+}
+fn dump_allow(xs: List(Sp(String)), b: Buffer) -> Buffer {
+  match xs {
+    Nil -> b
+    Cons(Sp(name, start, end), rest) -> dump_allow(rest, dump_line(b, 2, "Allow", start, end, name))
+  }
+}
+fn dump_decls(xs: List(Sp(Decl)), src: String, b: Buffer) -> Buffer {
+  match xs {
+    Nil -> b
+    Cons(x, rest) -> dump_decls(rest, src, dump_decl(x, src, 1, b))
+  }
+}
+fn dump_decl(x: Sp(Decl), src: String, depth: Int, b: Buffer) -> Buffer {
+  match x {
+    Sp(decl, start, end) -> match decl {
+      DFn(is_pub, name, params, row, ret, body) -> {
+        let b = dump_line(b, depth, "Fn", start, end, dump_words2(dump_flag(is_pub, "pub"), name))
+        let b = dump_params(params, src, depth + 1, b)
+        let b = match row {
+          No -> dump_line(b, depth + 1, "NoRow", -1, -1, "")
+          Yes(r) -> dump_row(r, src, depth + 1, b)
+        }
+        let b = dump_optional_type(ret, src, depth + 1, b)
+        dump_block(body, src, depth + 1, b)
+      }
+      DEffect(name, params, is_multi, ops) -> {
+        let text = dump_words3(dump_flag(is_multi, "multi"), name, dump_join(params, ",", "-"))
+        dump_ops(ops, src, depth + 1, dump_line(b, depth, "Effect", start, end, text))
+      }
+      DType(name, params, is_linear, variants) -> {
+        let text = dump_words3(dump_flag(is_linear, "linear"), name, dump_join(params, ",", "-"))
+        dump_variants(variants, src, depth + 1, dump_line(b, depth, "Type", start, end, text))
+      }
+    }
+  }
+}
+fn dump_ops(xs: List(Sp(OpSig)), src: String, depth: Int, b: Buffer) -> Buffer {
+  match xs {
+    Nil -> b
+    Cons(Sp(OpSig(name, params, tys, ret), start, end), rest) -> {
+      let b = dump_line(b, depth, "Op", start, end, dump_words2(name, int.to_string(count(tys))))
+      let b = dump_params(params, src, depth + 1, b)
+      let b = dump_types(tys, src, depth + 1, b)
+      let b = dump_type(ret, src, depth + 1, b)
+      dump_ops(rest, src, depth, b)
+    }
+  }
+}
+fn dump_variants(xs: List(Sp(VariantDecl)), src: String, depth: Int, b: Buffer) -> Buffer {
+  match xs {
+    Nil -> b
+    Cons(Sp(VariantDecl(name, fields), start, end), rest) -> {
+      let b = dump_line(b, depth, "Variant", start, end, name)
+      dump_variants(rest, src, depth, dump_types(fields, src, depth + 1, b))
+    }
+  }
+}
+fn dump_params(xs: List(Sp(Param)), src: String, depth: Int, b: Buffer) -> Buffer {
+  match xs {
+    Nil -> b
+    Cons(Sp(Param(name, ann, borrowing), start, end), rest) -> {
+      let b = dump_line(b, depth, "Param", start, end, dump_words2(dump_flag(borrowing, "borrow"), name))
+      let b = match ann { No -> b Yes(t) -> dump_type(t, src, depth + 1, b) }
+      dump_params(rest, src, depth, b)
+    }
+  }
+}
+fn dump_optional_type(t: Maybe(Sp(TypeAnn)), src: String, depth: Int, b: Buffer) -> Buffer {
+  match t {
+    No -> dump_line(b, depth, "NoType", -1, -1, "")
+    Yes(ty) -> dump_type(ty, src, depth, b)
+  }
+}
+fn dump_types(xs: List(Sp(TypeAnn)), src: String, depth: Int, b: Buffer) -> Buffer {
+  match xs {
+    Nil -> b
+    Cons(x, rest) -> dump_types(rest, src, depth, dump_type(x, src, depth, b))
+  }
+}
+fn dump_type(t: Sp(TypeAnn), src: String, depth: Int, b: Buffer) -> Buffer {
+  match t {
+    Sp(TypeAnn(name, args, row), start, end) -> {
+      let b = dump_line(b, depth, "Ty", start, end, name)
+      let b = dump_types(args, src, depth + 1, b)
+      match row { No -> b Yes(r) -> dump_row(r, src, depth + 1, b) }
+    }
+  }
+}
+fn dump_row(row: RowAnn, src: String, depth: Int, b: Buffer) -> Buffer {
+  match row {
+    RowAnn(labels, tail) -> {
+      let text = match tail { No -> "-" Yes(Sp(name, _, _)) -> name }
+      dump_labels(labels, src, depth + 1, dump_line(b, depth, "Row", -1, -1, text))
+    }
+  }
+}
+fn dump_labels(xs: List(LabelAnn), src: String, depth: Int, b: Buffer) -> Buffer {
+  match xs {
+    Nil -> b
+    Cons(LabelAnn(Sp(name, start, end), args), rest) -> {
+      let text = dump_words2(name, int.to_string(dump_optional_count(args)))
+      let b = dump_line(b, depth, "Label", start, end, text)
+      let b = match args { No -> b Yes(ts) -> dump_types(ts, src, depth + 1, b) }
+      dump_labels(rest, src, depth, b)
+    }
+  }
+}
+fn dump_block(block: Sp(Block), src: String, depth: Int, b: Buffer) -> Buffer {
+  match block {
+    Sp(items, start, end) -> dump_block_items(items, src, depth, dump_line(b, depth, "Block", start, end, ""))
+  }
+}
+fn dump_block_items(items: Block, src: String, depth: Int, b: Buffer) -> Buffer {
+  match items {
+    Block(stmts, tail) -> {
+      let b = dump_stmts(stmts, src, depth + 1, b)
+      match tail {
+        No -> b
+        Yes(t) -> dump_expr(t, src, depth + 2, dump_line(b, depth + 1, "Tail", -1, -1, ""))
+      }
+    }
+  }
+}
+fn dump_stmts(xs: List(Sp(Stmt)), src: String, depth: Int, b: Buffer) -> Buffer {
+  match xs {
+    Nil -> b
+    Cons(Sp(stmt, start, end), rest) -> {
+      let b = match stmt {
+        SLet(name, ann, value) -> {
+          let b = dump_line(b, depth, "Let", start, end, name)
+          let b = dump_optional_type(ann, src, depth + 1, b)
+          dump_expr(value, src, depth + 1, b)
+        }
+        SExpr(e) -> dump_expr(e, src, depth + 1, dump_line(b, depth, "Do", start, end, ""))
+      }
+      dump_stmts(rest, src, depth, b)
+    }
+  }
+}
+fn dump_pattern(p: Sp(Pattern), src: String, depth: Int, b: Buffer) -> Buffer {
+  match p {
+    Sp(pat, start, end) -> match pat {
+      PWild -> dump_line(b, depth, "PWild", start, end, "")
+      PVar(name) -> dump_line(b, depth, "PVar", start, end, name)
+      PCtor(name, args) -> {
+        let b = dump_line(b, depth, "PCtor", start, end, dump_words2(name, int.to_string(count(args))))
+        dump_patterns(args, src, depth + 1, b)
+      }
+      PInt(n) -> dump_line(b, depth, "PInt", start, end, int.to_string(n))
+      PBool(on) -> dump_line(b, depth, "PBool", start, end, dump_bool(on))
+      PStr(s) -> dump_line(b, depth, "PStr", start, end, s)
+      PUnit -> dump_line(b, depth, "PUnit", start, end, "")
+    }
+  }
+}
+fn dump_patterns(xs: List(Sp(Pattern)), src: String, depth: Int, b: Buffer) -> Buffer {
+  match xs {
+    Nil -> b
+    Cons(x, rest) -> dump_patterns(rest, src, depth, dump_pattern(x, src, depth, b))
+  }
+}
+fn dump_float_text(src: String, i: Int, end: Int, b: Buffer) -> String {
+  if i == end { buffer.finish(b) } else {
+    if string.byte_at(src, i) == 95 { dump_float_text(src, i + 1, end, b) } else {
+      // All non-ASCII bytes survive as whole UTF-8 slices, including grouped
+      // float expressions whose widened source span can contain comments.
+      let c = string.byte_at(src, i)
+      let width = if c < 128 { 1 } else { if c < 224 { 2 } else { if c < 240 { 3 } else { 4 } } }
+      dump_float_text(src, i + width, end, buffer.push(b, string.slice(src, i, i + width)))
+    }
+  }
+}
+fn dump_expr(e: Sp(Expr), src: String, depth: Int, b: Buffer) -> Buffer {
+  match e {
+    Sp(expr, start, end) -> match expr {
+      EInt(n) -> dump_line(b, depth, "Int", start, end, int.to_string(n))
+      EFloat -> dump_line(b, depth, "Float", start, end, dump_float_text(src, start, end, buffer.new()))
+      EStr(s) -> dump_line(b, depth, "Str", start, end, s)
+      EBool(on) -> dump_line(b, depth, "Bool", start, end, dump_bool(on))
+      EUnit -> dump_line(b, depth, "Unit", start, end, "")
+      EVar(name) -> dump_line(b, depth, "Var", start, end, name)
+      EQualified(module, name) -> dump_line(b, depth, "Qualified", start, end, dump_words2(module, name))
+      ECall(callee, args) -> {
+        let b = dump_line(b, depth, "Call", start, end, int.to_string(count(args)))
+        let b = dump_expr(callee, src, depth + 1, b)
+        dump_exprs(args, src, depth + 1, b)
+      }
+      EUnary(op, value) -> dump_expr(value, src, depth + 1, dump_line(b, depth, "Unary", start, end, op))
+      EBinary(op, lhs, rhs) -> {
+        let b = dump_line(b, depth, "Binary", start, end, op)
+        let b = dump_expr(lhs, src, depth + 1, b)
+        dump_expr(rhs, src, depth + 1, b)
+      }
+      EIf(cond, yes, no) -> {
+        let b = dump_line(b, depth, "If", start, end, "")
+        let b = dump_expr(cond, src, depth + 1, b)
+        let b = dump_block(yes, src, depth + 1, b)
+        dump_block(no, src, depth + 1, b)
+      }
+      EBlock(block) -> dump_block_items(block, src, depth, dump_line(b, depth, "Block", start, end, ""))
+      EHandle(body, handler) -> {
+        match handler {
+          Handler(is_multi, any, clauses, ret) -> {
+            let text = dump_words2(dump_flag(is_multi, "multi"), dump_flag(any, "any"))
+            let b = dump_line(b, depth, "Handle", start, end, text)
+            let b = dump_expr(body, src, depth + 1, b)
+            let b = dump_clauses(clauses, src, depth + 1, b)
+            match ret {
+              No -> b
+              Yes(ReturnClause(binder, value)) -> dump_expr(value, src, depth + 2, dump_line(b, depth + 1, "Return", -1, -1, binder))
+            }
+          }
+        }
+      }
+      EResume(arg) -> dump_expr(arg, src, depth + 1, dump_line(b, depth, "Resume", start, end, ""))
+      EMatch(scrutinee, arms) -> {
+        let b = dump_line(b, depth, "Match", start, end, int.to_string(count(arms)))
+        let b = dump_expr(scrutinee, src, depth + 1, b)
+        dump_arms(arms, src, depth + 1, b)
+      }
+      ELambda(params, body) -> {
+        let b = dump_line(b, depth, "Lambda", start, end, int.to_string(count(params)))
+        let b = dump_params(params, src, depth + 1, b)
+        dump_block(body, src, depth + 1, b)
+      }
+      EError -> dump_line(b, depth, "Error", start, end, "")
+    }
+  }
+}
+fn dump_exprs(xs: List(Sp(Expr)), src: String, depth: Int, b: Buffer) -> Buffer {
+  match xs {
+    Nil -> b
+    Cons(x, rest) -> dump_exprs(rest, src, depth, dump_expr(x, src, depth, b))
+  }
+}
+fn dump_clauses(xs: List(Sp(OpClause)), src: String, depth: Int, b: Buffer) -> Buffer {
+  match xs {
+    Nil -> b
+    Cons(Sp(OpClause(effect_name, op, params, body), start, end), rest) -> {
+      let text = dump_words2(dump_maybe_name(effect_name), op)
+      let b = dump_line(b, depth, "Clause", start, end, text)
+      let b = dump_params(params, src, depth + 1, b)
+      let b = dump_expr(body, src, depth + 1, b)
+      dump_clauses(rest, src, depth, b)
+    }
+  }
+}
+fn dump_arms(xs: List(Sp(MatchArm)), src: String, depth: Int, b: Buffer) -> Buffer {
+  match xs {
+    Nil -> b
+    Cons(Sp(MatchArm(pat, body), start, end), rest) -> {
+      let b = dump_line(b, depth, "Arm", start, end, "")
+      let b = dump_pattern(pat, src, depth + 1, b)
+      let b = dump_expr(body, src, depth + 1, b)
+      dump_arms(rest, src, depth, b)
+    }
+  }
+}
+
+
+fn error_line(code: String, start: Int, end: Int, b: Buffer) -> Buffer {
+  let b = buffer.push(buffer.push(b, "error "), code)
+  let b = buffer.push(buffer.push(b, " "), int.to_string(start))
+  buffer.push(buffer.push(buffer.push(b, " "), int.to_string(end)), "\n")
+}
+fn lexical_errors(borrow ds: Array(LexDiag), i: Int, b: Buffer) -> String {
+  if i == array.length(ds) { buffer.finish(b) } else {
+    match array.get(ds, i) {
+      LexDiag(c, s, e) -> lexical_errors(ds, i + 1, error_line(c, s, e, b))
+    }
+  }
+}
+pub fn parse_dump(src: String) -> String {
+  match lex.lex(src) {
+    Lexed(ts, ds) -> {
+      if array.length(ds) > 0 { lexical_errors(ds, 0, buffer.new()) } else {
+        match parse_module(ts, src, 0, Nil, Nil) {
+          Parsed(m, _) -> dump_module(m, src)
+          ParseError(c, s, e) -> buffer.finish(error_line(c, s, e, buffer.new()))
+        }
+      }
+    }
+  }
+}
+pub fn main() / {IO} {
+  let text = io.read_file(io.arg(0))
+  let result = parse_dump(text)
+  if string.length(result) == 0 { Unit } else {
+    io.println(string.slice(result, 0, string.length(result) - 1))
+  }
+}
