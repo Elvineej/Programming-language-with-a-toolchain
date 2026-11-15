@@ -1398,7 +1398,11 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
             // most allocate, so what this function needs is rooted across them,
             // the operands included.
             n if crate::is_array_builtin(n) => {
-                let roots = self.root_live(st, vals)?;
+                let roots = if crate::builtin_allocates(n) {
+                    self.root_live(st, vals)?
+                } else {
+                    0
+                };
                 let v = crate::array_builtin(self.ctx, self.b, self.lc, e, n, vals)?;
                 gc_unroot(self.b, self.lc, roots)?;
                 Ok(v)
@@ -1430,7 +1434,11 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                 crate::float_conversion(self.ctx, self.b, self.lc, name, vals[0].into_int_value())
             }
             n if n.starts_with("string.") && !vals.is_empty() => {
-                let roots = self.root_live(st, &vals[..1])?;
+                let roots = if crate::builtin_allocates(n) {
+                    self.root_live(st, &vals[..1])?
+                } else {
+                    0
+                };
                 let v = crate::string_builtin(self.ctx, self.b, self.lc, n, vals)?;
                 gc_unroot(self.b, self.lc, roots)?;
                 Ok(v)

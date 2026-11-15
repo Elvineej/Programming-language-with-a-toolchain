@@ -1,0 +1,60 @@
+//! What the emitter roots (2026-11-15): a value is put on the shadow stack
+//! only where something may collect before its last use. Rooting around reads
+//! that allocate nothing (`string.length`, `string.byte_at`, `array.get`, ...)
+//! and around arguments lowered before others that cannot allocate was half of
+//! `elya/map`'s native time (callgrind: `elya_gc_push` and `elya_gc_pop` 46%);
+//! without it, a million entries took 3.1 s instead of 4.5 s.
+//!
+//! Negative control (reverted, compared byte for byte): K1, `none_allocate`
+//! answering `false` (every argument rooted again):
+//! `reading_a_string_by_byte_roots_nothing` fails. The collector's safety
+//! under the change is the stress suites' (`native_gc_stress.rs`,
+//! `native_array.rs`, `native_std_map.rs`, a collection at every
+//! allocation).
+
+/// The optimised IR of `src`.
+fn ir(src: &str) -> String {
+    let (m, pd, _) = elya::front_end_with("t.elya", src, &mut |_| None);
+    assert!(pd.is_empty(), "{pd:?}");
+    let (d, table) = elya::types::infer_typed_table(&elya::Session::new(), &m);
+    assert!(d.is_empty(), "{d:?}");
+    let core = elya::core::lower_module(&m, &table).expect("lowers");
+    elya_codegen::emit_ir_for(
+        &core,
+        elya_codegen::Optimise::Speed,
+        &elya_codegen::Machine::host(),
+    )
+    .expect("IR")
+}
+
+/// The body of the function named `name` in `ir`.
+fn body(ir: &str, name: &str) -> String {
+    let start = ir
+        .find(&format!("@elya.{name}("))
+        .unwrap_or_else(|| panic!("no {name} in {ir}"));
+    let rest = &ir[start..];
+    rest[..rest.find("\n}\n").expect("the function ends")].to_string()
+}
+
+#[test]
+fn reading_a_string_by_byte_roots_nothing() {
+    let src = "fn hash(key: String, i: Int, h: Int) -> Int {\n  if i == string.length(key) { h } else {\n    let byte = string.byte_at(key, i)\n    hash(key, i + 1, int.wrapping_mul(int.xor(h, byte), 1099511628211))\n  }\n}\n\
+               pub fn main() -> Int { hash(\"hello\", 0, 7) }\n";
+    let f = body(&ir(src), "hash");
+    assert!(!f.contains("elya_gc_push"), "{f}");
+    // And a read of an array, likewise.
+    let src = "fn sum(borrow xs: Array(Int), i: Int, acc: Int) -> Int {\n  if i == array.length(xs) { acc } else { sum(xs, i + 1, acc + array.get(xs, i)) }\n}\n\
+               pub fn main() -> Int { sum(array.push(array.new(), 3), 0, 0) }\n";
+    let f = body(&ir(src), "sum");
+    assert!(!f.contains("elya_gc_push"), "{f}");
+}
+
+#[test]
+fn an_argument_is_still_rooted_while_a_later_one_allocates() {
+    // `s` must survive the allocation of `t` (a string built by `<>`).
+    let src = "fn both(s: String, t: String) -> Int { string.length(s) + string.length(t) }\n\
+               fn go(s: String, n: Int) -> Int { both(s, s <> int.to_string(n)) }\n\
+               pub fn main() -> Int { go(\"ab\", 12) }\n";
+    let f = body(&ir(src), "go");
+    assert!(f.contains("elya_gc_push"), "{f}");
+}

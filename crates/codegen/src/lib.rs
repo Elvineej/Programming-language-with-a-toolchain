@@ -899,6 +899,54 @@ pub(crate) fn array_builtin<'ctx>(
     }
 }
 
+/// Whether a builtin's runtime call may allocate, and so collect: what is
+/// live must be rooted across it only then. A read of a string, an array or
+/// a buffer, and an array's `set` (in place), allocate nothing; rooting
+/// everything live around each was half of `elya/map`'s time natively
+/// (callgrind, 2026-11-15).
+/// Whether lowering `e` may allocate, and so collect. Conservative: only
+/// what plainly cannot is `false` -- a variable that is not a function (a
+/// function's name as a value may build its closure), a literal but a
+/// string, arithmetic and comparison but `<>`, and a builtin that allocates
+/// nothing, over operands that cannot either.
+pub(crate) fn may_allocate(e: &CoreExpr) -> bool {
+    match &e.kind {
+        CoreKind::Var(_) => matches!(e.ty, Ty::Fn(..)),
+        CoreKind::Lit(CoreLit::Str(_)) => true,
+        CoreKind::Lit(_) => false,
+        CoreKind::Prim(op, args) => matches!(op, BinOp::Concat) || args.iter().any(may_allocate),
+        CoreKind::Builtin(name, args) => builtin_allocates(name) || args.iter().any(may_allocate),
+        _ => true,
+    }
+}
+
+/// Whether lowering every one of `rest` allocates nothing: an operand need
+/// not be rooted while such operands are lowered.
+pub(crate) fn none_allocate(rest: &[CoreExpr]) -> bool {
+    !rest.iter().any(may_allocate)
+}
+
+pub(crate) fn builtin_allocates(name: &str) -> bool {
+    if name
+        .strip_prefix("int.")
+        .is_some_and(|n| elya::eval::INT_BINARY_BUILTINS.contains(&n))
+    {
+        return false;
+    }
+    !matches!(
+        name,
+        "string.length"
+            | "string.byte_at"
+            | "array.get"
+            | "array.set"
+            | "array.length"
+            | "buffer.length"
+            | "float.of_int"
+            | "float.truncate"
+            | "float.round"
+    )
+}
+
 /// `array.<name>`, one of [`elya::resolve::ARRAY_BUILTINS`], or
 /// `buffer.length` (lowered with them: it reads the same word).
 pub(crate) fn is_array_builtin(name: &str) -> bool {
@@ -1391,13 +1439,15 @@ fn build_direct_call<'ctx>(
     let env_roots = if tail { 0 } else { gc_root_env(b, lc, env)? };
     let mut vals: Vec<BasicMetadataValueEnum<'ctx>> = Vec::with_capacity(args.len());
     let mut arg_roots = 0usize;
-    for a in args.iter() {
+    for (i, a) in args.iter().enumerate() {
         // Left to right, matching the evaluator's argument order. Each argument
         // is rooted AS IT IS LOWERED rather than batched afterwards: in
         // `f(g(), h())` the value of `g()` is a temp nothing names, and
-        // lowering `h()` can allocate.
+        // lowering `h()` can allocate. When no later argument can allocate
+        // (`f(xs, i + 1)`), nothing can collect before the call, whose
+        // arguments are unrooted first anyway: no root (2026-11-15).
         let v = lower_expr(ctx, func, b, lc, a, env)?;
-        if gc_root(b, lc, v)? {
+        if !none_allocate(&args[i + 1..]) && gc_root(b, lc, v)? {
             arg_roots += 1;
         }
         vals.push(v.into());
@@ -1465,9 +1515,9 @@ fn build_closure_call<'ctx>(
     let mut vals: Vec<BasicMetadataValueEnum<'ctx>> = Vec::with_capacity(args.len() + 1);
     vals.push(clos.into());
     let mut arg_roots = 0usize;
-    for a in args.iter() {
+    for (i, a) in args.iter().enumerate() {
         let v = lower_expr(ctx, func, b, lc, a, env)?;
-        if gc_root(b, lc, v)? {
+        if !none_allocate(&args[i + 1..]) && gc_root(b, lc, v)? {
             arg_roots += 1;
         }
         vals.push(v.into());
@@ -2119,14 +2169,23 @@ fn lower_expr<'ctx>(
         }
         CoreKind::Builtin(builtin, args) if is_array_builtin(builtin) => {
             // As for `buffer.*`.
+            // An operand is rooted while later ones are lowered if they may
+            // allocate, and everything across the call if it may.
+            let allocates = builtin_allocates(builtin);
             let mut vals = Vec::with_capacity(args.len());
             let mut own = 0;
-            for a in args.iter() {
+            for (i, a) in args.iter().enumerate() {
                 let v = lower_expr(ctx, func, b, lc, a, env)?;
-                own += usize::from(gc_root(b, lc, v)?);
+                if allocates || !none_allocate(&args[i + 1..]) {
+                    own += usize::from(gc_root(b, lc, v)?);
+                }
                 vals.push(v);
             }
-            let roots = gc_root_env(b, lc, env)?;
+            let roots = if allocates {
+                gc_root_env(b, lc, env)?
+            } else {
+                0
+            };
             let v = array_builtin(ctx, b, lc, e, builtin, &vals)?;
             gc_unroot(b, lc, roots + own)?;
             Ok(v)
@@ -2165,12 +2224,20 @@ fn lower_expr<'ctx>(
             // The string is rooted while later operands are lowered (they may
             // allocate), and the environment across a slice's allocation.
             let s = lower_expr(ctx, func, b, lc, &args[0], env)?;
-            let own = usize::from(gc_root(b, lc, s)?);
+            let own = if builtin_allocates(builtin) || !none_allocate(&args[1..]) {
+                usize::from(gc_root(b, lc, s)?)
+            } else {
+                0
+            };
             let mut vals = vec![s];
             for a in args[1..].iter() {
                 vals.push(lower_expr(ctx, func, b, lc, a, env)?);
             }
-            let roots = gc_root_env(b, lc, env)?;
+            let roots = if builtin_allocates(builtin) {
+                gc_root_env(b, lc, env)?
+            } else {
+                0
+            };
             let v = string_builtin(ctx, b, lc, builtin, &vals)?;
             gc_unroot(b, lc, roots + own)?;
             Ok(v)

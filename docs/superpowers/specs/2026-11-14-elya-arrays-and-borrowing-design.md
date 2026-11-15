@@ -149,8 +149,12 @@ key's bytes, doubled when an insert would pass three quarters. `map.new()`,
 an array's elements. Since `MapSlot` is the module's, an importer can build
 or read a slot: an abstract type (HANDOFF step 4) would close it. Measured natively:
 a million inserts and a million lookups of decimal keys in 4.5 s (250,000 in
-1.1 s: linear); half the time is the shadow stack's pushes and pops around
-calls (callgrind, 46%), HANDOFF step 3's known cost.
+1.1 s: linear); half the time was the shadow stack's pushes and pops around
+calls (callgrind, 46%). The emitters then stopped rooting around reads that
+allocate nothing and around arguments followed only by ones that cannot
+allocate (`crates/codegen/tests/native_roots.rs`): 3.1 s. What remains is
+mostly the collector (a `MapFull` per insert) and calls to user functions,
+which count as allocating until an analysis says otherwise.
 
 **D8. Not here:** arrays of affine elements (a swap); slices; a borrow that
 is returned or stored (regions); modes in function types.

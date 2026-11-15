@@ -63,9 +63,10 @@ fn a_million_entries_natively_in_linear_time() {
         );
         took
     };
-    // Measured (2026-11-15, this container): 1.09 s and 4.53 s. Half of it
-    // is the shadow stack's pushes and pops around every call (callgrind:
-    // 46%), HANDOFF step 3's known cost, not the map's.
+    // Measured (2026-11-15, this container): 1.09 s and 4.53 s, half of it
+    // the shadow stack's pushes and pops (callgrind: 46%); 0.75 s and 3.11 s
+    // once reads and arguments that cannot collect stopped being rooted
+    // (`native_roots.rs`).
     let large = time(1_000_000);
     let small = time(250_000).max(1e-3);
     assert!(large < 10.0, "1,000,000 entries took {large:.3} s");
