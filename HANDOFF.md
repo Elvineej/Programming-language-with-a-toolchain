@@ -30,7 +30,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1633 passed, 188 suites, and configuration C
+- Linux gate at the tip of `main`: 1651 passed, 191 suites, and configuration C
   (the boards on QEMU; `check.sh` fails without its tools unless
   `ELYA_BOARDS=skip`) 8 passed, 2 suites. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
@@ -744,6 +744,16 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   requirement riding on row variables; `with any` operations take duplicable
   arguments; new E0437. The review found two holes (a call's waiting operands; a local
   generic held on an outer row) and a false refusal, fixed test-first. Gate 1497.
+
+- **`&&` and `||` short-circuit** (2026-11-15): spec
+  `docs/superpowers/specs/2026-11-15-elya-short-circuit-design.md`, plan beside it.
+  They were strict since 5b-2; `a && b` is now `if a { b } else { False }` in both
+  evaluators and in Core (so natively), the right operand in tail position. The
+  parse and the dump are unchanged. The affine checker is unchanged too: its strict
+  reading gives the `if`'s verdicts (the other branch is a literal; controls K5-K7
+  making it branch-aware were not caught, as predicted, and the change was reverted).
+  Found by Codex's parser in Elya (4b), which had to rewrite an `&&` as an `if`. The
+  maintainer's bar for 1.0, "as simple to write as Python", is in docs/ROADMAP.md.
 
 ## The next five steps
 

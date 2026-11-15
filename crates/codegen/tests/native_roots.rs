@@ -101,3 +101,17 @@ fn a_string_literal_is_a_constant() {
         "the literal's bytes are a constant: {ir}"
     );
 }
+
+/// `a && b` is an `if` in Core (spec 2026-11-15-elya-short-circuit D1): a
+/// branch whose parts allocate nothing allocates nothing, so a string held
+/// across an argument that is a `&&` is not rooted, as it was not when `&&`
+/// was a strict `Prim`. The reviewer's finding; control K8 in that plan.
+#[test]
+fn a_short_circuit_argument_roots_nothing() {
+    let src = "fn g(s: String, b: Bool) -> Int { if b { string.length(s) } else { 0 } }\n\
+               fn h(s: String, i: Int) -> Int { 1 + g(s, i < string.length(s) && i > 0) }\n\
+               pub fn main() -> Int { h(\"abc\", 1) }\n";
+    let ir = ir(src);
+    let f = body(&ir, "h");
+    assert!(!f.contains("elya_gc_push"), "{f}");
+}

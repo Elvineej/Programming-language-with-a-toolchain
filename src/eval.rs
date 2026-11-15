@@ -765,6 +765,20 @@ pub mod tree {
                 let v = eval_expr(interp, expr, env, fns)?;
                 apply_unop(*op, v, span)
             }
+            // `&&` and `||` short-circuit (spec 2026-11-15-elya-short-circuit
+            // D1): the right runs only when the left does not decide.
+            Expr::Binary {
+                op: op @ (BinOp::And | BinOp::Or),
+                lhs,
+                rhs,
+            } => match eval_expr(interp, lhs, env, fns)? {
+                Value::Bool(l) if l == (*op == BinOp::Or) => Ok(Value::Bool(l)),
+                Value::Bool(_) => match eval_expr(interp, rhs, env, fns)? {
+                    v @ Value::Bool(_) => Ok(v),
+                    _ => Err(rt(span, "type error in binary operator")),
+                },
+                _ => Err(rt(span, "type error in binary operator")),
+            },
             Expr::Binary { op, lhs, rhs } => {
                 let l = eval_expr(interp, lhs, env, fns)?;
                 let r = eval_expr(interp, rhs, env, fns)?;
@@ -1702,6 +1716,22 @@ pub mod cek {
             meta,
         };
         Ok(Some(match frame {
+            // The left decided (spec 2026-11-15-elya-short-circuit D1): the
+            // answer, without the right.
+            Frame::BinRight {
+                op: op @ (BinOp::And | BinOp::Or),
+                ..
+            } if matches!(v, Value::Bool(b) if b == (op == BinOp::Or)) => State::Return(v, rest),
+            // The right is the answer, in tail position (D2): no frame after it.
+            Frame::BinRight {
+                op: BinOp::And | BinOp::Or,
+                rhs,
+                env,
+                span,
+            } => match v {
+                Value::Bool(_) => State::Eval(rhs, env, rest),
+                _ => return Err(rt(span, "type error in binary operator")),
+            },
             Frame::BinRight { op, rhs, env, span } => {
                 State::Eval(rhs, env, push(Frame::BinApply { op, lval: v, span }, rest))
             }

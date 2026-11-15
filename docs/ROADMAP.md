@@ -166,6 +166,19 @@ A language is not finished; the target is **Elya 1.0**: something another
 person can install, write a real program in, and trust not to break. Rough
 durations at the 2026-11 pace, estimates and not measurements.
 
+**The bar for 1.0: as simple to write as Python** (the maintainer,
+2026-11-15). The power stays (static types, effects, borrowing, native code
+down to bare metal), but none of it is asked for up front: a newcomer writes
+ordinary code with no annotations, no effect rows and no `borrow`, and gets
+errors that say what to do. Every feature is weighed against that. What it
+means for the work below: inference never needs help in ordinary code;
+effects and borrowing have defaults a beginner never sees; the operators mean
+what they mean elsewhere (`&&` and `||` short-circuit since 2026-11-15); the
+standard library has what Python's has for everyday work (strings, lists,
+maps, files, JSON, HTTP); and one command runs a file. Self-hosting is the
+first large test of it: what is awkward to write in the compiler is smoothed
+first.
+
 **0. Self-hosting** (HANDOFF step 1; 6 to 10 weeks from 2026-11-15). Done:
 files and arguments, buffers, arrays with borrowing, maps, the lexer and its
 tokens. Left, with the Rust each replaces: the parser (2,300 lines), modules

@@ -916,6 +916,9 @@ pub(crate) fn may_allocate(e: &CoreExpr) -> bool {
         CoreKind::Lit(_) => false,
         CoreKind::Prim(op, args) => matches!(op, BinOp::Concat) || args.iter().any(may_allocate),
         CoreKind::Builtin(name, args) => builtin_allocates(name) || args.iter().any(may_allocate),
+        // A branch allocates only if a part of it does: `a && b` is one
+        // (spec 2026-11-15-elya-short-circuit D1), and was a `Prim` before.
+        CoreKind::If(c, t, f) => may_allocate(c) || may_allocate(t) || may_allocate(f),
         _ => true,
     }
 }
@@ -936,6 +939,7 @@ fn allocates_here(e: &CoreExpr, lc: &LowerCtx<'_, '_>, env: &Env<'_>) -> bool {
         CoreKind::Builtin(name, args) => {
             builtin_allocates(name) || args.iter().any(|a| allocates_here(a, lc, env))
         }
+        CoreKind::If(c, t, f) => [c, t, f].iter().any(|x| allocates_here(x, lc, env)),
         _ => may_allocate(e),
     }
 }

@@ -902,7 +902,18 @@ fn lower_expr(
         Expr::Binary { op, lhs, rhs } => {
             let l = lower_expr(&lhs.node, lhs.span, table, cx)?;
             let r = lower_expr(&rhs.node, rhs.span, table, cx)?;
-            CoreKind::Prim(*op, vec![l, r].into())
+            // `&&` and `||` are the `if` they mean (spec
+            // 2026-11-15-elya-short-circuit D1, D3).
+            let decided = |b: bool| CoreExpr {
+                span,
+                ty: Ty::bool(),
+                kind: CoreKind::Lit(CoreLit::Bool(b)),
+            };
+            match op {
+                BinOp::And => CoreKind::If(Rc::new(l), Rc::new(r), Rc::new(decided(false))),
+                BinOp::Or => CoreKind::If(Rc::new(l), Rc::new(decided(true)), Rc::new(r)),
+                _ => CoreKind::Prim(*op, vec![l, r].into()),
+            }
         }
         Expr::If {
             cond,
