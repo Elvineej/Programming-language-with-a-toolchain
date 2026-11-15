@@ -2,6 +2,7 @@
 
 pub mod affine;
 pub mod ast;
+pub mod ast_dump;
 pub mod core;
 pub mod diag;
 pub mod eval;

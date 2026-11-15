@@ -469,3 +469,32 @@ fn a_recording_keeps_the_arguments_and_a_replay_takes_none() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `elya parse --dump` prints `elya::ast_dump`'s form (spec
+/// 2026-11-15-elya-parser-in-elya D2), exit 1 on a parse error.
+#[test]
+fn parse_dump_prints_the_tree_and_the_errors() {
+    let dir = scratch("parse-dump");
+    let ok = dir.join("ok.elya");
+    std::fs::write(&ok, "pub fn main() -> Int { 1 + 2 }\n").expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .args(["parse", "--dump"])
+        .arg(&ok)
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "0 Module - -\n1 Fn 4 30 pub main\n2 NoRow - -\n2 Ty 17 20 Int\n2 Block 21 30\n3 Tail - -\n4 Binary 23 28 +\n5 Int 23 24 1\n5 Int 27 28 2\n"
+    );
+    let bad = dir.join("bad.elya");
+    std::fs::write(&bad, "pub fn main( { 1 }\n").expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .args(["parse", "--dump"])
+        .arg(&bad)
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("error E0100 "));
+    std::fs::remove_dir_all(&dir).ok();
+}

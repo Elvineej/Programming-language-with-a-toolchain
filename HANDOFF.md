@@ -30,7 +30,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1614 passed, 180 suites, and configuration C
+- Linux gate at the tip of `main`: 1620 passed, 182 suites, and configuration C
   (the boards on QEMU; `check.sh` fails without its tools unless
   `ELYA_BOARDS=skip`) 8 passed, 2 suites. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
@@ -785,7 +785,13 @@ use (its round three found no counterexample to that rule). **Maps, done**
 (`elya/map`, spec D7; ChatGPT's, Codex being out of usage, checked here): a
 map is one `Array(MapSlot(a))`, since a borrowed value cannot be taken apart;
 `map.new/put/get/has/size/get_or`, FNV-1a, linear probing; a million entries
-natively in 4.5 s, half of it the shadow stack (step 3). The roadmap's "continuation-aware ownership" line takes
+natively in 4.5 s, half of it the shadow stack (step 3). **Part 4 begun: the
+parser in Elya** (spec `2026-11-15-elya-parser-in-elya-design.md`, plan
+beside it): the print form both parsers write is `elya::ast_dump` (`elya parse
+--dump <file>`), complete to every flag and span, pinned in
+`tests/ast_dump.rs`; next, Codex's job (brief in the plan's steps 2 and 3):
+the lexer's tokens as an array, then `selfhost/parse.elya`, compared byte for
+byte on every clean program (4a), errors and recovery after (4b). The roadmap's "continuation-aware ownership" line takes
 the review's longer proposals (loans through continuations, once-callable
 function types).
 **Part 3, begun: the lexer in Elya**, `selfhost/lex.elya` (b004e29; Codex wrote

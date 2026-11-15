@@ -92,6 +92,7 @@ fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCo
         }
         Some("run") => cmd(args, Some(host)),
         Some("check") => cmd(args, None),
+        Some("parse") if args.get(2).map(String::as_str) == Some("--dump") => parse_dump_cmd(args),
         #[cfg(feature = "codegen")]
         Some("build") => build_cmd(args),
         _ => {
@@ -101,8 +102,34 @@ fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCo
             eprintln!("       elya run --value <file.elya> [-- <args>...]");
             eprintln!("       elya run --record <trace> <file.elya> [-- <args>...]");
             eprintln!("       elya run --replay <trace> <file.elya>");
+            eprintln!("       elya parse --dump <file.elya>");
             ExitCode::from(2)
         }
+    }
+}
+
+/// `elya parse --dump <file>`: the parser's tree and diagnostics as text
+/// (`elya::ast_dump`, spec 2026-11-15-elya-parser-in-elya D2), what the
+/// parser in Elya prints. Exit 1 when the file has a parse error.
+fn parse_dump_cmd(args: &[String]) -> ExitCode {
+    let Some(path) = args.get(3) else {
+        eprintln!("usage: elya parse --dump <file.elya>");
+        return ExitCode::from(2);
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: cannot read {path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let (module, diags) = elya::parse::parse_module(&elya::Session::new(), &text);
+    print!("{}", elya::ast_dump::dump(&module, &text));
+    print!("{}", elya::ast_dump::dump_diagnostics(&diags));
+    if diags.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     }
 }
 
