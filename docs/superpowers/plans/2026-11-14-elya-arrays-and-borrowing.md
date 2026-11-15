@@ -78,6 +78,21 @@ sharpest are in `tests/array.rs`. Its other recommendations (loan lifetimes
 through continuations, once-callable function types) are the roadmap's
 "continuation-aware ownership" line, after the switch.
 
+Round three (after landing, a419e14) attacked the fix: a clause that resumes
+directly but whose argument performs to a nested handler that exports the
+continuation (A1), a nested return clause that exports it (A2), the same
+through a named function (A3) and `with any` (A4): all refused, the scan
+walking every form inside a clause, nested handlers included. Its controls
+behave as it required: an aborting handler (139), a direct resume answering a
+closure (100), an escaping body that owns the array (2), multi-shot after an
+abort (E0429), a `borrow` parameter through three functions (E0439), a
+continuation copied through an array (the one-shot guard, both back ends).
+Its verdict: no counterexample against the scan as built. The rule refuses
+three safe kinds (a read completed before the perform, a resume lambda
+called at once, a clause whose operation is never performed): to recover
+them needs loans tracked through suspension points, the same roadmap line.
+The decisive cases are in `tests/array.rs`.
+
 ## Tests
 
 - `tests/array.rs` (new, 9): the program's output; out of range by name;
