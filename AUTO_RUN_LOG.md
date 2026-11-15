@@ -4,7 +4,7 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
-## 2026-11-15 00:40 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
+## 2026-11-15 02:30 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the
   spec and plan for HANDOFF step 1, strings to read a trace). Taken over from there.
@@ -15,6 +15,10 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
   after the usage limit (primary)" about 5 h ahead (trig_01WyXi2uvHFnTw3TEU4FtMAY) and
   "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
+- **Done: `elya/map`** (spec D7; ChatGPT wrote it, Codex was out of usage).
+  Gate 1614 / 180 (predicted). Controls K1-K3. Also: round three of the borrow
+  review as tests, and `native_boards`' runner given empty input (the no-world
+  program hung a gate whose input stayed open).
 - **Done: self-hosting part 2b, arrays read by borrowing** (spec
   2026-11-14-elya-arrays-and-borrowing). Gate 1602 / 177, configuration C 8 / 2
   (predicted). Controls K1-K7. ChatGPT's second adversarial review found an

@@ -1,0 +1,194 @@
+// elya/map: a String-keyed hash map over builtin linear arrays.
+// Spec: docs/superpowers/specs/2026-11-14-elya-arrays-and-borrowing-design.md D7.
+// Written by ChatGPT (OpenAI) to Claude's brief; checked here, its functions
+// renamed for the qualified use (`map.put(m, k, v)`, `map.get(m, k)`).
+//
+// The map IS an Array(MapSlot(a)), not a type wrapping an array.
+// Index 0 is MapCount(n); indices 1..capacity are the table.
+// Capacity starts at 8 and doubles. Linear probing wraps at capacity.
+// There is no deletion. Replacement does not change the count.
+//
+// Elements must be duplicable: a map of Buffer, Array, or another
+// affine value is refused with E0437. The array itself is linear.
+//
+// All functions are pure. Every loop is a tail call.
+// Hashing uses 64-bit FNV-1a on UTF-8 bytes.
+
+type MapSlot(a) { MapEmpty, MapFull(String, a), MapCount(Int) }
+type MapLookup(a) { MapFound(a), MapMissing }
+
+// Append the unoccupied slots. The initial MapCount is already present.
+fn fill(m: Array(MapSlot(a)), remaining: Int) / {} -> Array(MapSlot(a)) {
+  if remaining == 0 {
+    m
+  } else {
+    fill(array.push(m, MapEmpty), remaining - 1)
+  }
+}
+
+// Allocate an empty table. The physical array has capacity + 1 slots.
+fn allocate(capacity: Int) / {} -> Array(MapSlot(a)) {
+  let m: Array(MapSlot(a)) = array.push(array.new(), MapCount(0))
+  fill(m, capacity)
+}
+
+// FNV-1a offset basis 0xcbf29ce484222325, as signed Int:
+// 14695981039346656037 - 2^64 = -3750763034362895579.
+// Multiplication is explicitly wrapping, not checked arithmetic.
+fn hash_bytes(key: String, i: Int, h: Int) / {} -> Int {
+  if i == string.length(key) {
+    h
+  } else {
+    let byte = string.byte_at(key, i)
+    let next = int.wrapping_mul(int.xor(h, byte), 1099511628211)
+    hash_bytes(key, i + 1, next)
+  }
+}
+
+fn hash(key: String) / {} -> Int {
+  hash_bytes(key, 0, -3750763034362895579)
+}
+
+// Return a physical index in 1..capacity.
+fn start(key: String, capacity: Int) / {} -> Int {
+  int.and(hash(key), capacity - 1) + 1
+}
+
+// The index is 1-based. When index == capacity, the successor is 1.
+fn next_index(index: Int, capacity: Int) / {} -> Int {
+  int.and(index, capacity - 1) + 1
+}
+
+// Find an existing key or the first empty slot.
+// With the load-factor invariant, a free slot always exists.
+// Index 0 is reserved and never part of the probe sequence.
+fn probe(
+  borrow m: Array(MapSlot(a)),
+  key: String,
+  index: Int,
+  capacity: Int
+) / {} -> Int {
+  match array.get(m, index) {
+    MapEmpty -> index
+    MapFull(found, _) ->
+      if found == key {
+        index
+      } else {
+        probe(m, key, next_index(index, capacity), capacity)
+      }
+    MapCount(_) -> 0
+  }
+}
+
+// Count is always stored at index 0.
+pub fn size(borrow m: Array(MapSlot(a))) / {} -> Int {
+  match array.get(m, 0) {
+    MapCount(n) -> n
+    MapEmpty -> 0
+    MapFull(_, _) -> 0
+  }
+}
+
+// New maps have eight usable slots, plus the count slot.
+pub fn new() / {} -> Array(MapSlot(a)) {
+  allocate(8)
+}
+
+// Reinsert every occupied slot into a newly allocated table.
+// The old table remains borrowed; only the destination is consumed.
+fn rehash(
+  borrow old: Array(MapSlot(a)),
+  fresh: Array(MapSlot(a)),
+  index: Int
+) / {} -> Array(MapSlot(a)) {
+  if index == array.length(old) {
+    fresh
+  } else {
+    match array.get(old, index) {
+      MapEmpty ->
+        rehash(old, fresh, index + 1)
+      MapCount(_) ->
+        rehash(old, fresh, index + 1)
+      MapFull(key, value) ->
+        rehash(old, put(fresh, key, value), index + 1)
+    }
+  }
+}
+
+// Double capacity. Rehashing copies duplicable slots, not the linear array.
+fn grow(borrow old: Array(MapSlot(a))) / {} -> Array(MapSlot(a)) {
+  let capacity = array.length(old) - 1
+  let fresh: Array(MapSlot(a)) = allocate(capacity * 2)
+  rehash(old, fresh, 1)
+}
+
+// Insert a new key or replace its value.
+//
+// Probe BEFORE deciding whether to grow, so replacement does not
+// trigger a needless expansion or increase MapCount.
+//
+// A new entry grows the table exactly when:
+//   (number_of_entries + 1) * 4 > capacity * 3
+pub fn put(
+  m: Array(MapSlot(a)),
+  key: String,
+  value: a
+) / {} -> Array(MapSlot(a)) {
+  let capacity = array.length(m) - 1
+  let index = probe(m, key, start(key, capacity), capacity)
+
+  match array.get(m, index) {
+    MapFull(_, _) ->
+      array.set(m, index, MapFull(key, value))
+
+    MapEmpty -> {
+      let n = size(m)
+
+      if (n + 1) * 4 > capacity * 3 {
+        put(grow(m), key, value)
+      } else {
+        let m = array.set(m, index, MapFull(key, value))
+        array.set(m, 0, MapCount(n + 1))
+      }
+    }
+
+    // Unreachable for a map made and maintained by this module.
+    MapCount(_) -> m
+  }
+}
+
+// Return a copied value, or explicitly report absence.
+pub fn get(
+  borrow m: Array(MapSlot(a)),
+  key: String
+) / {} -> MapLookup(a) {
+  let capacity = array.length(m) - 1
+  let index = probe(m, key, start(key, capacity), capacity)
+
+  match array.get(m, index) {
+    MapFull(_, value) -> MapFound(value)
+    MapEmpty -> MapMissing
+    MapCount(_) -> MapMissing
+  }
+}
+
+pub fn has(
+  borrow m: Array(MapSlot(a)),
+  key: String
+) / {} -> Bool {
+  match get(m, key) {
+    MapFound(_) -> True
+    MapMissing -> False
+  }
+}
+
+pub fn get_or(
+  borrow m: Array(MapSlot(a)),
+  key: String,
+  default: a
+) / {} -> a {
+  match get(m, key) {
+    MapFound(value) -> value
+    MapMissing -> default
+  }
+}

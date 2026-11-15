@@ -134,9 +134,23 @@ would need one at `set` and `push`, and the audit of old-to-young stores
 gains these two.
 
 **D7. Maps are Elya,** over arrays: `elya/map` in the standard library, open
-addressing on a string's bytes, written after this lands (a Codex job, checked
-here), with the lexer's keyword lookup and part 4's symbol tables as its
-first users.
+addressing on a string's bytes, written after this lands, with the lexer's
+keyword lookup and part 4's symbol tables as its first users. *Built*
+(2026-11-15; ChatGPT wrote it to Claude's brief, Codex being out of usage,
+checked here). A borrowed value cannot be taken apart (matching a `borrow`
+parameter consumes it, E0439), so the map is not a declared type around an
+array: it is one `Array(MapSlot(a))`, `type MapSlot(a) { MapEmpty,
+MapFull(String, a), MapCount(Int) }`, slot 0 the count, slots 1 to the
+capacity (a power of two, first 8) a table probed linearly, FNV-1a over the
+key's bytes, doubled when an insert would pass three quarters. `map.new()`,
+`map.put(m, k, v)` (consumes, answers the successor), and, borrowing,
+`map.get(m, k)` (`MapFound(v)` or `MapMissing`), `map.has`, `map.size`,
+`map.get_or(m, k, default)`. No deletion yet. Its values are duplicable, as
+an array's elements. Since `MapSlot` is the module's, an importer can build
+or read a slot: an abstract type (HANDOFF step 4) would close it. Measured natively:
+a million inserts and a million lookups of decimal keys in 4.5 s (250,000 in
+1.1 s: linear); half the time is the shadow stack's pushes and pops around
+calls (callgrind, 46%), HANDOFF step 3's known cost.
 
 **D8. Not here:** arrays of affine elements (a swap); slices; a borrow that
 is returned or stored (regions); modes in function types.

@@ -30,7 +30,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1602 passed, 177 suites, and configuration C
+- Linux gate at the tip of `main`: 1614 passed, 180 suites, and configuration C
   (the boards on QEMU; `check.sh` fails without its tools unless
   `ELYA_BOARDS=skip`) 8 passed, 2 suites. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
@@ -781,9 +781,11 @@ Natively an array of heap values has a descriptor row of arity -1, read by
 3.33 s). ChatGPT's two adversarial reviews shaped D3 and D4: the second found
 a continuation escaping its handler running a pending borrow late (checked: it
 printed 99); a borrow in such a handler's body of an outside binding is now a
-use. **Next in part 2: maps** (`elya/map`, spec D7: open addressing over
-arrays, in Elya; a Codex job, checked here), first users the lexer's keywords
-and part 4's tables. The roadmap's "continuation-aware ownership" line takes
+use (its round three found no counterexample to that rule). **Maps, done**
+(`elya/map`, spec D7; ChatGPT's, Codex being out of usage, checked here): a
+map is one `Array(MapSlot(a))`, since a borrowed value cannot be taken apart;
+`map.new/put/get/has/size/get_or`, FNV-1a, linear probing; a million entries
+natively in 4.5 s, half of it the shadow stack (step 3). The roadmap's "continuation-aware ownership" line takes
 the review's longer proposals (loans through continuations, once-callable
 function types).
 **Part 3, begun: the lexer in Elya**, `selfhost/lex.elya` (b004e29; Codex wrote
