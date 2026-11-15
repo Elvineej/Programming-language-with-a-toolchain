@@ -60,3 +60,95 @@ now lands in both parsers (R4).
 output (evaluator) against `ast_dump::dump`; a native run on the largest;
 4b's error programs once 4b lands. `tests/ast_dump.rs`: the dump on a program
 that uses every node, pinned, so a change to the form is seen.
+
+## 3. Measured after
+
+4a is implemented in `selfhost/parse.elya`. Its immutable, spanned AST mirrors
+`src/ast.rs`; a single token array stays in `parse_dump`, and all readers take
+it by `borrow`. Cursors are returned with parsed values, and output is built
+with `Buffer`. Strings retain the lexer's escaped payload and floats retain
+their source spelling, as required by the dump. No grammar or Rust compiler
+changes were needed. Errors detected by this port print only
+`error <code> <start> <end>`; complete diagnostics and recovery remain 4b.
+
+The differential test discovers every `.elya` file recursively in `examples/`,
+`selfhost/`, `src/std/`, and `tests/`, and extracts raw and ordinary string
+literals from `tests/*.rs` and `tests/programs/*.rs`. The Rust parser filters
+out programs with errors; duplicate embedded strings are compared once. On
+2026-11-15 it compared **39 repository files** (none skipped), **712 distinct
+embedded programs**, and **80 additional focused programs**: **831 inputs,
+241,784 bytes**. These include the pinned every-node program and all binary
+operators at every precedence boundary. The parser also parses its own source.
+Both back ends report the first differing dump line.
+
+The native test builds the parser at O2 and compares its output on the largest
+input, `selfhost/parse.elya` (**56,237 bytes**). The native runtime's final
+`0` value line for `main` returning `Unit` is removed by the harness; every
+byte printed by the Elya program itself is compared. Compilation is outside
+the timings. The following medians were measured on the same Linux x86-64
+machine with LLVM 18:
+
+| Measurement | Median | Runs |
+| --- | ---: | ---: |
+| Elya native: process startup + read file + lex + parse + dump + capture stdout | 65.696 ms | 7 |
+| Rust `src/parse.rs`: lex + parse, source already in memory | 1.603 ms | 101 |
+| Rust `ast_dump::dump`, parsed module already in memory | 1.094 ms | 101 |
+
+Command: `RUST_TEST_THREADS=1 taskset -c 1 cargo test --release -p elya-codegen --test selfhost_parse -- --nocapture`.
+Rust is optimized too. These are explicitly different scopes, so the timing
+does not isolate parsing speed; the native test prints each scope on every run.
+This final measurement ran on CPU 1 after the gate suites completed. Speed has
+no acceptance threshold in 4a (D4).
+
+All three negative controls were actually run, failed, and were restored byte
+for byte (`git diff --no-index --quiet` against the saved source and
+`git diff --quiet` for tracked files):
+
+- **K1:** change `+`'s binding power from 50 to 60. The evaluator comparison
+  fails on `examples/06_structured.elya`, dump line 244 (`Binary *` versus `+`).
+- **K2:** end a call's span at its callee. The evaluator comparison fails on
+  `examples/01_hello.elya`, line 9 (`Call 41 51` versus `Call 41 67`). The
+  native largest-input test also fails (line 263, the containing arm's span).
+- **K3:** consume the `borrow` modifier but store an ordinary parameter. The
+  evaluator comparison fails on `selfhost/lex.elya`, line 1807 (`Param -`
+  versus `Param borrow`).
+
+The evaluator test first failed while the parser file was absent. Independent
+review of the complete parser and harness found no remaining defects; further
+CLI probes covered contextual names, grouped calls, newline layout, skipped
+grant arguments, empty matches/handlers, repeated returns, and row phantoms.
+
+Gate measurements use `RUST_TEST_THREADS=1 taskset -c 1 sh scripts/check.sh`
+after activating the environment's Rust/LLVM 18/board tools, with no board skip.
+The baseline is the pristine `66b9077` worktree. Its original script stopped
+at the existing `reading_an_array_by_index_is_linear_natively` timing assertion
+(0.213 s versus 0.020 s), after 1,381 passes and one failure in 156 suites.
+Other baseline attempts also failed that timing ratio. Independent investigation
+found elevated kernel CPU time on the first large allocation; the exact cause
+is unproven. The unchanged test passed four isolated CPU-1 runs and then passed
+in the full native follow-up. No test, threshold, runtime, or compiler was changed.
+
+To complete baseline coverage after that fail-fast stop, the LLVM native/CLI
+suites were run with `--no-fail-fast`, followed by the frontend doctests and
+all configuration-C clippy and QEMU commands. Each follow-up command exited
+zero. Counting each suite once within its configuration, the measured baseline
+is **A: 621 passed / 76 suites; B: 1,002 / 107; C: 8 / 2**: **1,631 passed /
+185 suites** overall (**1,623 / 183** for A/B). This is the completed baseline
+with unchanged reruns, not a claim that the original script exited zero.
+
+The final original `check.sh` likewise stopped on the unchanged native-array
+ratio (0.218 s versus 0.020 s), after **1,383 passes, one failure, 158 suites**.
+The same complete follow-up commands all exited zero, including the native
+parser test and both QEMU suites. The completed configuration counts are:
+
+| Source | A passed / suites | B passed / suites | C passed / suites | Total passed / suites |
+| --- | ---: | ---: | ---: | ---: |
+| Before (`66b9077`) | 621 / 76 | 1,002 / 107 | 8 / 2 | 1,631 / 185 |
+| After | 622 / 77 | 1,004 / 109 | 8 / 2 | 1,634 / 188 |
+
+A/B after is **1,626 passed / 186 suites**, exactly the plan's prediction
+(+2 evaluator instances, +1 native instance). These totals count each suite
+once per configuration after unchanged reruns; they do not conceal the two
+original script failures. The PR remains a draft because a complete original
+`check.sh` run has not exited zero on this machine. No existing expected value
+or protected compiler source was changed to make the gate pass.
