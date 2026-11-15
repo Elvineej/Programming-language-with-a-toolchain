@@ -1,24 +1,45 @@
 // Elya's byte lexer, matching src/lex.rs (logos 0.14), except E0002:
+// (Codex wrote the first version, b004e29; ChatGPT rewrote it to answer its
+// tokens as an array, 2026-11-15, self-hosting part 4's plan step 2; both
+// checked here by tests/selfhost_lex.rs.)
 // float range diagnostics require float parsing and are deliberately omitted.
-// Written by Codex (OpenAI) to Claude's brief; its output is built in two
-// linear `Buffer`s (self-hosting part 2a), tokens and diagnostics, so the
-// whole lexer is O(n) (it joined lists by halves, O(n log n), before them).
-
-// The tokens' lines and the diagnostics' lines, each in source order.
-type Output { Output(Buffer, Buffer) }
+// A token's payload is exactly the text printed after the span by lex_dump:
+// numeric spelling without underscores, a quoted/escaped string, or an
+// identifier. Other tokens have an empty payload.
+//
+// Stable kind numbers follow TokenKind's declaration order in src/lex.rs.
+// IntExponent is normalised to Float by the Rust lexer, so has no separate id.
+//  0 Int         1 Float       2 Str         3 KwPub       4 KwFn
+//  5 KwLet       6 KwImport    7 KwIf        8 KwElse      9 KwType
+// 10 KwLinear   11 KwMatch    12 KwCase     13 KwEffect   14 KwTrait
+// 15 KwImpl     16 KwHandle   17 KwWith     18 KwMulti    19 KwReturn
+// 20 KwConst    21 True       22 False      23 Unit       24 Lower
+// 25 Upper      26 PlusDot    27 MinusDot   28 StarDot    29 SlashDot
+// 30 LtDot      31 LeDot      32 GtDot      33 GeDot      34 EqEq
+// 35 NotEq      36 Le         37 Ge         38 Arrow      39 FatArrow
+// 40 Concat     41 Pipe       42 AmpAmp     43 PipePipe   44 Bar
+// 45 DotDot     46 Plus       47 Minus      48 Star       49 Slash
+// 50 Percent    51 Eq         52 Lt         53 Gt         54 Bang
+// 55 Question   56 Dot        57 Comma      58 Colon      59 LParen
+// 60 RParen     61 LBrace     62 RBrace     63 LBracket   64 RBracket
+//
+// Arrays are linear; their Token and LexDiag elements are duplicable.
+// Lexed is consumed to obtain its two arrays, never borrowed and destructured.
+// Every scanning/printing loop is a tail call; Buffer is used for all text.
+type Token { Token(Int, Int, Int, String) }
+type LexDiag { LexDiag(String, Int, Int) }
+type Lexed { Lexed(Array(Token), Array(LexDiag)) }
 type Number { Number(Int, Bool, Bool) }
 type Quoted { Quoted(Int, Bool) }
 
 fn at(s: String, i: Int) -> Int {
   if i < string.length(s) { string.byte_at(s, i) } else { 0 - 1 }
 }
-
 fn width(c: Int) -> Int {
   if c < 128 { 1 } else {
     if c < 224 { 2 } else { if c < 240 { 3 } else { 4 } }
   }
 }
-
 fn digit(c: Int) -> Bool { c >= 48 && c <= 57 }
 fn lower(c: Int) -> Bool { (c >= 97 && c <= 122) || c == 95 }
 fn upper(c: Int) -> Bool { c >= 65 && c <= 90 }
@@ -28,15 +49,12 @@ fn digits(s: String, i: Int) -> Int {
   let c = at(s, i)
   if digit(c) || c == 95 { digits(s, i + 1) } else { i }
 }
-
 fn name_end(s: String, i: Int) -> Int {
   if ident(at(s, i)) { name_end(s, i + 1) } else { i }
 }
-
 fn line_end(s: String, i: Int) -> Int {
   if i == string.length(s) || at(s, i) == 10 { i } else { line_end(s, i + 1) }
 }
-
 // The regex body consumes '*' together with the following non-'/' character.
 // Thus '/***/' has no closing delimiter: the second '*' belongs to the body.
 // A failed regex is one error up to the last complete body unit.
@@ -50,7 +68,6 @@ fn block_end(s: String, i: Int) -> Quoted {
     } else { block_end(s, i + width(at(s, i))) }
   }
 }
-
 fn number(s: String, i: Int) -> Number {
   let whole = digits(s, i + 1)
   let dotted = at(s, whole) == 46 && digit(at(s, whole + 1))
@@ -62,7 +79,6 @@ fn number(s: String, i: Int) -> Number {
     Number(digits(s, start + 1), True, !dotted)
   } else { Number(end, dotted, False) }
 }
-
 fn without_underscores(s: String, i: Int, end: Int, b: Buffer) -> String {
   if i == end { buffer.finish(b) } else {
     if at(s, i) == 95 { without_underscores(s, i + 1, end, b) } else {
@@ -70,7 +86,6 @@ fn without_underscores(s: String, i: Int, end: Int, b: Buffer) -> String {
     }
   }
 }
-
 // A backslash followed by LF cannot match regex '.', but literal LF can match
 // the negated character class. Invalid escapes still consume a closed literal.
 fn quote_end(s: String, i: Int, valid: Bool) -> Quoted {
@@ -87,7 +102,6 @@ fn quote_end(s: String, i: Int, valid: Bool) -> Quoted {
     }
   }
 }
-
 // Unescape and re-escape in one pass. Every slice ends on a UTF-8 boundary.
 fn quoted_text(s: String, i: Int, end: Int, b: Buffer) -> String {
   if i == end { buffer.finish(buffer.push(b, "\"")) } else {
@@ -105,76 +119,91 @@ fn quoted_text(s: String, i: Int, end: Int, b: Buffer) -> String {
     }
   }
 }
-
-fn keyword(s: String) -> String {
+fn keyword(s: String) -> Int {
   match s {
-    "pub" -> "KwPub"  "fn" -> "KwFn"  "let" -> "KwLet"
-    "import" -> "KwImport"  "if" -> "KwIf"  "else" -> "KwElse"
-    "type" -> "KwType"  "linear" -> "KwLinear"  "match" -> "KwMatch"
-    "case" -> "KwCase"  "effect" -> "KwEffect"  "trait" -> "KwTrait"
-    "impl" -> "KwImpl"  "handle" -> "KwHandle"  "with" -> "KwWith"
-    "multi" -> "KwMulti"  "return" -> "KwReturn"  "const" -> "KwConst"
-    "True" -> "True"  "False" -> "False"  "Unit" -> "Unit"
+    "pub" -> 3  "fn" -> 4  "let" -> 5
+    "import" -> 6  "if" -> 7  "else" -> 8
+    "type" -> 9  "linear" -> 10  "match" -> 11
+    "case" -> 12  "effect" -> 13  "trait" -> 14
+    "impl" -> 15  "handle" -> 16  "with" -> 17
+    "multi" -> 18  "return" -> 19  "const" -> 20
+    "True" -> 21  "False" -> 22  "Unit" -> 23
+    _ -> 0 - 1
+  }
+}
+fn operator(s: String) -> Int {
+  match s {
+    "+." -> 26  "-." -> 27  "*." -> 28
+    "/." -> 29  "<." -> 30  "<=." -> 31
+    ">." -> 32  ">=." -> 33  "==" -> 34
+    "!=" -> 35  "<=" -> 36  ">=" -> 37
+    "->" -> 38  "=>" -> 39  "<>" -> 40
+    "|>" -> 41  "&&" -> 42  "||" -> 43
+    "|" -> 44  ".." -> 45  "+" -> 46
+    "-" -> 47  "*" -> 48  "/" -> 49
+    "%" -> 50  "=" -> 51  "<" -> 52
+    ">" -> 53  "!" -> 54  "?" -> 55
+    "." -> 56  "," -> 57  ":" -> 58
+    "(" -> 59  ")" -> 60  "{" -> 61
+    "}" -> 62  "[" -> 63  "]" -> 64
+    _ -> 0 - 1
+  }
+}
+fn kind_name(kind: Int) -> String {
+  match kind {
+    0 -> "Int"  1 -> "Float"  2 -> "Str"  3 -> "KwPub"
+    4 -> "KwFn"  5 -> "KwLet"  6 -> "KwImport"  7 -> "KwIf"
+    8 -> "KwElse"  9 -> "KwType"  10 -> "KwLinear"  11 -> "KwMatch"
+    12 -> "KwCase"  13 -> "KwEffect"  14 -> "KwTrait"  15 -> "KwImpl"
+    16 -> "KwHandle"  17 -> "KwWith"  18 -> "KwMulti"  19 -> "KwReturn"
+    20 -> "KwConst"  21 -> "True"  22 -> "False"  23 -> "Unit"
+    24 -> "Lower"  25 -> "Upper"  26 -> "PlusDot"  27 -> "MinusDot"
+    28 -> "StarDot"  29 -> "SlashDot"  30 -> "LtDot"  31 -> "LeDot"
+    32 -> "GtDot"  33 -> "GeDot"  34 -> "EqEq"  35 -> "NotEq"
+    36 -> "Le"  37 -> "Ge"  38 -> "Arrow"  39 -> "FatArrow"
+    40 -> "Concat"  41 -> "Pipe"  42 -> "AmpAmp"  43 -> "PipePipe"
+    44 -> "Bar"  45 -> "DotDot"  46 -> "Plus"  47 -> "Minus"
+    48 -> "Star"  49 -> "Slash"  50 -> "Percent"  51 -> "Eq"
+    52 -> "Lt"  53 -> "Gt"  54 -> "Bang"  55 -> "Question"
+    56 -> "Dot"  57 -> "Comma"  58 -> "Colon"  59 -> "LParen"
+    60 -> "RParen"  61 -> "LBrace"  62 -> "RBrace"  63 -> "LBracket"
+    64 -> "RBracket"
     _ -> ""
   }
 }
 
-fn operator(s: String) -> String {
-  match s {
-    "+." -> "PlusDot"  "-." -> "MinusDot"  "*." -> "StarDot"  "/." -> "SlashDot"
-    "<." -> "LtDot"  "<=." -> "LeDot"  ">." -> "GtDot"  ">=." -> "GeDot"
-    "==" -> "EqEq"  "!=" -> "NotEq"  "<=" -> "Le"  ">=" -> "Ge"
-    "->" -> "Arrow"  "=>" -> "FatArrow"  "<>" -> "Concat"  "|>" -> "Pipe"
-    "&&" -> "AmpAmp"  "||" -> "PipePipe"  "|" -> "Bar"  ".." -> "DotDot"
-    "+" -> "Plus"  "-" -> "Minus"  "*" -> "Star"  "/" -> "Slash"
-    "%" -> "Percent"  "=" -> "Eq"  "<" -> "Lt"  ">" -> "Gt"
-    "!" -> "Bang"  "?" -> "Question"  "." -> "Dot"  "," -> "Comma"
-    ":" -> "Colon"  "(" -> "LParen"  ")" -> "RParen"  "{" -> "LBrace"
-    "}" -> "RBrace"  "[" -> "LBracket"  "]" -> "RBracket"  _ -> ""
-  }
-}
-
-fn token(out: Output, kind: String, start: Int, end: Int, payload: String) -> Output {
+fn append_token(out: Lexed, kind: Int, start: Int, end: Int, payload: String) -> Lexed {
   match out {
-    Output(ts, ds) -> {
-      let line = kind <> " " <> int.to_string(start) <> " " <> int.to_string(end) <> payload <> "\n"
-      Output(buffer.push(ts, line), ds)
-    }
+    Lexed(ts, ds) -> Lexed(array.push(ts, Token(kind, start, end, payload)), ds)
   }
 }
-
-fn error(out: Output, code: String, start: Int, end: Int) -> Output {
+fn append_error(out: Lexed, code: String, start: Int, end: Int) -> Lexed {
   match out {
-    Output(ts, ds) -> {
-      let line = "error " <> code <> " " <> int.to_string(start) <> " " <> int.to_string(end) <> "\n"
-      Output(ts, buffer.push(ds, line))
-    }
+    Lexed(ts, ds) -> Lexed(ts, array.push(ds, LexDiag(code, start, end)))
   }
 }
-
-fn punctuation(s: String, i: Int, out: Output) -> String {
+fn punctuation(s: String, i: Int, out: Lexed) -> Lexed {
   let c = at(s, i)
   let w = width(c)
   // Only ASCII can start an operator. Do not slice a partial UTF-8 character.
   let three = if c < 128 && i + 3 <= string.length(s) && at(s, i + 1) < 128 && at(s, i + 2) < 128 {
     operator(string.slice(s, i, i + 3))
-  } else { "" }
+  } else { 0 - 1 }
   let two = if c < 128 && i + 2 <= string.length(s) && at(s, i + 1) < 128 {
     operator(string.slice(s, i, i + 2))
-  } else { "" }
-  if three != "" { scan(s, i + 3, token(out, three, i, i + 3, "")) } else {
-    if two != "" { scan(s, i + 2, token(out, two, i, i + 2, "")) } else {
+  } else { 0 - 1 }
+  if three >= 0 { scan(s, i + 3, append_token(out, three, i, i + 3, "")) } else {
+    if two >= 0 { scan(s, i + 2, append_token(out, two, i, i + 2, "")) } else {
       let one = operator(string.slice(s, i, i + w))
-      if one != "" { scan(s, i + w, token(out, one, i, i + w, "")) } else {
-        scan(s, i + w, error(out, "E0001", i, i + w))
+      if one >= 0 { scan(s, i + w, append_token(out, one, i, i + w, "")) } else {
+        scan(s, i + w, append_error(out, "E0001", i, i + w))
       }
     }
   }
 }
-
-fn scan(s: String, i: Int, out: Output) -> String {
+fn scan(s: String, i: Int, out: Lexed) -> Lexed {
   if i == string.length(s) {
-    match out { Output(ts, ds) -> buffer.finish(buffer.push(ts, buffer.finish(ds))) }
+    out
   } else {
     let c = at(s, i)
     if c == 32 || c == 9 || c == 13 || c == 10 || c == 12 {
@@ -184,7 +213,7 @@ fn scan(s: String, i: Int, out: Output) -> String {
         if c == 47 && at(s, i + 1) == 42 {
           match block_end(s, i + 2) {
             Quoted(end, closed) -> {
-              let next = if closed { out } else { error(out, "E0001", i, end) }
+              let next = if closed { out } else { append_error(out, "E0001", i, end) }
               scan(s, end, next)
             }
           }
@@ -192,9 +221,9 @@ fn scan(s: String, i: Int, out: Output) -> String {
           if digit(c) {
             match number(s, i) {
               Number(end, floating, exponent) -> {
-                let kind = if floating { "Float" } else { "Int" }
-                let next = token(out, kind, i, end, " " <> without_underscores(s, i, end, buffer.new()))
-                let next = if exponent { error(next, "E0003", i, end) } else { next }
+                let kind = if floating { 1 } else { 0 }
+                let next = append_token(out, kind, i, end, without_underscores(s, i, end, buffer.new()))
+                let next = if exponent { append_error(next, "E0003", i, end) } else { next }
                 scan(s, end, next)
               }
             }
@@ -203,16 +232,16 @@ fn scan(s: String, i: Int, out: Output) -> String {
               let end = name_end(s, i + 1)
               let name = string.slice(s, i, end)
               let kw = keyword(name)
-              let kind = if kw != "" { kw } else { if upper(c) { "Upper" } else { "Lower" } }
-              let payload = if kw != "" { "" } else { " " <> name }
-              scan(s, end, token(out, kind, i, end, payload))
+              let kind = if kw >= 0 { kw } else { if upper(c) { 25 } else { 24 } }
+              let payload = if kw >= 0 { "" } else { name }
+              scan(s, end, append_token(out, kind, i, end, payload))
             } else {
               if c == 34 {
                 match quote_end(s, i + 1, True) {
                   Quoted(end, valid) -> {
                     let next = if valid {
-                      token(out, "Str", i, end, " " <> quoted_text(s, i + 1, end - 1, buffer.push(buffer.new(), "\"")))
-                    } else { error(out, "E0001", i, end) }
+                      append_token(out, 2, i, end, quoted_text(s, i + 1, end - 1, buffer.push(buffer.new(), "\"")))
+                    } else { append_error(out, "E0001", i, end) }
                     scan(s, end, next)
                   }
                 }
@@ -225,7 +254,54 @@ fn scan(s: String, i: Int, out: Output) -> String {
   }
 }
 
-pub fn lex_dump(src: String) -> String { scan(src, 0, Output(buffer.new(), buffer.new())) }
+// The complete API, including diagnostics, for a future parser with recovery.
+// The parser can also use tokens() if it does not need lexer diagnostics.
+pub fn lex(src: String) -> Lexed {
+  scan(src, 0, Lexed(array.new(), array.new()))
+}
+pub fn tokens(src: String) -> Array(Token) {
+  match lex(src) { Lexed(ts, _) -> ts }
+}
+
+// A borrow only reads an array element (a copy of a duplicable Token/Diag).
+// It is never matched or consumed; the Buffer is threaded linearly.
+fn dump_tokens(borrow ts: Array(Token), i: Int, b: Buffer) -> Buffer {
+  if i == array.length(ts) { b } else {
+    match array.get(ts, i) {
+      Token(kind, start, end, payload) -> {
+        let b = buffer.push(b, kind_name(kind))
+        let b = buffer.push(b, " ")
+        let b = buffer.push(b, int.to_string(start))
+        let b = buffer.push(b, " ")
+        let b = buffer.push(b, int.to_string(end))
+        let b = if kind == 0 || kind == 1 || kind == 2 || kind == 24 || kind == 25 {
+          buffer.push(buffer.push(b, " "), payload)
+        } else { b }
+        dump_tokens(ts, i + 1, buffer.push(b, "\n"))
+      }
+    }
+  }
+}
+fn dump_diags(borrow ds: Array(LexDiag), i: Int, b: Buffer) -> Buffer {
+  if i == array.length(ds) { b } else {
+    match array.get(ds, i) {
+      LexDiag(code, start, end) -> {
+        let b = buffer.push(b, "error ")
+        let b = buffer.push(b, code)
+        let b = buffer.push(b, " ")
+        let b = buffer.push(b, int.to_string(start))
+        let b = buffer.push(b, " ")
+        let b = buffer.push(b, int.to_string(end))
+        dump_diags(ds, i + 1, buffer.push(b, "\n"))
+      }
+    }
+  }
+}
+pub fn lex_dump(src: String) -> String {
+  match lex(src) {
+    Lexed(ts, ds) -> buffer.finish(dump_diags(ds, 0, dump_tokens(ts, 0, buffer.new())))
+  }
+}
 
 pub fn main() {
   let text = if io.arg_count() > 0 { io.read_file(io.arg(0)) } else { "pub fn main() { 1e19 + 2 }\n" }
