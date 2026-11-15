@@ -68,10 +68,14 @@ type Run = (i32, String, String);
 
 /// Runs to the end (300 s at most), reading its output while it runs: a pipe
 /// read only after the end would stop a program that writes more than the
-/// pipe holds (the review of 52bf757).
+/// pipe holds (the review of 52bf757). Its input is empty: inherited, a
+/// program that reads standard input (the no-world one) waited on whatever
+/// the test's own input was, and a gate run whose input stayed open stopped
+/// at 300 s (2026-11-15).
 fn wait(mut cmd: Command, what: &str) -> Run {
     use std::io::Read;
     let mut child = cmd
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

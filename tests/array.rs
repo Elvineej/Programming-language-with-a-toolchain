@@ -182,7 +182,33 @@ fn an_escaping_continuation_does_not_keep_a_borrow() {
     let escaping = "with { Pause.pause() -> Later(fn() { resume(0) }) }";
     let later =
         "match pending { Done(n) -> n  Later(k) -> match k() { Done(n) -> n  Later(_) -> 0 } }";
+    let first = "effect First { fn first() -> Int }\neffect Second { fn second() -> Int }";
     for (decls, body, code) in [
+        // Round three, A1: a clause resumes directly, but its argument
+        // performs to a nested handler that exports the continuation.
+        (
+            first,
+            format!("  let pending = handle {{ Done(array.get(xs, first())) }} with {{ First.first() -> handle {{ resume(second()) }} with {{ Second.second() -> Later(fn() {{ resume(0) }}) }} }}\n  let u = array.set(xs, 0, 99)\n  let _ = array.length(u)\n  {later}"),
+            "E0428",
+        ),
+        // A2: a nested handler's return clause exports it.
+        (
+            first,
+            format!("  let pending = handle {{ Done(array.get(xs, first())) }} with {{ First.first() -> handle {{ 0 }} with {{ return(v) -> Later(fn() {{ resume(v) }}) }} }}\n  let u = array.set(xs, 0, 99)\n  let _ = array.length(u)\n  {later}"),
+            "E0428",
+        ),
+        // A4: a `with any` clause is a clause.
+        (
+            "",
+            format!("  let pending = handle {{ Done(array.get(xs, pause())) }} with any {{ op(o) -> Later(fn() {{ resume(op.decode(o, \"0\")) }}) }}\n  let u = array.set(xs, 0, 99)\n  let _ = array.length(u)\n  {later}"),
+            "E0428",
+        ),
+        // C1: a `borrow` parameter through three functions.
+        (
+            "fn leaf(borrow a: Array(Int), i: Int) -> Int { array.get(a, i) }\nfn middle(borrow b: Array(Int), i: Int) -> Int { leaf(b, i) }\nfn probe3(borrow c: Array(Int)) -> Int { middle(c, pause()) }\nfn attempt(borrow a: Array(Int)) -> Outcome { handle { Done(probe3(a)) } with { Pause.pause() -> Later(fn() { resume(0) }) } }",
+            format!("  let pending = attempt(xs)\n  let u = array.set(xs, 0, 99)\n  let _ = array.length(u)\n  {later}"),
+            "E0439",
+        ),
         // The review's Finding 1: the read pending across the perform.
         (
             "",
@@ -206,9 +232,28 @@ fn an_escaping_continuation_does_not_keep_a_borrow() {
         let e = errors(&src);
         assert!(e.contains(code), "{src}: wanted {code} in {e}");
     }
-    // Accepted: a handler that only aborts; an escaping one whose body reads
-    // nothing from outside; one whose body owns the array.
+    // Held across a multi-shot point, even when the first resumption is cut
+    // short by an abort (round three, B4).
+    let e = errors(
+        "effect multi Flip { fn flip() -> Int }\neffect Stop { fn stop() -> Int }\n\
+         pub fn main() -> Int {\n  let xs = array.push(array.new(), 1)\n  handle {\n    handle {\n      let _ = array.get(xs, flip())\n      stop()\n    } with { Stop.stop() -> 0 }\n  } with multi { Flip.flip() -> {\n    let _ = resume(0)\n    resume(0)\n  } }\n}\n",
+    );
+    assert!(e.contains("E0429"), "{e}");
+    // Accepted: a handler that only aborts (the read pending at the abort is
+    // never made: round three, B2); one that resumes directly and answers a
+    // closure (B3); an escaping one whose body reads nothing from outside;
+    // one whose body owns the array.
     for (decls, body, value) in [
+        (
+            "effect Stop { fn stop() -> Int }",
+            "  let n = handle { array.get(xs, stop()) } with { Stop.stop() -> 40 }\n  let ys = array.set(xs, 0, 99)\n  n + array.get(ys, 0)".to_string(),
+            "139",
+        ),
+        (
+            "effect Read { fn read() -> Int }",
+            "  let f = handle { array.get(xs, read()) } with { Read.read() -> resume(0)  return(n) -> fn() { n } }\n  let ys = array.set(xs, 0, 99)\n  f() + array.get(ys, 0)".to_string(),
+            "100",
+        ),
         (
             "effect Fail { fn fail() -> Int }\nfn check(borrow a: Array(Int)) -> Int { if array.length(a) == 1 { fail() } else { array.get(a, 0) } }",
             "  let r = handle { check(xs) } with { Fail.fail() -> 0 - 1 }\n  let u = array.set(xs, 0, 9)\n  r + array.get(u, 0)".to_string(),
