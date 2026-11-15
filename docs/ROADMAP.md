@@ -221,6 +221,55 @@ frozen with a written compatibility promise; binaries for Linux, Windows and
 macOS; the generated-program differential fuzzer run on every release. A 0.x
 preview can ship once part 1's tooling, packages and docs exist.
 
+**4. Critical and embedded systems** (the maintainer, 2026-11-15; built
+alongside parts 1 to 3, each piece its own spec). What exists, and what each
+asks for:
+
+- *A predictable real-time mode:* bounded execution times, controlled
+  allocation, no collection pause in a critical operation. Exists: the
+  boards' fixed heap and reserve, linear buffers and arrays written in place,
+  and the native analysis of functions that never allocate (`noalloc.rs`).
+  To build: that analysis as a checked promise (a `noalloc` function or block
+  the compiler refuses to accept if it may allocate, so it cannot collect);
+  allocation up front, before a loop starts; the nursery (HANDOFF step 2) with
+  a bound on its pause; and a measured worst-case time per function on a
+  board, its loops bounded where it is asked for.
+- *Low-level hardware access:* interrupts, memory-mapped registers, timers,
+  buses, sensors, processor-specific features. Exists: freestanding builds
+  for Cortex-M and RISC-V boards on QEMU, with the runtime's own vector table.
+  To build: volatile register reads and writes as builtins behind an effect,
+  so a function that touches hardware says so in its type, and a capability
+  grants it per dependency (priority problem 2); interrupt handlers as
+  functions with a fixed, allocation-free signature; register layouts
+  declared as types; timers and buses as standard modules over those, each
+  with a host fake for tests.
+- *Fault-tolerant execution:* specified behaviour when memory, a sensor,
+  computation or communication fails. Exists: failure as an effect
+  (`examples/10_failure.elya`), and runtime errors that fail by name on both
+  back ends in the same words (out of memory, integer overflow, division by
+  zero). To build: running out of memory as a handled failure, not only an
+  exit; a sensor's or a bus's errors as values of its effect; watchdog and
+  restart policies as handlers; and every failure mode written down in the
+  language's specification.
+- *Verifiable compiler output:* strong tests, traceability, reproducible
+  builds, static analysis, evidence that machine code keeps Elya's meaning.
+  Exists: every native test compares the binary with the evaluator; the house
+  process of specs, predictions, negative controls and independent review;
+  exact replay of a run from its trace. To build: byte-identical builds
+  (checked in CI by building twice); a map from each machine instruction back
+  to its source span; the generated-program differential fuzzer; checking
+  each compiled function against its Core (translation validation), on the
+  way to the machine-checked semantics of Core listed below.
+- *A safety-assurance process:* independent verification, hazard analysis,
+  hardware testing, the documents a particular mission needs. A language
+  cannot assure a mission by itself. That is done by the people building the
+  system, under the standard their field asks for (DO-178C for aircraft,
+  ISO 26262 for cars, IEC 61508 in general). What Elya can give them is
+  evidence: a written specification, a tool-qualification package (its tests,
+  their results and coverage, its known limits), traceability from
+  requirement to test to source to code, and hardware-in-the-loop tests on
+  real boards beside QEMU.
+
 **After 1.0, by choice:** refinement types, a machine-checked semantics of
 Core, the tensor/GPU sublanguage, capability values.
 
