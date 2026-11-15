@@ -9,11 +9,16 @@
 //! the module) roots nothing the caller holds, nor does a comparison whose
 //! right operand cannot allocate.
 //!
+//! A string literal is a constant object in read-only data, not a heap copy
+//! made each time it is evaluated: the parser in Elya natively took 66 ms on
+//! its own source, then 30 ms.
+//!
 //! Negative controls (reverted, compared byte for byte): K1, `none_allocate`
 //! answering `false` (every argument rooted again):
 //! `reading_a_string_by_byte_roots_nothing` fails. K2, `never_allocating`
 //! answering no function: `a_call_to_a_function_that_never_allocates_roots_nothing`
-//! fails. The collector's safety
+//! fails. K3, a string literal lowered to a call of `elya_str_lit` again:
+//! `a_string_literal_is_a_constant` fails. The collector's safety
 //! under the change is the stress suites' (`native_gc_stress.rs`,
 //! `native_array.rs`, `native_std_map.rs`, a collection at every
 //! allocation).
@@ -81,4 +86,18 @@ fn a_call_to_a_function_that_never_allocates_roots_nothing() {
                pub fn main() -> Int { go(\"ab\", 3) }\n";
     let f = body(&ir(src), "go");
     assert!(f.contains("elya_gc_push"), "{f}");
+}
+
+#[test]
+fn a_string_literal_is_a_constant() {
+    let src = "fn name(k: Int) -> String { if k == 0 { \"zero\" } else { \"many\" } }\n\
+               pub fn main() -> Int { string.length(name(1)) }\n";
+    let ir = ir(src);
+    let f = body(&ir, "name");
+    assert!(!f.contains("elya_str_lit"), "{f}");
+    assert!(!f.contains("elya_alloc"), "{f}");
+    assert!(
+        ir.contains("c\"many\\00"),
+        "the literal's bytes are a constant: {ir}"
+    );
 }

@@ -2,8 +2,7 @@
 //! what it holds across a call to one, since nothing can collect during it.
 //!
 //! The greatest fixpoint over the module: start from every function, and
-//! drop one whose body may allocate by itself (a constructor, a string
-//! literal, a lambda, a function named as a value, `<>`, an allocating
+//! drop one whose body may allocate by itself (a constructor, a lambda, a function named as a value, `<>`, an allocating
 //! builtin, an effect: a perform, a handler, a resume) or calls anything but
 //! a function still in the set, by name. Recursion keeps a function in (a
 //! loop that allocates nothing never allocates); a call through a local
@@ -13,7 +12,7 @@
 
 use crate::builtin_allocates;
 use elya::ast::BinOp;
-use elya::core::{CoreExpr, CoreKind, CoreLit, CoreModule, CorePat};
+use elya::core::{CoreExpr, CoreKind, CoreModule, CorePat};
 use elya::types::Ty;
 use std::collections::HashSet;
 
@@ -100,7 +99,7 @@ fn allocates(e: &CoreExpr, set: &HashSet<String>, locals: &HashSet<String>) -> b
     let mut work = vec![e];
     while let Some(e) = work.pop() {
         let here = match &e.kind {
-            CoreKind::Lit(CoreLit::Str(_)) => true,
+            // A string literal is a constant object (no allocation).
             CoreKind::Lit(_) => false,
             // A local is read; a top-level function named as a value may be
             // built into a closure.

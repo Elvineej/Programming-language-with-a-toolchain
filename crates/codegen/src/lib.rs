@@ -907,13 +907,12 @@ pub(crate) fn array_builtin<'ctx>(
 /// (callgrind, 2026-11-15).
 /// Whether lowering `e` may allocate, and so collect. Conservative: only
 /// what plainly cannot is `false` -- a variable that is not a function (a
-/// function's name as a value may build its closure), a literal but a
-/// string, arithmetic and comparison but `<>`, and a builtin that allocates
-/// nothing, over operands that cannot either.
+/// function's name as a value may build its closure), a literal (a string is
+/// a constant object), arithmetic and comparison but `<>`, and a builtin that
+/// allocates nothing, over operands that cannot either.
 pub(crate) fn may_allocate(e: &CoreExpr) -> bool {
     match &e.kind {
         CoreKind::Var(_) => matches!(e.ty, Ty::Fn(..)),
-        CoreKind::Lit(CoreLit::Str(_)) => true,
         CoreKind::Lit(_) => false,
         CoreKind::Prim(op, args) => matches!(op, BinOp::Concat) || args.iter().any(may_allocate),
         CoreKind::Builtin(name, args) => builtin_allocates(name) || args.iter().any(may_allocate),
@@ -2126,46 +2125,44 @@ fn lower_expr<'ctx>(
             .into_int_type()
             .const_int(u64::from(*v), false)
             .into()),
-        // N6 §1.5/§6.4: the .rodata bytes are static source data, not heap
-        // roots. Build the full byte array explicitly: Inkwell's string-global
-        // helper truncates at an embedded NUL, while elya_str_lit copies len.
+        // A string literal is a constant object, `[tag][length][bytes]`, in
+        // read-only data (2026-11-15): strings are immutable and the collector
+        // neither marks nor frees a block outside its pages (gc.c D3), so
+        // nothing is allocated or rooted. It was a fresh heap copy each time it
+        // was evaluated (`elya_str_lit`, 7% of the parser in Elya natively).
+        // The bytes are built explicitly: Inkwell's string-global helper
+        // truncates at an embedded NUL.
         CoreKind::Lit(CoreLit::Str(v)) => {
             let i64t = ctx.i64_type();
             let i8t = ctx.i8_type();
-            let env_roots = gc_root_env(b, lc, env)?;
-            let bytes = v.as_bytes().iter().copied().chain(std::iter::once(0));
+            let mut bytes: Vec<u8> = v.as_bytes().to_vec();
+            bytes.push(0);
+            while bytes.len() % 8 != 0 {
+                bytes.push(0);
+            }
             let bytes_const = i8t.const_array(
                 &bytes
-                    .map(|byte| i8t.const_int(byte as u64, false))
+                    .iter()
+                    .map(|byte| i8t.const_int(*byte as u64, false))
                     .collect::<Vec<_>>(),
             );
-            let source = lc.module.add_global(
-                bytes_const.get_type(),
-                Some(AddressSpace::default()),
-                "cstr",
+            let object = ctx.const_struct(
+                &[
+                    i64t.const_int(lc.string_tag as u64, false).into(),
+                    i64t.const_int(v.len() as u64, false).into(),
+                    bytes_const.into(),
+                ],
+                false,
             );
-            source.set_initializer(&bytes_const);
-            source.set_constant(true);
-            source.set_linkage(Linkage::Private);
-            source.set_unnamed_addr(true);
-            let bytes_ptr = source.as_pointer_value();
-            let p = b
-                .build_call(
-                    lc.str_lit,
-                    &[
-                        i64t.const_int(lc.string_tag as u64, false).into(),
-                        bytes_ptr.into(),
-                        i64t.const_int(v.len() as u64, false).into(),
-                    ],
-                    "str",
-                )
-                .map_err(internal)?
-                .try_as_basic_value()
-                .left()
-                .ok_or(CodegenError::Unsupported("elya_str_lit returned no value"))?
-                .into_pointer_value();
-            gc_unroot(b, lc, env_roots)?;
-            Ok(p.into())
+            let global =
+                lc.module
+                    .add_global(object.get_type(), Some(AddressSpace::default()), "strlit");
+            global.set_initializer(&object);
+            global.set_constant(true);
+            global.set_linkage(Linkage::Private);
+            global.set_unnamed_addr(true);
+            global.set_alignment(8);
+            Ok(global.as_pointer_value().into())
         }
         CoreKind::Builtin(builtin, args) if builtin.starts_with("time.") => {
             let mut vals = Vec::with_capacity(args.len());
@@ -2814,7 +2811,6 @@ struct LowerCtx<'a, 'ctx> {
     /// 5b-9b: each lambda's region (its scope), for effectful lifted bodies.
     pub(crate) lambda_regions: &'a HashMap<usize, cps::LambdaRegion>,
     alloc: FunctionValue<'ctx>,
-    str_lit: FunctionValue<'ctx>,
     /// Native strings (2026-10-15): `<>`, `==` on strings, `int.to_string`.
     str_concat: FunctionValue<'ctx>,
     str_eq: FunctionValue<'ctx>,
@@ -3046,8 +3042,6 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
 
     let alloc_ty = ptrt.fn_type(&[i64t.into()], false);
     let alloc = module.add_function("elya_alloc", alloc_ty, None); // ccc
-    let str_lit_ty = ptrt.fn_type(&[i64t.into(), ptrt.into(), i64t.into()], false);
-    let str_lit = module.add_function("elya_str_lit", str_lit_ty, None); // ccc
     let str_concat_ty = ptrt.fn_type(&[i64t.into(), ptrt.into(), ptrt.into()], false);
     let str_concat = module.add_function("elya_str_concat", str_concat_ty, None); // ccc
     let str_eq_ty = i64t.fn_type(&[ptrt.into(), ptrt.into()], false);
@@ -3267,7 +3261,6 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         lifted: &lifted,
         lambda_regions: &lambda_regions,
         alloc,
-        str_lit,
         str_concat,
         str_eq,
         data_eq,

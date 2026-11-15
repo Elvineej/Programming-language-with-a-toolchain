@@ -89,6 +89,17 @@ static int64_t gc_stress = 0, gc_stress_count = 0;
  * never collect incidentally. */
 enum { GC_THRESHOLD_WORDS = 1 << 16 };
 
+/* A fixed region's reserve (2026-11-15): on a board the budget above is more
+ * than the whole region, so a collection came only when no page was left, and
+ * the runtime's working blocks (`elya_gc_scratch`, which may not collect: the
+ * caller's values may be on no root) then found none: `any`'s show and decode
+ * stopped "out of memory" in a heap mostly garbage. A program's allocation that
+ * needs a page collects first when fewer than this many are free, so working
+ * blocks always have some. Hosted, the heap grows instead. */
+#ifndef ELYA_RESERVE_PAGES
+#define ELYA_RESERVE_PAGES 4
+#endif
+
 /* [2*i] = arity, [2*i+1] = pointer mask: bit f set iff field f holds a heap
  * pointer, so marking never guesses (precise; 5b-1 §3.4). `arity` counts the
  * traced-candidate words after the tag, not the object's size (a string's row
@@ -868,6 +879,17 @@ static void *gc_alloc_large(int64_t words) {
     return p;
 }
 
+#ifdef ELYA_FREESTANDING
+/* The pages free in every chunk (a board has one or a few). */
+static size_t gc_free_pages(void) {
+    size_t n = 0;
+    for (size_t i = 0; i < gc_n_chunks; i++) {
+        n += gc_chunks[i].nfree;
+    }
+    return n;
+}
+#endif
+
 /* `words` 8-byte words, zeroed: the contract the constructor code relies on. */
 void *elya_alloc(int64_t words) {
     /* Roots for a collection triggered here are already on the shadow stack;
@@ -892,6 +914,15 @@ void *elya_alloc(int64_t words) {
     }
     Class *c = &gc_classes[cls];
     if (!c->cur || !c->cur->free) {
+#ifdef ELYA_FREESTANDING
+        /* Keep the reserve for working blocks (above); not again before as
+         * much as the reserve has been allocated, so a region nearly full of
+         * live values does not collect at every page. */
+        if (!gc_no_collect && gc_allocated >= (int64_t)(ELYA_RESERVE_PAGES * (ELYA_PAGE_BYTES / 8)) &&
+            gc_free_pages() < ELYA_RESERVE_PAGES) {
+            gc_collect();
+        }
+#endif
         c->cur = gc_next_page_of(c);
         if (!c->cur) {
             c->cur = gc_new_small_page(cls);
