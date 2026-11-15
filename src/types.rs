@@ -5177,6 +5177,16 @@ pub fn infer_schemes(
     (schemes, with_affine(diags, affine))
 }
 
+/// What `infer_for_dump` answers: schemes by name, diagnostics, node types.
+pub type DumpParts = (Vec<(String, String)>, Vec<Diagnostic>, BTreeMap<Span, Ty>);
+
+/// Everything `check_dump` prints: the schemes, the diagnostics (affine ones
+/// after the others, as the front end reports them) and every node's type.
+pub fn infer_for_dump(module: &Module) -> DumpParts {
+    let (schemes, diags, _sites, typed, _fns, affine) = infer_all(module, true);
+    (schemes, with_affine(diags, affine), typed)
+}
+
 /// Inference plus the affine binding-site set (Slice 4d-2): which `let`s have a
 /// `linear`-declared type.
 pub fn infer_with_sites(_session: &Session, module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {

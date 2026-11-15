@@ -91,6 +91,7 @@ fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCo
             ExitCode::from(2)
         }
         Some("run") => cmd(args, Some(host)),
+        Some("check") if args.get(2).map(String::as_str) == Some("--dump") => check_dump_cmd(args),
         Some("check") => cmd(args, None),
         Some("parse") if args.get(2).map(String::as_str) == Some("--dump") => parse_dump_cmd(args),
         #[cfg(feature = "codegen")]
@@ -103,6 +104,7 @@ fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCo
             eprintln!("       elya run --record <trace> <file.elya> [-- <args>...]");
             eprintln!("       elya run --replay <trace> <file.elya>");
             eprintln!("       elya parse --dump <file.elya>");
+            eprintln!("       elya check --dump <file.elya>");
             ExitCode::from(2)
         }
     }
@@ -130,6 +132,43 @@ fn parse_dump_cmd(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+/// `elya check --dump <file>`: the checker's verdict as text (`elya::check_dump`):
+/// schemes, every node's type, diagnostics. Exit 1 when the program has an error.
+fn check_dump_cmd(args: &[String]) -> ExitCode {
+    let Some(path) = args.get(3) else {
+        eprintln!("usage: elya check --dump <file.elya>");
+        return ExitCode::from(2);
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: cannot read {path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let (module, diags, _) = elya::front_end_with(path, &text, &mut files(path));
+    // Errors before the checker (parsing, names, modules: every code outside
+    // the checker's E04xx) are printed alone: there is no verdict to dump.
+    let before: Vec<_> = diags
+        .iter()
+        .filter(|d| d.severity == elya::diag::Severity::Error && !d.code.starts_with("E04"))
+        .cloned()
+        .collect();
+    if !before.is_empty() {
+        print!("{}", elya::ast_dump::dump_diagnostics(&before));
+        return ExitCode::from(1);
+    }
+    print!("{}", elya::check_dump::dump(&module));
+    if diags
+        .iter()
+        .any(|d| d.severity == elya::diag::Severity::Error)
+    {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

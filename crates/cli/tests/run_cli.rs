@@ -498,3 +498,40 @@ fn parse_dump_prints_the_tree_and_the_errors() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("error E0100 "));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `elya check --dump` prints `elya::check_dump`'s verdict, or the errors
+/// before the checker alone; exit 1 on an error.
+#[test]
+fn check_dump_prints_the_verdict() {
+    let dir = scratch("check-dump");
+    let ok = dir.join("ok.elya");
+    std::fs::write(
+        &ok,
+        "fn id(x: a) -> a { x }\npub fn main() -> Int { id(1) }\n",
+    )
+    .expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .args(["check", "--dump"])
+        .arg(&ok)
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.starts_with("scheme id forall a. fn(a) -> a\nscheme main fn() -> Int\n"),
+        "{text}"
+    );
+    let bad = dir.join("bad.elya");
+    std::fs::write(&bad, "pub fn main() -> Int { nope }\n").expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .args(["check", "--dump"])
+        .arg(&bad)
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "error E0200 23 27 \"unresolved name `nope`\"\n"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

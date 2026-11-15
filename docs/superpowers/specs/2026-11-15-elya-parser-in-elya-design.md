@@ -50,6 +50,18 @@ parse --dump <file>`, so a job can compare without the test harness.
 native, against `src/parse.rs` on the largest inputs; the switch (part 6)
 needs it within a small factor, and the measurement says where it stands.
 
+**D6. The checker's verdict has a print form too, `elya::check_dump`**
+(`elya check --dump <file>`, added 2026-11-15 ahead of the checker's port):
+`scheme <name> <scheme>` for every top-level function, sorted by name (the
+order inference visits its groups in is not part of the verdict); `type
+<start> <end> <type>` for every node, its variables named afresh on each
+line, so two checkers that number variables differently agree; then the
+diagnostics, as the parser's. Errors before the checker (parse, names,
+modules) are printed alone. Whether the Elya checker must match the
+diagnostics' words or only their codes and spans is the maintainer's call
+(asked 2026-11-15; until answered, words too). Pinned in
+`tests/check_dump.rs`.
+
 **D5. Not here:** name resolution, the checker (part 4's later halves, or
 part 5's), and any change to the language's grammar: a grammar change from
 now lands in both parsers (R4).
