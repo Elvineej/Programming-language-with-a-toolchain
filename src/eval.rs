@@ -20,6 +20,9 @@ pub enum Value {
     /// the `Rc` (an environment keeps a binding after its last use) are not
     /// aliases a program can use: the affine guarantee forbids a second use.
     Buffer(Rc<std::cell::RefCell<String>>),
+    /// A linear array (spec 2026-11-14-elya-arrays-and-borrowing D6): written
+    /// in place, as a buffer is.
+    Array(Rc<std::cell::RefCell<Vec<Value>>>),
     Bool(bool),
     Unit,
     /// A top-level function, referenced by name (Slice 2 has no lambdas).
@@ -560,7 +563,43 @@ pub(crate) fn buffer_builtin(
         ("finish", [Value::Buffer(b)]) => {
             Ok(Value::Str(std::mem::take(&mut *b.borrow_mut()).into()))
         }
+        ("length", [Value::Buffer(b)]) => Ok(Value::Int(b.borrow().len() as i64)),
         _ => Err(rt(span, format!("buffer.{name}: a wrong argument"))),
+    }
+}
+
+/// `array.*` (spec 2026-11-14-elya-arrays-and-borrowing D2, D6): in place,
+/// amortised by `Vec`'s own growth; an index out of range stops by name.
+pub(crate) fn array_builtin(name: &str, args: &[Value], span: Span) -> Result<Value, RuntimeError> {
+    let out_of_range = |i: i64, n: usize| {
+        rt(
+            span,
+            format!("array index {i} out of range (the array has {n})"),
+        )
+    };
+    match (name, args) {
+        ("new", []) => Ok(Value::Array(Rc::new(std::cell::RefCell::new(Vec::new())))),
+        ("push", [Value::Array(xs), x]) => {
+            xs.borrow_mut().push(x.clone());
+            Ok(Value::Array(Rc::clone(xs)))
+        }
+        ("set", [Value::Array(xs), Value::Int(i), x]) => {
+            let n = xs.borrow().len();
+            if *i < 0 || *i as u64 >= n as u64 {
+                return Err(out_of_range(*i, n));
+            }
+            xs.borrow_mut()[*i as usize] = x.clone();
+            Ok(Value::Array(Rc::clone(xs)))
+        }
+        ("get", [Value::Array(xs), Value::Int(i)]) => {
+            let xs = xs.borrow();
+            if *i < 0 || *i as u64 >= xs.len() as u64 {
+                return Err(out_of_range(*i, xs.len()));
+            }
+            Ok(xs[*i as usize].clone())
+        }
+        ("length", [Value::Array(xs)]) => Ok(Value::Int(xs.borrow().len() as i64)),
+        _ => Err(rt(span, format!("array.{name}: a wrong argument"))),
     }
 }
 
@@ -814,6 +853,14 @@ pub mod tree {
                         }
                         return super::buffer_builtin(name, &vals, span);
                     }
+                    if module == "array" && crate::resolve::ARRAY_BUILTINS.contains(&name.as_str())
+                    {
+                        let mut vals = Vec::new();
+                        for a in args.iter() {
+                            vals.push(eval_expr(interp, a, env, fns)?);
+                        }
+                        return super::array_builtin(name, &vals, span);
+                    }
                     if module == "string"
                         && crate::resolve::STRING_BUILTINS.contains(&name.as_str())
                     {
@@ -970,6 +1017,7 @@ pub mod cek {
         IntBinary(&'static str),       // `int.<name>` of two Ints
         FloatConversion(&'static str), // `float.<name>` conversions
         StringBuiltin(&'static str),
+        ArrayBuiltin(&'static str), // `array.<name>` (spec 2026-11-14-elya-arrays-and-borrowing)
         BufferBuiltin(&'static str), // `buffer.<name>` (spec 2026-11-14-elya-buffer)              // `string.<name>` by byte
         Value(Value),                // an evaluated callee (a Value::Fn)
         Operation { effect: String, op: String }, // a perform of an effect op
@@ -1427,6 +1475,17 @@ pub mod cek {
                             }
                         }
                     }
+                    Expr::Qualified { module, name } if module == "array" => {
+                        match crate::resolve::ARRAY_BUILTINS
+                            .iter()
+                            .position(|b| b == name)
+                        {
+                            Some(i) => CalleeSlot::ArrayBuiltin(crate::resolve::ARRAY_BUILTINS[i]),
+                            None => {
+                                return Err(rt(span, format!("unknown builtin `array.{name}`")))
+                            }
+                        }
+                    }
                     Expr::Qualified { module, name } if module == "buffer" => {
                         match crate::resolve::BUFFER_BUILTINS
                             .iter()
@@ -1522,6 +1581,15 @@ pub mod cek {
                     CalleeSlot::Builtin(b) if args.is_empty() => {
                         apply_callee(interp, fns, CalleeSlot::Builtin(b), Vec::new(), span, k)?
                     }
+                    // `array.new()` too.
+                    CalleeSlot::ArrayBuiltin(b) if args.is_empty() => apply_callee(
+                        interp,
+                        fns,
+                        CalleeSlot::ArrayBuiltin(b),
+                        Vec::new(),
+                        span,
+                        k,
+                    )?,
                     // `buffer.new()` too.
                     CalleeSlot::BufferBuiltin(b) if args.is_empty() => apply_callee(
                         interp,
@@ -1950,6 +2018,9 @@ pub mod cek {
             }
             CalleeSlot::BufferBuiltin(name) => {
                 Ok(State::Return(super::buffer_builtin(name, &args, span)?, k))
+            }
+            CalleeSlot::ArrayBuiltin(name) => {
+                Ok(State::Return(super::array_builtin(name, &args, span)?, k))
             }
             CalleeSlot::Builtin("int.to_string") => {
                 let [Value::Int(n)] = &args[..] else {

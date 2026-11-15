@@ -120,6 +120,11 @@ impl Ty {
     pub fn buffer() -> Ty {
         Ty::Con("Buffer".to_string(), Vec::new())
     }
+    /// The builtin linear array of `a` (spec
+    /// 2026-11-14-elya-arrays-and-borrowing D1): opaque, as `Buffer` is.
+    pub fn array(a: Ty) -> Ty {
+        Ty::Con("Array".to_string(), vec![a])
+    }
 
     pub fn str() -> Ty {
         Ty::Base(TyCon::Str)
@@ -422,6 +427,17 @@ enum DupKind {
     AnyOp {
         op: String,
     },
+    /// Read (borrowed) after `gone` gave it away (spec
+    /// 2026-11-14-elya-arrays-and-borrowing D3).
+    Late {
+        gone: Span,
+    },
+    /// A `borrow` parameter used otherwise than as a borrow (D5).
+    Given,
+    /// An array's element (D1).
+    Element,
+    /// A function with a `borrow` parameter used as a value (D5).
+    Value,
 }
 
 impl DupMark {
@@ -1247,6 +1263,47 @@ impl Infer {
             };
             self.require_dup(&s.ty, &mark, &s.vars);
         }
+        // Spec 2026-11-14-elya-arrays-and-borrowing D3, D5.
+        if let Some((at, gone)) = self.affine.late.get(&key).copied() {
+            let mark = DupMark {
+                name: name.to_string(),
+                at,
+                kind: DupKind::Late { gone },
+                via: None,
+            };
+            self.require_dup(&s.ty, &mark, &s.vars);
+        }
+        if let Some(at) = self.affine.given.get(&key).copied() {
+            let mark = DupMark {
+                name: name.to_string(),
+                at,
+                kind: DupKind::Given,
+                via: None,
+            };
+            self.require_dup(&s.ty, &mark, &s.vars);
+        }
+    }
+
+    /// A function with a `borrow` parameter used as a value (spec
+    /// 2026-11-14-elya-arrays-and-borrowing D5): what it borrows must be
+    /// duplicable, since a caller through the value gives it away. Out of
+    /// line: `infer_expr`'s frame is on the recursive path.
+    #[inline(never)]
+    fn borrow_value(&mut self, span: Span, t: &Ty) {
+        let Some((f, modes)) = self.affine.borrow_values.get(&span).cloned() else {
+            return;
+        };
+        if let Ty::Fn(params, ..) = self.resolve(t) {
+            let mark = DupMark {
+                name: f,
+                at: span,
+                kind: DupKind::Value,
+                via: None,
+            };
+            for (p, _) in params.iter().zip(&modes).filter(|(_, b)| **b) {
+                self.require_dup(p, &mark, &[]);
+            }
+        }
     }
 
     /// The `multi` effect a row has, if any (D3).
@@ -1502,7 +1559,8 @@ impl Infer {
         let holds = if m.name.is_empty() {
             format!("this value holds a `{what}`, which is `linear`")
         } else if self.linear_types.contains(what) && m.via.is_none() {
-            format!("`{}` is a `{what}`, which is `linear`", m.name)
+            let a = if what == "Array" { "an" } else { "a" };
+            format!("`{}` is {a} `{what}`, which is `linear`", m.name)
         } else {
             format!("`{}` holds a `{what}`, which is `linear`", m.name)
         };
@@ -1553,6 +1611,68 @@ impl Infer {
                 .with_help(format!(
                     "{holds}: a multi-shot resume runs what follows the perform again, using it again; consume it before the perform"
                 ))
+            }
+            (DupKind::Late { gone }, None) => Diagnostic::error(
+                "E0438",
+                format!("`{}` is read here after it was given away", m.name),
+            )
+            .with_label(m.at, "read here")
+            .with_label(*gone, "given away here")
+            .with_help(format!(
+                "{holds}: the use that consumes it must be its last; a call reads what it borrows when it is made, after its arguments are evaluated"
+            )),
+            (DupKind::Late { gone }, Some(v)) => Diagnostic::error(
+                "E0437",
+                "this would read an affine value after it was given away",
+            )
+            .with_label(v, format!("a `{what}` reaches a generic function here"))
+            .with_label(m.at, format!("`{}` is read here", m.name))
+            .with_label(*gone, "after it was given away here")
+            .with_help(format!(
+                "{holds}: the use that consumes it must be its last"
+            )),
+            (DupKind::Given, None) => Diagnostic::error(
+                "E0439",
+                "a borrowed value is given away here",
+            )
+            .with_label(m.at, format!("`{}` is a `borrow` parameter", m.name))
+            .with_help(format!(
+                "{holds}, and the caller still has it: a `borrow` parameter may only be read (given where a parameter borrows), never consumed, returned, stored or captured"
+            )),
+            (DupKind::Given, Some(v)) => Diagnostic::error(
+                "E0437",
+                "this would give away a borrowed value",
+            )
+            .with_label(v, format!("a `{what}` reaches a generic function here"))
+            .with_label(m.at, format!("`{}` is a `borrow` parameter, used here", m.name))
+            .with_help(format!(
+                "{holds}, and the caller still has it: a `borrow` parameter may only be read"
+            )),
+            (DupKind::Element, via) => {
+                let mut d = Diagnostic::error(
+                    "E0437",
+                    "an array's elements must not be affine",
+                )
+                .with_label(m.at, format!("this array would hold a `{what}`"));
+                if let Some(v) = via {
+                    d = d.with_label(v, format!("a `{what}` reaches a generic function here"));
+                }
+                d.with_help(format!(
+                    "`array.get` copies an element out, and a `{what}` is `linear` (used at most once): it would be held twice"
+                ))
+            }
+            (DupKind::Value, via) => {
+                let mut d = Diagnostic::error(
+                    "E0439",
+                    format!("`{}` borrows its argument: it must be called by its name", m.name),
+                )
+                .with_label(m.at, "used as a value here");
+                if let Some(v) = via {
+                    d = d.with_label(v, format!("a `{what}` reaches a generic function here"));
+                }
+                d.with_help(
+                    "a function value does not say which arguments it borrows, so its caller would give the argument away; call it directly, or wrap the call in a lambda",
+                )
             }
             (DupKind::Many(_), Some(v)) => Diagnostic::error(
                 "E0437",
@@ -1626,6 +1746,7 @@ impl Infer {
             // what they are).
             Ty::Con(n, _) if n == "$Op" => None,
             Ty::Con(n, _) if n == "Buffer" => Some("buffers".to_string()),
+            Ty::Con(n, _) if n == "Array" => Some("arrays".to_string()),
             Ty::Con(n, args) => {
                 let mut why = None;
                 for a in &args {
@@ -2805,6 +2926,7 @@ impl Infer {
                     Some(s) => {
                         let s = s.clone();
                         let t = self.instantiate(&s);
+                        self.borrow_value(span, &t);
                         // Sub-effecting at a VALUE use (a call's callee is typed
                         // in `infer_call`, unopened): a closed row in a covariant
                         // position opens to a fresh tail.
@@ -3221,6 +3343,7 @@ impl Infer {
     fn builtin_known(module: &str, name: &str) -> bool {
         Self::host_signature(module, name).is_some()
             || Self::buffer_signature(module, name).is_some()
+            || (module == "array" && crate::resolve::ARRAY_BUILTINS.contains(&name))
             || (module == "op" && matches!(name, "name" | "show" | "perform" | "encode" | "decode"))
             || ((module == "int" || module == "float") && name == "to_string")
             || (module == "float" && crate::resolve::FLOAT_CONVERSIONS.contains(&name))
@@ -3235,8 +3358,27 @@ impl Infer {
             ("buffer", "new") => (Vec::new(), Ty::buffer()),
             ("buffer", "push") => (vec![Ty::buffer(), Ty::str()], Ty::buffer()),
             ("buffer", "finish") => (vec![Ty::buffer()], Ty::str()),
+            ("buffer", "length") => (vec![Ty::buffer()], Ty::int()),
             _ => return None,
         })
+    }
+
+    /// An array builtin's parameters and result at a fresh element type, and
+    /// that type (spec 2026-11-14-elya-arrays-and-borrowing D2): pure.
+    fn array_signature(&mut self, module: &str, name: &str) -> Option<(Vec<Ty>, Ty, Ty)> {
+        if module != "array" || !crate::resolve::ARRAY_BUILTINS.contains(&name) {
+            return None;
+        }
+        let a = self.fresh();
+        let xs = Ty::array(a.clone());
+        let (params, ret) = match name {
+            "new" => (Vec::new(), xs),
+            "push" => (vec![xs.clone(), a.clone()], xs),
+            "set" => (vec![xs.clone(), Ty::int(), a.clone()], xs),
+            "get" => (vec![xs, Ty::int()], a.clone()),
+            _ => (vec![xs], Ty::int()),
+        };
+        Some((params, ret, a))
     }
 
     /// A host builtin's parameters and result: each performs `IO`.
@@ -3270,6 +3412,27 @@ impl Infer {
         // arguments (spec 2026-11-14-elya-files-and-arguments D1), and
         // `time.now_ms`/`time.sleep_ms` (spec 2026-10-15-elya-async-step2-timers
         // D3), each performing `IO`.
+        if let Some((params, ret, elem)) = self.array_signature(module, name) {
+            let want = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(ret.clone()));
+            let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
+            self.unify(&want, &got, span);
+            // D1: a read copies an element out, so no element is affine.
+            // Where the array is made: every other builtin is given one.
+            if name == "new" {
+                let mark = DupMark {
+                    name: String::new(),
+                    at: span,
+                    kind: DupKind::Element,
+                    via: None,
+                };
+                self.require_dup(&elem, &mark, &[]);
+            }
+            self.node_types.insert(
+                callee_span,
+                Ty::Fn(params, EffectRow::pure(), Box::new(ret.clone())),
+            );
+            return ret;
+        }
         if let Some((params, ret)) = Self::buffer_signature(module, name) {
             let want = Ty::Fn(params.clone(), EffectRow::pure(), Box::new(ret.clone()));
             let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(ret.clone()));
@@ -4169,6 +4332,9 @@ impl Infer {
         seen.push(name.to_string());
         if name == "Buffer" {
             return Some("a `Buffer`".to_string());
+        }
+        if name == "Array" {
+            return Some("an `Array`".to_string());
         }
         let Some((params, ctors)) = self.adt_fields.get(name).cloned() else {
             return Some(format!("the type `{name}`"));
@@ -5103,6 +5269,8 @@ fn infer_all_counted(module: &Module, want_types: bool) -> (InferAllOut, u64) {
     inf.affine = crate::affine::analyze(module);
     // `Buffer` is linear wherever it is (spec 2026-11-14-elya-buffer D1).
     inf.linear_types.insert("Buffer".to_string());
+    // And `Array` (spec 2026-11-14-elya-arrays-and-borrowing D1).
+    inf.linear_types.insert("Array".to_string());
     // Names of `linear`-declared types — set before inference so `ty_is_linear`
     // sees them while recording affine binding sites (Slice 4d-2).
     for d in &module.decls {
@@ -5125,6 +5293,7 @@ fn infer_all_counted(module: &Module, want_types: bool) -> (InferAllOut, u64) {
             known_types.insert(t.name.clone(), t.params.len());
         }
     }
+    known_types.insert("Array".to_string(), 1);
     inf.known_types = known_types.clone();
     // Every declared effect and its arity, before any declaration is
     // elaborated: a function type in a field or an operation may name an

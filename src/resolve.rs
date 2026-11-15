@@ -33,7 +33,13 @@ pub const STRING_BUILTINS: &[&str] = &["length", "byte_at", "slice"];
 
 /// `buffer.*` (spec 2026-11-14-elya-buffer D2): `new : fn() -> Buffer`,
 /// `push : fn(Buffer, String) -> Buffer`, `finish : fn(Buffer) -> String`.
-pub const BUFFER_BUILTINS: &[&str] = &["new", "push", "finish"];
+pub const BUFFER_BUILTINS: &[&str] = &["new", "push", "finish", "length"];
+
+/// `array.*` (spec 2026-11-14-elya-arrays-and-borrowing D2): `new : fn() ->
+/// Array(a)`, `push : fn(Array(a), a) -> Array(a)`, `set : fn(Array(a), Int,
+/// a) -> Array(a)`, `get : fn(borrow Array(a), Int) -> a`, `length :
+/// fn(borrow Array(a)) -> Int`.
+pub const ARRAY_BUILTINS: &[&str] = &["new", "push", "set", "get", "length"];
 
 /// The host's `io.*` builtins besides `println` (spec
 /// 2026-11-14-elya-files-and-arguments D1), each performing `IO`:
@@ -52,9 +58,10 @@ pub const IO_BUILTINS: &[&str] = &[
 /// How many arguments a builtin takes (every name in [`builtins`]).
 pub fn builtin_arity(full: &str) -> usize {
     match full {
-        "time.now_ms" | "io.read_stdin" | "io.arg_count" | "buffer.new" => 0,
-        "op.encode" | "op.decode" | "string.byte_at" | "io.write_file" | "buffer.push" => 2,
-        "string.slice" => 3,
+        "time.now_ms" | "io.read_stdin" | "io.arg_count" | "buffer.new" | "array.new" => 0,
+        "op.encode" | "op.decode" | "string.byte_at" | "io.write_file" | "buffer.push"
+        | "array.push" | "array.get" => 2,
+        "string.slice" | "array.set" => 3,
         f if f
             .strip_prefix("int.")
             .is_some_and(|n| INT_BINARY_BUILTINS.contains(&n)) =>
@@ -80,6 +87,13 @@ pub fn builtins() -> &'static [&'static str] {
         "buffer.new",
         "buffer.push",
         "buffer.finish",
+        "buffer.length",
+        // A linear array (spec 2026-11-14-elya-arrays-and-borrowing D2).
+        "array.new",
+        "array.push",
+        "array.set",
+        "array.get",
+        "array.length",
         "int.to_string",
         // A float's literal text (2026-10-23, spec 2026-10-23-elya-float-natively D5).
         "float.to_string",
@@ -250,6 +264,16 @@ fn walk(module: &Module) -> (Vec<Diagnostic>, HashSet<Span>) {
                             .with_label(d.span, "this declares a type named `Buffer`")
                             .with_help(
                                 "`Buffer` is the linear text buffer of `buffer.new`, `buffer.push` and `buffer.finish`: give this type another name",
+                            ),
+                    );
+                }
+                // And `Array` (spec 2026-11-14-elya-arrays-and-borrowing D1).
+                if t.name == "Array" {
+                    dup_diags.push(
+                        Diagnostic::error("E0211", "`Array` is a builtin type")
+                            .with_label(d.span, "this declares a type named `Array`")
+                            .with_help(
+                                "`Array` is the linear array of `array.new`, `array.push`, `array.set` and `array.get`: give this type another name",
                             ),
                     );
                 }

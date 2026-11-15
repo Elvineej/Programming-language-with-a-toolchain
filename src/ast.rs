@@ -64,6 +64,9 @@ pub struct Param {
     pub name: String,
     /// `name: T` -- checked since 2026-10-09 (it used to be discarded).
     pub ann: Option<Spanned<TypeAnn>>,
+    /// `borrow name: T` on a function's parameter (spec
+    /// 2026-11-14-elya-arrays-and-borrowing D5): read, never consumed.
+    pub borrow: bool,
 }
 
 /// A surface type annotation. Slice 3a: base names (`Int`, `String`, `Unit`, …)
@@ -668,6 +671,7 @@ mod tests {
                     params: vec![sp(Param {
                         name: "o".into(),
                         ann: None,
+                        borrow: false,
                     })],
                     effect_row: None,
                     ret_ann: None,
@@ -720,6 +724,7 @@ mod tests {
                 params: vec![sp(Param {
                     name: "msg".into(),
                     ann: None,
+                    borrow: false,
                 })],
                 param_tys: vec![sp(TypeAnn {
                     name: "String".into(),
@@ -743,6 +748,7 @@ mod tests {
                 params: vec![sp(Param {
                     name: "m".into(),
                     ann: None,
+                    borrow: false,
                 })],
                 body: Rc::new(sp(Expr::Resume {
                     arg: Rc::new(sp(Expr::Var("m".into()))),

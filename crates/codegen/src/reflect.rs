@@ -34,6 +34,8 @@ pub(crate) const KIND_UNBUILT: i64 = 6;
 pub(crate) const KIND_FLOAT: i64 = 7;
 /// A `Buffer` (spec 2026-11-14-elya-buffer D1): not data, stops by name.
 pub(crate) const KIND_BUFFER: i64 = 8;
+/// An `Array` (spec 2026-11-14-elya-arrays-and-borrowing D1): the same.
+pub(crate) const KIND_ARRAY: i64 = 9;
 
 #[derive(Default)]
 pub(crate) struct Reflect {
@@ -91,6 +93,7 @@ impl Reflect {
             Ty::Base(TyCon::Str) => self.words.push(KIND_STRING),
             Ty::Fn(..) => self.words.push(KIND_FN),
             Ty::Con(n, a) if a.is_empty() && n == "Buffer" => self.words.push(KIND_BUFFER),
+            Ty::Con(n, _) if n == "Array" => self.words.push(KIND_ARRAY),
             Ty::Con(n, a) if a.is_empty() => {
                 let Some(decl) = core.types.iter().find(|d| d.name == *n) else {
                     self.words.push(KIND_UNBUILT);

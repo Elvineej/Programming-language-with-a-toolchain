@@ -297,6 +297,82 @@ void *elya_buffer_finish(int64_t string_tag, void *buffer) {
     return s;
 }
 
+int64_t elya_array_length(void *array);
+
+/* A linear array (spec 2026-11-14-elya-arrays-and-borrowing D6): one object,
+ * `[tag][length][capacity][words]`, each element one word. Its tag is the
+ * traced array's (the collector follows `length` words: gc.c `gc_scan`) or,
+ * for elements that are not heap values, the string's (it follows none). As
+ * the buffer: the program holds the only reference, so `push` and `set` write
+ * in place, and a push past the capacity answers a new object of twice it. */
+#define ELYA_ARRAY_FIRST 8
+
+static int64_t *array_alloc(int64_t tag, int64_t cap) {
+    int64_t *p = (int64_t *)elya_alloc(3 + cap);
+    p[0] = tag;
+    p[1] = 0;
+    p[2] = cap;
+    return p;
+}
+
+static void array_out_of_range(int64_t i, int64_t n) {
+    elya_platform_flush();
+    rt_printf(2, "elya: array index %lld out of range (the array has %lld)\n", (long long)i,
+              (long long)n);
+    elya_platform_exit(1);
+}
+
+void *elya_array_new(int64_t tag) { return array_alloc(tag, ELYA_ARRAY_FIRST); }
+
+void *elya_array_push(void *array, int64_t x) {
+    int64_t *a = (int64_t *)array;
+    int64_t len = a[1];
+    if (len < a[2]) {
+        a[3 + len] = x;
+        a[1] = len + 1;
+        return a;
+    }
+    int64_t cap = a[2] > INT64_MAX / 2 ? INT64_MAX : 2 * a[2];
+    if (cap < ELYA_ARRAY_FIRST) {
+        cap = ELYA_ARRAY_FIRST;
+    }
+    /* Only a heap value is a root: a number that looked like one is not. */
+    int traced = gc_descriptors[2 * a[0]] < 0;
+    elya_gc_push(array);
+    if (traced) {
+        elya_gc_push((void *)(intptr_t)x);
+    }
+    int64_t *grown = array_alloc(a[0], cap);
+    if (traced) {
+        elya_gc_pop();
+    }
+    elya_gc_pop();
+    memcpy(&grown[3], &a[3], (size_t)len * sizeof(int64_t));
+    grown[3 + len] = x;
+    grown[1] = len + 1;
+    return grown;
+}
+
+void *elya_array_set(void *array, int64_t i, int64_t x) {
+    int64_t *a = (int64_t *)array;
+    if (i < 0 || i >= a[1]) {
+        array_out_of_range(i, a[1]);
+    }
+    a[3 + i] = x;
+    return a;
+}
+
+int64_t elya_array_get(void *array, int64_t i) {
+    const int64_t *a = (const int64_t *)array;
+    if (i < 0 || i >= a[1]) {
+        array_out_of_range(i, a[1]);
+    }
+    return a[3 + i];
+}
+
+/* An array's length; a buffer's too (the same word of the same shape). */
+int64_t elya_array_length(void *array) { return ((const int64_t *)array)[1]; }
+
 /* Native strings (spec 2026-10-15-elya-native-strings, D2/D4). `a <> b` is a
  * fresh immutable string. Both operands are rooted while it allocates: callers
  * root them too (an operand is a temporary the emitter pushed), so this is
@@ -548,7 +624,7 @@ void *elya_float_to_string(int64_t tag, int64_t bits) {
  * value of exists. Every walk keeps its own stack: a million-cell list neither
  * recurses nor overflows. Failures carry the evaluator's words. */
 
-enum { ANY_INT, ANY_BOOL, ANY_UNIT, ANY_STRING, ANY_FN, ANY_ADT, ANY_UNBUILT, ANY_FLOAT, ANY_BUFFER };
+enum { ANY_INT, ANY_BOOL, ANY_UNIT, ANY_STRING, ANY_FN, ANY_ADT, ANY_UNBUILT, ANY_FLOAT, ANY_BUFFER, ANY_ARRAY };
 
 static void any_oom(void) {
     rt_puts(2, "elya: out of memory\n");
@@ -677,6 +753,10 @@ void *elya_any_show(int64_t string_tag, const int64_t *t, const char *names, int
             elya_platform_flush();
             rt_printf(2, "elya: %sa buffer%s\n", before, after);
             elya_platform_exit(1);
+        case ANY_ARRAY:
+            elya_platform_flush();
+            rt_printf(2, "elya: %san array%s\n", before, after);
+            elya_platform_exit(1);
         case ANY_ADT: {
             int64_t *p = (int64_t *)(intptr_t)it.value;
             int64_t c = any_ctor(t, it.node, p[0]);
@@ -724,6 +804,7 @@ int64_t elya_any_check(const int64_t *t, int64_t node, int64_t value) {
         switch (t[it.node]) {
         case ANY_FN:
         case ANY_BUFFER:
+        case ANY_ARRAY:
             rt_puts(2, "elya: `==` reached a value that is not data (E0436 should have rejected it)\n");
             elya_platform_exit(1);
         case ANY_ADT: {
@@ -1073,7 +1154,8 @@ static int any_conforms(AnyParser *p, const int64_t *t, const char *names, int64
         case ANY_UNIT: ok = l->kind == LIT_UNIT; break;
         case ANY_STRING: ok = l->kind == LIT_STR; break;
         case ANY_FN:
-        case ANY_BUFFER: ok = 0; break;
+        case ANY_BUFFER:
+        case ANY_ARRAY: ok = 0; break;
         case ANY_ADT: {
             ok = 0;
             if (l->kind != LIT_CTOR) {

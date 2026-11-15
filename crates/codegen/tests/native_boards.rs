@@ -153,7 +153,13 @@ fn ok(out: &str) -> Run {
 #[test]
 fn programs_on_the_boards_write_what_they_write_hosted() {
     let buffer = format!("{}130\n", buffer_programs::builds_out());
-    let programs: [(&str, &str, Run); 12] = [
+    let array = format!(
+        "{}{}\n",
+        array_programs::ARRAYS_OUT,
+        array_programs::ARRAYS_VALUE
+    );
+    let programs: [(&str, &str, Run); 13] = [
+        ("array", array_programs::ARRAYS, ok(&array)),
         (
             "buffer",
             buffer_programs::BUILDS,
@@ -340,6 +346,11 @@ fn a_stack_overflow_on_the_boards_is_named() {
 #[path = "../../../tests/programs/buffer.rs"]
 #[allow(dead_code)]
 mod buffer_programs;
+
+/// And the arrays of part 2b.
+#[path = "../../../tests/programs/array.rs"]
+#[allow(dead_code)]
+mod array_programs;
 
 #[path = "../../../tests/programs/files_and_arguments.rs"]
 #[allow(dead_code)]

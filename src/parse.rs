@@ -952,7 +952,14 @@ impl<'a> Parser<'a> {
                         } else {
                             None
                         };
-                        params.push(spanned(Param { name: pn, ann }, pspan));
+                        params.push(spanned(
+                            Param {
+                                name: pn,
+                                ann,
+                                borrow: false,
+                            },
+                            pspan,
+                        ));
                     }
                     _ => {
                         self.error(pspan, "expected parameter name");
@@ -1158,6 +1165,7 @@ impl<'a> Parser<'a> {
                     Param {
                         name: pname,
                         ann: None,
+                        borrow: false,
                     },
                     pspan,
                 ));
@@ -1447,7 +1455,14 @@ impl<'a> Parser<'a> {
                 match self.peek()?.clone() {
                     TokenKind::Lower(n) => {
                         self.bump();
-                        params.push(spanned(Param { name: n, ann: None }, pspan));
+                        params.push(spanned(
+                            Param {
+                                name: n,
+                                ann: None,
+                                borrow: false,
+                            },
+                            pspan,
+                        ));
                     }
                     _ => {
                         self.error(pspan, "expected parameter name");
@@ -1573,6 +1588,16 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         if self.peek() != Some(&TokenKind::RParen) {
             loop {
+                // `borrow name`: a word here, not a keyword (it is a name
+                // anywhere else), told by the name that follows it.
+                let borrow = matches!(self.peek(), Some(TokenKind::Lower(w)) if w == "borrow")
+                    && matches!(
+                        self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                        Some(TokenKind::Lower(_))
+                    );
+                if borrow {
+                    self.bump();
+                }
                 let pspan = self.peek_span();
                 match self.peek()?.clone() {
                     TokenKind::Lower(pn) => {
@@ -1582,7 +1607,14 @@ impl<'a> Parser<'a> {
                         } else {
                             None
                         };
-                        params.push(spanned(Param { name: pn, ann }, pspan));
+                        params.push(spanned(
+                            Param {
+                                name: pn,
+                                ann,
+                                borrow,
+                            },
+                            pspan,
+                        ));
                     }
                     _ => {
                         self.error(pspan, "expected parameter name");

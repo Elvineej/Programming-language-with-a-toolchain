@@ -3,7 +3,7 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-11-14, an interactive session on `main`)
+## State at handoff (updated 2026-11-15, an interactive session on `main`)
 
 - **Work lands on `main` directly** (the maintainer, 2026-10-30: "Commit in the main
   tho"). `main` has everything: #24 (2026-10-24), then `auto/elya`'s 15 commits since,
@@ -30,7 +30,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1580 passed, 174 suites, and configuration C
+- Linux gate at the tip of `main`: 1602 passed, 177 suites, and configuration C
   (the boards on QEMU; `check.sh` fails without its tools unless
   `ELYA_BOARDS=skip`) 8 passed, 2 suites. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
@@ -770,16 +770,22 @@ Windows gate. Running a program (`io.run`) waits for part 5.
 a builtin linear type (`buffer.new`, `buffer.push`, `buffer.finish`), written
 in place because the affine guarantee says no one else holds it; 80,000
 appends 8 ms natively (1.667 s with `<>`); its name reserved (E0211).
-**Part 2b, next: arrays** (`linear` `Array(a)`, consuming updates as the
-buffer's) and maps over them. The question to settle first, by measurement
-and a spec: how an element is read without consuming the array. The
-direction taken (docs/ROADMAP.md, "A reviewer's six directions", 2026-11-14):
-a *borrowed* parameter mode the affine checker understands, not a special
-case of `array.get`, and before part 4 ports the checker (R4: after that
-every type-system change lands twice). Also to decide:
-how a native array of pointers is traced (a row per array cannot say its
-length: `gc_scan` needs a kind for it). ChatGPT's survey (in its chat, "Write
-RISC V Board Files") lists the decisions.
+**Part 2b, done: arrays, read by borrowing** (spec
+`2026-11-14-elya-arrays-and-borrowing-design.md`, plan beside it): `Array(a)`,
+builtin and linear, `array.new/push/set` consuming and writing in place,
+`array.get/length` and `buffer.length` borrowing; `fn f(borrow xs: T)`; a
+borrow counts no use, takes place at its call, and never after the use that
+gives the binding away (E0438), a `borrow` parameter only borrowed (E0439).
+Natively an array of heap values has a descriptor row of arity -1, read by
+`gc_scan` as `length` words. 40,000 reads by index: 6 ms (a list's `nth`,
+3.33 s). ChatGPT's two adversarial reviews shaped D3 and D4: the second found
+a continuation escaping its handler running a pending borrow late (checked: it
+printed 99); a borrow in such a handler's body of an outside binding is now a
+use. **Next in part 2: maps** (`elya/map`, spec D7: open addressing over
+arrays, in Elya; a Codex job, checked here), first users the lexer's keywords
+and part 4's tables. The roadmap's "continuation-aware ownership" line takes
+the review's longer proposals (loans through continuations, once-callable
+function types).
 **Part 3, begun: the lexer in Elya**, `selfhost/lex.elya` (b004e29; Codex wrote
 it to Claude's brief, checked here): `tests/selfhost_lex.rs` compares its dump
 of tokens and diagnostics with `src/lex.rs`'s on every `.elya` file, byte for
@@ -791,8 +797,6 @@ ends (differential testing; the roadmap section above), after the benchmarks.
 The benchmark suite is in (`scripts/bench.sh`, `benches/`; Codex's, checked):
 run it before and after a change that should move a number, and compare on one
 machine only (its two committed baselines are Codex's machine's).
-Part 2b's design is spec `2026-11-14-elya-arrays-and-borrowing-design.md`;
-ChatGPT is trying to break its borrowing rules before any code.
 
 ### 2. A collector for bare metal and for large programs alike
 

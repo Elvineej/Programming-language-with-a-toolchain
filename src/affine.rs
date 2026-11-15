@@ -53,6 +53,74 @@ pub struct Facts {
     /// Each `handle`'s `resume`s (in its clauses, the lambdas there included),
     /// by the `handle`'s span: points whose rows are the `handle`'s.
     pub resumes: HashMap<Span, Vec<Span>>,
+    /// The bindings read (borrowed) after they were given away, by binder:
+    /// the read and the consuming use before it (spec
+    /// 2026-11-14-elya-arrays-and-borrowing D3, E0438).
+    pub late: HashMap<Span, (Span, Span)>,
+    /// A function's `borrow` parameters (by binder) with a use that is not a
+    /// borrow (D5, E0439).
+    pub given: HashMap<Span, Span>,
+    /// Uses of a function with `borrow` parameters as a value, each with the
+    /// function's name and its borrowed positions (D5: the mode does not
+    /// travel with the value).
+    pub borrow_values: HashMap<Span, (String, Vec<bool>)>,
+}
+
+/// Which arguments each callee borrows (spec
+/// 2026-11-14-elya-arrays-and-borrowing D2, D5): the reading builtins, and
+/// the module's functions with `borrow` parameters, by name.
+#[derive(Default)]
+struct Modes {
+    fns: HashMap<String, Vec<bool>>,
+}
+
+impl Modes {
+    fn of(module: &Module) -> Modes {
+        let mut fns = HashMap::new();
+        for d in &module.decls {
+            if let Decl::Fn(f) = &d.node {
+                if f.params.iter().any(|p| p.node.borrow) {
+                    fns.insert(
+                        f.name.clone(),
+                        f.params.iter().map(|p| p.node.borrow).collect(),
+                    );
+                }
+            }
+        }
+        Modes { fns }
+    }
+
+    /// The borrowed positions of a call to `callee`. A name bound locally
+    /// (`occ` has it) is a value: its modes are not known (D5).
+    fn positions(&self, callee: &Spanned<Expr>, occ: &HashMap<Span, Span>) -> &[bool] {
+        match &callee.node {
+            Expr::Qualified { module, name } => match (module.as_str(), name.as_str()) {
+                ("array", "get") => &[true, false],
+                ("array", "length") | ("buffer", "length") => &[true],
+                _ => &[],
+            },
+            Expr::Var(name) if !occ.contains_key(&callee.span) => {
+                self.fns.get(name).map(|v| v.as_slice()).unwrap_or(&[])
+            }
+            _ => &[],
+        }
+    }
+}
+
+/// Whether argument `i` of a call is a borrow: a borrowed position given a
+/// binding of the body the call is in (D4: one from outside a lambda or an
+/// operation clause is an ordinary use).
+fn is_borrow(
+    positions: &[bool],
+    i: usize,
+    arg: &Spanned<Expr>,
+    occ: &HashMap<Span, Span>,
+    outer: &HashSet<Span>,
+) -> bool {
+    positions.get(i).copied().unwrap_or(false)
+        && matches!(arg.node, Expr::Var(_))
+        && occ.contains_key(&arg.span)
+        && !outer.contains(&arg.span)
 }
 
 pub fn analyze(module: &Module) -> Facts {
@@ -68,14 +136,54 @@ pub fn analyze(module: &Module) -> Facts {
     for f in &fns {
         r.function(f);
     }
+    let modes = Modes::of(module);
     let mut facts = Facts::default();
+    let mut borrows = HashSet::new();
     let mut c = Counter {
         occ: &r.occ,
+        outer: &r.outer,
+        modes: &modes,
+        borrows: &mut borrows,
         many: &mut facts.many,
         bodies: HashMap::new(),
     };
     for f in &fns {
         c.function(f);
+    }
+    // D3: a read after the consuming use.
+    let mut o = Order {
+        occ: &r.occ,
+        outer: &r.outer,
+        caps: &r.caps,
+        modes: &modes,
+        late: &mut facts.late,
+    };
+    for f in &fns {
+        o.block(&f.body.node, &mut Gone::new());
+    }
+    // D5: a `borrow` parameter is only ever borrowed; a function with one,
+    // used as a value, loses the mode.
+    let mut uses: Vec<(&Span, &Span)> = r.occ.iter().collect();
+    uses.sort();
+    for f in &fns {
+        for p in f.params.iter().filter(|p| p.node.borrow) {
+            if let Some((at, _)) = uses
+                .iter()
+                .find(|(at, b)| **b == p.span && !borrows.contains(*at))
+            {
+                facts.given.insert(p.span, **at);
+            }
+        }
+    }
+    if !modes.fns.is_empty() {
+        let mut v = Values {
+            occ: &r.occ,
+            modes: &modes,
+            found: &mut facts.borrow_values,
+        };
+        for f in &fns {
+            v.block(&f.body.node);
+        }
     }
     let any_multi = module
         .decls
@@ -124,6 +232,65 @@ fn param_names(ps: &[Spanned<Param>]) -> Vec<(String, Span)> {
     ps.iter().map(|p| (p.node.name.clone(), p.span)).collect()
 }
 
+/// Whether `e` has a `resume` inside a lambda: a continuation that may be
+/// kept, and resumed after its `handle` has answered. Conservative: any
+/// lambda, whether or not it runs before the clause returns.
+fn resume_in_lambda(e: &Spanned<Expr>, in_lambda: bool) -> bool {
+    let block = |b: &Block, l: bool| {
+        b.stmts.iter().any(|st| match &st.node {
+            Stmt::Let { value, .. } => resume_in_lambda(value, l),
+            Stmt::Expr(x) => resume_in_lambda(x, l),
+        }) || b.tail.as_ref().is_some_and(|t| resume_in_lambda(t, l))
+    };
+    match &e.node {
+        Expr::Resume { arg } => in_lambda || resume_in_lambda(arg, in_lambda),
+        Expr::Lambda { body, .. } => block(&body.node, true),
+        Expr::Call { callee, args } => {
+            resume_in_lambda(callee, in_lambda)
+                || args.iter().any(|a| resume_in_lambda(a, in_lambda))
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            resume_in_lambda(lhs, in_lambda) || resume_in_lambda(rhs, in_lambda)
+        }
+        Expr::Unary { expr, .. } => resume_in_lambda(expr, in_lambda),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            resume_in_lambda(cond, in_lambda)
+                || block(&then_block.node, in_lambda)
+                || block(&else_block.node, in_lambda)
+        }
+        Expr::Block(b) => block(b, in_lambda),
+        Expr::Match { scrutinee, arms } => {
+            resume_in_lambda(scrutinee, in_lambda)
+                || arms
+                    .iter()
+                    .any(|a| resume_in_lambda(&a.node.body, in_lambda))
+        }
+        Expr::Handle { body, handler } => {
+            resume_in_lambda(body, in_lambda)
+                || handler
+                    .ret
+                    .as_ref()
+                    .is_some_and(|r| resume_in_lambda(&r.body, in_lambda))
+                || handler
+                    .clauses
+                    .iter()
+                    .any(|c| resume_in_lambda(&c.node.body, in_lambda))
+        }
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Unit
+        | Expr::Var(_)
+        | Expr::Qualified { .. }
+        | Expr::Error => false,
+    }
+}
+
 /// Each use's binding, and what each lambda captures.
 #[derive(Default)]
 struct Resolver {
@@ -139,6 +306,11 @@ struct Resolver {
     /// A lambda (its span: a `let` binding it is keyed by the same span) ->
     /// what it captures, through the `let`-bound lambdas it uses.
     caps: HashMap<Span, Vec<Span>>,
+    /// `scope`'s length where each open lambda or operation clause began: a
+    /// use of a binding from before the innermost is from outside its body.
+    barriers: Vec<usize>,
+    /// The uses of a binding from outside the body they are in.
+    outer: HashSet<Span>,
 }
 
 impl Resolver {
@@ -199,6 +371,9 @@ impl Resolver {
         };
         let b = self.scope[i];
         self.occ.insert(span, b);
+        if self.barriers.last().is_some_and(|s| i < *s) {
+            self.outer.insert(span);
+        }
         let extra = self.caps.get(&b).cloned().unwrap_or_default();
         for (start, free) in self.frames.iter_mut().rev() {
             if i >= *start {
@@ -220,10 +395,12 @@ impl Resolver {
             }
             Expr::Lambda { params, body } => {
                 self.frames.push((self.scope.len(), HashSet::new()));
+                self.barriers.push(self.scope.len());
                 let ps = param_names(params);
                 self.bind_all(&ps);
                 self.block(&body.node);
                 self.unbind_all(&ps);
+                self.barriers.pop();
                 let (_, free) = self.frames.pop().expect("a lambda's frame");
                 let mut free: Vec<Span> = free.into_iter().collect();
                 free.sort();
@@ -253,12 +430,30 @@ impl Resolver {
                 }
             }
             Expr::Handle { body, handler } => {
+                // A handler whose continuation may escape (a `resume` in a
+                // lambda of a clause) may answer before its body has finished:
+                // what follows the `handle` can run while a borrow in the body
+                // is pending, so there a binding from outside the body is never
+                // borrowed (spec 2026-11-14-elya-arrays-and-borrowing D4; the
+                // review's round two).
+                let escapes = handler
+                    .clauses
+                    .iter()
+                    .any(|c| resume_in_lambda(&c.node.body, false));
+                if escapes {
+                    self.barriers.push(self.scope.len());
+                }
                 self.expr(body);
+                if escapes {
+                    self.barriers.pop();
+                }
                 if let Some(r) = &handler.ret {
                     self.scoped(&[(r.binder.clone(), r.body.span)], &r.body);
                 }
                 for c in &handler.clauses {
+                    self.barriers.push(self.scope.len());
                     self.scoped(&param_names(&c.node.params), &c.node.body);
+                    self.barriers.pop();
                 }
             }
             Expr::Resume { arg } => self.expr(arg),
@@ -377,6 +572,10 @@ fn scale(f: Frame, m: Option<M>, why: Why) -> Frame {
 
 struct Counter<'a> {
     occ: &'a HashMap<Span, Span>,
+    outer: &'a HashSet<Span>,
+    modes: &'a Modes,
+    /// The uses that are borrows: they count no use.
+    borrows: &'a mut HashSet<Span>,
     many: &'a mut HashMap<Span, Many>,
     /// Each `let`-bound lambda's body counts, by its binding: counted where
     /// the lambda is called (once a call, many a use of any other kind), so
@@ -478,7 +677,12 @@ impl Counter<'_> {
                     Expr::Lambda { params, body } => self.lambda(params, body),
                     _ => self.expr(callee),
                 };
-                for a in args.iter() {
+                let positions = self.modes.positions(callee, self.occ);
+                for (i, a) in args.iter().enumerate() {
+                    if is_borrow(positions, i, a, self.occ, self.outer) {
+                        self.borrows.insert(a.span);
+                        continue;
+                    }
                     let f = self.expr(a);
                     add(&mut acc, f);
                 }
@@ -546,6 +750,222 @@ impl Counter<'_> {
             | Expr::Unit
             | Expr::Qualified { .. }
             | Expr::Error => Frame::new(),
+        }
+    }
+}
+
+/// The bindings given away so far on a path, each with the use that did it.
+type Gone = HashMap<Span, Span>;
+
+fn join_gone(into: &mut Gone, other: Gone) {
+    for (k, v) in other {
+        into.entry(k).or_insert(v);
+    }
+}
+
+/// D3 (spec 2026-11-14-elya-arrays-and-borrowing): a forward walk in
+/// evaluation order. A borrow takes place at its call, after the call's
+/// arguments; one of a binding already given away is recorded (E0438). What
+/// gives a binding away is conservative: any use that is not a borrow (a
+/// call's argument when the call is made, before the call's borrows; any other
+/// where it is written), and a lambda that captures it, from where the lambda
+/// is written.
+struct Order<'a> {
+    occ: &'a HashMap<Span, Span>,
+    outer: &'a HashSet<Span>,
+    caps: &'a HashMap<Span, Vec<Span>>,
+    modes: &'a Modes,
+    late: &'a mut HashMap<Span, (Span, Span)>,
+}
+
+impl Order<'_> {
+    fn block(&mut self, b: &Block, g: &mut Gone) {
+        for st in b.stmts.iter() {
+            match &st.node {
+                Stmt::Let { value, .. } => self.expr(value, g),
+                Stmt::Expr(e) => self.expr(e, g),
+            }
+        }
+        if let Some(t) = &b.tail {
+            self.expr(t, g);
+        }
+    }
+
+    fn gone(&self, binding: Span, at: Span, g: &mut Gone) {
+        g.entry(binding).or_insert(at);
+        // A `let`-bound lambda used: what it captures may be used by it.
+        for c in self.caps.get(&binding).into_iter().flatten() {
+            g.entry(*c).or_insert(at);
+        }
+    }
+
+    fn expr(&mut self, e: &Spanned<Expr>, g: &mut Gone) {
+        match &e.node {
+            Expr::Var(_) => {
+                if let Some(&b) = self.occ.get(&e.span) {
+                    self.gone(b, e.span, g);
+                }
+            }
+            Expr::Call { callee, args } => {
+                self.expr(callee, g);
+                let positions = self.modes.positions(callee, self.occ);
+                // A binding given as an argument is given away when the call
+                // is made, as a borrow takes place then: an argument after it
+                // may still read it (`array.set(xs, i, array.get(xs, i) + 1)`).
+                let (mut reads, mut given) = (Vec::new(), Vec::new());
+                for (i, a) in args.iter().enumerate() {
+                    if is_borrow(positions, i, a, self.occ, self.outer) {
+                        reads.push(a.span);
+                    } else if matches!(a.node, Expr::Var(_)) {
+                        given.push(a);
+                    } else {
+                        self.expr(a, g);
+                    }
+                }
+                for a in given {
+                    self.expr(a, g);
+                }
+                for at in reads {
+                    if let Some(&b) = self.occ.get(&at) {
+                        if let Some(&by) = g.get(&b) {
+                            self.late.entry(b).or_insert((at, by));
+                        }
+                    }
+                }
+            }
+            Expr::Lambda { body, .. } => {
+                for c in self.caps.get(&e.span).into_iter().flatten() {
+                    g.entry(*c).or_insert(e.span);
+                }
+                // Its body is a body of its own.
+                self.block(&body.node, &mut Gone::new());
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.expr(lhs, g);
+                self.expr(rhs, g);
+            }
+            Expr::Unary { expr, .. } => self.expr(expr, g),
+            Expr::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                self.expr(cond, g);
+                let mut t = g.clone();
+                self.block(&then_block.node, &mut t);
+                self.block(&else_block.node, g);
+                join_gone(g, t);
+            }
+            Expr::Block(b) => self.block(b, g),
+            Expr::Match { scrutinee, arms } => {
+                self.expr(scrutinee, g);
+                let before = g.clone();
+                for arm in arms.iter() {
+                    let mut a = before.clone();
+                    self.expr(&arm.node.body, &mut a);
+                    join_gone(g, a);
+                }
+            }
+            Expr::Handle { body, handler } => {
+                self.expr(body, g);
+                if let Some(r) = &handler.ret {
+                    self.expr(&r.body, g);
+                }
+                // A clause is a body of its own (a use there of a binding
+                // from outside is never a borrow).
+                for c in &handler.clauses {
+                    self.expr(&c.node.body, &mut Gone::new());
+                }
+            }
+            Expr::Resume { arg } => self.expr(arg, g),
+            Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Str(_)
+            | Expr::Bool(_)
+            | Expr::Unit
+            | Expr::Qualified { .. }
+            | Expr::Error => {}
+        }
+    }
+}
+
+/// D5: the uses of a function with `borrow` parameters that are not calls of
+/// it by name.
+struct Values<'a> {
+    occ: &'a HashMap<Span, Span>,
+    modes: &'a Modes,
+    found: &'a mut HashMap<Span, (String, Vec<bool>)>,
+}
+
+impl Values<'_> {
+    fn block(&mut self, b: &Block) {
+        for st in b.stmts.iter() {
+            match &st.node {
+                Stmt::Let { value, .. } => self.expr(value, false),
+                Stmt::Expr(e) => self.expr(e, false),
+            }
+        }
+        if let Some(t) = &b.tail {
+            self.expr(t, false);
+        }
+    }
+
+    fn expr(&mut self, e: &Spanned<Expr>, callee: bool) {
+        match &e.node {
+            Expr::Var(name) => {
+                if let (false, false, Some(m)) = (
+                    callee,
+                    self.occ.contains_key(&e.span),
+                    self.modes.fns.get(name),
+                ) {
+                    self.found.insert(e.span, (name.clone(), m.clone()));
+                }
+            }
+            Expr::Call { callee, args } => {
+                self.expr(callee, true);
+                for a in args.iter() {
+                    self.expr(a, false);
+                }
+            }
+            Expr::Lambda { body, .. } => self.block(&body.node),
+            Expr::Binary { lhs, rhs, .. } => {
+                self.expr(lhs, false);
+                self.expr(rhs, false);
+            }
+            Expr::Unary { expr, .. } => self.expr(expr, false),
+            Expr::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                self.expr(cond, false);
+                self.block(&then_block.node);
+                self.block(&else_block.node);
+            }
+            Expr::Block(b) => self.block(b),
+            Expr::Match { scrutinee, arms } => {
+                self.expr(scrutinee, false);
+                for arm in arms.iter() {
+                    self.expr(&arm.node.body, false);
+                }
+            }
+            Expr::Handle { body, handler } => {
+                self.expr(body, false);
+                if let Some(r) = &handler.ret {
+                    self.expr(&r.body, false);
+                }
+                for c in &handler.clauses {
+                    self.expr(&c.node.body, false);
+                }
+            }
+            Expr::Resume { arg } => self.expr(arg, false),
+            Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Str(_)
+            | Expr::Bool(_)
+            | Expr::Unit
+            | Expr::Qualified { .. }
+            | Expr::Error => {}
         }
     }
 }

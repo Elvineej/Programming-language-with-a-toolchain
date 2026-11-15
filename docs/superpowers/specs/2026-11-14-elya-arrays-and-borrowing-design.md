@@ -1,6 +1,7 @@
 # Self-hosting, part 2b: linear arrays, read by borrowing
 
-**Status:** designed (2026-11-14, on `main`, an interactive session). HANDOFF
+**Status:** built (2026-11-14, on `main`, an interactive session; the plan
+`docs/superpowers/plans/2026-11-14-elya-arrays-and-borrowing.md`). HANDOFF
 step 1, part 2b (spec 2026-11-14-elya-self-hosting R3). Design choices are
 Claude's (rule 2). It takes the first of a reviewer's directions the
 maintainer asked to be weighed (docs/ROADMAP.md, 2026-11-14: a function's
@@ -47,32 +48,65 @@ back ends: `elya: array index <i> out of range (the array has <n>)`. `push`
 is amortised O(1) (the capacity doubles, as the buffer's); `set`, `get` and
 `length` are O(1). `buffer.length(borrow Buffer) -> Int` joins them.
 
-**D3. A borrow is a use that does not consume, and must come before the use
-that does.** In the affine pass an occurrence of a binding *as the argument of
-a borrowed parameter* counts no use. What makes that sound is one new rule,
-checked in the same pass, per body (a function's, a lambda's, a clause's):
+**D3. A borrow is a use that does not consume; it happens at its call, and
+must not come after the use that consumes.** In the affine pass an occurrence
+of a binding *as the argument of a borrowed parameter* counts no use. What
+makes that sound is one new rule, checked in the same pass, per body (a
+function's, a lambda's, a clause's):
 
-> a borrow of a binding must not be evaluated after a consuming use of it
-> (E0438: "`xs` is read here after it was given away").
+> a borrow of a binding takes place when its call is made, after all of that
+> call's arguments are evaluated, and lasts until the call returns; it must
+> not take place after a consuming use of the binding (E0438: "`xs` is read
+> here after it was given away").
 
 Evaluation order is the language's (arguments left to right, a block's
 statements in order; the arms of an `if` or a `match` are alternatives, and
-after them the binding is consumed if any arm consumed it). Without the rule
-a read could see a later write (the update is in place), which a program
-that reads as pure must never observe. With it, every read sees the value
-the text names.
+after them the binding is consumed if any arm consumed it). A binding given
+as an argument is given away when that call is made, as a borrow takes place
+then, and before the call's own borrows: so `array.set(xs, i, array.get(xs,
+i) + 1)` reads and then writes (the `get`'s call is made first), and
+`walk(xs, xs, 1)` is refused. Any other consuming use gives the binding away
+where it is written; a lambda that captures it, where the lambda is written
+(conservative: it may run whenever). The first draft
+placed the borrow where its argument is evaluated; ChatGPT's review broke it
+with `array.get(xs, f(xs))`, where `f` consumes and updates `xs` while the
+read is pending (and the same through a branch, a one-shot handler, a
+recursive call and `walk(xs, xs, 1)` with one borrowed and one consumed
+parameter). Placing the borrow at the call refuses each: a consuming use in
+any argument of the call comes before it. During the call nothing else can
+consume the binding: the callee holds only the borrow (D5), a lambda that
+captures it was an argument (so a use before the borrow), and an operation
+clause that uses it is refused already (a clause counts many uses, E0428).
+Without the rule a read could see a later write (the update is in place),
+which a program that reads as pure must never observe. With it, every read
+sees the value the text names.
 
 **D4. Where a borrow cannot be followed, it is an ordinary use.** A borrow
 inside a lambda that captures the binding counts as a use of the capture, as
 any occurrence does now (the lambda may run after the consuming use, or
 twice). So does a borrow of a binding held across a `multi` point (E0429
-applies unchanged). Nothing is refused that was accepted before.
+applies unchanged). So does a borrow, in the body of a `handle` whose
+continuation may escape (a clause has a `resume` inside a lambda), of a
+binding from outside that body: such a handler may answer before its body has
+finished, and what follows the `handle` then runs while the borrow is pending.
+ChatGPT's second review found it: `handle { Done(array.get(xs, pause())) }
+with { Pause.pause() -> Later(fn() { resume(0) }) }`, then `array.set(xs, 0,
+99)`, then the kept continuation resumed, read 99. A one-shot continuation is
+resumed at most once, not before what follows its handler; D3's order is the
+order within a body, which a handler that only aborts or resumes in its
+clause keeps. The rule is conservative (a lambda with a `resume` that runs
+before its clause returns counts too) and refuses the review's five programs
+(Findings 1-5, among them a continuation copied through an array and through
+a `borrow` function): there the read is a use, and the write a second
+(E0428), or a `borrow` parameter is given away (E0439). Nothing is refused
+that was accepted before.
 
 **D5. A function may declare a borrowed parameter:** `fn total(borrow xs:
 Array(Int), i: Int) -> Int`. In its body `xs` may occur only as a borrowed
 argument (of a builtin or of another function's `borrow` parameter): it is
 never consumed, returned, stored in a value, or captured by a lambda (E0439:
-"a borrowed value is given away here"). At a call of a function *by its
+"a borrowed value is given away here"; through a generic `borrow x: a`,
+E0437 at the instance). At a call of a function *by its
 name*, an argument in a `borrow` position is a borrow (D3). A function value
 (`let f = total`, a parameter, a closure) does not carry the mode: called
 through one, the argument is consumed as now, and a `borrow` function used as
@@ -88,11 +122,12 @@ roadmap), after the switch if part 4 does not need them.
 **D6. Representation.** In the evaluator `Value::Array(Rc<RefCell<Vec<Value>>>)`,
 written through the `RefCell` as the buffer is. Natively one object,
 `[tag][length][capacity][words]`, each element one word (every Elya value
-is). Two tags, made beside the string tag: an array whose elements are
-pointers and one whose are not, chosen where the array is made from the
-element's type; `gc_scan` traces `length` words of the first kind (a
-dynamic-length row: the descriptor table cannot say it) and none of the
-second. `push` past the capacity allocates the next object and copies, the
+is). Two tags, chosen where the array is made from the element's type (the
+predicate a constructor's field uses, `is_heap_ty`): an array of heap values
+carries a tag of its own, whose descriptor row has the arity -1, which
+`gc_scan` reads as "`length` words from the fourth" (a row cannot say a
+length that changes); an array of anything else carries the string tag,
+traced nowhere, as the buffer does. `push` past the capacity allocates the next object and copies, the
 operands rooted. No write barrier: the collector has none to keep (it stops
 the world and marks everything); a generational collector (HANDOFF step 2)
 would need one at `set` and `push`, and the audit of old-to-young stores
@@ -117,6 +152,8 @@ passed on, accepted; one consumed, returned or captured (E0439); a `borrow`
 function called through a value (consumed, so E0428 on a second use);
 `Array(Buffer)` refused; `nth` on a list against `array.get`, the measurement.
 
-## 3. Predictions
+## 3. Measured after
 
-Written with the plan.
+The sum of every element read by index, natively: 40,000 elements took 3.33 s
+through a list's `nth` and 6 ms through `array.get`; 4,000,000 elements are
+read within the test's two seconds. The plan has the table.

@@ -633,6 +633,15 @@ static void gc_scan(int64_t *obj) {
         return; /* not a constructor we have a descriptor for */
     }
     int64_t arity = gc_descriptors[2 * tag];
+    if (arity < 0) {
+        /* An array of heap values (spec 2026-11-14-elya-arrays-and-borrowing
+         * D6), `[tag][length][capacity][words]`: its first `length` words,
+         * and nothing of the capacity past them (never written). */
+        for (int64_t i = obj[1]; i-- > 0;) {
+            gc_gray_push((void *)(intptr_t)obj[3 + i]);
+        }
+        return;
+    }
     /* Last field first: popped last, so a list's tail (its last field) is
      * taken after its head's leaf, and the worklist stays short. */
     for (int64_t f = arity; f-- > 0;) {

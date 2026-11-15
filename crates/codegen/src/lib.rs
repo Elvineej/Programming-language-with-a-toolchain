@@ -818,6 +818,96 @@ pub(crate) fn buffer_builtin<'ctx>(
         ))
 }
 
+/// `array.*` on lowered operands (spec 2026-11-14-elya-arrays-and-borrowing
+/// D6), both emitters. An element is one word, converted at the boundary a
+/// constructor's field is; the array's tag, chosen where it is made, says
+/// whether the collector traces its elements. `push` allocates when the array
+/// grows: the runtime roots its operands, the caller whatever else is live.
+pub(crate) fn array_builtin<'ctx>(
+    ctx: &'ctx Context,
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    e: &CoreExpr,
+    name: &str,
+    vals: &[BasicValueEnum<'ctx>],
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let i64t = ctx.i64_type();
+    let CoreKind::Builtin(_, args) = &e.kind else {
+        return Err(CodegenError::Unsupported("an array builtin's node"));
+    };
+    let value = |site: inkwell::values::CallSiteValue<'ctx>| {
+        site.try_as_basic_value()
+            .left()
+            .ok_or(CodegenError::Unsupported(
+                "an array builtin returned no value",
+            ))
+    };
+    match (name, vals) {
+        ("array.new", []) => {
+            let Ty::Con(_, elem) = &e.ty else {
+                return Err(CodegenError::Unsupported("an array's type"));
+            };
+            let traced = elem.first().is_some_and(is_heap_ty);
+            let tag = if traced {
+                lc.desc.array_tag
+            } else {
+                lc.string_tag
+            };
+            value(
+                b.build_call(
+                    lc.array_new,
+                    &[i64t.const_int(tag as u64, false).into()],
+                    "arr",
+                )
+                .map_err(internal)?,
+            )
+        }
+        ("array.push", [xs, x]) => {
+            let w = value_to_word(b, *x, &args[1].ty, i64t)?;
+            value(
+                b.build_call(lc.array_push, &[(*xs).into(), w.into()], "arr")
+                    .map_err(internal)?,
+            )
+        }
+        ("array.set", [xs, i, x]) => {
+            let w = value_to_word(b, *x, &args[2].ty, i64t)?;
+            value(
+                b.build_call(lc.array_set, &[(*xs).into(), (*i).into(), w.into()], "arr")
+                    .map_err(internal)?,
+            )
+        }
+        ("array.get", [xs, i]) => {
+            let w = value(
+                b.build_call(lc.array_get, &[(*xs).into(), (*i).into()], "elem")
+                    .map_err(internal)?,
+            )?
+            .into_int_value();
+            word_to_value(
+                b,
+                w,
+                &e.ty,
+                ctx.bool_type(),
+                ctx.ptr_type(AddressSpace::default()),
+            )
+        }
+        // A buffer's length is the same word of the same shape.
+        ("array.length" | "buffer.length", [xs]) => value(
+            b.build_call(lc.array_length, &[(*xs).into()], "len")
+                .map_err(internal)?,
+        ),
+        _ => Err(CodegenError::UnsupportedBuiltin(name.to_string())),
+    }
+}
+
+/// `array.<name>`, one of [`elya::resolve::ARRAY_BUILTINS`], or
+/// `buffer.length` (lowered with them: it reads the same word).
+pub(crate) fn is_array_builtin(name: &str) -> bool {
+    name == "buffer.length"
+        || name
+            .strip_prefix("array.")
+            .is_some_and(|n| elya::resolve::ARRAY_BUILTINS.contains(&n))
+}
+
 /// `buffer.<name>`, one of [`elya::resolve::BUFFER_BUILTINS`].
 pub(crate) fn is_buffer_builtin(name: &str) -> bool {
     name.strip_prefix("buffer.")
@@ -856,6 +946,12 @@ pub(crate) fn is_native_builtin(name: &str) -> bool {
             | "buffer.new"
             | "buffer.push"
             | "buffer.finish"
+            | "buffer.length"
+            | "array.new"
+            | "array.push"
+            | "array.set"
+            | "array.get"
+            | "array.length"
             | "any.show"
             | "any.decode"
             | "any.fail"
@@ -2021,6 +2117,20 @@ fn lower_expr<'ctx>(
             let x = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
             float_conversion(ctx, b, lc, builtin, x)
         }
+        CoreKind::Builtin(builtin, args) if is_array_builtin(builtin) => {
+            // As for `buffer.*`.
+            let mut vals = Vec::with_capacity(args.len());
+            let mut own = 0;
+            for a in args.iter() {
+                let v = lower_expr(ctx, func, b, lc, a, env)?;
+                own += usize::from(gc_root(b, lc, v)?);
+                vals.push(v);
+            }
+            let roots = gc_root_env(b, lc, env)?;
+            let v = array_builtin(ctx, b, lc, e, builtin, &vals)?;
+            gc_unroot(b, lc, roots + own)?;
+            Ok(v)
+        }
         CoreKind::Builtin(builtin, args) if is_buffer_builtin(builtin) => {
             // As for `io.*`: each operand rooted while later ones are lowered,
             // the environment across the call.
@@ -2382,6 +2492,10 @@ pub(crate) struct Descriptors {
     pub(crate) handler_lo: usize,
     /// D13: the continuation object's tag.
     pub(crate) cont_tag: usize,
+    /// An array of heap values (spec 2026-11-14-elya-arrays-and-borrowing
+    /// D6): its row's arity is -1, "as many words as the array's length says".
+    /// An array of anything else carries the string tag, traced nowhere.
+    pub(crate) array_tag: usize,
 }
 
 /// Which words of a value are heap values: one bit a word after the tag.
@@ -2559,6 +2673,10 @@ fn descriptor_rows(
     }
     desc.push(3);
     desc.push(0b101);
+    // The traced array's row: a length the object itself holds (`gc_scan`).
+    let array_tag = desc.len() / 2;
+    desc.push(u64::MAX);
+    desc.push(0);
     // The wide rows' mask words follow the rows; each such row's second word
     // is where its own begin.
     let n_rows = desc.len() / 2;
@@ -2574,6 +2692,7 @@ fn descriptor_rows(
         handler_tags,
         handler_lo,
         cont_tag,
+        array_tag,
     })
 }
 
@@ -2618,6 +2737,12 @@ struct LowerCtx<'a, 'ctx> {
     buffer_new: FunctionValue<'ctx>,
     buffer_push: FunctionValue<'ctx>,
     buffer_finish: FunctionValue<'ctx>,
+    /// `elya_array_*` (spec 2026-11-14-elya-arrays-and-borrowing).
+    array_new: FunctionValue<'ctx>,
+    array_push: FunctionValue<'ctx>,
+    array_set: FunctionValue<'ctx>,
+    array_get: FunctionValue<'ctx>,
+    array_length: FunctionValue<'ctx>,
     println: FunctionValue<'ctx>,
     string_tag: usize,
     /// The first closure tag (closures follow the real constructors), for
@@ -2871,6 +2996,28 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         ptrt.fn_type(&[i64t.into(), ptrt.into()], false),
         None,
     );
+    let array_new =
+        module.add_function("elya_array_new", ptrt.fn_type(&[i64t.into()], false), None);
+    let array_push = module.add_function(
+        "elya_array_push",
+        ptrt.fn_type(&[ptrt.into(), i64t.into()], false),
+        None,
+    );
+    let array_set = module.add_function(
+        "elya_array_set",
+        ptrt.fn_type(&[ptrt.into(), i64t.into(), i64t.into()], false),
+        None,
+    );
+    let array_get = module.add_function(
+        "elya_array_get",
+        i64t.fn_type(&[ptrt.into(), i64t.into()], false),
+        None,
+    );
+    let array_length = module.add_function(
+        "elya_array_length",
+        i64t.fn_type(&[ptrt.into()], false),
+        None,
+    );
     let args_init = module.add_function(
         "elya_args_init",
         ctx.void_type().fn_type(&[i32t.into(), ptrt.into()], false),
@@ -3033,6 +3180,11 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         buffer_new,
         buffer_push,
         buffer_finish,
+        array_new,
+        array_push,
+        array_set,
+        array_get,
+        array_length,
         println,
         string_tag,
         first_closure_tag: n_real_ctors,
@@ -4485,20 +4637,24 @@ mod tests {
         let rows = d.rows;
         let frame_tag = string_tag + 1;
         // Task 8 (D13, approved expected-value change): with no sites and no
-        // handles, the frame row is followed by exactly ONE more row -- the
-        // continuation object's `[3, 0b101]` -- where it used to be the last.
+        // handles, the frame row is followed by the continuation object's
+        // `[3, 0b101]` -- and since part 2b (spec
+        // 2026-11-14-elya-arrays-and-borrowing D6, the plan's predicted
+        // change) by the traced array's `[-1, 0]`, the last.
         assert_eq!(
             rows.len() / 2,
-            frame_tag + 2,
-            "frame row, then only the continuation-object row: {rows:?}"
+            frame_tag + 3,
+            "frame row, the continuation-object row, the array row: {rows:?}"
         );
+        assert_eq!(d.array_tag, frame_tag + 2);
+        assert_eq!(&rows[2 * d.array_tag..], &[u64::MAX, 0], "array row");
         assert_eq!(
             d.frame_tag, frame_tag,
             "descriptor_rows reports the frame tag"
         );
         assert_eq!(d.cont_tag, frame_tag + 1);
         assert_eq!(
-            &rows[2 * d.cont_tag..],
+            &rows[2 * d.cont_tag..2 * d.cont_tag + 2],
             &[3, 0b101],
             "continuation object: k and handler traced, consumed flag not"
         );
