@@ -97,6 +97,11 @@ fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCo
         Some("resolve") if args.get(2).map(String::as_str) == Some("--dump") => {
             resolve_dump_cmd(args)
         }
+        Some(pass @ ("exhaust" | "affine"))
+            if args.get(2).map(String::as_str) == Some("--dump") =>
+        {
+            pass_dump_cmd(pass, args)
+        }
         #[cfg(feature = "codegen")]
         Some("build") => build_cmd(args),
         _ => {
@@ -109,6 +114,8 @@ fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCo
             eprintln!("       elya parse --dump <file.elya>");
             eprintln!("       elya check --dump <file.elya>");
             eprintln!("       elya resolve --dump <file.elya>");
+            eprintln!("       elya exhaust --dump <file.elya>");
+            eprintln!("       elya affine --dump <file.elya>");
             ExitCode::from(2)
         }
     }
@@ -167,6 +174,43 @@ fn resolve_dump_cmd(args: &[String]) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// `elya exhaust --dump <file>` and `elya affine --dump <file>` (spec
+/// 2026-11-15-elya-checker-in-elya D2): a checker pass that reads only the
+/// syntax, run on the resolved program; when loading or resolving it failed,
+/// those diagnostics alone. Exit 1 when there is an error.
+fn pass_dump_cmd(pass: &str, args: &[String]) -> ExitCode {
+    let Some(path) = args.get(3) else {
+        eprintln!("usage: elya {pass} --dump <file.elya>");
+        return ExitCode::from(2);
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: cannot read {path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let (program, diags) = elya::resolved(&elya::Session::new(), path, &text, &mut files(path));
+    let is_error = |d: &elya::diag::Diagnostic| d.severity == elya::diag::Severity::Error;
+    if diags.iter().any(is_error) {
+        print!("{}", elya::ast_dump::dump_diagnostics(&diags));
+        return ExitCode::from(1);
+    }
+    if pass == "exhaust" {
+        let found = elya::exhaust::check(&program.module);
+        print!("{}", elya::ast_dump::dump_diagnostics(&found));
+        if found.iter().any(is_error) {
+            return ExitCode::from(1);
+        }
+    } else {
+        print!(
+            "{}",
+            elya::check_dump::affine_facts(&elya::affine::analyze(&program.module))
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 /// `elya check --dump <file>`: the checker's verdict as text (`elya::check_dump`):

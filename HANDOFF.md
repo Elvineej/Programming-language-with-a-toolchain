@@ -30,7 +30,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1653 passed, 191 suites, and configuration C
+- Linux gate at the tip of `main`: 1655 passed, 191 suites, and configuration C
   (the boards on QEMU; `check.sh` fails without its tools unless
   `ELYA_BOARDS=skip`) 8 passed, 2 suites. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
@@ -814,7 +814,11 @@ the rest of the gap closed (step 3, step 2's nursery). Next: **4b**, errors and 
 `2026-11-15-elya-resolution-in-elya-design.md`): its print form `elya resolve
 --dump` is built (the merged program's tree over `elya::merged_text`, then the
 load and resolve diagnostics); `selfhost/resolve.elya` is Codex's next job, its
-brief written. The checker's verdict has its print form too, `elya
+brief written. Then **the checker**, spec
+`2026-11-15-elya-checker-in-elya-design.md`: 4d exhaustiveness and 4e the
+affine facts (Codex; print forms `elya exhaust --dump`, `elya affine --dump`
+built), 4f inference (Claude), compared by `elya check --dump`, messages
+included. The checker's verdict has its print form too, `elya
 check --dump` (spec D6). The roadmap's "continuation-aware ownership" line takes
 the review's longer proposals (loans through continuations, once-callable
 function types).

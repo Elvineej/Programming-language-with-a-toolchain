@@ -578,3 +578,63 @@ fn resolve_dump_prints_the_merged_program() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `elya exhaust --dump` and `elya affine --dump` (spec
+/// 2026-11-15-elya-checker-in-elya D2): the passes that read only the
+/// syntax, as text; a warning's line begins `warning`.
+#[test]
+fn exhaust_and_affine_dumps() {
+    let dir = scratch("pass-dumps");
+    let ex = dir.join("ex.elya");
+    std::fs::write(
+        &ex,
+        "type T { A, B(Int) }\nfn f(t: T) -> Int { match t { A -> 1 } }\nfn g(t: T) -> Int { match t { A -> 1  B(_) -> 2  A -> 3 } }\npub fn main() -> Int { f(A) }\n",
+    )
+    .expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .args(["exhaust", "--dump"])
+        .arg(&ex)
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "error E0430 41 59 \"non-exhaustive match: `B(_)` is not covered\"\nwarning E0431 111 112 \"unreachable match arm\"\n"
+    );
+    let af = dir.join("af.elya");
+    std::fs::write(
+        &af,
+        "effect multi Flip { fn flip() -> Bool }\n\
+         fn eat(xs: Array(Int)) -> Int { array.length(xs) }\n\
+         fn h(borrow xs: Array(Int)) -> Int { eat(xs) }\n\
+         fn d(x: Int) -> Int { x + x }\n\
+         fn late() -> Int {\n  let xs = array.new()\n  let n = eat(xs)\n  array.length(xs)\n}\n\
+         pub fn main() -> Int {\n  let f = h\n  handle {\n    let a = 1\n    let b = flip()\n    a\n  } with multi { Flip.flip() -> resume(True) + resume(False) }\n}\n",
+    )
+    .expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .args(["affine", "--dump"])
+        .arg(&af)
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    for kind in [
+        "many ",
+        "held ",
+        "resumes ",
+        "late ",
+        "given ",
+        "borrow-value ",
+    ] {
+        assert!(
+            text.lines().any(|l| l.starts_with(kind)),
+            "no `{kind}` in\n{text}"
+        );
+    }
+    assert!(
+        text.contains(" twice\n") && text.contains(" h 1\n"),
+        "{text}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

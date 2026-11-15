@@ -15,6 +15,11 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
   after the usage limit (primary)" about 5 h ahead (trig_01WyXi2uvHFnTw3TEU4FtMAY) and
   "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
+- **Done: `elya exhaust --dump`, `elya affine --dump`** (spec
+  2026-11-15-elya-checker-in-elya, the checker split into 4d, 4e for Codex and 4f
+  for Claude; messages compared too, D3): gate 1663 / 193 as predicted. A warning
+  now prints as `warning` in every dump. The roadmap now keeps both ways of
+  running, interpreted and native through LLVM (the maintainer, 2026-11-15).
 - **Done: `elya resolve --dump`** (spec 2026-11-15-elya-resolution-in-elya D1):
   the Rust side of self-hosting part 4c; `elya::resolved` now holds the front end's
   first two passes. Gate 1661 / 193, as predicted. The Elya side goes to Codex

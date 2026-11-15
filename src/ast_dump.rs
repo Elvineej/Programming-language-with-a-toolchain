@@ -33,7 +33,9 @@ pub fn dump(m: &Module, src: &str) -> String {
 
 /// The parser's diagnostics, one a line after the tree: `error <code> <start>
 /// <end> <message>`, the span its first label's (the lexer's dump has no
-/// message; a parser's errors are told apart by theirs).
+/// message; a parser's errors are told apart by theirs). A warning's line
+/// begins `warning` (the checker's E0426, exhaustiveness's E0431; spec
+/// 2026-11-15-elya-checker-in-elya D2).
 pub fn dump_diagnostics(diags: &[crate::diag::Diagnostic]) -> String {
     let mut out = String::new();
     for d in diags {
@@ -43,8 +45,17 @@ pub fn dump_diagnostics(diags: &[crate::diag::Diagnostic]) -> String {
             .map_or(("-".to_string(), "-".to_string()), |l| {
                 (l.span.start.to_string(), l.span.end.to_string())
             });
-        writeln!(out, "error {} {start} {end} {}", d.code, quoted(&d.message))
-            .expect("a String takes writes");
+        let kind = match d.severity {
+            crate::diag::Severity::Error => "error",
+            crate::diag::Severity::Warning => "warning",
+        };
+        writeln!(
+            out,
+            "{kind} {} {start} {end} {}",
+            d.code,
+            quoted(&d.message)
+        )
+        .expect("a String takes writes");
     }
     out
 }

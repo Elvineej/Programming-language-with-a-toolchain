@@ -179,6 +179,15 @@ maps, files, JSON, HTTP); and one command runs a file. Self-hosting is the
 first large test of it: what is awkward to write in the compiler is smoothed
 first.
 
+**Both ways of running, for good** (the maintainer, 2026-11-15): a program
+runs at once under the interpreter (`elya run`, like `python`) or is compiled
+through LLVM to a native binary (`elya build`, like a C compiler), the same
+program either way with the same output. Both exist today, and every native
+test already checks the binary against the evaluator. 1.0 keeps both as
+first-class: the interpreter is not only a test oracle (it gets its own speed
+work and a REPL), and the self-hosted compiler of R3 parts 5 and 6 must offer
+both modes, not the native one alone.
+
 **0. Self-hosting** (HANDOFF step 1; 6 to 10 weeks from 2026-11-15). Done:
 files and arguments, buffers, arrays with borrowing, maps, the lexer and its
 tokens. Left, with the Rust each replaces: the parser (2,300 lines), modules
