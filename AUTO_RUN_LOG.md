@@ -15,6 +15,10 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   two resumes armed into itself, pushed forward at every checkpoint: "Elya: auto-resume
   after the usage limit (primary)" about 5 h ahead (trig_01WyXi2uvHFnTw3TEU4FtMAY) and
   "(backup)" about 9 h ahead (trig_01KNPbPDMoaxidd8dxj5qTVQ).
+- **Done: `elya resolve --dump`** (spec 2026-11-15-elya-resolution-in-elya D1):
+  the Rust side of self-hosting part 4c; `elya::resolved` now holds the front end's
+  first two passes. Gate 1661 / 193, as predicted. The Elya side goes to Codex
+  after 4b.
 - **Done: `&&` and `||` short-circuit** (spec 2026-11-15-elya-short-circuit):
   found by Codex's 4b work; both evaluators and Core, the affine checker
   unchanged (its verdicts already the `if`'s); the review's rooting finding

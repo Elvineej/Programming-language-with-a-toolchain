@@ -535,3 +535,46 @@ fn check_dump_prints_the_verdict() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `elya resolve --dump` prints the merged program in `elya::ast_dump`'s form
+/// and the diagnostics of loading and resolving it (spec
+/// 2026-11-15-elya-resolution-in-elya D1), exit 1 on an error. An imported
+/// file's spans follow the root's, and its `Float`'s digits are read there.
+#[test]
+fn resolve_dump_prints_the_merged_program() {
+    let dir = scratch("resolve-dump");
+    let root = "import half\npub fn main() -> Float { half.half() }\n";
+    let module = "pub fn half() -> Float { 0.5 }\n";
+    std::fs::write(dir.join("main.elya"), root).expect("write");
+    std::fs::write(dir.join("half.elya"), module).expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .args(["resolve", "--dump"])
+        .arg(dir.join("main.elya"))
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let base = root.len() + 1;
+    let at = base + module.find("0.5").expect("the literal");
+    assert!(
+        text.contains(&format!(" Float {at} {} 0.5\n", at + 3)),
+        "{text}"
+    );
+    assert!(
+        text.contains(" Fn ") && text.contains(" half.half"),
+        "{text}"
+    );
+    std::fs::write(dir.join("bad.elya"), "pub fn main() -> Int { nope }\n").expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .args(["resolve", "--dump"])
+        .arg(dir.join("bad.elya"))
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .ends_with("error E0200 23 27 \"unresolved name `nope`\"\n"),
+        "{out:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

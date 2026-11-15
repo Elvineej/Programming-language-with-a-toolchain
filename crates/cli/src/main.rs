@@ -94,6 +94,9 @@ fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCo
         Some("check") if args.get(2).map(String::as_str) == Some("--dump") => check_dump_cmd(args),
         Some("check") => cmd(args, None),
         Some("parse") if args.get(2).map(String::as_str) == Some("--dump") => parse_dump_cmd(args),
+        Some("resolve") if args.get(2).map(String::as_str) == Some("--dump") => {
+            resolve_dump_cmd(args)
+        }
         #[cfg(feature = "codegen")]
         Some("build") => build_cmd(args),
         _ => {
@@ -105,6 +108,7 @@ fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCo
             eprintln!("       elya run --replay <trace> <file.elya>");
             eprintln!("       elya parse --dump <file.elya>");
             eprintln!("       elya check --dump <file.elya>");
+            eprintln!("       elya resolve --dump <file.elya>");
             ExitCode::from(2)
         }
     }
@@ -132,6 +136,36 @@ fn parse_dump_cmd(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+/// `elya resolve --dump <file>`: the program its modules merge into and the
+/// diagnostics of loading and resolving it (`elya::resolved`, spec
+/// 2026-11-15-elya-resolution-in-elya D1), what the resolver in Elya prints.
+/// Exit 1 when there is an error.
+fn resolve_dump_cmd(args: &[String]) -> ExitCode {
+    let Some(path) = args.get(3) else {
+        eprintln!("usage: elya resolve --dump <file.elya>");
+        return ExitCode::from(2);
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: cannot read {path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let (program, diags) = elya::resolved(&elya::Session::new(), path, &text, &mut files(path));
+    let merged = elya::merged_text(&program.sources);
+    print!("{}", elya::ast_dump::dump(&program.module, &merged));
+    print!("{}", elya::ast_dump::dump_diagnostics(&diags));
+    if diags
+        .iter()
+        .any(|d| d.severity == elya::diag::Severity::Error)
+    {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

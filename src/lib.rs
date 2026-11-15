@@ -35,6 +35,45 @@ fn no_files(_: &str) -> Option<(String, String)> {
     None
 }
 
+/// Modules and names (the first two passes of [`front_end_with`]): the merged
+/// program, and the diagnostics of loading it (each file's parse diagnostics
+/// among them) and of resolving its names, in that order. What `elya resolve
+/// --dump` prints (spec 2026-11-15-elya-resolution-in-elya D1).
+pub fn resolved(
+    session: &Session,
+    name: &str,
+    text: &str,
+    read: &mut modules::Reader,
+) -> (modules::Program, Vec<Diagnostic>) {
+    let (program, mut diags) = modules::load(session, name, text, read);
+    // A name a module diagnostic already refused is not reported again (the
+    // modules review's R3: E0201 "unknown builtin" after E0600 or E0603).
+    diags.extend(
+        resolve::check(session, &program.module)
+            .into_iter()
+            .filter(|d| {
+                !d.labels
+                    .first()
+                    .is_some_and(|l| program.refused.contains(&l.span))
+            }),
+    );
+    (program, diags)
+}
+
+/// The text a merged program's spans index (spec
+/// 2026-11-15-elya-resolution-in-elya D1): every file's text in the order the
+/// files were first reached (the root first, then its imports depth first),
+/// one `"\n"` between, as [`span::SourceMap`] places each file one past the
+/// end of the one before. Not the order their declarations are merged in
+/// (each module after the ones it imports, the root last).
+pub fn merged_text(sources: &SourceMap) -> String {
+    sources
+        .files()
+        .map(|(_, t)| t)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The front-end passes over a whole program (load and merge the modules, then
 /// resolve → infer → exhaustiveness), returning the merged module, all
 /// diagnostics and the program's sources. The root and the modules it imports are
@@ -46,15 +85,8 @@ pub fn front_end_with(
     read: &mut modules::Reader,
 ) -> (ast::Module, Vec<Diagnostic>, SourceMap) {
     let session = Session::new();
-    let (program, mut diags) = modules::load(&session, name, text, read);
+    let (program, mut diags) = resolved(&session, name, text, read);
     let module = program.module;
-    // A name a module diagnostic already refused is not reported again (the
-    // modules review's R3: E0201 "unknown builtin" after E0600 or E0603).
-    diags.extend(resolve::check(&session, &module).into_iter().filter(|d| {
-        !d.labels
-            .first()
-            .is_some_and(|l| program.refused.contains(&l.span))
-    }));
     if diags.is_empty() {
         let (idiags, affine_diags, fns) = types::infer_with_interfaces(&session, &module);
         diags.extend(idiags);
