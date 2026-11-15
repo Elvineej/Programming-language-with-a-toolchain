@@ -392,10 +392,14 @@ fn settings_read_as_the_c_library_reads_them() {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn a_board_out_of_roots_fails_by_name() {
-    let src = "fn d(n: Int, s: String) -> Int { if n == 0 { 0 } else { d(n - 1, s) + string.length(s) } }\n\
+    // `d` allocates (`<>`), so each frame holds `s` as a root across its
+    // call. (Until 2026-11-15 it read `string.length(s)`; a function that
+    // never allocates now roots nothing, `noalloc.rs`, and that one no longer
+    // ran out.)
+    let src = "fn d(n: Int, s: String) -> Int { if n == 0 { 0 } else { d(n - 1, s) + string.length(s <> \"x\") } }\n\
                pub fn main() { d(30000, \"ab\") }\n";
     let [board, hosted] = board_and_hosted("noroots", src, 64 * 1024);
-    assert_eq!(hosted, (0, "60000\n".to_string(), String::new()));
+    assert_eq!(hosted, (0, "90000\n".to_string(), String::new()));
     assert_eq!(
         board,
         (

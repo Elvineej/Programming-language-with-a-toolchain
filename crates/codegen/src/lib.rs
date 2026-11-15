@@ -27,6 +27,7 @@ mod closure;
 mod cps;
 mod cps_emit;
 mod mono;
+mod noalloc;
 mod patterns;
 mod reflect;
 mod rv_tail;
@@ -920,6 +921,26 @@ pub(crate) fn may_allocate(e: &CoreExpr) -> bool {
     }
 }
 
+/// `may_allocate`, knowing the functions that never allocate (`noalloc`) and
+/// what `env` binds (a local shadowing a function is a closure call).
+fn allocates_here(e: &CoreExpr, lc: &LowerCtx<'_, '_>, env: &Env<'_>) -> bool {
+    match &e.kind {
+        CoreKind::App(callee, args) => match &callee.kind {
+            CoreKind::Var(name) if !env.contains_key(name) && lc.noalloc.contains(name) => {
+                args.iter().any(|a| allocates_here(a, lc, env))
+            }
+            _ => true,
+        },
+        CoreKind::Prim(op, args) => {
+            matches!(op, BinOp::Concat) || args.iter().any(|a| allocates_here(a, lc, env))
+        }
+        CoreKind::Builtin(name, args) => {
+            builtin_allocates(name) || args.iter().any(|a| allocates_here(a, lc, env))
+        }
+        _ => may_allocate(e),
+    }
+}
+
 /// Whether lowering every one of `rest` allocates nothing: an operand need
 /// not be rooted while such operands are lowered.
 pub(crate) fn none_allocate(rest: &[CoreExpr]) -> bool {
@@ -1412,7 +1433,10 @@ fn build_elya_call<'ctx>(
             "effectful call outside an effectful region",
         ));
     }
-    build_direct_call(ctx, func, b, lc, target, args, env, tail)
+    // A callee that never allocates, given arguments that cannot either:
+    // nothing collects from here to its return, so nothing need be rooted.
+    let quiet = lc.noalloc.contains(name) && !args.iter().any(|a| allocates_here(a, lc, env));
+    build_direct_call(ctx, func, b, lc, target, args, env, tail || quiet)
 }
 
 /// The N2 path, unchanged: a statically known `tailcc` callee, called by name.
@@ -1425,7 +1449,7 @@ fn build_direct_call<'ctx>(
     target: FunctionValue<'ctx>,
     args: &[CoreExpr],
     env: &mut Env<'ctx>,
-    tail: bool,
+    unrooted: bool,
 ) -> Result<CallSiteValue<'ctx>, CodegenError> {
     // Roots, in two layers, and the layering is the whole subtlety.
     //
@@ -1436,7 +1460,14 @@ fn build_direct_call<'ctx>(
     // call to be immediately followed by `ret`, leaving nowhere to pop, and a
     // million tail iterations would then grow the shadow stack without bound.
     // That would trade N2's constant-stack guarantee away to fix a GC bug.
-    let env_roots = if tail { 0 } else { gc_root_env(b, lc, env)? };
+    // `unrooted`: a tail call, or a call to a function that never allocates
+    // with arguments that cannot (`noalloc`): nothing collects before the
+    // caller's bindings are next read.
+    let env_roots = if unrooted {
+        0
+    } else {
+        gc_root_env(b, lc, env)?
+    };
     let mut vals: Vec<BasicMetadataValueEnum<'ctx>> = Vec::with_capacity(args.len());
     let mut arg_roots = 0usize;
     for (i, a) in args.iter().enumerate() {
@@ -2300,7 +2331,9 @@ fn lower_expr<'ctx>(
             // allocation, as `Ctor` does (spec D4).
             if is_string_prim(*op, args) {
                 let l = lower_expr(ctx, func, b, lc, &args[0], env)?;
-                let held = gc_root(b, lc, l)?;
+                // A comparison with an operand that cannot allocate roots
+                // nothing (2026-11-15); `<>` allocates, so it always does.
+                let held = (*op == BinOp::Concat || may_allocate(&args[1])) && gc_root(b, lc, l)?;
                 let r = lower_expr(ctx, func, b, lc, &args[1], env)?;
                 let roots = if *op == BinOp::Concat {
                     gc_root_env(b, lc, env)?
@@ -2323,7 +2356,7 @@ fn lower_expr<'ctx>(
             // itself allocates nothing.
             if is_data_eq_prim(*op, args) {
                 let l = lower_expr(ctx, func, b, lc, &args[0], env)?;
-                let held = gc_root(b, lc, l)?;
+                let held = may_allocate(&args[1]) && gc_root(b, lc, l)?;
                 let r = lower_expr(ctx, func, b, lc, &args[1], env)?;
                 let v = data_eq(
                     ctx,
@@ -2825,6 +2858,9 @@ struct LowerCtx<'a, 'ctx> {
     /// 5b-8 7b-3 (D16): the top-level functions compiled with the CPS
     /// convention -- `(params.., ptr k) -> i64`.
     cps_fns: &'a HashSet<String>,
+    /// The functions that never allocate (`noalloc`): a call to one roots
+    /// nothing the caller holds.
+    noalloc: &'a HashSet<String>,
     /// Every Core node by address, so the CPS emitter can walk a site's
     /// recorded path back up to its region root.
     nodes: &'a HashMap<usize, &'a CoreExpr>,
@@ -2974,6 +3010,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     // which resumes are theirs.
     let fx = cps::effect_facts(core);
     let cps_fns = cps_emit::cps_functions(core, &fx);
+    let noalloc = noalloc::never_allocating(core);
     cps_emit::prepass(core, &cps_fns)?;
     let sites = cps::collect_sites(core);
     let handlers = cps::collect_handlers(core);
@@ -3259,6 +3296,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         gc_push,
         gc_pop,
         cps_fns: &cps_fns,
+        noalloc: &noalloc,
         fx: &fx,
         nodes: &nodes,
         sites: &sites,

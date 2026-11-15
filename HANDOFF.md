@@ -30,7 +30,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1622 passed, 183 suites, and configuration C
+- Linux gate at the tip of `main`: 1623 passed, 183 suites, and configuration C
   (the boards on QEMU; `check.sh` fails without its tools unless
   `ELYA_BOARDS=skip`) 8 passed, 2 suites. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
@@ -880,9 +880,10 @@ test reader that could stop on large output, the vector table).
 
 **Fewer roots** (2026-11-15, `native_roots.rs`): no rooting around reads
 that allocate nothing nor around arguments followed only by ones that cannot
-allocate; `elya/map`'s million entries 4.5 s to 3.1 s. Next there: a "never
-allocates" fact per function (calls to user functions still count as
-allocating).
+allocate, nor around a call to a function that never allocates
+(`noalloc.rs`, a fixpoint over the module); `elya/map`'s million entries 4.5
+s to 3.0 s. What is left there is the collector marking everything live at
+each collection (step 2's nursery).
 **First, done** (fe2639d, spec 2026-11-13-elya-optimised-code): `default<O2>`
 on every program, functions over 10,000 instructions built as written. The
 arithmetic benchmarks reach C; what it left, in the spec's order: a closure's

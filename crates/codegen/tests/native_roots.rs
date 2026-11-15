@@ -5,9 +5,15 @@
 //! `elya/map`'s native time (callgrind: `elya_gc_push` and `elya_gc_pop` 46%);
 //! without it, a million entries took 3.1 s instead of 4.5 s.
 //!
-//! Negative control (reverted, compared byte for byte): K1, `none_allocate`
+//! A call to a function that never allocates (`noalloc.rs`, a fixpoint over
+//! the module) roots nothing the caller holds, nor does a comparison whose
+//! right operand cannot allocate.
+//!
+//! Negative controls (reverted, compared byte for byte): K1, `none_allocate`
 //! answering `false` (every argument rooted again):
-//! `reading_a_string_by_byte_roots_nothing` fails. The collector's safety
+//! `reading_a_string_by_byte_roots_nothing` fails. K2, `never_allocating`
+//! answering no function: `a_call_to_a_function_that_never_allocates_roots_nothing`
+//! fails. The collector's safety
 //! under the change is the stress suites' (`native_gc_stress.rs`,
 //! `native_array.rs`, `native_std_map.rs`, a collection at every
 //! allocation).
@@ -55,6 +61,24 @@ fn an_argument_is_still_rooted_while_a_later_one_allocates() {
     let src = "fn both(s: String, t: String) -> Int { string.length(s) + string.length(t) }\n\
                fn go(s: String, n: Int) -> Int { both(s, s <> int.to_string(n)) }\n\
                pub fn main() -> Int { go(\"ab\", 12) }\n";
+    let f = body(&ir(src), "go");
+    assert!(f.contains("elya_gc_push"), "{f}");
+}
+
+#[test]
+fn a_call_to_a_function_that_never_allocates_roots_nothing() {
+    // `at` and `is_digit` allocate nothing, and neither do the functions
+    // they call; `count` holds a string across calls to them.
+    let src = "fn at(s: String, i: Int) -> Int { if i < string.length(s) { string.byte_at(s, i) } else { 0 - 1 } }\n\
+               fn is_digit(c: Int) -> Bool { c >= 48 && c <= 57 }\n\
+               fn count(s: String, i: Int, n: Int) -> Int {\n  if i == string.length(s) { n } else {\n    let d = if is_digit(at(s, i)) { 1 } else { 0 }\n    count(s, i + 1, n + d)\n  }\n}\n\
+               pub fn main() -> Int { count(\"a1b22\", 0, 0) }\n";
+    let f = body(&ir(src), "count");
+    assert!(!f.contains("elya_gc_push"), "{f}");
+    // A helper that allocates (it builds a string) is rooted around as before.
+    let src = "fn label(i: Int) -> String { \"#\" <> int.to_string(i) }\n\
+               fn go(s: String, i: Int) -> Int { string.length(label(i)) + string.length(s) }\n\
+               pub fn main() -> Int { go(\"ab\", 3) }\n";
     let f = body(&ir(src), "go");
     assert!(f.contains("elya_gc_push"), "{f}");
 }
