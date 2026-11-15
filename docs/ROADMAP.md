@@ -159,6 +159,49 @@ effects granted per import, checked statically; a path-confining handler
 (`elya/files`' `under`) names a place and does not guard one, as its own
 comment says. Enforcement needs abstract types (HANDOFF step 4) first.
 
+## The road to 1.0 (2026-11-15)
+
+The maintainer asked how the project is finished once self-hosting is done.
+A language is not finished; the target is **Elya 1.0**: something another
+person can install, write a real program in, and trust not to break. Rough
+durations at the 2026-11 pace, estimates and not measurements.
+
+**0. Self-hosting** (HANDOFF step 1; 6 to 10 weeks from 2026-11-15). Done:
+files and arguments, buffers, arrays with borrowing, maps, the lexer and its
+tokens. Left, with the Rust each replaces: the parser (2,300 lines), modules
+and resolution (1,900), the checker with rows, effects, the affine rules and
+exhaustiveness (8,000, the hardest), Core and native code written as LLVM IR
+text (18,000; needs `io.run`), and the switch to a fixed point. Two ways to
+shorten it, the maintainer's call: compare the checker's verdicts and codes
+rather than every message's words; freeze new language features until the
+switch (R4 makes each one land twice).
+
+**1. Usable by someone else** (2 to 3 months).
+- Tooling, written in Elya: `elya fmt`, a language server, `elya test`.
+- Packages: `elya.toml`, versioned dependencies, a lock file, and the
+  per-dependency effect allowances (priority problem 2) as the first thing a
+  user meets.
+- The standard library in Elya over arrays and maps: collections, strings,
+  files and processes, time, async (in), JSON, a test library.
+- Speed: the nursery (HANDOFF step 2: most of what remains in today's
+  profiles is the collector marking everything live), the native limits
+  (step 3), and the self-hosted compiler's own time.
+- Documentation: a tutorial, a reference, the standard library's pages.
+
+**2. The decided "after self-hosting" features** (2 to 4 months): abstract
+types (HANDOFF step 4, needed before 1.0 or every library shows its
+insides), the polymorphism gap, reproducible concurrency, the explaining
+optimiser, and the research line (continuation-aware ownership; the
+arrays review's escaping-continuation finding is where it starts).
+
+**3. Stability and release** (about a month): the 1.0 grammar and semantics
+frozen with a written compatibility promise; binaries for Linux, Windows and
+macOS; the generated-program differential fuzzer run on every release. A 0.x
+preview can ship once part 1's tooling, packages and docs exist.
+
+**After 1.0, by choice:** refinement types, a machine-checked semantics of
+Core, the tensor/GPU sublanguage, capability values.
+
 ## Language decisions taken (2026-10-08/09)
 
 - **Partial handlers are an error** (`E0207`): a handler covers every operation of its
