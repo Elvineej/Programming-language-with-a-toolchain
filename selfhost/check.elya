@@ -17,14 +17,20 @@ type Diag { Diag(String, String, Int, Int) }
 // A node's type as recorded, at its span (the last record at a span wins).
 type Rec { Rec(Int, Int, Ty) }
 // A group member: its index, parameter types, result type.
-type Mem { Mem(Int, List(Ty), Ty) }
+type Mem { Mem(Int, List(Ty), Ty, List(Named)) }
 // A top-level function: name, declaration span, parameters, return
 // annotation, body.
 type FnInfo { FnInfo(String, Int, Int, List(Sp(Param)), Maybe(Sp(TypeAnn)), Sp(Block)) }
 
 // The substitution, each variable's level, the current level, the
 // diagnostics and the records (both newest first).
-linear type St { St(Array(Ty), Array(Int), Int, List(Diag), List(Rec)) }
+// What inference reads beside the substitution: the annotation variables
+// of the function being inferred, the declared types' arities, the
+// constructors' arities (the last of a name first), the empty types.
+type Named { Named(String, Ty) }
+type Arity { Arity(String, Int) }
+type Ctx { Ctx(List(Named), List(Arity), List(Arity), List(String)) }
+linear type St { St(Array(Ty), Array(Int), Int, List(Diag), List(Rec), Ctx) }
 linear type R(a) { R(a, St) }
 
 fn rev(xs: List(a)) -> List(a) { rev_onto(xs, Nil) }
@@ -50,9 +56,9 @@ fn nth_fn(xs: List(FnInfo), i: Int) -> FnInfo {
 
 fn fresh(s: St) -> R(Ty) {
   match s {
-    St(sub, lv, cur, ds, rs) -> {
+    St(sub, lv, cur, ds, rs, cx) -> {
       let n = array.length(sub)
-      R(TVar(n), St(array.push(sub, TNone), array.push(lv, cur), cur, ds, rs))
+      R(TVar(n), St(array.push(sub, TNone), array.push(lv, cur), cur, ds, rs, cx))
     }
   }
 }
@@ -63,37 +69,43 @@ fn fresh_list(s: St, n: Int, acc: List(Ty)) -> R(List(Ty)) {
 }
 fn bound(s: St, v: Int) -> R(Ty) {
   match s {
-    St(sub, lv, cur, ds, rs) -> {
+    St(sub, lv, cur, ds, rs, cx) -> {
       let t = array.get(sub, v)
-      R(t, St(sub, lv, cur, ds, rs))
+      R(t, St(sub, lv, cur, ds, rs, cx))
     }
   }
 }
 fn set_var(s: St, v: Int, t: Ty) -> St {
-  match s { St(sub, lv, cur, ds, rs) -> St(array.set(sub, v, t), lv, cur, ds, rs) }
+  match s { St(sub, lv, cur, ds, rs, cx) -> St(array.set(sub, v, t), lv, cur, ds, rs, cx) }
 }
 fn level_of(s: St, v: Int) -> R(Int) {
   match s {
-    St(sub, lv, cur, ds, rs) -> {
+    St(sub, lv, cur, ds, rs, cx) -> {
       let l = array.get(lv, v)
-      R(l, St(sub, lv, cur, ds, rs))
+      R(l, St(sub, lv, cur, ds, rs, cx))
     }
   }
 }
 fn set_level(s: St, v: Int, l: Int) -> St {
-  match s { St(sub, lv, cur, ds, rs) -> St(sub, array.set(lv, v, l), cur, ds, rs) }
+  match s { St(sub, lv, cur, ds, rs, cx) -> St(sub, array.set(lv, v, l), cur, ds, rs, cx) }
 }
 fn cur_level(s: St) -> R(Int) {
-  match s { St(sub, lv, cur, ds, rs) -> R(cur, St(sub, lv, cur, ds, rs)) }
+  match s { St(sub, lv, cur, ds, rs, cx) -> R(cur, St(sub, lv, cur, ds, rs, cx)) }
 }
 fn add_level(s: St, d: Int) -> St {
-  match s { St(sub, lv, cur, ds, rs) -> St(sub, lv, cur + d, ds, rs) }
+  match s { St(sub, lv, cur, ds, rs, cx) -> St(sub, lv, cur + d, ds, rs, cx) }
 }
 fn diag(s: St, code: String, msg: String, start: Int, end: Int) -> St {
-  match s { St(sub, lv, cur, ds, rs) -> St(sub, lv, cur, Cons(Diag(code, msg, start, end), ds), rs) }
+  match s { St(sub, lv, cur, ds, rs, cx) -> St(sub, lv, cur, Cons(Diag(code, msg, start, end), ds), rs, cx) }
+}
+fn get_cx(s: St) -> R(Ctx) {
+  match s { St(sub, lv, cur, ds, rs, cx) -> R(cx, St(sub, lv, cur, ds, rs, cx)) }
+}
+fn set_cx(s: St, cx: Ctx) -> St {
+  match s { St(sub, lv, cur, ds, rs, _) -> St(sub, lv, cur, ds, rs, cx) }
 }
 fn record(s: St, start: Int, end: Int, t: Ty) -> St {
-  match s { St(sub, lv, cur, ds, rs) -> St(sub, lv, cur, ds, Cons(Rec(start, end, t), rs)) }
+  match s { St(sub, lv, cur, ds, rs, cx) -> St(sub, lv, cur, ds, Cons(Rec(start, end, t), rs), cx) }
 }
 
 // `t` with the variables at its head followed (`head_of`).
@@ -272,38 +284,222 @@ fn fresh_map(s: St, vars: List(Int), acc: List(Pair)) -> R(List(Pair)) {
     Cons(v, rest) -> match fresh(s) { R(f, s2) -> fresh_map(s2, rest, Cons(Pair(v, f), acc)) }
   }
 }
-// The variables of the resolved `t` above the current level (`generalize`).
-fn above(s: St, vs: List(Int), lvl: Int, acc: List(Int)) -> R(List(Int)) {
+// The variables of the resolved `t` above the current level and not kept
+// monomorphic (`generalize`).
+fn above(s: St, vs: List(Int), lvl: Int, kept: List(Int), acc: List(Int)) -> R(List(Int)) {
   match vs {
     Nil -> R(rev(acc), s)
     Cons(v, rest) -> match level_of(s, v) {
-      R(l, s2) -> above(s2, rest, lvl, if l > lvl { Cons(v, acc) } else { acc })
+      R(l, s2) -> above(s2, rest, lvl, kept, if l > lvl && !has_int(kept, v) { Cons(v, acc) } else { acc })
+    }
+  }
+}
+// The function's annotation variables are part of the environment
+// (`kept_monomorphic`): a lowercase name is one type for the whole function,
+// so an inner `let` must not quantify it.
+fn kept_vars(s: St) -> R(List(Int)) {
+  match get_cx(s) { R(Ctx(avs, _, _, _), s2) -> kept_from(s2, avs, Nil) }
+}
+fn kept_from(s: St, avs: List(Named), acc: List(Int)) -> R(List(Int)) {
+  match avs {
+    Nil -> R(acc, s)
+    Cons(Named(_, t), rest) -> match resolve(s, t) { R(rt, s2) -> kept_from(s2, rest, free_vars(rt, acc)) }
+  }
+}
+// What is not quantified and sits above the level comes down to it.
+fn lower_unquantified(s: St, vs: List(Int), quantified: List(Int), lvl: Int) -> St {
+  match vs {
+    Nil -> s
+    Cons(v, rest) -> if has_int(quantified, v) { lower_unquantified(s, rest, quantified, lvl) } else {
+      match level_of(s, v) {
+        R(l, s2) -> lower_unquantified(if l > lvl { set_level(s2, v, lvl) } else { s2 }, rest, quantified, lvl)
+      }
     }
   }
 }
 fn generalize(s: St, t: Ty) -> R(Scheme) {
   match resolve(s, t) {
     R(rt, s2) -> match cur_level(s2) {
-      R(lvl, s3) -> match above(s3, rev(free_vars(rt, Nil)), lvl, Nil) { R(vs, s4) -> R(Scheme(vs, rt), s4) }
+      R(lvl, s3) -> match kept_vars(s3) {
+        R(kept, s4) -> {
+          let in_ty = rev(free_vars(rt, Nil))
+          match above(s4, in_ty, lvl, kept, Nil) {
+            R(vs, s5) -> R(Scheme(vs, rt), lower_unquantified(s5, in_ty, vs, lvl))
+          }
+        }
+      }
     }
   }
 }
 
 // ---- Annotations --------------------------------------------------------------
 
-fn elaborate(a: Sp(TypeAnn)) -> Ty {
+fn arity_of(xs: List(Arity), name: String) -> Int {
+  match xs { Nil -> 0 - 1  Cons(Arity(n, k), rest) -> if n == name { k } else { arity_of(rest, name) } }
+}
+fn named_get(xs: List(Named), name: String) -> Maybe(Ty) {
+  match xs { Nil -> No  Cons(Named(n, t), rest) -> if n == name { Yes(t) } else { named_get(rest, name) } }
+}
+fn has_str(xs: List(String), v: String) -> Bool {
+  match xs { Nil -> False  Cons(x, rest) -> if x == v { True } else { has_str(rest, v) } }
+}
+fn is_lower(name: String) -> Bool {
+  if string.length(name) == 0 { False } else {
+    let c = string.byte_at(name, 0)
+    c >= 97 && c <= 122
+  }
+}
+fn base_code(name: String) -> Int {
+  if name == "Int" { 0 } else { if name == "Float" { 1 } else { if name == "Bool" { 2 } else {
+    if name == "String" { 3 } else { if name == "Unit" { 4 } else { 0 - 1 } } } } }
+}
+fn ann_vars(s: St) -> R(List(Named)) {
+  match get_cx(s) { R(Ctx(vs, _, _, _), s2) -> R(vs, s2) }
+}
+fn set_ann_vars(s: St, vs: List(Named)) -> St {
+  match get_cx(s) { R(Ctx(_, k, c, e), s2) -> set_cx(s2, Ctx(vs, k, c, e)) }
+}
+fn known_arity(s: St, name: String) -> R(Int) {
+  match get_cx(s) { R(Ctx(v, k, c, e), s2) -> R(arity_of(k, name), s2) }
+}
+fn ctor_arity(s: St, name: String) -> R(Int) {
+  match get_cx(s) { R(Ctx(v, k, c, e), s2) -> R(arity_of(c, name), s2) }
+}
+// A function's annotation (`elaborate_ann`): a lowercase name is that
+// function's variable of the name.
+fn elaborate(s: St, a: Sp(TypeAnn)) -> R(Ty) {
   match a {
-    Sp(TypeAnn(name, _, _), _, _) -> {
-      if name == "Int" { TB(0) } else { if name == "Float" { TB(1) } else {
-        if name == "Bool" { TB(2) } else { if name == "String" { TB(3) } else {
-          if name == "Unit" { TB(4) } else { TCon(name, Nil) } } } } }
+    Sp(TypeAnn(name, args, _), start, end) -> {
+      let n = len(args)
+      if n == 0 && is_lower(name) {
+        match ann_vars(s) {
+          R(vs, s2) -> match named_get(vs, name) {
+            Yes(t) -> R(t, s2)
+            No -> match fresh(s2) { R(t, s3) -> R(t, set_ann_vars(s3, Cons(Named(name, t), vs))) }
+          }
+        }
+      } else {
+        let b = base_code(name)
+        if b >= 0 && n > 0 {
+          R(TErr, diag(s, "E0400", "`" <> name <> "` takes no type arguments", start, end))
+        } else {
+          if b >= 0 { R(TB(b), s) } else {
+            match known_arity(s, name) {
+              R(k, s2) -> if k < 0 {
+                R(TErr, diag(s2, "E0432", "unknown type `" <> name <> "`", start, end))
+              } else {
+                if k != n {
+                  R(TErr, diag(s2, "E0400", "type `" <> name <> "` expects " <> int.to_string(k) <> " argument(s), found " <> int.to_string(n), start, end))
+                } else {
+                  match elaborate_list(s2, args, Nil) { R(ts, s3) -> R(TCon(name, ts), s3) }
+                }
+              }
+            }
+          }
+        }
+      }
     }
+  }
+}
+fn elaborate_list(s: St, xs: List(Sp(TypeAnn)), acc: List(Ty)) -> R(List(Ty)) {
+  match xs {
+    Nil -> R(rev(acc), s)
+    Cons(x, rest) -> match elaborate(s, x) { R(t, s2) -> elaborate_list(s2, rest, Cons(t, acc)) }
   }
 }
 fn check_ann(s: St, ann: Maybe(Sp(TypeAnn)), t: Ty) -> St {
   match ann {
     No -> s
-    Yes(a) -> match a { Sp(_, start, end) -> unify(s, elaborate(a), t, start, end) }
+    Yes(a) -> match a {
+      Sp(_, start, end) -> match elaborate(s, a) { R(want, s2) -> unify(s2, want, t, start, end) }
+    }
+  }
+}
+// A declared type's field (`elaborate_adt_ty`): its parameters are the
+// declaration's; a base type's arguments are not looked at; a wrong count
+// of arguments is reported and the arguments still read.
+fn elaborate_adt(s: St, a: Sp(TypeAnn), params: List(Named)) -> R(Ty) {
+  match a {
+    Sp(TypeAnn(name, args, _), start, end) -> {
+      let n = len(args)
+      let p = if n == 0 { named_get(params, name) } else { No }
+      match p {
+        Yes(t) -> R(t, s)
+        No -> {
+          let b = base_code(name)
+          if b >= 0 { R(TB(b), s) } else {
+            match known_arity(s, name) {
+              R(k, s2) -> if k < 0 {
+                R(TErr, diag(s2, "E0432", "unknown type `" <> name <> "`", start, end))
+              } else {
+                let s3 = if k != n {
+                  diag(s2, "E0400", "type `" <> name <> "` expects " <> int.to_string(k) <> " argument(s), found " <> int.to_string(n), start, end)
+                } else { s2 }
+                match elaborate_adt_list(s3, args, params, Nil) { R(ts, s4) -> R(TCon(name, ts), s4) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+fn elaborate_adt_list(s: St, xs: List(Sp(TypeAnn)), params: List(Named), acc: List(Ty)) -> R(List(Ty)) {
+  match xs {
+    Nil -> R(rev(acc), s)
+    Cons(x, rest) -> match elaborate_adt(s, x, params) { R(t, s2) -> elaborate_adt_list(s2, rest, params, Cons(t, acc)) }
+  }
+}
+
+// ---- Declarations -------------------------------------------------------------
+
+fn known_types(decls: List(Sp(Decl)), acc: List(Arity)) -> List(Arity) {
+  match decls {
+    Nil -> acc
+    Cons(Sp(DType(name, params, _, _), _, _), rest) -> known_types(rest, Cons(Arity(name, len(params)), acc))
+    Cons(_, rest) -> known_types(rest, acc)
+  }
+}
+fn ids(ts: List(Ty), acc: List(Int)) -> List(Int) {
+  match ts { Nil -> rev(acc)  Cons(TVar(v), rest) -> ids(rest, Cons(v, acc))  Cons(_, rest) -> ids(rest, acc) }
+}
+fn zip_named(ns: List(String), ts: List(Ty), acc: List(Named)) -> List(Named) {
+  match ns {
+    Nil -> acc
+    Cons(n, nr) -> match ts { Nil -> acc  Cons(t, tr) -> zip_named(nr, tr, Cons(Named(n, t), acc)) }
+  }
+}
+fn add_ctor(s: St, name: String, k: Int) -> St {
+  match get_cx(s) { R(Ctx(v, kn, c, e), s2) -> set_cx(s2, Ctx(v, kn, Cons(Arity(name, k), c), e)) }
+}
+fn add_empty(s: St, name: String) -> St {
+  match get_cx(s) { R(Ctx(v, kn, c, e), s2) -> set_cx(s2, Ctx(v, kn, c, Cons(name, e))) }
+}
+// The constructors' schemes, in declaration order (`infer_all`'s type pass).
+fn type_decls(s: St, decls: List(Sp(Decl)), env: List(Entry)) -> R(List(Entry)) {
+  match decls {
+    Nil -> R(env, s)
+    Cons(Sp(DType(name, params, _, variants), _, _), rest) -> match fresh_list(s, len(params), Nil) {
+      R(vars, s2) -> {
+        let pe = zip_named(params, vars, Nil)
+        let s3 = match variants { Nil -> add_empty(s2, name)  _ -> s2 }
+        match ctors(s3, variants, TCon(name, vars), ids(vars, Nil), pe, env) {
+          R(env2, s4) -> type_decls(s4, rest, env2)
+        }
+      }
+    }
+    Cons(_, rest) -> type_decls(s, rest, env)
+  }
+}
+fn ctors(s: St, vs: List(Sp(VariantDecl)), result: Ty, vars: List(Int), pe: List(Named), env: List(Entry)) -> R(List(Entry)) {
+  match vs {
+    Nil -> R(env, s)
+    Cons(Sp(VariantDecl(cname, fields), _, _), rest) -> match elaborate_adt_list(add_ctor(s, cname, len(fields)), fields, pe, Nil) {
+      R(fts, s2) -> {
+        let t = match fts { Nil -> result  _ -> TFn(fts, result) }
+        ctors(s2, rest, result, vars, pe, Cons(Entry(cname, Scheme(vars, t)), env))
+      }
+    }
   }
 }
 
@@ -406,8 +602,82 @@ fn infer_inner(s: St, node: Expr, start: Int, end: Int, env: List(Entry)) -> R(T
       }
     }
     EBlock(b) -> infer_block(s, b, env)
+    EMatch(x, arms) -> match infer_expr(s, x, env) {
+      R(st, s2) -> match fresh(s2) {
+        R(result, s3) -> {
+          let s4 = match arms { Nil -> match x { Sp(_, xs, xe) -> check_empty_match(s3, st, xs, xe) }  _ -> s3 }
+          R(result, infer_arms(s4, arms, st, result, env))
+        }
+      }
+    }
     ECall(callee, args) -> infer_call(s, callee, args, start, end, env)
     _ -> R(TErr, s)
+  }
+}
+fn infer_arms(s: St, arms: List(Sp(MatchArm)), st: Ty, result: Ty, env: List(Entry)) -> St {
+  match arms {
+    Nil -> s
+    Cons(Sp(MatchArm(pat, body), _, _), rest) -> match check_pattern(s, pat, st, env, env) {
+      R(env2, s2) -> match infer_expr(s2, body, env2) {
+        R(bt, s3) -> match body { Sp(_, bs, be) -> infer_arms(unify(s3, bt, result, bs, be), rest, st, result, env) }
+      }
+    }
+  }
+}
+// A pattern against the type it must have (`check_pattern`): its bindings
+// pushed onto `acc` in order; constructors looked up in `env`.
+fn check_pattern(s: St, pat: Sp(Pattern), expected: Ty, env: List(Entry), acc: List(Entry)) -> R(List(Entry)) {
+  match pat {
+    Sp(node, start, end) -> match node {
+      PWild -> R(acc, s)
+      PVar(x) -> R(Cons(Entry(x, Scheme(Nil, expected)), acc), s)
+      PInt(_) -> R(acc, unify(s, expected, TB(0), start, end))
+      PBool(_) -> R(acc, unify(s, expected, TB(2), start, end))
+      PStr(_) -> R(acc, unify(s, expected, TB(3), start, end))
+      PUnit -> R(acc, unify(s, expected, TB(4), start, end))
+      PCtor(name, args) -> match lookup(env, name) {
+        No -> R(acc, s)
+        Yes(sc) -> match instantiate(s, sc) {
+          R(t, s2) -> {
+            let fields = match t { TFn(fs, _) -> fs  _ -> Nil }
+            let result = match t { TFn(_, r) -> r  _ -> t }
+            let s3 = unify(s2, result, expected, start, end)
+            let nf = len(fields)
+            let na = len(args)
+            let s4 = if na != nf {
+              diag(s3, "E0402", "constructor `" <> name <> "` expects " <> int.to_string(nf) <> " field(s), found " <> int.to_string(na), start, end)
+            } else { s3 }
+            check_fields(s4, args, fields, env, acc)
+          }
+        }
+      }
+    }
+  }
+}
+fn check_fields(s: St, ps: List(Sp(Pattern)), ts: List(Ty), env: List(Entry), acc: List(Entry)) -> R(List(Entry)) {
+  match ps {
+    Nil -> R(acc, s)
+    Cons(p, pr) -> match ts {
+      Nil -> R(acc, s)
+      Cons(t, tr) -> match check_pattern(s, p, t, env, acc) { R(acc2, s2) -> check_fields(s2, pr, tr, env, acc2) }
+    }
+  }
+}
+fn is_empty_type(s: St, name: String) -> R(Bool) {
+  match get_cx(s) { R(Ctx(v, k, c, e), s2) -> R(has_str(e, name), s2) }
+}
+fn check_empty_match(s: St, t: Ty, start: Int, end: Int) -> St {
+  match resolve(s, t) {
+    R(rt, s2) -> match rt {
+      TErr -> s2
+      TCon(n, _) -> match is_empty_type(s2, n) { R(e, s3) -> if e { s3 } else { empty_match_error(s3, rt, start, end) } }
+      _ -> empty_match_error(s2, rt, start, end)
+    }
+  }
+}
+fn empty_match_error(s: St, rt: Ty, start: Int, end: Int) -> St {
+  match show(rt, Names(Nil, 0)) {
+    Shown(text, _) -> diag(s, "E0430", "a match with no arms needs a scrutinee whose type has no constructors; this is `" <> text <> "`", start, end)
   }
 }
 fn sp_block(b: Sp(Block)) -> Block { match b { Sp(x, _, _) -> x } }
@@ -429,18 +699,71 @@ fn infer_args(s: St, args: List(Sp(Expr)), env: List(Entry), acc: List(Ty)) -> R
     Cons(a, rest) -> match infer_expr(s, a, env) { R(t, s2) -> infer_args(s2, rest, env, Cons(t, acc)) }
   }
 }
+// A pure builtin's parameters and result (`type_builtin_call`'s pure
+// arms), or no parameters and an error for the others.
+type Sig { Sig(List(Ty), Ty), NoSig }
+fn pure_builtin(m: String, n: String) -> Sig {
+  if (m == "int" || m == "float") && n == "to_string" { Sig(Cons(if m == "int" { TB(0) } else { TB(1) }, Nil), TB(3)) } else {
+    if m == "float" && n == "of_int" { Sig(Cons(TB(0), Nil), TB(1)) } else {
+      if m == "float" && (n == "truncate" || n == "round") { Sig(Cons(TB(1), Nil), TB(0)) } else {
+        if m == "string" && n == "length" { Sig(Cons(TB(3), Nil), TB(0)) } else {
+          if m == "string" && n == "byte_at" { Sig(Cons(TB(3), Cons(TB(0), Nil)), TB(0)) } else {
+            if m == "string" && n == "slice" { Sig(Cons(TB(3), Cons(TB(0), Cons(TB(0), Nil))), TB(3)) } else {
+              if m == "int" && (n == "wrapping_add" || n == "wrapping_sub" || n == "wrapping_mul" || n == "and" || n == "or" || n == "xor" || n == "shl" || n == "shr" || n == "ushr") {
+                Sig(Cons(TB(0), Cons(TB(0), Nil)), TB(0))
+              } else { NoSig }
+            }
+          }
+        }
+      }
+    }
+  }
+}
 fn infer_call(s: St, callee: Sp(Expr), args: List(Sp(Expr)), start: Int, end: Int, env: List(Entry)) -> R(Ty) {
   match callee {
-    Sp(EQualified(_, _), _, _) -> R(TErr, s)
-    Sp(EVar(name), cs, ce) -> {
-      let f = match lookup(env, name) {
-        Yes(sc) -> match instantiate(s, sc) { R(t, s2) -> R(t, record(s2, cs, ce, t)) }
-        No -> R(TErr, s)
+    Sp(EQualified(m, n), cs, ce) -> match pure_builtin(m, n) {
+      NoSig -> R(TErr, s)
+      Sig(params, ret) -> match infer_args(s, args, env, Nil) {
+        R(ts, s2) -> {
+          let want = TFn(params, ret)
+          R(ret, record(unify(s2, want, TFn(ts, ret), start, end), cs, ce, want))
+        }
       }
-      match f { R(ft, s2) -> call_with(s2, ft, args, start, end, env) }
+    }
+    Sp(EVar(name), cs, ce) -> match ctor_arity(s, name) {
+      R(k, s1) -> if k >= 0 {
+        match infer_args(s1, args, env, Nil) { R(ts, s2) -> ctor_call(s2, name, k, ts, start, end, env) }
+      } else { ordinary(s1, name, cs, ce, args, start, end, env) }
     }
     _ -> match infer_expr(s, callee, env) { R(ft, s2) -> call_with(s2, ft, args, start, end, env) }
   }
+}
+fn ctor_call(s: St, name: String, k: Int, ts: List(Ty), start: Int, end: Int, env: List(Entry)) -> R(Ty) {
+  if len(ts) != k {
+    let plural = if k == 1 { "" } else { "s" }
+    R(TErr, diag(s, "E0433", "constructor `" <> name <> "` takes " <> int.to_string(k) <> " argument" <> plural <> " but was applied to a different number", start, end))
+  } else {
+    match lookup(env, name) {
+      No -> R(TErr, s)
+      Yes(sc) -> match instantiate(s, sc) {
+        R(t, s2) -> match t {
+          TFn(ps, result) -> R(result, unify_each(s2, ts, ps, start, end))
+          _ -> R(t, s2)
+        }
+      }
+    }
+  }
+}
+// Each argument against its parameter, as far as both go.
+fn unify_each(s: St, xs: List(Ty), ys: List(Ty), start: Int, end: Int) -> St { unify_pairs(s, xs, ys, start, end) }
+// An ordinary call (`callee_scheme_type`, `type_ordinary_call`): the
+// callee's instantiated type recorded at its span.
+fn ordinary(s: St, name: String, cs: Int, ce: Int, args: List(Sp(Expr)), start: Int, end: Int, env: List(Entry)) -> R(Ty) {
+  let f = match lookup(env, name) {
+    Yes(sc) -> match instantiate(s, sc) { R(t, s2) -> R(t, record(s2, cs, ce, t)) }
+    No -> R(TErr, s)
+  }
+  match f { R(ft, s2) -> call_with(s2, ft, args, start, end, env) }
 }
 fn call_with(s: St, f: Ty, args: List(Sp(Expr)), start: Int, end: Int, env: List(Entry)) -> R(Ty) {
   match infer_args(s, args, env, Nil) {
@@ -672,8 +995,10 @@ fn members_list(s: St, fns: List(FnInfo), group: List(Int), env: List(Entry), ac
         R(ps, s2) -> match fresh(s2) {
           R(result, s3) -> {
             let ft = TFn(ps, result)
-            let s4 = record(check_ann(check_anns(s3, params, ps), ret, result), ds, de, ft)
-            members_list(s4, fns, rest, Cons(Entry(name, Scheme(Nil, ft)), env), Cons(Mem(i, ps, result), acc))
+            let s4 = check_ann(check_anns(set_ann_vars(s3, Nil), params, ps), ret, result)
+            match ann_vars(s4) {
+              R(avs, s5) -> members_list(record(s5, ds, de, ft), fns, rest, Cons(Entry(name, Scheme(Nil, ft)), env), Cons(Mem(i, ps, result, avs), acc))
+            }
           }
         }
       }
@@ -695,8 +1020,8 @@ fn bind_params(s: St, params: List(Sp(Param)), tys: List(Ty), env: List(Entry)) 
 fn bodies(s: St, fns: List(FnInfo), ms: List(Mem), env: List(Entry), all: List(Mem)) -> R(Out) {
   match ms {
     Nil -> schemes_of(s, fns, all, env, Nil)
-    Cons(Mem(i, ps, result), rest) -> match nth_fn(fns, i) {
-      FnInfo(_, _, _, params, _, body) -> match bind_params(s, params, ps, env) {
+    Cons(Mem(i, ps, result, avs), rest) -> match nth_fn(fns, i) {
+      FnInfo(_, _, _, params, _, body) -> match bind_params(set_ann_vars(s, avs), params, ps, env) {
         R(benv, s2) -> match body {
           Sp(b, bs, be) -> match infer_block(s2, b, benv) {
             R(bt, s3) -> bodies(unify(s3, result, bt, bs, be), fns, rest, env, all)
@@ -711,7 +1036,7 @@ fn bodies(s: St, fns: List(FnInfo), ms: List(Mem), env: List(Entry), all: List(M
 fn schemes_of(s: St, fns: List(FnInfo), ms: List(Mem), env: List(Entry), lines: List(SchemeLine)) -> R(Out) {
   match ms {
     Nil -> R(Out(env, lines), s)
-    Cons(Mem(i, ps, result), rest) -> match nth_fn(fns, i) {
+    Cons(Mem(i, ps, result, _), rest) -> match nth_fn(fns, i) {
       FnInfo(name, _, _, _, _, _) -> match resolve(s, TFn(ps, result)) {
         R(rt, s2) -> {
           let sc = Scheme(rev(free_vars(rt, Nil)), rt)
@@ -885,12 +1210,15 @@ pub fn check_dump(m: Module) -> String {
     Module(_, decls) -> {
       let fns = fn_infos(decls, Nil)
       let order = tarjan(all_edges(fns, fns, Nil), len(fns))
-      match groups(St(array.new(), array.new(), 0, Nil, Nil), fns, order, Nil, Nil) {
+      let known = Cons(Arity("Array", 1), known_types(decls, Nil))
+      let st0 = St(array.new(), array.new(), 0, Nil, Nil, Ctx(Nil, known, Nil, Nil))
+      let declared = type_decls(st0, decls, Nil)
+      match match declared { R(env0, s0) -> groups(s0, fns, order, env0, Nil) } {
         R(lines, s) -> match s {
-          St(sub, lv, cur, ds, rs) -> {
+          St(sub, lv, cur, ds, rs, cx) -> {
             let b1 = dump_schemes(sort_by(rev(lines), line_le), buffer.new())
             let recs = last_per_span(sort_by(rs, rec_le), 0 - 1, 0 - 1, Nil)
-            match dump_types(St(sub, lv, cur, Nil, Nil), recs, b1) {
+            match dump_types(St(sub, lv, cur, Nil, Nil, cx), recs, b1) {
               R(b2, _) -> buffer.finish(dump_diags(rev(ds), b2))
             }
           }

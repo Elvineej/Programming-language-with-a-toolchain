@@ -12,7 +12,7 @@ mod support;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const BUILT: u8 = 1;
+const BUILT: u8 = 2;
 
 fn median(mut times: Vec<Duration>) -> Duration {
     times.sort_unstable();
@@ -77,6 +77,12 @@ fn native_proof() {
                 .iter()
                 .enumerate()
                 .map(|(i, t)| (format!("focused F1 #{i}"), t.to_string())),
+        )
+        .chain(
+            support::FOCUSED_F2A
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (format!("focused F2a #{i}"), t.to_string())),
         );
     let mut largest: Option<(String, String, String)> = None;
     let mut compared = 0;
@@ -98,8 +104,8 @@ fn native_proof() {
         }
     }
     assert!(
-        compared >= 49 + support::FOCUSED_F1.len(),
-        "F1 natively: at least 49 corpus programs, and the focused set ({compared})"
+        compared >= 80 + support::FOCUSED_F1.len() + support::FOCUSED_F2A.len(),
+        "F1 and F2a natively: at least 80 corpus programs, and the focused sets ({compared})"
     );
     let (name, text, _) = largest.expect("a program in the built stages");
     let path = scratch.put(&text);

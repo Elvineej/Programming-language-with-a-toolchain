@@ -38,11 +38,28 @@ Spec: `docs/superpowers/specs/2026-11-15-elya-checker-in-elya-design.md`.
      recursion (the call graph's groups, generalized in Rust's order). With
      it: the type printer (`write_ty`, `write_row`, `letter`, the `Names`
      shared across lines of one dump) and the diagnostics of this fragment.
-   - F2: lambdas and closures, let-polymorphism by levels (D14-D16 of the
-     inference-levels spec), tuples, `type` declarations, constructors and
-     `match`, the builtins' signatures (`int.*`, `float.*`, `string.*`).
-   - F3: annotations (parameter, return, `let`), checked, and the kinds of
-     declaration parameters (`decl_kinds`).
+   - F2a (**built** 2026-11-22): `type` declarations and their
+     constructors' schemes, constructor calls (E0433), `match` with every
+     pattern (E0402 on fields, E0430 on an empty match), the pure builtins
+     (`int.*`, `float.*`, `string.*`), annotations naming declared types and
+     type variables (E0400, E0432). 32 corpus programs and 32 focused ones
+     agree, in the evaluator and natively; controls K4-K7 in the test's
+     header. Review: one defect (a `let` could quantify the function's
+     annotation variables, `kept_monomorphic`; and the unquantified
+     variables above the level were not lowered), fixed with K7; its
+     mutation testing found 15 unpinned behaviours, now pinned by focused
+     programs; about 55 probes otherwise agreed. Gate 1666 passed, 196
+     suites, as predicted. No effect rows: everything here is called directly, so every
+     row closes to pure.
+   - F2b (the classifier's stage 3; F3's annotations went to F2a and F2b,
+     the kinds of declaration parameters to F4): higher order. Lambdas and closures, functions and n-ary
+     constructors as values, calls of locals and of expressions, function
+     types in annotations, with let-polymorphism over them (D14-D16 of the
+     inference-levels spec). These bring effect rows into the printed types
+     even in pure programs (`fn app(f, x) { f(x) }` is
+     `forall a b c. fn(fn(a) / {c} -> b, a) / {c} -> b`), so F2b ports the
+     row variables' tails: phantom rows, relays through parameters,
+     inclusions, closing what nothing relays.
    - F4: effects. Declarations, performs, `handle` and `resume`, rows with
      labels and tails, row variables and their inclusions, phantom rows,
      parametric effects, `with any`, `multi`.

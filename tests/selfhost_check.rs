@@ -1,6 +1,8 @@
 //! The checker in Elya (plan docs/superpowers/plans/2026-11-15-elya-checker-in-elya.md,
 //! step 4): `selfhost/check.elya` prints exactly `elya check --dump` on every
-//! corpus program inside the stages built so far (F1: first-order programs).
+//! corpus program inside the stages built so far: F1 (first-order programs)
+//! and F2a (declared types, constructors, `match`, the pure builtins,
+//! annotations naming types and type variables).
 //!
 //! Negative controls, each run, reverted and compared byte for byte:
 //! K1, every scheme left unquantified: fails on `scheme id fn(a) -> a`
@@ -8,6 +10,13 @@
 //! K2, `<` typed `Int`: fails on a `type` line, `Int` against `Bool`.
 //! K3, the diagnostics printed newest first: fails on a focused program
 //! with two errors (no F1 corpus program has two, hence the focused set).
+//! K4, a pattern's field-count message with its counts swapped: fails on
+//! focused F2a #3.
+//! K5, a field type with the wrong number of arguments made an error type:
+//! fails on focused F2a #16 (written for it; it survived before).
+//! K6, a builtin's callee type not recorded: fails on tests/float_text.rs.
+//! K7, a `let` free to quantify the function's annotation variables (the
+//! second review's D1, a defect it found): fails on focused F2a #17.
 
 #[path = "support/selfhost_parse.rs"]
 mod parse_support;
@@ -18,7 +27,7 @@ use elya::eval::{Host, World};
 use std::path::Path;
 
 /// The stages `selfhost/check.elya` covers.
-const BUILT: u8 = 1;
+const BUILT: u8 = 2;
 
 #[test]
 fn the_checker_in_elya_agrees_on_its_stages() {
@@ -38,7 +47,13 @@ fn the_checker_in_elya_agrees_on_its_stages() {
     let focused = support::FOCUSED_F1
         .iter()
         .enumerate()
-        .map(|(i, t)| (format!("focused F1 #{i}"), t.to_string()));
+        .map(|(i, t)| (format!("focused F1 #{i}"), t.to_string()))
+        .chain(
+            support::FOCUSED_F2A
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (format!("focused F2a #{i}"), t.to_string())),
+        );
     let cases = corpus
         .cases
         .iter()
@@ -71,7 +86,7 @@ fn the_checker_in_elya_agrees_on_its_stages() {
         &counts[1..]
     );
     assert!(
-        compared >= 49 + support::FOCUSED_F1.len(),
-        "F1: at least 49 corpus programs, and the focused set"
+        compared >= 80 + support::FOCUSED_F1.len() + support::FOCUSED_F2A.len(),
+        "F1 and F2a: at least 80 corpus programs, and the focused sets"
     );
 }

@@ -32,6 +32,52 @@ pub const FOCUSED_F1: &[&str] = &[
     "fn a(n) { let e = 1 + True\n b(n) }\nfn b(n) { let e = if 2 { 1 } else { 2 }\n a(n) }\npub fn main() -> Int { a(1) }\n",
 ];
 
+/// Programs of F2a with errors: each diagnostic the stage adds, and several
+/// in one program.
+pub const FOCUSED_F2A: &[&str] = &[
+    "type Opt(a) { None, Some(a) }\npub fn main() -> Int { match Some(1) { None -> 0  Some(x) -> x } }\n",
+    "type Opt(a) { None, Some(a) }\npub fn main() -> Int { match Some(True) { None -> 0  Some(x) -> x } }\n",
+    "type Opt(a) { None, Some(a) }\npub fn main() -> Int { let o = Some(1, 2)\n 0 }\n",
+    "type Pair(a, b) { Pair(a, b) }\npub fn main() -> Int { match Pair(1, 2) { Pair(x) -> x } }\n",
+    "type T { A(Nope) }\npub fn main() -> Int { 0 }\n",
+    "type T(a) { A(a) }\ntype U { B(T), C(T(Int, Int)) }\npub fn main() -> Int { 0 }\n",
+    "type Never { }\nfn f(n: Never) -> Int { match n { } }\nfn g(x: Int) -> Int { match x { } }\npub fn main() -> Int { 0 }\n",
+    "fn f(x: Int(Bool), y: Opt) -> Int { 0 }\npub fn main() -> Int { 0 }\n",
+    "type Opt(a) { None, Some(a) }\nfn f(x: Opt) -> Opt(Int, Int) { x }\npub fn main() -> Int { 0 }\n",
+    "fn id(x: a) -> a { x }\nfn bad(x: a, y: a) -> a { if True { x } else { y } }\npub fn main() -> Int { bad(1, True) + id(2) }\n",
+    "pub fn main() -> Int { string.length(1) + string.byte_at(\"a\") + int.wrapping_add(1, True) }\n",
+    "pub fn main() -> String { int.to_string(1.5) <> float.to_string(1) <> string.slice(\"ab\", 0, 1) }\n",
+    "pub fn main() -> Int { match 3 { 1 -> \"one\"  True -> 2  _ -> 3 } }\n",
+    "type L(a) { N, C(a, L(a)) }\nfn len(l: L(a)) -> Int { match l { N -> 0  C(_, r) -> 1 + len(r) } }\nfn bad(l) { match l { N -> 0  C(x, r) -> x <> bad(r) } }\npub fn main() -> Int { len(C(1, N)) + bad(C(\"a\", N)) }\n",
+    "type Opt(a) { None, Some(a) }\npub fn main() -> Int { let n: Opt(Int) = None\n let s: Opt(String) = Some(1)\n match n { Some(v) -> v  None -> float.round(2.5) } }\n",
+    "type Box(a) { Box(a) }\npub fn main() -> Bool { Box(1) == Box(2) && Box(\"a\") != Box(3) }\n",
+    // A field whose type has the wrong number of arguments is still that
+    // type: using its constructor meets it (control K5).
+    "type T(a) { A(a) }\ntype U { B(T) }\npub fn main() -> Int { match B(A(1)) { B(A(x)) -> x } }\n",
+    // The second review's (2026-11-22). A `let` does not quantify the
+    // function's annotation variables (its D1, a defect it found):
+    "type O(a) { No, Ye(a) }\npub fn main() -> Int { let y: O(a) = No\n let z: a = True\n match y { Ye(v) -> v + 1  No -> 0 } }\n",
+    "type O(a) { No, Ye(a) }\nfn f(x) { let y: O(a) = No\n let z: a = True\n y }\npub fn main() -> Int { 0 }\n",
+    // and the behaviours its mutations showed unpinned: annotation variables
+    // per member, kept for the body, and a lowercase name with arguments;
+    "fn f(x: a, y: b) -> a { x }\nfn g(x: a) -> a { let y: a = x\n let z: b = 1\n y }\npub fn main() -> Int { 0 }\n",
+    "fn f(x: a) -> Int { let y: a = 1\n g(True) }\nfn g(x: a) -> Int { let y: a = 2\n f(x) }\npub fn main() -> Int { 0 }\n",
+    "fn f(x: a(Int)) -> Int { 0 }\npub fn main() -> Int { 0 }\n",
+    "type T(a, a) { B(a) }\nfn f(x: T(Int, Bool)) -> Int { match x { B(v) -> v } }\npub fn main() -> Int { 0 }\n",
+    // an empty match on an error, and on a declared type with constructors;
+    "type O(a) { No, Ye(a) }\npub fn main() -> Int { match Ye(1, 2) { } }\n",
+    "type O(a) { No, Ye(a) }\nfn f(z) { match Ye(z) { } }\npub fn main() -> Int { 0 }\n",
+    // arm bindings staying in their arm, string patterns, a repeated variable;
+    "fn f(x) { match True { x -> 1  _ -> x } }\npub fn main() -> Int { f(True) }\n",
+    "fn h(x) { match x { \"a\" -> 0  _ -> 1 } }\npub fn main() -> Int { h(1) }\n",
+    "type P(a, b) { P(a, b) }\nfn f(p) { match p { P(x, x) -> x } }\npub fn main() -> Int { f(P(True, 1)) + 1 }\n",
+    // field types: a parameter given arguments, a base type given arguments;
+    "type T(a) { A(b), B(a(Int)) }\npub fn main() -> Int { 0 }\n",
+    "type T { A(Int(Bool)), B(Bool(x)) }\npub fn main() -> Int { match A(1) { A(n) -> n  B(b) -> 0 } }\n",
+    // and every pure builtin's signature.
+    "fn f(s) { string.slice(s, string.length(s), int.shl(1, 2)) }\nfn g(n) { float.of_int(int.xor(n, n)) }\nfn h(x) { float.truncate(x) + int.ushr(x, 1) }\nfn k(x) { int.and(int.or(x, 1), int.shr(x, 2)) + float.round(1.5) + int.wrapping_mul(int.wrapping_sub(x, 1), int.wrapping_add(x, 2)) }\npub fn main() -> Int { 0 }\n",
+];
+
 /// The checker's imports: the parser in Elya and its lexer.
 pub fn reader(name: &str) -> Option<(String, String)> {
     let file = match name {
@@ -49,7 +95,12 @@ pub fn reader(name: &str) -> Option<(String, String)> {
 
 const BASE: &[&str] = &["Int", "Float", "Bool", "String", "Unit"];
 
-/// The stage a program needs, 1 to 6 (F1 first order ... F6 the grants).
+/// The stage a program needs, 1 to 6: F1 first order; F2a (2) declared
+/// types, constructors, `match`, the pure builtins, annotations naming types
+/// and type variables; F2b (3) higher order: lambdas, functions as values,
+/// calls of locals or of expressions, function types in annotations, all of
+/// which bring effect rows into types; F4 effects; F5 linearity, `Buffer`,
+/// `Array`, `borrow`; F6 imports.
 pub fn stage(m: &Module) -> u8 {
     let fns = m
         .decls
@@ -59,7 +110,19 @@ pub fn stage(m: &Module) -> u8 {
             _ => None,
         })
         .collect();
-    let mut s = Stage(1, fns);
+    let ctors = m
+        .decls
+        .iter()
+        .flat_map(|d| match &d.node {
+            Decl::Type(t) => t
+                .variants
+                .iter()
+                .map(|v| (v.node.name.clone(), v.node.fields.len()))
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let mut s = Stage(1, fns, ctors);
     if !m.imports.is_empty() {
         s.at(6);
     }
@@ -97,21 +160,30 @@ pub fn stage(m: &Module) -> u8 {
     s.0
 }
 
-/// The stage so far, and the top-level functions' names: in F1 a call's
-/// callee is one of them, and they are used only as callees.
-struct Stage(u8, Vec<String>);
+/// The stage so far, the top-level functions' names, and the constructors
+/// with their arities: below F2b a call's callee is a function or a
+/// constructor, and a function or an n-ary constructor is only ever called.
+struct Stage(u8, Vec<String>, Vec<(String, usize)>);
 
 impl Stage {
     fn at(&mut self, n: u8) {
         self.0 = self.0.max(n);
     }
 
-    /// A parameter or `let` named like a top-level function shadows it, so a
-    /// call of that name may be a call of a local (the review's D1):
-    /// conservatively, not F1.
+    fn arity(&self, name: &str) -> Option<usize> {
+        self.2
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, k)| *k)
+    }
+
+    /// A parameter, `let` or pattern variable named like a top-level function
+    /// shadows it, so a call of that name may be a call of a local (the
+    /// review's D1): conservatively, higher order.
     fn binder(&mut self, name: &str) {
         if self.1.iter().any(|f| f == name) {
-            self.at(2)
+            self.at(3)
         }
     }
 
@@ -122,10 +194,12 @@ impl Stage {
         }
         if t.name == "Array" || t.name == "Buffer" {
             self.at(5);
-        } else if !BASE.contains(&t.name.as_str()) || !t.args.is_empty() {
-            // A base type given arguments is an error the checker's
-            // annotations report (F3; the review's D2).
+        } else if t.name == "fn" {
             self.at(3);
+        } else if !BASE.contains(&t.name.as_str()) || !t.args.is_empty() {
+            // A declared type, a type variable, or a base type given
+            // arguments (an error the annotations report; the review's D2).
+            self.at(2);
         }
         for x in &t.args {
             self.ann(x);
@@ -153,9 +227,11 @@ impl Stage {
     fn expr(&mut self, e: &Spanned<Expr>) {
         match &e.node {
             Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Unit => {}
-            // A function used as a value is higher order (F2).
+            // A function, or a constructor with fields, used as a value.
             Expr::Var(n) => {
-                if self.1.contains(n) {
+                if self.1.contains(n) || self.arity(n).is_some_and(|k| k > 0) {
+                    self.at(3)
+                } else if self.arity(n).is_some() {
                     self.at(2)
                 }
             }
@@ -167,17 +243,19 @@ impl Stage {
             },
             Expr::Call { callee, args } => {
                 match &callee.node {
-                    // A call of a top-level function is first order; of a
-                    // local, a constructor or an operation, it is not.
                     Expr::Var(n) => {
-                        if !self.1.contains(n) {
+                        if self.arity(n).is_some() {
                             self.at(2)
+                        } else if !self.1.contains(n) {
+                            // A local, or an operation.
+                            self.at(3)
                         }
                     }
+                    Expr::Qualified { .. } => self.expr(callee),
                     // A call of a call's result, or of any other
                     // expression, is higher order.
                     _ => {
-                        self.at(2);
+                        self.at(3);
                         self.expr(callee)
                     }
                 }
@@ -208,7 +286,7 @@ impl Stage {
                 }
             }
             Expr::Lambda { params, body } => {
-                self.at(2);
+                self.at(3);
                 for p in params {
                     if let Some(a) = &p.node.ann {
                         self.ann(a);
@@ -219,5 +297,11 @@ impl Stage {
         }
     }
 
-    fn pattern(&mut self, _p: &Spanned<Pattern>) {}
+    fn pattern(&mut self, p: &Spanned<Pattern>) {
+        match &p.node {
+            Pattern::Var(x) => self.binder(x),
+            Pattern::Ctor { args, .. } => args.iter().for_each(|a| self.pattern(a)),
+            Pattern::Wild | Pattern::Lit(_) => {}
+        }
+    }
 }

@@ -11,6 +11,10 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
   49 first-order corpus programs and 20 focused ones with errors, in the evaluator
   and natively. Review: classifier holes fixed, five behaviours pinned. Gate 1666 /
   196 as predicted.
+- **Done: stage F2a** (declared types, constructors, `match`, the pure builtins,
+  annotations naming types): 32 corpus and 32 focused programs agree. Review found
+  one defect (a `let` quantifying the function's annotation variables), fixed.
+  Gate 1666 / 196 as predicted.
 - Codex's part 4b never reached GitHub (its task was last seen resuming at 15:41 on
   the 15th; Chrome on the PC unreachable tonight, so its state is unknown).
 
