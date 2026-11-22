@@ -1396,6 +1396,15 @@ pub fn parse_dump(src: String) -> String {
     }
   }
 }
+// The tree, for the passes after parsing (the checker in Elya, part 4f):
+// a lexical error is reported as a parse error at the start.
+pub fn parse_tree(src: String) -> Parsed(Module) {
+  match lex.lex(src) {
+    Lexed(ts, ds) -> {
+      if array.length(ds) > 0 { ParseError("E0001", 0, 0) } else { parse_module(ts, src, 0, Nil, Nil) }
+    }
+  }
+}
 pub fn main() / {IO} {
   let text = io.read_file(io.arg(0))
   let result = parse_dump(text)

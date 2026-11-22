@@ -4,6 +4,16 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
+## 2026-11-22 03:00 UTC — IN PROGRESS
+
+- **Done: the checker in Elya, stage F1** (plan 2026-11-15-elya-checker-in-elya,
+  step 4): `selfhost/check.elya` agrees byte for byte with `elya check --dump` on
+  49 first-order corpus programs and 20 focused ones with errors, in the evaluator
+  and natively. Review: classifier holes fixed, five behaviours pinned. Gate 1666 /
+  196 as predicted.
+- Codex's part 4b never reached GitHub (its task was last seen resuming at 15:41 on
+  the 15th; Chrome on the PC unreachable tonight, so its state is unknown).
+
 ## 2026-11-15 15:05 UTC — IN PROGRESS (interactive session, at the maintainer's "Continue"; started 2026-10-31 01:22, re-dated at each checkpoint)
 
 - The 2026-10-24 09:48 entry never marked DONE; its last commit is 2778bc1 (09:59, the

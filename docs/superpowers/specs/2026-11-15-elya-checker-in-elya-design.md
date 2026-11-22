@@ -68,6 +68,11 @@ diagnostic's message is that printer plus fixed words copied from
 src/types.rs. Leaving the messages out would save little, and would leave
 R2's "byte for byte" unmet.
 
+**D3a. What a diagnostic prints.** `dump_diagnostics` prints a
+diagnostic's headline only (`type mismatch`), not its labels, which hold
+most of the type printing (`expected Int, found Bool`). So D3 costs even
+less than it first seemed.
+
 **D4. Inference's own order.** `check --dump` names type variables afresh on
 each line (spec 2026-11-15 D6), so the Elya checker does not have to number
 its variables the way Rust does. It must reach the same types, the same
@@ -82,4 +87,6 @@ which.
 
 ## 3. Measured after
 
-(To be filled in.)
+- F1 (2026-11-22): the largest first-order program (285 bytes) takes 1.8 ms
+  natively per process, against 0.31 ms for Rust's resolve and check in
+  process. The native figure is mostly process start-up and the parse.

@@ -1,0 +1,912 @@
+// The checker in Elya, self-hosting part 4f (plan
+// docs/superpowers/plans/2026-11-15-elya-checker-in-elya.md, step 4).
+// Oracle: src/types.rs through `elya check --dump` (src/check_dump.rs).
+// Stage F1: first-order programs. Every function's row closes to pure in
+// that fragment, so rows are not represented yet.
+import parse / {IO}
+
+// ---- Types, schemes, the state ------------------------------------------
+
+// TB's codes: 0 Int, 1 Float, 2 Bool, 3 String, 4 Unit. TNone marks an
+// unbound variable's slot in the substitution.
+type Ty { TVar(Int), TB(Int), TFn(List(Ty), Ty), TCon(String, List(Ty)), TErr, TNone }
+type Scheme { Scheme(List(Int), Ty) }
+type Entry { Entry(String, Scheme) }
+// A diagnostic: code, message, span.
+type Diag { Diag(String, String, Int, Int) }
+// A node's type as recorded, at its span (the last record at a span wins).
+type Rec { Rec(Int, Int, Ty) }
+// A group member: its index, parameter types, result type.
+type Mem { Mem(Int, List(Ty), Ty) }
+// A top-level function: name, declaration span, parameters, return
+// annotation, body.
+type FnInfo { FnInfo(String, Int, Int, List(Sp(Param)), Maybe(Sp(TypeAnn)), Sp(Block)) }
+
+// The substitution, each variable's level, the current level, the
+// diagnostics and the records (both newest first).
+linear type St { St(Array(Ty), Array(Int), Int, List(Diag), List(Rec)) }
+linear type R(a) { R(a, St) }
+
+fn rev(xs: List(a)) -> List(a) { rev_onto(xs, Nil) }
+fn rev_onto(xs: List(a), acc: List(a)) -> List(a) {
+  match xs { Nil -> acc  Cons(x, rest) -> rev_onto(rest, Cons(x, acc)) }
+}
+fn len(xs: List(a)) -> Int { len_from(xs, 0) }
+fn len_from(xs: List(a), n: Int) -> Int {
+  match xs { Nil -> n  Cons(_, rest) -> len_from(rest, n + 1) }
+}
+fn nth_int(xs: List(Int), i: Int) -> Int {
+  match xs { Nil -> 0 - 1  Cons(x, rest) -> if i == 0 { x } else { nth_int(rest, i - 1) } }
+}
+fn has_int(xs: List(Int), v: Int) -> Bool {
+  match xs { Nil -> False  Cons(x, rest) -> if x == v { True } else { has_int(rest, v) } }
+}
+fn nth_fn(xs: List(FnInfo), i: Int) -> FnInfo {
+  match xs {
+    Cons(x, rest) -> if i == 0 { x } else { nth_fn(rest, i - 1) }
+    Nil -> FnInfo("", 0, 0, Nil, No, Sp(Block(Nil, No), 0, 0))
+  }
+}
+
+fn fresh(s: St) -> R(Ty) {
+  match s {
+    St(sub, lv, cur, ds, rs) -> {
+      let n = array.length(sub)
+      R(TVar(n), St(array.push(sub, TNone), array.push(lv, cur), cur, ds, rs))
+    }
+  }
+}
+fn fresh_list(s: St, n: Int, acc: List(Ty)) -> R(List(Ty)) {
+  if n == 0 { R(rev(acc), s) } else {
+    match fresh(s) { R(t, s2) -> fresh_list(s2, n - 1, Cons(t, acc)) }
+  }
+}
+fn bound(s: St, v: Int) -> R(Ty) {
+  match s {
+    St(sub, lv, cur, ds, rs) -> {
+      let t = array.get(sub, v)
+      R(t, St(sub, lv, cur, ds, rs))
+    }
+  }
+}
+fn set_var(s: St, v: Int, t: Ty) -> St {
+  match s { St(sub, lv, cur, ds, rs) -> St(array.set(sub, v, t), lv, cur, ds, rs) }
+}
+fn level_of(s: St, v: Int) -> R(Int) {
+  match s {
+    St(sub, lv, cur, ds, rs) -> {
+      let l = array.get(lv, v)
+      R(l, St(sub, lv, cur, ds, rs))
+    }
+  }
+}
+fn set_level(s: St, v: Int, l: Int) -> St {
+  match s { St(sub, lv, cur, ds, rs) -> St(sub, array.set(lv, v, l), cur, ds, rs) }
+}
+fn cur_level(s: St) -> R(Int) {
+  match s { St(sub, lv, cur, ds, rs) -> R(cur, St(sub, lv, cur, ds, rs)) }
+}
+fn add_level(s: St, d: Int) -> St {
+  match s { St(sub, lv, cur, ds, rs) -> St(sub, lv, cur + d, ds, rs) }
+}
+fn diag(s: St, code: String, msg: String, start: Int, end: Int) -> St {
+  match s { St(sub, lv, cur, ds, rs) -> St(sub, lv, cur, Cons(Diag(code, msg, start, end), ds), rs) }
+}
+fn record(s: St, start: Int, end: Int, t: Ty) -> St {
+  match s { St(sub, lv, cur, ds, rs) -> St(sub, lv, cur, ds, Cons(Rec(start, end, t), rs)) }
+}
+
+// `t` with the variables at its head followed (`head_of`).
+fn head(s: St, t: Ty) -> R(Ty) {
+  match t {
+    TVar(v) -> match bound(s, v) {
+      R(b, s2) -> match b { TNone -> R(t, s2)  _ -> head(s2, b) }
+    }
+    _ -> R(t, s)
+  }
+}
+// `t` resolved whole (`resolve`).
+fn resolve(s: St, t: Ty) -> R(Ty) {
+  match head(s, t) {
+    R(h, s2) -> match h {
+      TFn(ps, r) -> match resolve_list(s2, ps, Nil) {
+        R(ps2, s3) -> match resolve(s3, r) { R(r2, s4) -> R(TFn(ps2, r2), s4) }
+      }
+      TCon(n, args) -> match resolve_list(s2, args, Nil) { R(args2, s3) -> R(TCon(n, args2), s3) }
+      _ -> R(h, s2)
+    }
+  }
+}
+fn resolve_list(s: St, xs: List(Ty), acc: List(Ty)) -> R(List(Ty)) {
+  match xs {
+    Nil -> R(rev(acc), s)
+    Cons(x, rest) -> match resolve(s, x) { R(y, s2) -> resolve_list(s2, rest, Cons(y, acc)) }
+  }
+}
+
+// The free variables of a resolved type, in the order they first appear
+// (`free_vars`).
+fn free_vars(t: Ty, acc: List(Int)) -> List(Int) {
+  match t {
+    TVar(v) -> if has_int(acc, v) { acc } else { Cons(v, acc) }
+    TFn(ps, r) -> free_vars(r, free_list(ps, acc))
+    TCon(_, args) -> free_list(args, acc)
+    _ -> acc
+  }
+}
+fn free_list(xs: List(Ty), acc: List(Int)) -> List(Int) {
+  match xs { Nil -> acc  Cons(x, rest) -> free_list(rest, free_vars(x, acc)) }
+}
+fn occurs(v: Int, t: Ty) -> Bool {
+  match t {
+    TVar(u) -> u == v
+    TFn(ps, r) -> occurs_list(v, ps) || occurs(v, r)
+    TCon(_, args) -> occurs_list(v, args)
+    _ -> False
+  }
+}
+fn occurs_list(v: Int, xs: List(Ty)) -> Bool {
+  match xs { Nil -> False  Cons(x, rest) -> occurs(v, x) || occurs_list(v, rest) }
+}
+
+// What a variable stood for is where it was (D14): every variable free in
+// the resolved `t` is lowered to `lvl`.
+fn lower_vars(s: St, vs: List(Int), lvl: Int) -> St {
+  match vs {
+    Nil -> s
+    Cons(v, rest) -> match level_of(s, v) {
+      R(l, s2) -> lower_vars(if l > lvl { set_level(s2, v, lvl) } else { s2 }, rest, lvl)
+    }
+  }
+}
+fn lower_levels(s: St, t: Ty, lvl: Int) -> St {
+  match resolve(s, t) { R(rt, s2) -> lower_vars(s2, rev(free_vars(rt, Nil)), lvl) }
+}
+
+// ---- Unification ----------------------------------------------------------
+
+fn bind(s: St, v: Int, t: Ty, start: Int, end: Int) -> St {
+  match t {
+    TVar(u) -> if u == v { s } else { bind_checked(s, v, t, start, end) }
+    _ -> bind_checked(s, v, t, start, end)
+  }
+}
+fn bind_checked(s: St, v: Int, t: Ty, start: Int, end: Int) -> St {
+  match resolve(s, t) {
+    R(rt, s2) -> if occurs(v, rt) {
+      set_var(diag(s2, "E0401", "infinite type", start, end), v, TErr)
+    } else {
+      match level_of(s2, v) { R(l, s3) -> set_var(lower_levels(s3, t, l), v, t) }
+    }
+  }
+}
+
+fn unify(s: St, a: Ty, b: Ty, start: Int, end: Int) -> St {
+  match head(s, a) {
+    R(x, s1) -> match head(s1, b) { R(y, s2) -> unify_heads(s2, x, y, start, end) }
+  }
+}
+fn mismatch(s: St, start: Int, end: Int) -> St { diag(s, "E0400", "type mismatch", start, end) }
+fn unify_heads(s: St, x: Ty, y: Ty, start: Int, end: Int) -> St {
+  match x {
+    TErr -> s
+    TVar(a) -> match y {
+      TErr -> s
+      TVar(b) -> if a == b { s } else { bind(s, a, y, start, end) }
+      _ -> bind(s, a, y, start, end)
+    }
+    _ -> match y {
+      TErr -> s
+      TVar(b) -> bind(s, b, x, start, end)
+      _ -> unify_rigid(s, x, y, start, end)
+    }
+  }
+}
+fn unify_rigid(s: St, x: Ty, y: Ty, start: Int, end: Int) -> St {
+  match x {
+    TB(a) -> match y { TB(b) -> if a == b { s } else { mismatch(s, start, end) }  _ -> mismatch(s, start, end) }
+    TFn(p1, r1) -> match y {
+      TFn(p2, r2) -> if len(p1) != len(p2) {
+        diag(s, "E0402", "wrong number of arguments", start, end)
+      } else {
+        unify(unify_pairs(s, p1, p2, start, end), r1, r2, start, end)
+      }
+      _ -> mismatch(s, start, end)
+    }
+    TCon(n1, a1) -> match y {
+      TCon(n2, a2) -> if n1 == n2 && len(a1) == len(a2) {
+        unify_pairs(s, a1, a2, start, end)
+      } else { mismatch(s, start, end) }
+      _ -> mismatch(s, start, end)
+    }
+    _ -> mismatch(s, start, end)
+  }
+}
+fn unify_pairs(s: St, xs: List(Ty), ys: List(Ty), start: Int, end: Int) -> St {
+  match xs {
+    Nil -> s
+    Cons(x, xr) -> match ys {
+      Nil -> s
+      Cons(y, yr) -> unify_pairs(unify(s, x, y, start, end), xr, yr, start, end)
+    }
+  }
+}
+
+// ---- Schemes ----------------------------------------------------------------
+
+fn lookup(env: List(Entry), name: String) -> Maybe(Scheme) {
+  match env {
+    Nil -> No
+    Cons(e, rest) -> match e { Entry(n, sc) -> if n == name { Yes(sc) } else { lookup(rest, name) } }
+  }
+}
+type Pair { Pair(Int, Ty) }
+fn subst_get(m: List(Pair), v: Int) -> Maybe(Ty) {
+  match m {
+    Nil -> No
+    Cons(p, rest) -> match p { Pair(u, t) -> if u == v { Yes(t) } else { subst_get(rest, v) } }
+  }
+}
+fn subst(t: Ty, m: List(Pair)) -> Ty {
+  match t {
+    TVar(v) -> match subst_get(m, v) { Yes(f) -> f  No -> t }
+    TFn(ps, r) -> TFn(subst_list(ps, m, Nil), subst(r, m))
+    TCon(n, args) -> TCon(n, subst_list(args, m, Nil))
+    _ -> t
+  }
+}
+fn subst_list(xs: List(Ty), m: List(Pair), acc: List(Ty)) -> List(Ty) {
+  match xs { Nil -> rev(acc)  Cons(x, rest) -> subst_list(rest, m, Cons(subst(x, m), acc)) }
+}
+fn instantiate(s: St, sc: Scheme) -> R(Ty) {
+  match sc {
+    Scheme(vars, t) -> match vars {
+      Nil -> R(t, s)
+      _ -> match fresh_map(s, vars, Nil) { R(m, s2) -> R(subst(t, m), s2) }
+    }
+  }
+}
+fn fresh_map(s: St, vars: List(Int), acc: List(Pair)) -> R(List(Pair)) {
+  match vars {
+    Nil -> R(acc, s)
+    Cons(v, rest) -> match fresh(s) { R(f, s2) -> fresh_map(s2, rest, Cons(Pair(v, f), acc)) }
+  }
+}
+// The variables of the resolved `t` above the current level (`generalize`).
+fn above(s: St, vs: List(Int), lvl: Int, acc: List(Int)) -> R(List(Int)) {
+  match vs {
+    Nil -> R(rev(acc), s)
+    Cons(v, rest) -> match level_of(s, v) {
+      R(l, s2) -> above(s2, rest, lvl, if l > lvl { Cons(v, acc) } else { acc })
+    }
+  }
+}
+fn generalize(s: St, t: Ty) -> R(Scheme) {
+  match resolve(s, t) {
+    R(rt, s2) -> match cur_level(s2) {
+      R(lvl, s3) -> match above(s3, rev(free_vars(rt, Nil)), lvl, Nil) { R(vs, s4) -> R(Scheme(vs, rt), s4) }
+    }
+  }
+}
+
+// ---- Annotations --------------------------------------------------------------
+
+fn elaborate(a: Sp(TypeAnn)) -> Ty {
+  match a {
+    Sp(TypeAnn(name, _, _), _, _) -> {
+      if name == "Int" { TB(0) } else { if name == "Float" { TB(1) } else {
+        if name == "Bool" { TB(2) } else { if name == "String" { TB(3) } else {
+          if name == "Unit" { TB(4) } else { TCon(name, Nil) } } } } }
+    }
+  }
+}
+fn check_ann(s: St, ann: Maybe(Sp(TypeAnn)), t: Ty) -> St {
+  match ann {
+    No -> s
+    Yes(a) -> match a { Sp(_, start, end) -> unify(s, elaborate(a), t, start, end) }
+  }
+}
+
+// ---- Expressions ----------------------------------------------------------------
+
+fn is_value(e: Expr) -> Bool {
+  match e {
+    EVar(_) -> True  EQualified(_, _) -> True  EInt(_) -> True  EFloat -> True
+    EStr(_) -> True  EBool(_) -> True  EUnit -> True  ELambda(_, _) -> True  _ -> False
+  }
+}
+
+fn infer_block(s: St, b: Block, env: List(Entry)) -> R(Ty) {
+  match b {
+    Block(stmts, tail) -> match infer_stmts(s, stmts, env) {
+      R(env2, s2) -> match tail { No -> R(TB(4), s2)  Yes(t) -> infer_expr(s2, t, env2) }
+    }
+  }
+}
+fn infer_stmts(s: St, stmts: List(Sp(Stmt)), env: List(Entry)) -> R(List(Entry)) {
+  match stmts {
+    Nil -> R(env, s)
+    Cons(st, rest) -> match st {
+      Sp(SExpr(e), _, _) -> match infer_expr(s, e, env) { R(_, s2) -> infer_stmts(s2, rest, env) }
+      Sp(SLet(name, ann, value), _, _) -> match infer_expr(add_level(s, 1), value, env) {
+        R(t, s2) -> {
+          let s3 = add_level(check_ann(s2, ann, t), 0 - 1)
+          match let_scheme(s3, value, t) { R(sc, s4) -> infer_stmts(s4, rest, Cons(Entry(name, sc), env)) }
+        }
+      }
+    }
+  }
+}
+// The value restriction (spec 4b-1 §2.4): only a syntactic value is
+// generalized; a non-value's variables are the environment's from here on.
+fn let_scheme(s: St, value: Sp(Expr), t: Ty) -> R(Scheme) {
+  match value {
+    Sp(e, _, _) -> if is_value(e) { generalize(s, t) } else {
+      match cur_level(s) {
+        R(lvl, s2) -> match resolve(lower_levels(s2, t, lvl), t) { R(rt, s3) -> R(Scheme(Nil, rt), s3) }
+      }
+    }
+  }
+}
+
+// Record-then-zonk: every expression's type at its span, after inferring it.
+fn infer_expr(s: St, e: Sp(Expr), env: List(Entry)) -> R(Ty) {
+  match e {
+    Sp(node, start, end) -> match infer_inner(s, node, start, end, env) {
+      R(t, s2) -> R(t, record(s2, start, end, t))
+    }
+  }
+}
+
+fn binop_left(op: String) -> Ty {
+  if op == "+." || op == "-." || op == "*." || op == "/." || op == "<." || op == "<=." || op == ">." || op == ">=." { TB(1) } else {
+    if op == "<>" { TB(3) } else { if op == "&&" || op == "||" { TB(2) } else { TB(0) } }
+  }
+}
+fn binop_result(op: String) -> Ty {
+  if op == "<" || op == "<=" || op == ">" || op == ">=" || op == "<." || op == "<=." || op == ">." || op == ">=." || op == "&&" || op == "||" { TB(2) } else {
+    binop_left(op)
+  }
+}
+
+fn infer_inner(s: St, node: Expr, start: Int, end: Int, env: List(Entry)) -> R(Ty) {
+  match node {
+    EInt(_) -> R(TB(0), s)
+    EFloat -> R(TB(1), s)
+    EStr(_) -> R(TB(3), s)
+    EBool(_) -> R(TB(2), s)
+    EUnit -> R(TB(4), s)
+    EError -> R(TErr, s)
+    EVar(name) -> match lookup(env, name) { Yes(sc) -> instantiate(s, sc)  No -> R(TErr, s) }
+    EQualified(_, _) -> R(TErr, s)
+    EUnary(op, x) -> match infer_expr(s, x, env) {
+      R(t, s2) -> {
+        let want = if op == "!" { TB(2) } else { if op == "-." { TB(1) } else { TB(0) } }
+        R(want, unify(s2, t, want, start, end))
+      }
+    }
+    EBinary(op, l, r) -> match infer_expr(s, l, env) {
+      R(lt, s2) -> match infer_expr(s2, r, env) {
+        R(rt, s3) -> if op == "==" || op == "!=" {
+          R(TB(2), unify(s3, lt, rt, start, end))
+        } else {
+          let want = binop_left(op)
+          R(binop_result(op), unify(unify(s3, lt, want, start, end), rt, want, start, end))
+        }
+      }
+    }
+    EIf(c, tb, eb) -> match infer_expr(s, c, env) {
+      R(ct, s2) -> {
+        let s3 = match c { Sp(_, cs, ce) -> unify_cond(s2, ct, cs, ce) }
+        match infer_block(s3, sp_block(tb), env) {
+          R(tt, s4) -> match infer_block(s4, sp_block(eb), env) {
+            R(et, s5) -> R(tt, unify(s5, tt, et, start, end))
+          }
+        }
+      }
+    }
+    EBlock(b) -> infer_block(s, b, env)
+    ECall(callee, args) -> infer_call(s, callee, args, start, end, env)
+    _ -> R(TErr, s)
+  }
+}
+fn sp_block(b: Sp(Block)) -> Block { match b { Sp(x, _, _) -> x } }
+
+fn unify_cond(s: St, t: Ty, start: Int, end: Int) -> St {
+  match resolve(s, t) {
+    R(rt, s2) -> match rt {
+      TB(2) -> unify(s2, t, TB(2), start, end)
+      TErr -> unify(s2, t, TB(2), start, end)
+      TVar(_) -> unify(s2, t, TB(2), start, end)
+      _ -> diag(s2, "E0403", "condition must be `Bool`", start, end)
+    }
+  }
+}
+
+fn infer_args(s: St, args: List(Sp(Expr)), env: List(Entry), acc: List(Ty)) -> R(List(Ty)) {
+  match args {
+    Nil -> R(rev(acc), s)
+    Cons(a, rest) -> match infer_expr(s, a, env) { R(t, s2) -> infer_args(s2, rest, env, Cons(t, acc)) }
+  }
+}
+fn infer_call(s: St, callee: Sp(Expr), args: List(Sp(Expr)), start: Int, end: Int, env: List(Entry)) -> R(Ty) {
+  match callee {
+    Sp(EQualified(_, _), _, _) -> R(TErr, s)
+    Sp(EVar(name), cs, ce) -> {
+      let f = match lookup(env, name) {
+        Yes(sc) -> match instantiate(s, sc) { R(t, s2) -> R(t, record(s2, cs, ce, t)) }
+        No -> R(TErr, s)
+      }
+      match f { R(ft, s2) -> call_with(s2, ft, args, start, end, env) }
+    }
+    _ -> match infer_expr(s, callee, env) { R(ft, s2) -> call_with(s2, ft, args, start, end, env) }
+  }
+}
+fn call_with(s: St, f: Ty, args: List(Sp(Expr)), start: Int, end: Int, env: List(Entry)) -> R(Ty) {
+  match infer_args(s, args, env, Nil) {
+    R(ts, s2) -> match fresh(s2) { R(result, s3) -> R(result, unify(s3, f, TFn(ts, result), start, end)) }
+  }
+}
+
+// ---- The call graph (`collect_refs`, `tarjan_scc`) ----------------------------
+
+fn refs_block(b: Block, acc: List(String)) -> List(String) {
+  match b {
+    Block(stmts, tail) -> {
+      let a2 = refs_stmts(stmts, acc)
+      match tail { No -> a2  Yes(t) -> refs_expr(t, a2) }
+    }
+  }
+}
+fn refs_stmts(stmts: List(Sp(Stmt)), acc: List(String)) -> List(String) {
+  match stmts {
+    Nil -> acc
+    Cons(st, rest) -> match st {
+      Sp(SLet(_, _, v), _, _) -> refs_stmts(rest, refs_expr(v, acc))
+      Sp(SExpr(e), _, _) -> refs_stmts(rest, refs_expr(e, acc))
+    }
+  }
+}
+fn refs_list(xs: List(Sp(Expr)), acc: List(String)) -> List(String) {
+  match xs { Nil -> acc  Cons(x, rest) -> refs_list(rest, refs_expr(x, acc)) }
+}
+fn refs_arms(arms: List(Sp(MatchArm)), acc: List(String)) -> List(String) {
+  match arms {
+    Nil -> acc
+    Cons(a, rest) -> match a { Sp(MatchArm(_, body), _, _) -> refs_arms(rest, refs_expr(body, acc)) }
+  }
+}
+fn refs_clauses(cs: List(Sp(OpClause)), acc: List(String)) -> List(String) {
+  match cs {
+    Nil -> acc
+    Cons(c, rest) -> match c { Sp(OpClause(_, _, _, body), _, _) -> refs_clauses(rest, refs_expr(body, acc)) }
+  }
+}
+// Newest first, as `acc` grows.
+fn refs_expr(e: Sp(Expr), acc: List(String)) -> List(String) {
+  match e {
+    Sp(node, _, _) -> match node {
+      EVar(n) -> Cons(n, acc)
+      ECall(c, args) -> refs_list(args, refs_expr(c, acc))
+      EUnary(_, x) -> refs_expr(x, acc)
+      EBinary(_, l, r) -> refs_expr(r, refs_expr(l, acc))
+      EIf(c, t, f) -> refs_block(sp_block(f), refs_block(sp_block(t), refs_expr(c, acc)))
+      EBlock(b) -> refs_block(b, acc)
+      EMatch(x, arms) -> refs_arms(arms, refs_expr(x, acc))
+      ELambda(_, body) -> refs_block(sp_block(body), acc)
+      EHandle(body, h) -> match h {
+        Handler(_, _, clauses, ret) -> {
+          let a2 = refs_clauses(clauses, refs_expr(body, acc))
+          match ret { No -> a2  Yes(ReturnClause(_, rb)) -> refs_expr(rb, a2) }
+        }
+      }
+      EResume(x) -> refs_expr(x, acc)
+      _ -> acc
+    }
+  }
+}
+// The last function of a name, as Rust's name-to-index map keeps it.
+fn fn_index(fns: List(FnInfo), name: String, i: Int, found: Int) -> Int {
+  match fns {
+    Nil -> found
+    Cons(f, rest) -> match f {
+      FnInfo(n, _, _, _, _, _) -> fn_index(rest, name, i + 1, if n == name { i } else { found })
+    }
+  }
+}
+fn edges_of(fns: List(FnInfo), names: List(String), acc: List(Int)) -> List(Int) {
+  match names {
+    Nil -> rev(acc)
+    Cons(n, rest) -> {
+      let j = fn_index(fns, n, 0, 0 - 1)
+      edges_of(fns, rest, if j < 0 || has_int(acc, j) { acc } else { Cons(j, acc) })
+    }
+  }
+}
+fn all_edges(fns: List(FnInfo), xs: List(FnInfo), acc: List(List(Int))) -> List(List(Int)) {
+  match xs {
+    Nil -> rev(acc)
+    Cons(f, rest) -> match f {
+      FnInfo(_, _, _, _, _, body) -> all_edges(fns, rest, Cons(edges_of(fns, rev(refs_block(sp_block(body), Nil)), Nil), acc))
+    }
+  }
+}
+fn nth_edges(es: List(List(Int)), i: Int) -> List(Int) {
+  match es { Nil -> Nil  Cons(e, rest) -> if i == 0 { e } else { nth_edges(rest, i - 1) } }
+}
+
+// Tarjan's state: index, low, on-stack, the stack, the counter, the
+// components (newest first).
+linear type Tj { Tj(Array(Int), Array(Int), Array(Bool), List(Int), Int, List(List(Int))) }
+type Frame { Frame(Int, Int) }
+fn filled(a: Array(Int), n: Int, v: Int) -> Array(Int) { if n == 0 { a } else { filled(array.push(a, v), n - 1, v) } }
+fn filled_b(a: Array(Bool), n: Int) -> Array(Bool) { if n == 0 { a } else { filled_b(array.push(a, False), n - 1) } }
+
+fn tarjan(es: List(List(Int)), n: Int) -> List(List(Int)) {
+  match tj_starts(Tj(filled(array.new(), n, 0 - 1), filled(array.new(), n, 0), filled_b(array.new(), n), Nil, 0, Nil), es, 0, n) {
+    Tj(_, _, _, _, _, out) -> rev(out)
+  }
+}
+fn tj_starts(t: Tj, es: List(List(Int)), start: Int, n: Int) -> Tj {
+  if start == n { t } else {
+    match t {
+      Tj(index, low, on, stack, counter, out) -> {
+        let seen = array.get(index, start) >= 0
+        let t2 = Tj(index, low, on, stack, counter, out)
+        tj_starts(if seen { t2 } else { tj_loop(t2, es, Cons(Frame(start, 0), Nil)) }, es, start + 1, n)
+      }
+    }
+  }
+}
+fn tj_loop(t: Tj, es: List(List(Int)), call: List(Frame)) -> Tj {
+  match call {
+    Nil -> t
+    Cons(fr, below) -> match fr {
+      Frame(v, pi) -> {
+        let t2 = if pi == 0 { tj_visit(t, v) } else { t }
+        tj_scan(t2, es, v, pi, nth_edges(es, v), below)
+      }
+    }
+  }
+}
+fn tj_visit(t: Tj, v: Int) -> Tj {
+  match t {
+    Tj(index, low, on, stack, counter, out) ->
+      Tj(array.set(index, v, counter), array.set(low, v, counter), array.set(on, v, True), Cons(v, stack), counter + 1, out)
+  }
+}
+fn tj_scan(t: Tj, es: List(List(Int)), v: Int, pi: Int, edges: List(Int), below: List(Frame)) -> Tj {
+  if pi < len(edges) {
+    let w = nth_int(edges, pi)
+    match t {
+      Tj(index, low, on, stack, counter, out) -> {
+        let iw = array.get(index, w)
+        if iw < 0 {
+          tj_loop(Tj(index, low, on, stack, counter, out), es, Cons(Frame(w, 0), Cons(Frame(v, pi + 1), below)))
+        } else {
+          let low2 = if array.get(on, w) {
+            let lv = array.get(low, v)
+            array.set(low, v, if iw < lv { iw } else { lv })
+          } else { low }
+          tj_scan(Tj(index, low2, on, stack, counter, out), es, v, pi + 1, edges, below)
+        }
+      }
+    }
+  } else {
+    tj_finish(t, es, v, below)
+  }
+}
+fn tj_finish(t: Tj, es: List(List(Int)), v: Int, below: List(Frame)) -> Tj {
+  match t {
+    Tj(index, low, on, stack, counter, out) -> {
+      let lv = array.get(low, v)
+      let t2 = if lv == array.get(index, v) {
+        tj_pop(Tj(index, low, on, stack, counter, out), v, Nil)
+      } else { Tj(index, low, on, stack, counter, out) }
+      match below {
+        Nil -> t2
+        Cons(Frame(parent, ppi), rest) -> match t2 {
+          Tj(i2, l2, o2, s2, c2, out2) -> {
+            let lp = array.get(l2, parent)
+            let l3 = array.set(l2, parent, if lv < lp { lv } else { lp })
+            tj_resume(Tj(i2, l3, o2, s2, c2, out2), es, parent, ppi, rest)
+          }
+        }
+      }
+    }
+  }
+}
+// The parent frame continues its scan where it stopped.
+fn tj_resume(t: Tj, es: List(List(Int)), v: Int, pi: Int, below: List(Frame)) -> Tj {
+  tj_scan(t, es, v, pi, nth_edges(es, v), below)
+}
+fn tj_pop(t: Tj, v: Int, comp: List(Int)) -> Tj {
+  match t {
+    Tj(index, low, on, stack, counter, out) -> match stack {
+      Nil -> Tj(index, low, on, stack, counter, Cons(rev(comp), out))
+      Cons(w, rest) -> {
+        let t2 = Tj(index, low, array.set(on, w, False), rest, counter, out)
+        if w == v { match t2 { Tj(a, b, c, d, e, o) -> Tj(a, b, c, d, e, Cons(rev(Cons(w, comp)), o)) } } else { tj_pop(t2, v, Cons(w, comp)) }
+      }
+    }
+  }
+}
+
+// ---- The top level (`infer_all`) ------------------------------------------------
+
+fn fn_infos(decls: List(Sp(Decl)), acc: List(FnInfo)) -> List(FnInfo) {
+  match decls {
+    Nil -> rev(acc)
+    Cons(d, rest) -> match d {
+      Sp(DFn(_, name, params, _, ret, body), start, end) -> fn_infos(rest, Cons(FnInfo(name, start, end, params, ret, body), acc))
+      _ -> fn_infos(rest, acc)
+    }
+  }
+}
+type SchemeLine { SchemeLine(String, String) }
+// What the groups leave: the environment and the scheme lines.
+type Out { Out(List(Entry), List(SchemeLine)) }
+
+fn check_anns(s: St, params: List(Sp(Param)), tys: List(Ty)) -> St {
+  match params {
+    Nil -> s
+    Cons(p, rest) -> match tys {
+      Nil -> s
+      Cons(t, trest) -> match p { Sp(Param(_, ann, _), _, _) -> check_anns(check_ann(s, ann, t), rest, trest) }
+    }
+  }
+}
+type MemsEnv { MemsEnv(List(Mem), List(Entry)) }
+fn members_more(s: St, fns: List(FnInfo), group: List(Int), env: List(Entry), acc: List(Mem)) -> R(Out) {
+  match members_list(s, fns, group, env, acc) {
+    R(MemsEnv(ms, env2), s2) -> bodies(s2, fns, rev(ms), env2, rev(ms))
+  }
+}
+// Step 1: a fresh monotype per member, its annotations checked, its type
+// recorded at its declaration.
+fn members_list(s: St, fns: List(FnInfo), group: List(Int), env: List(Entry), acc: List(Mem)) -> R(MemsEnv) {
+  match group {
+    Nil -> R(MemsEnv(acc, env), s)
+    Cons(i, rest) -> match nth_fn(fns, i) {
+      FnInfo(name, ds, de, params, ret, _) -> match fresh_list(s, len(params), Nil) {
+        R(ps, s2) -> match fresh(s2) {
+          R(result, s3) -> {
+            let ft = TFn(ps, result)
+            let s4 = record(check_ann(check_anns(s3, params, ps), ret, result), ds, de, ft)
+            members_list(s4, fns, rest, Cons(Entry(name, Scheme(Nil, ft)), env), Cons(Mem(i, ps, result), acc))
+          }
+        }
+      }
+    }
+  }
+}
+fn bind_params(s: St, params: List(Sp(Param)), tys: List(Ty), env: List(Entry)) -> R(List(Entry)) {
+  match params {
+    Nil -> R(env, s)
+    Cons(p, rest) -> match tys {
+      Nil -> R(env, s)
+      Cons(t, trest) -> match p {
+        Sp(Param(name, _, _), start, end) -> bind_params(record(s, start, end, t), rest, trest, Cons(Entry(name, Scheme(Nil, t)), env))
+      }
+    }
+  }
+}
+// Step 2: each body under its parameters, the group monomorphic.
+fn bodies(s: St, fns: List(FnInfo), ms: List(Mem), env: List(Entry), all: List(Mem)) -> R(Out) {
+  match ms {
+    Nil -> schemes_of(s, fns, all, env, Nil)
+    Cons(Mem(i, ps, result), rest) -> match nth_fn(fns, i) {
+      FnInfo(_, _, _, params, _, body) -> match bind_params(s, params, ps, env) {
+        R(benv, s2) -> match body {
+          Sp(b, bs, be) -> match infer_block(s2, b, benv) {
+            R(bt, s3) -> bodies(unify(s3, result, bt, bs, be), fns, rest, env, all)
+          }
+        }
+      }
+    }
+  }
+}
+// Step 3: each member generalized; nothing outside the group is left free
+// in this fragment, so every free variable is quantified.
+fn schemes_of(s: St, fns: List(FnInfo), ms: List(Mem), env: List(Entry), lines: List(SchemeLine)) -> R(Out) {
+  match ms {
+    Nil -> R(Out(env, lines), s)
+    Cons(Mem(i, ps, result), rest) -> match nth_fn(fns, i) {
+      FnInfo(name, _, _, _, _, _) -> match resolve(s, TFn(ps, result)) {
+        R(rt, s2) -> {
+          let sc = Scheme(rev(free_vars(rt, Nil)), rt)
+          schemes_of(s2, fns, rest, Cons(Entry(name, sc), env), Cons(SchemeLine(name, show_scheme(sc)), lines))
+        }
+      }
+    }
+  }
+}
+fn groups(s: St, fns: List(FnInfo), gs: List(List(Int)), env: List(Entry), lines: List(SchemeLine)) -> R(List(SchemeLine)) {
+  match gs {
+    Nil -> R(lines, s)
+    Cons(g, rest) -> match members_more(s, fns, g, env, Nil) {
+      R(Out(env2, more), s2) -> groups(s2, fns, rest, env2, rev_onto(rev(more), lines))
+    }
+  }
+}
+
+// ---- Printing (`write_ty`, `display_scheme`, `TyPrinter`) -----------------------
+
+type Name { Name(Int, String) }
+linear type Names { Names(List(Name), Int) }
+linear type Shown { Shown(String, Names) }
+fn letter(i: Int) -> String {
+  let c = string.slice("abcdefghijklmnopqrstuvwxyz", i % 26, i % 26 + 1)
+  if i < 26 { c } else { c <> int.to_string(i / 26) }
+}
+fn name_get(ns: List(Name), v: Int) -> Maybe(String) {
+  match ns { Nil -> No  Cons(Name(u, n), rest) -> if u == v { Yes(n) } else { name_get(rest, v) } }
+}
+fn name_of(names: Names, v: Int) -> Shown {
+  match names {
+    Names(ns, count) -> match name_get(ns, v) {
+      Yes(n) -> Shown(n, Names(ns, count))
+      No -> {
+        let n = letter(count)
+        Shown(n, Names(Cons(Name(v, n), ns), count + 1))
+      }
+    }
+  }
+}
+fn show(t: Ty, names: Names) -> Shown {
+  match t {
+    TVar(v) -> name_of(names, v)
+    TB(c) -> Shown(if c == 0 { "Int" } else { if c == 1 { "Float" } else { if c == 2 { "Bool" } else { if c == 3 { "String" } else { "Unit" } } } }, names)
+    TFn(ps, r) -> match show_list(ps, names, "") {
+      Shown(p, n2) -> match show(r, n2) { Shown(rs, n3) -> Shown("fn(" <> p <> ") -> " <> rs, n3) }
+    }
+    TCon(n, args) -> match args {
+      Nil -> Shown(n, names)
+      _ -> match show_list(args, names, "") { Shown(a, n2) -> Shown(n <> "(" <> a <> ")", n2) }
+    }
+    _ -> Shown("<error>", names)
+  }
+}
+fn show_list(xs: List(Ty), names: Names, sep: String) -> Shown {
+  match xs {
+    Nil -> Shown("", names)
+    Cons(x, rest) -> match show(x, names) {
+      Shown(a, n2) -> match show_list(rest, n2, ", ") { Shown(b, n3) -> Shown(sep <> a <> b, n3) }
+    }
+  }
+}
+fn seed(vs: List(Int), names: Names, acc: String) -> Shown {
+  match vs {
+    Nil -> Shown(acc, names)
+    Cons(v, rest) -> match name_of(names, v) {
+      Shown(n, n2) -> seed(rest, n2, if acc == "" { n } else { acc <> " " <> n })
+    }
+  }
+}
+fn show_scheme(sc: Scheme) -> String {
+  match sc {
+    Scheme(vars, t) -> match seed(vars, Names(Nil, 0), "") {
+      Shown(q, n2) -> match show(t, n2) {
+        Shown(body, _) -> if q == "" { body } else { "forall " <> q <> ". " <> body }
+      }
+    }
+  }
+}
+
+// ---- Sorting and the dump -------------------------------------------------------
+
+fn str_lt(a: String, b: String, i: Int) -> Bool {
+  if i == string.length(a) { i < string.length(b) } else {
+    if i == string.length(b) { False } else {
+      let x = string.byte_at(a, i)
+      let y = string.byte_at(b, i)
+      if x == y { str_lt(a, b, i + 1) } else { x < y }
+    }
+  }
+}
+fn line_le(a: SchemeLine, b: SchemeLine) -> Bool {
+  match a {
+    SchemeLine(n1, s1) -> match b {
+      SchemeLine(n2, s2) -> if n1 == n2 { !str_lt(s2, s1, 0) } else { str_lt(n1, n2, 0) }
+    }
+  }
+}
+fn rec_le(a: Rec, b: Rec) -> Bool {
+  match a { Rec(s1, e1, _) -> match b { Rec(s2, e2, _) -> s1 < s2 || s1 == s2 && e1 <= e2 } }
+}
+type Halves(a) { Halves(List(a), List(a)) }
+fn split(xs: List(a), l: List(a), r: List(a)) -> Halves(a) {
+  match xs {
+    Nil -> Halves(l, r)
+    Cons(x, rest) -> split(rest, r, Cons(x, l))
+  }
+}
+// A stable merge sort: the first of equals stays first.
+fn sort_by(xs: List(a), le: fn(a, a) -> Bool) -> List(a) {
+  match xs {
+    Nil -> Nil
+    Cons(_, Nil) -> xs
+    _ -> match halve(xs, len(xs) / 2, Nil) {
+      Halves(l, r) -> merge(sort_by(l, le), sort_by(r, le), le, Nil)
+    }
+  }
+}
+fn halve(xs: List(a), n: Int, acc: List(a)) -> Halves(a) {
+  if n == 0 { Halves(rev(acc), xs) } else {
+    match xs { Nil -> Halves(rev(acc), Nil)  Cons(x, rest) -> halve(rest, n - 1, Cons(x, acc)) }
+  }
+}
+fn merge(l: List(a), r: List(a), le: fn(a, a) -> Bool, acc: List(a)) -> List(a) {
+  match l {
+    Nil -> rev_onto(acc, r)
+    Cons(x, lr) -> match r {
+      Nil -> rev_onto(acc, l)
+      Cons(y, rr) -> if le(x, y) { merge(lr, r, le, Cons(x, acc)) } else { merge(l, rr, le, Cons(y, acc)) }
+    }
+  }
+}
+// After a stable sort of the newest-first records, the first of each span
+// is the last recorded there.
+fn last_per_span(rs: List(Rec), prev_s: Int, prev_e: Int, acc: List(Rec)) -> List(Rec) {
+  match rs {
+    Nil -> rev(acc)
+    Cons(Rec(s, e, t), rest) -> if s == prev_s && e == prev_e { last_per_span(rest, s, e, acc) } else {
+      last_per_span(rest, s, e, Cons(Rec(s, e, t), acc))
+    }
+  }
+}
+fn quoted(m: String) -> String { "\"" <> m <> "\"" }
+
+fn dump_types(s: St, rs: List(Rec), b: Buffer) -> R(Buffer) {
+  match rs {
+    Nil -> R(b, s)
+    Cons(Rec(start, end, t), rest) -> match resolve(s, t) {
+      R(rt, s2) -> match show(rt, Names(Nil, 0)) {
+        Shown(text, _) -> dump_types(s2, rest, buffer.push(b, "type " <> int.to_string(start) <> " " <> int.to_string(end) <> " " <> text <> "\n"))
+      }
+    }
+  }
+}
+fn dump_schemes(ls: List(SchemeLine), b: Buffer) -> Buffer {
+  match ls {
+    Nil -> b
+    Cons(SchemeLine(n, sc), rest) -> dump_schemes(rest, buffer.push(b, "scheme " <> n <> " " <> sc <> "\n"))
+  }
+}
+fn dump_diags(ds: List(Diag), b: Buffer) -> Buffer {
+  match ds {
+    Nil -> b
+    Cons(Diag(code, msg, start, end), rest) -> dump_diags(rest, buffer.push(b, "error " <> code <> " " <> int.to_string(start) <> " " <> int.to_string(end) <> " " <> quoted(msg) <> "\n"))
+  }
+}
+
+pub fn check_dump(m: Module) -> String {
+  match m {
+    Module(_, decls) -> {
+      let fns = fn_infos(decls, Nil)
+      let order = tarjan(all_edges(fns, fns, Nil), len(fns))
+      match groups(St(array.new(), array.new(), 0, Nil, Nil), fns, order, Nil, Nil) {
+        R(lines, s) -> match s {
+          St(sub, lv, cur, ds, rs) -> {
+            let b1 = dump_schemes(sort_by(rev(lines), line_le), buffer.new())
+            let recs = last_per_span(sort_by(rs, rec_le), 0 - 1, 0 - 1, Nil)
+            match dump_types(St(sub, lv, cur, Nil, Nil), recs, b1) {
+              R(b2, _) -> buffer.finish(dump_diags(rev(ds), b2))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+pub fn main() / {IO} {
+  let text = io.read_file(io.arg(0))
+  match parse.parse_tree(text) {
+    Parsed(m, _) -> {
+      let out = check_dump(m)
+      if string.length(out) == 0 { Unit } else { io.println(string.slice(out, 0, string.length(out) - 1)) }
+    }
+    ParseError(_, _, _) -> Unit
+  }
+}
