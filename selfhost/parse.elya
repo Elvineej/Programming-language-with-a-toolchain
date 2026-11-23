@@ -1,9 +1,7 @@
-// Elya parser, self-hosting part 4a. Clean-program oracle: src/parse.rs.
-// Every span and flag is retained; recovery and full diagnostics are part 4b.
+// Elya parser, self-hosting parts 4a and 4b. Oracle: src/parse.rs.
+// Keep every recovered node, span, flag and diagnostic in oracle order.
 import lex / {IO}
 
-// The surface AST mirrors src/ast.rs. Sp stores the parser's byte offsets.
-// Lists are immutable and duplicable; only the lexer's token array is linear.
 type List(a) { Nil, Cons(a, List(a)) }
 type Maybe(a) { No, Yes(a) }
 type Sp(a) { Sp(a, Int, Int) }
@@ -57,7 +55,6 @@ fn respan(x: Sp(a), start: Int, end: Int) -> Sp(a) {
 }
 
 
-// Token storage stays in parse_dump. Every reader borrows that same array.
 fn tk(borrow ts: Array(Token), src: String, i: Int) -> Int {
   if i >= array.length(ts) { -1 } else {
     match array.get(ts, i) { Token(k, _, _, _) -> k }
@@ -78,9 +75,6 @@ fn payload(borrow ts: Array(Token), src: String, i: Int) -> String {
     match array.get(ts, i) { Token(_, _, _, p) -> p }
   }
 }
-fn err(borrow ts: Array(Token), src: String, i: Int) -> Parsed(a) {
-  ParseError("E0100", ts_start(ts, src, i), ts_end(ts, src, i))
-}
 fn has_newline(src: String, i: Int, end: Int) -> Bool {
   if i >= end { False } else {
     if string.byte_at(src, i) == 10 { True } else { has_newline(src, i + 1, end) }
@@ -91,471 +85,882 @@ fn newline_before(borrow ts: Array(Token), src: String, i: Int) -> Bool {
     has_newline(src, ts_end(ts, src, i - 1), ts_start(ts, src, i))
   }
 }
-// Accumulate negatively so the magnitude of Int's minimum never overflows.
-fn magnitude(text: String, i: Int, n: Int) -> Int {
-  if i == string.length(text) { n } else {
-    magnitude(text, i + 1, int.wrapping_sub(int.wrapping_mul(n, 10), string.byte_at(text, i) - 48))
+
+// Internal parsing returns immutable state; the public Parsed API stays stable.
+type ParseDiag { ParseDiag(String, Int, Int, String) }
+type State { State(Int, List(ParseDiag), Bool, Int, Int, Int, Int, Int) }
+type Read(a) { Read(a, State), Failed(State) }
+fn state_pos(s: State) -> Int { match s { State(x, _, _, _, _, _, _, _) -> x } }
+fn state_diags(s: State) -> List(ParseDiag) { match s { State(_, x, _, _, _, _, _, _) -> x } }
+fn state_eof(s: State) -> Bool { match s { State(_, _, x, _, _, _, _, _) -> x } }
+fn state_decl(s: State) -> Int { match s { State(_, _, _, x, _, _, _, _) -> x } }
+fn state_raised(s: State) -> Int { match s { State(_, _, _, _, x, _, _, _) -> x } }
+fn state_depth(s: State) -> Int { match s { State(_, _, _, _, _, x, _, _) -> x } }
+fn state_height(s: State) -> Int { match s { State(_, _, _, _, _, _, x, _) -> x } }
+fn state_stop(s: State) -> Int { match s { State(_, _, _, _, _, _, _, x) -> x } }
+fn set_pos(s: State, x: Int) -> State { match s { State(_, ds, e, d, r, dep, h, t) -> State(x, ds, e, d, r, dep, h, t) } }
+fn set_decl(s: State, x: Int) -> State { match s { State(p, ds, e, _, r, dep, h, t) -> State(p, ds, e, x, r, dep, h, t) } }
+fn set_depth(s: State, x: Int) -> State { match s { State(p, ds, e, d, r, _, h, t) -> State(p, ds, e, d, r, x, h, t) } }
+fn set_height(s: State, x: Int) -> State { match s { State(p, ds, e, d, r, dep, _, t) -> State(p, ds, e, d, r, dep, x, t) } }
+fn set_stop(s: State, x: Int) -> State { match s { State(p, ds, e, d, r, dep, h, _) -> State(p, ds, e, d, r, dep, h, x) } }
+fn set_eof(s: State) -> State { match s { State(p, ds, _, d, r, dep, h, t) -> State(p, ds, True, d, r, dep, h, t) } }
+fn raise(s: State) -> State { match s { State(p, ds, e, d, r, dep, h, t) -> State(p, ds, e, d, r + 1, dep, h, t) } }
+fn max_int(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+fn min_int(a: Int, b: Int) -> Int { if a < b { a } else { b } }
+// Token readers avoid nested state accessor calls in the evaluator.
+fn peek(borrow ts: Array(Token), src: String, s: State) -> Int {
+  match s { State(p, _, _, _, _, _, _, stop) -> {
+    if stop >= 0 || p >= array.length(ts) { -1 } else { match array.get(ts, p) { Token(k, _, _, _) -> k } }
+  } }
+}
+fn current_token(borrow ts: Array(Token), src: String, s: State) -> Token {
+  match s { State(p, _, _, _, _, _, _, stop) -> {
+    if p >= array.length(ts) { Token(-1, string.length(src), string.length(src), "") } else {
+      let token = array.get(ts, p)
+      if stop >= 0 { match token { Token(_, a, b, text) -> Token(-1, a, b, text) } } else { token }
+    }
+  } }
+}
+fn start_at(borrow ts: Array(Token), src: String, s: State) -> Int {
+  match s { State(p, _, _, _, _, _, _, _) -> { if p >= array.length(ts) { string.length(src) } else { match array.get(ts, p) { Token(_, a, _, _) -> a } } } }
+}
+fn end_at(borrow ts: Array(Token), src: String, s: State) -> Int {
+  match s { State(p, _, _, _, _, _, _, _) -> { if p >= array.length(ts) { string.length(src) } else { match array.get(ts, p) { Token(_, _, b, _) -> b } } } }
+}
+fn text_at(borrow ts: Array(Token), src: String, s: State) -> String {
+  match s { State(p, _, _, _, _, _, _, _) -> { if p >= array.length(ts) { "" } else { match array.get(ts, p) { Token(_, _, _, text) -> text } } } }
+}
+fn bump(borrow ts: Array(Token), src: String, s: State) -> State {
+  match s { State(p, ds, e, d, r, dep, h, stop) -> {
+    if stop >= 0 || p >= array.length(ts) { s } else { State(p + 1, ds, e, d, r, dep, h, stop) }
+  } }
+}
+fn last_at_eof(ds: List(ParseDiag), a: Int, b: Int, eof: Int) -> Bool {
+  match ds { Nil -> False Cons(ParseDiag(_, x, y, _), _) -> a == x && b == y && a == eof }
+}
+fn push_diag(s: State, src: String, code: String, a: Int, b: Int, message: String) -> State {
+  match s { State(p, ds, eof, d, r, dep, h, stop) -> {
+    let ds = if stop >= 0 || last_at_eof(ds, a, b, string.length(src)) { ds } else { Cons(ParseDiag(code, a, b, message), ds) }
+    State(p, ds, eof, d, r + 1, dep, h, stop)
+  } }
+}
+fn err(borrow ts: Array(Token), src: String, s: State, message: String) -> Read(a) {
+  Failed(push_diag(s, src, "E0100", start_at(ts, src, s), end_at(ts, src, s), message))
+}
+fn silent(s: State) -> Read(a) { Failed(s) }
+fn eof_error(borrow ts: Array(Token), src: String, s: State) -> State {
+  if state_eof(s) || state_stop(s) >= 0 { raise(s) } else {
+    push_diag(set_eof(s), src, "E0100", start_at(ts, src, s), end_at(ts, src, s), "unexpected end of file")
   }
 }
-fn number_value(text: String, negative: Bool) -> Int {
-  let n = magnitude(text, 0, 0)
-  if negative { n } else { int.wrapping_sub(0, n) }
+fn close_brace(borrow ts: Array(Token), src: String, s: State) -> Read(Unit) {
+  if peek(ts, src, s) == 62 { Read(Unit, bump(ts, src, s)) } else {
+    if state_stop(s) >= 0 { Failed(raise(s)) } else {
+      if peek(ts, src, s) < 0 {
+        if state_eof(s) { Failed(s) } else { err(ts, src, set_eof(s), "expected `}`") }
+      } else { err(ts, src, s, "expected `}`") }
+    }
+  }
 }
-
-
-// Type, row, parameter and pattern readers. Every cursor is a token index;
-// ts remains in its owner and is only borrowed at each call.
-fn parse_type(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(TypeAnn)) {
+fn starts_decl(borrow ts: Array(Token), src: String, i: Int) -> Bool {
   let k = tk(ts, src, i)
-  let start = ts_start(ts, src, i)
-  let end = ts_end(ts, src, i)
-  if k == 4 {
-    if tk(ts, src, i + 1) != 59 { err(ts, src, i + 1) } else {
-      match function_type_inputs(ts, src, i + 2, Nil) {
-        Parsed(args, next) -> {
-          if tk(ts, src, next) == 49 {
-            match parse_row(ts, src, next + 1, True) {
-              Parsed(row, after) -> finish_function_type(ts, src, after, start, args, Yes(row))
-              ParseError(code, a, b) -> ParseError(code, a, b)
-            }
-          } else { finish_function_type(ts, src, next, start, args, No) }
-        }
-        ParseError(code, a, b) -> ParseError(code, a, b)
+  k == 3 || k == 6 || k == 9 || k == 10 || k == 13 || (k == 4 && tk(ts, src, i + 1) == 24)
+}
+fn brace_delta(k: Int) -> Int { if k == 61 { 1 } else { if k == 62 { -1 } else { 0 } } }
+fn count_braces(borrow ts: Array(Token), src: String, i: Int, end: Int, n: Int) -> Int {
+  if i >= end { n } else { count_braces(ts, src, i + 1, end, n + brace_delta(tk(ts, src, i))) }
+}
+fn resume_fallback(borrow ts: Array(Token), src: String, i: Int) -> Int {
+  if i >= array.length(ts) { array.length(ts) } else {
+    if starts_decl(ts, src, i) && newline_before(ts, src, i) { i } else { resume_fallback(ts, src, i + 1) }
+  }
+}
+fn resume_scan(borrow ts: Array(Token), src: String, i: Int, first: Int, open: Int) -> Int {
+  if i >= array.length(ts) { resume_fallback(ts, src, first + 1) } else {
+    if open <= 0 && i > first && starts_decl(ts, src, i) { i } else { resume_scan(ts, src, i + 1, first, open + brace_delta(tk(ts, src, i))) }
+  }
+}
+fn too_deep(borrow ts: Array(Token), src: String, s: State, a: Int, b: Int) -> State {
+  if state_stop(s) >= 0 { s } else {
+    let i = state_pos(s)
+    let stop = resume_scan(ts, src, i, i, count_braces(ts, src, min_int(state_decl(s), i), i, 0))
+    set_stop(push_diag(s, src, "E0102", a, b, "expression nested too deeply"), stop)
+  }
+}
+fn enter(borrow ts: Array(Token), src: String, s: State) -> Read(Unit) {
+  match s { State(p, ds, e, d, r, depth, h, stop) -> {
+    if stop >= 0 { Failed(s) } else {
+      if depth >= 1024 { Failed(too_deep(ts, src, s, start_at(ts, src, s), end_at(ts, src, s))) } else {
+        Read(Unit, State(p, ds, e, d, r, depth + 1, h, stop))
       }
     }
-  } else {
-    if k == 59 {
-      if tk(ts, src, i + 1) == 60 {
-        Parsed(Sp(TypeAnn("Unit", Nil, No), start, end), i + 2)
+  } }
+}
+fn leave(s: State) -> State { match s { State(p, ds, e, d, r, depth, h, stop) -> State(p, ds, e, d, r, depth - 1, h, stop) } }
+fn check_height(borrow ts: Array(Token), src: String, s: State, h: Int, a: Int, b: Int) -> Read(Unit) {
+  if h > 1024 { Failed(too_deep(ts, src, s, a, b)) } else { Read(Unit, s) }
+}
+fn integer_digits(text: String, i: Int, n: Int, negative: Bool) -> Maybe(Int) {
+  if i >= string.length(text) { Yes(if negative { n } else { int.wrapping_sub(0, n) }) } else {
+    let c = string.byte_at(text, i)
+    if c == 95 { integer_digits(text, i + 1, n, negative) } else {
+      let digit = c - 48
+      let last = if negative { 8 } else { 7 }
+      if n < -922337203685477580 || (n == -922337203685477580 && digit > last) { No } else {
+        integer_digits(text, i + 1, int.wrapping_sub(int.wrapping_mul(n, 10), digit), negative)
+      }
+    }
+  }
+}
+fn parse_integer(borrow ts: Array(Token), src: String, s: State, text: String, negative: Bool, a: Int, b: Int) -> Read(Int) {
+  match integer_digits(text, 0, 0, negative) { Yes(n) -> Read(n, s) No -> Read(0, push_diag(s, src, "E0002", a, b, "integer literal out of range")) }
+}
+
+// Type and row readers mirror Rust's silent EOF and internal row recovery.
+fn parse_type(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(TypeAnn)) {
+  match enter(ts, src, s) {
+    Failed(s) -> Failed(s)
+    Read(_, s) -> match ty_inner(ts, src, s) {
+      Read(t, s) -> Read(t, leave(s))
+      Failed(s) -> Failed(leave(s))
+    }
+  }
+}
+fn ty_inner(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(TypeAnn)) {
+  match current_token(ts, src, s) { Token(k, start, end, text) -> {
+    if k == 4 {
+      let s = bump(ts, src, s)
+      if peek(ts, src, s) != 59 { err(ts, src, s, "expected `(` in a function type") } else {
+        match ty_inputs(ts, src, bump(ts, src, s), Nil, True) {
+          Failed(s) -> Failed(s)
+          Read(args, s) -> {
+            if peek(ts, src, s) == 49 {
+              match parse_row(ts, src, bump(ts, src, s), True) {
+                Read(row, s) -> ty_function_result(ts, src, s, start, args, Yes(row))
+                Failed(s) -> Failed(s)
+              }
+            } else { ty_function_result(ts, src, s, start, args, No) }
+          }
+        }
+      }
+    } else {
+      if k == 59 {
+        let s = bump(ts, src, s)
+        if peek(ts, src, s) == 60 { Read(Sp(TypeAnn("Unit", Nil, No), start, end), bump(ts, src, s)) } else {
+          match parse_type(ts, src, s) {
+            Failed(s) -> Failed(s)
+            Read(inner, s) -> {
+              if peek(ts, src, s) == 60 { Read(inner, bump(ts, src, s)) } else {
+                err(ts, src, s, "expected `)` -- tuple types are not supported in annotations")
+              }
+            }
+          }
+        }
       } else {
-        match parse_type(ts, src, i + 1) {
-          Parsed(inner, next) -> {
-            if tk(ts, src, next) == 60 { Parsed(inner, next + 1) } else { err(ts, src, next) }
-          }
-          ParseError(code, a, b) -> ParseError(code, a, b)
+        if k < 0 { Failed(s) } else {
+          if k == 24 || k == 25 || k == 23 {
+            let name = if k == 23 { "Unit" } else { text }
+            let s = bump(ts, src, s)
+            if peek(ts, src, s) == 59 {
+              match parse_type_args(ts, src, bump(ts, src, s)) {
+                Failed(s) -> Failed(s)
+                Read(args, s) -> Read(Sp(TypeAnn(name, args, No), start, end), s)
+              }
+            } else { Read(Sp(TypeAnn(name, Nil, No), start, end), s) }
+          } else { err(ts, src, s, "expected a type") }
         }
       }
-    } else {
-      if k == 24 || k == 25 || k == 23 {
-        let name = if k == 23 { "Unit" } else { payload(ts, src, i) }
-        if tk(ts, src, i + 1) == 59 {
-          match parse_type_args(ts, src, i + 2) {
-            Parsed(args, next) -> Parsed(Sp(TypeAnn(name, args, No), start, end), next)
-            ParseError(code, a, b) -> ParseError(code, a, b)
-          }
-        } else { Parsed(Sp(TypeAnn(name, Nil, No), start, end), i + 1) }
-      } else { err(ts, src, i) }
     }
-  }
+  } }
 }
-
-// Function-type inputs are annotations, rather than general row arguments.
-fn function_type_inputs(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(TypeAnn))) -> Parsed(List(Sp(TypeAnn))) {
-  if tk(ts, src, i) == 60 { Parsed(rev(acc), i + 1) } else {
-    match parse_type(ts, src, i) {
-      Parsed(ann, next) -> {
-        if tk(ts, src, next) == 57 {
-          function_type_more(ts, src, next + 1, Cons(ann, acc))
-        } else {
-          if tk(ts, src, next) == 60 { Parsed(rev(Cons(ann, acc)), next + 1) } else { err(ts, src, next) }
+fn ty_inputs(borrow ts: Array(Token), src: String, s: State, acc: List(Sp(TypeAnn)), first: Bool) -> Read(List(Sp(TypeAnn))) {
+  if first && peek(ts, src, s) == 60 { Read(rev(acc), bump(ts, src, s)) } else {
+    match parse_type(ts, src, s) {
+      Failed(s) -> Failed(s)
+      Read(ann, s) -> {
+        if peek(ts, src, s) == 57 { ty_inputs(ts, src, bump(ts, src, s), Cons(ann, acc), False) } else {
+          if peek(ts, src, s) == 60 { Read(rev(Cons(ann, acc)), bump(ts, src, s)) } else {
+            err(ts, src, s, "expected `)` in a function type")
+          }
         }
       }
-      ParseError(code, a, b) -> ParseError(code, a, b)
     }
   }
 }
-
-fn function_type_more(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(TypeAnn))) -> Parsed(List(Sp(TypeAnn))) {
-  if tk(ts, src, i) == 60 { err(ts, src, i) } else { function_type_inputs(ts, src, i, acc) }
-}
-
-fn type_result(args: List(Sp(TypeAnn)), ret: Sp(TypeAnn)) -> List(Sp(TypeAnn)) {
-  reverse_into(rev(args), Cons(ret, Nil))
-}
-
-fn finish_function_type(borrow ts: Array(Token), src: String, i: Int, start: Int, args: List(Sp(TypeAnn)), row: Maybe(RowAnn)) -> Parsed(Sp(TypeAnn)) {
-  if tk(ts, src, i) != 38 { err(ts, src, i) } else {
-    match parse_type(ts, src, i + 1) {
-      Parsed(ret, next) -> Parsed(Sp(TypeAnn("fn", type_result(args, ret), row), start, sp_end(ret)), next)
-      ParseError(code, a, b) -> ParseError(code, a, b)
+fn ty_function_result(borrow ts: Array(Token), src: String, s: State, start: Int, args: List(Sp(TypeAnn)), row: Maybe(RowAnn)) -> Read(Sp(TypeAnn)) {
+  if peek(ts, src, s) != 38 { err(ts, src, s, "expected `->` in a function type") } else {
+    match parse_type(ts, src, bump(ts, src, s)) {
+      Failed(s) -> Failed(s)
+      Read(ret, s) -> Read(Sp(TypeAnn("fn", reverse_into(rev(args), Cons(ret, Nil)), row), start, sp_end(ret)), s)
     }
   }
 }
-
-fn parse_type_arg(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(TypeAnn)) {
-  if tk(ts, src, i) == 61 {
-    let start = ts_start(ts, src, i)
-    let end = ts_end(ts, src, i)
-    match parse_row(ts, src, i, True) {
-      Parsed(row, next) -> {
+fn parse_type_arg(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(TypeAnn)) {
+  if peek(ts, src, s) == 61 {
+    let start = start_at(ts, src, s)
+    let end = end_at(ts, src, s)
+    match parse_row(ts, src, s, True) {
+      Read(row, s) -> {
         let result = Sp(TypeAnn("$Row", Nil, No), start, end)
-        Parsed(Sp(TypeAnn("fn", Cons(result, Nil), Yes(row)), start, end), next)
+        Read(Sp(TypeAnn("fn", Cons(result, Nil), Yes(row)), start, end), s)
       }
-      ParseError(code, a, b) -> ParseError(code, a, b)
+      Failed(s) -> Failed(s)
     }
-  } else { parse_type(ts, src, i) }
+  } else { parse_type(ts, src, s) }
 }
-
-fn parse_type_args(borrow ts: Array(Token), src: String, i: Int) -> Parsed(List(Sp(TypeAnn))) {
-  if tk(ts, src, i) == 60 { Parsed(Nil, i + 1) } else { type_args_items(ts, src, i, Nil) }
+fn parse_type_args(borrow ts: Array(Token), src: String, s: State) -> Read(List(Sp(TypeAnn))) {
+  if peek(ts, src, s) == 60 { Read(Nil, bump(ts, src, s)) } else { ty_arg_items(ts, src, s, Nil) }
 }
-
-fn type_args_items(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(TypeAnn))) -> Parsed(List(Sp(TypeAnn))) {
-  match parse_type_arg(ts, src, i) {
-    Parsed(ann, next) -> {
-      if tk(ts, src, next) == 57 { type_args_items(ts, src, next + 1, Cons(ann, acc)) } else {
-        // The bootstrap parser consumes this closing paren only when present.
-        let after = if tk(ts, src, next) == 60 { next + 1 } else { next }
-        Parsed(rev(Cons(ann, acc)), after)
-      }
-    }
-    ParseError(code, a, b) -> ParseError(code, a, b)
-  }
-}
-
-fn parse_row(borrow ts: Array(Token), src: String, i: Int, tail: Bool) -> Parsed(RowAnn) {
-  if tk(ts, src, i) != 61 { err(ts, src, i) } else {
-    let first = i + 1
-    if tk(ts, src, first) == 24 && tk(ts, src, first + 1) == 62 {
-      if !tail || payload(ts, src, first) == "_" { err(ts, src, first) } else {
-        let name = Sp(payload(ts, src, first), ts_start(ts, src, first), ts_end(ts, src, first))
-        Parsed(RowAnn(Nil, Yes(name)), first + 2)
-      }
-    } else { row_items(ts, src, first, tail, Nil) }
-  }
-}
-
-fn row_items(borrow ts: Array(Token), src: String, i: Int, tail: Bool, acc: List(LabelAnn)) -> Parsed(RowAnn) {
-  let k = tk(ts, src, i)
-  if k == 62 { Parsed(RowAnn(rev(acc), No), i + 1) } else {
-    if k == 44 { row_tail(ts, src, i + 1, tail, acc) } else {
-      if k != 25 { err(ts, src, i) } else {
-        let name = Sp(payload(ts, src, i), ts_start(ts, src, i), ts_end(ts, src, i))
-        if tk(ts, src, i + 1) == 59 {
-          if tail {
-            match parse_type_args(ts, src, i + 2) {
-              Parsed(args, next) -> row_after_item(ts, src, next, tail, Cons(LabelAnn(name, Yes(args)), acc))
-              ParseError(code, a, b) -> ParseError(code, a, b)
-            }
-          } else {
-            match skip_row_parens(ts, src, i + 2, 1) {
-              Parsed(ignored, next) -> row_after_item(ts, src, next, tail, Cons(LabelAnn(name, No), acc))
-              ParseError(code, a, b) -> ParseError(code, a, b)
-            }
-          }
-        } else { row_after_item(ts, src, i + 1, tail, Cons(LabelAnn(name, No), acc)) }
+fn ty_arg_items(borrow ts: Array(Token), src: String, s: State, acc: List(Sp(TypeAnn))) -> Read(List(Sp(TypeAnn))) {
+  match parse_type_arg(ts, src, s) {
+    Failed(s) -> Failed(s)
+    Read(ann, s) -> {
+      if peek(ts, src, s) == 57 { ty_arg_items(ts, src, bump(ts, src, s), Cons(ann, acc)) } else {
+        let s = if peek(ts, src, s) == 60 { bump(ts, src, s) } else { s }
+        Read(rev(Cons(ann, acc)), s)
       }
     }
   }
 }
-
-fn row_after_item(borrow ts: Array(Token), src: String, i: Int, tail: Bool, acc: List(LabelAnn)) -> Parsed(RowAnn) {
-  if tk(ts, src, i) == 57 {
-    // A trailing comma is an error in Rust's row reader.
-    if tk(ts, src, i + 1) == 62 { err(ts, src, i + 1) } else { row_items(ts, src, i + 1, tail, acc) }
+// A malformed row still annotates its owner. Only its arguments can fail, and
+// their failure is recovered before returning the retained labels and tail.
+type RowItem { RowItem(Bool, LabelAnn) }
+fn skip_row_parens(borrow ts: Array(Token), src: String, s: State, depth: Int) -> State {
+  let k = peek(ts, src, s)
+  if depth <= 0 || k < 0 { s } else {
+    let d = if k == 59 { depth + 1 } else { if k == 60 { depth - 1 } else { depth } }
+    skip_row_parens(ts, src, bump(ts, src, s), d)
+  }
+}
+fn ty_skip_row_end(borrow ts: Array(Token), src: String, s: State) -> State {
+  if peek(ts, src, s) < 0 || peek(ts, src, s) == 62 { s } else { ty_skip_row_end(ts, src, bump(ts, src, s)) }
+}
+fn parse_row(borrow ts: Array(Token), src: String, s: State, tail: Bool) -> Read(RowAnn) {
+  if peek(ts, src, s) != 61 {
+    Read(RowAnn(Nil, No), push_diag(s, src, "E0100", start_at(ts, src, s), end_at(ts, src, s), "expected `{` for effect row"))
   } else {
-    if tk(ts, src, i) == 44 { row_tail(ts, src, i + 1, tail, acc) } else {
-      if tk(ts, src, i) == 62 { Parsed(RowAnn(rev(acc), No), i + 1) } else { err(ts, src, i) }
+    let s = bump(ts, src, s)
+    if peek(ts, src, s) == 62 || peek(ts, src, s) == 44 { ty_row_variables(ts, src, s, tail, Nil) } else {
+      ty_row_items(ts, src, s, tail, Nil)
     }
   }
 }
-
-fn row_tail(borrow ts: Array(Token), src: String, i: Int, tail: Bool, acc: List(LabelAnn)) -> Parsed(RowAnn) {
-  if !tail || tk(ts, src, i) != 24 || payload(ts, src, i) == "_" { err(ts, src, i) } else {
-    let name = Sp(payload(ts, src, i), ts_start(ts, src, i), ts_end(ts, src, i))
-    if tk(ts, src, i + 1) == 62 { Parsed(RowAnn(rev(acc), Yes(name)), i + 2) } else { err(ts, src, i + 1) }
-  }
-}
-
-fn skip_row_parens(borrow ts: Array(Token), src: String, i: Int, depth: Int) -> Parsed(Int) {
-  let k = tk(ts, src, i)
-  if k == 0 - 1 { err(ts, src, i) } else {
-    if k == 60 && depth == 1 { Parsed(0, i + 1) } else {
-      let next_depth = if k == 59 { depth + 1 } else { if k == 60 { depth - 1 } else { depth } }
-      skip_row_parens(ts, src, i + 1, next_depth)
-    }
-  }
-}
-
-fn parse_params(borrow ts: Array(Token), src: String, i: Int) -> Parsed(List(Sp(Param))) {
-  if tk(ts, src, i) == 60 { Parsed(Nil, i + 1) } else { param_items(ts, src, i, Nil) }
-}
-
-fn param_items(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(Param))) -> Parsed(List(Sp(Param))) {
-  let borrowed = tk(ts, src, i) == 24 && payload(ts, src, i) == "borrow" && tk(ts, src, i + 1) == 24
-  let at = if borrowed { i + 1 } else { i }
-  if tk(ts, src, at) != 24 { err(ts, src, at) } else {
-    let name = payload(ts, src, at)
-    let start = ts_start(ts, src, at)
-    let end = ts_end(ts, src, at)
-    if tk(ts, src, at + 1) == 58 {
-      match parse_type(ts, src, at + 2) {
-        Parsed(ann, next) -> param_after(ts, src, next, Cons(Sp(Param(name, Yes(ann), borrowed), start, end), acc))
-        ParseError(code, a, b) -> ParseError(code, a, b)
-      }
-    } else { param_after(ts, src, at + 1, Cons(Sp(Param(name, No, borrowed), start, end), acc)) }
-  }
-}
-
-fn param_after(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(Param))) -> Parsed(List(Sp(Param))) {
-  if tk(ts, src, i) == 57 { param_items(ts, src, i + 1, acc) } else {
-    if tk(ts, src, i) == 60 { Parsed(rev(acc), i + 1) } else { err(ts, src, i) }
-  }
-}
-
-fn parse_pattern(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Pattern)) {
-  let k = tk(ts, src, i)
-  let start = ts_start(ts, src, i)
-  let end = ts_end(ts, src, i)
-  if k == 25 {
-    let name = payload(ts, src, i)
-    if tk(ts, src, i + 1) == 59 {
-      match pattern_args(ts, src, i + 2) {
-        Parsed(args, next) -> Parsed(Sp(PCtor(name, args), start, ts_end(ts, src, next - 1)), next)
-        ParseError(code, a, b) -> ParseError(code, a, b)
-      }
-    } else { Parsed(Sp(PCtor(name, Nil), start, end), i + 1) }
-  } else {
-    if k == 24 {
-      let name = payload(ts, src, i)
-      let node = if name == "_" { PWild } else { PVar(name) }
-      Parsed(Sp(node, start, end), i + 1)
-    } else {
-      if k == 0 { Parsed(Sp(PInt(number_value(payload(ts, src, i), False)), start, end), i + 1) } else {
-        if k == 47 {
-          if tk(ts, src, i + 1) == 0 {
-            Parsed(Sp(PInt(number_value(payload(ts, src, i + 1), True)), start, ts_end(ts, src, i + 1)), i + 2)
-          } else { err(ts, src, i + 1) }
+fn ty_row_items(borrow ts: Array(Token), src: String, s: State, tail: Bool, acc: List(RowItem)) -> Read(RowAnn) {
+  match current_token(ts, src, s) { Token(k, a, b, text) -> {
+    if k == 25 || k == 24 {
+      let name = Sp(text, a, b)
+      let s = bump(ts, src, s)
+      if k == 25 && peek(ts, src, s) == 59 {
+        let s = bump(ts, src, s)
+        if !tail {
+          ty_row_after(ts, src, skip_row_parens(ts, src, s, 1), tail, Cons(RowItem(False, LabelAnn(name, No)), acc))
         } else {
-          if k == 2 { Parsed(Sp(PStr(payload(ts, src, i)), start, end), i + 1) } else {
-            if k == 21 || k == 22 { Parsed(Sp(PBool(k == 21), start, end), i + 1) } else {
-              if k == 23 { Parsed(Sp(PUnit, start, end), i + 1) } else { err(ts, src, i) }
-            }
+          match parse_type_args(ts, src, s) {
+            Read(args, s) -> ty_row_after(ts, src, s, tail, Cons(RowItem(False, LabelAnn(name, Yes(args))), acc))
+            Failed(s) -> ty_row_after(ts, src, skip_row_parens(ts, src, s, 1), tail, Cons(RowItem(False, LabelAnn(name, No)), acc))
           }
+        }
+      } else { ty_row_after(ts, src, s, tail, Cons(RowItem(k == 24, LabelAnn(name, No)), acc)) }
+    } else {
+      let s = push_diag(s, src, "E0100", a, b, "expected effect name")
+      ty_row_variables(ts, src, s, tail, rev(acc))
+    }
+  } }
+}
+fn ty_row_after(borrow ts: Array(Token), src: String, s: State, tail: Bool, acc: List(RowItem)) -> Read(RowAnn) {
+  if peek(ts, src, s) == 57 { ty_row_items(ts, src, bump(ts, src, s), tail, acc) } else { ty_row_variables(ts, src, s, tail, rev(acc)) }
+}
+fn ty_first_lower(xs: List(RowItem)) -> Maybe(Sp(String)) {
+  match xs { Nil -> No Cons(RowItem(lower, LabelAnn(name, _)), rest) -> if lower { Yes(name) } else { ty_first_lower(rest) } }
+}
+fn ty_row_labels(xs: List(RowItem)) -> List(LabelAnn) {
+  match xs { Nil -> Nil Cons(RowItem(lower, label), rest) -> if lower { ty_row_labels(rest) } else { Cons(label, ty_row_labels(rest)) } }
+}
+fn ty_row_variables(borrow ts: Array(Token), src: String, s: State, tail: Bool, items: List(RowItem)) -> Read(RowAnn) {
+  match items {
+    Cons(RowItem(True, LabelAnn(v, _)), Nil) -> {
+      if peek(ts, src, s) == 44 {
+        let s = push_diag(s, src, "E0100", start_at(ts, src, s), end_at(ts, src, s), "nothing follows a row variable")
+        ty_finish_row(ts, src, ty_skip_row_end(ts, src, s), tail, Nil, No)
+      } else { ty_finish_row(ts, src, s, tail, Nil, Yes(v)) }
+    }
+    _ -> {
+      let s = match ty_first_lower(items) {
+        No -> s
+        Yes(v) -> push_diag(s, src, "E0100", sp_start(v), sp_end(v), "a row variable comes after the effects and `|`: write `{Log | e}`")
+      }
+      if peek(ts, src, s) == 44 { ty_row_tail(ts, src, bump(ts, src, s), tail, ty_row_labels(items)) } else {
+        ty_finish_row(ts, src, s, tail, ty_row_labels(items), No)
+      }
+    }
+  }
+}
+fn ty_row_tail(borrow ts: Array(Token), src: String, s: State, tail: Bool, labels: List(LabelAnn)) -> Read(RowAnn) {
+  if peek(ts, src, s) == 24 {
+    let v = Sp(text_at(ts, src, s), start_at(ts, src, s), end_at(ts, src, s))
+    let s = bump(ts, src, s)
+    if peek(ts, src, s) == 44 {
+      let s = push_diag(s, src, "E0100", start_at(ts, src, s), end_at(ts, src, s), "nothing follows a row variable")
+      ty_finish_row(ts, src, ty_skip_row_end(ts, src, s), tail, labels, No)
+    } else { ty_finish_row(ts, src, s, tail, labels, Yes(v)) }
+  } else {
+    let s = push_diag(s, src, "E0100", start_at(ts, src, s), end_at(ts, src, s), "expected a row variable (lowercase) after `|`")
+    ty_finish_row(ts, src, ty_skip_row_end(ts, src, s), tail, labels, No)
+  }
+}
+fn ty_finish_row(borrow ts: Array(Token), src: String, s: State, tail: Bool, labels: List(LabelAnn), var: Maybe(Sp(String))) -> Read(RowAnn) {
+  match var {
+    No -> ty_close_row(ts, src, s, RowAnn(labels, No))
+    Yes(v) -> {
+      if !tail { ty_close_row(ts, src, push_diag(s, src, "E0100", sp_start(v), sp_end(v), "a grant names effects, not a row variable"), RowAnn(labels, No)) } else {
+        if sp_node(v) == "_" { ty_close_row(ts, src, push_diag(s, src, "E0100", sp_start(v), sp_end(v), "a row variable needs a name"), RowAnn(labels, No)) } else {
+          ty_close_row(ts, src, s, RowAnn(labels, Yes(v)))
         }
       }
     }
   }
 }
-
-fn pattern_args(borrow ts: Array(Token), src: String, i: Int) -> Parsed(List(Sp(Pattern))) {
-  if tk(ts, src, i) == 60 { Parsed(Nil, i + 1) } else { pattern_arg_items(ts, src, i, Nil) }
+fn ty_close_row(borrow ts: Array(Token), src: String, s: State, row: RowAnn) -> Read(RowAnn) {
+  match close_brace(ts, src, s) { Read(_, s) -> Read(row, s) Failed(s) -> Read(row, s) }
 }
 
-fn pattern_arg_items(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(Pattern))) -> Parsed(List(Sp(Pattern))) {
-  match parse_pattern(ts, src, i) {
-    Parsed(pat, next) -> {
-      if tk(ts, src, next) == 57 { pattern_arg_items(ts, src, next + 1, Cons(pat, acc)) } else {
-        if tk(ts, src, next) == 60 { Parsed(rev(Cons(pat, acc)), next + 1) } else { err(ts, src, next) }
-      }
-    }
-    ParseError(code, a, b) -> ParseError(code, a, b)
-  }
-}
-
-
-// Expressions use the Rust parser's binding powers and layout flag. Postfix
-// calls bind even at min_bp=100; parentheses preserve the inner node's span.
+// Pratt expressions, patterns and statement recovery mirror src/parse.rs.
 fn infix_power(kind: Int) -> Int {
-  match kind {
-    43 -> 10
-    42 -> 20
-    34 -> 30
-    35 -> 30
-    52 -> 30
-    36 -> 30
-    53 -> 30
-    37 -> 30
-    30 -> 30
-    31 -> 30
-    32 -> 30
-    33 -> 30
-    40 -> 40
-    46 -> 50
-    47 -> 50
-    26 -> 50
-    27 -> 50
-    48 -> 60
-    49 -> 60
-    50 -> 60
-    28 -> 60
-    29 -> 60
-    _ -> 0 - 1
+  if kind < 26 || kind > 53 { -1 } else {
+    match kind {
+      43 -> 10 42 -> 20
+      34 -> 30 35 -> 30 52 -> 30 36 -> 30 53 -> 30 37 -> 30
+      30 -> 30 31 -> 30 32 -> 30 33 -> 30
+      40 -> 40
+      46 -> 50 47 -> 50 26 -> 50 27 -> 50
+      48 -> 60 49 -> 60 50 -> 60 28 -> 60 29 -> 60
+      _ -> -1
+    }
   }
 }
-
 fn infix_symbol(kind: Int) -> String {
   match kind {
-    43 -> "||"
-    42 -> "&&"
-    34 -> "=="
-    35 -> "!="
-    52 -> "<"
-    36 -> "<="
-    53 -> ">"
-    37 -> ">="
-    30 -> "<."
-    31 -> "<=."
-    32 -> ">."
-    33 -> ">=."
-    40 -> "<>"
-    46 -> "+"
-    47 -> "-"
-    26 -> "+."
-    27 -> "-."
-    48 -> "*"
-    49 -> "/"
-    50 -> "%"
-    28 -> "*."
-    29 -> "/."
+    43 -> "||" 42 -> "&&" 34 -> "==" 35 -> "!="
+    52 -> "<" 36 -> "<=" 53 -> ">" 37 -> ">="
+    30 -> "<." 31 -> "<=." 32 -> ">." 33 -> ">=."
+    40 -> "<>" 46 -> "+" 47 -> "-" 26 -> "+." 27 -> "-."
+    48 -> "*" 49 -> "/" 50 -> "%" 28 -> "*." 29 -> "/."
     _ -> "?"
   }
 }
-
-fn parse_expr(borrow ts: Array(Token), src: String, i: Int, min_bp: Int, braces: Bool) -> Parsed(Sp(Expr)) {
-  match parse_atom(ts, src, i, braces) {
-    ParseError(code, s, e) -> ParseError(code, s, e)
-    Parsed(lhs, next) -> parse_expr_chain(ts, src, next, min_bp, braces, lhs)
+fn expr_finish(result: Read(Sp(Expr)), outer: Int) -> Read(Sp(Expr)) {
+  match result {
+    Read(e, State(p, ds, eof, decl, raised, depth, height, stop)) -> {
+      Read(e, State(p, ds, eof, decl, raised, depth - 1, if outer > height { outer } else { height }, stop))
+    }
+    Failed(State(p, ds, eof, decl, raised, depth, height, stop)) -> {
+      Failed(State(p, ds, eof, decl, raised, depth - 1, if outer > height { outer } else { height }, stop))
+    }
   }
 }
-
-fn parse_expr_chain(borrow ts: Array(Token), src: String, i: Int, min_bp: Int, braces: Bool, lhs: Sp(Expr)) -> Parsed(Sp(Expr)) {
-  let kind = tk(ts, src, i)
+fn parse_expr(borrow ts: Array(Token), src: String, s: State, min_bp: Int, braces: Bool) -> Read(Sp(Expr)) {
+  match s { State(p, ds, eof, decl, raised, depth, height, stop) -> {
+    if stop >= 0 { Failed(s) } else {
+      if depth >= 1024 { Failed(too_deep(ts, src, s, start_at(ts, src, s), end_at(ts, src, s))) } else {
+        let inner = State(p, ds, eof, decl, raised, depth + 1, 0, stop)
+        expr_finish(parse_expr_begin(ts, src, inner, min_bp, braces), height)
+      }
+    }
+  } }
+}
+fn parse_expr_begin(borrow ts: Array(Token), src: String, s: State, min_bp: Int, braces: Bool) -> Read(Sp(Expr)) {
+  match parse_atom(ts, src, s, braces) {
+    Failed(s) -> Failed(s)
+    Read(lhs, s) -> {
+      let h = state_height(s) + 1
+      if h > 1024 { Failed(too_deep(ts, src, s, sp_start(lhs), sp_end(lhs))) } else {
+        parse_expr_chain(ts, src, s, min_bp, braces, lhs, h)
+      }
+    }
+  }
+}
+fn parse_expr_chain(borrow ts: Array(Token), src: String, s: State, min_bp: Int, braces: Bool, lhs: Sp(Expr), h: Int) -> Read(Sp(Expr)) {
+  let kind = peek(ts, src, s)
   if kind == 59 {
-    if braces && newline_before(ts, src, i) { Parsed(lhs, i) } else {
-      match parse_call_args(ts, src, i + 1, Nil) {
-        ParseError(code, s, e) -> ParseError(code, s, e)
-        Parsed(args, next) -> {
-          let call = Sp(ECall(lhs, args), sp_start(lhs), ts_end(ts, src, next - 1))
-          parse_expr_chain(ts, src, next, min_bp, braces, call)
+    if braces && newline_before(ts, src, state_pos(s)) { Read(lhs, set_height(s, h)) } else {
+      match parse_call_args(ts, src, bump(ts, src, set_height(s, 0)), Nil) {
+        Failed(s) -> Failed(s)
+        Read(args, s) -> {
+          let end = end_at(ts, src, s)
+          if peek(ts, src, s) != 60 { err(ts, src, s, "expected `)` to close call") } else {
+            let call = Sp(ECall(lhs, args), sp_start(lhs), end)
+            let s = bump(ts, src, s)
+            let h = max_int(h, state_height(s)) + 1
+            if h > 1024 { Failed(too_deep(ts, src, s, sp_start(call), sp_end(call))) } else {
+              parse_expr_chain(ts, src, s, min_bp, braces, call, h)
+            }
+          }
         }
       }
     }
   } else {
     let power = infix_power(kind)
-    if power < min_bp { Parsed(lhs, i) } else {
-      if braces && newline_before(ts, src, i) {
-        if (kind == 47 || kind == 27) && ts_end(ts, src, i) == ts_start(ts, src, i + 1) {
-          Parsed(lhs, i)
-        } else { ParseError("E0101", ts_start(ts, src, i), ts_end(ts, src, i)) }
+    if power < min_bp { Read(lhs, set_height(s, h)) } else {
+      if braces && newline_before(ts, src, state_pos(s)) {
+        if (kind == 47 || kind == 27) && state_pos(s) + 1 < array.length(ts) && end_at(ts, src, s) == ts_start(ts, src, state_pos(s) + 1) {
+          Read(lhs, set_height(s, h))
+        } else { layout_error(ts, src, s) }
       } else {
-        match parse_expr(ts, src, i + 1, power + 1, braces) {
-          ParseError(code, s, e) -> ParseError(code, s, e)
-          Parsed(rhs, next) -> {
+        match parse_expr(ts, src, set_height(bump(ts, src, s), 0), power + 1, braces) {
+          Failed(s) -> Failed(s)
+          Read(rhs, s) -> {
             let combined = Sp(EBinary(infix_symbol(kind), lhs, rhs), sp_start(lhs), sp_end(rhs))
-            parse_expr_chain(ts, src, next, min_bp, braces, combined)
+            let h = max_int(h, state_height(s)) + 1
+            if h > 1024 { Failed(too_deep(ts, src, s, sp_start(combined), sp_end(combined))) } else {
+              parse_expr_chain(ts, src, s, min_bp, braces, combined, h)
+            }
           }
         }
       }
     }
   }
 }
-
-// i follows '('; the returned cursor follows its closing ')'. A trailing
-// comma is rejected, as in src/parse.rs's finish_call.
-fn parse_call_args(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(Expr))) -> Parsed(List(Sp(Expr))) {
-  if tk(ts, src, i) == 60 { Parsed(rev(acc), i + 1) } else {
-    parse_call_arg(ts, src, i, acc)
+fn layout_error(borrow ts: Array(Token), src: String, s: State) -> Read(a) {
+  Failed(push_diag(s, src, "E0101", start_at(ts, src, s), end_at(ts, src, s), "an operator at the start of a line does not continue the line before"))
+}
+// Argument readers stop before the closing token, so callers sample its span.
+fn parse_call_args(borrow ts: Array(Token), src: String, s: State, acc: List(Sp(Expr))) -> Read(List(Sp(Expr))) {
+  if peek(ts, src, s) == 60 { Read(rev(acc), s) } else { parse_call_arg(ts, src, s, acc) }
+}
+fn parse_call_arg(borrow ts: Array(Token), src: String, s: State, acc: List(Sp(Expr))) -> Read(List(Sp(Expr))) {
+  match parse_expr(ts, src, s, 0, False) {
+    Failed(s) -> Failed(s)
+    Read(arg, s) -> {
+      if peek(ts, src, s) == 57 { parse_call_arg(ts, src, bump(ts, src, s), Cons(arg, acc)) }
+      else { Read(rev(Cons(arg, acc)), s) }
+    }
   }
 }
-
-fn parse_call_arg(borrow ts: Array(Token), src: String, i: Int, acc: List(Sp(Expr))) -> Parsed(List(Sp(Expr))) {
-  match parse_expr(ts, src, i, 0, False) {
-    ParseError(code, s, e) -> ParseError(code, s, e)
-    Parsed(arg, next) -> {
-      if tk(ts, src, next) == 57 { parse_call_arg(ts, src, next + 1, Cons(arg, acc)) } else {
-        if tk(ts, src, next) == 60 { Parsed(rev(Cons(arg, acc)), next + 1) } else { err(ts, src, next) }
+fn parse_atom(borrow ts: Array(Token), src: String, s: State, braces: Bool) -> Read(Sp(Expr)) {
+  match current_token(ts, src, s) { Token(kind, start, end, text) -> {
+    match kind {
+      -1 -> Failed(s)
+      0 -> {
+        match parse_integer(ts, src, bump(ts, src, s), text, False, start, end) {
+          Read(n, s) -> Read(Sp(EInt(n), start, end), s)
+          Failed(s) -> Failed(s)
+        }
+      }
+      1 -> Read(Sp(EFloat, start, end), bump(ts, src, s))
+      2 -> Read(Sp(EStr(text), start, end), bump(ts, src, s))
+      21 -> Read(Sp(EBool(True), start, end), bump(ts, src, s))
+      22 -> Read(Sp(EBool(False), start, end), bump(ts, src, s))
+      23 -> Read(Sp(EUnit, start, end), bump(ts, src, s))
+      24 -> {
+        if text == "resume" { parse_resume(ts, src, s) } else {
+          let s = bump(ts, src, s)
+          if peek(ts, src, s) == 56 {
+            let s = bump(ts, src, s)
+            if peek(ts, src, s) == -1 { Failed(s) } else {
+              if peek(ts, src, s) == 24 {
+                Read(Sp(EQualified(text, text_at(ts, src, s)), start, end_at(ts, src, s)), bump(ts, src, s))
+              } else { err(ts, src, s, "expected identifier after `.`") }
+            }
+          } else { Read(Sp(EVar(text), start, end), s) }
+        }
+      }
+      25 -> Read(Sp(EVar(text), start, end), bump(ts, src, s))
+      47 -> {
+        let after = bump(ts, src, s)
+        if peek(ts, src, after) == 0 {
+          let end = end_at(ts, src, after)
+          match parse_integer(ts, src, bump(ts, src, after), text_at(ts, src, after), True, start, end) {
+            Read(n, s) -> Read(Sp(EInt(n), start, end), s)
+            Failed(s) -> Failed(s)
+          }
+        } else {
+          if peek(ts, src, after) == 1 {
+            Read(Sp(EFloat, start, end_at(ts, src, after)), bump(ts, src, after))
+          } else { parse_unary(ts, src, after, start, "-", braces) }
+        }
+      }
+      27 -> parse_unary(ts, src, bump(ts, src, s), start, "-.", braces)
+      54 -> parse_unary(ts, src, bump(ts, src, s), start, "!", braces)
+      59 -> {
+        match parse_expr(ts, src, bump(ts, src, s), 0, False) {
+          Failed(s) -> Failed(s)
+          Read(inner, s) -> {
+            if peek(ts, src, s) == 60 { Read(inner, bump(ts, src, s)) } else { err(ts, src, s, "expected `)`") }
+          }
+        }
+      }
+      61 -> {
+        match parse_block(ts, src, s) {
+          Failed(s) -> Failed(s)
+          Read(block, s) -> Read(Sp(EBlock(sp_node(block)), sp_start(block), sp_end(block)), s)
+        }
+      }
+      7 -> parse_if(ts, src, s, braces)
+      4 -> parse_lambda(ts, src, s)
+      11 -> parse_match(ts, src, s, braces)
+      16 -> parse_handle(ts, src, s, braces)
+      _ -> err(ts, src, s, "expected an expression")
+    }
+  } }
+}
+fn parse_unary(borrow ts: Array(Token), src: String, s: State, start: Int, op: String, braces: Bool) -> Read(Sp(Expr)) {
+  match parse_expr(ts, src, s, 100, braces) {
+    Failed(s) -> Failed(s)
+    Read(operand, s) -> Read(Sp(EUnary(op, operand), start, sp_end(operand)), s)
+  }
+}
+fn parse_resume(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(Expr)) {
+  let start = start_at(ts, src, s)
+  let s = bump(ts, src, s)
+  if peek(ts, src, s) != 59 { err(ts, src, s, "expected `(` after `resume`") } else {
+    match parse_expr(ts, src, bump(ts, src, s), 0, False) {
+      Failed(s) -> Failed(s)
+      Read(arg, s) -> {
+        if peek(ts, src, s) != 60 { err(ts, src, s, "expected `)`") } else {
+          Read(Sp(EResume(arg), start, end_at(ts, src, s)), bump(ts, src, s))
+        }
       }
     }
   }
 }
-
-fn parse_atom(borrow ts: Array(Token), src: String, i: Int, braces: Bool) -> Parsed(Sp(Expr)) {
-  let kind = tk(ts, src, i)
-  let start = ts_start(ts, src, i)
-  let end = ts_end(ts, src, i)
-  match kind {
-    0 -> Parsed(Sp(EInt(number_value(payload(ts, src, i), False)), start, end), i + 1)
-    1 -> Parsed(Sp(EFloat, start, end), i + 1)
-    2 -> Parsed(Sp(EStr(payload(ts, src, i)), start, end), i + 1)
-    21 -> Parsed(Sp(EBool(True), start, end), i + 1)
-    22 -> Parsed(Sp(EBool(False), start, end), i + 1)
-    23 -> Parsed(Sp(EUnit, start, end), i + 1)
-    24 -> {
-      if payload(ts, src, i) == "resume" { parse_resume(ts, src, i) } else {
-        if tk(ts, src, i + 1) == 56 {
-          if tk(ts, src, i + 2) == 24 {
-            Parsed(Sp(EQualified(payload(ts, src, i), payload(ts, src, i + 2)), start, ts_end(ts, src, i + 2)), i + 3)
-          } else { err(ts, src, i + 2) }
-        } else { Parsed(Sp(EVar(payload(ts, src, i)), start, end), i + 1) }
+fn parse_if(borrow ts: Array(Token), src: String, s: State, braces: Bool) -> Read(Sp(Expr)) {
+  let start = start_at(ts, src, s)
+  match parse_expr(ts, src, bump(ts, src, s), 0, braces) {
+    Failed(s) -> Failed(s)
+    Read(cond, s) -> {
+      match parse_block(ts, src, s) {
+        Failed(s) -> Failed(s)
+        Read(then_block, s) -> {
+          if peek(ts, src, s) != 8 { err(ts, src, s, "expected `else` (if is an expression)") } else {
+            match parse_block(ts, src, bump(ts, src, s)) {
+              Failed(s) -> Failed(s)
+              Read(else_block, s) -> Read(Sp(EIf(cond, then_block, else_block), start, sp_end(else_block)), s)
+            }
+          }
+        }
       }
     }
-    25 -> Parsed(Sp(EVar(payload(ts, src, i)), start, end), i + 1)
-    47 -> {
-      if tk(ts, src, i + 1) == 0 {
-        Parsed(Sp(EInt(number_value(payload(ts, src, i + 1), True)), start, ts_end(ts, src, i + 1)), i + 2)
+  }
+}
+// A failed statement synchronizes with a reversed delimiter stack.
+fn stack_has_brace(open: List(Int)) -> Bool {
+  match open { Nil -> False Cons(k, rest) -> k == 61 || stack_has_brace(rest) }
+}
+fn drop_through_brace(open: List(Int)) -> List(Int) {
+  match open { Nil -> Nil Cons(k, rest) -> if k == 61 { rest } else { drop_through_brace(rest) } }
+}
+fn update_open(open: List(Int), k: Int) -> List(Int) {
+  if k == 59 || k == 61 || k == 63 { Cons(k, open) } else {
+    if k == 60 || k == 64 {
+      let want = if k == 60 { 59 } else { 63 }
+      match open { Cons(last, rest) -> if last == want { rest } else { open } Nil -> Nil }
+    } else {
+      if k == 62 && stack_has_brace(open) { drop_through_brace(open) } else { open }
+    }
+  }
+}
+fn consumed_open(borrow ts: Array(Token), src: String, i: Int, end: Int, open: List(Int)) -> List(Int) {
+  if i >= end { open } else { consumed_open(ts, src, i + 1, end, update_open(open, tk(ts, src, i))) }
+}
+fn can_start_statement(k: Int) -> Bool {
+  k == 0 || k == 1 || k == 2 || k == 21 || k == 22 || k == 23 || k == 24 || k == 25 ||
+  k == 5 || k == 7 || k == 11 || k == 16 || k == 4 || k == 59 || k == 61 || k == 47 || k == 27 || k == 54
+}
+fn skip_statement(borrow ts: Array(Token), src: String, s: State, first: Bool, open: List(Int)) -> State {
+  let k = peek(ts, src, s)
+  if k == -1 { s } else {
+    let line = newline_before(ts, src, state_pos(s))
+    let empty = match open { Nil -> True Cons(_, _) -> False }
+    if !first && line && ((empty && can_start_statement(k)) || starts_decl(ts, src, state_pos(s))) { s } else {
+      if !first && line && k == 5 && !stack_has_brace(open) { s } else {
+        if k == 62 && !stack_has_brace(open) { s } else {
+          skip_statement(ts, src, bump(ts, src, s), False, update_open(open, k))
+        }
+      }
+    }
+  }
+}
+fn recover_statement(borrow ts: Array(Token), src: String, s: State, at: Int, reported: Int, first_start: Int, first_end: Int) -> Read(Sp(Expr)) {
+  let s = if state_raised(s) == reported && peek(ts, src, s) == -1 { eof_error(ts, src, s) } else { s }
+  // At EOF or after E0102, no token can be consumed: replaying nested prefixes
+  // into an unused delimiter stack would be quadratic and has no effect.
+  let s = if peek(ts, src, s) < 0 { s } else {
+    let open = consumed_open(ts, src, at, state_pos(s), Nil)
+    skip_statement(ts, src, s, state_pos(s) == at, open)
+  }
+  let last = max_int(state_pos(s), at + 1)
+  let last = if last > array.length(ts) { array.length(ts) - 1 } else { last - 1 }
+  let end = if state_pos(s) > at { max_int(first_end, ts_end(ts, src, last)) } else { first_end }
+  Read(Sp(EError, first_start, end), s)
+}
+fn parse_block(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(Block)) {
+  if peek(ts, src, s) != 61 { err(ts, src, s, "expected `{`") } else {
+    parse_block_items(ts, src, bump(ts, src, s), start_at(ts, src, s), Nil, No)
+  }
+}
+fn parse_block_items(borrow ts: Array(Token), src: String, s: State, start: Int, stmts: List(Sp(Stmt)), tail: Maybe(Sp(Expr))) -> Read(Sp(Block)) {
+  let k = peek(ts, src, s)
+  if k == -1 || k == 62 || (newline_before(ts, src, state_pos(s)) && starts_decl(ts, src, state_pos(s))) {
+    let end = end_at(ts, src, s)
+    let s = if k == 62 && state_stop(s) == -1 {
+      match tail { Yes(_) -> s No -> check_block_value(src, s, start, end, stmts) }
+    } else { s }
+    match close_brace(ts, src, s) {
+      Read(_, s) -> Read(Sp(Block(rev(stmts), tail), start, end), s)
+      Failed(s) -> Read(Sp(Block(rev(stmts), tail), start, end), s)
+    }
+  } else {
+    let at = state_pos(s)
+    let first_start = start_at(ts, src, s)
+    let first_end = end_at(ts, src, s)
+    let reported = state_raised(s)
+    if k == 5 {
+      let name = if tk(ts, src, at + 1) == 24 { Yes(payload(ts, src, at + 1)) } else { No }
+      match parse_let(ts, src, s) {
+        Read(st, s) -> parse_block_items(ts, src, s, start, Cons(st, stmts), tail)
+        Failed(s) -> {
+          match recover_statement(ts, src, s, at, reported, first_start, first_end) {
+            Failed(s) -> Failed(s)
+            Read(error, s) -> {
+              let node = match name { Yes(n) -> SLet(n, No, error) No -> SExpr(error) }
+              parse_block_items(ts, src, s, start, Cons(Sp(node, sp_start(error), sp_end(error)), stmts), tail)
+            }
+          }
+        }
+      }
+    } else {
+      match parse_expr(ts, src, s, 0, True) {
+        Read(e, s) -> {
+          if peek(ts, src, s) == 62 { parse_block_items(ts, src, s, start, stmts, Yes(e)) } else {
+            parse_block_items(ts, src, s, start, Cons(Sp(SExpr(e), sp_start(e), sp_end(e)), stmts), tail)
+          }
+        }
+        Failed(s) -> {
+          match recover_statement(ts, src, s, at, reported, first_start, first_end) {
+            Failed(s) -> Failed(s)
+            Read(error, s) -> parse_block_items(ts, src, s, start, Cons(Sp(SExpr(error), sp_start(error), sp_end(error)), stmts), tail)
+          }
+        }
+      }
+    }
+  }
+}
+fn check_block_value(src: String, s: State, start: Int, end: Int, stmts: List(Sp(Stmt))) -> State {
+  match stmts {
+    Nil -> push_diag(s, src, "E0103", start, end, "a block has no value")
+    Cons(last, _) -> {
+      match sp_node(last) {
+        SLet(_, _, value) -> {
+          match sp_node(value) {
+            EError -> s
+            _ -> push_diag(s, src, "E0103", sp_start(last), sp_end(last), "a block cannot end with `let`")
+          }
+        }
+        _ -> s
+      }
+    }
+  }
+}
+fn parse_let(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(Stmt)) {
+  let start = start_at(ts, src, s)
+  let s = bump(ts, src, s)
+  if peek(ts, src, s) == -1 { Failed(s) } else {
+    if peek(ts, src, s) != 24 { err(ts, src, s, "expected binding name") } else {
+      let name = text_at(ts, src, s)
+      let s = bump(ts, src, s)
+      if peek(ts, src, s) == 58 {
+        match parse_type(ts, src, bump(ts, src, s)) {
+          Failed(s) -> Failed(s)
+          Read(ann, s) -> parse_let_value(ts, src, s, start, name, Yes(ann))
+        }
+      } else { parse_let_value(ts, src, s, start, name, No) }
+    }
+  }
+}
+fn parse_let_value(borrow ts: Array(Token), src: String, s: State, start: Int, name: String, ann: Maybe(Sp(TypeAnn))) -> Read(Sp(Stmt)) {
+  if peek(ts, src, s) != 51 { err(ts, src, s, "expected `=` in let binding") } else {
+    match parse_expr(ts, src, bump(ts, src, s), 0, True) {
+      Failed(s) -> Failed(s)
+      Read(value, s) -> Read(Sp(SLet(name, ann, value), start, sp_end(value)), s)
+    }
+  }
+}
+fn pattern_finish(result: Read(Sp(Pattern))) -> Read(Sp(Pattern)) {
+  match result { Read(p, s) -> Read(p, leave(s)) Failed(s) -> Failed(leave(s)) }
+}
+fn parse_pattern(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(Pattern)) {
+  match enter(ts, src, s) {
+    Failed(s) -> Failed(s)
+    Read(_, s) -> pattern_finish(parse_pattern_inner(ts, src, s))
+  }
+}
+fn parse_pattern_inner(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(Pattern)) {
+  match current_token(ts, src, s) { Token(k, start, end, text) -> {
+    match k {
+      -1 -> Failed(s)
+      25 -> {
+        let s = bump(ts, src, s)
+        if peek(ts, src, s) == 59 {
+          match pattern_args(ts, src, bump(ts, src, s)) {
+            Failed(s) -> Failed(s)
+            Read(args, s) -> {
+              let end = end_at(ts, src, s)
+              if peek(ts, src, s) != 60 { err(ts, src, s, "expected `)`") } else {
+                Read(Sp(PCtor(text, args), start, end), bump(ts, src, s))
+              }
+            }
+          }
+        } else { Read(Sp(PCtor(text, Nil), start, end), s) }
+      }
+      24 -> {
+        let node = if text == "_" { PWild } else { PVar(text) }
+        Read(Sp(node, start, end), bump(ts, src, s))
+      }
+      0 -> {
+        match parse_integer(ts, src, bump(ts, src, s), text, False, start, end) {
+          Read(n, s) -> Read(Sp(PInt(n), start, end), s)
+          Failed(s) -> Failed(s)
+        }
+      }
+      47 -> {
+        let s = bump(ts, src, s)
+        if peek(ts, src, s) == 0 {
+          let end = end_at(ts, src, s)
+          match parse_integer(ts, src, bump(ts, src, s), text_at(ts, src, s), True, start, end) {
+            Read(n, s) -> Read(Sp(PInt(n), start, end), s)
+            Failed(s) -> Failed(s)
+          }
+        } else { err(ts, src, s, "expected an integer after `-` in a pattern") }
+      }
+      2 -> Read(Sp(PStr(text), start, end), bump(ts, src, s))
+      21 -> Read(Sp(PBool(True), start, end), bump(ts, src, s))
+      22 -> Read(Sp(PBool(False), start, end), bump(ts, src, s))
+      23 -> Read(Sp(PUnit, start, end), bump(ts, src, s))
+      _ -> err(ts, src, s, "expected a pattern")
+    }
+  } }
+}
+fn pattern_args(borrow ts: Array(Token), src: String, s: State) -> Read(List(Sp(Pattern))) {
+  if peek(ts, src, s) == 60 { Read(Nil, s) } else { pattern_arg_items(ts, src, s, Nil) }
+}
+fn pattern_arg_items(borrow ts: Array(Token), src: String, s: State, acc: List(Sp(Pattern))) -> Read(List(Sp(Pattern))) {
+  match parse_pattern(ts, src, s) {
+    Failed(s) -> Failed(s)
+    Read(pat, s) -> {
+      if peek(ts, src, s) == 57 { pattern_arg_items(ts, src, bump(ts, src, s), Cons(pat, acc)) } else {
+        Read(rev(Cons(pat, acc)), s)
+      }
+    }
+  }
+}
+fn parse_lambda(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(Expr)) {
+  let start = start_at(ts, src, s)
+  let s = bump(ts, src, s)
+  if peek(ts, src, s) != 59 { err(ts, src, s, "expected `(` after `fn` in a lambda") } else {
+    match parse_lambda_params(ts, src, bump(ts, src, s), True) {
+      Failed(s) -> Failed(s)
+      Read(params, s) -> {
+        if peek(ts, src, s) != 60 { err(ts, src, s, "expected `)`") } else {
+          match parse_block(ts, src, bump(ts, src, s)) {
+            Failed(s) -> Failed(s)
+            Read(body, s) -> Read(Sp(ELambda(params, body), start, sp_end(body)), s)
+          }
+        }
+      }
+    }
+  }
+}
+// Lambdas allow annotations; operation-clause parameters allow neither an
+// annotation nor named functions' contextual borrow prefix.
+fn parse_lambda_params(borrow ts: Array(Token), src: String, s: State, ann_allowed: Bool) -> Read(List(Sp(Param))) {
+  if peek(ts, src, s) == 60 { Read(Nil, s) } else { parse_lambda_param(ts, src, s, Nil, ann_allowed) }
+}
+fn parse_lambda_param(borrow ts: Array(Token), src: String, s: State, params: List(Sp(Param)), ann_allowed: Bool) -> Read(List(Sp(Param))) {
+  if peek(ts, src, s) == -1 { Failed(s) } else {
+    if peek(ts, src, s) != 24 { err(ts, src, s, "expected parameter name") } else {
+      let name = text_at(ts, src, s)
+      let start = start_at(ts, src, s)
+      let end = end_at(ts, src, s)
+      let s = bump(ts, src, s)
+      if ann_allowed && peek(ts, src, s) == 58 {
+        match parse_type(ts, src, bump(ts, src, s)) {
+          Failed(s) -> Failed(s)
+          Read(ann, s) -> parse_lambda_param_end(ts, src, s, Cons(Sp(Param(name, Yes(ann), False), start, end), params), ann_allowed)
+        }
       } else {
-        if tk(ts, src, i + 1) == 1 {
-          Parsed(Sp(EFloat, start, ts_end(ts, src, i + 1)), i + 2)
-        } else { parse_unary(ts, src, i, "-", braces) }
+        parse_lambda_param_end(ts, src, s, Cons(Sp(Param(name, No, False), start, end), params), ann_allowed)
       }
     }
-    27 -> parse_unary(ts, src, i, "-.", braces)
-    54 -> parse_unary(ts, src, i, "!", braces)
-    59 -> {
-      match parse_expr(ts, src, i + 1, 0, False) {
-        ParseError(code, s, e) -> ParseError(code, s, e)
-        Parsed(inner, next) -> {
-          if tk(ts, src, next) == 60 { Parsed(inner, next + 1) } else { err(ts, src, next) }
-        }
-      }
-    }
-    61 -> {
-      match parse_block(ts, src, i) {
-        ParseError(code, s, e) -> ParseError(code, s, e)
-        Parsed(block, next) -> Parsed(Sp(EBlock(sp_node(block)), sp_start(block), sp_end(block)), next)
-      }
-    }
-    7 -> parse_if(ts, src, i, braces)
-    4 -> parse_lambda(ts, src, i)
-    11 -> parse_match(ts, src, i, braces)
-    16 -> parse_handle(ts, src, i, braces)
-    _ -> err(ts, src, i)
   }
 }
-
-fn parse_unary(borrow ts: Array(Token), src: String, i: Int, op: String, braces: Bool) -> Parsed(Sp(Expr)) {
-  match parse_expr(ts, src, i + 1, 100, braces) {
-    ParseError(code, s, e) -> ParseError(code, s, e)
-    Parsed(operand, next) -> Parsed(Sp(EUnary(op, operand), ts_start(ts, src, i), sp_end(operand)), next)
-  }
+fn parse_lambda_param_end(borrow ts: Array(Token), src: String, s: State, params: List(Sp(Param)), ann_allowed: Bool) -> Read(List(Sp(Param))) {
+  if peek(ts, src, s) == 57 { parse_lambda_param(ts, src, bump(ts, src, s), params, ann_allowed) } else { Read(rev(params), s) }
 }
-
-fn parse_resume(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Expr)) {
-  if tk(ts, src, i + 1) != 59 { err(ts, src, i + 1) } else {
-    match parse_expr(ts, src, i + 2, 0, False) {
-      ParseError(code, s, e) -> ParseError(code, s, e)
-      Parsed(arg, next) -> {
-        if tk(ts, src, next) != 60 { err(ts, src, next) } else {
-          Parsed(Sp(EResume(arg), ts_start(ts, src, i), ts_end(ts, src, next)), next + 1)
+fn parse_match(borrow ts: Array(Token), src: String, s: State, braces: Bool) -> Read(Sp(Expr)) {
+  let start = start_at(ts, src, s)
+  match parse_expr(ts, src, bump(ts, src, s), 0, braces) {
+    Failed(s) -> Failed(s)
+    Read(scrutinee, s) -> {
+      if peek(ts, src, s) != 61 { err(ts, src, s, "expected `{` after match scrutinee") } else {
+        match parse_match_arms(ts, src, bump(ts, src, s), Nil) {
+          Failed(s) -> Failed(s)
+          Read(arms, s) -> {
+            let end = end_at(ts, src, s)
+            match close_brace(ts, src, s) {
+              Failed(s) -> Failed(s)
+              Read(_, s) -> Read(Sp(EMatch(scrutinee, arms), start, end), s)
+            }
+          }
         }
       }
     }
   }
 }
-
-fn parse_if(borrow ts: Array(Token), src: String, i: Int, braces: Bool) -> Parsed(Sp(Expr)) {
-  match parse_expr(ts, src, i + 1, 0, braces) {
-    ParseError(code, s, e) -> ParseError(code, s, e)
-    Parsed(cond, next) -> {
-      match parse_block(ts, src, next) {
-        ParseError(code, s, e) -> ParseError(code, s, e)
-        Parsed(then_block, after_then) -> {
-          if tk(ts, src, after_then) != 8 { err(ts, src, after_then) } else {
-            match parse_block(ts, src, after_then + 1) {
-              ParseError(code, s, e) -> ParseError(code, s, e)
-              Parsed(else_block, after_else) -> {
-                Parsed(Sp(EIf(cond, then_block, else_block), ts_start(ts, src, i), sp_end(else_block)), after_else)
+fn parse_match_arms(borrow ts: Array(Token), src: String, s: State, arms: List(Sp(MatchArm))) -> Read(List(Sp(MatchArm))) {
+  let k = peek(ts, src, s)
+  if k == -1 || k == 62 { Read(rev(arms), s) } else {
+    let start = start_at(ts, src, s)
+    match parse_pattern(ts, src, s) {
+      Failed(s) -> Failed(s)
+      Read(pattern, s) -> {
+        if peek(ts, src, s) != 38 { err(ts, src, s, "expected `->` in match arm") } else {
+          match parse_expr(ts, src, bump(ts, src, s), 0, True) {
+            Failed(s) -> Failed(s)
+            Read(body, s) -> {
+              let arm = Sp(MatchArm(pattern, body), start, sp_end(body))
+              parse_match_arms(ts, src, s, Cons(arm, arms))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+fn parse_handle(borrow ts: Array(Token), src: String, s: State, braces: Bool) -> Read(Sp(Expr)) {
+  let start = start_at(ts, src, s)
+  match parse_expr(ts, src, bump(ts, src, s), 0, braces) {
+    Failed(s) -> Failed(s)
+    Read(body, s) -> {
+      if peek(ts, src, s) != 17 { err(ts, src, s, "expected `with`") } else {
+        let s = bump(ts, src, s)
+        let is_multi = peek(ts, src, s) == 18
+        let s = if is_multi { bump(ts, src, s) } else { s }
+        let any = peek(ts, src, s) == 24 && text_at(ts, src, s) == "any"
+        let any_start = start_at(ts, src, s)
+        let any_end = end_at(ts, src, s)
+        let s = if any { bump(ts, src, s) } else { s }
+        if is_multi && any {
+          Failed(push_diag(s, src, "E0100", any_start, any_end, "a `with any` handler is one-shot: drop `multi`"))
+        } else {
+          if peek(ts, src, s) != 61 { err(ts, src, s, "expected `{`") } else {
+            match parse_handler_items(ts, src, bump(ts, src, s), is_multi, any, Nil, No) {
+              Failed(s) -> Failed(s)
+              Read(handler, s) -> {
+                let end = end_at(ts, src, s)
+                match close_brace(ts, src, s) {
+                  Failed(s) -> Failed(s)
+                  Read(_, s) -> Read(Sp(EHandle(body, handler), start, end), s)
+                }
               }
             }
           }
@@ -564,191 +969,96 @@ fn parse_if(borrow ts: Array(Token), src: String, i: Int, braces: Bool) -> Parse
     }
   }
 }
-
-fn parse_block(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Block)) {
-  if tk(ts, src, i) != 61 { err(ts, src, i) } else {
-    parse_block_items(ts, src, i + 1, ts_start(ts, src, i), Nil)
-  }
-}
-
-fn parse_block_items(borrow ts: Array(Token), src: String, i: Int, start: Int, stmts: List(Sp(Stmt))) -> Parsed(Sp(Block)) {
-  if tk(ts, src, i) == 62 {
-    match stmts {
-      Nil -> ParseError("E0103", start, ts_end(ts, src, i))
-      Cons(last, _) -> ParseError("E0103", sp_start(last), sp_end(last))
-    }
-  } else {
-    if tk(ts, src, i) == 5 {
-      match parse_let(ts, src, i) {
-        ParseError(code, s, e) -> ParseError(code, s, e)
-        Parsed(stmt, next) -> parse_block_items(ts, src, next, start, Cons(stmt, stmts))
-      }
-    } else {
-      match parse_expr(ts, src, i, 0, True) {
-        ParseError(code, s, e) -> ParseError(code, s, e)
-        Parsed(expr, next) -> {
-          if tk(ts, src, next) == 62 {
-            Parsed(Sp(Block(rev(stmts), Yes(expr)), start, ts_end(ts, src, next)), next + 1)
-          } else {
-            let stmt = Sp(SExpr(expr), sp_start(expr), sp_end(expr))
-            parse_block_items(ts, src, next, start, Cons(stmt, stmts))
-          }
-        }
-      }
-    }
-  }
-}
-
-fn parse_let(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Stmt)) {
-  if tk(ts, src, i + 1) != 24 { err(ts, src, i + 1) } else {
-    let name = payload(ts, src, i + 1)
-    if tk(ts, src, i + 2) == 58 {
-      match parse_type(ts, src, i + 3) {
-        ParseError(code, s, e) -> ParseError(code, s, e)
-        Parsed(ann, next) -> parse_let_value(ts, src, next, ts_start(ts, src, i), name, Yes(ann))
-      }
-    } else { parse_let_value(ts, src, i + 2, ts_start(ts, src, i), name, No) }
-  }
-}
-
-fn parse_let_value(borrow ts: Array(Token), src: String, i: Int, start: Int, name: String, ann: Maybe(Sp(TypeAnn))) -> Parsed(Sp(Stmt)) {
-  if tk(ts, src, i) != 51 { err(ts, src, i) } else {
-    match parse_expr(ts, src, i + 1, 0, True) {
-      ParseError(code, s, e) -> ParseError(code, s, e)
-      Parsed(value, next) -> Parsed(Sp(SLet(name, ann, value), start, sp_end(value)), next)
-    }
-  }
-}
-
-fn parse_lambda(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Expr)) {
-  if tk(ts, src, i + 1) != 59 { err(ts, src, i + 1) } else {
-    match parse_lambda_params(ts, src, i + 2, Nil, True) {
-      ParseError(code, s, e) -> ParseError(code, s, e)
-      Parsed(params, next) -> {
-        match parse_block(ts, src, next) {
-          ParseError(code, s, e) -> ParseError(code, s, e)
-          Parsed(body, after) -> Parsed(Sp(ELambda(params, body), ts_start(ts, src, i), sp_end(body)), after)
-        }
-      }
-    }
-  }
-}
-
-// Lambdas accept name annotations, while handler clause binders are bare.
-// Neither grammar accepts a contextual `borrow` prefix.
-fn parse_lambda_params(borrow ts: Array(Token), src: String, i: Int, params: List(Sp(Param)), ann_allowed: Bool) -> Parsed(List(Sp(Param))) {
-  if tk(ts, src, i) == 60 { Parsed(rev(params), i + 1) } else {
-    parse_lambda_param(ts, src, i, params, ann_allowed)
-  }
-}
-
-fn parse_lambda_param(borrow ts: Array(Token), src: String, i: Int, params: List(Sp(Param)), ann_allowed: Bool) -> Parsed(List(Sp(Param))) {
-  if tk(ts, src, i) != 24 { err(ts, src, i) } else {
-    if ann_allowed && tk(ts, src, i + 1) == 58 {
-      match parse_type(ts, src, i + 2) {
-        ParseError(code, s, e) -> ParseError(code, s, e)
-        Parsed(ann, next) -> {
-          let param = Sp(Param(payload(ts, src, i), Yes(ann), False), ts_start(ts, src, i), ts_end(ts, src, i))
-          parse_lambda_param_end(ts, src, next, Cons(param, params), ann_allowed)
-        }
-      }
-    } else {
-      let param = Sp(Param(payload(ts, src, i), No, False), ts_start(ts, src, i), ts_end(ts, src, i))
-      parse_lambda_param_end(ts, src, i + 1, Cons(param, params), ann_allowed)
-    }
-  }
-}
-
-fn parse_lambda_param_end(borrow ts: Array(Token), src: String, i: Int, params: List(Sp(Param)), ann_allowed: Bool) -> Parsed(List(Sp(Param))) {
-  if tk(ts, src, i) == 57 { parse_lambda_param(ts, src, i + 1, params, ann_allowed) } else {
-    if tk(ts, src, i) == 60 { Parsed(rev(params), i + 1) } else { err(ts, src, i) }
-  }
-}
-
-fn parse_match(borrow ts: Array(Token), src: String, i: Int, braces: Bool) -> Parsed(Sp(Expr)) {
-  match parse_expr(ts, src, i + 1, 0, braces) {
-    ParseError(code, s, e) -> ParseError(code, s, e)
-    Parsed(scrutinee, next) -> {
-      if tk(ts, src, next) != 61 { err(ts, src, next) } else {
-        match parse_match_arms(ts, src, next + 1, Nil) {
-          ParseError(code, s, e) -> ParseError(code, s, e)
-          Parsed(arms, after) -> Parsed(Sp(EMatch(scrutinee, arms), ts_start(ts, src, i), ts_end(ts, src, after - 1)), after)
-        }
-      }
-    }
-  }
-}
-
-fn parse_match_arms(borrow ts: Array(Token), src: String, i: Int, arms: List(Sp(MatchArm))) -> Parsed(List(Sp(MatchArm))) {
-  if tk(ts, src, i) == 62 { Parsed(rev(arms), i + 1) } else {
-    match parse_pattern(ts, src, i) {
-      ParseError(code, s, e) -> ParseError(code, s, e)
-      Parsed(pattern, next) -> {
-        if tk(ts, src, next) != 38 { err(ts, src, next) } else {
-          match parse_expr(ts, src, next + 1, 0, True) {
-            ParseError(code, s, e) -> ParseError(code, s, e)
-            Parsed(body, after) -> {
-              let arm = Sp(MatchArm(pattern, body), ts_start(ts, src, i), sp_end(body))
-              parse_match_arms(ts, src, after, Cons(arm, arms))
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-fn parse_handle(borrow ts: Array(Token), src: String, i: Int, braces: Bool) -> Parsed(Sp(Expr)) {
-  match parse_expr(ts, src, i + 1, 0, braces) {
-    ParseError(code, s, e) -> ParseError(code, s, e)
-    Parsed(body, next) -> {
-      if tk(ts, src, next) != 17 { err(ts, src, next) } else {
-        let is_multi = tk(ts, src, next + 1) == 18
-        let after_multi = if is_multi { next + 2 } else { next + 1 }
-        let any = tk(ts, src, after_multi) == 24 && payload(ts, src, after_multi) == "any"
-        let brace = if any { after_multi + 1 } else { after_multi }
-        if is_multi && any { err(ts, src, after_multi) } else {
-          if tk(ts, src, brace) != 61 { err(ts, src, brace) } else {
-            match parse_handler_items(ts, src, brace + 1, is_multi, any, Nil, No) {
-              ParseError(code, s, e) -> ParseError(code, s, e)
-              Parsed(handler, after) -> Parsed(Sp(EHandle(body, handler), ts_start(ts, src, i), ts_end(ts, src, after - 1)), after)
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
 fn any_clause_ok(clause: Sp(OpClause)) -> Bool {
   match sp_node(clause) {
     OpClause(qualifier, op, params, _) -> {
-      match qualifier {
-        Yes(_) -> False
-        No -> op == "op" && count(params) == 1
+      match qualifier { Yes(_) -> False No -> op == "op" && count(params) == 1 }
+    }
+  }
+}
+fn parse_handler_items(borrow ts: Array(Token), src: String, s: State, is_multi: Bool, any: Bool, clauses: List(Sp(OpClause)), ret: Maybe(ReturnClause)) -> Read(Handler) {
+  let k = peek(ts, src, s)
+  if k == -1 || k == 62 {
+    if any && count(clauses) == 0 { err(ts, src, s, "a `with any` handler needs its `op(o)` clause") }
+    else { Read(Handler(is_multi, any, rev(clauses), ret), s) }
+  } else {
+    if k == 47 && newline_before(ts, src, state_pos(s)) { layout_error(ts, src, s) } else {
+      if k == 19 {
+        match parse_return_clause(ts, src, s) {
+          Failed(s) -> Failed(s)
+          Read(return_clause, s) -> parse_handler_items(ts, src, s, is_multi, any, clauses, Yes(return_clause))
+        }
+      } else {
+        match parse_op_clause(ts, src, s) {
+          Failed(s) -> Failed(s)
+          Read(clause, s) -> {
+            if any && !any_clause_ok(clause) {
+              Failed(push_diag(s, src, "E0100", sp_start(clause), sp_end(clause), "a `with any` handler has one operation clause, `op(o)`, and a `return` clause"))
+            } else {
+              if any && count(clauses) != 0 {
+                Failed(push_diag(s, src, "E0100", sp_start(clause), sp_end(clause), "a `with any` handler has one `op(o)` clause"))
+              } else { parse_handler_items(ts, src, s, is_multi, any, Cons(clause, clauses), ret) }
+            }
+          }
+        }
       }
     }
   }
 }
-
-fn parse_handler_items(borrow ts: Array(Token), src: String, i: Int, is_multi: Bool, any: Bool, clauses: List(Sp(OpClause)), ret: Maybe(ReturnClause)) -> Parsed(Handler) {
-  if tk(ts, src, i) == 62 {
-    if any && count(clauses) == 0 { err(ts, src, i) } else { Parsed(Handler(is_multi, any, rev(clauses), ret), i + 1) }
-  } else {
-    if tk(ts, src, i) == 47 && newline_before(ts, src, i) {
-      ParseError("E0101", ts_start(ts, src, i), ts_end(ts, src, i))
-    } else {
-      if tk(ts, src, i) == 19 {
-        match parse_return_clause(ts, src, i) {
-          ParseError(code, s, e) -> ParseError(code, s, e)
-          Parsed(return_clause, next) -> parse_handler_items(ts, src, next, is_multi, any, clauses, Yes(return_clause))
+fn parse_return_clause(borrow ts: Array(Token), src: String, s: State) -> Read(ReturnClause) {
+  let s = bump(ts, src, s)
+  if peek(ts, src, s) != 59 { err(ts, src, s, "expected `(`") } else {
+    let s = bump(ts, src, s)
+    if peek(ts, src, s) == -1 { Failed(s) } else {
+      if peek(ts, src, s) != 24 { err(ts, src, s, "expected binder") } else {
+        let binder = text_at(ts, src, s)
+        let s = bump(ts, src, s)
+        if peek(ts, src, s) != 60 { err(ts, src, s, "expected `)`") } else {
+          let s = bump(ts, src, s)
+          if peek(ts, src, s) != 38 { err(ts, src, s, "expected `->`") } else {
+            match parse_expr(ts, src, bump(ts, src, s), 0, True) {
+              Failed(s) -> Failed(s)
+              Read(body, s) -> Read(ReturnClause(binder, body), s)
+            }
+          }
         }
-      } else {
-        match parse_op_clause(ts, src, i) {
-          ParseError(code, s, e) -> ParseError(code, s, e)
-          Parsed(clause, next) -> {
-            if any && (!any_clause_ok(clause) || count(clauses) != 0) { err(ts, src, i) } else {
-              parse_handler_items(ts, src, next, is_multi, any, Cons(clause, clauses), ret)
+      }
+    }
+  }
+}
+fn parse_op_clause(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(OpClause)) {
+  let start = start_at(ts, src, s)
+  let k = peek(ts, src, s)
+  if k == -1 { Failed(s) } else {
+    if k == 25 {
+      let qualifier = text_at(ts, src, s)
+      let s = bump(ts, src, s)
+      if peek(ts, src, s) != 56 { err(ts, src, s, "expected `.` after effect name") } else {
+        let s = bump(ts, src, s)
+        if peek(ts, src, s) == -1 { Failed(s) } else {
+          if peek(ts, src, s) != 24 { err(ts, src, s, "expected operation name") } else {
+            parse_op_clause_params(ts, src, bump(ts, src, s), start, Yes(qualifier), text_at(ts, src, s))
+          }
+        }
+      }
+    } else {
+      if k != 24 { err(ts, src, s, "expected `Effect.op` clause") } else {
+        parse_op_clause_params(ts, src, bump(ts, src, s), start, No, text_at(ts, src, s))
+      }
+    }
+  }
+}
+fn parse_op_clause_params(borrow ts: Array(Token), src: String, s: State, start: Int, qualifier: Maybe(String), op: String) -> Read(Sp(OpClause)) {
+  if peek(ts, src, s) != 59 { err(ts, src, s, "expected `(`") } else {
+    match parse_lambda_params(ts, src, bump(ts, src, s), False) {
+      Failed(s) -> Failed(s)
+      Read(params, s) -> {
+        if peek(ts, src, s) != 60 { err(ts, src, s, "expected `)`") } else {
+          let s = bump(ts, src, s)
+          if peek(ts, src, s) != 38 { err(ts, src, s, "expected `->`") } else {
+            match parse_expr(ts, src, bump(ts, src, s), 0, True) {
+              Failed(s) -> Failed(s)
+              Read(body, s) -> Read(Sp(OpClause(qualifier, op, params, body), start, sp_end(body)), s)
             }
           }
         }
@@ -757,105 +1067,98 @@ fn parse_handler_items(borrow ts: Array(Token), src: String, i: Int, is_multi: B
   }
 }
 
-fn parse_return_clause(borrow ts: Array(Token), src: String, i: Int) -> Parsed(ReturnClause) {
-  if tk(ts, src, i + 1) != 59 { err(ts, src, i + 1) } else {
-    if tk(ts, src, i + 2) != 24 { err(ts, src, i + 2) } else {
-      if tk(ts, src, i + 3) != 60 { err(ts, src, i + 3) } else {
-        if tk(ts, src, i + 4) != 38 { err(ts, src, i + 4) } else {
-          match parse_expr(ts, src, i + 5, 0, True) {
-            ParseError(code, s, e) -> ParseError(code, s, e)
-            Parsed(body, next) -> Parsed(ReturnClause(payload(ts, src, i + 2), body), next)
-          }
-        }
-      }
-    }
-  }
+// Declarations retain named functions after malformed headers, as src/parse.rs.
+fn decl_expect(borrow ts: Array(Token), src: String, s: State, kind: Int, message: String) -> Read(Unit) {
+  if peek(ts, src, s) == kind { Read(Unit, bump(ts, src, s)) } else { err(ts, src, s, message) }
 }
-
-fn parse_op_clause(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(OpClause)) {
-  if tk(ts, src, i) == 25 {
-    if tk(ts, src, i + 1) != 56 { err(ts, src, i + 1) } else {
-      if tk(ts, src, i + 2) != 24 { err(ts, src, i + 2) } else {
-        parse_op_clause_params(ts, src, i + 3, ts_start(ts, src, i), Yes(payload(ts, src, i)), payload(ts, src, i + 2))
-      }
-    }
-  } else {
-    if tk(ts, src, i) != 24 { err(ts, src, i) } else {
-      parse_op_clause_params(ts, src, i + 1, ts_start(ts, src, i), No, payload(ts, src, i))
-    }
-  }
+fn decl_lower(borrow ts: Array(Token), src: String, s: State, message: String) -> Read(Sp(String)) {
+  match current_token(ts, src, s) { Token(k, a, b, text) -> {
+    if k < 0 { Failed(s) } else { if k == 24 { Read(Sp(text, a, b), bump(ts, src, s)) } else { err(ts, src, s, message) } }
+  } }
 }
-
-fn parse_op_clause_params(borrow ts: Array(Token), src: String, i: Int, start: Int, qualifier: Maybe(String), op: String) -> Parsed(Sp(OpClause)) {
-  if tk(ts, src, i) != 59 { err(ts, src, i) } else {
-    match parse_lambda_params(ts, src, i + 1, Nil, False) {
-      ParseError(code, s, e) -> ParseError(code, s, e)
-      Parsed(params, next) -> {
-        if tk(ts, src, next) != 38 { err(ts, src, next) } else {
-          match parse_expr(ts, src, next + 1, 0, True) {
-            ParseError(code, s, e) -> ParseError(code, s, e)
-            Parsed(body, after) -> Parsed(Sp(OpClause(qualifier, op, params, body), start, sp_end(body)), after)
-          }
-        }
-      }
-    }
-  }
+fn decl_upper(borrow ts: Array(Token), src: String, s: State, message: String) -> Read(Sp(String)) {
+  match current_token(ts, src, s) { Token(k, a, b, text) -> {
+    if k < 0 { Failed(s) } else { if k == 25 { Read(Sp(text, a, b), bump(ts, src, s)) } else { err(ts, src, s, message) } }
+  } }
 }
-
-
-fn parse_module(borrow ts: Array(Token), src: String, i: Int, imports: List(Sp(Import)), decls: List(Sp(Decl))) -> Parsed(Module) {
-  let k = tk(ts, src, i)
-  if k == -1 { Parsed(Module(rev(imports), rev(decls)), i) } else {
+fn decl_recover(borrow ts: Array(Token), src: String, s: State) -> State {
+  if peek(ts, src, s) < 0 || starts_decl(ts, src, state_pos(s)) { s } else { decl_recover(ts, src, bump(ts, src, s)) }
+}
+fn module_failed(borrow ts: Array(Token), src: String, s: State, reported: Int) -> State {
+  let s = if state_raised(s) == reported { eof_error(ts, src, s) } else { s }
+  decl_recover(ts, src, s)
+}
+fn module_continue(borrow ts: Array(Token), src: String, s: State, before: Int, imports: List(Sp(Import)), decls: List(Sp(Decl))) -> Read(Module) {
+  let s = if state_stop(s) >= 0 { set_height(set_depth(set_pos(set_stop(s, -1), state_stop(s)), 0), 0) } else { s }
+  let s = if state_pos(s) == before { bump(ts, src, s) } else { s }
+  parse_module(ts, src, s, imports, decls)
+}
+fn parse_module(borrow ts: Array(Token), src: String, s: State, imports: List(Sp(Import)), decls: List(Sp(Decl))) -> Read(Module) {
+  let k = peek(ts, src, s)
+  if k < 0 { Read(Module(rev(imports), rev(decls)), s) } else {
+    let before = state_pos(s)
+    let s = set_decl(s, before)
+    let reported = state_raised(s)
     if k == 6 {
-      match parse_import(ts, src, i) {
-        Parsed(im, j) -> parse_module(ts, src, j, Cons(im, imports), decls)
-        ParseError(c, s, e) -> ParseError(c, s, e)
+      match parse_import(ts, src, s) {
+        Read(im, s) -> module_continue(ts, src, s, before, Cons(im, imports), decls)
+        Failed(s) -> module_continue(ts, src, module_failed(ts, src, s, reported), before, imports, decls)
       }
     } else {
-      let parsed = if k == 3 || k == 4 {
-        parse_fn(ts, src, if k == 3 { i + 1 } else { i }, k == 3)
-      } else {
-        if k == 13 { parse_effect_decl(ts, src, i) } else {
-          if k == 9 || k == 10 { parse_type_decl(ts, src, i) } else { err(ts, src, i) }
+      if k == 3 || k == 4 {
+        let start = start_at(ts, src, s)
+        let is_pub = k == 3
+        let fs = if is_pub { bump(ts, src, s) } else { s }
+        let ni = state_pos(fs) + 1
+        let known = tk(ts, src, state_pos(fs)) == 4 && tk(ts, src, ni) == 24
+        match parse_fn(ts, src, fs, is_pub) {
+          Read(d, s) -> module_continue(ts, src, s, before, imports, Cons(d, decls))
+          Failed(s) -> {
+            let decls = if known {
+              let end = ts_end(ts, src, ni)
+              let body = Sp(Block(Nil, Yes(Sp(EError, start, end))), start, end)
+              Cons(Sp(DFn(is_pub, payload(ts, src, ni), Nil, No, No, body), start, end), decls)
+            } else { decls }
+            module_continue(ts, src, module_failed(ts, src, s, reported), before, imports, decls)
+          }
         }
-      }
-      match parsed {
-        Parsed(d, j) -> parse_module(ts, src, j, imports, Cons(d, decls))
-        ParseError(c, s, e) -> ParseError(c, s, e)
+      } else {
+        let result = if k == 13 { parse_effect_decl(ts, src, s) } else {
+          if k == 9 || k == 10 { parse_type_decl(ts, src, s) } else { err(ts, src, s, "expected `import`, `fn`, `pub fn`, `effect`, or `type`") }
+        }
+        match result {
+          Read(d, s) -> module_continue(ts, src, s, before, imports, Cons(d, decls))
+          Failed(s) -> module_continue(ts, src, module_failed(ts, src, s, reported), before, imports, decls)
+        }
       }
     }
   }
 }
-
-fn parse_fn(borrow ts: Array(Token), src: String, i: Int, is_pub: Bool) -> Parsed(Sp(Decl)) {
-  if tk(ts, src, i) != 4 { err(ts, src, i) } else {
-    if tk(ts, src, i + 1) != 24 { err(ts, src, i + 1) } else {
-      if tk(ts, src, i + 2) != 59 { err(ts, src, i + 2) } else {
-        match parse_params(ts, src, i + 3) {
-          ParseError(c, s, e) -> ParseError(c, s, e)
-          Parsed(params, j) -> {
-            let row = if tk(ts, src, j) == 49 {
-              match parse_row(ts, src, j + 1, True) {
-                Parsed(r, next) -> Parsed(Yes(r), next)
-                ParseError(c, s, e) -> ParseError(c, s, e)
-              }
-            } else { Parsed(No, j) }
+fn parse_fn(borrow ts: Array(Token), src: String, s: State, is_pub: Bool) -> Read(Sp(Decl)) {
+  let start = start_at(ts, src, s)
+  match decl_expect(ts, src, s, 4, "expected `fn`") {
+    Failed(s) -> Failed(s)
+    Read(_, s) -> match decl_lower(ts, src, s, "expected function name") {
+      Failed(s) -> Failed(s)
+      Read(name, s) -> match decl_expect(ts, src, s, 59, "expected `(`") {
+        Failed(s) -> Failed(s)
+        Read(_, s) -> match parse_params(ts, src, s) {
+          Failed(s) -> Failed(s)
+          Read(params, s) -> {
+            let row = if peek(ts, src, s) == 49 {
+              match parse_row(ts, src, bump(ts, src, s), True) { Read(row, s) -> Read(Yes(row), s) Failed(s) -> Failed(s) }
+            } else { Read(No, s) }
             match row {
-              ParseError(c, s, e) -> ParseError(c, s, e)
-              Parsed(r, next) -> {
-                let ret = if tk(ts, src, next) == 38 {
-                  match parse_type(ts, src, next + 1) {
-                    Parsed(t, after) -> Parsed(Yes(t), after)
-                    ParseError(c, s, e) -> ParseError(c, s, e)
-                  }
-                } else { Parsed(No, next) }
+              Failed(s) -> Failed(s)
+              Read(row, s) -> {
+                let ret = if peek(ts, src, s) == 38 {
+                  match parse_type(ts, src, bump(ts, src, s)) { Read(t, s) -> Read(Yes(t), s) Failed(s) -> Failed(s) }
+                } else { Read(No, s) }
                 match ret {
-                  ParseError(c, s, e) -> ParseError(c, s, e)
-                  Parsed(t, after) -> {
-                    match parse_block(ts, src, after) {
-                      ParseError(c, s, e) -> ParseError(c, s, e)
-                      Parsed(b, end) -> Parsed(Sp(DFn(is_pub, payload(ts, src, i + 1), params, r, t, b), ts_start(ts, src, i), sp_end(b)), end)
-                    }
+                  Failed(s) -> Failed(s)
+                  Read(ret, s) -> match parse_block(ts, src, s) {
+                    Failed(s) -> Failed(s)
+                    Read(body, s) -> Read(Sp(DFn(is_pub, sp_node(name), params, row, ret, body), start, sp_end(body)), s)
                   }
                 }
               }
@@ -866,80 +1169,90 @@ fn parse_fn(borrow ts: Array(Token), src: String, i: Int, is_pub: Bool) -> Parse
     }
   }
 }
-
-fn parse_names(borrow ts: Array(Token), src: String, i: Int, names: List(String)) -> Parsed(List(String)) {
-  if tk(ts, src, i) != 24 { err(ts, src, i) } else {
-    let names = Cons(payload(ts, src, i), names)
-    if tk(ts, src, i + 1) == 57 { parse_names(ts, src, i + 2, names) } else {
-      if tk(ts, src, i + 1) == 60 { Parsed(rev(names), i + 2) } else { err(ts, src, i + 1) }
+fn parse_params(borrow ts: Array(Token), src: String, s: State) -> Read(List(Sp(Param))) {
+  if peek(ts, src, s) == 60 { Read(Nil, bump(ts, src, s)) } else { param_items(ts, src, s, Nil) }
+}
+fn param_items(borrow ts: Array(Token), src: String, s: State, params: List(Sp(Param))) -> Read(List(Sp(Param))) {
+  let borrowing = peek(ts, src, s) == 24 && text_at(ts, src, s) == "borrow" && tk(ts, src, state_pos(s) + 1) == 24
+  let s = if borrowing { bump(ts, src, s) } else { s }
+  match decl_lower(ts, src, s, "expected parameter name") {
+    Failed(s) -> Failed(s)
+    Read(name, s) -> {
+      if peek(ts, src, s) == 58 {
+        match parse_type(ts, src, bump(ts, src, s)) {
+          Failed(s) -> Failed(s)
+          Read(ann, s) -> param_after(ts, src, s, Cons(Sp(Param(sp_node(name), Yes(ann), borrowing), sp_start(name), sp_end(name)), params))
+        }
+      } else { param_after(ts, src, s, Cons(Sp(Param(sp_node(name), No, borrowing), sp_start(name), sp_end(name)), params)) }
     }
   }
 }
-fn decl_names(borrow ts: Array(Token), src: String, i: Int) -> Parsed(List(String)) {
-  if tk(ts, src, i) != 59 { Parsed(Nil, i) } else {
-    if tk(ts, src, i + 1) == 60 { Parsed(Nil, i + 2) } else { parse_names(ts, src, i + 1, Nil) }
+fn param_after(borrow ts: Array(Token), src: String, s: State, params: List(Sp(Param))) -> Read(List(Sp(Param))) {
+  if peek(ts, src, s) == 57 { param_items(ts, src, bump(ts, src, s), params) } else {
+    match decl_expect(ts, src, s, 60, "expected `)`") { Failed(s) -> Failed(s) Read(_, s) -> Read(rev(params), s) }
   }
 }
-fn parse_effect_decl(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Decl)) {
-  let is_multi = tk(ts, src, i + 1) == 18
-  let n = if is_multi { i + 2 } else { i + 1 }
-  if tk(ts, src, n) != 25 { err(ts, src, n) } else {
-    match decl_names(ts, src, n + 1) {
-      ParseError(c, s, e) -> ParseError(c, s, e)
-      Parsed(params, j) -> {
-        if tk(ts, src, j) != 61 { err(ts, src, j) } else {
-          match parse_ops(ts, src, j + 1, Nil) {
-            ParseError(c, s, e) -> ParseError(c, s, e)
-            Parsed(ops, end) -> Parsed(Sp(DEffect(payload(ts, src, n), params, is_multi, ops), ts_start(ts, src, i), ts_end(ts, src, end - 1)), end)
+fn decl_names(borrow ts: Array(Token), src: String, s: State) -> Read(List(String)) {
+  if peek(ts, src, s) != 59 { Read(Nil, s) } else {
+    let s = bump(ts, src, s)
+    if peek(ts, src, s) == 60 { Read(Nil, bump(ts, src, s)) } else { parse_names(ts, src, s, Nil) }
+  }
+}
+fn parse_names(borrow ts: Array(Token), src: String, s: State, names: List(String)) -> Read(List(String)) {
+  match decl_lower(ts, src, s, "expected type parameter (lowercase)") {
+    Failed(s) -> Failed(s)
+    Read(name, s) -> {
+      if peek(ts, src, s) == 57 { parse_names(ts, src, bump(ts, src, s), Cons(sp_node(name), names)) } else {
+        match decl_expect(ts, src, s, 60, "expected `)`") { Failed(s) -> Failed(s) Read(_, s) -> Read(rev(Cons(sp_node(name), names)), s) }
+      }
+    }
+  }
+}
+fn parse_effect_decl(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(Decl)) {
+  let start = start_at(ts, src, s)
+  let s = bump(ts, src, s)
+  let is_multi = peek(ts, src, s) == 18
+  let s = if is_multi { bump(ts, src, s) } else { s }
+  match decl_upper(ts, src, s, "expected effect name (uppercase)") {
+    Failed(s) -> Failed(s)
+    Read(name, s) -> match decl_names(ts, src, s) {
+      Failed(s) -> Failed(s)
+      Read(params, s) -> match decl_expect(ts, src, s, 61, "expected `{`") {
+        Failed(s) -> Failed(s)
+        Read(_, s) -> match parse_ops(ts, src, s, Nil) {
+          Failed(s) -> Failed(s)
+          Read(ops, s) -> {
+            let end = end_at(ts, src, s)
+            match close_brace(ts, src, s) {
+              Failed(s) -> Failed(s)
+              Read(_, s) -> Read(Sp(DEffect(sp_node(name), params, is_multi, ops), start, end), s)
+            }
           }
         }
       }
     }
   }
 }
-fn parse_ops(borrow ts: Array(Token), src: String, i: Int, ops: List(Sp(OpSig))) -> Parsed(List(Sp(OpSig))) {
-  if tk(ts, src, i) == 62 { Parsed(rev(ops), i + 1) } else {
-    if tk(ts, src, i) != 4 { err(ts, src, i) } else {
-      match parse_op(ts, src, i) {
-        ParseError(c, s, e) -> ParseError(c, s, e)
-        Parsed(op, j) -> parse_ops(ts, src, j, Cons(op, ops))
-      }
-    }
+fn parse_ops(borrow ts: Array(Token), src: String, s: State, ops: List(Sp(OpSig))) -> Read(List(Sp(OpSig))) {
+  if peek(ts, src, s) != 4 { Read(rev(ops), s) } else {
+    match parse_op(ts, src, s) { Failed(s) -> Failed(s) Read(op, s) -> parse_ops(ts, src, s, Cons(op, ops)) }
   }
 }
 type OpParams { OpParams(List(Sp(Param)), List(Sp(TypeAnn))) }
-fn parse_op_params(borrow ts: Array(Token), src: String, i: Int, ps: List(Sp(Param)), tys: List(Sp(TypeAnn))) -> Parsed(OpParams) {
-  if tk(ts, src, i) == 60 { Parsed(OpParams(rev(ps), rev(tys)), i + 1) } else {
-    if tk(ts, src, i) != 24 { err(ts, src, i) } else {
-      if tk(ts, src, i + 1) != 58 { err(ts, src, i + 1) } else {
-        match parse_type(ts, src, i + 2) {
-          ParseError(c, s, e) -> ParseError(c, s, e)
-          Parsed(t, j) -> {
-            let p = Sp(Param(payload(ts, src, i), No, False), ts_start(ts, src, i), ts_end(ts, src, i))
-            if tk(ts, src, j) == 57 {
-              if tk(ts, src, j + 1) == 60 { err(ts, src, j + 1) } else { parse_op_params(ts, src, j + 1, Cons(p, ps), Cons(t, tys)) }
-            } else {
-              if tk(ts, src, j) == 60 { Parsed(OpParams(rev(Cons(p, ps)), rev(Cons(t, tys))), j + 1) } else { err(ts, src, j) }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-fn parse_op(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(OpSig)) {
-  if tk(ts, src, i + 1) != 24 { err(ts, src, i + 1) } else {
-    if tk(ts, src, i + 2) != 59 { err(ts, src, i + 2) } else {
-      match parse_op_params(ts, src, i + 3, Nil, Nil) {
-        ParseError(c, s, e) -> ParseError(c, s, e)
-        Parsed(pars, j) -> {
-          if tk(ts, src, j) != 38 { err(ts, src, j) } else {
-            match parse_type(ts, src, j + 1) {
-              ParseError(c, s, e) -> ParseError(c, s, e)
-              Parsed(ret, end) -> {
-                match pars {
-                  OpParams(ps, tys) -> Parsed(Sp(OpSig(payload(ts, src, i + 1), ps, tys, ret), ts_start(ts, src, i), sp_end(ret)), end)
-                }
+fn parse_op_params(borrow ts: Array(Token), src: String, s: State, ps: List(Sp(Param)), tys: List(Sp(TypeAnn)), first: Bool) -> Read(OpParams) {
+  if first && peek(ts, src, s) == 60 { Read(OpParams(rev(ps), rev(tys)), bump(ts, src, s)) } else {
+    match decl_lower(ts, src, s, "expected parameter name") {
+      Failed(s) -> Failed(s)
+      Read(name, s) -> match decl_expect(ts, src, s, 58, "operation params need a type") {
+        Failed(s) -> Failed(s)
+        Read(_, s) -> match parse_type(ts, src, s) {
+          Failed(s) -> Failed(s)
+          Read(ty, s) -> {
+            let ps = Cons(Sp(Param(sp_node(name), No, False), sp_start(name), sp_end(name)), ps)
+            if peek(ts, src, s) == 57 { parse_op_params(ts, src, bump(ts, src, s), ps, Cons(ty, tys), False) } else {
+              match decl_expect(ts, src, s, 60, "expected `)`") {
+                Failed(s) -> Failed(s)
+                Read(_, s) -> Read(OpParams(rev(ps), rev(Cons(ty, tys))), s)
               }
             }
           }
@@ -948,19 +1261,43 @@ fn parse_op(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(OpSig)) {
     }
   }
 }
-
-fn parse_type_decl(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Decl)) {
-  let is_linear = tk(ts, src, i) == 10
-  let t = if is_linear { i + 1 } else { i }
-  if tk(ts, src, t) != 9 { err(ts, src, t) } else {
-    if tk(ts, src, t + 1) != 25 { err(ts, src, t + 1) } else {
-      match decl_names(ts, src, t + 2) {
-        ParseError(c, s, e) -> ParseError(c, s, e)
-        Parsed(params, j) -> {
-          if tk(ts, src, j) != 61 { err(ts, src, j) } else {
-            match parse_variants(ts, src, j + 1, Nil) {
-              ParseError(c, s, e) -> ParseError(c, s, e)
-              Parsed(variants, end) -> Parsed(Sp(DType(payload(ts, src, t + 1), params, is_linear, variants), ts_start(ts, src, i), ts_end(ts, src, end - 1)), end)
+fn parse_op(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(OpSig)) {
+  let start = start_at(ts, src, s)
+  match decl_lower(ts, src, bump(ts, src, s), "expected operation name") {
+    Failed(s) -> Failed(s)
+    Read(name, s) -> match decl_expect(ts, src, s, 59, "expected `(`") {
+      Failed(s) -> Failed(s)
+      Read(_, s) -> match parse_op_params(ts, src, s, Nil, Nil, True) {
+        Failed(s) -> Failed(s)
+        Read(OpParams(ps, tys), s) -> match decl_expect(ts, src, s, 38, "operation needs a return type `-> T`") {
+          Failed(s) -> Failed(s)
+          Read(_, s) -> match parse_type(ts, src, s) {
+            Failed(s) -> Failed(s)
+            Read(ret, s) -> Read(Sp(OpSig(sp_node(name), ps, tys, ret), start, sp_end(ret)), s)
+          }
+        }
+      }
+    }
+  }
+}
+fn parse_type_decl(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(Decl)) {
+  let start = start_at(ts, src, s)
+  let is_linear = peek(ts, src, s) == 10
+  let s = bump(ts, src, s)
+  let head = if is_linear { decl_expect(ts, src, s, 9, "expected `type` after `linear`") } else { Read(Unit, s) }
+  match head {
+    Failed(s) -> Failed(s)
+    Read(_, s) -> match decl_upper(ts, src, s, "expected type name (uppercase)") {
+      Failed(s) -> Failed(s)
+      Read(name, s) -> match decl_names(ts, src, s) {
+        Failed(s) -> Failed(s)
+        Read(params, s) -> match decl_expect(ts, src, s, 61, "expected `{`") {
+          Failed(s) -> Failed(s)
+          Read(_, s) -> match parse_variants(ts, src, s, Nil, True) {
+            Failed(s) -> Failed(s)
+            Read(variants, s) -> {
+              let end = end_at(ts, src, s)
+              match close_brace(ts, src, s) { Failed(s) -> Failed(s) Read(_, s) -> Read(Sp(DType(sp_node(name), params, is_linear, variants), start, end), s) }
             }
           }
         }
@@ -968,105 +1305,175 @@ fn parse_type_decl(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(De
     }
   }
 }
-fn parse_variants(borrow ts: Array(Token), src: String, i: Int, vs: List(Sp(VariantDecl))) -> Parsed(List(Sp(VariantDecl))) {
-  if tk(ts, src, i) == 62 { Parsed(rev(vs), i + 1) } else {
-    if tk(ts, src, i) != 25 { err(ts, src, i) } else {
-      let fields = if tk(ts, src, i + 1) == 59 {
-        parse_variant_fields(ts, src, i + 2, Nil)
-      } else { Parsed(Nil, i + 1) }
-      match fields {
-        ParseError(c, s, e) -> ParseError(c, s, e)
-        Parsed(fs, j) -> {
-          let v = Sp(VariantDecl(payload(ts, src, i), fs), ts_start(ts, src, i), ts_end(ts, src, j - 1))
-          if tk(ts, src, j) == 57 {
-            if tk(ts, src, j + 1) == 62 { err(ts, src, j + 1) } else { parse_variants(ts, src, j + 1, Cons(v, vs)) }
-          } else {
-            if tk(ts, src, j) == 62 { Parsed(rev(Cons(v, vs)), j + 1) } else { err(ts, src, j) }
+fn parse_variants(borrow ts: Array(Token), src: String, s: State, vs: List(Sp(VariantDecl)), first: Bool) -> Read(List(Sp(VariantDecl))) {
+  if first && peek(ts, src, s) == 62 { Read(rev(vs), s) } else {
+    match decl_upper(ts, src, s, "expected constructor name (uppercase)") {
+      Failed(s) -> Failed(s)
+      Read(name, s) -> {
+        if peek(ts, src, s) == 59 {
+          match parse_variant_fields(ts, src, bump(ts, src, s), Nil, True) {
+            Failed(s) -> Failed(s)
+            Read(fields, s) -> {
+              let end = end_at(ts, src, s)
+              match decl_expect(ts, src, s, 60, "expected `)`") {
+                Failed(s) -> Failed(s)
+                Read(_, s) -> variant_after(ts, src, s, Cons(Sp(VariantDecl(sp_node(name), fields), sp_start(name), end), vs))
+              }
+            }
           }
-        }
+        } else { variant_after(ts, src, s, Cons(Sp(VariantDecl(sp_node(name), Nil), sp_start(name), sp_end(name)), vs)) }
       }
     }
   }
 }
-fn parse_variant_fields(borrow ts: Array(Token), src: String, i: Int, fs: List(Sp(TypeAnn))) -> Parsed(List(Sp(TypeAnn))) {
-  if tk(ts, src, i) == 60 { Parsed(rev(fs), i + 1) } else {
-    match parse_type(ts, src, i) {
-      ParseError(c, s, e) -> ParseError(c, s, e)
-      Parsed(t, j) -> {
-        if tk(ts, src, j) == 57 {
-          if tk(ts, src, j + 1) == 60 { err(ts, src, j + 1) } else { parse_variant_fields(ts, src, j + 1, Cons(t, fs)) }
-        } else {
-          if tk(ts, src, j) == 60 { Parsed(rev(Cons(t, fs)), j + 1) } else { err(ts, src, j) }
-        }
+fn variant_after(borrow ts: Array(Token), src: String, s: State, vs: List(Sp(VariantDecl))) -> Read(List(Sp(VariantDecl))) {
+  if peek(ts, src, s) == 57 { parse_variants(ts, src, bump(ts, src, s), vs, False) } else { Read(rev(vs), s) }
+}
+fn parse_variant_fields(borrow ts: Array(Token), src: String, s: State, fields: List(Sp(TypeAnn)), first: Bool) -> Read(List(Sp(TypeAnn))) {
+  if first && peek(ts, src, s) == 60 { Read(rev(fields), s) } else {
+    match parse_type(ts, src, s) {
+      Failed(s) -> Failed(s)
+      Read(ty, s) -> {
+        if peek(ts, src, s) == 57 { parse_variant_fields(ts, src, bump(ts, src, s), Cons(ty, fields), False) } else { Read(rev(Cons(ty, fields)), s) }
       }
     }
   }
 }
-
 type ImportPath { ImportPath(List(String), Int) }
-fn parse_import_path(borrow ts: Array(Token), src: String, i: Int, path: List(String)) -> Parsed(ImportPath) {
-  if tk(ts, src, i) != 24 { err(ts, src, i) } else {
-    let path = Cons(payload(ts, src, i), path)
-    if tk(ts, src, i + 1) == 49 && tk(ts, src, i + 2) != 61 {
-      parse_import_path(ts, src, i + 2, path)
-    } else { Parsed(ImportPath(rev(path), ts_end(ts, src, i)), i + 1) }
+fn parse_import_path(borrow ts: Array(Token), src: String, s: State, path: List(String)) -> Read(ImportPath) {
+  match decl_lower(ts, src, s, "expected module path segment") {
+    Failed(s) -> Failed(s)
+    Read(name, s) -> {
+      let path = Cons(sp_node(name), path)
+      if peek(ts, src, s) == 49 && tk(ts, src, state_pos(s) + 1) != 61 {
+        parse_import_path(ts, src, bump(ts, src, s), path)
+      } else { Read(ImportPath(rev(path), sp_end(name)), s) }
+    }
   }
 }
 fn import_labels(labels: List(LabelAnn)) -> List(Sp(String)) {
-  match labels { Nil -> Nil Cons(LabelAnn(n, _), rest) -> Cons(n, import_labels(rest)) }
+  match labels { Nil -> Nil Cons(LabelAnn(name, _), rest) -> Cons(name, import_labels(rest)) }
 }
 fn last_label_end(labels: List(Sp(String)), end: Int) -> Int {
-  match labels { Nil -> end Cons(l, ls) -> last_label_end(ls, sp_end(l)) }
+  match labels { Nil -> end Cons(name, rest) -> last_label_end(rest, max_int(end, sp_end(name))) }
 }
-fn parse_import(borrow ts: Array(Token), src: String, i: Int) -> Parsed(Sp(Import)) {
-  match parse_import_path(ts, src, i + 1, Nil) {
-    ParseError(c, s, e) -> ParseError(c, s, e)
-    Parsed(ImportPath(path, end), j) -> {
-      let alias = if tk(ts, src, j) == 24 && payload(ts, src, j) == "as" {
-        if tk(ts, src, j + 1) == 24 { Parsed(Yes(payload(ts, src, j + 1)), j + 2) } else { err(ts, src, j + 1) }
-      } else { Parsed(No, j) }
-      match alias {
-        ParseError(c, s, e) -> ParseError(c, s, e)
-        Parsed(a, next) -> {
-          let end = if next == j { end } else { ts_end(ts, src, next - 1) }
-          if tk(ts, src, next) == 49 {
-            let open_end = ts_end(ts, src, next + 1)
-            match parse_row(ts, src, next + 1, False) {
-              ParseError(c, s, e) -> ParseError(c, s, e)
-              Parsed(RowAnn(labels, _), after) -> {
-                let allows = import_labels(labels)
-                Parsed(Sp(Import(path, a, Yes(allows)), ts_start(ts, src, i), last_label_end(allows, open_end)), after)
-              }
-            }
-          } else { Parsed(Sp(Import(path, a, No), ts_start(ts, src, i), end), next) }
+fn parse_import(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(Import)) {
+  let start = start_at(ts, src, s)
+  match parse_import_path(ts, src, bump(ts, src, s), Nil) {
+    Failed(s) -> Failed(s)
+    Read(ImportPath(path, end), s) -> {
+      if peek(ts, src, s) == 24 && text_at(ts, src, s) == "as" {
+        let s = bump(ts, src, s)
+        if peek(ts, src, s) != 24 { err(ts, src, s, "expected a name after `as`") } else {
+          let alias = text_at(ts, src, s)
+          let end = end_at(ts, src, s)
+          finish_import(ts, src, bump(ts, src, s), start, end, path, Yes(alias))
+        }
+      } else { finish_import(ts, src, s, start, end, path, No) }
+    }
+  }
+}
+fn finish_import(borrow ts: Array(Token), src: String, s: State, start: Int, end: Int, path: List(String), alias: Maybe(String)) -> Read(Sp(Import)) {
+  if peek(ts, src, s) == 49 {
+    let s = bump(ts, src, s)
+    let end = max_int(end, end_at(ts, src, s))
+    match parse_row(ts, src, s, False) {
+      Failed(s) -> Failed(s)
+      Read(RowAnn(labels, _), s) -> {
+        let labels = import_labels(labels)
+        Read(Sp(Import(path, alias, Yes(labels)), start, last_label_end(labels, end)), s)
+      }
+    }
+  } else { Read(Sp(Import(path, alias, No), start, end), s) }
+}
+
+// Exact binary64 range tests without converting decimal text to Float.
+// Halfway to the least subnormal is 2^-1075 = 5^1075 * 10^-1075.
+// Halfway from the largest finite value to infinity is 2^1024 - 2^970.
+// Round-to-nearest ties-to-even chooses zero/infinity at those boundaries.
+// Constants below are str(5**1075) and str(2**1024 - 2**970), respectively.
+type FloatParts { FloatParts(Int, Int, Int, Int) }
+// End of mantissa, digits before dot, first nonzero digit number and byte index.
+fn float_parts(text: String, i: Int, size: Int, n: Int, dot: Int, first: Int, at: Int) -> FloatParts {
+  if i >= size { FloatParts(i, if dot < 0 { n } else { dot }, first, at) } else {
+    let c = string.byte_at(text, i)
+    if c == 101 || c == 69 { FloatParts(i, if dot < 0 { n } else { dot }, first, at) } else {
+      if c == 46 { float_parts(text, i + 1, size, n, n, first, at) } else {
+        if c == 95 { float_parts(text, i + 1, size, n, dot, first, at) } else {
+          let nonzero = first < 0 && c != 48
+          float_parts(text, i + 1, size, n + 1, dot, if nonzero { n } else { first }, if nonzero { i } else { at })
+        }
+      }
+    }
+  }
+}
+// Rust dec2flt accumulates while the exponent is below 0x10000, then ignores
+// subsequent digits. This is observable when a long mantissa cancels it:
+// fifty exponent 9s mean 99999, not an unbounded mathematical exponent.
+fn float_exp_digits(text: String, i: Int, size: Int, n: Int) -> Int {
+  if i >= size || n >= 65536 { n } else {
+    let c = string.byte_at(text, i)
+    if c == 95 { float_exp_digits(text, i + 1, size, n) } else {
+      float_exp_digits(text, i + 1, size, n * 10 + c - 48)
+    }
+  }
+}
+fn float_exponent(text: String, i: Int, size: Int) -> Int {
+  if i >= size { 0 } else {
+    let c = string.byte_at(text, i)
+    let negative = c == 45
+    let begin = if c == 43 || negative { i + 1 } else { i }
+    let n = float_exp_digits(text, begin, size, 0)
+    if negative { 0 - n } else { n }
+  }
+}
+// Compare significant digits after scientific exponents agree, padding either
+// side with zeroes. Extra source precision is retained rather than rounded.
+fn float_digits_compare(text: String, i: Int, end: Int, bound: String, j: Int, size: Int) -> Int {
+  if i >= end && j >= size { 0 } else {
+    let a = if i >= end { 48 } else { string.byte_at(text, i) }
+    if a == 46 || a == 95 { float_digits_compare(text, i + 1, end, bound, j, size) } else {
+      let b = if j >= size { 48 } else { string.byte_at(bound, j) }
+      if a < b { -1 } else {
+        if a > b { 1 } else { float_digits_compare(text, if i < end { i + 1 } else { i }, end, bound, j + 1, size) }
+      }
+    }
+  }
+}
+fn float_out_of_range(text: String) -> Bool {
+  let size = string.length(text)
+  match float_parts(text, 0, size, 0, -1, -1, 0) {
+    FloatParts(end, before, first, at) -> {
+      if first < 0 { False } else {
+        let exponent = float_exponent(text, end + 1, size) + before - first - 1
+        if exponent < -324 || exponent > 308 { True } else {
+          if exponent == -324 {
+            float_digits_compare(text, at, end, "24703282292062327208828439643411068618252990130716238221279284125033775363510437593264991818081799618989828234772285886546332835517796989819938739800539093906315035659515570226392290858392449105184435931802849936536152500319370457678249219365623669863658480757001585769269903706311928279558551332927834338409351978015531246597263579574622766465272827220056374006485499977096599470454020828166226237857393450736339007967761930577506740176324673600968951340535537458516661134223766678604162159680461914467291840300530057530849048765391711386591646239524912623653881879636239373280423891018672348497668235089863388587925628302755995657524455507255189313690836254779186948667994968324049705821028513185451396213837722826145437693412532098591327667236328125", 0, 752) <= 0
+          } else {
+            if exponent == 308 {
+              float_digits_compare(text, at, end, "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792", 0, 309) >= 0
+            } else { False }
+          }
         }
       }
     }
   }
 }
 
-
-// Pre-order, complete AST dump: the byte-for-byte form in src/ast_dump.rs.
-// A single Buffer is threaded through every traversal and list loop.
+// A line is short; compose it before appending to avoid repeated Buffer
+// builtin calls in the evaluator. The enclosing dump still uses one Buffer.
 fn dump_line(b: Buffer, depth: Int, kind: String, start: Int, end: Int, text: String) -> Buffer {
-  let b = buffer.push(buffer.push(buffer.push(b, int.to_string(depth)), " "), kind)
-  let b = buffer.push(b, " ")
-  let b = if start < 0 {
-    buffer.push(b, "- -")
-  } else {
-    buffer.push(buffer.push(buffer.push(b, int.to_string(start)), " "), int.to_string(end))
-  }
-  let b = if string.length(text) == 0 { b } else {
-    buffer.push(buffer.push(b, " "), text)
-  }
-  buffer.push(b, "\n")
+  let span = if start < 0 { "- -" } else { int.to_string(start) <> " " <> int.to_string(end) }
+  let line = int.to_string(depth) <> " " <> kind <> " " <> span
+  let line = if text == "" { line <> "\n" } else { line <> " " <> text <> "\n" }
+  buffer.push(b, line)
 }
 
 fn dump_words2(a: String, b: String) -> String {
-  buffer.finish(buffer.push(buffer.push(buffer.push(buffer.new(), a), " "), b))
+  a <> " " <> b
 }
 fn dump_words3(a: String, b: String, c: String) -> String {
-  buffer.finish(buffer.push(buffer.push(buffer.push(buffer.push(buffer.push(buffer.new(), a), " "), b), " "), c))
+  a <> " " <> b <> " " <> c
 }
 fn dump_flag(on: Bool, word: String) -> String { if on { word } else { "-" } }
 fn dump_bool(on: Bool) -> String { if on { "True" } else { "False" } }
@@ -1273,15 +1680,16 @@ fn dump_patterns(xs: List(Sp(Pattern)), src: String, depth: Int, b: Buffer) -> B
     Cons(x, rest) -> dump_patterns(rest, src, depth, dump_pattern(x, src, depth, b))
   }
 }
+// Only underscores are removed, including from a negative literal's whole
+// source span. Append UTF-8 runs rather than allocating one string per scalar.
+fn dump_float_run(src: String, i: Int, end: Int) -> Int {
+  if i >= end || string.byte_at(src, i) == 95 { i } else { dump_float_run(src, i + 1, end) }
+}
 fn dump_float_text(src: String, i: Int, end: Int, b: Buffer) -> String {
-  if i == end { buffer.finish(b) } else {
-    if string.byte_at(src, i) == 95 { dump_float_text(src, i + 1, end, b) } else {
-      // All non-ASCII bytes survive as whole UTF-8 slices, including grouped
-      // float expressions whose widened source span can contain comments.
-      let c = string.byte_at(src, i)
-      let width = if c < 128 { 1 } else { if c < 224 { 2 } else { if c < 240 { 3 } else { 4 } } }
-      dump_float_text(src, i + width, end, buffer.push(b, string.slice(src, i, i + width)))
-    }
+  if i >= end { buffer.finish(b) } else {
+    let next = dump_float_run(src, i, end)
+    let b = if next > i { buffer.push(b, string.slice(src, i, next)) } else { b }
+    dump_float_text(src, if next < end { next + 1 } else { next }, end, b)
   }
 }
 fn dump_expr(e: Sp(Expr), src: String, depth: Int, b: Buffer) -> Buffer {
@@ -1372,43 +1780,63 @@ fn dump_arms(xs: List(Sp(MatchArm)), src: String, depth: Int, b: Buffer) -> Buff
 }
 
 
-fn error_line(code: String, start: Int, end: Int, b: Buffer) -> Buffer {
-  let b = buffer.push(buffer.push(b, "error "), code)
-  let b = buffer.push(buffer.push(b, " "), int.to_string(start))
-  buffer.push(buffer.push(buffer.push(b, " "), int.to_string(end)), "\n")
-}
-fn lexical_errors(borrow ds: Array(LexDiag), i: Int, b: Buffer) -> String {
-  if i == array.length(ds) { buffer.finish(b) } else {
-    match array.get(ds, i) {
-      LexDiag(c, s, e) -> lexical_errors(ds, i + 1, error_line(c, s, e, b))
-    }
+
+// The lexer and parser use separate diagnostic streams. Merge lexical range
+// errors at their scan position, then append all parser diagnostics.
+fn lex_message(code: String) -> String { if code == "E0003" { "an exponent needs a float literal" } else { "unexpected character" } }
+fn remaining_lex_diags(borrow ds: Array(LexDiag), j: Int, acc: List(ParseDiag)) -> List(ParseDiag) {
+  if j >= array.length(ds) { rev(acc) } else {
+    match array.get(ds, j) { LexDiag(code, a, b) -> remaining_lex_diags(ds, j + 1, Cons(ParseDiag(code, a, b, lex_message(code)), acc)) }
   }
+}
+fn lexical_diags(borrow ts: Array(Token), borrow ds: Array(LexDiag), i: Int, j: Int, acc: List(ParseDiag)) -> List(ParseDiag) {
+  if i >= array.length(ts) { remaining_lex_diags(ds, j, acc) } else {
+    match array.get(ts, i) { Token(kind, a, b, text) -> {
+      let prior = if j < array.length(ds) { match array.get(ds, j) { LexDiag(_, start, _) -> start <= a } } else { False }
+      if prior {
+        match array.get(ds, j) { LexDiag(code, start, end) -> lexical_diags(ts, ds, i, j + 1, Cons(ParseDiag(code, start, end, lex_message(code)), acc)) }
+      } else {
+        let acc = if kind == 1 {
+          if float_out_of_range(text) { Cons(ParseDiag("E0002", a, b, "float literal out of range"), acc) } else { acc }
+        } else { acc }
+        lexical_diags(ts, ds, i + 1, j, acc)
+      }
+    } }
+  }
+}
+type ParsedSource { ParsedSource(Module, List(ParseDiag), Int) }
+fn parse_source(src: String) -> ParsedSource {
+  match lex.lex(src) { Lexed(ts, ds) -> {
+    let lexical = lexical_diags(ts, ds, 0, 0, Nil)
+    let initial = State(0, Nil, False, 0, 0, 0, 0, -1)
+    match parse_module(ts, src, initial, Nil, Nil) {
+      Read(m, s) -> ParsedSource(m, reverse_into(rev(lexical), rev(state_diags(s))), state_pos(s))
+      Failed(s) -> ParsedSource(Module(Nil, Nil), reverse_into(rev(lexical), rev(state_diags(s))), state_pos(s))
+    }
+  } }
+}
+fn error_line(code: String, a: Int, b: Int, message: String, out: Buffer) -> Buffer {
+  buffer.push(out, "error " <> code <> " " <> int.to_string(a) <> " " <> int.to_string(b) <> " \"" <> message <> "\"\n")
+}
+fn dump_errors(ds: List(ParseDiag), out: Buffer) -> Buffer {
+  match ds { Nil -> out Cons(ParseDiag(code, a, b, message), rest) -> dump_errors(rest, error_line(code, a, b, message, out)) }
 }
 pub fn parse_dump(src: String) -> String {
-  match lex.lex(src) {
-    Lexed(ts, ds) -> {
-      if array.length(ds) > 0 { lexical_errors(ds, 0, buffer.new()) } else {
-        match parse_module(ts, src, 0, Nil, Nil) {
-          Parsed(m, _) -> dump_module(m, src)
-          ParseError(c, s, e) -> buffer.finish(error_line(c, s, e, buffer.new()))
-        }
-      }
-    }
-  }
+  match parse_source(src) { ParsedSource(Module(imports, decls), ds, _) -> {
+    let out = dump_line(buffer.new(), 0, "Module", -1, -1, "")
+    let out = dump_imports(imports, src, out)
+    let out = dump_decls(decls, src, out)
+    buffer.finish(dump_errors(ds, out))
+  } }
 }
-// The tree, for the passes after parsing (the checker in Elya, part 4f):
-// a lexical error is reported as a parse error at the start.
+// Stable tree API used by selfhost/check.elya. Public Parsed's constructors
+// retain their original arity and cursor type; diagnostics stay internal.
 pub fn parse_tree(src: String) -> Parsed(Module) {
-  match lex.lex(src) {
-    Lexed(ts, ds) -> {
-      if array.length(ds) > 0 { ParseError("E0001", 0, 0) } else { parse_module(ts, src, 0, Nil, Nil) }
-    }
-  }
+  match parse_source(src) { ParsedSource(m, ds, pos) -> {
+    match ds { Nil -> Parsed(m, pos) Cons(ParseDiag(code, a, b, _), _) -> ParseError(code, a, b) }
+  } }
 }
 pub fn main() / {IO} {
-  let text = io.read_file(io.arg(0))
-  let result = parse_dump(text)
-  if string.length(result) == 0 { Unit } else {
-    io.println(string.slice(result, 0, string.length(result) - 1))
-  }
+  let result = parse_dump(io.read_file(io.arg(0)))
+  io.println(string.slice(result, 0, string.length(result) - 1))
 }
