@@ -539,18 +539,6 @@ fn parse_call_arg(borrow ts: Array(Token), src: String, s: State, acc: List(Sp(E
 fn parse_atom(borrow ts: Array(Token), src: String, s: State, braces: Bool) -> Read(Sp(Expr)) {
   match current_token(ts, src, s) { Token(kind, start, end, text) -> {
     match kind {
-      -1 -> Failed(s)
-      0 -> {
-        match parse_integer(ts, src, bump(ts, src, s), text, False, start, end) {
-          Read(n, s) -> Read(Sp(EInt(n), start, end), s)
-          Failed(s) -> Failed(s)
-        }
-      }
-      1 -> Read(Sp(EFloat, start, end), bump(ts, src, s))
-      2 -> Read(Sp(EStr(text), start, end), bump(ts, src, s))
-      21 -> Read(Sp(EBool(True), start, end), bump(ts, src, s))
-      22 -> Read(Sp(EBool(False), start, end), bump(ts, src, s))
-      23 -> Read(Sp(EUnit, start, end), bump(ts, src, s))
       24 -> {
         if text == "resume" { parse_resume(ts, src, s) } else {
           let s = bump(ts, src, s)
@@ -564,23 +552,17 @@ fn parse_atom(borrow ts: Array(Token), src: String, s: State, braces: Bool) -> R
           } else { Read(Sp(EVar(text), start, end), s) }
         }
       }
-      25 -> Read(Sp(EVar(text), start, end), bump(ts, src, s))
-      47 -> {
-        let after = bump(ts, src, s)
-        if peek(ts, src, after) == 0 {
-          let end = end_at(ts, src, after)
-          match parse_integer(ts, src, bump(ts, src, after), text_at(ts, src, after), True, start, end) {
-            Read(n, s) -> Read(Sp(EInt(n), start, end), s)
-            Failed(s) -> Failed(s)
-          }
-        } else {
-          if peek(ts, src, after) == 1 {
-            Read(Sp(EFloat, start, end_at(ts, src, after)), bump(ts, src, after))
-          } else { parse_unary(ts, src, after, start, "-", braces) }
+      0 -> {
+        match parse_integer(ts, src, bump(ts, src, s), text, False, start, end) {
+          Read(n, s) -> Read(Sp(EInt(n), start, end), s)
+          Failed(s) -> Failed(s)
         }
       }
-      27 -> parse_unary(ts, src, bump(ts, src, s), start, "-.", braces)
-      54 -> parse_unary(ts, src, bump(ts, src, s), start, "!", braces)
+      25 -> Read(Sp(EVar(text), start, end), bump(ts, src, s))
+      2 -> Read(Sp(EStr(text), start, end), bump(ts, src, s))
+      21 -> Read(Sp(EBool(True), start, end), bump(ts, src, s))
+      22 -> Read(Sp(EBool(False), start, end), bump(ts, src, s))
+      23 -> Read(Sp(EUnit, start, end), bump(ts, src, s))
       59 -> {
         match parse_expr(ts, src, bump(ts, src, s), 0, False) {
           Failed(s) -> Failed(s)
@@ -599,6 +581,24 @@ fn parse_atom(borrow ts: Array(Token), src: String, s: State, braces: Bool) -> R
       4 -> parse_lambda(ts, src, s)
       11 -> parse_match(ts, src, s, braces)
       16 -> parse_handle(ts, src, s, braces)
+      1 -> Read(Sp(EFloat, start, end), bump(ts, src, s))
+      47 -> {
+        let after = bump(ts, src, s)
+        if peek(ts, src, after) == 0 {
+          let end = end_at(ts, src, after)
+          match parse_integer(ts, src, bump(ts, src, after), text_at(ts, src, after), True, start, end) {
+            Read(n, s) -> Read(Sp(EInt(n), start, end), s)
+            Failed(s) -> Failed(s)
+          }
+        } else {
+          if peek(ts, src, after) == 1 {
+            Read(Sp(EFloat, start, end_at(ts, src, after)), bump(ts, src, after))
+          } else { parse_unary(ts, src, after, start, "-", braces) }
+        }
+      }
+      27 -> parse_unary(ts, src, bump(ts, src, s), start, "-.", braces)
+      54 -> parse_unary(ts, src, bump(ts, src, s), start, "!", braces)
+      -1 -> Failed(s)
       _ -> err(ts, src, s, "expected an expression")
     }
   } }
@@ -700,7 +700,7 @@ fn parse_block(borrow ts: Array(Token), src: String, s: State) -> Read(Sp(Block)
 }
 fn parse_block_items(borrow ts: Array(Token), src: String, s: State, start: Int, stmts: List(Sp(Stmt)), tail: Maybe(Sp(Expr))) -> Read(Sp(Block)) {
   let k = peek(ts, src, s)
-  if k == -1 || k == 62 || (newline_before(ts, src, state_pos(s)) && starts_decl(ts, src, state_pos(s))) {
+  if k == -1 || k == 62 || (starts_decl(ts, src, state_pos(s)) && newline_before(ts, src, state_pos(s))) {
     let end = end_at(ts, src, s)
     let s = if k == 62 && state_stop(s) == -1 {
       match tail { Yes(_) -> s No -> check_block_value(src, s, start, end, stmts) }
@@ -1695,19 +1695,14 @@ fn dump_float_text(src: String, i: Int, end: Int, b: Buffer) -> String {
 fn dump_expr(e: Sp(Expr), src: String, depth: Int, b: Buffer) -> Buffer {
   match e {
     Sp(expr, start, end) -> match expr {
-      EInt(n) -> dump_line(b, depth, "Int", start, end, int.to_string(n))
-      EFloat -> dump_line(b, depth, "Float", start, end, dump_float_text(src, start, end, buffer.new()))
-      EStr(s) -> dump_line(b, depth, "Str", start, end, s)
-      EBool(on) -> dump_line(b, depth, "Bool", start, end, dump_bool(on))
-      EUnit -> dump_line(b, depth, "Unit", start, end, "")
       EVar(name) -> dump_line(b, depth, "Var", start, end, name)
-      EQualified(module, name) -> dump_line(b, depth, "Qualified", start, end, dump_words2(module, name))
       ECall(callee, args) -> {
         let b = dump_line(b, depth, "Call", start, end, int.to_string(count(args)))
         let b = dump_expr(callee, src, depth + 1, b)
         dump_exprs(args, src, depth + 1, b)
       }
-      EUnary(op, value) -> dump_expr(value, src, depth + 1, dump_line(b, depth, "Unary", start, end, op))
+      EInt(n) -> dump_line(b, depth, "Int", start, end, int.to_string(n))
+      EQualified(module, name) -> dump_line(b, depth, "Qualified", start, end, dump_words2(module, name))
       EBinary(op, lhs, rhs) -> {
         let b = dump_line(b, depth, "Binary", start, end, op)
         let b = dump_expr(lhs, src, depth + 1, b)
@@ -1719,7 +1714,22 @@ fn dump_expr(e: Sp(Expr), src: String, depth: Int, b: Buffer) -> Buffer {
         let b = dump_block(yes, src, depth + 1, b)
         dump_block(no, src, depth + 1, b)
       }
+      EStr(s) -> dump_line(b, depth, "Str", start, end, s)
+      EBool(on) -> dump_line(b, depth, "Bool", start, end, dump_bool(on))
       EBlock(block) -> dump_block_items(block, src, depth, dump_line(b, depth, "Block", start, end, ""))
+      EMatch(scrutinee, arms) -> {
+        let b = dump_line(b, depth, "Match", start, end, int.to_string(count(arms)))
+        let b = dump_expr(scrutinee, src, depth + 1, b)
+        dump_arms(arms, src, depth + 1, b)
+      }
+      EUnit -> dump_line(b, depth, "Unit", start, end, "")
+      EUnary(op, value) -> dump_expr(value, src, depth + 1, dump_line(b, depth, "Unary", start, end, op))
+      ELambda(params, body) -> {
+        let b = dump_line(b, depth, "Lambda", start, end, int.to_string(count(params)))
+        let b = dump_params(params, src, depth + 1, b)
+        dump_block(body, src, depth + 1, b)
+      }
+      EFloat -> dump_line(b, depth, "Float", start, end, dump_float_text(src, start, end, buffer.new()))
       EHandle(body, handler) -> {
         match handler {
           Handler(is_multi, any, clauses, ret) -> {
@@ -1735,16 +1745,6 @@ fn dump_expr(e: Sp(Expr), src: String, depth: Int, b: Buffer) -> Buffer {
         }
       }
       EResume(arg) -> dump_expr(arg, src, depth + 1, dump_line(b, depth, "Resume", start, end, ""))
-      EMatch(scrutinee, arms) -> {
-        let b = dump_line(b, depth, "Match", start, end, int.to_string(count(arms)))
-        let b = dump_expr(scrutinee, src, depth + 1, b)
-        dump_arms(arms, src, depth + 1, b)
-      }
-      ELambda(params, body) -> {
-        let b = dump_line(b, depth, "Lambda", start, end, int.to_string(count(params)))
-        let b = dump_params(params, src, depth + 1, b)
-        dump_block(body, src, depth + 1, b)
-      }
       EError -> dump_line(b, depth, "Error", start, end, "")
     }
   }
