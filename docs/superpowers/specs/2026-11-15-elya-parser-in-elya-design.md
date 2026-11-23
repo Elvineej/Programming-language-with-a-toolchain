@@ -1,8 +1,10 @@
 # Self-hosting, part 4: the parser in Elya
 
-**Status:** designed (2026-11-15, on `main`, an interactive session). HANDOFF
-step 1, part 4 (spec 2026-11-14-elya-self-hosting R2, R3). Design choices are
-Claude's (rule 2); the parser is a Codex job to this spec, checked here.
+**Status:** 4a and 4b implemented; 4b verification recorded 2026-11-23 in
+section 3, including the remaining debug evaluator runtime budget. The design
+was made on 2026-11-15 on `main` in an interactive session: HANDOFF step 1,
+part 4 (spec 2026-11-14-elya-self-hosting R2, R3). Design choices are Claude's
+(rule 2); the parser is a Codex job to this spec.
 
 ## 0. Measured first
 
@@ -74,6 +76,8 @@ output (evaluator) against `ast_dump::dump`; a native run on the largest;
 that uses every node, pinned, so a change to the form is seen.
 
 ## 3. Measured after
+
+### 4a (historical record)
 
 4a is implemented in `selfhost/parse.elya`. Its immutable, spanned AST mirrors
 `src/ast.rs`; a single token array stays in `parse_dump`, and all readers take
@@ -164,3 +168,139 @@ once per configuration after unchanged reruns; they do not conceal the two
 original script failures. The PR remains a draft because a complete original
 `check.sh` run has not exited zero on this machine. No existing expected value
 or protected compiler source was changed to make the gate pass.
+
+
+### 4b: diagnostics and recovery (2026-11-23)
+
+The 4b implementation is based on `42d13c5`. `parse_dump` now writes the
+complete retained tree followed by the lexical diagnostics and then the parser
+diagnostics, exactly as `elya parse --dump` does. Its immutable state carries the
+cursor, diagnostics, raised-error count, EOF suppression, declaration resume
+point, shared nesting depth and expression height. Recovery retains bad binding
+names and function names, synthesizes the same `Error` nodes, and skips the same
+tokens as `src/parse.rs`.
+
+`pub fn parse_tree(src: String) -> Parsed(Module)` remains available to the
+checker, with the original `Parsed(a, Int)` and `ParseError(String, Int, Int)`
+constructors. Internal recovery uses a separate `Read` type. The unchanged
+`tests/selfhost_check.rs` passed: **203 comparisons**. Neither the checker nor
+its tests, the Rust compiler sources, or existing expected values were changed.
+
+The imported lexer still has its established standalone dump contract. The
+parser supplements its E0001/E0003 diagnostics with lexical float E0002,
+interleaved at the original scan positions (E0003 first at an identical span).
+Exact decimal halfway comparisons reproduce binary64 overflow and underflow;
+large exponents follow Rust's actual exponent-accumulation rule. Independent
+checks agreed with Rust on **1,001 evaluator payloads** and **1,083 native
+payloads**, including exact halfway values, randomized spellings and
+100,000-digit mantissas. Integer E0002 belongs to the parser and remains after
+all lexical diagnostics.
+
+The shared `parity_corpus()` adds malformed and token-deleted inputs while
+retaining the original clean `corpus()` API for the unchanged checker test.
+Both parser suites compare every input. Native execution uses the shipped
+`main`; the evaluator batches file reads through a test-only IO entry point,
+keeping every shipped parsing function unchanged. Each evaluator worker owns
+its module and files, and the harness checks that every case is assigned and
+compared exactly once. Both back ends report the first differing dump line.
+
+Rust literal discovery includes root tests, crate tests, other test-support
+fixtures and inline test modules. It decodes raw and escaped strings, skips
+comments, and filters assertion text, locator strings, bare tags and
+uninstantiated format templates. Duplicate source texts are counted once across
+the embedded scopes. A paired manifest proof established identical inputs and
+Rust dumps in the evaluator and native suites.
+
+The focused malformed set asserts coverage of **all 55 parser diagnostic
+messages**, all seven diagnostic codes (E0001–E0003, E0100–E0103), every operator
+precedence level, delimiter recovery, rows, declarations, handlers, match arms,
+multiple errors, and nesting depth/height in every composite expression context.
+Clean cases also pin both sides of the nesting boundary. Generated cases delete
+one middle token from **every nonempty clean input**, including the focused
+clean inputs. **N = 1**; two empty/comment-only inputs have no token to delete.
+
+Final full-corpus inventory (the same **3,345 inputs, 1,102,488 bytes** in both
+back ends):
+
+| Source | Clean | Malformed |
+| --- | ---: | ---: |
+| Repository `.elya` files | 40 | 0 |
+| Embedded root-test inputs | 722 | 73 |
+| Embedded crate/support/inline-test inputs | 676 | 20 |
+| Additional focused inputs | 85 | 208 |
+
+These 1,824 base cases are followed by 1,521 generated variants, which are
+compared whether they parse clean or produce diagnostics. There are
+**93 distinct malformed extracted inputs**. N=1 is the minimum
+positive deletion count; all 1,521 deletions are retained. The largest clean
+input is `selfhost/parse.elya` (**83,893 bytes**). The largest malformed input
+removes the token at zero-based index 12,313 from that source (**83,892 bytes**).
+
+The complete stable evaluator run passed in **74.560627689 seconds**, with two
+workers under a two-CPU quota, including front ends, corpus construction, input
+files and batched IO. This **exceeds the original one-minute budget**. No input,
+focused family or discovery scope was dropped to improve that number. The
+initial reconstructed run took 84.843762834 seconds before the final lexer
+optimizations. The native parser has no speed acceptance threshold (D4).
+
+The final lexer fast paths cache ASCII run bounds, append whole numeric/string
+runs, and recognize punctuation that cannot start a longer operator without
+probing every operator spelling. Token kinds, spans, regex consumption,
+payloads and diagnostics are unchanged. The existing standalone lexer tests
+passed unchanged, including **8,991 independent edge cases**. Parser arm
+ordering and pure lookahead ordering reduce evaluator dispatch overhead without
+changing grammar or recovery.
+
+All three negative controls were run against
+`largest_input_agrees_natively_and_is_measured`, each exited **101** with a byte
+parity failure, and each was restored byte for byte. The restored parser SHA-256
+was `811e5f53b657849b7d89cd5dee43c00eadeed0efac6d7f1e04b12eed7d655d28`:
+
+| Control | Mutation | Input that caught it | First difference |
+| --- | --- | --- | --- |
+| K1 | Recovery consumes one extra token at a statement boundary | `tests/diagnostics_edges.rs`, byte 5197 | line 2: retained function ends at 81 instead of 34 |
+| K2 | E0100's diagnostic end is one byte too far | `tests/any_handler.rs`, byte 2479 | line 9: span `57 59` instead of `57 58` |
+| K3 | Parser diagnostics precede lexer diagnostics | focused `module-garbage` | line 14: E0100 precedes E0001 instead of following it |
+
+Optimized measurements were taken after the full gate finished, with the native
+comparison pinned to CPU 1 and no other test workload running. Compilation is
+excluded. Both native and Rust are optimized; Elya native is O2. Medians:
+
+| Input | Bytes | Native process + file + lex + parse + dump + capture (7 runs) | Rust lex + parse (101 runs) | Rust tree + diagnostics dump (101 runs) | Rust lex + parse + dump (101 runs) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Largest clean: `selfhost/parse.elya` | 83,893 | 49.630710 ms | 2.227088 ms | 1.559628 ms | 3.851725 ms |
+| Largest malformed: token-12,313 deletion | 83,892 | 47.071485 ms | 2.015538 ms | 1.388219 ms | 3.428314 ms |
+
+Command: `RUST_TEST_THREADS=1 taskset -c 1 cargo test --release -p elya-codegen --test selfhost_parse -- --nocapture`.
+Rust's source is already in memory; its dump timing starts from the parsed
+module, and its combined timing includes both phases. Native includes process
+startup, file IO and captured stdout. These are stated scopes, not an isolated
+comparison of parsing speed. The native runtime's final Unit value line alone
+is removed, as in 4a; every byte printed by the parser is compared.
+
+The same complete corpus also passed in the **optimized Rust evaluator in
+18.295462491 seconds**, with two workers, including front ends, corpus and files:
+`cargo test --release -p elya --test selfhost_parse -- --nocapture`. This remains
+an evaluator run, not a native Elya execution. The default debug evaluator
+measurement above is retained: no repository build profile was changed to hide
+its one-minute-budget miss.
+
+The pristine baseline `sh scripts/check.sh` on `42d13c5` exited zero, including
+configuration C and both QEMU boards. No board skip or changed threshold was
+used. Counts include every suite once per configuration, including zero-test
+library/doctest suites:
+
+| Source | A passed / suites | B passed / suites | C passed / suites | Total passed / suites |
+| --- | ---: | ---: | ---: | ---: |
+| Before, pristine `42d13c5` | 636 / 80 | 1,022 / 114 | 8 / 2 | 1,666 / 196 |
+| After 4b | 636 / 80 | 1,022 / 114 | 8 / 2 | 1,666 / 196 |
+
+Both original scripts exited **zero**, with **zero failures and zero ignored
+tests**. The native array test, using its existing faster-of-three measurement,
+passed under the full gate's load; no pinned rerun or workaround was needed.
+The unchanged checker test passed explicitly and within both gate configurations.
+The parser proof expands existing test functions, so the number of test
+functions/suites is unchanged while differential input coverage increases.
+Protected-source and checker diffs were checked empty. Independent source and
+corpus reviews found no remaining functional defect or suspicious Rust recovery.
+The remaining limitation is the debug evaluator's runtime budget, stated above.
