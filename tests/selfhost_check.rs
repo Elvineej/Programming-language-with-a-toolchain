@@ -2,8 +2,10 @@
 //! step 4): `selfhost/check.elya` prints exactly `elya check --dump` on every
 //! corpus program inside the stages built so far: F1 (first-order programs)
 //! F2a (declared types, constructors, `match`, the pure builtins,
-//! annotations naming types and type variables), and F2b (higher order:
-//! lambdas, functions as values, function types, with effect rows' tails).
+//! annotations naming types and type variables), F2b (higher order:
+//! lambdas, functions as values, function types, with effect rows' tails)
+//! and F4a (effects: rows with labels, performs, handlers, `resume`, the
+//! host's builtins, declared rows, `main`'s discharge).
 //!
 //! Negative controls, each run, reverted and compared byte for byte:
 //! K1, every scheme left unquantified: fails on `scheme id fn(a) -> a`
@@ -29,6 +31,36 @@
 //! it (it survived the corpus).
 //! K13, a `let` free to quantify a deferred lambda's row (the third
 //! review's defect): fails on focused F2b #22.
+//! K14, the last label along a row's chain kept, not the first: fails on
+//! tests/handle_recursion.rs.
+//! K15, a conflict into an ambient row not reported: fails on
+//! tests/handle_recursion.rs.
+//! K16, a declared label never performed not reported: tests/modules.rs.
+//! K17, `main` discharging every effect: tests/ui/unhandled_effect.elya.
+//! K18, `resume` not rerunning the handled body's labels: src/std/clock.elya.
+//! K19, an escaped `resume` not taking the clauses row:
+//! tests/handle_recursion.rs.
+//! K20, a handle passing its handled effect on: examples/04_async.elya.
+//! K21, an inclusion adding no labels: survived the corpus; fails on the
+//! focused F4a program written for it (`fn pick(x) { x }`).
+//! K22, a call dropping its callee row's labels: examples/04_async.elya.
+//! K23, an absorbed phantom tail's rest made meaningful: tests/modules.rs.
+//! K25, the clauses row taking nothing: tests/resume_row.rs.
+//! K28, an unknown effect in a row accepted: tests/fn_fields.rs.
+//! Three survive and cannot be caught inside F4a: K24 (a `let` free to
+//! quantify the resume rows) and K27 (the resume's types), since without
+//! parametric effects those rows and types are made at the handle's level
+//! and binding only lowers them, so no `let` inside a clause sees them
+//! above its level; K26 (the first operation of a name wins), since two
+//! operations of one name are a resolution error (E0202).
+//! The review's mutation testing (39 mutants) left six more surviving the
+//! corpus, each now failing on a focused F4a program after K21's: M4 (a
+//! written row keeping its first label of a name, not its last), M11
+//! (`resume` not rerunning the return clause), M17 (the clauses row closed
+//! though it became the ambient's tail), M19 (a failing inclusion not
+//! killed: `flush` never ends), M30 (no flush before closing the return
+//! clause's row), M37 (an inclusion's label keeping its own span, not the
+//! call's).
 
 #[path = "support/selfhost_parse.rs"]
 mod parse_support;
@@ -39,7 +71,7 @@ use elya::eval::{Host, World};
 use std::path::Path;
 
 /// The stages `selfhost/check.elya` covers.
-const BUILT: u8 = 3;
+const BUILT: u8 = 4;
 
 #[test]
 fn the_checker_in_elya_agrees_on_its_stages() {
@@ -54,7 +86,7 @@ fn the_checker_in_elya_agrees_on_its_stages() {
     );
     let corpus = parse_support::corpus(Path::new(env!("CARGO_MANIFEST_DIR")));
     let scratch = parse_support::Scratch::new("checker");
-    let mut counts = [0usize; 7];
+    let mut counts = [0usize; 8];
     let mut compared = 0;
     let focused = support::FOCUSED_F1
         .iter()
@@ -71,6 +103,12 @@ fn the_checker_in_elya_agrees_on_its_stages() {
                 .iter()
                 .enumerate()
                 .map(|(i, t)| (format!("focused F2b #{i}"), t.to_string())),
+        )
+        .chain(
+            support::FOCUSED_F4A
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (format!("focused F4a #{i}"), t.to_string())),
         );
     let cases = corpus
         .cases
@@ -100,15 +138,16 @@ fn the_checker_in_elya_agrees_on_its_stages() {
         compared += 1;
     }
     println!(
-        "compared {compared}; resolved cleanly by stage F1..F6: {:?}",
+        "compared {compared}; resolved cleanly by stage 1..7: {:?}",
         &counts[1..]
     );
     assert!(
         compared
-            >= 110
+            >= 340
                 + support::FOCUSED_F1.len()
                 + support::FOCUSED_F2A.len()
-                + support::FOCUSED_F2B.len(),
-        "F1, F2a and F2b: at least 110 corpus programs, and the focused sets"
+                + support::FOCUSED_F2B.len()
+                + support::FOCUSED_F4A.len(),
+        "F1 to F4a: at least 340 corpus programs, and the focused sets"
     );
 }

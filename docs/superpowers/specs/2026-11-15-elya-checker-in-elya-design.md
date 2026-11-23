@@ -90,3 +90,9 @@ which.
 - F1 (2026-11-22): the largest first-order program (285 bytes) takes 1.8 ms
   natively per process, against 0.31 ms for Rust's resolve and check in
   process. The native figure is mostly process start-up and the parse.
+- F4a (2026-11-23): the largest program inside F4a (examples/05_replay.elya,
+  6,266 bytes) takes 8.9 ms natively per process, against 7.1 ms for Rust's
+  resolve and check in process, both in the gate's debug build. Built with
+  `--release` the figures are 8.0 ms and 0.85 ms: the native checker is
+  about nine times slower than Rust's, before process start-up is taken
+  out.

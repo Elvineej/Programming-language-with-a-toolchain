@@ -76,9 +76,32 @@ Spec: `docs/superpowers/specs/2026-11-15-elya-checker-in-elya-design.md`.
      `forall a b c. fn(fn(a) / {c} -> b, a) / {c} -> b`), so F2b ports the
      row variables' tails: phantom rows, relays through parameters,
      inclusions, closing what nothing relays.
-   - F4: effects. Declarations, performs, `handle` and `resume`, rows with
-     labels and tails, row variables and their inclusions, phantom rows,
-     parametric effects, `with any`, `multi`.
+   - F4: effects, in two parts (the classifier's stages 4 and 5).
+     - F4a (**built** 2026-11-23): effect declarations and their
+       operations, performs, `handle` with return and operation clauses,
+       `resume` (escaping into a lambda too), rows with labels (sorted, each
+       keeping the span that introduced it, the first along a chain), rows
+       written in annotations and declared on functions (E0421, E0423),
+       unknown effects (E0432), the host's builtins (`io.*`, `time.*`), and
+       `main`'s discharge (E0420). The inclusions now carry labels, so a
+       conflict ends one (`incl_dead`); `flush` still passes over all of
+       them until nothing gets in, which reaches what Rust's queue of the
+       woken ones reaches in the same order. 232 corpus programs and 58
+       focused ones agree, in the evaluator and natively; controls K14-K28
+       in the test's header (K21 survived the corpus and got a focused
+       program; K24, K26 and K27 cannot be caught inside F4a, and the
+       header says why). Review: no defect (about 5,350 handwritten and
+       random F4a programs agree byte for byte; the port read against Rust
+       function by function; the repeated-pass `flush` argued equivalent to
+       Rust's queue, its kills load-bearing for termination). Its 39
+       mutants left six unpinned behaviours, now pinned by eight focused
+       programs; six more argued equivalent in F4a, and one (a
+       conflict's span among several labels) unreachable from the programs
+       it tried. The classifier's `Op` rule was dropped: a written `Op` is
+       an ordinary name in Rust (`$Op` is internal), so F2b's focused #12
+       is compared again.
+     - F4b: `multi` (E0426, E0427), `with any` and `op.*`, parametric
+       effects, named row variables, rows as type arguments.
    - F5: duplicability (the marks on type variables, E0428, E0429, E0437),
      `linear` types, `Buffer` and `Array`, and the borrow facts (E0438,
      E0439). These read 4e's facts, so F5 waits for 4e.

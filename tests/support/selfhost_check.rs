@@ -2,7 +2,7 @@
 //! docs/superpowers/plans/2026-11-15-elya-checker-in-elya.md, step 4): the
 //! smallest stage whose fragment holds a program, read off its syntax.
 
-use elya::ast::{Block, Decl, Expr, Module, Pattern, Stmt, TypeAnn};
+use elya::ast::{Block, Decl, Expr, Module, Pattern, RowAnn, Stmt, TypeAnn};
 use elya::span::Spanned;
 
 /// First-order programs with type errors, for F1's diagnostics: one each,
@@ -131,6 +131,73 @@ pub const FOCUSED_F2B: &[&str] = &[
     "type L { N, C(Int, L) }\nfn e(x: L) -> Bool { x == x }\npub fn main() -> Int { 0 }\n",
 ];
 
+/// F4a: effect declarations, performs, handlers and their return and
+/// operation clauses, `resume` (escaping into a lambda too), labelled rows
+/// written and declared, the host's builtins, `main`'s discharge, and the
+/// row diagnostics (E0420, E0421, E0423, E0432).
+pub const FOCUSED_F4A: &[&str] = &[
+    "effect Log { fn log(msg: String) -> Unit }\nfn f() { log(\"a\") }\npub fn main() -> Int { handle { f()  1 } with { log(m) -> resume(Unit) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn f() { log(\"a\") }\npub fn main() -> Int { f()  0 }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn f() { log(\"a\")  ask() }\npub fn main() -> Int { handle { handle f() with { ask() -> resume(2) } } with { log(m) -> resume(Unit) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn f() / {Log} -> Int { ask() }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn f() / {Ask, Log} -> Int { ask() }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn f() / {} -> Int { log(\"x\")  1 }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn f() / {} -> Int { log(\"x\")  ask() }\npub fn main() -> Int { 0 }\n",
+    "fn f() / {Nope} -> Int { 1 }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(msg: String) -> Unit }\ntype T { T(fn() / {Log, Nope} -> Int) }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(msg: String) -> Unit }\ntype T { T(fn(Int) / {Log} -> Int) }\nfn run(t: T) -> Int { match t { T(g) -> g(1) } }\npub fn main() -> Int { handle run(T(fn(n) { log(\"n\")  n })) with { log(m) -> resume(Unit) } }\n",
+    "fn f() { io.println(\"x\") }\npub fn main() / {IO} { f() }\n",
+    "pub fn main() / {IO} -> Int { let t = time.now_ms()\n time.sleep_ms(1)\n io.arg_count() + t }\n",
+    "fn f(p) { io.write_file(p, io.read_file(p))  io.file_exists(p) }\npub fn main() -> Int { 0 }\n",
+    "pub fn main() -> Int { let g = fn() { io.println(io.read_stdin()) }\n 0 }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\npub fn main() -> Int { handle { ask() } with { ask() -> resume(1)  return(x) -> { log(\"r\")  x + 1 } } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn h() { handle { ask() } with { ask() -> { log(\"c\")  resume(1) } } }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn h() { handle { log(\"b\")  ask() } with { ask() -> resume(1) } }\npub fn main() -> Int { handle h() with { log(m) -> resume(Unit) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn h() { handle { log(\"b\")  ask() } with { ask() -> { let k = fn() { resume(1) }\n k() } } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask() -> Int }\nfn h() { handle { ask() + ask() } with { ask() -> { let k = fn(x) { resume(x) }\n k(1) } return(r) -> r * 2 } }\npub fn main() -> Int { h() }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\npub fn main() -> Int { handle { ask() } with { ask() -> resume(1)  log(m) -> resume(Unit) } }\n",
+    "effect Ask { fn ask() -> Int }\npub fn main() -> Int { let ask = fn() { 3 }\n ask() }\n",
+    "effect Ask { fn ask() -> Int }\nfn g(ask) { ask() }\npub fn main() -> Int { g(fn() { 1 }) }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn run(f: fn() / {Log} -> Int) -> Int { f() }\npub fn main() -> Int { handle run(fn() { ask() }) with { ask() -> resume(1) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn run(f: fn() / {Log} -> Int) -> Int { handle f() with { log(m) -> resume(Unit) } }\npub fn main() -> Int { run(fn() { log(\"x\")  2 }) }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn pick(b: Bool, f: fn() / {Log} -> Int, g: fn() / {Ask} -> Int) -> Int { 0 }\nfn same(f: fn() / {Log} -> Int) -> fn() / {Ask} -> Int { f }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn keep(f) { f }\nfn use() { let g = keep(fn() { log(\"x\") })\n g() }\npub fn main() -> Int { handle { use()  1 } with { log(m) -> resume(Unit) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn walk(n) { if n == 0 { 0 } else { handle { log(\"s\")  walk(n - 1) } with { log(m) -> resume(Unit) } } }\npub fn main() -> Int { walk(2) }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn a(n) { if n == 0 { log(\"z\")  0 } else { (fn() { b(n - 1) })() } }\nfn b(n) { a(n) }\npub fn main() -> Int { handle a(3) with { log(m) -> resume(Unit) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn loop(n) { handle { if n == 0 { ask() } else { loop(n - 1) } } with { log(m) -> { let k = fn() { resume(Unit) }\n k() } } }\npub fn main() -> Int { handle loop(1) with { ask() -> resume(5) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\npub fn main() / {IO} { log(\"x\")  io.println(\"y\") }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn f() { log(\"x\")  ask() }\npub fn main() -> Int { f() }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn twice(f) { f()  f() }\nfn say() { log(\"x\") }\npub fn main() -> Int { handle { twice(say)  1 } with { log(m) -> resume(Unit) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn both(f, g) { f()  g() }\npub fn main() -> Int { handle { handle both(fn() { log(\"x\") }, fn() { ask() }) with { ask() -> resume(3) } } with { log(m) -> resume(Unit) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn wrap(f) { handle f() with { log(m) -> resume(Unit) } }\npub fn main() -> Int { wrap(fn() { log(\"x\")  4 }) }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn wrap(f) { handle f() with { log(m) -> { io.println(m)  resume(Unit) } } }\npub fn main() / {IO} -> Int { wrap(fn() { log(\"x\")  4 }) }\n",
+    "effect Ask { fn ask() -> Int }\npub fn main() -> Int { handle { ask() } with { ask() -> { let r = fn(x) { resume(x) }\n r(1) } } }\n",
+    "effect Ask { fn ask() -> Int }\npub fn main() -> Int { handle { ask() } with { ask() -> { let r = fn(x) { resume(x) }\n r(\"no\") } } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\npub fn main() -> Int { handle { log(\"x\")  1 } with { log(m) -> resume(m) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\npub fn main() -> Int { handle { log(1)  1 } with { log(m) -> resume(Unit) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn mk() { fn() { log(\"x\") } }\nfn go() { mk()() }\npub fn main() -> Int { handle { go()  1 } with { log(m) -> resume(Unit) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn mk() -> fn() / {Log} -> Unit { fn() { ask()  log(\"x\") } }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\npub fn main() -> Int { handle { handle { log(\"a\")  ask() } with { ask() -> { log(\"in\")  resume(7) } } } with { log(m) -> resume(Unit) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn quiet() / {} -> Int { handle { log(\"x\")  1 } with { log(m) -> resume(Unit) } }\npub fn main() -> Int { quiet() }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn half() / {Ask} -> Int { handle { log(\"x\")  ask() } with { log(m) -> resume(Unit) } }\npub fn main() -> Int { handle half() with { ask() -> resume(1) } }\n",
+    "effect Zed { fn zed() -> Unit }\neffect Abc { fn abc() -> Unit }\nfn f() { zed()  abc()  io.println(\"x\") }\npub fn main() / {IO} { handle { handle f() with { abc() -> resume(Unit) } } with { zed() -> resume(Unit) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\ntype T { T(fn() / {Log} -> Int) }\npub fn main() -> Int { match T(fn() { ask() }) { T(g) -> 0 } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn run(f) / {Log} -> Int { log(\"r\")  f() }\npub fn main() -> Int { handle run(fn() { 1 }) with { log(m) -> resume(Unit) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn run(f) / {Log} -> Int { f() }\npub fn main() -> Int { handle { handle run(fn() { ask() }) with { ask() -> resume(1) } } with { log(m) -> resume(Unit) } }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn go(n) { let k = fn() { log(\"k\") }\n if n == 0 { k() } else { go(n - 1) } }\npub fn main() -> Int { handle { go(2)  0 } with { log(m) -> resume(Unit) } }\n",
+    // K21: a phantom call row that takes a label after its inclusion was recorded.
+    "effect Log { fn log(msg: String) -> Unit }\nfn pick(x) { x }\nfn use_log(f: fn() / {Log} -> Int) -> Int { 0 }\nfn go() { let k = pick(fn() { 1 })\n k()\n use_log(k) }\npub fn main() -> Int { 0 }\n",
+    // The review's mutants M4, M11, M17, M19, M30, M37 (verified to differ).
+    "effect Log { fn log(msg: String) -> Unit }\nfn run(g: fn() / {Log, Log} -> Unit) { g() }\npub fn main() -> Int { run(fn() { log(\"x\") })\n 0 }\n",
+    "effect Ask { fn ask() -> Int }\neffect Log { fn log(msg: String) -> Unit }\nfn h() { handle { ask() } with { ask() -> { let k = fn() { resume(1) }\n k() }  return(x) -> { log(\"r\")\n x } } }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn id(x) { x }\npub fn main() -> Int { let g = id(fn() { 1 })\n g()\n let z = if True { g } else { fn() { log(\"a\")\n 2 } }\n 0 }\n",
+    "effect Log { fn log(msg: String) -> Unit }\nfn id(x) { x }\npub fn main() -> Int { let g = id(fn() { 1 })\n let h = fn() { g() }\n let z = if True { g } else { fn() { log(\"a\")\n 2 } }\n 0 }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn id(x) { x }\nfn f() { handle { ask() } with { ask() -> resume(1)  return(x) -> { let g = id(fn() { 1 })\n g()\n let z = if True { g } else { fn() { log(\"a\")\n 2 } }\n x } } }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(msg: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn id(x) { x }\npub fn main() -> Int { let g = id(fn() { 1 })\n let h = fn() { g() }\n let k = fn() { g() }\n let z = if True { g } else { fn() { log(\"a\")\n ask() } }\n 0 }\n",
+    "effect Ask { fn ask() -> Int }\neffect Log { fn log(msg: String) -> Unit }\nfn h() { handle { ask() } with { ask() -> { let k = fn() { resume(1) }\n k() } }\n log(\"after\") }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask() -> Int }\neffect Log { fn log(msg: String) -> Unit }\nfn h() { handle { ask() } with { ask() -> { let k = fn() { resume(1) }\n k }  return(x) -> { log(\"r\")\n fn() { x } } } }\npub fn main() -> Int { 0 }\n",
+];
+
 /// The checker's imports: the parser in Elya and its lexer.
 pub fn reader(name: &str) -> Option<(String, String)> {
     let file = match name {
@@ -154,6 +221,9 @@ const BASE: &[&str] = &["Int", "Float", "Bool", "String", "Unit"];
 /// calls of locals or of expressions, function types in annotations, all of
 /// which bring effect rows into types; F4 effects; F5 linearity, `Buffer`,
 /// `Array`, `borrow`; F6 imports.
+/// Numbered: 1 F1, 2 F2a, 3 F2b, 4 F4a (effects: declarations, performs,
+/// handlers, `resume`, labelled rows), 5 F4b (`multi`, `with any`,
+/// parametric effects, named row variables), 6 F5, 7 F6.
 pub fn stage(m: &Module) -> u8 {
     let fns = m
         .decls
@@ -177,13 +247,25 @@ pub fn stage(m: &Module) -> u8 {
         .collect();
     let mut s = Stage(1, fns, ctors);
     if !m.imports.is_empty() {
-        s.at(6);
+        s.at(7);
     }
     for d in &m.decls {
         match &d.node {
-            Decl::Effect(_) => s.at(4),
+            Decl::Effect(e) => {
+                s.at(if e.is_multi || !e.params.is_empty() {
+                    5
+                } else {
+                    4
+                });
+                for op in &e.ops {
+                    for a in &op.node.param_tys {
+                        s.ann(a);
+                    }
+                    s.ann(&op.node.ret);
+                }
+            }
             Decl::Type(t) => {
-                s.at(if t.is_linear { 5 } else { 2 });
+                s.at(if t.is_linear { 6 } else { 2 });
                 for v in &t.variants {
                     for f in &v.node.fields {
                         s.ann(f);
@@ -191,13 +273,13 @@ pub fn stage(m: &Module) -> u8 {
                 }
             }
             Decl::Fn(f) => {
-                if f.effect_row.is_some() {
-                    s.at(4);
+                if let Some(r) = &f.effect_row {
+                    s.row(r);
                 }
                 for p in &f.params {
                     s.binder(&p.node.name);
                     if p.node.borrow {
-                        s.at(5);
+                        s.at(6);
                     }
                     if let Some(a) = &p.node.ann {
                         s.ann(a);
@@ -240,13 +322,26 @@ impl Stage {
         }
     }
 
+    /// A written row: labels without arguments are F4a; a named row variable
+    /// or a label with arguments (a parametric effect) is F4b.
+    fn row(&mut self, r: &RowAnn) {
+        self.at(4);
+        if r.tail.is_some() || r.labels.iter().any(|l| l.args.is_some()) {
+            self.at(5);
+        }
+    }
+
     fn ann(&mut self, a: &Spanned<TypeAnn>) {
         let t = &a.node;
-        if t.row.is_some() {
-            self.at(4);
+        // A row written as a type argument (row parameters, F4b).
+        if t.as_row_arg().is_some() {
+            self.at(5);
+        }
+        if let Some(r) = &t.row {
+            self.row(r);
         }
         if t.name == "Array" || t.name == "Buffer" {
-            self.at(5);
+            self.at(6);
         } else if t.name == "fn" {
             self.at(3);
         } else if !BASE.contains(&t.name.as_str()) || !t.args.is_empty() {
@@ -291,7 +386,9 @@ impl Stage {
             Expr::Error => {}
             Expr::Qualified { module, .. } => match module.as_str() {
                 "int" | "float" | "string" => self.at(2),
-                "array" | "buffer" => self.at(5),
+                "array" | "buffer" => self.at(6),
+                // An operation of a `with any` clause.
+                "op" => self.at(5),
                 _ => self.at(4),
             },
             Expr::Call { callee, args } => {
@@ -329,7 +426,27 @@ impl Stage {
                 self.block(&else_block.node);
             }
             Expr::Block(b) => self.block(b),
-            Expr::Handle { .. } | Expr::Resume { .. } => self.at(4),
+            Expr::Handle { body, handler } => {
+                self.at(if handler.multi || handler.any { 5 } else { 4 });
+                self.expr(body);
+                for c in &handler.clauses {
+                    for p in &c.node.params {
+                        self.binder(&p.node.name);
+                        if let Some(a) = &p.node.ann {
+                            self.ann(a);
+                        }
+                    }
+                    self.expr(&c.node.body);
+                }
+                if let Some(r) = &handler.ret {
+                    self.binder(&r.binder);
+                    self.expr(&r.body);
+                }
+            }
+            Expr::Resume { arg } => {
+                self.at(4);
+                self.expr(arg);
+            }
             Expr::Match { scrutinee, arms } => {
                 self.at(2);
                 self.expr(scrutinee);

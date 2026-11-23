@@ -9,9 +9,13 @@ import parse / {IO}
 
 // TB's codes: 0 Int, 1 Float, 2 Bool, 3 String, 4 Unit. TNone marks an
 // unbound variable's slot in the substitution. A function type's effect row
-// is its tail alone: no stage built yet has labels (F4 brings them).
+// is its labels, sorted by name, each with the span that introduced it, and
+// its tail (`EffectRow`); RNone marks an unbound row variable's slot. No
+// label has arguments yet (parametric effects are F4b).
 type Tail { RClosed, ROpen(Int), RError, RNone }
-type Ty { TVar(Int), TB(Int), TFn(List(Ty), Tail, Ty), TCon(String, List(Ty)), TErr, TNone }
+type Lab { Lab(String, Int, Int) }
+type Row { Row(List(Lab), Tail) }
+type Ty { TVar(Int), TB(Int), TFn(List(Ty), Row, Ty), TCon(String, List(Ty)), TErr, TNone }
 // Quantified type variables, quantified row variables, the type.
 type Scheme { Scheme(List(Int), List(Int), Ty) }
 type Entry { Entry(String, Scheme) }
@@ -23,8 +27,8 @@ type Rec { Rec(Int, Int, Ty) }
 // annotation variables.
 type Mem { Mem(Int, List(Ty), Int, Ty, List(Named)) }
 // A top-level function: name, declaration span, parameters, return
-// annotation, body.
-type FnInfo { FnInfo(String, Int, Int, List(Sp(Param)), Maybe(Sp(TypeAnn)), Sp(Block)) }
+// annotation, body, declared row.
+type FnInfo { FnInfo(String, Int, Int, List(Sp(Param)), Maybe(Sp(TypeAnn)), Sp(Block), Maybe(RowAnn)) }
 
 // What inference reads beside the substitution: the annotation variables
 // of the function being inferred, the declared types' arities, the
@@ -35,15 +39,18 @@ type Ctx { Ctx(List(Named), List(Arity), List(Arity), List(String)) }
 // A pending inclusion: the source row variable's effects reach the
 // destination's (`pending_incl`, and `pending_member_incl` for a group
 // member's row deferred inside a lambda).
-type Incl { Incl(Int, Int) }
+// Its span is the call's.
+type Incl { Incl(Int, Int, Int, Int) }
 // A lambda's row whose closing waits for the group (`deferred_rows`).
 type Deferred { Deferred(Int, List(Ty)) }
 // The rows' bookkeeping: inclusions, member inclusions, the parameter types
 // in scope (`param_tys`), the lambdas' regions, deferred rows, the group's
-// parameters and ambient rows.
-type Gx { Gx(List(Incl), List(Incl), List(Ty), List(Int), List(Deferred), List(Ty), List(Int)) }
+// parameters and ambient rows. A region is a lambda's or a handle's row,
+// and whether a member's row may be deferred inside it (`regions`).
+type Region { Region(Int, Bool) }
+type Gx { Gx(List(Incl), List(Incl), List(Ty), List(Region), List(Deferred), List(Ty), List(Int)) }
 // The row substitution, each row variable's level, the phantom marks.
-linear type Rows { Rows(Array(Tail), Array(Int), Array(Bool)) }
+linear type Rows { Rows(Array(Row), Array(Int), Array(Bool)) }
 // The substitution, each variable's level, the current level, the
 // diagnostics and the records (both newest first), the context, the rows.
 // Equality (`require_data`): the marked type variables with the comparison
@@ -53,7 +60,14 @@ type EqMark { EqMark(Int, Int, Int) }
 type Span2 { Span2(Int, Int) }
 type Adt { Adt(String, List(Int), List(List(Ty))) }
 type Eqs { Eqs(List(EqMark), List(Span2), List(Adt)) }
-linear type St { St(Array(Ty), Array(Int), Int, List(Diag), List(Rec), Ctx, Rows, Gx, Eqs) }
+// What handlers read (F4a): the enclosing clauses' `resume`s, innermost
+// first; the handles' clauses rows still being filled; the lambda depth;
+// the effects' operations (the last of a name first); the declared
+// effects; the inclusions a conflict ended (`incl_dead`).
+type Resume { Resume(Ty, Ty, Int, Int, String, Int, Int) }
+type OpInfo { OpInfo(String, String, List(Ty), Ty) }
+type Hx { Hx(List(Resume), List(Int), Int, List(OpInfo), List(String), List(Incl)) }
+linear type St { St(Array(Ty), Array(Int), Int, List(Diag), List(Rec), Ctx, Rows, Gx, Eqs, Hx) }
 linear type R(a) { R(a, St) }
 
 fn rev(xs: List(a)) -> List(a) { rev_onto(xs, Nil) }
@@ -74,15 +88,15 @@ fn has_int(xs: List(Int), v: Int) -> Bool {
 fn nth_fn(xs: List(FnInfo), i: Int) -> FnInfo {
   match xs {
     Cons(x, rest) -> if i == 0 { x } else { nth_fn(rest, i - 1) }
-    Nil -> FnInfo("", 0, 0, Nil, No, Sp(Block(Nil, No), 0, 0))
+    Nil -> FnInfo("", 0, 0, Nil, No, Sp(Block(Nil, No), 0, 0), No)
   }
 }
 
 fn fresh(s: St) -> R(Ty) {
   match s {
-    St(sub, lv, cur, ds, rs, cx, rw, gx, eq) -> {
+    St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> {
       let n = array.length(sub)
-      R(TVar(n), St(array.push(sub, TNone), array.push(lv, cur), cur, ds, rs, cx, rw, gx, eq))
+      R(TVar(n), St(array.push(sub, TNone), array.push(lv, cur), cur, ds, rs, cx, rw, gx, eq, hx))
     }
   }
 }
@@ -93,56 +107,62 @@ fn fresh_list(s: St, n: Int, acc: List(Ty)) -> R(List(Ty)) {
 }
 fn bound(s: St, v: Int) -> R(Ty) {
   match s {
-    St(sub, lv, cur, ds, rs, cx, rw, gx, eq) -> {
+    St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> {
       let t = array.get(sub, v)
-      R(t, St(sub, lv, cur, ds, rs, cx, rw, gx, eq))
+      R(t, St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx))
     }
   }
 }
 fn set_var(s: St, v: Int, t: Ty) -> St {
-  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq) -> St(array.set(sub, v, t), lv, cur, ds, rs, cx, rw, gx, eq) }
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> St(array.set(sub, v, t), lv, cur, ds, rs, cx, rw, gx, eq, hx) }
 }
 fn level_of(s: St, v: Int) -> R(Int) {
   match s {
-    St(sub, lv, cur, ds, rs, cx, rw, gx, eq) -> {
+    St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> {
       let l = array.get(lv, v)
-      R(l, St(sub, lv, cur, ds, rs, cx, rw, gx, eq))
+      R(l, St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx))
     }
   }
 }
 fn set_level(s: St, v: Int, l: Int) -> St {
-  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq) -> St(sub, array.set(lv, v, l), cur, ds, rs, cx, rw, gx, eq) }
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> St(sub, array.set(lv, v, l), cur, ds, rs, cx, rw, gx, eq, hx) }
 }
 fn cur_level(s: St) -> R(Int) {
-  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq) -> R(cur, St(sub, lv, cur, ds, rs, cx, rw, gx, eq)) }
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> R(cur, St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx)) }
 }
 fn add_level(s: St, d: Int) -> St {
-  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq) -> St(sub, lv, cur + d, ds, rs, cx, rw, gx, eq) }
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> St(sub, lv, cur + d, ds, rs, cx, rw, gx, eq, hx) }
 }
 fn diag(s: St, code: String, msg: String, start: Int, end: Int) -> St {
-  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq) -> St(sub, lv, cur, Cons(Diag(code, msg, start, end), ds), rs, cx, rw, gx, eq) }
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> St(sub, lv, cur, Cons(Diag(code, msg, start, end), ds), rs, cx, rw, gx, eq, hx) }
 }
 fn get_cx(s: St) -> R(Ctx) {
-  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq) -> R(cx, St(sub, lv, cur, ds, rs, cx, rw, gx, eq)) }
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> R(cx, St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx)) }
 }
 fn set_cx(s: St, cx: Ctx) -> St {
-  match s { St(sub, lv, cur, ds, rs, _, rw, gx, eq) -> St(sub, lv, cur, ds, rs, cx, rw, gx, eq) }
+  match s { St(sub, lv, cur, ds, rs, _, rw, gx, eq, hx) -> St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) }
 }
 fn get_gx(s: St) -> R(Gx) {
-  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq) -> R(gx, St(sub, lv, cur, ds, rs, cx, rw, gx, eq)) }
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> R(gx, St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx)) }
 }
 fn set_gx(s: St, gx: Gx) -> St {
-  match s { St(sub, lv, cur, ds, rs, cx, rw, _, eq) -> St(sub, lv, cur, ds, rs, cx, rw, gx, eq) }
+  match s { St(sub, lv, cur, ds, rs, cx, rw, _, eq, hx) -> St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) }
+}
+fn get_hx(s: St) -> R(Hx) {
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> R(hx, St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx)) }
+}
+fn set_hx(s: St, hx: Hx) -> St {
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, _) -> St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) }
 }
 fn record(s: St, start: Int, end: Int, t: Ty) -> St {
-  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq) -> St(sub, lv, cur, ds, Cons(Rec(start, end, t), rs), cx, rw, gx, eq) }
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> St(sub, lv, cur, ds, Cons(Rec(start, end, t), rs), cx, rw, gx, eq, hx) }
 }
 
 fn get_eq(s: St) -> R(Eqs) {
-  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq) -> R(eq, St(sub, lv, cur, ds, rs, cx, rw, gx, eq)) }
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> R(eq, St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx)) }
 }
 fn set_eq(s: St, eq: Eqs) -> St {
-  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, _) -> St(sub, lv, cur, ds, rs, cx, rw, gx, eq) }
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, _, hx) -> St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) }
 }
 
 // ---- Equality (`require_data`) ------------------------------------------------
@@ -250,66 +270,110 @@ fn require_data(s: St, t: Ty, start: Int, end: Int, o: Span2) -> St {
 
 // ---- Row variables -----------------------------------------------------------
 
+fn ropen(v: Int) -> Row { Row(Nil, ROpen(v)) }
+fn pure_row() -> Row { Row(Nil, RClosed) }
 fn fresh_row_marked(s: St, phantom: Bool) -> R(Int) {
   match s {
-    St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq) -> {
+    St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq, hx) -> {
       let n = array.length(rsub)
-      R(n, St(sub, lv, cur, ds, rs, cx, Rows(array.push(rsub, RNone), array.push(rlv, cur), array.push(ph, phantom)), gx, eq))
+      R(n, St(sub, lv, cur, ds, rs, cx, Rows(array.push(rsub, Row(Nil, RNone)), array.push(rlv, cur), array.push(ph, phantom)), gx, eq, hx))
     }
   }
 }
 fn fresh_row(s: St) -> R(Int) { fresh_row_marked(s, False) }
 // A phantom row: an upcast tail that means nothing yet (`fresh_phantom_row`).
 fn fresh_phantom(s: St) -> R(Int) { fresh_row_marked(s, True) }
-fn row_bound(s: St, v: Int) -> R(Tail) {
+fn row_bound(s: St, v: Int) -> R(Row) {
   match s {
-    St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq) -> {
+    St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq, hx) -> {
       let t = array.get(rsub, v)
-      R(t, St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq))
+      R(t, St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq, hx))
     }
   }
 }
-fn set_row(s: St, v: Int, t: Tail) -> St {
-  match s { St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq) -> St(sub, lv, cur, ds, rs, cx, Rows(array.set(rsub, v, t), rlv, ph), gx, eq) }
+fn set_row(s: St, v: Int, t: Row) -> St {
+  match s { St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq, hx) -> St(sub, lv, cur, ds, rs, cx, Rows(array.set(rsub, v, t), rlv, ph), gx, eq, hx) }
 }
 fn row_level(s: St, v: Int) -> R(Int) {
   match s {
-    St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq) -> {
+    St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq, hx) -> {
       let l = array.get(rlv, v)
-      R(l, St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq))
+      R(l, St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq, hx))
     }
   }
 }
 fn set_row_level(s: St, v: Int, l: Int) -> St {
-  match s { St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq) -> St(sub, lv, cur, ds, rs, cx, Rows(rsub, array.set(rlv, v, l), ph), gx, eq) }
+  match s { St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq, hx) -> St(sub, lv, cur, ds, rs, cx, Rows(rsub, array.set(rlv, v, l), ph), gx, eq, hx) }
 }
 fn is_phantom(s: St, v: Int) -> R(Bool) {
   match s {
-    St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq) -> {
+    St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq, hx) -> {
       let p = array.get(ph, v)
-      R(p, St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq))
+      R(p, St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq, hx))
     }
   }
 }
 fn set_phantom(s: St, v: Int, p: Bool) -> St {
-  match s { St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq) -> St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, array.set(ph, v, p)), gx, eq) }
+  match s { St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq, hx) -> St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, array.set(ph, v, p)), gx, eq, hx) }
 }
 fn row_count(s: St) -> R(Int) {
   match s {
-    St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq) -> {
+    St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq, hx) -> {
       let n = array.length(rsub)
-      R(n, St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq))
+      R(n, St(sub, lv, cur, ds, rs, cx, Rows(rsub, rlv, ph), gx, eq, hx))
     }
   }
 }
-// A tail with its bound variables followed (`resolve_row`).
-fn rhead(s: St, t: Tail) -> R(Tail) {
+
+// Labels are kept sorted by name (a `BTreeMap`): `keep_lab` leaves a label
+// already there (the first along a chain is kept), `put_lab` replaces it
+// (a written row's last).
+fn lab_name(l: Lab) -> String { match l { Lab(n, _, _) -> n } }
+fn has_lab(xs: List(Lab), n: String) -> Bool {
+  match xs { Nil -> False  Cons(Lab(m, _, _), rest) -> m == n || has_lab(rest, n) }
+}
+fn keep_lab(xs: List(Lab), l: Lab) -> List(Lab) {
+  match xs {
+    Nil -> Cons(l, Nil)
+    Cons(x, rest) -> if lab_name(x) == lab_name(l) { xs } else {
+      if str_lt(lab_name(l), lab_name(x), 0) { Cons(l, xs) } else { Cons(x, keep_lab(rest, l)) }
+    }
+  }
+}
+fn put_lab(xs: List(Lab), l: Lab) -> List(Lab) {
+  match xs {
+    Nil -> Cons(l, Nil)
+    Cons(x, rest) -> if lab_name(x) == lab_name(l) { Cons(l, rest) } else {
+      if str_lt(lab_name(l), lab_name(x), 0) { Cons(l, xs) } else { Cons(x, put_lab(rest, l)) }
+    }
+  }
+}
+fn keep_labs(xs: List(Lab), more: List(Lab)) -> List(Lab) {
+  match more { Nil -> xs  Cons(l, rest) -> keep_labs(keep_lab(xs, l), rest) }
+}
+// `xs`'s labels absent from `ys`, in order.
+fn labs_minus(xs: List(Lab), ys: List(Lab)) -> List(Lab) {
+  match xs {
+    Nil -> Nil
+    Cons(l, rest) -> if has_lab(ys, lab_name(l)) { labs_minus(rest, ys) } else { Cons(l, labs_minus(rest, ys)) }
+  }
+}
+// A row with its bound tails followed, the first label of each effect
+// along the chain kept (`resolve_row`).
+fn resolve_row(s: St, r: Row) -> R(Row) {
+  match r { Row(labs, t) -> follow_row(s, labs, t) }
+}
+fn follow_row(s: St, labs: List(Lab), t: Tail) -> R(Row) {
   match t {
     ROpen(v) -> match row_bound(s, v) {
-      R(b, s2) -> match b { RNone -> R(t, s2)  _ -> rhead(s2, b) }
+      R(Row(bl, bt), s2) -> match bt { RNone -> R(Row(labs, t), s2)  _ -> follow_row(s2, keep_labs(labs, bl), bt) }
     }
-    _ -> R(t, s)
+    _ -> R(Row(labs, t), s)
   }
+}
+// A tail as it stands now (`tail_now`).
+fn rhead(s: St, t: Tail) -> R(Tail) {
+  match resolve_row(s, Row(Nil, t)) { R(Row(_, t2), s2) -> R(t2, s2) }
 }
 fn tail_eq(a: Tail, b: Tail) -> Bool {
   match a {
@@ -322,50 +386,130 @@ fn tail_eq(a: Tail, b: Tail) -> Bool {
 fn lower_row(s: St, w: Int, lvl: Int) -> St {
   match row_level(s, w) { R(l, s2) -> if l > lvl { set_row_level(s2, w, lvl) } else { s2 } }
 }
-// `bind_row` on a label-free row: a bound variable unifies instead; a
-// meaningful variable bound to `{w}` hands its meaning to `w`; levels drop
-// as `bind`'s do.
-fn bind_row(s: St, v: Int, t: Tail) -> St {
+// `bind_row`: a bound variable unifies instead; a row ending in `v` is
+// cyclic (E0424, the row poisoned); a meaningful variable bound to
+// `{.. | w}` hands its meaning to `w`; levels drop as `bind`'s do.
+fn bind_row(s: St, v: Int, r: Row, start: Int, end: Int) -> St {
   match row_bound(s, v) {
-    R(b, s1) -> match b {
-      RNone -> match rhead(s1, t) {
-        R(r, s2) -> if tail_eq(r, ROpen(v)) {
-          set_row(diag(s2, "E0424", "cyclic effect row", 0, 0), v, RError)
+    R(Row(_, bt), s1) -> match bt {
+      RNone -> match resolve_row(s1, r) {
+        R(Row(rl, rt), s2) -> if tail_eq(rt, ROpen(v)) {
+          set_row(diag(s2, "E0424", "cyclic effect row", start, end), v, Row(Nil, RError))
         } else {
           match is_phantom(s2, v) {
             R(pv, s3) -> {
-              let s4 = match r { ROpen(w) -> if pv { s3 } else { set_phantom(s3, w, False) }  _ -> s3 }
+              let s4 = match rt { ROpen(w) -> if pv { s3 } else { set_phantom(s3, w, False) }  _ -> s3 }
               match row_level(s4, v) {
                 R(lvl, s5) -> {
-                  let s6 = match r { ROpen(w) -> lower_row(s5, w, lvl)  _ -> s5 }
-                  set_row(s6, v, r)
+                  let s6 = match rt { ROpen(w) -> lower_row(s5, w, lvl)  _ -> s5 }
+                  set_row(s6, v, Row(rl, rt))
                 }
               }
             }
           }
         }
       }
-      _ -> unify_tail(s1, ROpen(v), t)
+      _ -> surface(unify_row(s1, ropen(v), r, start, end))
     }
   }
 }
-// Two rows without labels meet at their tails (`unify_row`, `unify_tails`):
-// the younger variable is bound to the older.
-fn unify_tail(s: St, a: Tail, b: Tail) -> St {
+// What a row reconciliation could not absorb: the first row's labels the
+// second (closed) cannot take, then the second's (`RowConflict`); empty
+// when the rows were reconciled. `Ab` is one side's residual tail and
+// what it could not take.
+type Ab { Ab(Tail, List(Lab)) }
+// `unify_row`: labels on one side only are absorbed by the other's tail,
+// then the residual tails are unified. Diagnostic-free but for E0424.
+fn unify_row(s: St, g1: Row, g2: Row, start: Int, end: Int) -> R(List(Lab)) {
+  match resolve_row(s, g1) {
+    R(Row(l1, t1), s1) -> match resolve_row(s1, g2) {
+      R(Row(l2, t2), s2) -> if tail_eq(t1, RError) || tail_eq(t2, RError) { R(Nil, s2) } else {
+        match absorb(s2, labs_minus(l1, l2), t2, start, end) {
+          R(Ab(n2, c1), s3) -> match rhead(s3, t1) {
+            R(t1n, s4) -> match absorb(s4, labs_minus(l2, l1), t1n, start, end) {
+              R(Ab(n1, c2), s5) -> match append(c1, c2) {
+                Nil -> match rhead(s5, n2) { R(n2b, s6) -> R(Nil, unify_tails(s6, n1, n2b, start, end)) }
+                c -> R(c, s5)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+// `absorb`: an open tail grows by `v := {extra} | fresh`, the fresh tail
+// phantom if `v` was; a closed one cannot.
+fn absorb(s: St, extra: List(Lab), t: Tail, start: Int, end: Int) -> R(Ab) {
+  match extra {
+    Nil -> R(Ab(t, Nil), s)
+    _ -> match t {
+      ROpen(v) -> match fresh_row(s) {
+        R(f, s1) -> match is_phantom(s1, v) {
+          R(p, s2) -> {
+            let s3 = if p { set_phantom(s2, f, True) } else { s2 }
+            R(Ab(ROpen(f), Nil), bind_row(s3, v, Row(extra, ROpen(f)), start, end))
+          }
+        }
+      }
+      RClosed -> R(Ab(t, extra), s)
+      _ -> R(Ab(t, Nil), s)
+    }
+  }
+}
+// Two residual tails (`unify_tails`): the younger variable bound to the
+// older.
+fn unify_tails(s: St, a: Tail, b: Tail, start: Int, end: Int) -> St {
   match rhead(s, a) {
     R(x, s1) -> match rhead(s1, b) {
       R(y, s2) -> match x {
         RError -> s2
         ROpen(p) -> match y {
           RError -> s2
-          ROpen(q) -> if p == q { s2 } else { if p > q { bind_row(s2, p, ROpen(q)) } else { bind_row(s2, q, ROpen(p)) } }
-          _ -> bind_row(s2, p, RClosed)
+          ROpen(q) -> if p == q { s2 } else { if p > q { bind_row(s2, p, ropen(q), start, end) } else { bind_row(s2, q, ropen(p), start, end) } }
+          _ -> bind_row(s2, p, pure_row(), start, end)
         }
         _ -> match y {
-          ROpen(q) -> bind_row(s2, q, RClosed)
+          ROpen(q) -> bind_row(s2, q, pure_row(), start, end)
           _ -> s2
         }
       }
+    }
+  }
+}
+// A conflict on the way into an ambient row (`surface_conflict`): E0423
+// at the first differing label.
+fn surface(r: R(List(Lab))) -> St {
+  match r {
+    R(c, s) -> match c {
+      Nil -> s
+      Cons(Lab(_, a, b), _) -> diag(s, "E0423", "effect row mismatch", a, b)
+    }
+  }
+}
+// `op ∈ amb` (`add_effect`): the ambient against `{op} | fresh`.
+fn add_effect(s: St, amb: Int, name: String, start: Int, end: Int) -> R(List(Lab)) {
+  match fresh_row(s) {
+    R(f, s2) -> unify_row(s2, ropen(amb), Row(Cons(Lab(name, start, end), Nil), ROpen(f)), start, end)
+  }
+}
+// `amb ⊇ eff` (`add_row`): each label at its own span, stopping at the
+// first conflict, then the tail relayed.
+fn add_row(s: St, amb: Int, eff: Row, start: Int, end: Int) -> R(List(Lab)) {
+  match resolve_row(s, eff) {
+    R(Row(ls, t), s1) -> match add_labs(s1, amb, ls) {
+      R(c, s2) -> match c {
+        Nil -> match t { ROpen(rho) -> unify_row(s2, ropen(amb), ropen(rho), start, end)  _ -> R(Nil, s2) }
+        _ -> R(c, s2)
+      }
+    }
+  }
+}
+fn add_labs(s: St, amb: Int, ls: List(Lab)) -> R(List(Lab)) {
+  match ls {
+    Nil -> R(Nil, s)
+    Cons(Lab(n, a, b), rest) -> match add_effect(s, amb, n, a, b) {
+      R(c, s2) -> match c { Nil -> add_labs(s2, amb, rest)  _ -> R(c, s2) }
     }
   }
 }
@@ -385,7 +529,7 @@ fn resolve(s: St, t: Ty) -> R(Ty) {
     R(h, s2) -> match h {
       TFn(ps, rw, r) -> match resolve_list(s2, ps, Nil) {
         R(ps2, s3) -> match resolve(s3, r) {
-          R(r2, s4) -> match rhead(s4, rw) { R(rw2, s5) -> R(TFn(ps2, rw2, r2), s5) }
+          R(r2, s4) -> match resolve_row(s4, rw) { R(rw2, s5) -> R(TFn(ps2, rw2, r2), s5) }
         }
       }
       TCon(n, args) -> match resolve_list(s2, args, Nil) { R(args2, s3) -> R(TCon(n, args2), s3) }
@@ -419,7 +563,7 @@ fn free_rows(t: Ty, acc: List(Int)) -> List(Int) {
   match t {
     TFn(ps, rw, r) -> {
       let a1 = free_rows_list(ps, acc)
-      let a2 = match rw { ROpen(v) -> if has_int(a1, v) { a1 } else { Cons(v, a1) }  _ -> a1 }
+      let a2 = match rw { Row(_, ROpen(v)) -> if has_int(a1, v) { a1 } else { Cons(v, a1) }  _ -> a1 }
       free_rows(r, a2)
     }
     TCon(_, args) -> free_rows_list(args, acc)
@@ -519,7 +663,9 @@ fn unify_rigid(s: St, x: Ty, y: Ty, start: Int, end: Int) -> St {
       TFn(p2, w2, r2) -> if len(p1) != len(p2) {
         diag(s, "E0402", "wrong number of arguments", start, end)
       } else {
-        unify_tail(unify(unify_pairs(s, p1, p2, start, end), r1, r2, start, end), w1, w2)
+        match unify_row(unify(unify_pairs(s, p1, p2, start, end), r1, r2, start, end), w1, w2, start, end) {
+          R(c, s2) -> match c { Nil -> s2  _ -> diag(s2, "E0423", "effect row mismatch", start, end) }
+        }
       }
       _ -> mismatch(s, start, end)
     }
@@ -565,7 +711,7 @@ fn subst(t: Ty, m: List(Pair), rm: List(RPair)) -> Ty {
   match t {
     TVar(v) -> match subst_get(m, v) { Yes(f) -> f  No -> t }
     TFn(ps, rw, r) -> {
-      let rw2 = match rw { ROpen(v) -> { let w = rsubst_get(rm, v)  if w < 0 { rw } else { ROpen(w) } }  _ -> rw }
+      let rw2 = match rw { Row(ls, ROpen(v)) -> { let w = rsubst_get(rm, v)  if w < 0 { rw } else { Row(ls, ROpen(w)) } }  _ -> rw }
       TFn(subst_list(ps, m, rm, Nil), rw2, subst(r, m, rm))
     }
     TCon(n, args) -> TCon(n, subst_list(args, m, rm, Nil))
@@ -632,7 +778,39 @@ fn above_rows(s: St, vs: List(Int), lvl: Int, kept: List(Int), acc: List(Int)) -
 // (`kept_monomorphic`): a lowercase name is one type for the whole function,
 // so an inner `let` must not quantify it, nor the rows inside it.
 fn kept_vars(s: St) -> R(List(Int)) {
-  match get_cx(s) { R(Ctx(avs, _, _, _), s2) -> kept_from(s2, avs, Nil) }
+  match get_cx(s) {
+    R(Ctx(avs, _, _, _), s2) -> match kept_from(s2, avs, Nil) {
+      R(acc, s3) -> match get_hx(s3) { R(Hx(rs, _, _, _, _, _), s4) -> kept_resume_vars(s4, rs, acc) }
+    }
+  }
+}
+// The enclosing clauses' `resume` types are one type for their clause, and
+// its rows one row each (`kept_monomorphic`).
+fn kept_resume_vars(s: St, rs: List(Resume), acc: List(Int)) -> R(List(Int)) {
+  match rs {
+    Nil -> R(acc, s)
+    Cons(Resume(arg, result, _, _, _, _, _), rest) -> match resolve(s, arg) {
+      R(a, s2) -> match resolve(s2, result) { R(r, s3) -> kept_resume_vars(s3, rest, free_vars(r, free_vars(a, acc))) }
+    }
+  }
+}
+fn kept_resume_rows(s: St, rs: List(Resume), acc: List(Int)) -> R(List(Int)) {
+  match rs {
+    Nil -> R(acc, s)
+    Cons(Resume(arg, result, b, r, _, _, c), rest) -> match resolve(s, arg) {
+      R(a, s2) -> match resolve(s2, result) {
+        R(rr, s3) -> match kept_tails(s3, Cons(b, Cons(r, Cons(c, Nil))), free_rows(rr, free_rows(a, acc))) {
+          R(acc2, s4) -> kept_resume_rows(s4, rest, acc2)
+        }
+      }
+    }
+  }
+}
+fn kept_tails(s: St, rows: List(Int), acc: List(Int)) -> R(List(Int)) {
+  match rows {
+    Nil -> R(acc, s)
+    Cons(r, rest) -> match rhead(s, ROpen(r)) { R(t, s2) -> kept_tails(s2, rest, match t { ROpen(v) -> Cons(v, acc)  _ -> acc }) }
+  }
 }
 fn kept_from(s: St, avs: List(Named), acc: List(Int)) -> R(List(Int)) {
   match avs {
@@ -646,7 +824,13 @@ fn kept_from(s: St, avs: List(Named), acc: List(Int)) -> R(List(Int)) {
 fn kept_rows(s: St) -> R(List(Int)) {
   match get_cx(s) {
     R(Ctx(avs, _, _, _), s2) -> match kept_rows_from(s2, avs, Nil) {
-      R(acc, s3) -> match get_gx(s3) { R(Gx(_, _, _, _, ds, _, _), s4) -> kept_deferred(s4, ds, acc) }
+      R(acc, s3) -> match get_gx(s3) {
+        R(Gx(_, _, _, _, ds, _, _), s4) -> match kept_deferred(s4, ds, acc) {
+          R(acc2, s5) -> match get_hx(s5) {
+            R(Hx(rs, crs, _, _, _, _), s6) -> match kept_resume_rows(s6, rs, acc2) { R(acc3, s7) -> kept_tails(s7, crs, acc3) }
+          }
+        }
+      }
     }
   }
 }
@@ -740,12 +924,17 @@ fn ctor_arity(s: St, name: String) -> R(Int) {
 // where it is consumed.
 fn elaborate(s: St, a: Sp(TypeAnn), cov: Bool) -> R(Ty) {
   match a {
-    Sp(TypeAnn(name, args, _), start, end) -> {
+    Sp(TypeAnn(name, args, written), start, end) -> {
       let n = len(args)
       if name == "fn" && n > 0 {
         match elaborate_fn_params(s, args, n - 1, !cov, Nil) {
           R(ps, s2) -> match elaborate(s2, last_ann(args), cov) {
-            R(ret, s3) -> match fresh_row_marked(s3, cov) { R(w, s4) -> R(TFn(ps, ROpen(w), ret), s4) }
+            R(ret, s3) -> match written {
+              // Unwritten: an upcast tail where the value is produced, a
+              // real variable where it is consumed.
+              No -> match fresh_row_marked(s3, cov) { R(w, s4) -> R(TFn(ps, ropen(w), ret), s4) }
+              Yes(RowAnn(labels, _)) -> match ann_labels(s3, labels, Nil) { R(ls, s4) -> R(TFn(ps, Row(ls, RClosed), ret), s4) }
+            }
           }
         }
       } else { if n == 0 && is_lower(name) {
@@ -777,6 +966,20 @@ fn elaborate(s: St, a: Sp(TypeAnn), cov: Bool) -> R(Ty) {
       } }
     }
   }
+}
+// A written row's labels (`ann_labels`): each a declared effect or `IO`.
+fn ann_labels(s: St, xs: List(LabelAnn), acc: List(Lab)) -> R(List(Lab)) {
+  match xs {
+    Nil -> R(acc, s)
+    Cons(LabelAnn(Sp(name, a, b), _), rest) -> match is_effect(s, name) {
+      R(known, s2) -> if known || name == "IO" { ann_labels(s2, rest, put_lab(acc, Lab(name, a, b))) } else {
+        ann_labels(diag(s2, "E0432", "unknown effect `" <> name <> "`", a, b), rest, acc)
+      }
+    }
+  }
+}
+fn is_effect(s: St, name: String) -> R(Bool) {
+  match get_hx(s) { R(Hx(_, _, _, _, effs, _), s2) -> R(has_str(effs, name), s2) }
 }
 fn last_ann(xs: List(Sp(TypeAnn))) -> Sp(TypeAnn) {
   match xs {
@@ -813,11 +1016,16 @@ fn check_ann(s: St, ann: Maybe(Sp(TypeAnn)), t: Ty, cov: Bool) -> St {
 // of arguments is reported and the arguments still read.
 fn elaborate_adt(s: St, a: Sp(TypeAnn), params: List(Named)) -> R(Ty) {
   match a {
-    Sp(TypeAnn(name, args, _), start, end) -> if name == "fn" && len(args) > 0 {
+    Sp(TypeAnn(name, args, written), start, end) -> if name == "fn" && len(args) > 0 {
       // A declaration's rows are exactly what is written: none is pure.
       let n = len(args)
       match elaborate_adt_list(s, first_anns(args, n - 1, Nil), params, Nil) {
-        R(ps, s2) -> match elaborate_adt(s2, last_ann(args), params) { R(ret, s3) -> R(TFn(ps, RClosed, ret), s3) }
+        R(ps, s2) -> match elaborate_adt(s2, last_ann(args), params) {
+          R(ret, s3) -> match written {
+            No -> R(TFn(ps, pure_row(), ret), s3)
+            Yes(RowAnn(labels, _)) -> match ann_labels(s3, labels, Nil) { R(ls, s4) -> R(TFn(ps, Row(ls, RClosed), ret), s4) }
+          }
+        }
       }
     } else {
       let n = len(args)
@@ -913,7 +1121,7 @@ fn ctors(s: St, vs: List(Sp(VariantDecl)), result: Ty, vars: List(Int), pe: List
       R(fts0, s1) -> {
         let fts = fts0
         let s2 = add_adt_fields(s1, result, vars, fts)
-        let t = match fts { Nil -> result  _ -> TFn(fts, RClosed, result) }
+        let t = match fts { Nil -> result  _ -> TFn(fts, pure_row(), result) }
         ctors(s2, rest, result, vars, pe, Cons(Entry(cname, Scheme(vars, Nil, t)), env))
       }
     }
@@ -1031,8 +1239,9 @@ fn infer_inner(s: St, node: Expr, start: Int, end: Int, env: List(Entry), amb: I
       }
     }
     ECall(callee, args) -> infer_call(s, callee, args, start, end, env, amb)
+    EHandle(body, h) -> infer_handle(s, body, h, start, end, env, amb)
+    EResume(arg) -> match infer_expr(s, arg, env, amb) { R(at, s2) -> type_resume(s2, at, start, end, amb) }
     ELambda(params, body) -> infer_lambda(s, params, body, env)
-    _ -> R(TErr, s)
   }
 }
 fn infer_arms(s: St, arms: List(Sp(MatchArm)), st: Ty, result: Ty, env: List(Entry), amb: Int) -> St {
@@ -1140,21 +1349,55 @@ fn pure_builtin(m: String, n: String) -> Sig {
     }
   }
 }
+fn host_signature(m: String, n: String) -> Sig {
+  if m == "io" {
+    if n == "println" { Sig(Cons(TB(3), Nil), TB(4)) } else {
+      if n == "read_file" { Sig(Cons(TB(3), Nil), TB(3)) } else {
+        if n == "file_exists" { Sig(Cons(TB(3), Nil), TB(2)) } else {
+          if n == "write_file" { Sig(Cons(TB(3), Cons(TB(3), Nil)), TB(4)) } else {
+            if n == "read_stdin" { Sig(Nil, TB(3)) } else {
+              if n == "arg_count" { Sig(Nil, TB(0)) } else { if n == "arg" { Sig(Cons(TB(0), Nil), TB(3)) } else { NoSig } }
+            }
+          }
+        }
+      }
+    }
+  } else {
+    if m == "time" && n == "now_ms" { Sig(Nil, TB(0)) } else { if m == "time" && n == "sleep_ms" { Sig(Cons(TB(0), Nil), TB(4)) } else { NoSig } }
+  }
+}
 fn infer_call(s: St, callee: Sp(Expr), args: List(Sp(Expr)), start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
   match callee {
-    Sp(EQualified(m, n), cs, ce) -> match pure_builtin(m, n) {
-      NoSig -> R(TErr, s)
+    Sp(EQualified(m, n), cs, ce) -> match host_signature(m, n) {
+      // The host's builtins perform `IO` (`type_builtin_call`).
       Sig(params, ret) -> match infer_args(s, args, env, Nil, amb) {
         R(ts, s2) -> {
-          let want = TFn(params, RClosed, ret)
-          R(ret, record(unify(s2, want, TFn(ts, RClosed, ret), start, end), cs, ce, want))
+          let s3 = unify(s2, TFn(params, pure_row(), ret), TFn(ts, pure_row(), ret), start, end)
+          let s4 = surface(add_effect(s3, amb, "IO", start, end))
+          R(ret, record(s4, cs, ce, TFn(params, Row(Cons(Lab("IO", cs, ce), Nil), RClosed), ret)))
+        }
+      }
+      NoSig -> match pure_builtin(m, n) {
+        NoSig -> R(TErr, s)
+        Sig(params, ret) -> match infer_args(s, args, env, Nil, amb) {
+          R(ts, s2) -> {
+            let want = TFn(params, pure_row(), ret)
+            R(ret, record(unify(s2, want, TFn(ts, pure_row(), ret), start, end), cs, ce, want))
+          }
         }
       }
     }
     Sp(EVar(name), cs, ce) -> match ctor_arity(s, name) {
       R(k, s1) -> if k >= 0 {
         match infer_args(s1, args, env, Nil, amb) { R(ts, s2) -> ctor_call(s2, name, k, ts, start, end, env) }
-      } else { ordinary(s1, name, cs, ce, args, start, end, env, amb) }
+      } else {
+        // An operation's name not bound in scope is a perform.
+        let op = match lookup(env, name) { Yes(_) -> R(No, s1)  No -> find_op(s1, name) }
+        match op {
+          R(Yes(info), s2) -> type_perform(s2, info, args, cs, ce, start, end, env, amb)
+          R(No, s2) -> ordinary(s2, name, cs, ce, args, start, end, env, amb)
+        }
+      }
     }
     _ -> match infer_expr(s, callee, env, amb) { R(ft, s2) -> call_with(s2, ft, args, start, end, env, amb) }
   }
@@ -1187,19 +1430,22 @@ fn ordinary(s: St, name: String, cs: Int, ce: Int, args: List(Sp(Expr)), start: 
   match f { R(ft, s2) -> call_with(s2, ft, args, start, end, env, amb) }
 }
 // `type_ordinary_call`: the callee against a fresh arrow whose row is a
-// phantom; what the call performs reaches the ambient row, through a
-// pending inclusion when it is still a phantom nothing in scope relays, or
-// deferred when it is a group member's row inside a lambda.
+// phantom. Its labels reach the ambient row now; its tail through a pending
+// inclusion when it is still a phantom nothing in scope relays, or deferred
+// when it is a group member's row inside a lambda or a handled body, or
+// else relayed.
 fn call_with(s: St, f: Ty, args: List(Sp(Expr)), start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
   match infer_args(s, args, env, Nil, amb) {
     R(ts, s2) -> match fresh(s2) {
       R(result, s3) -> match fresh_phantom(s3) {
         R(cr, s4) -> {
-          let s5 = unify(s4, f, TFn(ts, ROpen(cr), result), start, end)
-          match rhead(s5, ROpen(cr)) {
-            R(eff, s6) -> match eff {
-              ROpen(v) -> R(result, call_open(s6, v, amb))
-              _ -> R(result, s6)
+          let s5 = unify(s4, f, TFn(ts, ropen(cr), result), start, end)
+          match resolve_row(s5, ropen(cr)) {
+            R(Row(ls, t), s6) -> match t {
+              ROpen(v) -> match call_open(s6, v, amb, start, end) {
+                R(keep, s7) -> R(result, surface(add_row(s7, amb, Row(ls, if keep { t } else { RClosed }), start, end)))
+              }
+              _ -> R(result, surface(add_row(s6, amb, Row(ls, t), start, end)))
             }
           }
         }
@@ -1207,20 +1453,22 @@ fn call_with(s: St, f: Ty, args: List(Sp(Expr)), start: Int, end: Int, env: List
     }
   }
 }
-fn call_open(s: St, v: Int, amb: Int) -> St {
+// Whether the call's tail `v` is relayed into the ambient row, or else
+// recorded as an inclusion.
+fn call_open(s: St, v: Int, amb: Int, start: Int, end: Int) -> R(Bool) {
   match get_gx(s) {
     R(Gx(incl, mincl, ptys, regions, deferred, gparams, gambs), s2) -> match rows_in(s2, ptys, Nil) {
       R(in_params, s3) -> match is_phantom(s3, v) {
         R(ph, s4) -> if ph && !has_int(in_params, v) {
-          set_gx(s4, Gx(append(incl, Cons(Incl(v, amb), Nil)), mincl, ptys, regions, deferred, gparams, gambs))
+          R(False, set_gx(s4, Gx(append(incl, Cons(Incl(v, amb, start, end), Nil)), mincl, ptys, regions, deferred, gparams, gambs)))
         } else {
-          if has_int(in_params, v) { unify_tail(s4, ROpen(amb), ROpen(v)) } else {
+          if has_int(in_params, v) { R(True, s4) } else {
             match member_in_lambda(s4, v, amb) {
               R(m, s5) -> if m >= 0 {
                 match get_gx(s5) {
-                  R(Gx(i2, mi2, p2, r2, d2, gp2, ga2), s6) -> set_gx(s6, Gx(i2, append(mi2, Cons(Incl(m, amb), Nil)), p2, r2, d2, gp2, ga2))
+                  R(Gx(i2, mi2, p2, r2, d2, gp2, ga2), s6) -> R(False, set_gx(s6, Gx(i2, append(mi2, Cons(Incl(m, amb, start, end), Nil)), p2, r2, d2, gp2, ga2)))
                 }
-              } else { unify_tail(s5, ROpen(amb), ROpen(v)) }
+              } else { R(True, s5) }
             }
           }
         }
@@ -1228,18 +1476,20 @@ fn call_open(s: St, v: Int, amb: Int) -> St {
     }
   }
 }
-// `member_in_handle_body`: inside a lambda (a region), a call whose row is
-// a group member's, not relayed by the group's parameters, is deferred.
-// The member's ambient row, or -1.
+// `member_in_handle_body`: inside a lambda or a handled body (a region
+// that includes), a call whose row is a group member's, not relayed by the
+// group's parameters, is deferred. The member's ambient row, or -1.
 fn member_in_lambda(s: St, v: Int, amb: Int) -> R(Int) {
   match get_gx(s) {
     R(Gx(_, _, _, regions, _, gparams, gambs), s2) -> match regions {
       Nil -> R(0 - 1, s2)
-      Cons(region, _) -> match rhead(s2, ROpen(amb)) {
-        R(at, s3) -> match rhead(s3, ROpen(region)) {
-          R(rt, s4) -> if !tail_eq(at, rt) || tail_eq(at, ROpen(v)) { R(0 - 1, s4) } else {
-            match rows_in(s4, gparams, Nil) {
-              R(relayed, s5) -> if has_int(relayed, v) { R(0 - 1, s5) } else { member_with(s5, gambs, v) }
+      Cons(Region(region, includes), _) -> if !includes { R(0 - 1, s2) } else {
+        match rhead(s2, ROpen(amb)) {
+          R(at, s3) -> match rhead(s3, ROpen(region)) {
+            R(rt, s4) -> if !tail_eq(at, rt) || tail_eq(at, ROpen(v)) { R(0 - 1, s4) } else {
+              match rows_in(s4, gparams, Nil) {
+                R(relayed, s5) -> if has_int(relayed, v) { R(0 - 1, s5) } else { member_with(s5, gambs, v) }
+              }
             }
           }
         }
@@ -1263,7 +1513,7 @@ fn open_arrows(s: St, t: Ty) -> R(Ty) {
   match t {
     TFn(ps, rw, r) -> {
       let opened = match rw {
-        RClosed -> match fresh_phantom(s) { R(w, s2) -> R(ROpen(w), s2) }
+        Row(ls, RClosed) -> match fresh_phantom(s) { R(w, s2) -> R(Row(ls, ROpen(w)), s2) }
         _ -> R(rw, s)
       }
       match opened { R(rw2, s2) -> match open_arrows(s2, r) { R(r2, s3) -> R(TFn(ps, rw2, r2), s3) } }
@@ -1279,9 +1529,9 @@ fn infer_lambda(s: St, params: List(Sp(Param)), body: Sp(Block), env: List(Entry
     R(LamIn(env2, pts), s2) -> match fresh_row(s2) {
       R(lam, s3) -> match get_gx(s3) {
         R(Gx(incl, mincl, ptys, regions, deferred, gparams, gambs), s4) -> {
-          let s5 = set_gx(s4, Gx(incl, mincl, append(ptys, pts), Cons(lam, regions), deferred, gparams, gambs))
+          let s5 = add_depth(set_gx(s4, Gx(incl, mincl, append(ptys, pts), Cons(Region(lam, True), regions), deferred, gparams, gambs)), 1)
           match infer_block(s5, sp_block(body), env2, lam) {
-            R(bt, s6) -> match get_gx(s6) {
+            R(bt, s6) -> match get_gx(add_depth(s6, 0 - 1)) {
               R(Gx(i7, mi7, _, r7, d7, gp7, ga7), s7) -> {
                 let regions2 = match r7 { Cons(_, rest) -> rest  Nil -> Nil }
                 lambda_exit(flush(set_gx(s7, Gx(i7, mi7, ptys, regions2, d7, gp7, ga7))), lam, append(ptys, pts), pts, bt)
@@ -1292,6 +1542,9 @@ fn infer_lambda(s: St, params: List(Sp(Param)), body: Sp(Block), env: List(Entry
       }
     }
   }
+}
+fn add_depth(s: St, d: Int) -> St {
+  match get_hx(s) { R(Hx(rs, cr, depth, ops, effs, dead), s2) -> set_hx(s2, Hx(rs, cr, depth + d, ops, effs, dead)) }
 }
 type LamIn { LamIn(List(Entry), List(Ty)) }
 fn lambda_params(s: St, params: List(Sp(Param)), env: List(Entry), acc: List(Ty)) -> R(LamIn) {
@@ -1314,9 +1567,9 @@ fn lambda_exit(s: St, lam: Int, scope: List(Ty), pts: List(Ty), bt: Ty) -> R(Ty)
           let s5 = if inc && open {
             set_gx(s4, Gx(incl, mincl, ptys, regions, append(deferred, Cons(Deferred(lam, scope), Nil)), gparams, gambs))
           } else { close_residual(s4, lam, scope) }
-          match rhead(s5, ROpen(lam)) {
+          match resolve_row(s5, ropen(lam)) {
             R(row, s6) -> match row {
-              RClosed -> match fresh_phantom(s6) { R(w, s7) -> R(TFn(pts, ROpen(w), bt), s7) }
+              Row(ls, RClosed) -> match fresh_phantom(s6) { R(w, s7) -> R(TFn(pts, Row(ls, ROpen(w)), bt), s7) }
               _ -> R(TFn(pts, row, bt), s6)
             }
           }
@@ -1328,68 +1581,431 @@ fn lambda_exit(s: St, lam: Int, scope: List(Ty), pts: List(Ty), bt: Ty) -> R(Ty)
 fn includes_member(s: St, mincl: List(Incl), lt: Tail) -> R(Bool) {
   match mincl {
     Nil -> R(False, s)
-    Cons(Incl(_, dst), rest) -> match rhead(s, ROpen(dst)) {
+    Cons(Incl(_, dst, _, _), rest) -> match rhead(s, ROpen(dst)) {
       R(t, s2) -> if tail_eq(t, lt) { R(True, s2) } else { includes_member(s2, rest, lt) }
     }
   }
 }
 // `close_unrelayed_residual`: an ambient row nothing in `params` relays
-// closes to pure.
+// closes to pure, unless a handle's clauses row still being filled ends
+// in it.
 fn close_residual(s: St, amb: Int, params: List(Ty)) -> St {
   match rhead(s, ROpen(amb)) {
     R(t, s2) -> match t {
-      ROpen(rho) -> match rows_in(s2, params, Nil) {
-        R(in_params, s3) -> if has_int(in_params, rho) { s3 } else { bind_row(s3, rho, RClosed) }
+      ROpen(rho) -> match get_hx(s2) {
+        R(Hx(_, crs, _, _, _, _), s3) -> match tail_in(s3, crs, rho) {
+          R(pending, s4) -> if pending { s4 } else {
+            match rows_in(s4, params, Nil) {
+              R(in_params, s5) -> if has_int(in_params, rho) { s5 } else { bind_row(s5, rho, pure_row(), 0, 0) }
+            }
+          }
+        }
       }
       _ -> s2
     }
   }
 }
+// Whether one of the rows `rs` ends in `v` now.
+fn tail_in(s: St, rs: List(Int), v: Int) -> R(Bool) {
+  match rs {
+    Nil -> R(False, s)
+    Cons(r, rest) -> match rhead(s, ROpen(r)) { R(t, s2) -> if tail_eq(t, ROpen(v)) { R(True, s2) } else { tail_in(s2, rest, v) } }
+  }
+}
 
 // ---- Inclusions (`flush_inclusions`) ----------------------------------------
 
-// Without labels an inclusion only ever joins two tails, and phantom-ness
-// belongs to a whole class (phantom while every member is), so the
-// event-driven queue of src/types.rs reaches the fixpoint this reaches.
+// Each pending inclusion in order, again until nothing more gets in: a
+// pass over all of them reaches what src/types.rs's queue of the woken
+// ones reaches, in the same order, since one that nothing woke adds
+// nothing. A label that meets a closed row is reported once and its
+// inclusion is dead (`incl_dead`); a member inclusion is dropped instead.
+fn incl_eq(x: Incl, y: Incl) -> Bool {
+  match x { Incl(a, b, c, d) -> match y { Incl(e, f, g, h) -> a == e && b == f && c == g && d == h } }
+}
+fn has_incl(xs: List(Incl), x: Incl) -> Bool {
+  match xs { Nil -> False  Cons(y, rest) -> incl_eq(x, y) || has_incl(rest, x) }
+}
+fn without_incls(xs: List(Incl), gone: List(Incl)) -> List(Incl) {
+  match xs { Nil -> Nil  Cons(x, rest) -> if has_incl(gone, x) { without_incls(rest, gone) } else { Cons(x, without_incls(rest, gone)) } }
+}
+fn get_dead(s: St) -> R(List(Incl)) {
+  match get_hx(s) { R(Hx(_, _, _, _, _, dead), s2) -> R(dead, s2) }
+}
+fn kill_incl(s: St, x: Incl) -> St {
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead), s2) -> set_hx(s2, Hx(rs, cr, d, ops, effs, Cons(x, dead))) }
+}
 fn flush(s: St) -> St {
-  match get_gx(s) {
-    R(Gx(incl, mincl, _, _, _, gparams, _), s2) -> match flush_incl(s2, incl, False) {
-      R(c1, s3) -> match rows_in(s3, gparams, Nil) {
-        R(relayed, s4) -> match flush_member(s4, mincl, relayed, False) {
-          R(c2, s5) -> if c1 || c2 { flush(s5) } else { s5 }
+  match row_count(s) {
+    R(n0, s0) -> match get_gx(s0) {
+      R(Gx(incl, _, _, _, _, gparams, _), s1) -> match flush_incl(s1, incl, False) {
+        R(c1, s2) -> match rows_in(s2, gparams, Nil) {
+          R(relayed, s3) -> match get_gx(s3) {
+            R(Gx(_, mincl, _, _, _, _, _), s4) -> match flush_member(s4, mincl, relayed, c1, Nil) {
+              R(Flushed(c2, gone), s5) -> match get_gx(s5) {
+                R(Gx(i6, mi6, p6, r6, d6, gp6, ga6), s6) -> match row_count(set_gx(s6, Gx(i6, without_incls(mi6, gone), p6, r6, d6, gp6, ga6))) {
+                  R(n1, s7) -> if c2 || n1 != n0 { flush(s7) } else { s7 }
+                }
+              }
+            }
+          }
         }
       }
     }
   }
 }
+type Flushed { Flushed(Bool, List(Incl)) }
 fn flush_incl(s: St, xs: List(Incl), changed: Bool) -> R(Bool) {
   match xs {
     Nil -> R(changed, s)
-    Cons(Incl(src, dst), rest) -> match rhead(s, ROpen(dst)) {
-      R(have, s2) -> match rhead(s2, ROpen(src)) {
-        R(want, s3) -> match want {
-          ROpen(w) -> match is_phantom(s3, w) {
-            R(ph, s4) -> if !ph && !tail_eq(have, ROpen(w)) && !tail_eq(have, RError) {
-              flush_incl(unify_tail(s4, ROpen(dst), ROpen(w)), rest, True)
-            } else { flush_incl(s4, rest, changed) }
+    Cons(x, rest) -> match get_dead(s) {
+      R(dead, s1) -> if has_incl(dead, x) { flush_incl(s1, rest, changed) } else {
+        match x {
+          Incl(src, dst, a, b) -> match resolve_row(s1, ropen(dst)) {
+            R(Row(hl, ht), s2) -> if tail_eq(ht, RError) { flush_incl(kill_incl(s2, x), rest, changed) } else {
+              match resolve_row(s2, ropen(src)) {
+                R(Row(wl, wt), s3) -> match relay_incl(s3, dst, ht, wt, a, b) {
+                  R(c1, s4) -> match incl_labels(s4, x, dst, hl, wl, a, b, False) {
+                    R(c2, s5) -> flush_incl(s5, rest, changed || c1 || c2)
+                  }
+                }
+              }
+            }
           }
-          _ -> flush_incl(s3, rest, changed)
         }
       }
     }
   }
 }
-fn flush_member(s: St, xs: List(Incl), relayed: List(Int), changed: Bool) -> R(Bool) {
-  match xs {
+// A recorded tail that has since become meaningful is a relay after all.
+fn relay_incl(s: St, dst: Int, have: Tail, want: Tail, a: Int, b: Int) -> R(Bool) {
+  match want {
+    ROpen(w) -> match is_phantom(s, w) {
+      R(ph, s2) -> if !ph && !tail_eq(have, ROpen(w)) {
+        match add_row(s2, dst, ropen(w), a, b) { R(c, s3) -> R(match c { Nil -> True  _ -> False }, surface(R(c, s3))) }
+      } else { R(False, s2) }
+    }
+    _ -> R(False, s)
+  }
+}
+fn incl_labels(s: St, x: Incl, dst: Int, have: List(Lab), want: List(Lab), a: Int, b: Int, changed: Bool) -> R(Bool) {
+  match want {
     Nil -> R(changed, s)
-    Cons(Incl(src, dst), rest) -> match rhead(s, ROpen(dst)) {
-      R(have, s2) -> match rhead(s2, ROpen(src)) {
-        R(want, s3) -> match want {
-          ROpen(w) -> if has_int(relayed, w) && !tail_eq(have, ROpen(w)) && !tail_eq(have, RError) {
-            flush_member(unify_tail(s3, ROpen(dst), ROpen(w)), rest, relayed, True)
-          } else { flush_member(s3, rest, relayed, changed) }
-          _ -> flush_member(s3, rest, relayed, changed)
+    Cons(Lab(n, _, _), rest) -> if has_lab(have, n) { incl_labels(s, x, dst, have, rest, a, b, changed) } else {
+      match add_effect(s, dst, n, a, b) {
+        R(c, s2) -> match c {
+          Nil -> incl_labels(s2, x, dst, have, rest, a, b, True)
+          _ -> incl_labels(surface(R(c, kill_incl(s2, x))), x, dst, have, rest, a, b, changed)
         }
+      }
+    }
+  }
+}
+fn flush_member(s: St, xs: List(Incl), relayed: List(Int), changed: Bool, gone: List(Incl)) -> R(Flushed) {
+  match xs {
+    Nil -> R(Flushed(changed, gone), s)
+    Cons(x, rest) -> match x {
+      Incl(src, dst, a, b) -> match resolve_row(s, ropen(dst)) {
+        R(Row(hl, ht), s2) -> if tail_eq(ht, RError) { flush_member(s2, rest, relayed, changed, gone) } else {
+          match resolve_row(s2, ropen(src)) {
+            R(Row(wl, wt), s3) -> {
+              let relay = match wt { ROpen(w) -> has_int(relayed, w) && !tail_eq(ht, ROpen(w))  _ -> False }
+              let r1 = if relay {
+                match wt {
+                  ROpen(w) -> match unify_row(s3, ropen(dst), ropen(w), a, b) {
+                    R(c, s4) -> match c { Nil -> R(Flushed(True, gone), s4)  _ -> R(Flushed(changed, Cons(x, gone)), surface(R(c, s4))) }
+                  }
+                  _ -> R(Flushed(changed, gone), s3)
+                }
+              } else { R(Flushed(changed, gone), s3) }
+              match r1 {
+                R(Flushed(c1, g1), s5) -> match member_labels(s5, x, dst, hl, wl, a, b, c1, g1) {
+                  R(Flushed(c2, g2), s6) -> flush_member(s6, rest, relayed, c2, g2)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+fn member_labels(s: St, x: Incl, dst: Int, have: List(Lab), want: List(Lab), a: Int, b: Int, changed: Bool, gone: List(Incl)) -> R(Flushed) {
+  match want {
+    Nil -> R(Flushed(changed, gone), s)
+    Cons(Lab(n, _, _), rest) -> if has_lab(have, n) { member_labels(s, x, dst, have, rest, a, b, changed, gone) } else {
+      match add_effect(s, dst, n, a, b) {
+        R(c, s2) -> match c {
+          Nil -> member_labels(s2, x, dst, have, rest, a, b, True, gone)
+          _ -> member_labels(surface(R(c, s2)), x, dst, have, rest, a, b, changed, Cons(x, gone))
+        }
+      }
+    }
+  }
+}
+
+// ---- Effects: performs, handlers, `resume` ------------------------------------
+
+fn op_get(ops: List(OpInfo), name: String) -> Maybe(OpInfo) {
+  match ops { Nil -> No  Cons(OpInfo(n, e, ps, r), rest) -> if n == name { Yes(OpInfo(n, e, ps, r)) } else { op_get(rest, name) } }
+}
+fn find_op(s: St, name: String) -> R(Maybe(OpInfo)) {
+  match get_hx(s) { R(Hx(_, _, _, ops, _, _), s2) -> R(op_get(ops, name), s2) }
+}
+// The effect declarations' operations (`ops`), after every type: each
+// operation's parameters and result as a declaration's fields are read.
+fn effect_decls(s: St, decls: List(Sp(Decl))) -> St {
+  match decls {
+    Nil -> s
+    Cons(Sp(DEffect(name, _, _, sigs), _, _), rest) -> effect_decls(op_sigs(s, name, sigs), rest)
+    Cons(_, rest) -> effect_decls(s, rest)
+  }
+}
+fn op_sigs(s: St, eff: String, sigs: List(Sp(OpSig))) -> St {
+  match sigs {
+    Nil -> s
+    Cons(Sp(OpSig(name, _, ptys, ret), _, _), rest) -> match elaborate_adt_list(s, ptys, Nil, Nil) {
+      R(ps, s2) -> match elaborate_adt(s2, ret, Nil) {
+        R(rt, s3) -> match get_hx(s3) {
+          R(Hx(rs, cr, d, ops, effs, dead), s4) -> op_sigs(set_hx(s4, Hx(rs, cr, d, Cons(OpInfo(name, eff, ps, rt), ops), effs, dead)), eff, rest)
+        }
+      }
+    }
+  }
+}
+fn effect_names(decls: List(Sp(Decl)), acc: List(String)) -> List(String) {
+  match decls {
+    Nil -> acc
+    Cons(Sp(DEffect(name, _, _, _), _, _), rest) -> effect_names(rest, Cons(name, acc))
+    Cons(_, rest) -> effect_names(rest, acc)
+  }
+}
+// `type_perform`: the callee is the operation at its effect's closed row;
+// the arguments against its parameters; the effect reaches the ambient row.
+fn type_perform(s: St, op: OpInfo, args: List(Sp(Expr)), cs: Int, ce: Int, start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
+  match op {
+    OpInfo(_, eff, ps, ret) -> match infer_args(s, args, env, Nil, amb) {
+      R(ts, s2) -> {
+        let s3 = record(s2, cs, ce, TFn(ps, Row(Cons(Lab(eff, cs, ce), Nil), RClosed), ret))
+        let s4 = unify(s3, TFn(ps, pure_row(), ret), TFn(ts, pure_row(), ret), start, end)
+        R(ret, surface(add_effect(s4, amb, eff, start, end)))
+      }
+    }
+  }
+}
+// `handler_effect`: the one effect a handler's clauses cover; a clause of
+// another is E0423 at the clause. "" when none is known.
+fn handler_effect(s: St, cs: List(Sp(OpClause)), found: String) -> R(String) {
+  match cs {
+    Nil -> R(found, s)
+    Cons(Sp(OpClause(qual, op, _, _), a, b), rest) -> {
+      let known = match qual { Yes(e) -> R(e, s)  No -> match find_op(s, op) { R(m, s2) -> R(match m { Yes(OpInfo(_, e, _, _)) -> e  No -> "" }, s2) } }
+      match known {
+        R(e, s2) -> if e == "" { handler_effect(s2, rest, found) } else {
+          if found == "" { handler_effect(s2, rest, e) } else {
+            if found == e { handler_effect(s2, rest, found) } else { handler_effect(diag(s2, "E0423", "a handler must cover a single effect", a, b), rest, found) }
+          }
+        }
+      }
+    }
+  }
+}
+fn push_region(s: St, r: Region) -> St {
+  match get_gx(s) { R(Gx(i, mi, p, rs, d, gp, ga), s2) -> set_gx(s2, Gx(i, mi, p, Cons(r, rs), d, gp, ga)) }
+}
+fn pop_region(s: St) -> St {
+  match get_gx(s) { R(Gx(i, mi, p, rs, d, gp, ga), s2) -> set_gx(s2, Gx(i, mi, p, match rs { Cons(_, rest) -> rest  Nil -> Nil }, d, gp, ga)) }
+}
+fn get_ptys(s: St) -> R(List(Ty)) {
+  match get_gx(s) { R(Gx(_, _, p, _, _, _, _), s2) -> R(p, s2) }
+}
+fn remove_lab(xs: List(Lab), n: String) -> List(Lab) {
+  match xs { Nil -> Nil  Cons(l, rest) -> if lab_name(l) == n { rest } else { Cons(l, remove_lab(rest, n)) } }
+}
+// `infer_handle` (not `with any`): the body in a row holding the handled
+// effect; the return clause, then each operation clause, in rows of their
+// own; what they perform reaches the ambient row, and the clauses' labels
+// the clauses row an escaped `resume` reads.
+fn infer_handle(s: St, body: Sp(Expr), h: Handler, start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
+  match h {
+    Handler(_, _, clauses, ret) -> match handler_effect(s, clauses, "") {
+      R(eff, s1) -> match fresh_row(s1) {
+        R(amb_in, s2) -> {
+          let s3 = if eff == "" { s2 } else { surface(add_effect(s2, amb_in, eff, start, end)) }
+          match infer_expr(push_region(s3, Region(amb_in, True)), body, env, amb_in) {
+            R(body_ty, s4) -> match fresh(pop_region(s4)) {
+              R(result, s5) -> match fresh_row(s5) {
+                R(ret_amb, s6) -> {
+                  let s7 = match ret {
+                    Yes(ReturnClause(binder, rbody)) -> match infer_expr(push_region(s6, Region(ret_amb, False)), rbody, Cons(Entry(binder, Scheme(Nil, Nil, body_ty)), env), ret_amb) {
+                      R(ret_ty, s6b) -> match rbody { Sp(_, rs, re) -> unify(pop_region(s6b), ret_ty, result, rs, re) }
+                    }
+                    No -> unify(s6, result, body_ty, start, end)
+                  }
+                  match get_ptys(flush(s7)) {
+                    R(scope, s8) -> match resolve_row(close_residual(s8, ret_amb, scope), ropen(ret_amb)) {
+                      R(ret_row, s9) -> match fresh_row(surface(add_row(s9, amb, ret_row, start, end))) {
+                        R(clauses_row, s10) -> match push_clause_row(s10, clauses_row) {
+                          s11 -> match op_clauses(s11, clauses, Resume(TErr, result, amb_in, ret_amb, eff, 0, clauses_row), env, amb, Nil) {
+                            R(cambs, s12) -> {
+                              let s13 = flush(clause_labels(pop_clause_row(s12), rev(cambs), clauses_row, eff, start, end))
+                              match rhead(s13, ROpen(amb)) {
+                                R(own, s14) -> match rhead(s14, ROpen(clauses_row)) {
+                                  R(ct, s15) -> {
+                                    let s16 = if tail_eq(ct, own) { s15 } else { match get_ptys(s15) { R(sp, s15b) -> close_residual(s15b, clauses_row, sp) } }
+                                    match resolve_row(s16, ropen(amb_in)) {
+                                      R(Row(ls, t), s17) -> R(result, surface(add_row(s17, amb, Row(remove_lab(ls, eff), t), start, end)))
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+fn push_clause_row(s: St, r: Int) -> St {
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead), s2) -> set_hx(s2, Hx(rs, Cons(r, cr), d, ops, effs, dead)) }
+}
+fn pop_clause_row(s: St) -> St {
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead), s2) -> set_hx(s2, Hx(rs, match cr { Cons(_, rest) -> rest  Nil -> Nil }, d, ops, effs, dead)) }
+}
+fn push_resume(s: St, r: Resume) -> St {
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead), s2) -> set_hx(s2, Hx(Cons(r, rs), cr, d, ops, effs, dead)) }
+}
+fn pop_resume(s: St) -> St {
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead), s2) -> set_hx(s2, Hx(match rs { Cons(_, rest) -> rest  Nil -> Nil }, cr, d, ops, effs, dead)) }
+}
+fn set_ptys(s: St, p: List(Ty)) -> St {
+  match get_gx(s) { R(Gx(i, mi, _, rs, d, gp, ga), s2) -> set_gx(s2, Gx(i, mi, p, rs, d, gp, ga)) }
+}
+// Each operation clause: its parameters at the operation's types (fresh
+// past them), `resume` taking the operation's result; its own row closed
+// unless relayed, and poured into the ambient. The clauses' rows, newest
+// first.
+fn op_clauses(s: St, cs: List(Sp(OpClause)), cx: Resume, env: List(Entry), amb: Int, acc: List(Int)) -> R(List(Int)) {
+  match cs {
+    Nil -> R(acc, s)
+    Cons(Sp(OpClause(_, op, params, cbody), _, _), rest) -> match find_op(s, op) {
+      R(m, s1) -> {
+        let sig = match m { Yes(OpInfo(_, _, ps, r)) -> Sig(ps, r)  No -> Sig(Nil, TErr) }
+        match sig {
+          Sig(ops, b) -> match clause_params(s1, params, ops, env) {
+            R(env2, s2) -> match fresh_row(s2) {
+              R(camb, s3) -> match get_hx(s3) {
+                R(Hx(_, _, depth, _, _, _), s4) -> match cx {
+                  Resume(_, result, body_amb, ret_amb, handled, _, crow) -> match get_ptys(s4) {
+                    R(saved, s5) -> {
+                      let s6 = push_region(set_ptys(push_resume(s5, Resume(b, result, body_amb, ret_amb, handled, depth, crow)), append(saved, ops)), Region(camb, False))
+                      match infer_expr(s6, cbody, env2, camb) {
+                        R(cty, s7) -> match get_ptys(flush(pop_region(s7))) {
+                          R(scope, s8) -> match resolve_row(set_ptys(close_residual(s8, camb, scope), saved), ropen(camb)) {
+                            R(row, s9) -> match cbody {
+                              Sp(_, bs, be) -> {
+                                let s10 = unify(surface(add_row(s9, amb, row, bs, be)), cty, result, bs, be)
+                                op_clauses(pop_resume(s10), rest, cx, env, amb, Cons(camb, acc))
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          NoSig -> R(acc, s1)
+        }
+      }
+    }
+  }
+}
+fn clause_params(s: St, ps: List(Sp(Param)), ts: List(Ty), env: List(Entry)) -> R(List(Entry)) {
+  match ps {
+    Nil -> R(env, s)
+    Cons(Sp(Param(name, _, _), a, b), rest) -> {
+      let got = match ts { Cons(t, _) -> R(t, s)  Nil -> fresh(s) }
+      match got { R(t, s2) -> clause_params(record(s2, a, b, t), rest, match ts { Cons(_, tr) -> tr  Nil -> Nil }, Cons(Entry(name, Scheme(Nil, Nil, t)), env)) }
+    }
+  }
+}
+// Each clause's labels but the handled effect, and its open tail, reach the
+// clauses row.
+fn clause_labels(s: St, cambs: List(Int), crow: Int, eff: String, start: Int, end: Int) -> St {
+  match cambs {
+    Nil -> s
+    Cons(ca, rest) -> match resolve_row(s, ropen(ca)) {
+      R(Row(ls, t), s2) -> {
+        let s3 = clause_labs(s2, ls, crow, eff)
+        let s4 = match t { ROpen(_) -> surface(add_row(s3, crow, Row(Nil, t), start, end))  _ -> s3 }
+        clause_labels(s4, rest, crow, eff, start, end)
+      }
+    }
+  }
+}
+fn clause_labs(s: St, ls: List(Lab), crow: Int, eff: String) -> St {
+  match ls {
+    Nil -> s
+    Cons(Lab(n, a, b), rest) -> clause_labs(if n == eff { s } else { surface(add_effect(s, crow, n, a, b)) }, rest, crow, eff)
+  }
+}
+// `type_resume`: the argument against the operation's result; the rest of
+// the handled body and the return clause run again, so their labels (but
+// the handled one) reach this ambient, and a relayed tail too. Escaped
+// into a lambda, every clause's effects and the body's member rows too.
+fn type_resume(s: St, arg_ty: Ty, start: Int, end: Int, amb: Int) -> R(Ty) {
+  match get_hx(s) {
+    R(Hx(rs, _, depth, _, _, _), s1) -> match rs {
+      Nil -> R(TErr, s1)
+      Cons(Resume(arg, result, body_amb, ret_amb, handled, d, crow), _) -> {
+        let s2 = unify(s1, arg_ty, arg, start, end)
+        let s3 = if depth > d { escaped(surface(add_row(s2, amb, ropen(crow), start, end)), body_amb, amb) } else { s2 }
+        match get_ptys(s3) {
+          R(ptys, s4) -> match rows_in(s4, ptys, Nil) {
+            R(in_params, s5) -> R(result, rerun(rerun(s5, body_amb, handled, in_params, amb, start, end), ret_amb, "", in_params, amb, start, end))
+          }
+        }
+      }
+    }
+  }
+}
+fn escaped(s: St, body_amb: Int, amb: Int) -> St {
+  match rhead(s, ROpen(body_amb)) {
+    R(bt, s2) -> match get_gx(s2) {
+      R(Gx(_, mincl, _, _, _, _, _), s3) -> match more_member(s3, mincl, bt, amb, Nil) {
+        R(more, s4) -> match get_gx(s4) {
+          R(Gx(i, mi, p, r, d, gp, ga), s5) -> set_gx(s5, Gx(i, append(mi, rev(more)), p, r, d, gp, ga))
+        }
+      }
+    }
+  }
+}
+fn more_member(s: St, xs: List(Incl), bt: Tail, amb: Int, acc: List(Incl)) -> R(List(Incl)) {
+  match xs {
+    Nil -> R(acc, s)
+    Cons(Incl(m, dst, a, b), rest) -> match rhead(s, ROpen(dst)) {
+      R(t, s2) -> more_member(s2, rest, bt, amb, if tail_eq(t, bt) { Cons(Incl(m, amb, a, b), acc) } else { acc })
+    }
+  }
+}
+fn rerun(s: St, src: Int, except: String, in_params: List(Int), amb: Int, start: Int, end: Int) -> St {
+  match resolve_row(s, ropen(src)) {
+    R(Row(ls, t), s2) -> {
+      let s3 = clause_labs(s2, ls, amb, except)
+      match t {
+        ROpen(w) -> if has_int(in_params, w) { surface(add_row(s3, amb, Row(Nil, t), start, end)) } else { s3 }
+        _ -> s3
       }
     }
   }
@@ -1457,7 +2073,7 @@ fn fn_index(fns: List(FnInfo), name: String, i: Int, found: Int) -> Int {
   match fns {
     Nil -> found
     Cons(f, rest) -> match f {
-      FnInfo(n, _, _, _, _, _) -> fn_index(rest, name, i + 1, if n == name { i } else { found })
+      FnInfo(n, _, _, _, _, _, _) -> fn_index(rest, name, i + 1, if n == name { i } else { found })
     }
   }
 }
@@ -1474,7 +2090,7 @@ fn all_edges(fns: List(FnInfo), xs: List(FnInfo), acc: List(List(Int))) -> List(
   match xs {
     Nil -> rev(acc)
     Cons(f, rest) -> match f {
-      FnInfo(_, _, _, _, _, body) -> all_edges(fns, rest, Cons(edges_of(fns, rev(refs_block(sp_block(body), Nil)), Nil), acc))
+      FnInfo(_, _, _, _, _, body, _) -> all_edges(fns, rest, Cons(edges_of(fns, rev(refs_block(sp_block(body), Nil)), Nil), acc))
     }
   }
 }
@@ -1585,7 +2201,7 @@ fn fn_infos(decls: List(Sp(Decl)), acc: List(FnInfo)) -> List(FnInfo) {
   match decls {
     Nil -> rev(acc)
     Cons(d, rest) -> match d {
-      Sp(DFn(_, name, params, _, ret, body), start, end) -> fn_infos(rest, Cons(FnInfo(name, start, end, params, ret, body), acc))
+      Sp(DFn(_, name, params, row, ret, body), start, end) -> fn_infos(rest, Cons(FnInfo(name, start, end, params, ret, body, row), acc))
       _ -> fn_infos(rest, acc)
     }
   }
@@ -1614,7 +2230,7 @@ fn group(s: St, fns: List(FnInfo), g: List(Int), env: List(Entry)) -> R(Out) {
         R(Gx(incl, mincl, ptys, regions, deferred, _, _), s3) -> {
           let s4 = set_gx(s3, Gx(incl, mincl, ptys, regions, deferred, mem_params(ms, Nil), mem_ambs(ms, Nil)))
           match bodies(s4, fns, ms, env2) {
-            s5 -> schemes_of(close_group(s5, ms), fns, ms, env2, Nil)
+            s5 -> schemes_of(close_group(s5, fns, ms), fns, ms, env2, Nil)
           }
         }
       }
@@ -1633,11 +2249,11 @@ fn members_list(s: St, fns: List(FnInfo), g: List(Int), env: List(Entry), acc: L
   match g {
     Nil -> R(MemsEnv(acc, env), s)
     Cons(i, rest) -> match nth_fn(fns, i) {
-      FnInfo(name, ds, de, params, ret, _) -> match fresh_list(s, len(params), Nil) {
+      FnInfo(name, ds, de, params, ret, _, _) -> match fresh_list(s, len(params), Nil) {
         R(ps, s2) -> match fresh_row(s2) {
           R(amb, s2b) -> match fresh(s2b) {
             R(result, s3) -> {
-              let ft = TFn(ps, ROpen(amb), result)
+              let ft = TFn(ps, ropen(amb), result)
               let s4 = check_ann(check_anns(set_ann_vars(s3, Nil), params, ps), ret, result, True)
               match ann_vars(s4) {
                 R(avs, s5) -> members_list(record(s5, ds, de, ft), fns, rest, Cons(Entry(name, Scheme(Nil, Nil, ft)), env), Cons(Mem(i, ps, amb, result, avs), acc))
@@ -1669,7 +2285,7 @@ fn bodies(s: St, fns: List(FnInfo), ms: List(Mem), env: List(Entry)) -> St {
   match ms {
     Nil -> s
     Cons(Mem(i, ps, amb, result, avs), rest) -> match nth_fn(fns, i) {
-      FnInfo(_, _, _, params, _, body) -> match bind_params(set_ann_vars(s, avs), params, ps, env) {
+      FnInfo(_, _, _, params, _, body, _) -> match bind_params(set_ann_vars(s, avs), params, ps, env) {
         R(benv, s2) -> match body {
           Sp(b, bs, be) -> match infer_block(set_param_tys(s2, ps), b, benv, amb) {
             R(bt, s3) -> bodies(unify(set_param_tys(s3, Nil), result, bt, bs, be), fns, rest, env)
@@ -1679,8 +2295,8 @@ fn bodies(s: St, fns: List(FnInfo), ms: List(Mem), env: List(Entry)) -> St {
     }
   }
 }
-// Steps 2.4 to 2.7 for rows without labels.
-fn close_group(s: St, ms: List(Mem)) -> St {
+// Steps 2.4 to 2.7.
+fn close_group(s: St, fns: List(FnInfo), ms: List(Mem)) -> St {
   match get_gx(s) {
     R(Gx(incl, _, _, _, deferred, gparams, _), s2) -> match rows_in(s2, gparams, Nil) {
       R(in_params, s3) -> {
@@ -1690,11 +2306,15 @@ fn close_group(s: St, ms: List(Mem)) -> St {
         let s5 = close_deferred(s4, deferred, gparams)
         // 2.5: each member's residual ambient row.
         let s6 = close_members(s5, ms)
+        // 2.6: the declared rows, exactly, and what `main` may perform.
+        let s6b = exact_rows(s6, fns, ms)
         // 2.7: what is still pending reaches its rows; the group's phantoms
         // that nothing bound close to pure.
-        match get_gx(flush(s6)) {
+        match get_gx(flush(s6b)) {
           R(Gx(_, _, ptys, regions, _, _, _), s7) -> match row_count(s7) {
-            R(n, s8) -> close_phantoms(set_gx(s8, Gx(Nil, Nil, ptys, regions, Nil, Nil, Nil)), 0, n)
+            R(n, s8) -> match get_hx(s8) {
+              R(Hx(rs9, cr9, d9, ops9, effs9, _), s9) -> close_phantoms(set_hx(set_gx(s9, Gx(Nil, Nil, ptys, regions, Nil, Nil, Nil)), Hx(rs9, cr9, d9, ops9, effs9, Nil)), 0, n)
+            }
           }
         }
       }
@@ -1704,7 +2324,7 @@ fn close_group(s: St, ms: List(Mem)) -> St {
 fn unmark_relayed(s: St, xs: List(Incl), in_params: List(Int)) -> St {
   match xs {
     Nil -> s
-    Cons(Incl(src, _), rest) -> match rhead(s, ROpen(src)) {
+    Cons(Incl(src, _, _, _), rest) -> match rhead(s, ROpen(src)) {
       R(t, s2) -> match t {
         ROpen(w) -> unmark_relayed(if has_int(in_params, w) { set_phantom(s2, w, False) } else { s2 }, rest, in_params)
         _ -> unmark_relayed(s2, rest, in_params)
@@ -1724,12 +2344,66 @@ fn close_members(s: St, ms: List(Mem)) -> St {
     Cons(Mem(_, ps, amb, _, _), rest) -> close_members(close_residual(s, amb, ps), rest)
   }
 }
+fn exact_rows(s: St, fns: List(FnInfo), ms: List(Mem)) -> St {
+  match ms {
+    Nil -> s
+    Cons(Mem(i, _, amb, _, _), rest) -> match nth_fn(fns, i) {
+      FnInfo(name, _, _, _, _, _, declared) -> {
+        let s2 = match declared { Yes(RowAnn(labels, No)) -> check_exact_row(s, amb, labels)  _ -> s }
+        exact_rows(if name == "main" { check_main_discharge(s2, amb) } else { s2 }, fns, rest)
+      }
+    }
+  }
+}
+// `check_exact_row`: an annotated function performs exactly its declared
+// row. Declared pure, any effect is E0421; otherwise each difference, in
+// either direction, is E0423 at its first label.
+fn check_exact_row(s: St, amb: Int, declared: List(LabelAnn)) -> St {
+  match resolve_row(s, ropen(amb)) {
+    R(Row(performed, _), s2) -> match declared {
+      Nil -> match performed {
+        Nil -> s2
+        Cons(Lab(_, a, b), _) -> diag(s2, "E0421", "this function is declared pure but performs `" <> join_labs(performed, "") <> "`", a, b)
+      }
+      _ -> {
+        let s3 = match extra_labs(performed, declared) { Cons(Lab(_, a, b), _) -> diag(s2, "E0423", "effect row mismatch", a, b)  Nil -> s2 }
+        match unused_labs(declared, performed) { Cons(Lab(_, a, b), _) -> diag(s3, "E0423", "effect row mismatch", a, b)  Nil -> s3 }
+      }
+    }
+  }
+}
+fn join_labs(ls: List(Lab), acc: String) -> String {
+  match ls { Nil -> acc  Cons(Lab(n, _, _), rest) -> join_labs(rest, if acc == "" { n } else { acc <> ", " <> n }) }
+}
+fn declares(xs: List(LabelAnn), n: String) -> Bool {
+  match xs { Nil -> False  Cons(LabelAnn(Sp(m, _, _), _), rest) -> m == n || declares(rest, n) }
+}
+fn extra_labs(ls: List(Lab), declared: List(LabelAnn)) -> List(Lab) {
+  match ls { Nil -> Nil  Cons(l, rest) -> if declares(declared, lab_name(l)) { extra_labs(rest, declared) } else { Cons(l, extra_labs(rest, declared)) } }
+}
+fn unused_labs(declared: List(LabelAnn), ls: List(Lab)) -> List(Lab) {
+  match declared {
+    Nil -> Nil
+    Cons(LabelAnn(Sp(n, a, b), _), rest) -> if has_lab(ls, n) { unused_labs(rest, ls) } else { Cons(Lab(n, a, b), unused_labs(rest, ls)) }
+  }
+}
+// `check_main_discharge`: `main` may perform only `IO`; each other effect
+// is E0420 where it is performed.
+fn check_main_discharge(s: St, amb: Int) -> St {
+  match resolve_row(s, ropen(amb)) { R(Row(ls, _), s2) -> unhandled(s2, ls) }
+}
+fn unhandled(s: St, ls: List(Lab)) -> St {
+  match ls {
+    Nil -> s
+    Cons(Lab(n, a, b), rest) -> unhandled(if n == "IO" { s } else { diag(s, "E0420", "effect `" <> n <> "` is never handled", a, b) }, rest)
+  }
+}
 fn close_phantoms(s: St, v: Int, n: Int) -> St {
   if v == n { s } else {
     match is_phantom(s, v) {
       R(ph, s2) -> {
         let s3 = if ph {
-          match row_bound(s2, v) { R(b, s2b) -> match b { RNone -> bind_row(s2b, v, RClosed)  _ -> s2b } }
+          match row_bound(s2, v) { R(Row(_, b), s2b) -> match b { RNone -> bind_row(s2b, v, pure_row(), 0, 0)  _ -> s2b } }
         } else { s2 }
         close_phantoms(set_phantom(s3, v, False), v + 1, n)
       }
@@ -1743,7 +2417,7 @@ fn schemes_of(s: St, fns: List(FnInfo), ms: List(Mem), env: List(Entry), lines: 
   match ms {
     Nil -> R(Out(env, lines), s)
     Cons(Mem(i, ps, amb, result, _), rest) -> match nth_fn(fns, i) {
-      FnInfo(name, _, _, _, _, _) -> match resolve(s, TFn(ps, ROpen(amb), result)) {
+      FnInfo(name, _, _, _, _, _, _) -> match resolve(s, TFn(ps, ropen(amb), result)) {
         R(rt, s2) -> {
           let sc = Scheme(rev(free_vars(rt, Nil)), rev(free_rows(rt, Nil)), rt)
           schemes_of(s2, fns, rest, Cons(Entry(name, sc), env), Cons(SchemeLine(name, show_scheme(sc)), lines))
@@ -1789,12 +2463,22 @@ fn name_kind(names: Names, k: Int, v: Int) -> Shown {
 fn name_of(names: Names, v: Int) -> Shown { name_kind(names, 0, v) }
 fn row_name(names: Names, v: Int) -> Shown { name_kind(names, 1, v) }
 // `write_row` without labels: a pure row is not printed.
-fn show_row(rw: Tail, names: Names) -> Shown {
+// A pure row is invisible; another prints ` / {E, F | e}` (`write_row`).
+fn show_row(rw: Row, names: Names) -> Shown {
   match rw {
-    ROpen(v) -> match row_name(names, v) { Shown(n, n2) -> Shown(" / {" <> n <> "}", n2) }
-    RError -> Shown(" / { | <error>}", names)
-    _ -> Shown("", names)
+    Row(Nil, RClosed) -> Shown("", names)
+    Row(ls, t) -> {
+      let labs = show_labs(ls, "")
+      match t {
+        ROpen(v) -> match row_name(names, v) { Shown(n, n2) -> Shown(" / {" <> labs <> (if labs == "" { "" } else { " | " }) <> n <> "}", n2) }
+        RError -> Shown(" / {" <> labs <> " | <error>}", names)
+        _ -> Shown(" / {" <> labs <> "}", names)
+      }
+    }
   }
+}
+fn show_labs(ls: List(Lab), acc: String) -> String {
+  match ls { Nil -> acc  Cons(Lab(n, _, _), rest) -> show_labs(rest, if acc == "" { n } else { acc <> ", " <> n }) }
 }
 fn show(t: Ty, names: Names) -> Shown {
   match t {
@@ -1935,14 +2619,15 @@ pub fn check_dump(m: Module) -> String {
       let fns = fn_infos(decls, Nil)
       let order = tarjan(all_edges(fns, fns, Nil), len(fns))
       let known = Cons(Arity("Array", 1), known_types(decls, Nil))
-      let st0 = St(array.new(), array.new(), 0, Nil, Nil, Ctx(Nil, known, Nil, Nil), Rows(array.new(), array.new(), array.new()), Gx(Nil, Nil, Nil, Nil, Nil, Nil, Nil), Eqs(Nil, Nil, Nil))
-      let declared = type_decls(st0, decls, Nil)
+      let st0 = St(array.new(), array.new(), 0, Nil, Nil, Ctx(Nil, known, Nil, Nil), Rows(array.new(), array.new(), array.new()), Gx(Nil, Nil, Nil, Nil, Nil, Nil, Nil), Eqs(Nil, Nil, Nil), Hx(Nil, Nil, 0, Nil, Nil, Nil))
+      let st1 = set_hx(st0, Hx(Nil, Nil, 0, Nil, effect_names(decls, Nil), Nil))
+      let declared = match type_decls(st1, decls, Nil) { R(env0, s0) -> R(env0, effect_decls(s0, decls)) }
       match match declared { R(env0, s0) -> groups(s0, fns, order, env0, Nil) } {
         R(lines, s) -> match s {
-          St(sub, lv, cur, ds, rs, cx, rw, gx, eq) -> {
+          St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> {
             let b1 = dump_schemes(sort_by(rev(lines), line_le), buffer.new())
             let recs = last_per_span(sort_by(rs, rec_le), 0 - 1, 0 - 1, Nil)
-            match dump_types(St(sub, lv, cur, Nil, Nil, cx, rw, gx, eq), recs, b1) {
+            match dump_types(St(sub, lv, cur, Nil, Nil, cx, rw, gx, eq, hx), recs, b1) {
               R(b2, _) -> buffer.finish(dump_diags(rev(ds), b2))
             }
           }
