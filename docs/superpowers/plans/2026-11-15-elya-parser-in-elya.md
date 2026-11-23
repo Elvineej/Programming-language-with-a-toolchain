@@ -88,3 +88,9 @@ malformed input versus Rust **3.428314 ms** for lex + parse + dump (explicitly
 different process/IO scopes). The spec contains all phase medians and scopes.
 Functional parity and compatibility gates are complete; the debug one-minute
 budget remains an explicit limitation, with all coverage retained.
+
+
+PR #29 is mergeable against the subsequent `cf32ace` main. A clean merge
+preview additionally passed the newer F4a checker's unchanged evaluator and
+native suites (**493 comparisons each**). The recorded full-gate and parser
+corpus measurements above are on the requested `42d13c5` base.
