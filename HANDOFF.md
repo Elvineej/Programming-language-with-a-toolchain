@@ -822,9 +822,15 @@ included. **4f stage F1 is built** (2026-11-22, `selfhost/check.elya`): every
 first-order program of the corpus agrees, in the evaluator and natively;
 so does **F2a** (declared types, constructors, `match`, the pure builtins,
 annotations naming types), and **F2b** (higher order: lambdas, functions as
-values, function types, the rows' tails, E0436). Next F4: effects (labels in
-rows, performs, handlers, `resume`, inclusions with labels, the kinds of
-declaration parameters), then F5 (linearity, needing 4e's affine facts). The checker's verdict has its print form too, `elya
+values, function types, the rows' tails, E0436), and **F4a** (2026-11-23:
+effects: labels in rows, performs, handlers, `resume`, inclusions with labels,
+declared and written rows, `io.*`/`time.*`, `main`'s discharge; 232 corpus
+programs and 58 focused ones; the review's 5,350 programs agreed and its
+mutants left six behaviours, now pinned). Natively, with `--release`, the
+largest F4a program checks in 8.0 ms against Rust's 0.85 ms. Next **F4b**:
+`multi` (E0426, E0427), named row variables, rows as type arguments; then
+**F4c**, parametric effects (labels with arguments) and `with any`/`op.*`;
+then F5 (linearity, needing 4e's affine facts). The checker's verdict has its print form too, `elya
 check --dump` (spec D6). The roadmap's "continuation-aware ownership" line takes
 the review's longer proposals (loans through continuations, once-callable
 function types).

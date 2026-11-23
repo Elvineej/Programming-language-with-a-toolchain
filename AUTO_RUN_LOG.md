@@ -18,6 +18,12 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 - **Done: stage F2b** (higher order, with the effect rows' tails and E0436):
   36 corpus and 35 focused programs agree; controls K8-K13. Review (2,200 random
   programs) found one defect (a `let` quantifying a deferred lambda's row), fixed.
+- **Done: stage F4a** (2026-11-23; effects: labels, performs, handlers, `resume`,
+  declared and written rows, the host's builtins, `main`'s discharge): 232 corpus and
+  58 focused programs agree; controls K14-K28. Review (about 5,350 programs, 39
+  mutants): no defect, six unpinned behaviours now pinned. Gate 1666 / 196 as
+  predicted. Disk filled once (old review build directories, 19 GB, removed).
+- Codex out of usage until 13:56 local on 2026-11-23; its 4b still not on GitHub.
 - Codex's part 4b never reached GitHub (its task was last seen resuming at 15:41 on
   the 15th; Chrome on the PC unreachable tonight, so its state is unknown).
 
