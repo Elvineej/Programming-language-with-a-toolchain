@@ -304,3 +304,12 @@ functions/suites is unchanged while differential input coverage increases.
 Protected-source and checker diffs were checked empty. Independent source and
 corpus reviews found no remaining functional defect or suspicious Rust recovery.
 The remaining limitation is the debug evaluator's runtime budget, stated above.
+
+
+After the PR was opened, `main` was found to have advanced to `cf32ace` with
+stage F4a of the checker. The changes merge cleanly and do not overlap 4b's
+files. A separate clean merge preview of that main and this branch ran both
+unchanged checker suites: **493 evaluator comparisons** and **493 native
+comparisons**, both passing. No checker source or test was edited in the
+preview or in this PR. The before/after gate and parser-corpus measurements
+above remain explicitly based on the requested `42d13c5` revision.
