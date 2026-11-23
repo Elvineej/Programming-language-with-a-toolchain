@@ -1,6 +1,5 @@
-//! Native proof and timing for the parser in Elya. Native entry points append
-//! main's value line (`0\n` for Unit); that runtime line alone is removed before
-//! comparing the program's printed dump with the Rust parser.
+//! Native parser parity and timings. Only the native runtime's final Unit value
+//! line is removed; every byte printed by the Elya parser itself is compared.
 
 #[path = "../../../tests/support/selfhost_parse.rs"]
 mod support;
@@ -15,8 +14,6 @@ fn median(mut times: Vec<Duration>) -> Duration {
 
 #[test]
 fn largest_input_agrees_natively_and_is_measured() {
-    // Compiler passes run on the same 1 GiB stack as the CLI, independently of
-    // the test runner's small default stack (including on Windows).
     std::thread::Builder::new()
         .stack_size(1024 * 1024 * 1024)
         .spawn(native_proof)
@@ -45,50 +42,68 @@ fn native_proof() {
         .join(format!("parse{}", std::env::consts::EXE_SUFFIX));
     elya_codegen::compile_module(&core, &object).expect("native parser compiles");
     elya_codegen::link(&object, &executable).expect("native parser links");
-    let corpus = support::corpus(&root);
-    let largest = corpus.largest();
-    let path = scratch.put(&largest.text);
-    let mut native_times = Vec::new();
-    for _ in 0..7 {
-        let start = Instant::now();
-        let output = Command::new(&executable)
-            .arg(&path)
-            .env_remove("ELYA_RECORD")
-            .env_remove("ELYA_REPLAY")
-            .output()
-            .expect("run native parser");
-        native_times.push(start.elapsed());
-        assert!(
-            output.status.success(),
-            "native parser: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(output.stderr.is_empty(), "{output:?}");
-        let stdout = String::from_utf8(output.stdout).expect("native parser output is UTF-8");
-        let dump = stdout
-            .strip_suffix("0\n")
-            .expect("native runtime appends main's Unit value line");
-        support::assert_dump(&largest.name, dump, &largest.dump);
+    let corpus = support::parity_corpus(&root);
+    corpus.report();
+    for case in &corpus.cases {
+        run_case(&executable, &scratch, case);
     }
+    measure(&executable, &scratch, "clean", corpus.largest_clean());
+    measure(&executable, &scratch, "broken", corpus.largest_broken());
+}
+
+fn run_case(
+    executable: &std::path::Path,
+    scratch: &support::Scratch,
+    case: &support::Case,
+) -> Duration {
+    let path = scratch.put(&case.text);
+    let start = Instant::now();
+    let output = Command::new(executable)
+        .arg(&path)
+        .env_remove("ELYA_RECORD")
+        .env_remove("ELYA_REPLAY")
+        .output()
+        .expect("run native parser");
+    let elapsed = start.elapsed();
+    assert!(
+        output.status.success(),
+        "{}: native parser: {}",
+        support::case_label(case),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "{}: {output:?}", case.name);
+    let stdout = String::from_utf8(output.stdout).expect("native parser output is UTF-8");
+    let dump = stdout
+        .strip_suffix("0\n")
+        .expect("native runtime appends main's Unit value line");
+    support::assert_dump(&support::case_label(case), dump, &case.dump);
+    elapsed
+}
+
+fn measure(
+    executable: &std::path::Path,
+    scratch: &support::Scratch,
+    label: &str,
+    largest: &support::Case,
+) {
+    let native_times = (0..7)
+        .map(|_| run_case(executable, scratch, largest))
+        .collect();
     let mut rust_parse_times = Vec::new();
     let mut rust_dump_times = Vec::new();
+    let mut rust_combined_times = Vec::new();
     for _ in 0..101 {
+        let combined = Instant::now();
         let start = Instant::now();
         let (module, diagnostics) =
             elya::parse::parse_module(&elya::Session::new(), std::hint::black_box(&largest.text));
         rust_parse_times.push(start.elapsed());
-        assert!(diagnostics.is_empty(), "Rust benchmark parses clean");
         let start = Instant::now();
-        let dump = elya::ast_dump::dump(std::hint::black_box(&module), &largest.text);
+        let mut dump = elya::ast_dump::dump(std::hint::black_box(&module), &largest.text);
+        dump.push_str(&elya::ast_dump::dump_diagnostics(&diagnostics));
         rust_dump_times.push(start.elapsed());
+        rust_combined_times.push(combined.elapsed());
         support::assert_dump("Rust benchmark", &dump, &largest.dump);
     }
-    println!(
-        "MEASURED largest={} bytes={}; native file+lex+parse+dump+process median={:?} (7 runs); Rust lex+parse median={:?}; Rust dump median={:?} (101 runs each; Cargo test profile, native O2)",
-        largest.name,
-        largest.text.len(),
-        median(native_times),
-        median(rust_parse_times),
-        median(rust_dump_times)
-    );
+    println!("MEASURED {label} largest={} bytes={}; native file+lex+parse+dump+process median={:?} (7 runs); Rust lex+parse median={:?}; Rust tree+diagnostics dump median={:?}; Rust lex+parse+dump median={:?} (101 runs each; Cargo test profile, native O2)", largest.name, largest.text.len(), median(native_times), median(rust_parse_times), median(rust_dump_times), median(rust_combined_times));
 }
