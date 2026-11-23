@@ -78,6 +78,59 @@ pub const FOCUSED_F2A: &[&str] = &[
     "fn f(s) { string.slice(s, string.length(s), int.shl(1, 2)) }\nfn g(n) { float.of_int(int.xor(n, n)) }\nfn h(x) { float.truncate(x) + int.ushr(x, 1) }\nfn k(x) { int.and(int.or(x, 1), int.shr(x, 2)) + float.round(1.5) + int.wrapping_mul(int.wrapping_sub(x, 1), int.wrapping_add(x, 2)) }\npub fn main() -> Int { 0 }\n",
 ];
 
+/// Programs of F2b, higher order: compositions, recursion through a lambda
+/// (a group member's row deferred), let-polymorphic lambdas, function types
+/// in annotations of both variances, functions as values, equality on
+/// functions (E0436), an infinite type through a call of a call.
+pub const FOCUSED_F2B: &[&str] = &[
+    "type Never { }\nfn f(a: Never, b: Never) -> Bool { a == b }\npub fn main() -> Int { 0 }\n",
+    "fn app(f, x) { f(x) }\nfn compose(f, g) { fn(x) { g(f(x)) } }\npub fn main() -> Int { compose(fn(a) { a + 1 }, fn(b) { b * 2 })(3) }\n",
+    "fn loop(n) { let k = fn() { loop(n - 1) }\n if n == 0 { 0 } else { k() } }\npub fn main() -> Int { loop(3) }\n",
+    "fn even(n) { if n == 0 { True } else { (fn(m) { odd(m) })(n - 1) } }\nfn odd(n) { if n == 0 { False } else { even(n - 1) } }\npub fn main() -> Int { if even(4) { 1 } else { 0 } }\n",
+    "pub fn main() -> Int { let id = fn(x) { x }\n let a = id(1)\n let b = id(True)\n if b { a } else { 0 } }\n",
+    "fn twice(f: fn(Int) -> Int, x: Int) -> Int { f(f(x)) }\nfn mk() -> fn(Int) -> Int { fn(n) { n + 1 } }\npub fn main() -> Int { twice(mk(), 1) }\n",
+    "fn inc(n: Int) -> Int { n + 1 }\npub fn main() -> Int { let f = inc\n let g = f\n g(1) + f(True) }\n",
+    "pub fn main() -> Bool { let f = fn(x) { x }\n f == f }\n",
+    "type Box(a) { Box(a) }\nfn eq(x, y) { x == y }\npub fn main() -> Bool { eq(Box(1), Box(2)) && eq(fn(a) { a }, fn(b) { b }) }\n",
+    "fn f(x) { x(x) }\npub fn main() -> Int { 0 }\n",
+    "fn g(h) { h(1)(2) }\npub fn main() -> Int { g(fn(a) { fn(b) { a + b } }) }\n",
+    "pub fn main() -> Int { let f = fn(a, b) { a + b }\n f(1) + f(1, 2, 3) }\n",
+    "type Op { Op(fn(Int, Int) -> Int) }\nfn run(o: Op) -> Int { match o { Op(f) -> f(1, 2) } }\npub fn main() -> Int { run(Op(fn(a, b) { a * b })) }\n",
+    "fn map(l, f) { match l { N -> N  C(x, r) -> C(f(x), map(r, f)) } }\ntype L(a) { N, C(a, L(a)) }\npub fn main() -> Int { match map(C(1, N), fn(x) { x + 1 }) { N -> 0  C(y, _) -> y } }\n",
+    "fn apply(f: fn(a) -> b, x: a) -> b { f(x) }\npub fn main() -> Int { apply(fn(n) { n + 1 }, True) }\n",
+    "fn k(x) { fn(y) { x } }\nfn c() { k }\npub fn main() -> Int { c()(1)(2) }\n",
+    "pub fn main() -> Int { let f: fn(Int) -> Int = fn(x) { x }\n let g: fn(Bool) -> Int = f\n 0 }\n",
+    "fn rec(f) { rec(fn(x) { f(x) }) }\npub fn main() -> Int { 0 }\n",
+    "fn fix(f) { fn(x) { f(fix(f))(x) } }\npub fn main() -> Int { 0 }\n",
+    "fn both(a, b) { if True { a } else { b } }\nfn pick() { both(fn(x) { x + 1 }, fn(y) { y }) }\npub fn main() -> Int { pick()(2) }\n",
+    // A function used as a value gets an upcast tail (`open_covariant`):
+    // joined with a parameter, it leaves that parameter's row open (control
+    // K9, which survived before it).
+    "fn inc(n: Int) -> Int { n + 1 }\nfn pick(f, g) { if True { f } else { g } }\nfn use(h) { pick(inc, h)(1) }\npub fn main() -> Int { use(inc) }\n",
+    // A `let` quantifies a lambda's row: the instance joined to a relayed
+    // parameter does not open the one returned (control K12).
+    "fn pick(f, g) { if True { f } else { g } }\nfn use(h) { let f = fn(x) { x }\n let a = pick(f, h)\n let b = a(1)\n f }\npub fn main() -> Int { use(fn(n) { n })(True)\n 0 }\n",
+    // The third review's (2026-11-23). A `let` keeps a deferred lambda's
+    // row (its defect, control K13):
+    "type P(x, y) { P(x, y) }\nfn a(n) { let f = fn(k) { k(1) + b(n) }\n P(f, f) }\nfn b(n) { if n == 0 { 0 } else { match a(n - 1) { P(_, _) -> 0 } } }\npub fn main() -> Int { 0 }\n",
+    // and the behaviours its mutations showed unpinned (inclusions, a
+    // flush at a lambda's exit, deferral, a lambda's phantom tail, 2.4,
+    // variance of annotations, `fn` fields, E0436 once per span and over
+    // every argument, a type met again):
+    "fn r(k) { k(0) + (fn(x) { x })(1) }\npub fn main() -> Int { r(fn(z) { z }) }\n",
+    "fn mk() { fn(x) { x + 1 } }\nfn use(h) { let g = if True { mk } else { h }\n g()(1) }\npub fn main() -> Int { use(mk) }\n",
+    "fn id(v) { v }\nfn r(k) { let b = k(0)\n fn() { let g = id(fn(x) { x })\n let a = g(1)\n let h = if True { g } else { k }\n a } }\npub fn main() -> Int { r(fn(z) { z })() }\n",
+    "fn a(k, n) { let f = fn() { a(k, n - 1) }\n if n == 0 { k(0) } else { f() } }\npub fn main() -> Int { a(fn(z) { z }, 2) }\n",
+    "fn u(h) { let g = if True { fn(x) { x } } else { h }\n g(1) }\npub fn main() -> Int { u(fn(z) { z }) }\n",
+    "fn id(v) { v }\nfn r(k) { let g = id(fn(x) { x })\n let a = g(1)\n let h = if True { g } else { k }\n a }\npub fn main() -> Int { r(fn(z) { z }) }\n",
+    "fn a(n) { fn() { b(fn(x) { x }, n) } }\nfn b(k, n) { if n == 0 { k(0) } else { a(n - 1)() } }\npub fn main() -> Int { b(fn(z) { z }, 2) }\n",
+    "fn p(f: fn(fn(Int) -> Int) -> Int) { f }\npub fn main() -> Int { 0 }\n",
+    "type O { O(fn(Int) -> Int) }\nfn get(o) { match o { O(f) -> f } }\npub fn main() -> Int { get(O(fn(x) { x }))(1) }\n",
+    "fn e(x, y) { x == x && y == y }\nfn h() { e(fn() { 1 }, fn() { 2 }) }\npub fn main() -> Int { 0 }\n",
+    "type P(x, y) { P(x, y) }\nfn e(y) { let p = P(fn() { 1 }, y)\n p == p }\nfn h() { e(fn() { 2 }) }\npub fn main() -> Int { 0 }\n",
+    "type L { N, C(Int, L) }\nfn e(x: L) -> Bool { x == x }\npub fn main() -> Int { 0 }\n",
+];
+
 /// The checker's imports: the parser in Elya and its lexer.
 pub fn reader(name: &str) -> Option<(String, String)> {
     let file = match name {

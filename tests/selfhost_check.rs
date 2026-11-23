@@ -1,8 +1,9 @@
 //! The checker in Elya (plan docs/superpowers/plans/2026-11-15-elya-checker-in-elya.md,
 //! step 4): `selfhost/check.elya` prints exactly `elya check --dump` on every
 //! corpus program inside the stages built so far: F1 (first-order programs)
-//! and F2a (declared types, constructors, `match`, the pure builtins,
-//! annotations naming types and type variables).
+//! F2a (declared types, constructors, `match`, the pure builtins,
+//! annotations naming types and type variables), and F2b (higher order:
+//! lambdas, functions as values, function types, with effect rows' tails).
 //!
 //! Negative controls, each run, reverted and compared byte for byte:
 //! K1, every scheme left unquantified: fails on `scheme id fn(a) -> a`
@@ -17,6 +18,17 @@
 //! K6, a builtin's callee type not recorded: fails on tests/float_text.rs.
 //! K7, a `let` free to quantify the function's annotation variables (the
 //! second review's D1, a defect it found): fails on focused F2a #17.
+//! K8, a residual ambient row never closed: fails on
+//! tests/ui/nonexhaustive_int.elya (`/ {a}` on a pure function).
+//! K9, a value's closed arrows not opened (`open_covariant`): fails on
+//! focused F2b #20, written for it (it survived the corpus).
+//! K10, equality marks not carried by instantiation: fails on focused F2b #8.
+//! K11, no group member's row deferred inside a lambda: fails on focused
+//! F2b #18 (`fix`).
+//! K12, a `let` quantifying no rows: fails on focused F2b #21, written for
+//! it (it survived the corpus).
+//! K13, a `let` free to quantify a deferred lambda's row (the third
+//! review's defect): fails on focused F2b #22.
 
 #[path = "support/selfhost_parse.rs"]
 mod parse_support;
@@ -27,7 +39,7 @@ use elya::eval::{Host, World};
 use std::path::Path;
 
 /// The stages `selfhost/check.elya` covers.
-const BUILT: u8 = 2;
+const BUILT: u8 = 3;
 
 #[test]
 fn the_checker_in_elya_agrees_on_its_stages() {
@@ -53,6 +65,12 @@ fn the_checker_in_elya_agrees_on_its_stages() {
                 .iter()
                 .enumerate()
                 .map(|(i, t)| (format!("focused F2a #{i}"), t.to_string())),
+        )
+        .chain(
+            support::FOCUSED_F2B
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (format!("focused F2b #{i}"), t.to_string())),
         );
     let cases = corpus
         .cases
@@ -86,7 +104,11 @@ fn the_checker_in_elya_agrees_on_its_stages() {
         &counts[1..]
     );
     assert!(
-        compared >= 80 + support::FOCUSED_F1.len() + support::FOCUSED_F2A.len(),
-        "F1 and F2a: at least 80 corpus programs, and the focused sets"
+        compared
+            >= 110
+                + support::FOCUSED_F1.len()
+                + support::FOCUSED_F2A.len()
+                + support::FOCUSED_F2B.len(),
+        "F1, F2a and F2b: at least 110 corpus programs, and the focused sets"
     );
 }

@@ -51,8 +51,24 @@ Spec: `docs/superpowers/specs/2026-11-15-elya-checker-in-elya-design.md`.
      programs; about 55 probes otherwise agreed. Gate 1666 passed, 196
      suites, as predicted. No effect rows: everything here is called directly, so every
      row closes to pure.
-   - F2b (the classifier's stage 3; F3's annotations went to F2a and F2b,
-     the kinds of declaration parameters to F4): higher order. Lambdas and closures, functions and n-ary
+   - F2b (**built** 2026-11-23; the classifier's stage 3; F3's annotations
+     went to F2a and F2b, the kinds of declaration parameters to F4):
+     higher order. Rows are tails only (no labels before F4), so
+     unification of rows is a union-find whose phantom-ness belongs to a
+     class, and the inclusions reach their fixpoint at Rust's three flush
+     points (a lambda's exit, steps 2.4 and 2.7) without its event queue.
+     Equality on functions (E0436, with the marks on type variables) came
+     with it. 36 corpus programs and 35 focused ones agree, in the
+     evaluator and natively; controls K8-K13 in the test's header (two of
+     them survived the corpus and got a focused program each). Review
+     (about 130 handwritten and 2,200 random stage-3 programs, an
+     instrumented oracle): one defect, a `let` quantifying a deferred
+     lambda's row (Rust's `kept_monomorphic` keeps `deferred_rows`), 7 of
+     300 random programs; fixed with K13. It confirmed the fixpoint claim
+     (phantom-ness is a class property; every mark read is on a
+     representative or an unbound variable), and its mutations found 13
+     unpinned behaviours, now pinned by 12 focused programs. Gate 1666
+     passed, 196 suites, as predicted. Lambdas and closures, functions and n-ary
      constructors as values, calls of locals and of expressions, function
      types in annotations, with let-polymorphism over them (D14-D16 of the
      inference-levels spec). These bring effect rows into the printed types

@@ -821,10 +821,10 @@ built), 4f inference (Claude), compared by `elya check --dump`, messages
 included. **4f stage F1 is built** (2026-11-22, `selfhost/check.elya`): every
 first-order program of the corpus agrees, in the evaluator and natively;
 so does **F2a** (declared types, constructors, `match`, the pure builtins,
-annotations naming types). Next F2b (higher order: lambdas, functions as
-values), which needs the row machinery's tails (phantom rows, relays through
-parameters, inclusions, a lambda's region) even in pure programs: `fn
-app(f, x) { f(x) }` prints `/ {c}` rows. The checker's verdict has its print form too, `elya
+annotations naming types), and **F2b** (higher order: lambdas, functions as
+values, function types, the rows' tails, E0436). Next F4: effects (labels in
+rows, performs, handlers, `resume`, inclusions with labels, the kinds of
+declaration parameters), then F5 (linearity, needing 4e's affine facts). The checker's verdict has its print form too, `elya
 check --dump` (spec D6). The roadmap's "continuation-aware ownership" line takes
 the review's longer proposals (loans through continuations, once-callable
 function types).
