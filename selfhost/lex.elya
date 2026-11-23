@@ -45,12 +45,22 @@ fn lower(c: Int) -> Bool { (c >= 97 && c <= 122) || c == 95 }
 fn upper(c: Int) -> Bool { c >= 65 && c <= 90 }
 fn ident(c: Int) -> Bool { lower(c) || upper(c) || digit(c) }
 
-fn digits(s: String, i: Int) -> Int {
-  let c = at(s, i)
-  if digit(c) || c == 95 { digits(s, i + 1) } else { i }
+// Scan ASCII identifier/numeric runs with one cached source length.
+fn digits(s: String, i: Int) -> Int { digits_run(s, i, string.length(s)) }
+fn digits_run(s: String, i: Int, end: Int) -> Int {
+  if i >= end { i } else {
+    let c = string.byte_at(s, i)
+    if (c >= 48 && c <= 57) || c == 95 { digits_run(s, i + 1, end) } else { i }
+  }
 }
-fn name_end(s: String, i: Int) -> Int {
-  if ident(at(s, i)) { name_end(s, i + 1) } else { i }
+fn name_end(s: String, i: Int) -> Int { name_run(s, i, string.length(s)) }
+fn name_run(s: String, i: Int, end: Int) -> Int {
+  if i >= end { i } else {
+    let c = string.byte_at(s, i)
+    if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 {
+      name_run(s, i + 1, end)
+    } else { i }
+  }
 }
 fn line_end(s: String, i: Int) -> Int {
   if i == string.length(s) || at(s, i) == 10 { i } else { line_end(s, i + 1) }
@@ -79,11 +89,15 @@ fn number(s: String, i: Int) -> Number {
     Number(digits(s, start + 1), True, !dotted)
   } else { Number(end, dotted, False) }
 }
+// Copy entire numeric runs, rather than allocating one substring per byte.
+fn number_run_end(s: String, i: Int, end: Int) -> Int {
+  if i >= end || string.byte_at(s, i) == 95 { i } else { number_run_end(s, i + 1, end) }
+}
 fn without_underscores(s: String, i: Int, end: Int, b: Buffer) -> String {
-  if i == end { buffer.finish(b) } else {
-    if at(s, i) == 95 { without_underscores(s, i + 1, end, b) } else {
-      without_underscores(s, i + 1, end, buffer.push(b, string.slice(s, i, i + 1)))
-    }
+  if i >= end { buffer.finish(b) } else {
+    let next = number_run_end(s, i, end)
+    let b = if next > i { buffer.push(b, string.slice(s, i, next)) } else { b }
+    without_underscores(s, if next < end { next + 1 } else { next }, end, b)
   }
 }
 // A backslash followed by LF cannot match regex '.', but literal LF can match
@@ -103,32 +117,44 @@ fn quote_end(s: String, i: Int, valid: Bool) -> Quoted {
   }
 }
 // Unescape and re-escape in one pass. Every slice ends on a UTF-8 boundary.
+// Stops only at an ASCII escape/control byte or the end, so slices around
+// complete ordinary UTF-8 runs always begin and end on scalar boundaries.
+fn quoted_run_end(s: String, i: Int, end: Int) -> Int {
+  if i >= end { i } else {
+    let c = string.byte_at(s, i)
+    if c == 92 || c == 10 || c == 9 || c == 13 { i } else { quoted_run_end(s, i + 1, end) }
+  }
+}
 fn quoted_text(s: String, i: Int, end: Int, b: Buffer) -> String {
-  if i == end { buffer.finish(buffer.push(b, "\"")) } else {
-    let c = at(s, i)
-    if c == 92 {
-      quoted_text(s, i + 2, end, buffer.push(b, string.slice(s, i, i + 2)))
+  if i >= end { buffer.finish(buffer.push(b, "\"")) } else {
+    let next = quoted_run_end(s, i, end)
+    if next > i {
+      quoted_text(s, next, end, buffer.push(b, string.slice(s, i, next)))
     } else {
-      let w = width(c)
-      let text = if c == 10 { "\\n" } else {
-        if c == 9 { "\\t" } else {
-          if c == 13 { "\\r" } else { string.slice(s, i, i + w) }
-        }
+      let c = string.byte_at(s, i)
+      if c == 92 {
+        quoted_text(s, i + 2, end, buffer.push(b, string.slice(s, i, i + 2)))
+      } else {
+        let text = if c == 10 { "\\n" } else { if c == 9 { "\\t" } else { "\\r" } }
+        quoted_text(s, i + 1, end, buffer.push(b, text))
       }
-      quoted_text(s, i + w, end, buffer.push(b, text))
     }
   }
 }
 fn keyword(s: String) -> Int {
-  match s {
-    "pub" -> 3  "fn" -> 4  "let" -> 5
-    "import" -> 6  "if" -> 7  "else" -> 8
-    "type" -> 9  "linear" -> 10  "match" -> 11
-    "case" -> 12  "effect" -> 13  "trait" -> 14
-    "impl" -> 15  "handle" -> 16  "with" -> 17
-    "multi" -> 18  "return" -> 19  "const" -> 20
-    "True" -> 21  "False" -> 22  "Unit" -> 23
-    _ -> 0 - 1
+  // All current keywords have between two and six bytes.
+  let size = string.length(s)
+  if size < 2 || size > 6 { -1 } else {
+    match s {
+      "pub" -> 3  "fn" -> 4  "let" -> 5
+      "import" -> 6  "if" -> 7  "else" -> 8
+      "type" -> 9  "linear" -> 10  "match" -> 11
+      "case" -> 12  "effect" -> 13  "trait" -> 14
+      "impl" -> 15  "handle" -> 16  "with" -> 17
+      "multi" -> 18  "return" -> 19  "const" -> 20
+      "True" -> 21  "False" -> 22  "Unit" -> 23
+      _ -> -1
+    }
   }
 }
 fn operator(s: String) -> Int {
@@ -184,19 +210,25 @@ fn append_error(out: Lexed, code: String, start: Int, end: Int) -> Lexed {
 }
 fn punctuation(s: String, i: Int, out: Lexed) -> Lexed {
   let c = at(s, i)
-  let w = width(c)
-  // Only ASCII can start an operator. Do not slice a partial UTF-8 character.
-  let three = if c < 128 && i + 3 <= string.length(s) && at(s, i + 1) < 128 && at(s, i + 2) < 128 {
-    operator(string.slice(s, i, i + 3))
-  } else { 0 - 1 }
-  let two = if c < 128 && i + 2 <= string.length(s) && at(s, i + 1) < 128 {
-    operator(string.slice(s, i, i + 2))
-  } else { 0 - 1 }
-  if three >= 0 { scan(s, i + 3, append_token(out, three, i, i + 3, "")) } else {
-    if two >= 0 { scan(s, i + 2, append_token(out, two, i, i + 2, "")) } else {
-      let one = operator(string.slice(s, i, i + w))
-      if one >= 0 { scan(s, i + w, append_token(out, one, i, i + w, "")) } else {
-        scan(s, i + w, append_error(out, "E0001", i, i + w))
+  let structural = match c {
+    40 -> 59 41 -> 60 123 -> 61 125 -> 62 91 -> 63 93 -> 64
+    44 -> 57 58 -> 58 37 -> 50 63 -> 55 _ -> -1
+  }
+  if structural >= 0 { scan(s, i + 1, append_token(out, structural, i, i + 1, "")) } else {
+    let w = width(c)
+    // Only ASCII can start an operator. Do not slice a partial UTF-8 character.
+    let three = if c < 128 && i + 3 <= string.length(s) && at(s, i + 1) < 128 && at(s, i + 2) < 128 {
+      operator(string.slice(s, i, i + 3))
+    } else { 0 - 1 }
+    let two = if c < 128 && i + 2 <= string.length(s) && at(s, i + 1) < 128 {
+      operator(string.slice(s, i, i + 2))
+    } else { 0 - 1 }
+    if three >= 0 { scan(s, i + 3, append_token(out, three, i, i + 3, "")) } else {
+      if two >= 0 { scan(s, i + 2, append_token(out, two, i, i + 2, "")) } else {
+        let one = operator(string.slice(s, i, i + w))
+        if one >= 0 { scan(s, i + w, append_token(out, one, i, i + w, "")) } else {
+          scan(s, i + w, append_error(out, "E0001", i, i + w))
+        }
       }
     }
   }
