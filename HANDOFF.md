@@ -827,10 +827,17 @@ effects: labels in rows, performs, handlers, `resume`, inclusions with labels,
 declared and written rows, `io.*`/`time.*`, `main`'s discharge; 232 corpus
 programs and 58 focused ones; the review's 5,350 programs agreed and its
 mutants left six behaviours, now pinned). Natively, with `--release`, the
-largest F4a program checks in 8.0 ms against Rust's 0.85 ms. Next **F4b**:
-`multi` (E0426, E0427), named row variables, rows as type arguments; then
-**F4c**, parametric effects (labels with arguments) and `with any`/`op.*`;
-then F5 (linearity, needing 4e's affine facts). The checker's verdict has its print form too, `elya
+largest F4a program checks in 8.0 ms against Rust's 0.85 ms. **F4b**
+(2026-11-24, 44effe6: `multi`, named row variables, row parameters of
+types; the review's 21,104 programs agreed, 21 mutants pinned, two Rust quirks
+kept and recorded in the plan), **F4c** and **F4d** (2026-11-24: parametric
+effects; `with any` and `op.*`; their reviews found four defects, all fixed
+with focused programs). The classifier's stages are now F1, F2a, F2b, F4a,
+F4b, F4c, F4d, F5 (linear types, arrays, borrows), F6 (imports). Codex's
+**4b** landed (75d65d9: the parser's diagnostics and recovery, its 3,345
+inputs agreeing). Next: **4e**, the affine pass in Elya (`selfhost/affine.elya`,
+Claude's, Codex being unreachable; under review), then **F5** (built on it),
+then **4c**, **4d** and **F6**. The checker's verdict has its print form too, `elya
 check --dump` (spec D6). The roadmap's "continuation-aware ownership" line takes
 the review's longer proposals (loans through continuations, once-callable
 function types).

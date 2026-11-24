@@ -18,6 +18,15 @@ A run whose top entry says IN PROGRESS and started less than 3 hours ago is stil
 - **Done: stage F2b** (higher order, with the effect rows' tails and E0436):
   36 corpus and 35 focused programs agree; controls K8-K13. Review (2,200 random
   programs) found one defect (a `let` quantifying a deferred lambda's row), fixed.
+- **Done: Codex's 4b** (75d65d9, 2026-11-24: the parser in Elya's diagnostics and
+  recovery; checked here: gate 1666 / 196, Windows green, the checker's suites agree
+  with it). PR #29 closed as landed.
+- **Done: stages F4b, F4c, F4d** (44effe6 and the commit after it, 2026-11-24): each
+  reviewed (about 21,100, 15,500 and 12,200 programs); four defects found by the
+  F4c and F4d reviews, fixed with focused programs. Gates 1666 / 196 as predicted.
+- Usage limit hit at 05:26 UTC on the 24th (reset 09:10); the session resumed at
+  14:20 on the maintainer's message. The PC is not linked now: Codex and the E:
+  copy wait for it.
 - **Done: stage F4a** (2026-11-23; effects: labels, performs, handlers, `resume`,
   declared and written rows, the host's builtins, `main`'s discharge): 232 corpus and
   58 focused programs agree; controls K14-K28. Review (about 5,350 programs, 39
