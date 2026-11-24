@@ -1836,6 +1836,10 @@ pub fn parse_tree(src: String) -> Parsed(Module) {
     match ds { Nil -> Parsed(m, pos) Cons(ParseDiag(code, a, b, _), _) -> ParseError(code, a, b) }
   } }
 }
+// The tree and every diagnostic, and the tree's dump: what the resolver in
+// Elya (selfhost/resolve.elya, part 4c) reads and prints for each file.
+pub fn parse_full(src: String) -> ParsedSource { parse_source(src) }
+pub fn dump_tree(m: Module, src: String) -> String { dump_module(m, src) }
 pub fn main() / {IO} {
   let result = parse_dump(io.read_file(io.arg(0)))
   io.println(string.slice(result, 0, string.length(result) - 1))
