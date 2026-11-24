@@ -132,7 +132,7 @@ fn clean_case(name: String, text: String, require_module: bool) -> Option<Case> 
 // Both raw strings (arbitrary # delimiters) and normal escaped UTF-8 strings are
 // included; comments and character literals are skipped. Invalid candidate
 // strings are ignored and every result still passes the Rust Elya parser.
-fn rust_strings(src: &str) -> Vec<(usize, String)> {
+pub fn rust_strings(src: &str) -> Vec<(usize, String)> {
     let bytes = src.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
