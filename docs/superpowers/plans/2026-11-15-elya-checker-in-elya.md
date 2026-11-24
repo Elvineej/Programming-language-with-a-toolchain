@@ -123,9 +123,58 @@ Spec: `docs/superpowers/specs/2026-11-15-elya-checker-in-elya-design.md`.
        (`fn a(x: e) / {e} -> Int` reports E0400 or not by declaration
        order); and `{io}` is a row variable, since only its first letter
        is capitalized before the comparison with `IO`.
-     - F4c (the classifier's stage 6): parametric effects (labels with
-       arguments, `unify_effect_args`, `settle_duplicates`), `with any` and
-       `op.*` (E0434).
+     - F4c (**built** 2026-11-23; the classifier's stage 6, `with any`
+       measured apart into stage 7): parametric effects. A label carries
+       its arguments through every walk of a type (resolving, free
+       variables and rows, occurs checks, levels, instantiation,
+       printing); where a label meets itself its arguments agree
+       (`unify_effect_args`, E0423 for two that cannot be one type), read
+       again until no label is newly shared, and a label met twice along a
+       chain is settled first (`settle_duplicates`); a row whose labels
+       mention its own tail joins an ambient whole; effects' parameters
+       have kinds too, are instantiated once per perform and once per
+       handler, and are written in annotations (fresh when unwritten) and
+       declarations (the effect's own when unwritten in its own); a declared
+       row's written arguments (2.47) and the labels its named tail cannot
+       hold are checked. 38 corpus programs and 42 focused ones agree, in
+       the evaluator and natively (the 38 at the first run); controls
+       K44-K64 in the test's header (seven survived the corpus and got
+       focused programs; K49, K57, K58 argued). Review (about 15,500
+       handwritten and random programs): two defects, fixed with focused
+       programs: a settled chain was not compressed (Rust rebinds each of
+       its variables to the chain's end), so its duplicate was reported
+       again (the F4d review met it too), and a clause for another effect's
+       operation took the handled effect's substitution, not its own
+       effect's parameters zipped with the handle's arguments. One
+       classifier hole: a label's arguments were not walked, so `St(Buffer)`
+       counted as stage 6. Two of the three arguments failed (K49 and K57
+       are caught now); of its 63 mutants, 11 survivors are pinned, five
+       argued equivalent, two (the settled pairs' order with three
+       instances, `add_row` not settling its own row) unpinned, reachable
+       only in principle.
+     - F4d (**built** 2026-11-23; the classifier's stage 7): `with any`
+       and `op.*`. A clause's operation is the `$Op` type, printed
+       `Op(t / {..})`, of a rigid answer type `'tN` per clause; its
+       `resume` reruns only the body's `IO`; `op.perform` forwards; the
+       handled row (the body's but `IO`) is data, checked when the group
+       is solved (E0434, step 2.8) and again where a scheme quantifying a
+       still-open handled tail is instantiated (unless it is the
+       function's own row), and stays monomorphic in a `let` until then;
+       an answer type may not escape its clause (E0435); an operation is
+       data for `==`. Rust's `cur_span` is read only by those
+       instantiations, so it is passed, not tracked (tracked, it cost
+       native checking 3.7 times). 27 corpus programs and 29 focused ones
+       agree, in the evaluator and natively (the 27 at the first run but
+       for `==` on an operation); controls K65-K81 in the test's header
+       (two survived the corpus and got focused programs; K79 cannot be
+       caught, and the header says why). Review (about 12,200 programs):
+       two defects, both fixed with controls: E0435's walk of the
+       environment counted a binding a later `let` hid in its block (Rust
+       walks each scope's open entries; the port now marks blocks), and
+       F4c's settling left a chain's duplicate in place, reported again by
+       the next settling (Rust compresses the chain; ported). Its 34 mutants
+       left 13 unpinned behaviours, now pinned; the `cur_span` claim and
+       the omitted `hold_*` bookkeeping (stage 8's) confirmed.
    - F5: duplicability (the marks on type variables, E0428, E0429, E0437),
      `linear` types, `Buffer` and `Array`, and the borrow facts (E0438,
      E0439). These read 4e's facts, so F5 waits for 4e.

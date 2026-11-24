@@ -264,6 +264,134 @@ pub const FOCUSED_F4B: &[&str] = &[
     "effect Abc { fn abc() -> Int }\nfn f(g: fn() / {abc} -> Int) -> Int { 0 }\npub fn main() -> Int { 0 }\n",
 ];
 
+/// Stage F4c's focused programs: parametric effects. A label's arguments
+/// agree wherever it meets itself (E0423 at a conflict, a duplicate along a
+/// chain settled), are instantiated once per perform and once per handler,
+/// are written in annotations (fresh when unwritten, E0400 on a wrong count)
+/// and declarations (E0432 when unwritten but the effect's own), carry rows
+/// (row parameters of effects, E0424 and E0401 through them, a label kept
+/// whole out of its own tail), and a declared row's written arguments and
+/// named tail are checked against what the body performs.
+pub const FOCUSED_F4C: &[&str] = &[
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn counter() { put(get() + 1) }\nfn run() { handle { counter()\n get() } with { get() -> resume(0)  put(v) -> resume(Unit) } }\npub fn main() -> Int { run() }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn bad() { put(1)\n put(\"x\") }\npub fn main() -> Int { 0 }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn a() { put(1) }\nfn b() { put(\"x\") }\nfn both() { a()\n b() }\npub fn main() -> Int { 0 }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn f() / {State(Int)} -> Int { get() }\nfn g() / {State(String)} -> Int { put(1)\n 0 }\npub fn main() -> Int { 0 }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn f() / {State} -> Int { 0 }\nfn g() / {State(Int, Int)} -> Int { 0 }\nfn h(k: fn() / {State(Bool)} -> Int) -> Int { k() }\npub fn main() -> Int { 0 }\n",
+    "effect E(t) { fn op(x: t) -> Unit }\nfn f() { op(f) }\npub fn main() -> Int { 0 }\n",
+    "effect E(t) { fn op(x: t) -> Unit }\nfn g(k) { op(k)\n k() }\npub fn main() -> Int { 0 }\n",
+    "effect Async(e) { fn spawn(f: fn() / {Async(e) | e} -> Int) -> Int }\nfn task() { spawn(fn() { 1 }) }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\neffect Async(e) { fn spawn(f: fn() / {Async(e) | e} -> Int) -> Int }\nfn task() { spawn(fn() { log(\"a\")\n 1 }) }\nfn run(t: fn() / {Async(e) | e} -> Int) / {Async(e) | e} -> Int { t() }\npub fn main() -> Int { 0 }\n",
+    "effect Box(a) { fn take() -> a }\ntype Pair(a) { Pair(fn() / {Box(a)} -> a) }\nfn mk() { Pair(fn() { take() }) }\npub fn main() -> Int { 0 }\n",
+    "effect Box(a) { fn take() -> a }\ntype Pair(a) { Pair(fn() / {Box} -> a) }\ntype Q { Q(fn() / {Box(Int, Int)} -> Int) }\ntype W { W(fn() / {Nope} -> Int) }\npub fn main() -> Int { 0 }\n",
+    "effect Rd(e) { fn ask() -> fn() / {e} -> Int }\nfn go() { let f = ask()\n f() }\npub fn main() -> Int { 0 }\n",
+    "effect Rd(e) { fn ask() -> fn() / {e} -> Int }\neffect Log { fn log(m: String) -> Unit }\nfn go() { handle { let f = ask()\n f() } with { ask() -> resume(fn() { log(\"x\")\n 1 }) } }\npub fn main() -> Int { 0 }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn run(init) { handle { put(init)\n get() } with { get() -> resume(init)  put(v) -> resume(Unit) } }\nfn use() { run(3) + 1 }\npub fn main() -> Int { use() }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn run() { handle { put(1)\n get() } with { get() -> resume(\"no\")  put(v) -> resume(Unit) } }\npub fn main() -> Int { 0 }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn f(k: fn() / {State(Int)} -> Int) / {State(Int)} -> Int { k()\n put(2)\n get() }\nfn g() / {State(Int)} -> Int { f(fn() { get() }) }\npub fn main() -> Int { 0 }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn f(k: fn() / {State(Int) | e} -> Int) / {State(Int) | e} -> Int { k() }\nfn g() { f(fn() { put(\"s\")\n 1 }) }\npub fn main() -> Int { 0 }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn apply(k) { k()\n put(1) }\nfn h() { apply(fn() { put(True) }) }\npub fn main() -> Int { 0 }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn r(n) { if n == 0 { get() } else { put(n)\n r(n - 1) } }\npub fn main() -> Int { 0 }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn a(n) { if n == 0 { put(1) } else { b(n) } }\nfn b(n) { put(\"x\")\n a(n - 1) }\npub fn main() -> Int { 0 }\n",
+    "effect E(a, b) { fn op(x: a) -> b }\nfn f() { op(1) }\nfn g() { let x: String = op(True)\n x }\npub fn main() -> Int { 0 }\n",
+    "effect E(t) { fn op(x: t) -> t }\nfn id_eff(x) { op(x) }\nfn two() { let a = id_eff(1)\n let b = id_eff(\"s\")\n a }\npub fn main() -> Int { 0 }\n",
+    "effect E(t) { fn op(x: t) -> t }\nfn h() { handle { let g = fn(y) { op(y) }\n g(1) } with { op(x) -> resume(x) } }\npub fn main() -> Int { h() }\n",
+    "effect E(t) { fn op(x: t) -> t }\nfn h() { handle { op(1) } with { op(x) -> { let k = fn() { resume(x) }\n let z = k\n z() } } }\npub fn main() -> Int { h() }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn f() / {State(Int) | e} -> Int { get() }\nfn g() / {State(Int) | e} -> Int { put(\"x\")\n 0 }\npub fn main() -> Int { 0 }\n",
+    "effect Ask(e) { fn ask() -> fn() / {e} -> Int }\nfn t() / {e} -> Int { let k = ask()\n k() }\npub fn main() -> Int { 0 }\n",
+    "effect St(s) { fn get() -> s }\nfn f(k: fn() / {St(Int)} -> Int) { k() }\nfn g(k: fn() / {St(e)} -> Int) { k() }\nfn h(k: fn() / {St({IO})} -> Int) { k() }\npub fn main() -> Int { 0 }\n",
+    "effect R(e) { fn go(f: fn() / {e} -> Int) -> Int }\nfn f(k: fn() / {R({IO})} -> Int) { k() }\nfn g(k: fn() / {R(Int)} -> Int) { k() }\nfn h(k: fn() / {R(e)} -> Int) / {R(e)} -> Int { k() }\npub fn main() -> Int { 0 }\n",
+    "effect R(e) { fn go(f: fn() / {e} -> Int) -> Int }\neffect Log { fn log(m: String) -> Unit }\nfn run() { handle { go(fn() { log(\"a\")\n 2 }) } with { go(f) -> resume(f()) } }\npub fn main() -> Int { 0 }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn outer() { handle { handle { put(1)\n get() } with { get() -> resume(2)  put(v) -> resume(Unit) } } with { get() -> resume(\"a\")  put(v) -> resume(Unit) } }\npub fn main() -> Int { 0 }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn f() { let k = fn() { get() + 1 }\n let j = fn() { put(\"a\") }\n k() }\npub fn main() -> Int { 0 }\n",
+    "effect E(t) { fn op() -> t }\ntype T(e) { T(fn() / {E(Int) | e} -> Int) }\nfn run(t: T(e)) / {E(Int) | e} -> Int { match t { T(f) -> f() } }\nfn mk() { T(fn() { op() }) }\npub fn main() -> Int { 0 }\n",
+    "effect E(t) { fn op() -> t }\nfn f(g: fn() / {E(fn() / {E(Int)} -> Int)} -> Int) { g() }\npub fn main() -> Int { 0 }\n",
+    "effect multi Amb(t) { fn pick(a: t, b: t) -> t }\nfn h() { handle { pick(1, 2) + pick(3, 4) } with multi { pick(a, b) -> resume(a) + resume(b) } }\npub fn main() -> Int { h() }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn main_like() / {State(Int)} -> Int { get() }\npub fn main() -> Int { main_like() }\n",
+    // Written for controls K46 (two), K51, K56, K63, K62 and K45, which
+    // survived the rest.
+    "effect E(t) { fn op(x: t) -> Unit }\nfn g(k) { op(k)  k() }\nfn self_op() { op(1)  2 }\npub fn main() -> Int { handle { g(self_op) } with { E.op(x) -> resume(Unit) } }\n",
+    "effect E(t) { fn op(x: t) -> Unit }\nfn g(k) { op(k)  k() }\nfn self_op() / {E(Int)} -> Int { op(1)  2 }\nfn h() { g(self_op) }\npub fn main() -> Int { 0 }\n",
+    "effect State(s) { fn get() -> s }\nfn f(k: fn() / {State} -> Int) -> Int { k() }\npub fn main() -> Int { 0 }\n",
+    "effect Async(e) { fn spawn(f: fn() / {Async(e) | e} -> Int) -> Int }\nfn run(t: fn() / {Async(e) | e} -> Int) / {e} -> Int { t() }\npub fn main() -> Int { 0 }\n",
+    "effect E(t) { fn op(x: t) -> Unit }\nfn f(k: fn() / {E(fn(Int) / {} -> Int)} -> Int, j: fn() / {E(fn(String) / {} -> Int)} -> Int) { if True { k } else { j } }\npub fn main() -> Int { 0 }\n",
+    "effect E(t) { fn op(x: t) -> Unit }\nfn id(x) { x }\npub fn main() -> Int { let g = id(fn() { 1 })\n g()\n let z = if True { g } else { fn() { op(5)\n 2 } }\n 0 }\n",
+    "effect St(s) { fn get() -> s }\neffect Async(e) { fn spawn(f: fn() / {Async(e) | e} -> Int) -> Int }\nfn run(t: fn() / {Async(e) | e} -> Int) -> Int { 0 }\nfn g(k: fn() / {Async({St(String) | w}), St(Int) | w} -> Int) { run(k) }\npub fn main() -> Int { 0 }\n",
+    // The review's: K49, M25, M09, M22, M33, M34, M37/M38, M47, M18, K57/M56,
+    // then its defects D1 (a settled chain compressed, M12 too) and D2 (a
+    // clause of another effect at its own effect's parameters).
+    "effect P(a) { fn pp(x: a) -> a }\nfn f(k) { let g = fn(y) { k()\n pp(y) }\n g(1)\n g(\"s\") }\npub fn main() -> Int { 0 }\n",
+    "effect Go(e) { fn go(f: fn() / {e} -> Int) -> Int }\neffect Log { fn log(m: String) -> Unit }\nfn f(k) { let g = fn(y) { k()\n go(y) }\n g(fn() { log(\"a\")\n 1 }) }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\neffect E(t) { fn op(x: t) -> Unit }\nfn f(k: fn() / {E(fn() / {Log} -> Int)} -> Int, j: fn() / {E(fn() / {Log} -> Int)} -> Int) { if True { k } else { j } }\npub fn main() -> Int { 0 }\n",
+    "effect Ef(t) { fn op(x: t) -> Unit }\nfn f(k: fn() / {Ef(fn(fn() / {e} -> Int) -> Int) | e} -> Int) / {e} -> Int { k() }\nfn g(k: fn() / {Ef(fn(fn() / {e} -> Int) -> Int) | e} -> Int) { k() }\npub fn main() -> Int { 0 }\n",
+    "effect E(t) { fn op(x: t) -> t }\neffect F(a) { fn fo(k: fn() / {E} -> Int) -> a }\npub fn main() -> Int { 0 }\n",
+    "effect E(t) { fn op(x: t) -> t }\ntype T { T(fn() / {E(Int, Int)} -> Int) }\nfn mk() { T(fn() { 1 }) }\npub fn main() -> Int { 0 }\n",
+    "effect A(x) { fn a(k: fn() / {B(x)} -> Int) -> Int }\neffect B(y) { fn b(f: fn() / {y} -> Int) -> Int }\npub fn main() -> Int { 0 }\n",
+    "effect Async(e) { fn spawn(f: fn() / {Async(e) | e} -> Int) -> Int }\nfn run(t) / {e} -> Int { spawn(t)\n let j: fn() / {e} -> Int = t\n t() }\npub fn main() -> Int { 0 }\n",
+    "effect Amb(t) { fn pick(a: t, b: t) -> t }\nfn f(k: fn(Unit) / {Amb(Bool) | e} -> Int) { k(pick(fn(z) { 1 }, k)) }\npub fn main() -> Int { 0 }\n",
+    "effect P(a, b) { fn pp(x: a) -> b }\neffect Rd(e) { fn ask() -> fn() / {e} -> Int }\nfn f1(x0) / {IO} -> Unit { pp(x0)\n x0() }\nfn f2(x0, x1: fn(Int) -> e) / {Rd({Rd({P(Int, {P | r}, Int) | r})}), IO | e} -> Int { pp(handle { ask()() } with { P.pp(p0) -> { let kk = fn() { resume({ let l2: String = 1\n f1(p0) }) }\n kk() } }) }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask() -> Int }\neffect Fx(t) { fn fx(x: t) -> Int }\nfn f() { handle { 1 } with { ask() -> { let k = fn() { resume(fx(1)) }\n k() }  return(r) -> fx(\"s\") } }\npub fn main() -> Int { 0 }\n",
+    "effect State(s) { fn get() -> s  fn put(v: s) -> Unit }\neffect E(t) { fn op(x: t) -> t }\nfn f() { handle { get() + 1 } with { get() -> resume(1)  put(v) -> resume(Unit)  op(x) -> resume(x) } }\npub fn main() -> Int { 0 }\n",
+];
+
+/// Stage F4d's focused programs: `with any`. A clause's operation is an
+/// `Op(t / {..})` of a rigid answer type, `op.*` on it, `op.perform`
+/// forwarding; the handled row is data (E0434, `IO` too, at the handle and
+/// where a scheme generalizing it is instantiated); an answer type escaping
+/// its clause (E0435) into the result, a binding outside, or an effect's
+/// argument; equality on an operation.
+pub const FOCUSED_F4D: &[&str] = &[
+    "effect Ask { fn ask(q: String) -> Int }\nfn f(body) { handle { body() } with any { op(o) -> resume(op.decode(o, \"1\")) } }\npub fn main() -> Int { f(fn() { ask(\"x\") }) }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn f(body) { handle { body() } with any { op(o) -> { let s = op.show(o)\n let n = op.name(o)\n resume(op.decode(o, s <> n)) } } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn fwd(body) { handle { body() } with any { op(o) -> resume(op.perform(o)) } }\nfn run() { fwd(fn() { ask(\"q\") }) }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(f: fn() -> Int) -> Int }\nfn f() { handle { ask(fn() { 1 }) } with any { op(o) -> resume(op.decode(o, \"1\")) } }\npub fn main() -> Int { 0 }\n",
+    "fn f() { handle { io.println(\"x\")\n 1 } with any { op(o) -> resume(op.decode(o, \"1\")) } }\npub fn main() / {IO} -> Int { f() }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn f() { handle { ask(\"a\") } with any { op(o) -> o } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn f() { let keep = 0\n handle { ask(\"a\") } with any { op(o) -> { let x = resume(op.decode(o, \"1\"))\n x } } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn g(body) { handle { body() } with any { op(o) -> resume(op.decode(o, \"1\")) } }\nfn h() { g(fn() { ask(\"z\") }) }\nfn k() { g(fn() { 5 }) }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\neffect Bad { fn bad(f: fn() -> Int) -> Int }\nfn g(body) { handle { body() } with any { op(o) -> resume(op.decode(o, \"1\")) } }\nfn h() { g(fn() { bad(fn() { 1 }) }) }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn g(body) { handle { body() } with any { op(o) -> resume(op.decode(o, \"1\")) } }\nfn h() { let gg = g\n gg(fn() { ask(\"z\") }) }\npub fn main() -> Int { 0 }\n",
+    "effect St(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn f(body) { handle { body() } with any { op(o) -> resume(op.decode(o, op.encode(o, op.perform(o)))) } }\nfn h() { f(fn() { put(1)\n get() }) }\npub fn main() -> Int { 0 }\n",
+    "effect St(s) { fn get() -> s }\nfn f() { handle { let g = fn() { get() }\n g() + 1 } with any { op(o) -> resume(op.decode(o, \"0\")) } }\npub fn main() -> Int { 0 }\n",
+    "effect St(s) { fn get() -> s }\nfn f() { handle { let g: fn() -> Int = fn() { 1 }\n get() } with any { op(o) -> resume(op.decode(o, \"0\")) } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn f() { handle { ask(\"a\") } with any { op(o) -> { let k = fn() { resume(op.decode(o, \"1\")) }\n k() } } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\neffect Log { fn log(m: String) -> Unit }\nfn f() { handle { ask(\"a\") } with any { op(o) -> { log(op.show(o))\n resume(op.decode(o, \"1\")) } } }\npub fn main() -> Int { f() }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn f() { handle { ask(\"a\") } with any { op(o) -> resume(1) } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn f() { handle { ask(\"a\") } with any { op(o) -> resume(op.decode(o, \"1\"))  return(x) -> x + 1 } }\npub fn main() -> Int { f() }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn f(o) { op.show(o) }\nfn g() { handle { ask(\"a\") } with any { op(o) -> { let s = f(o)\n resume(op.decode(o, s)) } } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn f() { handle { ask(\"a\") } with any { op(o) -> if o == o { resume(op.decode(o, \"1\")) } else { 0 } } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn f() { let r = handle { ask(\"a\") } with any { op(o) -> op.encode(o, 1) }\n r }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\neffect T { fn t() -> Int }\nfn f() { handle { handle { ask(\"a\") + t() } with any { op(o) -> resume(op.decode(o, \"1\")) } } with any { op(p) -> resume(op.decode(p, \"2\")) } }\npub fn main() -> Int { f() }\n",
+    "effect E(t) { fn op1(x: t) -> t }\nfn f() { handle { op1(fn() { 1 }) } with any { op(o) -> resume(op.decode(o, \"1\")) } }\nfn g() { handle { op1(3) } with any { op(o) -> resume(op.decode(o, \"1\")) } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn f(body) { handle { body() } with any { op(o) -> op.decode(o, \"1\") } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn f(keep) { handle { ask(\"a\") } with any { op(o) -> { let v = op.decode(o, \"1\")\n let u = if True { keep } else { v }\n resume(v) } } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\neffect Box(t) { fn put(x: t) -> Unit }\nfn f() { handle { ask(\"a\") } with any { op(o) -> { put(op.decode(o, \"1\"))\n resume(1) } } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn f(body) { handle { body() } with any { op(o) -> resume(op.decode(o, \"1\")) } }\nfn g(body2) { f(body2) }\nfn h() { g(fn() { io.println(\"x\")\n 1 }) }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn f(body) { handle { body() } with any { op(o) -> resume(op.perform(o)) } }\nfn h() { f(fn() { io.println(\"x\")\n 1 }) }\npub fn main() -> Int { 0 }\n",
+    // Written for controls K66 and K73, which survived the rest.
+    "fn f() { handle { io.println(\"x\")\n 1 } with any { op(o) -> 0 } }\npub fn main() / {IO} -> Int { f() }\n",
+    "effect Ask { fn ask(q: String) -> Int }\neffect Box(t) { fn put(x: t) -> Unit }\nfn f() { handle { handle { ask(\"a\") } with any { op(o) -> { put(op.decode(o, \"1\"))\n resume(1) } } } with { put(x) -> resume(Unit) } }\npub fn main() -> Int { 0 }\n",
+    // The review's mutants N1, N4, N5/N11, N7/N12, N13, N19, N23, N33, N38,
+    // N44, N45; then its two defects: a name bound again in its block hides
+    // its earlier binding from E0435's walk; and a chain's duplicates,
+    // settled, are compressed away (Rust's path compression), so a later
+    // settling does not report them again.
+    "effect Bad { fn bad(f: fn() -> Int) -> Int }\nfn f(b) { fn() { handle { b() } with any { op(o) -> resume(op.perform(o)) } } }\nfn g() { f(fn() { bad(fn() { 1 }) })() }\npub fn main() -> Int { 0 }\n",
+    "effect Bx(t) { fn bx(x: t) -> Unit }\neffect Ask { fn ask(q: String) -> Int }\nfn f() { bx(1)\n handle { ask(\"q\") } with any { op(o) -> { bx(True)\n \"s\" } } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\neffect Log { fn log(m: String) -> Unit }\nfn f(n) { let r = handle { ask(\"q\") } with any { op(o) -> resume(op.decode(o, \"1\"))  return(x) -> if n == 0 { x } else { f(n - 1) } }\n log(\"x\")\n r }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\neffect Log { fn log(m: String) -> Unit }\nfn f() { handle { ask(\"q\") } with any { op(o) -> resume(op.perform(o)) }\n log(\"x\") }\npub fn main() -> Int { 0 }\n",
+    "fn f() / {} -> Int { handle { io.println(\"x\")\n 1 } with any { op(o) -> 0 } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\neffect St(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn f(z) { handle { ask(\"q\") } with any { op(o) -> { let u = if True { z } else { fn() { put(op.decode(o, \"1\")) } }\n resume(1) } } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\neffect Bad { fn bad(f: fn() -> Int) -> Int }\nfn rep(body) { handle { body() } with any { op(o) -> resume(op.decode(o, \"1\")) } }\nfn a() { let r = rep\n r(fn() { bad(fn() { 1 }) }) }\npub fn main() -> Int { 0 }\n",
+    "effect St(s) { fn get() -> s  fn put(v: s) -> Unit }\nfn g(b) { handle { b() } with any { op(o) -> resume(op.decode(o, \"1\")) } }\nfn h() { g(fn() { put(fn() { 1 }) }) }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\ntype Opt(a) { No, So(a) }\nfn f(z) { handle { ask(\"q\") } with any { op(o) -> { let u = if True { z } else { So(op.decode(o, \"1\")) }\n resume(op.decode(o, \"1\")) } } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\neffect Log { fn log(m: String) -> Unit }\nfn id(x) { x }\nfn f() { handle { ask(\"q\") } with any { op(o) -> { let g = id(fn() { 1 })\n g()\n let z = if True { g } else { fn() { log(\"a\")\n 2 } }\n resume(op.decode(o, \"1\")) } } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\neffect Log { fn log(m: String) -> Unit }\nfn id(x) { x }\nfn f() { handle { ask(\"q\") } with any { op(o) -> resume(op.decode(o, \"1\"))  return(x) -> { let g = id(fn() { 1 })\n g()\n let z = if True { g } else { fn() { log(\"a\")\n 2 } }\n x } } }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask(q: String) -> Int }\nfn mk() { mk() }\nfn f() -> Int { let x: a = mk()\n let x = 0\n handle { ask(\"q\") } with any { op(o) -> { let u: a = op.decode(o, \"1\")\n resume(u) } } }\npub fn main() -> Int { 0 }\n",
+    "effect Bx(t) { fn bx(x: t) -> Unit }\neffect Ask { fn ask(q: String) -> Int }\nfn f(g) { bx(1)\n handle { g()\n bx(True) } with { ask(q) -> resume(1) } }\npub fn main() -> Int { 0 }\n",
+    "effect Bx(t) { fn bx(x: t) -> Unit }\nfn f() { bx(1)\n handle { bx(True) } with any { op(p) -> op.perform(p) }\n io.println(\"x\") }\npub fn main() -> Int { 0 }\n",
+];
+
 /// The checker's imports: the parser in Elya and its lexer.
 pub fn reader(name: &str) -> Option<(String, String)> {
     let file = match name {
@@ -281,7 +409,7 @@ pub fn reader(name: &str) -> Option<(String, String)> {
 
 const BASE: &[&str] = &["Int", "Float", "Bool", "String", "Unit"];
 
-/// The stage a program needs, 1 to 8: F1 first order; F2a (2) declared
+/// The stage a program needs, 1 to 9: F1 first order; F2a (2) declared
 /// types, constructors, `match`, the pure builtins, annotations naming types
 /// and type variables; F2b (3) higher order: lambdas, functions as values,
 /// calls of locals or of expressions, function types in annotations, all of
@@ -289,8 +417,8 @@ const BASE: &[&str] = &["Int", "Float", "Bool", "String", "Unit"];
 /// `Array`, `borrow`; F6 imports.
 /// Numbered: 1 F1, 2 F2a, 3 F2b, 4 F4a (effects: declarations, performs,
 /// handlers, `resume`, labelled rows), 5 F4b (`multi`, named row variables,
-/// rows as type arguments), 6 F4c (parametric effects, `with any`, `op.*`),
-/// 7 F5, 8 F6.
+/// rows as type arguments), 6 F4c (parametric effects), 7 F4d (`with any`,
+/// `op.*`), 8 F5, 9 F6.
 pub fn stage(m: &Module) -> u8 {
     let fns = m
         .decls
@@ -314,7 +442,7 @@ pub fn stage(m: &Module) -> u8 {
         .collect();
     let mut s = Stage(1, fns, ctors);
     if !m.imports.is_empty() {
-        s.at(8);
+        s.at(9);
     }
     for d in &m.decls {
         match &d.node {
@@ -334,7 +462,7 @@ pub fn stage(m: &Module) -> u8 {
                 }
             }
             Decl::Type(t) => {
-                s.at(if t.is_linear { 7 } else { 2 });
+                s.at(if t.is_linear { 8 } else { 2 });
                 for v in &t.variants {
                     for f in &v.node.fields {
                         s.ann(f);
@@ -348,7 +476,7 @@ pub fn stage(m: &Module) -> u8 {
                 for p in &f.params {
                     s.binder(&p.node.name);
                     if p.node.borrow {
-                        s.at(7);
+                        s.at(8);
                     }
                     if let Some(a) = &p.node.ann {
                         s.ann(a);
@@ -398,8 +526,14 @@ impl Stage {
         if r.tail.is_some() {
             self.at(5);
         }
-        if r.labels.iter().any(|l| l.args.is_some()) {
-            self.at(6);
+        for l in &r.labels {
+            if let Some(args) = &l.args {
+                self.at(6);
+                // A label's arguments are annotations too (`St(Buffer)`).
+                for x in args {
+                    self.ann(x);
+                }
+            }
         }
     }
 
@@ -413,7 +547,7 @@ impl Stage {
             self.row(r);
         }
         if t.name == "Array" || t.name == "Buffer" {
-            self.at(7);
+            self.at(8);
         } else if t.name == "fn" {
             self.at(3);
         } else if !BASE.contains(&t.name.as_str()) || !t.args.is_empty() {
@@ -458,9 +592,9 @@ impl Stage {
             Expr::Error => {}
             Expr::Qualified { module, .. } => match module.as_str() {
                 "int" | "float" | "string" => self.at(2),
-                "array" | "buffer" => self.at(7),
+                "array" | "buffer" => self.at(8),
                 // An operation of a `with any` clause.
-                "op" => self.at(6),
+                "op" => self.at(7),
                 _ => self.at(4),
             },
             Expr::Call { callee, args } => {
@@ -500,7 +634,7 @@ impl Stage {
             Expr::Block(b) => self.block(b),
             Expr::Handle { body, handler } => {
                 self.at(if handler.any {
-                    6
+                    7
                 } else if handler.multi {
                     5
                 } else {

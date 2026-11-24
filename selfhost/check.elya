@@ -13,7 +13,7 @@ import parse / {IO}
 // its tail (`EffectRow`); RNone marks an unbound row variable's slot. No
 // label has arguments yet (parametric effects are F4b).
 type Tail { RClosed, ROpen(Int), RError, RNone }
-type Lab { Lab(String, Int, Int) }
+type Lab { Lab(String, List(Ty), Int, Int) }
 type Row { Row(List(Lab), Tail) }
 type Ty { TVar(Int), TB(Int), TFn(List(Ty), Row, Ty), TCon(String, List(Ty)), TErr, TNone }
 // Quantified type variables, quantified row variables, the type.
@@ -25,7 +25,9 @@ type Diag { Diag(String, String, String, Int, Int) }
 type Rec { Rec(Int, Int, Ty) }
 // A group member: its index, parameter types, ambient row, result type,
 // annotation variables.
-type Mem { Mem(Int, List(Ty), Int, Ty, List(Named), List(Arity)) }
+// A member: its index, parameter types, ambient row, result, annotation
+// variables, named rows, and its declared row's written label arguments.
+type Mem { Mem(Int, List(Ty), Int, Ty, List(Named), List(Arity), List(Lab)) }
 // A top-level function: name, declaration span, parameters, return
 // annotation, body, declared row.
 type FnInfo { FnInfo(String, Int, Int, List(Sp(Param)), Maybe(Sp(TypeAnn)), Sp(Block), Maybe(RowAnn)) }
@@ -39,7 +41,7 @@ type Arity { Arity(String, Int) }
 // each declared type's parameters' kinds (a row parameter: True).
 type KP { KP(String, Bool) }
 type Kind { Kind(String, List(KP)) }
-type Ctx { Ctx(List(Named), List(Arity), List(Arity), List(String), List(Arity), List(Kind)) }
+type Ctx { Ctx(List(Named), List(Arity), List(Arity), List(String), List(Arity), Kinds) }
 // A pending inclusion: the source row variable's effects reach the
 // destination's (`pending_incl`, and `pending_member_incl` for a group
 // member's row deferred inside a lambda).
@@ -69,8 +71,16 @@ type Eqs { Eqs(List(EqMark), List(Span2), List(Adt)) }
 // the effects' operations (the last of a name first); the declared
 // effects; the inclusions a conflict ended (`incl_dead`).
 type Resume { Resume(Ty, Ty, Int, Int, String, Int, Int) }
-type OpInfo { OpInfo(String, String, List(Ty), Ty) }
-type Hx { Hx(List(Resume), List(Int), Int, List(OpInfo), List(String), List(Incl), List(String)) }
+// An operation: its name, its effect, its effect's parameters (each type
+// variable with its row variable, -1 for a type parameter), its parameters
+// and its result.
+type OpInfo { OpInfo(String, String, List(RPair), List(Ty), Ty) }
+// `with any`: the clauses' rigid answer types made so far, the rows handled
+// generically (`generic_rows`), and the sites whose handled rows wait for
+// the group (`pending_generic`).
+type GSite { GSite(List(Lab), Tail, Bool, Int, Int) }
+type Gn { Gn(Int, List(Int), List(GSite)) }
+type Hx { Hx(List(Resume), List(Int), Int, List(OpInfo), List(String), List(Incl), List(String), Gn) }
 linear type St { St(Array(Ty), Array(Int), Int, List(Diag), List(Rec), Ctx, Rows, Gx, Eqs, Hx) }
 linear type R(a) { R(a, St) }
 
@@ -136,6 +146,18 @@ fn cur_level(s: St) -> R(Int) {
 }
 fn add_level(s: St, d: Int) -> St {
   match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> St(sub, lv, cur + d, ds, rs, cx, rw, gx, eq, hx) }
+}
+fn get_gn(s: St) -> R(Gn) {
+  match get_hx(s) { R(Hx(_, _, _, _, _, _, _, gn), s2) -> R(gn, s2) }
+}
+fn set_gn(s: St, gn: Gn) -> St {
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, _), s2) -> set_hx(s2, Hx(rs, cr, d, ops, effs, dead, mu, gn)) }
+}
+fn push_site(s: St, g: GSite) -> St {
+  match get_gn(s) { R(Gn(k, gr, pg), s2) -> set_gn(s2, Gn(k, gr, append(pg, Cons(g, Nil)))) }
+}
+fn diag_count(s: St) -> R(Int) {
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> R(len(ds), St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx)) }
 }
 fn diag(s: St, code: String, msg: String, start: Int, end: Int) -> St {
   match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> St(sub, lv, cur, Cons(Diag("error", code, msg, start, end), ds), rs, cx, rw, gx, eq, hx) }
@@ -243,6 +265,9 @@ fn eq_resolved(s: St, t: Ty, o: Span2) -> R(Bool) {
   match t {
     TVar(v) -> R(False, mark(s, v, o))
     TFn(_, _, _) -> R(True, s)
+    // An operation caught by `with any` is data; its answer type is an
+    // index, not a field.
+    TCon("$Op", _) -> R(False, s)
     TCon(n, args) -> if n == "Buffer" || n == "Array" { R(True, s) } else {
       match eq_args(s, args, o, False) {
         R(any, s2) -> if any { R(True, s2) } else {
@@ -335,9 +360,9 @@ fn row_count(s: St) -> R(Int) {
 // Labels are kept sorted by name (a `BTreeMap`): `keep_lab` leaves a label
 // already there (the first along a chain is kept), `put_lab` replaces it
 // (a written row's last).
-fn lab_name(l: Lab) -> String { match l { Lab(n, _, _) -> n } }
+fn lab_name(l: Lab) -> String { match l { Lab(n, _, _, _) -> n } }
 fn has_lab(xs: List(Lab), n: String) -> Bool {
-  match xs { Nil -> False  Cons(Lab(m, _, _), rest) -> m == n || has_lab(rest, n) }
+  match xs { Nil -> False  Cons(Lab(m, _, _, _), rest) -> m == n || has_lab(rest, n) }
 }
 fn keep_lab(xs: List(Lab), l: Lab) -> List(Lab) {
   match xs {
@@ -368,7 +393,19 @@ fn labs_minus(xs: List(Lab), ys: List(Lab)) -> List(Lab) {
 // A row with its bound tails followed, the first label of each effect
 // along the chain kept (`resolve_row`).
 fn resolve_row(s: St, r: Row) -> R(Row) {
-  match r { Row(labs, t) -> follow_row(s, labs, t) }
+  match r {
+    Row(labs, t) -> match follow_row(s, labs, t) {
+      R(Row(ls, t2), s2) -> match resolve_labs(s2, ls, Nil) { R(ls2, s3) -> R(Row(ls2, t2), s3) }
+    }
+  }
+}
+// Each label's arguments resolved (they are types).
+fn resolve_labs(s: St, ls: List(Lab), acc: List(Lab)) -> R(List(Lab)) {
+  match ls {
+    Nil -> R(rev(acc), s)
+    Cons(Lab(n, Nil, a, b), rest) -> resolve_labs(s, rest, Cons(Lab(n, Nil, a, b), acc))
+    Cons(Lab(n, args, a, b), rest) -> match resolve_list(s, args, Nil) { R(args2, s2) -> resolve_labs(s2, rest, Cons(Lab(n, args2, a, b), acc)) }
+  }
 }
 fn follow_row(s: St, labs: List(Lab), t: Tail) -> R(Row) {
   match t {
@@ -400,7 +437,7 @@ fn bind_row(s: St, v: Int, r: Row, start: Int, end: Int) -> St {
   match row_bound(s, v) {
     R(Row(_, bt), s1) -> match bt {
       RNone -> match resolve_row(s1, r) {
-        R(Row(rl, rt), s2) -> if tail_eq(rt, ROpen(v)) {
+        R(Row(rl, rt), s2) -> if tail_eq(rt, ROpen(v)) || mentions_labs(v, rl) {
           set_row(diag(s2, "E0424", "cyclic effect row", start, end), v, Row(Nil, RError))
         } else {
           match is_phantom(s2, v) {
@@ -409,7 +446,7 @@ fn bind_row(s: St, v: Int, r: Row, start: Int, end: Int) -> St {
               match row_level(s4, v) {
                 R(lvl, s5) -> {
                   let s6 = match rt { ROpen(w) -> lower_row(s5, w, lvl)  _ -> s5 }
-                  set_row(s6, v, Row(rl, rt))
+                  set_row(lower_labs(s6, rl, lvl), v, Row(rl, rt))
                 }
               }
             }
@@ -428,23 +465,219 @@ type Ab { Ab(Tail, List(Lab)) }
 // `unify_row`: labels on one side only are absorbed by the other's tail,
 // then the residual tails are unified. Diagnostic-free but for E0424.
 fn unify_row(s: St, g1: Row, g2: Row, start: Int, end: Int) -> R(List(Lab)) {
+  shared_args(settle(settle(s, g1, start, end), g2, start, end), g1, g2, Nil, start, end)
+}
+// A label on both sides must agree on its arguments; unifying them can bind
+// either row's tail, so both rows are read again until no label is newly
+// shared. Then each side's labels the other lacks are absorbed by the
+// other's tail, and the residual tails unified.
+fn shared_args(s: St, g1: Row, g2: Row, done: List(String), start: Int, end: Int) -> R(List(Lab)) {
   match resolve_row(s, g1) {
     R(Row(l1, t1), s1) -> match resolve_row(s1, g2) {
       R(Row(l2, t2), s2) -> if tail_eq(t1, RError) || tail_eq(t2, RError) { R(Nil, s2) } else {
-        match absorb(s2, labs_minus(l1, l2), t2, start, end) {
-          R(Ab(n2, c1), s3) -> match rhead(s3, t1) {
-            R(t1n, s4) -> match absorb(s4, labs_minus(l2, l1), t1n, start, end) {
-              R(Ab(n1, c2), s5) -> match append(c1, c2) {
-                Nil -> match rhead(s5, n2) { R(n2b, s6) -> R(Nil, unify_tails(s6, n1, n2b, start, end)) }
-                c -> R(c, s5)
-              }
-            }
+        match shared_labs(l1, l2, done) {
+          Nil -> unify_rest(s2, l1, t1, l2, t2, start, end)
+          pairs -> shared_args(unify_pairs_args(s2, pairs, start, end), g1, g2, append(done, pair_names(pairs)), start, end)
+        }
+      }
+    }
+  }
+}
+type LabPair { LabPair(String, List(Ty), List(Ty)) }
+fn shared_labs(l1: List(Lab), l2: List(Lab), done: List(String)) -> List(LabPair) {
+  match l1 {
+    Nil -> Nil
+    Cons(Lab(n, a1, _, _), rest) -> if has_str(done, n) { shared_labs(rest, l2, done) } else {
+      match lab_get(l2, n) {
+        Yes(Lab(_, a2, _, _)) -> Cons(LabPair(n, a1, a2), shared_labs(rest, l2, done))
+        No -> shared_labs(rest, l2, done)
+      }
+    }
+  }
+}
+fn pair_names(ps: List(LabPair)) -> List(String) {
+  match ps { Nil -> Nil  Cons(LabPair(n, _, _), rest) -> Cons(n, pair_names(rest)) }
+}
+fn unify_pairs_args(s: St, ps: List(LabPair), start: Int, end: Int) -> St {
+  match ps {
+    Nil -> s
+    Cons(LabPair(n, a1, a2), rest) -> unify_pairs_args(unify_effect_args(s, n, a1, a2, start, end), rest, start, end)
+  }
+}
+fn unify_rest(s2: St, l1: List(Lab), t1: Tail, l2: List(Lab), t2: Tail, start: Int, end: Int) -> R(List(Lab)) {
+  match absorb(s2, labs_minus(l1, l2), t2, start, end) {
+    R(Ab(n2, c1), s3) -> match rhead(s3, t1) {
+      R(t1n, s4) -> match absorb(s4, labs_minus(l2, l1), t1n, start, end) {
+        R(Ab(n1, c2), s5) -> match append(c1, c2) {
+          Nil -> match rhead(s5, n2) { R(n2b, s6) -> R(Nil, unify_tails(s6, n1, n2b, start, end)) }
+          c -> R(c, s5)
+        }
+      }
+    }
+  }
+}
+// `unify_effect_args`: two arguments that cannot be one type (different
+// heads, or two ground types that differ) are E0423; others are unified.
+fn unify_effect_args(s: St, eff: String, a1: List(Ty), a2: List(Ty), start: Int, end: Int) -> St {
+  match a1 {
+    Nil -> s
+    Cons(x, xr) -> match a2 {
+      Nil -> s
+      Cons(y, yr) -> match resolve(s, x) {
+        R(rx, s2) -> match resolve(s2, y) {
+          R(ry, s3) -> {
+            let both = concrete(rx) && concrete(ry)
+            let conflict = !head_eq(rx, ry) || (ground(rx) && ground(ry))
+            if both && !ty_eq(rx, ry) && conflict {
+              diag(s3, "E0423", "effect row mismatch", start, end)
+            } else { unify_effect_args(unify(s3, x, y, start, end), eff, xr, yr, start, end) }
           }
         }
       }
     }
   }
 }
+fn concrete(t: Ty) -> Bool { match t { TVar(_) -> False  TErr -> False  _ -> True } }
+// A resolved type's head: its constructor and arity.
+fn head_eq(a: Ty, b: Ty) -> Bool {
+  match a {
+    TVar(_) -> match b { TVar(_) -> True  _ -> False }
+    TB(x) -> match b { TB(y) -> x == y  _ -> False }
+    TFn(p, _, _) -> match b { TFn(q, _, _) -> len(p) == len(q)  _ -> False }
+    TCon(n, xs) -> match b { TCon(m, ys) -> n == m && len(xs) == len(ys)  _ -> False }
+    TErr -> match b { TErr -> True  _ -> False }
+    TNone -> match b { TNone -> True  _ -> False }
+  }
+}
+fn ground(t: Ty) -> Bool {
+  match t {
+    TVar(_) -> False  TErr -> False  TB(_) -> True
+    TFn(ps, Row(ls, tl), r) -> tail_eq(tl, RClosed) && ground_labs(ls) && ground_list(ps) && ground(r)
+    TCon(_, xs) -> ground_list(xs)
+    TNone -> False
+  }
+}
+fn ground_list(xs: List(Ty)) -> Bool { match xs { Nil -> True  Cons(x, rest) -> ground(x) && ground_list(rest) } }
+fn ground_labs(ls: List(Lab)) -> Bool { match ls { Nil -> True  Cons(Lab(_, a, _, _), rest) -> ground_list(a) && ground_labs(rest) } }
+// Structural equality of resolved types, a label's span included (Rust's
+// derived `PartialEq`).
+fn ty_eq(a: Ty, b: Ty) -> Bool {
+  match a {
+    TVar(x) -> match b { TVar(y) -> x == y  _ -> False }
+    TB(x) -> match b { TB(y) -> x == y  _ -> False }
+    TFn(p, w, r) -> match b { TFn(q, v, u) -> ty_list_eq(p, q) && row_eq(w, v) && ty_eq(r, u)  _ -> False }
+    TCon(n, xs) -> match b { TCon(m, ys) -> n == m && ty_list_eq(xs, ys)  _ -> False }
+    TErr -> match b { TErr -> True  _ -> False }
+    TNone -> match b { TNone -> True  _ -> False }
+  }
+}
+fn ty_list_eq(xs: List(Ty), ys: List(Ty)) -> Bool {
+  match xs {
+    Nil -> match ys { Nil -> True  _ -> False }
+    Cons(x, xr) -> match ys { Nil -> False  Cons(y, yr) -> ty_eq(x, y) && ty_list_eq(xr, yr) }
+  }
+}
+fn row_eq(a: Row, b: Row) -> Bool {
+  match a { Row(la, ta) -> match b { Row(lb, tb) -> tail_eq(ta, tb) && labs_eq(la, lb) } }
+}
+fn labs_eq(xs: List(Lab), ys: List(Lab)) -> Bool {
+  match xs {
+    Nil -> match ys { Nil -> True  _ -> False }
+    Cons(Lab(n, a, s1, e1), xr) -> match ys {
+      Nil -> False
+      Cons(Lab(m, b, s2, e2), yr) -> n == m && s1 == s2 && e1 == e2 && ty_list_eq(a, b) && labs_eq(xr, yr)
+    }
+  }
+}
+// `settle_duplicates`: one effect met twice along a row's chain (`resolve_row`
+// keeps the first) has its arguments unified here, where rows meet.
+fn settle(s: St, r: Row, start: Int, end: Int) -> St {
+  match r {
+    Row(ls, t) -> match settle_walk(s, t, seen_of(ls), Nil, Nil) {
+      R(Walk(pairs, chain, tail), s2) -> {
+        let s3 = unify_pairs_args(s2, rev(pairs), start, end)
+        // Each variable of the chain bound straight to what it resolves to
+        // (path compression): its duplicates are settled, so keeping the
+        // first of each drops nothing, and no later read meets them again.
+        if len(chain) > 1 { compress(s3, chain, Nil, tail) } else { s3 }
+      }
+    }
+  }
+}
+// The chain's variables, the last first: each bound to its own labels and
+// those after it, over the chain's end.
+fn compress(s: St, chain: List(Int), suffix: List(Lab), tail: Tail) -> St {
+  match chain {
+    Nil -> s
+    Cons(v, rest) -> match row_bound(s, v) {
+      R(Row(bl, _), s2) -> {
+        let merged = keep_labs(bl, suffix)
+        compress(set_row(s2, v, Row(merged, tail)), rest, merged, tail)
+      }
+    }
+  }
+}
+type Walk { Walk(List(LabPair), List(Int), Tail) }
+fn seen_of(ls: List(Lab)) -> List(LabPair) {
+  match ls { Nil -> Nil  Cons(Lab(n, a, _, _), rest) -> Cons(LabPair(n, a, Nil), seen_of(rest)) }
+}
+fn seen_get(xs: List(LabPair), n: String) -> Maybe(List(Ty)) {
+  match xs { Nil -> No  Cons(LabPair(m, a, _), rest) -> if m == n { Yes(a) } else { seen_get(rest, n) } }
+}
+fn settle_walk(s: St, t: Tail, seen: List(LabPair), pairs: List(LabPair), chain: List(Int)) -> R(Walk) {
+  match t {
+    ROpen(v) -> match row_bound(s, v) {
+      R(Row(bl, bt), s2) -> match bt {
+        RNone -> R(Walk(pairs, chain, t), s2)
+        _ -> match settle_labs(s2, bl, seen, pairs) {
+          R(SeenPairs(seen2, pairs2), s3) -> settle_walk(s3, bt, seen2, pairs2, Cons(v, chain))
+        }
+      }
+    }
+    _ -> R(Walk(pairs, chain, t), s)
+  }
+}
+type SeenPairs { SeenPairs(List(LabPair), List(LabPair)) }
+fn settle_labs(s: St, bl: List(Lab), seen: List(LabPair), pairs: List(LabPair)) -> R(SeenPairs) {
+  match bl {
+    Nil -> R(SeenPairs(seen, pairs), s)
+    Cons(Lab(k, args, _, _), rest) -> match seen_get(seen, k) {
+      Yes(first) -> match differ(s, first, args) {
+        R(d, s2) -> settle_labs(s2, rest, seen, if d { Cons(LabPair(k, first, args), pairs) } else { pairs })
+      }
+      No -> settle_labs(s, rest, Cons(LabPair(k, args, Nil), seen), pairs)
+    }
+  }
+}
+// Same arity and some argument resolving differently.
+fn differ(s: St, a: List(Ty), b: List(Ty)) -> R(Bool) {
+  if len(a) != len(b) { R(False, s) } else { differ_any(s, a, b) }
+}
+fn differ_any(s: St, a: List(Ty), b: List(Ty)) -> R(Bool) {
+  match a {
+    Nil -> R(False, s)
+    Cons(x, xr) -> match b {
+      Nil -> R(False, s)
+      Cons(y, yr) -> match resolve(s, x) {
+        R(rx, s2) -> match resolve(s2, y) { R(ry, s3) -> if ty_eq(rx, ry) { differ_any(s3, xr, yr) } else { R(True, s3) } }
+      }
+    }
+  }
+}
+// Whether row variable `v` is in `t`: a tail, or inside a label's arguments
+// (`mentions_row`).
+fn mentions_row(s: St, v: Int, t: Ty) -> R(Bool) {
+  match resolve(s, t) { R(rt, s2) -> R(mentions(v, rt), s2) }
+}
+fn mentions(v: Int, t: Ty) -> Bool {
+  match t {
+    TFn(ps, Row(ls, tl), r) -> tail_eq(tl, ROpen(v)) || mentions_labs(v, ls) || mentions_list(v, ps) || mentions(v, r)
+    TCon(_, xs) -> mentions_list(v, xs)
+    _ -> False
+  }
+}
+fn mentions_list(v: Int, xs: List(Ty)) -> Bool { match xs { Nil -> False  Cons(x, rest) -> mentions(v, x) || mentions_list(v, rest) } }
+fn mentions_labs(v: Int, ls: List(Lab)) -> Bool { match ls { Nil -> False  Cons(Lab(_, a, _, _), rest) -> mentions_list(v, a) || mentions_labs(v, rest) } }
 // `absorb`: an open tail grows by `v := {extra} | fresh`, the fresh tail
 // phantom if `v` was; a closed one cannot.
 fn absorb(s: St, extra: List(Lab), t: Tail, start: Int, end: Int) -> R(Ab) {
@@ -490,32 +723,68 @@ fn surface(r: R(List(Lab))) -> St {
   match r {
     R(c, s) -> match c {
       Nil -> s
-      Cons(Lab(_, a, b), _) -> diag(s, "E0423", "effect row mismatch", a, b)
+      Cons(Lab(_, _, a, b), _) -> diag(s, "E0423", "effect row mismatch", a, b)
     }
   }
 }
 // `op ∈ amb` (`add_effect`): the ambient against `{op} | fresh`.
-fn add_effect(s: St, amb: Int, name: String, start: Int, end: Int) -> R(List(Lab)) {
+fn add_effect(s: St, amb: Int, name: String, start: Int, end: Int) -> R(List(Lab)) { add_effect_args(s, amb, name, Nil, start, end) }
+fn add_effect_args(s: St, amb: Int, name: String, args: List(Ty), start: Int, end: Int) -> R(List(Lab)) {
   match fresh_row(s) {
-    R(f, s2) -> unify_row(s2, ropen(amb), Row(Cons(Lab(name, start, end), Nil), ROpen(f)), start, end)
+    R(f, s2) -> unify_row(s2, ropen(amb), Row(Cons(Lab(name, args, start, end), Nil), ROpen(f)), start, end)
+  }
+}
+// The levels inside a resolved row's labels' arguments (`lower_row_walk`).
+fn lower_labs(s: St, ls: List(Lab), lvl: Int) -> St {
+  match ls {
+    Nil -> s
+    Cons(Lab(_, Nil, _, _), rest) -> lower_labs(s, rest, lvl)
+    Cons(Lab(_, args, _, _), rest) -> {
+      let t = TCon("", args)
+      lower_labs(lower_rows(lower_vars(s, rev(free_vars(t, Nil)), lvl), rev(free_rows(t, Nil)), lvl), rest, lvl)
+    }
   }
 }
 // `amb ⊇ eff` (`add_row`): each label at its own span, stopping at the
 // first conflict, then the tail relayed.
+// A label whose arguments mention the row's own tail (`{Async(e) | e}`)
+// cannot be inside that tail: such a row is unified whole, with the
+// ambient's own such labels.
 fn add_row(s: St, amb: Int, eff: Row, start: Int, end: Int) -> R(List(Lab)) {
-  match resolve_row(s, eff) {
-    R(Row(ls, t), s1) -> match add_labs(s1, amb, ls) {
-      R(c, s2) -> match c {
-        Nil -> match t { ROpen(rho) -> unify_row(s2, ropen(amb), ropen(rho), start, end)  _ -> R(Nil, s2) }
-        _ -> R(c, s2)
+  match resolve_row(settle(s, eff, start, end), eff) {
+    R(Row(ls, t), s1) -> match t {
+      ROpen(rho) -> match resolve_row(s1, ropen(amb)) {
+        R(Row(al, _), s1b) -> {
+          let own = mentions_labs(rho, ls)
+          let theirs = theirs_labs(al, ls, rho)
+          match theirs {
+            Nil -> if own { unify_row(s1b, ropen(amb), Row(ls, t), start, end) } else { add_row_labs(s1b, amb, ls, t, start, end) }
+            _ -> unify_row(s1b, ropen(amb), Row(keep_labs(ls, theirs), t), start, end)
+          }
+        }
       }
+      _ -> add_row_labs(s1, amb, ls, t, start, end)
+    }
+  }
+}
+fn theirs_labs(al: List(Lab), ls: List(Lab), rho: Int) -> List(Lab) {
+  match al {
+    Nil -> Nil
+    Cons(Lab(k, a, x, y), rest) -> if !has_lab(ls, k) && mentions_list(rho, a) { Cons(Lab(k, a, x, y), theirs_labs(rest, ls, rho)) } else { theirs_labs(rest, ls, rho) }
+  }
+}
+fn add_row_labs(s1: St, amb: Int, ls: List(Lab), t: Tail, start: Int, end: Int) -> R(List(Lab)) {
+  match add_labs(s1, amb, ls) {
+    R(c, s2) -> match c {
+      Nil -> match t { ROpen(rho) -> unify_row(s2, ropen(amb), ropen(rho), start, end)  _ -> R(Nil, s2) }
+      _ -> R(c, s2)
     }
   }
 }
 fn add_labs(s: St, amb: Int, ls: List(Lab)) -> R(List(Lab)) {
   match ls {
     Nil -> R(Nil, s)
-    Cons(Lab(n, a, b), rest) -> match add_effect(s, amb, n, a, b) {
+    Cons(Lab(n, args, a, b), rest) -> match add_effect_args(s, amb, n, args, a, b) {
       R(c, s2) -> match c { Nil -> add_labs(s2, amb, rest)  _ -> R(c, s2) }
     }
   }
@@ -556,10 +825,13 @@ fn resolve_list(s: St, xs: List(Ty), acc: List(Ty)) -> R(List(Ty)) {
 fn free_vars(t: Ty, acc: List(Int)) -> List(Int) {
   match t {
     TVar(v) -> if has_int(acc, v) { acc } else { Cons(v, acc) }
-    TFn(ps, _, r) -> free_vars(r, free_list(ps, acc))
+    TFn(ps, Row(ls, _), r) -> free_vars(r, lab_vars(ls, free_list(ps, acc)))
     TCon(_, args) -> free_list(args, acc)
     _ -> acc
   }
+}
+fn lab_vars(ls: List(Lab), acc: List(Int)) -> List(Int) {
+  match ls { Nil -> acc  Cons(Lab(_, args, _, _), rest) -> lab_vars(rest, free_list(args, acc)) }
 }
 fn free_list(xs: List(Ty), acc: List(Int)) -> List(Int) {
   match xs { Nil -> acc  Cons(x, rest) -> free_list(rest, free_vars(x, acc)) }
@@ -571,11 +843,15 @@ fn free_rows(t: Ty, acc: List(Int)) -> List(Int) {
     TFn(ps, rw, r) -> {
       let a1 = free_rows_list(ps, acc)
       let a2 = match rw { Row(_, ROpen(v)) -> if has_int(a1, v) { a1 } else { Cons(v, a1) }  _ -> a1 }
-      free_rows(r, a2)
+      free_rows(r, lab_rows(row_labs(rw), a2))
     }
     TCon(_, args) -> free_rows_list(args, acc)
     _ -> acc
   }
+}
+fn row_labs(r: Row) -> List(Lab) { match r { Row(ls, _) -> ls } }
+fn lab_rows(ls: List(Lab), acc: List(Int)) -> List(Int) {
+  match ls { Nil -> acc  Cons(Lab(_, args, _, _), rest) -> lab_rows(rest, free_rows_list(args, acc)) }
 }
 fn free_rows_list(xs: List(Ty), acc: List(Int)) -> List(Int) {
   match xs { Nil -> acc  Cons(x, rest) -> free_rows_list(rest, free_rows(x, acc)) }
@@ -590,10 +866,13 @@ fn rows_in(s: St, ts: List(Ty), acc: List(Int)) -> R(List(Int)) {
 fn occurs(v: Int, t: Ty) -> Bool {
   match t {
     TVar(u) -> u == v
-    TFn(ps, _, r) -> occurs_list(v, ps) || occurs(v, r)
+    TFn(ps, Row(ls, _), r) -> occurs_list(v, ps) || occurs(v, r) || occurs_labs(v, ls)
     TCon(_, args) -> occurs_list(v, args)
     _ -> False
   }
+}
+fn occurs_labs(v: Int, ls: List(Lab)) -> Bool {
+  match ls { Nil -> False  Cons(Lab(_, args, _, _), rest) -> occurs_list(v, args) || occurs_labs(v, rest) }
 }
 fn occurs_list(v: Int, xs: List(Ty)) -> Bool {
   match xs { Nil -> False  Cons(x, rest) -> occurs(v, x) || occurs_list(v, rest) }
@@ -719,27 +998,55 @@ fn subst(t: Ty, m: List(Pair), rm: List(RPair)) -> Ty {
     TVar(v) -> match subst_get(m, v) { Yes(f) -> f  No -> t }
     TFn(ps, rw, r) -> {
       let rw2 = match rw { Row(ls, ROpen(v)) -> { let w = rsubst_get(rm, v)  if w < 0 { rw } else { Row(ls, ROpen(w)) } }  _ -> rw }
-      TFn(subst_list(ps, m, rm, Nil), rw2, subst(r, m, rm))
+      TFn(subst_list(ps, m, rm, Nil), subst_labs(rw2, m, rm), subst(r, m, rm))
     }
     TCon(n, args) -> TCon(n, subst_list(args, m, rm, Nil))
     _ -> t
   }
 }
+fn subst_labs(r: Row, m: List(Pair), rm: List(RPair)) -> Row {
+  match r { Row(ls, t) -> Row(subst_labs_list(ls, m, rm), t) }
+}
+fn subst_labs_list(ls: List(Lab), m: List(Pair), rm: List(RPair)) -> List(Lab) {
+  match ls {
+    Nil -> Nil
+    Cons(Lab(n, Nil, a, b), rest) -> Cons(Lab(n, Nil, a, b), subst_labs_list(rest, m, rm))
+    Cons(Lab(n, args, a, b), rest) -> Cons(Lab(n, subst_list(args, m, rm, Nil), a, b), subst_labs_list(rest, m, rm))
+  }
+}
 fn subst_list(xs: List(Ty), m: List(Pair), rm: List(RPair), acc: List(Ty)) -> List(Ty) {
   match xs { Nil -> rev(acc)  Cons(x, rest) -> subst_list(rest, m, rm, Cons(subst(x, m, rm), acc)) }
 }
-// A quantified phantom row instantiates phantom (`instantiate`).
-fn instantiate(s: St, sc: Scheme) -> R(Ty) {
+// A quantified phantom row instantiates phantom (`instantiate`). The span
+// is the expression being typed (Rust's `cur_span`: a variable's own, or a
+// call's for its callee), where a generically handled row is checked again;
+// a constructor's scheme quantifies no such row.
+fn instantiate(s: St, sc: Scheme) -> R(Ty) { instantiate_at(s, sc, 0, 0) }
+fn instantiate_at(s: St, sc: Scheme, a: Int, b: Int) -> R(Ty) {
   match sc {
     Scheme(vars, rvars, t) -> match vars {
-      Nil -> match rvars { Nil -> R(t, s)  _ -> instantiate_with(s, vars, rvars, t) }
-      _ -> instantiate_with(s, vars, rvars, t)
+      Nil -> match rvars { Nil -> R(t, s)  _ -> instantiate_with(s, vars, rvars, t, a, b) }
+      _ -> instantiate_with(s, vars, rvars, t, a, b)
     }
   }
 }
-fn instantiate_with(s: St, vars: List(Int), rvars: List(Int), t: Ty) -> R(Ty) {
+fn instantiate_with(s: St, vars: List(Int), rvars: List(Int), t: Ty, a: Int, b: Int) -> R(Ty) {
   match fresh_map(s, vars, Nil) {
-    R(m, s2) -> match fresh_rmap(s2, rvars, Nil) { R(rm, s3) -> R(subst(t, m, rm), s3) }
+    R(m, s2) -> match fresh_rmap(s2, rvars, Nil) { R(rm, s3) -> R(subst(t, m, rm), generic_sites(s3, rvars, rm, t, a, b)) }
+  }
+}
+// A generically handled row quantified by a scheme is checked again where
+// the scheme is instantiated, unless it is the function's own row (a
+// forwarding handler's, the caller's ambient after the call).
+fn generic_sites(s: St, rvars: List(Int), rm: List(RPair), t: Ty, a: Int, b: Int) -> St {
+  match rvars {
+    Nil -> s
+    Cons(v, rest) -> match get_gn(s) {
+      R(Gn(_, gr, _), s2) -> {
+        let latent = match t { TFn(_, Row(_, ROpen(w)), _) -> w == v  _ -> False }
+        generic_sites(if has_int(gr, v) && !latent { push_site(s2, GSite(Nil, ROpen(rsubst_get(rm, v)), False, a, b)) } else { s2 }, rest, rm, t, a, b)
+      }
+    }
   }
 }
 fn fresh_map(s: St, vars: List(Int), acc: List(Pair)) -> R(List(Pair)) {
@@ -787,7 +1094,7 @@ fn above_rows(s: St, vs: List(Int), lvl: Int, kept: List(Int), acc: List(Int)) -
 fn kept_vars(s: St) -> R(List(Int)) {
   match get_cx(s) {
     R(Ctx(avs, _, _, _, _, _), s2) -> match kept_from(s2, avs, Nil) {
-      R(acc, s3) -> match get_hx(s3) { R(Hx(rs, _, _, _, _, _, _), s4) -> kept_resume_vars(s4, rs, acc) }
+      R(acc, s3) -> match get_hx(s3) { R(Hx(rs, _, _, _, _, _, _, _), s4) -> kept_resume_vars(s4, rs, acc) }
     }
   }
 }
@@ -796,8 +1103,13 @@ fn kept_vars(s: St) -> R(List(Int)) {
 fn kept_resume_vars(s: St, rs: List(Resume), acc: List(Int)) -> R(List(Int)) {
   match rs {
     Nil -> R(acc, s)
-    Cons(Resume(arg, result, _, _, _, _, _), rest) -> match resolve(s, arg) {
-      R(a, s2) -> match resolve(s2, result) { R(r, s3) -> kept_resume_vars(s3, rest, free_vars(r, free_vars(a, acc))) }
+    Cons(Resume(arg, result, rb, rr, _, _, rc), rest) -> match resolve(s, arg) {
+      R(a, s2) -> match resolve(s2, result) {
+        // A row's labels' arguments are types too.
+        R(r, s3) -> match resolve_list(s3, Cons(phantom(ropen(rb)), Cons(phantom(ropen(rr)), Cons(phantom(ropen(rc)), Nil))), Nil) {
+          R(rows, s4) -> kept_resume_vars(s4, rest, free_list(rows, free_vars(r, free_vars(a, acc))))
+        }
+      }
     }
   }
 }
@@ -806,8 +1118,8 @@ fn kept_resume_rows(s: St, rs: List(Resume), acc: List(Int)) -> R(List(Int)) {
     Nil -> R(acc, s)
     Cons(Resume(arg, result, b, r, _, _, c), rest) -> match resolve(s, arg) {
       R(a, s2) -> match resolve(s2, result) {
-        R(rr, s3) -> match kept_tails(s3, Cons(b, Cons(r, Cons(c, Nil))), free_rows(rr, free_rows(a, acc))) {
-          R(acc2, s4) -> kept_resume_rows(s4, rest, acc2)
+        R(rr, s3) -> match resolve_list(s3, Cons(phantom(ropen(b)), Cons(phantom(ropen(r)), Cons(phantom(ropen(c)), Nil))), Nil) {
+          R(rows, s4) -> kept_resume_rows(s4, rest, free_rows_list(rows, free_rows(rr, free_rows(a, acc))))
         }
       }
     }
@@ -835,11 +1147,23 @@ fn kept_rows(s: St) -> R(List(Int)) {
       R(acc, s3) -> match get_gx(s3) {
         R(Gx(_, _, _, _, ds, _, _), s4) -> match kept_deferred(s4, ds, acc) {
           R(acc2, s5) -> match get_hx(s5) {
-            R(Hx(rs, crs, _, _, _, _, _), s6) -> match kept_resume_rows(s6, rs, acc2) { R(acc3, s7) -> kept_tails(s7, crs, acc3) }
+            R(Hx(rs, crs, _, _, _, _, _, Gn(_, _, pg)), s6) -> match kept_resume_rows(s6, rs, acc2) {
+              R(acc3, s7) -> match kept_tails(s7, crs, acc3) { R(acc4, s8) -> kept_sites(s8, pg, acc4) }
+            }
           }
         }
       }
       }
+    }
+  }
+}
+// A row a `with any` handler handles, not yet checked for data, stays
+// monomorphic in a local `let`.
+fn kept_sites(s: St, sites: List(GSite), acc: List(Int)) -> R(List(Int)) {
+  match sites {
+    Nil -> R(acc, s)
+    Cons(GSite(_, t, fw, _, _), rest) -> if fw { kept_sites(s, rest, acc) } else {
+      match rhead(s, t) { R(h, s2) -> kept_sites(s2, rest, match h { ROpen(v) -> Cons(v, acc)  _ -> acc }) }
     }
   }
 }
@@ -1088,15 +1412,40 @@ fn phantom(r: Row) -> Ty { TFn(Nil, r, TCon("$Row", Nil)) }
 fn ann_labels(s: St, xs: List(LabelAnn), acc: List(Lab)) -> R(List(Lab)) {
   match xs {
     Nil -> R(acc, s)
-    Cons(LabelAnn(Sp(name, a, b), _), rest) -> match is_effect(s, name) {
-      R(known, s2) -> if known || name == "IO" { ann_labels(s2, rest, put_lab(acc, Lab(name, a, b))) } else {
+    Cons(LabelAnn(Sp(name, a, b), written), rest) -> match is_effect(s, name) {
+      R(known, s2) -> if known || name == "IO" {
+        match effect_kinds(s2) {
+          R(ek, s3) -> {
+            let arity = len(kind_params(ek, name))
+            match written {
+              // Unwritten: a fresh variable for each.
+              No -> match fresh_list(s3, arity, Nil) { R(ts, s4) -> ann_labels(s4, rest, put_lab(acc, Lab(name, ts, a, b))) }
+              Yes(args) -> if len(args) != arity {
+                ann_labels(diag(s3, "E0400", "effect `" <> name <> "` takes " <> int.to_string(arity) <> " argument(s), found " <> int.to_string(len(args)), a, b), rest, acc)
+              } else {
+                match ann_label_args(s3, ek, name, args, 0, Nil) { R(ts, s4) -> ann_labels(s4, rest, put_lab(acc, Lab(name, ts, a, b))) }
+              }
+            }
+          }
+        }
+      } else {
         ann_labels(diag(s2, "E0432", "unknown effect `" <> name <> "`", a, b), rest, acc)
       }
     }
   }
 }
+fn ann_label_args(s: St, ek: List(Kind), eff: String, xs: List(Sp(TypeAnn)), j: Int, acc: List(Ty)) -> R(List(Ty)) {
+  match xs {
+    Nil -> R(rev(acc), s)
+    Cons(x, rest) -> {
+      let param = param_name(ek, eff, j)
+      let got = if kind_at(ek, eff, j) { ann_row_arg(s, x, eff, param) } else { ann_type_arg(s, x, eff, param) }
+      match got { R(t, s2) -> ann_label_args(s2, ek, eff, rest, j + 1, Cons(t, acc)) }
+    }
+  }
+}
 fn is_effect(s: St, name: String) -> R(Bool) {
-  match get_hx(s) { R(Hx(_, _, _, _, effs, _, _), s2) -> R(has_str(effs, name), s2) }
+  match get_hx(s) { R(Hx(_, _, _, _, effs, _, _, _), s2) -> R(has_str(effs, name), s2) }
 }
 fn last_ann(xs: List(Sp(TypeAnn))) -> Sp(TypeAnn) {
   match xs {
@@ -1132,7 +1481,9 @@ fn check_ann(s: St, ann: Maybe(Sp(TypeAnn)), t: Ty, cov: Bool) -> St {
 // declaration's (`DeclCx`: its name, its type parameters, its row
 // parameters); a base type's arguments are not looked at; a wrong count of
 // arguments is reported and the arguments still read.
-type DeclCx { DeclCx(String, List(Named), List(Arity)) }
+// An effect's own label written without arguments in its declaration takes
+// the declaration's own arguments (`own`).
+type DeclCx { DeclCx(String, List(Named), List(Arity), Maybe(List(Ty))) }
 fn elaborate_adt(s: St, a: Sp(TypeAnn), cx: DeclCx) -> R(Ty) {
   match a {
     Sp(_, start, end) -> if is_row_arg(a) { R(TErr, diag(s, "E0400", row_not_here(), start, end)) } else { elaborate_adt_inner(s, a, cx) }
@@ -1149,11 +1500,11 @@ fn elaborate_adt_inner(s: St, a: Sp(TypeAnn), cx: DeclCx) -> R(Ty) {
           R(ps, s2) -> match elaborate_adt(s2, last_ann(args), cx) {
             R(ret, s3) -> match written {
               No -> R(TFn(ps, pure_row(), ret), s3)
-              Yes(RowAnn(labels, tail)) -> match ann_labels(s3, labels, Nil) {
+              Yes(RowAnn(labels, tail)) -> match adt_labels(s3, labels, cx, Nil) {
                 R(ls, s4) -> match tail {
                   No -> R(TFn(ps, Row(ls, RClosed), ret), s4)
                   Yes(Sp(v, vs, ve)) -> match cx {
-                    DeclCx(decl, _, re) -> match arity_get(re, v) {
+                    DeclCx(decl, _, re, _) -> match arity_get(re, v) {
                       Yes(rv) -> R(TFn(ps, Row(ls, ROpen(rv)), ret), s4)
                       No -> R(TFn(ps, Row(ls, RClosed), ret), undeclared_row_var(s4, v, vs, ve))
                     }
@@ -1165,7 +1516,7 @@ fn elaborate_adt_inner(s: St, a: Sp(TypeAnn), cx: DeclCx) -> R(Ty) {
         }
       } else {
         match cx {
-          DeclCx(decl, pe, re) -> {
+          DeclCx(decl, pe, re, _) -> {
             let p = if n == 0 { named_get(pe, name) } else { No }
             match p {
               Yes(t) -> R(t, s)
@@ -1193,6 +1544,51 @@ fn elaborate_adt_inner(s: St, a: Sp(TypeAnn), cx: DeclCx) -> R(Ty) {
     }
   }
 }
+// A declaration's written labels: each a declared effect or `IO`, with
+// exactly its arguments (none written: the effect's own in its own
+// declaration).
+fn adt_labels(s: St, xs: List(LabelAnn), cx: DeclCx, acc: List(Lab)) -> R(List(Lab)) {
+  match xs {
+    Nil -> R(acc, s)
+    Cons(LabelAnn(Sp(name, a, b), written), rest) -> if name == "IO" { adt_labels(s, rest, cx, put_lab(acc, Lab(name, Nil, a, b))) } else {
+      match effect_kinds(s) {
+        R(ek, s2) -> if !has_kind(ek, name) {
+          adt_labels(diag(s2, "E0432", "unknown effect `" <> name <> "`", a, b), rest, cx, acc)
+        } else {
+          let arity = len(kind_params(ek, name))
+          match written {
+            No -> if arity == 0 { adt_labels(s2, rest, cx, put_lab(acc, Lab(name, Nil, a, b))) } else {
+              match cx {
+                DeclCx(decl, _, _, Yes(own)) -> if decl == name { adt_labels(s2, rest, cx, put_lab(acc, Lab(name, own, a, b))) } else {
+                  adt_labels(diag(s2, "E0432", "effect `" <> name <> "` takes type arguments: write them, `" <> name <> "(..)`", a, b), rest, cx, acc)
+                }
+                _ -> adt_labels(diag(s2, "E0432", "effect `" <> name <> "` takes type arguments: write them, `" <> name <> "(..)`", a, b), rest, cx, acc)
+              }
+            }
+            Yes(args) -> if len(args) != arity {
+              adt_labels(diag(s2, "E0400", "effect `" <> name <> "` takes " <> int.to_string(arity) <> " argument(s), found " <> int.to_string(len(args)), a, b), rest, cx, acc)
+            } else {
+              match adt_label_args(s2, ek, name, args, 0, cx, Nil) { R(ts, s3) -> adt_labels(s3, rest, cx, put_lab(acc, Lab(name, ts, a, b))) }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+fn has_kind(kd: List(Kind), name: String) -> Bool {
+  match kd { Nil -> False  Cons(Kind(n, _), rest) -> n == name || has_kind(rest, name) }
+}
+fn adt_label_args(s: St, ek: List(Kind), eff: String, xs: List(Sp(TypeAnn)), j: Int, cx: DeclCx, acc: List(Ty)) -> R(List(Ty)) {
+  match xs {
+    Nil -> R(rev(acc), s)
+    Cons(x, rest) -> {
+      let param = param_name(ek, eff, j)
+      let got = if kind_at(ek, eff, j) { decl_row_arg(s, x, cx, eff, param) } else { decl_type_arg(s, x, cx, eff, param) }
+      match got { R(t, s2) -> adt_label_args(s2, ek, eff, rest, j + 1, cx, Cons(t, acc)) }
+    }
+  }
+}
 fn has_arity(xs: List(Arity), name: String) -> Bool {
   match arity_get(xs, name) { Yes(_) -> True  No -> False }
 }
@@ -1217,7 +1613,7 @@ fn adt_args(s: St, decl: String, xs: List(Sp(TypeAnn)), j: Int, cx: DeclCx, acc:
 fn decl_row_arg(s: St, a: Sp(TypeAnn), cx: DeclCx, decl: String, param: String) -> R(Ty) {
   if is_row_arg(a) { elaborate_adt_inner(s, a, cx) } else {
     match cx {
-      DeclCx(own, pe, re) -> match a {
+      DeclCx(own, pe, re, _) -> match a {
         Sp(TypeAnn(n, Nil, No), start, end) -> if is_lower(n) {
           match arity_get(re, n) {
             Yes(rv) -> R(phantom(ropen(rv)), s)
@@ -1288,7 +1684,10 @@ fn add_adt_fields(s: St, result: Ty, vars: List(Int), fts: List(Ty)) -> St {
 // another declaration's row parameter. A fixpoint: a parameter only turns
 // from type to row.
 type KindPass { KindPass(List(Kind), Bool) }
-fn decl_kinds(decls: List(Sp(Decl))) -> List(Kind) { kinds_fix(decls, kinds_init(decls, Nil)) }
+// The declared types' kinds and the effects'.
+type Kinds { Kinds(List(Kind), List(Kind)) }
+type KindsPass { KindsPass(Kinds, Bool) }
+fn decl_kinds(decls: List(Sp(Decl))) -> Kinds { kinds_fix(decls, Kinds(kinds_init(decls, Nil), effect_kinds_init(decls, Nil))) }
 fn kinds_init(decls: List(Sp(Decl)), acc: List(Kind)) -> List(Kind) {
   match decls {
     Nil -> rev(acc)
@@ -1296,38 +1695,55 @@ fn kinds_init(decls: List(Sp(Decl)), acc: List(Kind)) -> List(Kind) {
     Cons(_, rest) -> kinds_init(rest, acc)
   }
 }
+fn effect_kinds_init(decls: List(Sp(Decl)), acc: List(Kind)) -> List(Kind) {
+  match decls {
+    Nil -> rev(acc)
+    Cons(Sp(DEffect(name, params, _, _), _, _), rest) -> effect_kinds_init(rest, Cons(Kind(name, kps(params)), acc))
+    Cons(_, rest) -> effect_kinds_init(rest, acc)
+  }
+}
 fn kps(ps: List(String)) -> List(KP) {
   match ps { Nil -> Nil  Cons(p, rest) -> Cons(KP(p, False), kps(rest)) }
 }
-fn kinds_fix(decls: List(Sp(Decl)), kd: List(Kind)) -> List(Kind) {
+fn kinds_fix(decls: List(Sp(Decl)), kd: Kinds) -> Kinds {
   match kinds_pass(decls, kd, False) {
-    KindPass(kd2, changed) -> if changed { kinds_fix(decls, kd2) } else { kd2 }
+    KindsPass(kd2, changed) -> if changed { kinds_fix(decls, kd2) } else { kd2 }
   }
 }
-fn kinds_pass(decls: List(Sp(Decl)), kd: List(Kind), changed: Bool) -> KindPass {
+fn kinds_pass(decls: List(Sp(Decl)), kd: Kinds, changed: Bool) -> KindsPass {
   match decls {
-    Nil -> KindPass(kd, changed)
-    Cons(Sp(DType(name, params, _, variants), _, _), rest) -> {
-      let rows = variant_uses(variants, params, kd, Nil)
-      match mark_kinds(kd, name, rows) {
-        KindPass(kd2, c) -> kinds_pass(rest, kd2, changed || c)
+    Nil -> KindsPass(kd, changed)
+    Cons(Sp(DType(name, params, _, variants), _, _), rest) -> match kd {
+      Kinds(ts, es) -> match mark_kinds(ts, name, variant_uses(variants, params, kd, Nil)) {
+        KindPass(ts2, c) -> kinds_pass(rest, Kinds(ts2, es), changed || c)
+      }
+    }
+    Cons(Sp(DEffect(name, params, _, ops), _, _), rest) -> match kd {
+      Kinds(ts, es) -> match mark_kinds(es, name, op_uses(ops, params, kd, Nil)) {
+        KindPass(es2, c) -> kinds_pass(rest, Kinds(ts, es2), changed || c)
       }
     }
     Cons(_, rest) -> kinds_pass(rest, kd, changed)
   }
 }
-fn variant_uses(vs: List(Sp(VariantDecl)), params: List(String), kd: List(Kind), out: List(String)) -> List(String) {
+fn op_uses(ops: List(Sp(OpSig)), params: List(String), kd: Kinds, out: List(String)) -> List(String) {
+  match ops {
+    Nil -> out
+    Cons(Sp(OpSig(_, _, ptys, ret), _, _), rest) -> op_uses(rest, params, kd, row_uses(ret, params, kd, anns_uses(ptys, params, kd, out)))
+  }
+}
+fn variant_uses(vs: List(Sp(VariantDecl)), params: List(String), kd: Kinds, out: List(String)) -> List(String) {
   match vs {
     Nil -> out
     Cons(Sp(VariantDecl(_, fields), _, _), rest) -> variant_uses(rest, params, kd, anns_uses(fields, params, kd, out))
   }
 }
-fn anns_uses(xs: List(Sp(TypeAnn)), params: List(String), kd: List(Kind), out: List(String)) -> List(String) {
+fn anns_uses(xs: List(Sp(TypeAnn)), params: List(String), kd: Kinds, out: List(String)) -> List(String) {
   match xs { Nil -> out  Cons(x, rest) -> anns_uses(rest, params, kd, row_uses(x, params, kd, out)) }
 }
 // `row_uses`: the parameters (of `params`) an annotation uses where a row
 // goes.
-fn row_uses(a: Sp(TypeAnn), params: List(String), kd: List(Kind), out: List(String)) -> List(String) {
+fn row_uses(a: Sp(TypeAnn), params: List(String), kd: Kinds, out: List(String)) -> List(String) {
   match a {
     Sp(TypeAnn(name, args, written), _, _) -> {
       let o1 = match written {
@@ -1341,19 +1757,32 @@ fn row_uses(a: Sp(TypeAnn), params: List(String), kd: List(Kind), out: List(Stri
     }
   }
 }
-fn label_uses(ls: List(LabelAnn), params: List(String), kd: List(Kind), out: List(String)) -> List(String) {
+fn label_uses(ls: List(LabelAnn), params: List(String), kd: Kinds, out: List(String)) -> List(String) {
   match ls {
     Nil -> out
-    Cons(LabelAnn(_, Yes(xs)), rest) -> label_uses(rest, params, kd, anns_uses(xs, params, kd, out))
+    Cons(LabelAnn(Sp(n, _, _), Yes(xs)), rest) -> label_uses(rest, params, kd, label_arg_uses(n, xs, 0, params, kd, out))
     Cons(_, rest) -> label_uses(rest, params, kd, out)
   }
 }
-fn arg_uses(name: String, args: List(Sp(TypeAnn)), j: Int, params: List(String), kd: List(Kind), out: List(String)) -> List(String) {
+fn label_arg_uses(eff: String, xs: List(Sp(TypeAnn)), j: Int, params: List(String), kd: Kinds, out: List(String)) -> List(String) {
+  match xs {
+    Nil -> out
+    Cons(x, rest) -> match kd {
+      Kinds(_, es) -> {
+        let o = if kind_at(es, eff, j) { bare_use(x, params, out) } else { out }
+        label_arg_uses(eff, rest, j + 1, params, kd, row_uses(x, params, kd, o))
+      }
+    }
+  }
+}
+fn arg_uses(name: String, args: List(Sp(TypeAnn)), j: Int, params: List(String), kd: Kinds, out: List(String)) -> List(String) {
   match args {
     Nil -> out
-    Cons(x, rest) -> {
-      let o = if name != "fn" && kind_at(kd, name, j) { bare_use(x, params, out) } else { out }
-      arg_uses(name, rest, j + 1, params, kd, row_uses(x, params, kd, o))
+    Cons(x, rest) -> match kd {
+      Kinds(ts, _) -> {
+        let o = if name != "fn" && kind_at(ts, name, j) { bare_use(x, params, out) } else { out }
+        arg_uses(name, rest, j + 1, params, kd, row_uses(x, params, kd, o))
+      }
     }
   }
 }
@@ -1395,23 +1824,29 @@ fn param_name(kd: List(Kind), name: String, j: Int) -> String {
   match kp_at(kind_params(kd, name), j) { Yes(KP(p, _)) -> p  No -> "?" }
 }
 fn get_kinds(s: St) -> R(List(Kind)) {
-  match get_cx(s) { R(Ctx(_, _, _, _, _, kd), s2) -> R(kd, s2) }
+  match get_cx(s) { R(Ctx(_, _, _, _, _, Kinds(kd, _)), s2) -> R(kd, s2) }
+}
+fn effect_kinds(s: St) -> R(List(Kind)) {
+  match get_cx(s) { R(Ctx(_, _, _, _, _, Kinds(_, ek)), s2) -> R(ek, s2) }
 }
 // A declaration's parameters (`decl_params`): each a fresh type variable; a
 // row parameter also a fresh row variable, its argument that row's phantom.
 // The arguments, the type parameters' variables, the type and the row
 // parameters by name, the row parameters' variables.
-type DeclParams { DeclParams(List(Ty), List(Int), List(Named), List(Arity), List(Int)) }
+// And every parameter's type variable with its row variable (-1: a type
+// parameter), in order (`effect_params`, `row_params`).
+type DeclParams { DeclParams(List(Ty), List(Int), List(Named), List(Arity), List(Int), List(RPair)) }
 fn decl_params(s: St, ps: List(KP), acc: DeclParams) -> R(DeclParams) {
   match ps {
-    Nil -> match acc { DeclParams(args, vs, pe, re, rvs) -> R(DeclParams(rev(args), rev(vs), pe, re, rev(rvs)), s) }
+    Nil -> match acc { DeclParams(args, vs, pe, re, rvs, all) -> R(DeclParams(rev(args), rev(vs), pe, re, rev(rvs), rev(all)), s) }
     Cons(KP(p, is_row), rest) -> match fresh(s) {
       R(v, s2) -> match acc {
-        DeclParams(args, vs, pe, re, rvs) -> if is_row {
-          match fresh_row(s2) { R(rv, s3) -> decl_params(s3, rest, DeclParams(Cons(phantom(ropen(rv)), args), vs, pe, Cons(Arity(p, rv), re), Cons(rv, rvs))) }
+        DeclParams(args, vs, pe, re, rvs, all) -> if is_row {
+          let id = match v { TVar(i) -> i  _ -> 0 }
+          match fresh_row(s2) { R(rv, s3) -> decl_params(s3, rest, DeclParams(Cons(phantom(ropen(rv)), args), vs, pe, Cons(Arity(p, rv), re), Cons(rv, rvs), Cons(RPair(id, rv), all))) }
         } else {
           let id = match v { TVar(i) -> i  _ -> 0 }
-          decl_params(s2, rest, DeclParams(Cons(v, args), Cons(id, vs), Cons(Named(p, v), pe), re, rvs))
+          decl_params(s2, rest, DeclParams(Cons(v, args), Cons(id, vs), Cons(Named(p, v), pe), re, rvs, Cons(RPair(id, 0 - 1), all)))
         }
       }
     }
@@ -1422,12 +1857,12 @@ fn type_decls(s: St, decls: List(Sp(Decl)), env: List(Entry)) -> R(List(Entry)) 
   match decls {
     Nil -> R(env, s)
     Cons(Sp(DType(name, _, _, variants), _, _), rest) -> match get_kinds(s) {
-      R(kd, s1) -> match decl_params(s1, kind_params(kd, name), DeclParams(Nil, Nil, Nil, Nil, Nil)) {
-        R(DeclParams(args, vars, pe, re, rvs), s2) -> {
+      R(kd, s1) -> match decl_params(s1, kind_params(kd, name), DeclParams(Nil, Nil, Nil, Nil, Nil, Nil)) {
+        R(DeclParams(args, vars, pe, re, rvs, _), s2) -> {
           // Every declared type has its entry, a type without constructors too.
           let s2b = match get_eq(s2) { R(Eqs(ms, rep, adts), s2a) -> set_eq(s2a, Eqs(ms, rep, Cons(Adt(name, vars, Nil), adts))) }
           let s3 = match variants { Nil -> add_empty(s2b, name)  _ -> s2b }
-          match ctors(s3, variants, TCon(name, args), vars, rvs, DeclCx(name, pe, re), env) {
+          match ctors(s3, variants, TCon(name, args), vars, rvs, DeclCx(name, pe, re, No), env) {
             R(env2, s4) -> type_decls(s4, rest, env2)
           }
         }
@@ -1460,7 +1895,9 @@ fn is_value(e: Expr) -> Bool {
 
 fn infer_block(s: St, b: Block, env: List(Entry), amb: Int) -> R(Ty) {
   match b {
-    Block(stmts, tail) -> match infer_stmts(s, stmts, env, amb) {
+    // A block is a scope of its own (Rust's `env.push()`): its mark is read
+    // only by `env_mentions`.
+    Block(stmts, tail) -> match infer_stmts(s, stmts, Cons(scope_mark(), env), amb) {
       R(env2, s2) -> match tail { No -> R(TB(4), s2)  Yes(t) -> infer_expr(s2, t, env2, amb) }
     }
   }
@@ -1520,7 +1957,7 @@ fn infer_inner(s: St, node: Expr, start: Int, end: Int, env: List(Entry), amb: I
     EUnit -> R(TB(4), s)
     EError -> R(TErr, s)
     EVar(name) -> match lookup(env, name) {
-      Yes(sc) -> match instantiate(s, sc) { R(t, s2) -> open_covariant(s2, t) }
+      Yes(sc) -> match instantiate_at(s, sc, start, end) { R(t, s2) -> open_covariant(s2, t) }
       No -> R(TErr, s)
     }
     EQualified(_, _) -> R(TErr, s)
@@ -1687,6 +2124,27 @@ fn host_signature(m: String, n: String) -> Sig {
     if m == "time" && n == "now_ms" { Sig(Nil, TB(0)) } else { if m == "time" && n == "sleep_ms" { Sig(Cons(TB(0), Nil), TB(4)) } else { NoSig } }
   }
 }
+// The builtins on a `with any` clause's operation: `o : Op(t, fn() / H ->
+// t)`; `op.perform` performs `H`.
+fn op_ty(t: Ty, h: Int) -> Ty { TCon("$Op", Cons(t, Cons(TFn(Nil, ropen(h), t), Nil))) }
+fn op_builtin(s: St, n: String, args: List(Sp(Expr)), cs: Int, ce: Int, start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
+  match infer_args(s, args, env, Nil, amb) {
+    R(ts, s1) -> match fresh(s1) {
+      R(t, s2) -> match fresh_row(s2) {
+        R(h, s3) -> {
+          let o = op_ty(t, h)
+          let params = if n == "encode" { Cons(o, Cons(t, Nil)) } else { if n == "decode" { Cons(o, Cons(TB(3), Nil)) } else { Cons(o, Nil) } }
+          let ret = if n == "name" || n == "show" || n == "encode" { TB(3) } else { t }
+          let s4 = unify(s3, TFn(params, pure_row(), ret), TFn(ts, pure_row(), ret), start, end)
+          let s5 = if n == "perform" {
+            match resolve_row(s4, ropen(h)) { R(performed, s4b) -> surface(add_row(s4b, amb, performed, start, end)) }
+          } else { s4 }
+          R(ret, record(s5, cs, ce, TFn(params, if n == "perform" { ropen(h) } else { pure_row() }, ret)))
+        }
+      }
+    }
+  }
+}
 fn infer_call(s: St, callee: Sp(Expr), args: List(Sp(Expr)), start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
   match callee {
     Sp(EQualified(m, n), cs, ce) -> match host_signature(m, n) {
@@ -1695,10 +2153,10 @@ fn infer_call(s: St, callee: Sp(Expr), args: List(Sp(Expr)), start: Int, end: In
         R(ts, s2) -> {
           let s3 = unify(s2, TFn(params, pure_row(), ret), TFn(ts, pure_row(), ret), start, end)
           let s4 = surface(add_effect(s3, amb, "IO", start, end))
-          R(ret, record(s4, cs, ce, TFn(params, Row(Cons(Lab("IO", cs, ce), Nil), RClosed), ret)))
+          R(ret, record(s4, cs, ce, TFn(params, Row(Cons(Lab("IO", Nil, cs, ce), Nil), RClosed), ret)))
         }
       }
-      NoSig -> match pure_builtin(m, n) {
+      NoSig -> if m == "op" && (n == "name" || n == "show" || n == "perform" || n == "encode" || n == "decode") { op_builtin(s, n, args, cs, ce, start, end, env, amb) } else { match pure_builtin(m, n) {
         NoSig -> R(TErr, s)
         Sig(params, ret) -> match infer_args(s, args, env, Nil, amb) {
           R(ts, s2) -> {
@@ -1706,7 +2164,7 @@ fn infer_call(s: St, callee: Sp(Expr), args: List(Sp(Expr)), start: Int, end: In
             R(ret, record(unify(s2, want, TFn(ts, pure_row(), ret), start, end), cs, ce, want))
           }
         }
-      }
+      } }
     }
     Sp(EVar(name), cs, ce) -> match ctor_arity(s, name) {
       R(k, s1) -> if k >= 0 {
@@ -1745,7 +2203,7 @@ fn unify_each(s: St, xs: List(Ty), ys: List(Ty), start: Int, end: Int) -> St { u
 // callee's instantiated type recorded at its span.
 fn ordinary(s: St, name: String, cs: Int, ce: Int, args: List(Sp(Expr)), start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
   let f = match lookup(env, name) {
-    Yes(sc) -> match instantiate(s, sc) { R(t, s2) -> R(t, record(s2, cs, ce, t)) }
+    Yes(sc) -> match instantiate_at(s, sc, start, end) { R(t, s2) -> R(t, record(s2, cs, ce, t)) }
     No -> R(TErr, s)
   }
   match f { R(ft, s2) -> call_with(s2, ft, args, start, end, env, amb) }
@@ -1865,7 +2323,7 @@ fn infer_lambda(s: St, params: List(Sp(Param)), body: Sp(Block), env: List(Entry
   }
 }
 fn add_depth(s: St, d: Int) -> St {
-  match get_hx(s) { R(Hx(rs, cr, depth, ops, effs, dead, mu), s2) -> set_hx(s2, Hx(rs, cr, depth + d, ops, effs, dead, mu)) }
+  match get_hx(s) { R(Hx(rs, cr, depth, ops, effs, dead, mu, gn), s2) -> set_hx(s2, Hx(rs, cr, depth + d, ops, effs, dead, mu, gn)) }
 }
 type LamIn { LamIn(List(Entry), List(Ty)) }
 fn lambda_params(s: St, params: List(Sp(Param)), env: List(Entry), acc: List(Ty)) -> R(LamIn) {
@@ -1914,7 +2372,7 @@ fn close_residual(s: St, amb: Int, params: List(Ty)) -> St {
   match rhead(s, ROpen(amb)) {
     R(t, s2) -> match t {
       ROpen(rho) -> match get_hx(s2) {
-        R(Hx(_, crs, _, _, _, _, _), s3) -> match tail_in(s3, crs, rho) {
+        R(Hx(_, crs, _, _, _, _, _, _), s3) -> match tail_in(s3, crs, rho) {
           R(pending, s4) -> if pending { s4 } else {
             match rows_in(s4, params, Nil) {
               R(in_params, s5) -> if has_int(in_params, rho) { s5 } else { bind_row(s5, rho, pure_row(), 0, 0) }
@@ -1951,10 +2409,10 @@ fn without_incls(xs: List(Incl), gone: List(Incl)) -> List(Incl) {
   match xs { Nil -> Nil  Cons(x, rest) -> if has_incl(gone, x) { without_incls(rest, gone) } else { Cons(x, without_incls(rest, gone)) } }
 }
 fn get_dead(s: St) -> R(List(Incl)) {
-  match get_hx(s) { R(Hx(_, _, _, _, _, dead, mu), s2) -> R(dead, s2) }
+  match get_hx(s) { R(Hx(_, _, _, _, _, dead, mu, gn), s2) -> R(dead, s2) }
 }
 fn kill_incl(s: St, x: Incl) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu), s2) -> set_hx(s2, Hx(rs, cr, d, ops, effs, Cons(x, dead), mu)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn), s2) -> set_hx(s2, Hx(rs, cr, d, ops, effs, Cons(x, dead), mu, gn)) }
 }
 fn flush(s: St) -> St {
   match row_count(s) {
@@ -2012,8 +2470,8 @@ fn relay_incl(s: St, dst: Int, have: Tail, want: Tail, a: Int, b: Int) -> R(Bool
 fn incl_labels(s: St, x: Incl, dst: Int, have: List(Lab), want: List(Lab), a: Int, b: Int, changed: Bool) -> R(Bool) {
   match want {
     Nil -> R(changed, s)
-    Cons(Lab(n, _, _), rest) -> if has_lab(have, n) { incl_labels(s, x, dst, have, rest, a, b, changed) } else {
-      match add_effect(s, dst, n, a, b) {
+    Cons(Lab(n, args, _, _), rest) -> if has_lab(have, n) { incl_labels(s, x, dst, have, rest, a, b, changed) } else {
+      match add_effect_args(s, dst, n, args, a, b) {
         R(c, s2) -> match c {
           Nil -> incl_labels(s2, x, dst, have, rest, a, b, True)
           _ -> incl_labels(surface(R(c, kill_incl(s2, x))), x, dst, have, rest, a, b, changed)
@@ -2054,8 +2512,15 @@ fn flush_member(s: St, xs: List(Incl), relayed: List(Int), changed: Bool, gone: 
 fn member_labels(s: St, x: Incl, dst: Int, have: List(Lab), want: List(Lab), a: Int, b: Int, changed: Bool, gone: List(Incl)) -> R(Flushed) {
   match want {
     Nil -> R(Flushed(changed, gone), s)
-    Cons(Lab(n, _, _), rest) -> if has_lab(have, n) { member_labels(s, x, dst, have, rest, a, b, changed, gone) } else {
-      match add_effect(s, dst, n, a, b) {
+    // The same effect on both sides: its arguments must agree, a conflict
+    // reported once.
+    Cons(Lab(n, args, _, _), rest) -> match lab_get(have, n) {
+      Yes(Lab(_, hargs, _, _)) -> match diag_count(s) {
+        R(before, s1) -> match diag_count(unify_effect_args(s1, n, hargs, args, a, b)) {
+          R(after, s2) -> member_labels(s2, x, dst, have, rest, a, b, changed, if after > before { Cons(x, gone) } else { gone })
+        }
+      }
+      No -> match add_effect_args(s, dst, n, args, a, b) {
         R(c, s2) -> match c {
           Nil -> member_labels(s2, x, dst, have, rest, a, b, True, gone)
           _ -> member_labels(surface(R(c, s2)), x, dst, have, rest, a, b, changed, Cons(x, gone))
@@ -2068,27 +2533,34 @@ fn member_labels(s: St, x: Incl, dst: Int, have: List(Lab), want: List(Lab), a: 
 // ---- Effects: performs, handlers, `resume` ------------------------------------
 
 fn op_get(ops: List(OpInfo), name: String) -> Maybe(OpInfo) {
-  match ops { Nil -> No  Cons(OpInfo(n, e, ps, r), rest) -> if n == name { Yes(OpInfo(n, e, ps, r)) } else { op_get(rest, name) } }
+  match ops { Nil -> No  Cons(OpInfo(n, e, ep, ps, r), rest) -> if n == name { Yes(OpInfo(n, e, ep, ps, r)) } else { op_get(rest, name) } }
 }
 fn find_op(s: St, name: String) -> R(Maybe(OpInfo)) {
-  match get_hx(s) { R(Hx(_, _, _, ops, _, _, _), s2) -> R(op_get(ops, name), s2) }
+  match get_hx(s) { R(Hx(_, _, _, ops, _, _, _, _), s2) -> R(op_get(ops, name), s2) }
 }
 // The effect declarations' operations (`ops`), after every type: each
 // operation's parameters and result as a declaration's fields are read.
+// Each effect's parameters fresh, shared by its operations' signatures
+// (read as a declaration's fields are); a row parameter a row variable, and
+// the effect's own label in its declaration carries its arguments.
 fn effect_decls(s: St, decls: List(Sp(Decl))) -> St {
   match decls {
     Nil -> s
-    Cons(Sp(DEffect(name, _, _, sigs), _, _), rest) -> effect_decls(op_sigs(s, name, sigs), rest)
+    Cons(Sp(DEffect(name, _, _, sigs), _, _), rest) -> match effect_kinds(s) {
+      R(ek, s1) -> match decl_params(s1, kind_params(ek, name), DeclParams(Nil, Nil, Nil, Nil, Nil, Nil)) {
+        R(DeclParams(args, _, pe, re, _, all), s2) -> effect_decls(op_sigs(s2, name, all, DeclCx(name, pe, re, Yes(args)), sigs), rest)
+      }
+    }
     Cons(_, rest) -> effect_decls(s, rest)
   }
 }
-fn op_sigs(s: St, eff: String, sigs: List(Sp(OpSig))) -> St {
+fn op_sigs(s: St, eff: String, all: List(RPair), cx: DeclCx, sigs: List(Sp(OpSig))) -> St {
   match sigs {
     Nil -> s
-    Cons(Sp(OpSig(name, _, ptys, ret), _, _), rest) -> match elaborate_adt_list(s, ptys, DeclCx(eff, Nil, Nil), Nil) {
-      R(ps, s2) -> match elaborate_adt(s2, ret, DeclCx(eff, Nil, Nil)) {
+    Cons(Sp(OpSig(name, _, ptys, ret), _, _), rest) -> match elaborate_adt_list(s, ptys, cx, Nil) {
+      R(ps, s2) -> match elaborate_adt(s2, ret, cx) {
         R(rt, s3) -> match get_hx(s3) {
-          R(Hx(rs, cr, d, ops, effs, dead, mu), s4) -> op_sigs(set_hx(s4, Hx(rs, cr, d, Cons(OpInfo(name, eff, ps, rt), ops), effs, dead, mu)), eff, rest)
+          R(Hx(rs, cr, d, ops, effs, dead, mu, gn), s4) -> op_sigs(set_hx(s4, Hx(rs, cr, d, Cons(OpInfo(name, eff, all, ps, rt), ops), effs, dead, mu, gn)), eff, all, cx, rest)
         }
       }
     }
@@ -2103,7 +2575,7 @@ fn multi_names(decls: List(Sp(Decl)), acc: List(String)) -> List(String) {
   }
 }
 fn is_multi(s: St, name: String) -> R(Bool) {
-  match get_hx(s) { R(Hx(_, _, _, _, _, _, mu), s2) -> R(has_str(mu, name), s2) }
+  match get_hx(s) { R(Hx(_, _, _, _, _, _, mu, gn), s2) -> R(has_str(mu, name), s2) }
 }
 fn effect_names(decls: List(Sp(Decl)), acc: List(String)) -> List(String) {
   match decls {
@@ -2116,11 +2588,40 @@ fn effect_names(decls: List(Sp(Decl)), acc: List(String)) -> List(String) {
 // the arguments against its parameters; the effect reaches the ambient row.
 fn type_perform(s: St, op: OpInfo, args: List(Sp(Expr)), cs: Int, ce: Int, start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
   match op {
-    OpInfo(_, eff, ps, ret) -> match infer_args(s, args, env, Nil, amb) {
-      R(ts, s2) -> {
-        let s3 = record(s2, cs, ce, TFn(ps, Row(Cons(Lab(eff, cs, ce), Nil), RClosed), ret))
-        let s4 = unify(s3, TFn(ps, pure_row(), ret), TFn(ts, pure_row(), ret), start, end)
-        R(ret, surface(add_effect(s4, amb, eff, start, end)))
+    // The effect's parameters instantiated fresh before the arguments are
+    // inferred (`instantiate_op`).
+    OpInfo(_, eff, all, ps0, ret0) -> match fresh_effect_args(s, all, EffArgs(Nil, Nil, Nil)) {
+      R(EffArgs(eargs, m, rm), s1) -> {
+        let ps = match all { Nil -> ps0  _ -> subst_list(ps0, m, rm, Nil) }
+        let ret = match all { Nil -> ret0  _ -> subst(ret0, m, rm) }
+        match infer_args(s1, args, env, Nil, amb) {
+          R(ts, s2) -> {
+            let s3 = record(s2, cs, ce, TFn(ps, Row(Cons(Lab(eff, eargs, cs, ce), Nil), RClosed), ret))
+            let s4 = unify(s3, TFn(ps, pure_row(), ret), TFn(ts, pure_row(), ret), start, end)
+            R(ret, surface(add_effect_args(s4, amb, eff, eargs, start, end)))
+          }
+        }
+      }
+    }
+  }
+}
+// Fresh arguments for an effect: a type variable per type parameter, a
+// fresh row's phantom per row parameter, and the substitutions taking the
+// declaration's variables to them (`fresh_effect_args`).
+type EffArgs { EffArgs(List(Ty), List(Pair), List(RPair)) }
+fn fresh_effect_args(s: St, all: List(RPair), acc: EffArgs) -> R(EffArgs) {
+  match all {
+    Nil -> match acc { EffArgs(args, m, rm) -> R(EffArgs(rev(args), m, rm), s) }
+    Cons(RPair(p, rv), rest) -> match acc {
+      EffArgs(args, m, rm) -> if rv >= 0 {
+        match fresh_row(s) {
+          R(f, s2) -> {
+            let a = phantom(ropen(f))
+            fresh_effect_args(s2, rest, EffArgs(Cons(a, args), Cons(Pair(p, a), m), Cons(RPair(rv, f), rm)))
+          }
+        }
+      } else {
+        match fresh(s) { R(a, s2) -> fresh_effect_args(s2, rest, EffArgs(Cons(a, args), Cons(Pair(p, a), m), rm)) }
       }
     }
   }
@@ -2131,7 +2632,7 @@ fn handler_effect(s: St, cs: List(Sp(OpClause)), found: String) -> R(String) {
   match cs {
     Nil -> R(found, s)
     Cons(Sp(OpClause(qual, op, _, _), a, b), rest) -> {
-      let known = match qual { Yes(e) -> R(e, s)  No -> match find_op(s, op) { R(m, s2) -> R(match m { Yes(OpInfo(_, e, _, _)) -> e  No -> "" }, s2) } }
+      let known = match qual { Yes(e) -> R(e, s)  No -> match find_op(s, op) { R(m, s2) -> R(match m { Yes(OpInfo(_, e, _, _, _)) -> e  No -> "" }, s2) } }
       match known {
         R(e, s2) -> if e == "" { handler_effect(s2, rest, found) } else {
           if found == "" { handler_effect(s2, rest, e) } else {
@@ -2160,10 +2661,12 @@ fn remove_lab(xs: List(Lab), n: String) -> List(Lab) {
 // the clauses row an escaped `resume` reads.
 fn infer_handle(s: St, body: Sp(Expr), h: Handler, start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
   match h {
+    Handler(_, True, clauses, ret) -> infer_any_handle(s, body, clauses, ret, start, end, env, amb)
     Handler(many, _, clauses, ret) -> match one_shot(handler_effect(s, clauses, ""), many, start, end) {
-      R(eff, s1) -> match fresh_row(s1) {
+      R(eff, s0) -> match handle_args(s0, eff) {
+      R(EffArgs(eargs, em, erm), s1) -> match fresh_row(s1) {
         R(amb_in, s2) -> {
-          let s3 = if eff == "" { s2 } else { surface(add_effect(s2, amb_in, eff, start, end)) }
+          let s3 = if eff == "" { s2 } else { surface(add_effect_args(s2, amb_in, eff, eargs, start, end)) }
           match infer_expr(push_region(s3, Region(amb_in, True)), body, env, amb_in) {
             R(body_ty, s4) -> match fresh(pop_region(s4)) {
               R(result, s5) -> match fresh_row(s5) {
@@ -2178,7 +2681,7 @@ fn infer_handle(s: St, body: Sp(Expr), h: Handler, start: Int, end: Int, env: Li
                     R(scope, s8) -> match resolve_row(close_residual(s8, ret_amb, scope), ropen(ret_amb)) {
                       R(ret_row, s9) -> match fresh_row(surface(add_row(s9, amb, ret_row, start, end))) {
                         R(clauses_row, s10) -> match push_clause_row(s10, clauses_row) {
-                          s11 -> match op_clauses(s11, clauses, Resume(TErr, result, amb_in, ret_amb, eff, 0, clauses_row), env, amb, Nil) {
+                          s11 -> match op_clauses(s11, clauses, Resume(TErr, result, amb_in, ret_amb, eff, 0, clauses_row), EffArgs(eargs, em, erm), env, amb, Nil) {
                             R(cambs, s12) -> {
                               let s13 = flush(clause_labels(pop_clause_row(s12), rev(cambs), clauses_row, eff, start, end))
                               match rhead(s13, ROpen(amb)) {
@@ -2205,7 +2708,165 @@ fn infer_handle(s: St, body: Sp(Expr), h: Handler, start: Int, end: Int, env: Li
       }
     }
   }
+  }
 }
+// `infer_any_handle`: a `with any` handler handles every effect its body
+// performs but `IO`. Each clause's operation is an `Op(t, fn() / H -> t)`
+// of a rigid answer type `'tN` its own; what it handles must be data
+// (E0434, when the group is solved), and an answer type may not escape its
+// clause (E0435).
+type Skol { Skol(String, Int, Int) }
+fn infer_any_handle(s: St, body: Sp(Expr), clauses: List(Sp(OpClause)), ret: Maybe(ReturnClause), start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
+  match fresh_row(s) {
+    R(amb_in, s1) -> match infer_expr(push_region(s1, Region(amb_in, True)), body, env, amb_in) {
+      R(body_ty, s2) -> match fresh(pop_region(s2)) {
+        R(result, s3) -> match fresh_row(s3) {
+          R(ret_amb, s4) -> {
+            let s5 = match ret {
+              Yes(ReturnClause(binder, rbody)) -> match infer_expr(push_region(s4, Region(ret_amb, False)), rbody, Cons(Entry(binder, Scheme(Nil, Nil, body_ty)), env), ret_amb) {
+                R(ret_ty, s4b) -> match rbody { Sp(_, rs, re) -> unify(pop_region(s4b), ret_ty, result, rs, re) }
+              }
+              No -> unify(s4, result, body_ty, start, end)
+            }
+            match get_ptys(flush(s5)) {
+              R(scope, s6) -> match resolve_row(close_residual(s6, ret_amb, scope), ropen(ret_amb)) {
+                R(ret_row, s7) -> match resolve_row(surface(add_row(s7, amb, ret_row, start, end)), ropen(amb_in)) {
+                  // The handled row: the body's, but `IO`.
+                  R(Row(bl, bt), s8) -> {
+                    let hl = remove_lab(bl, "IO")
+                    match fresh_row(s8) {
+                      R(clauses_row, s9) -> match any_clauses(push_clause_row(s9, clauses_row), clauses, Row(hl, bt), result, amb_in, ret_amb, clauses_row, env, amb, Nil, Nil) {
+                        R(Clauses(cambs, sks), s10) -> {
+                          let s11 = flush(clause_labels(pop_clause_row(s10), cambs, clauses_row, "", start, end))
+                          match rhead(s11, ROpen(amb)) {
+                            R(own, s12) -> match rhead(s12, ROpen(clauses_row)) {
+                              R(ct, s13) -> {
+                                let s14 = if tail_eq(ct, own) { s13 } else { match get_ptys(s13) { R(sp, s13b) -> close_residual(s13b, clauses_row, sp) } }
+                                // The residual: `IO`, never dispatched to a handler.
+                                match resolve_row(s14, ropen(amb_in)) {
+                                  R(Row(bl2, _), s15) -> {
+                                    let s16 = match lab_get(bl2, "IO") { Yes(Lab(_, args, a, b)) -> surface(add_effect_args(s15, amb, "IO", args, a, b))  No -> s15 }
+                                    // Forwarding: a clause that performs its operation again
+                                    // poured the handled tail into its ambient.
+                                    match rhead(s16, bt) {
+                                      R(htail, s17) -> match forwards(s17, cambs, htail) {
+                                        R(fw, s18) -> {
+                                          let s19 = push_site(s18, GSite(hl, bt, fw, start, end))
+                                          R(result, escapes(s19, sks, result, env, amb))
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+type Clauses { Clauses(List(Int), List(Skol)) }
+fn forwards(s: St, cambs: List(Int), htail: Tail) -> R(Bool) {
+  match htail {
+    ROpen(_) -> forwards_any(s, cambs, htail)
+    _ -> R(False, s)
+  }
+}
+fn forwards_any(s: St, cambs: List(Int), htail: Tail) -> R(Bool) {
+  match cambs {
+    Nil -> R(False, s)
+    Cons(c, rest) -> match rhead(s, ROpen(c)) { R(t, s2) -> if tail_eq(t, htail) { R(True, s2) } else { forwards_any(s2, rest, htail) } }
+  }
+}
+fn any_clauses(s: St, cs: List(Sp(OpClause)), handled: Row, result: Ty, amb_in: Int, ret_amb: Int, crow: Int, env: List(Entry), amb: Int, cambs: List(Int), sks: List(Skol)) -> R(Clauses) {
+  match cs {
+    Nil -> R(Clauses(rev(cambs), rev(sks)), s)
+    Cons(Sp(OpClause(_, _, params, cbody), ca, cb), rest) -> match get_gn(s) {
+      R(Gn(k, gr, pg), s1) -> {
+        let sk = "'t" <> int.to_string(k + 1)
+        let t = TCon(sk, Nil)
+        let o = TCon("$Op", Cons(t, Cons(TFn(Nil, handled, t), Nil)))
+        match any_params(set_gn(s1, Gn(k + 1, gr, pg)), params, o, env) {
+          R(env2, s2) -> match fresh_row(s2) {
+            R(camb, s3) -> match get_hx(s3) {
+              R(Hx(_, _, depth, _, _, _, _, _), s4) -> match get_ptys(s4) {
+                R(saved, s5) -> {
+                  let s6 = push_region(set_ptys(push_resume(s5, Resume(t, result, amb_in, ret_amb, "*", depth, crow)), append(saved, Cons(o, Nil))), Region(camb, False))
+                  match infer_expr(s6, cbody, env2, camb) {
+                    R(cty, s7) -> match get_ptys(flush(pop_region(s7))) {
+                      R(scope, s8) -> match resolve_row(set_ptys(close_residual(s8, camb, scope), saved), ropen(camb)) {
+                        R(row, s9) -> match cbody {
+                          Sp(_, bs, be) -> {
+                            let s10 = unify(surface(add_row(s9, amb, row, bs, be)), cty, result, bs, be)
+                            any_clauses(pop_resume(s10), rest, handled, result, amb_in, ret_amb, crow, env, amb, Cons(camb, cambs), Cons(Skol(sk, ca, cb), sks))
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+fn any_params(s: St, ps: List(Sp(Param)), o: Ty, env: List(Entry)) -> R(List(Entry)) {
+  match ps {
+    Nil -> R(env, s)
+    Cons(Sp(Param(name, _, _), a, b), rest) -> any_params(record(s, a, b, o), rest, o, Cons(Entry(name, Scheme(Nil, Nil, o)), env))
+  }
+}
+// E0435: a clause's answer type in the handle's result, in a binding
+// outside the clause, or in the ambient row's labels' arguments.
+fn escapes(s: St, sks: List(Skol), result: Ty, env: List(Entry), amb: Int) -> St {
+  match sks {
+    Nil -> s
+    Cons(Skol(sk, a, b), rest) -> match resolve(s, result) {
+      R(rt, s2) -> match env_mentions(s2, env, sk) {
+        R(in_env, s3) -> match resolve_row(s3, ropen(amb)) {
+          R(Row(al, _), s4) -> {
+            let hit = mentions_con(rt, sk) || in_env || labs_mention_con(al, sk)
+            escapes(if hit { diag(s4, "E0435", "an operation's answer type escapes its clause", a, b) } else { s4 }, rest, result, env, amb)
+          }
+        }
+      }
+    }
+  }
+}
+// Rust walks each scope's open entries: a name bound again in the same
+// scope hides its earlier binding there (`open_entries`).
+fn scope_mark() -> Entry { Entry("{", Scheme(Nil, Nil, TErr)) }
+fn env_mentions(s: St, env: List(Entry), sk: String) -> R(Bool) { env_mentions_in(s, env, sk, Nil) }
+fn env_mentions_in(s: St, env: List(Entry), sk: String, seen: List(String)) -> R(Bool) {
+  match env {
+    Nil -> R(False, s)
+    Cons(Entry("{", _), rest) -> env_mentions_in(s, rest, sk, Nil)
+    Cons(Entry(n, Scheme(_, _, t)), rest) -> if has_str(seen, n) { env_mentions_in(s, rest, sk, seen) } else {
+      match resolve(s, t) { R(rt, s2) -> if mentions_con(rt, sk) { R(True, s2) } else { env_mentions_in(s2, rest, sk, Cons(n, seen)) } }
+    }
+  }
+}
+fn mentions_con(t: Ty, name: String) -> Bool {
+  match t {
+    TCon(n, args) -> n == name || mentions_con_list(args, name)
+    TFn(ps, Row(ls, _), r) -> mentions_con_list(ps, name) || mentions_con(r, name) || labs_mention_con(ls, name)
+    _ -> False
+  }
+}
+fn mentions_con_list(xs: List(Ty), name: String) -> Bool { match xs { Nil -> False  Cons(x, rest) -> mentions_con(x, name) || mentions_con_list(rest, name) } }
+fn labs_mention_con(ls: List(Lab), name: String) -> Bool { match ls { Nil -> False  Cons(Lab(_, a, _, _), rest) -> mentions_con_list(a, name) || labs_mention_con(rest, name) } }
 // E0427: `with multi` over an effect not declared `multi`.
 fn one_shot(r: R(String), many: Bool, start: Int, end: Int) -> R(String) {
   match r {
@@ -2223,17 +2884,30 @@ fn repeats(s: St, amb_in: Int, start: Int, end: Int) -> St {
     R(Row(ls, _), s2) -> if has_lab(ls, "IO") { warn(s2, "E0426", "a multi-shot handler may run its continuation's effects more than once", start, end) } else { s2 }
   }
 }
+// One instantiation of the handled effect's parameters, shared by the
+// body's row and every clause.
+fn handle_args(s: St, eff: String) -> R(EffArgs) {
+  match get_hx(s) {
+    R(Hx(_, _, _, ops, _, _, _, _), s2) -> match op_of_effect(ops, eff) {
+      Yes(all) -> fresh_effect_args(s2, all, EffArgs(Nil, Nil, Nil))
+      No -> R(EffArgs(Nil, Nil, Nil), s2)
+    }
+  }
+}
+fn op_of_effect(ops: List(OpInfo), eff: String) -> Maybe(List(RPair)) {
+  match ops { Nil -> No  Cons(OpInfo(_, e, all, _, _), rest) -> if e == eff && eff != "" { Yes(all) } else { op_of_effect(rest, eff) } }
+}
 fn push_clause_row(s: St, r: Int) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu), s2) -> set_hx(s2, Hx(rs, Cons(r, cr), d, ops, effs, dead, mu)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn), s2) -> set_hx(s2, Hx(rs, Cons(r, cr), d, ops, effs, dead, mu, gn)) }
 }
 fn pop_clause_row(s: St) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu), s2) -> set_hx(s2, Hx(rs, match cr { Cons(_, rest) -> rest  Nil -> Nil }, d, ops, effs, dead, mu)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn), s2) -> set_hx(s2, Hx(rs, match cr { Cons(_, rest) -> rest  Nil -> Nil }, d, ops, effs, dead, mu, gn)) }
 }
 fn push_resume(s: St, r: Resume) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu), s2) -> set_hx(s2, Hx(Cons(r, rs), cr, d, ops, effs, dead, mu)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn), s2) -> set_hx(s2, Hx(Cons(r, rs), cr, d, ops, effs, dead, mu, gn)) }
 }
 fn pop_resume(s: St) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu), s2) -> set_hx(s2, Hx(match rs { Cons(_, rest) -> rest  Nil -> Nil }, cr, d, ops, effs, dead, mu)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn), s2) -> set_hx(s2, Hx(match rs { Cons(_, rest) -> rest  Nil -> Nil }, cr, d, ops, effs, dead, mu, gn)) }
 }
 fn set_ptys(s: St, p: List(Ty)) -> St {
   match get_gx(s) { R(Gx(i, mi, _, rs, d, gp, ga), s2) -> set_gx(s2, Gx(i, mi, p, rs, d, gp, ga)) }
@@ -2242,17 +2916,23 @@ fn set_ptys(s: St, p: List(Ty)) -> St {
 // past them), `resume` taking the operation's result; its own row closed
 // unless relayed, and poured into the ambient. The clauses' rows, newest
 // first.
-fn op_clauses(s: St, cs: List(Sp(OpClause)), cx: Resume, env: List(Entry), amb: Int, acc: List(Int)) -> R(List(Int)) {
+fn op_clauses(s: St, cs: List(Sp(OpClause)), cx: Resume, ea: EffArgs, env: List(Entry), amb: Int, acc: List(Int)) -> R(List(Int)) {
   match cs {
     Nil -> R(acc, s)
     Cons(Sp(OpClause(_, op, params, cbody), _, _), rest) -> match find_op(s, op) {
       R(m, s1) -> {
-        let sig = match m { Yes(OpInfo(_, _, ps, r)) -> Sig(ps, r)  No -> Sig(Nil, TErr) }
+        // The handler's one instantiation of the effect's parameters.
+        let sig = match m {
+          // (Its own effect's parameters, position by position, even for a
+          // clause of another effect, which E0423 reports.)
+          Yes(OpInfo(_, _, all, ps, r)) -> match ea { EffArgs(eargs, _, erm) -> { let em = zip_params(all, eargs)  Sig(subst_list(ps, em, erm, Nil), subst(r, em, erm)) } }
+          No -> Sig(Nil, TErr)
+        }
         match sig {
           Sig(ops, b) -> match clause_params(s1, params, ops, env) {
             R(env2, s2) -> match fresh_row(s2) {
               R(camb, s3) -> match get_hx(s3) {
-                R(Hx(_, _, depth, _, _, _, _), s4) -> match cx {
+                R(Hx(_, _, depth, _, _, _, _, _), s4) -> match cx {
                   Resume(_, result, body_amb, ret_amb, handled, _, crow) -> match get_ptys(s4) {
                     R(saved, s5) -> {
                       let s6 = push_region(set_ptys(push_resume(s5, Resume(b, result, body_amb, ret_amb, handled, depth, crow)), append(saved, ops)), Region(camb, False))
@@ -2262,7 +2942,7 @@ fn op_clauses(s: St, cs: List(Sp(OpClause)), cx: Resume, env: List(Entry), amb: 
                             R(row, s9) -> match cbody {
                               Sp(_, bs, be) -> {
                                 let s10 = unify(surface(add_row(s9, amb, row, bs, be)), cty, result, bs, be)
-                                op_clauses(pop_resume(s10), rest, cx, env, amb, Cons(camb, acc))
+                                op_clauses(pop_resume(s10), rest, cx, ea, env, amb, Cons(camb, acc))
                               }
                             }
                           }
@@ -2306,7 +2986,7 @@ fn clause_labels(s: St, cambs: List(Int), crow: Int, eff: String, start: Int, en
 fn clause_labs(s: St, ls: List(Lab), crow: Int, eff: String) -> St {
   match ls {
     Nil -> s
-    Cons(Lab(n, a, b), rest) -> clause_labs(if n == eff { s } else { surface(add_effect(s, crow, n, a, b)) }, rest, crow, eff)
+    Cons(Lab(n, args, a, b), rest) -> clause_labs(if n == eff { s } else { surface(add_effect_args(s, crow, n, args, a, b)) }, rest, crow, eff)
   }
 }
 // `type_resume`: the argument against the operation's result; the rest of
@@ -2315,7 +2995,7 @@ fn clause_labs(s: St, ls: List(Lab), crow: Int, eff: String) -> St {
 // into a lambda, every clause's effects and the body's member rows too.
 fn type_resume(s: St, arg_ty: Ty, start: Int, end: Int, amb: Int) -> R(Ty) {
   match get_hx(s) {
-    R(Hx(rs, _, depth, _, _, _, _), s1) -> match rs {
+    R(Hx(rs, _, depth, _, _, _, _, _), s1) -> match rs {
       Nil -> R(TErr, s1)
       Cons(Resume(arg, result, body_amb, ret_amb, handled, d, crow), _) -> {
         let s2 = unify(s1, arg_ty, arg, start, end)
@@ -2348,9 +3028,11 @@ fn more_member(s: St, xs: List(Incl), bt: Tail, amb: Int, acc: List(Incl)) -> R(
     }
   }
 }
+// A `with any` handler's resume (`except` "*") reruns only the body's `IO`,
+// and relays no tail.
 fn rerun(s: St, src: Int, except: String, in_params: List(Int), amb: Int, start: Int, end: Int) -> St {
   match resolve_row(s, ropen(src)) {
-    R(Row(ls, t), s2) -> {
+    R(Row(ls, t), s2) -> if except == "*" { clause_labs(s2, only_io(ls), amb, "") } else {
       let s3 = clause_labs(s2, ls, amb, except)
       match t {
         ROpen(w) -> if has_int(in_params, w) { surface(add_row(s3, amb, Row(Nil, t), start, end)) } else { s3 }
@@ -2358,6 +3040,9 @@ fn rerun(s: St, src: Int, except: String, in_params: List(Int), amb: Int, start:
       }
     }
   }
+}
+fn only_io(ls: List(Lab)) -> List(Lab) {
+  match ls { Nil -> Nil  Cons(l, rest) -> if lab_name(l) == "IO" { Cons(l, Nil) } else { only_io(rest) } }
 }
 
 // ---- The call graph (`collect_refs`, `tarjan_scc`) ----------------------------
@@ -2587,10 +3272,10 @@ fn group(s: St, fns: List(FnInfo), g: List(Int), env: List(Entry)) -> R(Out) {
   }
 }
 fn mem_params(ms: List(Mem), acc: List(Ty)) -> List(Ty) {
-  match ms { Nil -> acc  Cons(Mem(_, ps, _, _, _, _), rest) -> mem_params(rest, append(acc, ps)) }
+  match ms { Nil -> acc  Cons(Mem(_, ps, _, _, _, _, _), rest) -> mem_params(rest, append(acc, ps)) }
 }
 fn mem_ambs(ms: List(Mem), acc: List(Int)) -> List(Int) {
-  match ms { Nil -> rev(acc)  Cons(Mem(_, _, amb, _, _, _), rest) -> mem_ambs(rest, Cons(amb, acc)) }
+  match ms { Nil -> rev(acc)  Cons(Mem(_, _, amb, _, _, _, _), rest) -> mem_ambs(rest, Cons(amb, acc)) }
 }
 // Step 1: a fresh monotype per member, its annotations checked, its type
 // recorded at its declaration.
@@ -2598,15 +3283,17 @@ fn members_list(s: St, fns: List(FnInfo), g: List(Int), env: List(Entry), acc: L
   match g {
     Nil -> R(MemsEnv(acc, env), s)
     Cons(i, rest) -> match nth_fn(fns, i) {
-      FnInfo(name, ds, de, params, ret, _, _) -> match fresh_list(s, len(params), Nil) {
+      FnInfo(name, ds, de, params, ret, _, declared) -> match fresh_list(s, len(params), Nil) {
         R(ps, s2) -> match fresh_row(s2) {
           R(amb, s2b) -> match fresh(s2b) {
             R(result, s3) -> {
               let ft = TFn(ps, ropen(amb), result)
-              let s4 = check_ann(check_anns(set_ann_rows(set_ann_vars(s3, Nil), Nil), params, ps), ret, result, True)
-              match ann_vars(s4) {
-                R(avs, s4b) -> match ann_rows(s4b) {
-                  R(ar, s5) -> members_list(record(s5, ds, de, ft), fns, rest, Cons(Entry(name, Scheme(Nil, Nil, ft)), env), Cons(Mem(i, ps, amb, result, avs, ar), acc))
+              let s4a = check_ann(check_anns(set_ann_rows(set_ann_vars(s3, Nil), Nil), params, ps), ret, result, True)
+              match declared_label_args(s4a, declared) {
+                R(dl, s4) -> match ann_vars(s4) {
+                  R(avs, s4b) -> match ann_rows(s4b) {
+                    R(ar, s5) -> members_list(record(s5, ds, de, ft), fns, rest, Cons(Entry(name, Scheme(Nil, Nil, ft)), env), Cons(Mem(i, ps, amb, result, avs, ar, dl), acc))
+                  }
                 }
               }
             }
@@ -2636,12 +3323,12 @@ fn set_param_tys(s: St, ptys: List(Ty)) -> St {
 fn bodies(s: St, fns: List(FnInfo), ms: List(Mem), env: List(Entry), acc: List(Mem)) -> R(List(Mem)) {
   match ms {
     Nil -> R(rev(acc), set_ann_rows(s, Nil))
-    Cons(Mem(i, ps, amb, result, avs, ar), rest) -> match nth_fn(fns, i) {
+    Cons(Mem(i, ps, amb, result, avs, ar, dl), rest) -> match nth_fn(fns, i) {
       FnInfo(_, _, _, params, _, body, _) -> match bind_params(set_ann_rows(set_ann_vars(s, avs), ar), params, ps, env) {
         R(benv, s2) -> match body {
           Sp(b, bs, be) -> match infer_block(set_param_tys(s2, ps), b, benv, amb) {
             R(bt, s3) -> match ann_rows(unify(set_param_tys(s3, Nil), result, bt, bs, be)) {
-              R(ar2, s4) -> bodies(s4, fns, rest, env, Cons(Mem(i, ps, amb, result, avs, ar2), acc))
+              R(ar2, s4) -> bodies(s4, fns, rest, env, Cons(Mem(i, ps, amb, result, avs, ar2, dl), acc))
             }
           }
         }
@@ -2661,15 +3348,17 @@ fn close_group(s: St, fns: List(FnInfo), ms: List(Mem)) -> St {
         // 2.48: a declared row ending in a named variable, with its own
         // member's names, before anything closes.
         // 2.5: each member's residual ambient row.
-        let s6 = close_members(set_ann_rows(named_rows(s5, fns, ms), Nil), ms)
+        // 2.47: a declared row's written label arguments are what the body
+        // performs at them.
+        let s6 = close_members(set_ann_rows(named_rows(label_args_at(s5, ms), fns, ms), Nil), ms)
         // 2.6: the declared rows, exactly, and what `main` may perform.
-        let s6b = exact_rows(s6, fns, ms)
+        let s6b = exact_rows(settle_members(s6, fns, ms), fns, ms)
         // 2.7: what is still pending reaches its rows; the group's phantoms
         // that nothing bound close to pure.
         match get_gx(flush(s6b)) {
           R(Gx(_, _, ptys, regions, _, _, _), s7) -> match row_count(s7) {
             R(n, s8) -> match get_hx(s8) {
-              R(Hx(rs9, cr9, d9, ops9, effs9, _, mu9), s9) -> close_phantoms(set_hx(set_gx(s9, Gx(Nil, Nil, ptys, regions, Nil, Nil, Nil)), Hx(rs9, cr9, d9, ops9, effs9, Nil, mu9)), 0, n)
+              R(Hx(rs9, cr9, d9, ops9, effs9, _, mu9, gn9), s9) -> check_generic_rows(close_phantoms(set_hx(set_gx(s9, Gx(Nil, Nil, ptys, regions, Nil, Nil, Nil)), Hx(rs9, cr9, d9, ops9, effs9, Nil, mu9, gn9)), 0, n))
             }
           }
         }
@@ -2697,13 +3386,47 @@ fn close_deferred(s: St, ds: List(Deferred), gparams: List(Ty)) -> St {
 fn close_members(s: St, ms: List(Mem)) -> St {
   match ms {
     Nil -> s
-    Cons(Mem(_, ps, amb, _, _, _), rest) -> close_members(close_residual(s, amb, ps), rest)
+    Cons(Mem(_, ps, amb, _, _, _, _), rest) -> close_members(close_residual(s, amb, ps), rest)
+  }
+}
+// A declared row's labels written with arguments, elaborated where the
+// member's annotation names are live (`declared_label_args`).
+fn declared_label_args(s: St, declared: Maybe(RowAnn)) -> R(List(Lab)) {
+  match declared {
+    No -> R(Nil, s)
+    Yes(RowAnn(labels, _)) -> match effect_kinds(s) {
+      R(ek, s2) -> match ann_labels(s2, written_args(labels, ek), Nil) { R(ls, s3) -> R(ls, s3) }
+    }
+  }
+}
+fn written_args(ls: List(LabelAnn), ek: List(Kind)) -> List(LabelAnn) {
+  match ls {
+    Nil -> Nil
+    Cons(LabelAnn(Sp(n, a, b), Yes(xs)), rest) -> if has_kind(ek, n) { Cons(LabelAnn(Sp(n, a, b), Yes(xs)), written_args(rest, ek)) } else { written_args(rest, ek) }
+    Cons(_, rest) -> written_args(rest, ek)
+  }
+}
+fn label_args_at(s: St, ms: List(Mem)) -> St {
+  match ms {
+    Nil -> s
+    Cons(Mem(_, _, amb, _, _, _, dl), rest) -> label_args_at(label_args_one(s, amb, dl), rest)
+  }
+}
+fn label_args_one(s: St, amb: Int, dl: List(Lab)) -> St {
+  match dl {
+    Nil -> s
+    Cons(Lab(n, want, a, b), rest) -> match resolve_row(s, ropen(amb)) {
+      R(Row(performed, _), s2) -> label_args_one(match lab_get(performed, n) {
+        Yes(Lab(_, have, _, _)) -> unify_effect_args(s2, n, have, want, a, b)
+        No -> s2
+      }, amb, rest)
+    }
   }
 }
 fn named_rows(s: St, fns: List(FnInfo), ms: List(Mem)) -> St {
   match ms {
     Nil -> s
-    Cons(Mem(i, _, amb, _, _, ar), rest) -> match nth_fn(fns, i) {
+    Cons(Mem(i, _, amb, _, _, ar, _), rest) -> match nth_fn(fns, i) {
       FnInfo(_, _, _, _, _, _, declared) -> named_rows(match declared {
         Yes(RowAnn(labels, Yes(v))) -> check_named_row(set_ann_rows(s, ar), amb, labels, v)
         _ -> s
@@ -2717,19 +3440,45 @@ fn named_rows(s: St, fns: List(FnInfo), ms: List(Mem)) -> St {
 fn check_named_row(s: St, amb: Int, labels: List(LabelAnn), v: Sp(String)) -> St {
   match resolve_row(s, ropen(amb)) {
     R(Row(performed, _), s2) -> match unused_labs(labels, performed) {
-      Cons(Lab(_, a, b), _) -> diag(s2, "E0423", "effect row mismatch", a, b)
+      Cons(Lab(_, _, a, b), _) -> diag(s2, "E0423", "effect row mismatch", a, b)
       Nil -> match v {
         Sp(name, vs, ve) -> match ann_row(s2, name, vs, ve) {
-          R(tail, s3) -> {
+          R(tail, s2b) -> match rhead(s2b, ROpen(tail)) {
+          R(now_t, s2c) -> {
+          // A performed label whose arguments mention the named row (a task's
+          // own `Async(e)` under `/ {e}`) cannot be in it.
+          let now = match now_t { ROpen(w) -> w  _ -> tail }
+          match left_out(s2c, performed, labels, now) {
+          R(Cons(Lab(_, _, a, b), _), s2d) -> diag(s2d, "E0423", "effect row mismatch", a, b)
+          R(Nil, s3) -> {
             let m = performed_of(labels, performed, Nil)
             match labels {
               Cons(LabelAnn(Sp(_, a, b), _), _) -> surface(unify_row(s3, ropen(amb), Row(m, ROpen(tail)), a, b))
               Nil -> surface(unify_row(s3, ropen(amb), Row(m, ROpen(tail)), 0, 0))
             }
           }
+          }
+          }
+          }
         }
       }
     }
+  }
+}
+fn left_out(s: St, performed: List(Lab), labels: List(LabelAnn), now: Int) -> R(List(Lab)) {
+  match performed {
+    Nil -> R(Nil, s)
+    Cons(Lab(k, args, a, b), rest) -> if declares(labels, k) { left_out(s, rest, labels, now) } else {
+      match mentions_any(s, now, args) {
+        R(m, s2) -> match left_out(s2, rest, labels, now) { R(more, s3) -> R(if m { Cons(Lab(k, args, a, b), more) } else { more }, s3) }
+      }
+    }
+  }
+}
+fn mentions_any(s: St, v: Int, xs: List(Ty)) -> R(Bool) {
+  match xs {
+    Nil -> R(False, s)
+    Cons(x, rest) -> match mentions_row(s, v, x) { R(m, s2) -> if m { R(True, s2) } else { mentions_any(s2, v, rest) } }
   }
 }
 fn performed_of(labels: List(LabelAnn), performed: List(Lab), acc: List(Lab)) -> List(Lab) {
@@ -2741,10 +3490,20 @@ fn performed_of(labels: List(LabelAnn), performed: List(Lab), acc: List(Lab)) ->
 fn lab_get(ls: List(Lab), n: String) -> Maybe(Lab) {
   match ls { Nil -> No  Cons(l, rest) -> if lab_name(l) == n { Yes(l) } else { lab_get(rest, n) } }
 }
+// 2.6 first: a member's row with one effect met twice along it has its
+// arguments unified.
+fn settle_members(s: St, fns: List(FnInfo), ms: List(Mem)) -> St {
+  match ms {
+    Nil -> s
+    Cons(Mem(i, _, amb, _, _, _, _), rest) -> match nth_fn(fns, i) {
+      FnInfo(_, _, _, _, _, Sp(_, bs, be), _) -> settle_members(settle(s, ropen(amb), bs, be), fns, rest)
+    }
+  }
+}
 fn exact_rows(s: St, fns: List(FnInfo), ms: List(Mem)) -> St {
   match ms {
     Nil -> s
-    Cons(Mem(i, _, amb, _, _, _), rest) -> match nth_fn(fns, i) {
+    Cons(Mem(i, _, amb, _, _, _, _), rest) -> match nth_fn(fns, i) {
       FnInfo(name, _, _, _, _, _, declared) -> {
         let s2 = match declared { Yes(RowAnn(labels, No)) -> check_exact_row(s, amb, labels)  _ -> s }
         exact_rows(if name == "main" { check_main_discharge(s2, amb) } else { s2 }, fns, rest)
@@ -2760,17 +3519,17 @@ fn check_exact_row(s: St, amb: Int, declared: List(LabelAnn)) -> St {
     R(Row(performed, _), s2) -> match declared {
       Nil -> match performed {
         Nil -> s2
-        Cons(Lab(_, a, b), _) -> diag(s2, "E0421", "this function is declared pure but performs `" <> join_labs(performed, "") <> "`", a, b)
+        Cons(Lab(_, _, a, b), _) -> diag(s2, "E0421", "this function is declared pure but performs `" <> join_labs(performed, "") <> "`", a, b)
       }
       _ -> {
-        let s3 = match extra_labs(performed, declared) { Cons(Lab(_, a, b), _) -> diag(s2, "E0423", "effect row mismatch", a, b)  Nil -> s2 }
-        match unused_labs(declared, performed) { Cons(Lab(_, a, b), _) -> diag(s3, "E0423", "effect row mismatch", a, b)  Nil -> s3 }
+        let s3 = match extra_labs(performed, declared) { Cons(Lab(_, _, a, b), _) -> diag(s2, "E0423", "effect row mismatch", a, b)  Nil -> s2 }
+        match unused_labs(declared, performed) { Cons(Lab(_, _, a, b), _) -> diag(s3, "E0423", "effect row mismatch", a, b)  Nil -> s3 }
       }
     }
   }
 }
 fn join_labs(ls: List(Lab), acc: String) -> String {
-  match ls { Nil -> acc  Cons(Lab(n, _, _), rest) -> join_labs(rest, if acc == "" { n } else { acc <> ", " <> n }) }
+  match ls { Nil -> acc  Cons(Lab(n, _, _, _), rest) -> join_labs(rest, if acc == "" { n } else { acc <> ", " <> n }) }
 }
 fn declares(xs: List(LabelAnn), n: String) -> Bool {
   match xs { Nil -> False  Cons(LabelAnn(Sp(m, _, _), _), rest) -> m == n || declares(rest, n) }
@@ -2781,7 +3540,7 @@ fn extra_labs(ls: List(Lab), declared: List(LabelAnn)) -> List(Lab) {
 fn unused_labs(declared: List(LabelAnn), ls: List(Lab)) -> List(Lab) {
   match declared {
     Nil -> Nil
-    Cons(LabelAnn(Sp(n, a, b), _), rest) -> if has_lab(ls, n) { unused_labs(rest, ls) } else { Cons(Lab(n, a, b), unused_labs(rest, ls)) }
+    Cons(LabelAnn(Sp(n, a, b), _), rest) -> if has_lab(ls, n) { unused_labs(rest, ls) } else { Cons(Lab(n, Nil, a, b), unused_labs(rest, ls)) }
   }
 }
 // `check_main_discharge`: `main` may perform only `IO`; each other effect
@@ -2792,7 +3551,101 @@ fn check_main_discharge(s: St, amb: Int) -> St {
 fn unhandled(s: St, ls: List(Lab)) -> St {
   match ls {
     Nil -> s
-    Cons(Lab(n, a, b), rest) -> unhandled(if n == "IO" { s } else { diag(s, "E0420", "effect `" <> n <> "` is never handled", a, b) }, rest)
+    Cons(Lab(n, _, a, b), rest) -> unhandled(if n == "IO" { s } else { diag(s, "E0420", "effect `" <> n <> "` is never handled", a, b) }, rest)
+  }
+}
+// 2.8, E0434: every row a `with any` handler handles is data: each label a
+// user effect (never `IO`) whose operations take and answer data at the
+// label's arguments. A tail still open is generically handled from now on.
+fn check_generic_rows(s: St) -> St {
+  match get_gn(s) {
+    R(Gn(k, gr, pg), s2) -> generic_sites_check(set_gn(s2, Gn(k, gr, Nil)), pg)
+  }
+}
+fn generic_sites_check(s: St, sites: List(GSite)) -> St {
+  match sites {
+    Nil -> s
+    Cons(GSite(snap, tail, fw, a, b), rest) -> match resolve_row(s, Row(Nil, tail)) {
+      R(Row(rl, rt), s2) -> {
+        let labels = if fw { snap } else { keep_labs(snap, rl) }
+        let s3 = site_labels(s2, labels, a, b)
+        let s4 = match rt {
+          ROpen(v) -> match get_gn(s3) { R(Gn(k, gr, pg), s3b) -> set_gn(s3b, Gn(k, if has_int(gr, v) { gr } else { Cons(v, gr) }, pg)) }
+          _ -> s3
+        }
+        generic_sites_check(s4, rest)
+      }
+    }
+  }
+}
+fn site_labels(s: St, ls: List(Lab), a: Int, b: Int) -> St {
+  match ls {
+    Nil -> s
+    Cons(Lab(n, args, _, _), rest) -> if n == "IO" {
+      site_labels(diag(s, "E0434", "`IO` cannot be handled by `with any`", a, b), rest, a, b)
+    } else {
+      match get_hx(s) {
+        R(Hx(_, _, _, ops, _, _, _, _), s2) -> site_labels(ops_data(s2, sort_ops(ops_of(ops, n)), args, a, b), rest, a, b)
+      }
+    }
+  }
+}
+fn ops_of(ops: List(OpInfo), eff: String) -> List(OpInfo) {
+  match ops { Nil -> Nil  Cons(OpInfo(n, e, all, ps, r), rest) -> if e == eff { Cons(OpInfo(n, e, all, ps, r), ops_of(rest, eff)) } else { ops_of(rest, eff) } }
+}
+// By name (Rust sorts them).
+fn sort_ops(ops: List(OpInfo)) -> List(OpInfo) {
+  match ops { Nil -> Nil  Cons(o, rest) -> insert_op(sort_ops(rest), o) }
+}
+fn insert_op(xs: List(OpInfo), o: OpInfo) -> List(OpInfo) {
+  match xs {
+    Nil -> Cons(o, Nil)
+    Cons(x, rest) -> match x {
+      OpInfo(n, _, _, _, _) -> match o { OpInfo(m, _, _, _, _) -> if str_lt(m, n, 0) { Cons(o, xs) } else { Cons(x, insert_op(rest, o)) } }
+    }
+  }
+}
+fn ops_data(s: St, ops: List(OpInfo), args: List(Ty), a: Int, b: Int) -> St {
+  match ops {
+    Nil -> s
+    Cons(OpInfo(_, _, all, ps, r), rest) -> {
+      let m = zip_params(all, args)
+      let tys = subst_list(append(ps, Cons(r, Nil)), m, Nil, Nil)
+      match any_not_data(s, tys) {
+        R(bad, s2) -> ops_data(if bad { diag(s2, "E0434", "an effect handled by `with any` must be data", a, b) } else { s2 }, rest, args, a, b)
+      }
+    }
+  }
+}
+fn zip_params(all: List(RPair), args: List(Ty)) -> List(Pair) {
+  match all { Nil -> Nil  Cons(RPair(p, _), rest) -> match args { Nil -> Nil  Cons(t, ar) -> Cons(Pair(p, t), zip_params(rest, ar)) } }
+}
+fn any_not_data(s: St, ts: List(Ty)) -> R(Bool) {
+  match ts {
+    Nil -> R(False, s)
+    Cons(t, rest) -> match resolve(s, t) {
+      R(rt, s2) -> match get_eq(s2) {
+        R(Eqs(ms, rep, adts), s3) -> match not_data(adts, rt, Nil) { Why(bad, _) -> if bad { R(True, s3) } else { any_not_data(s3, rest) } }
+      }
+    }
+  }
+}
+// `not_data` on a resolved type.
+fn not_data(adts: List(Adt), t: Ty, seen: List(String)) -> Why {
+  match t {
+    TFn(_, _, _) -> Why(True, seen)
+    TVar(_) -> Why(True, seen)
+    TCon(n, args) -> match not_data_list(adts, args, seen) {
+      Why(True, seen2) -> Why(True, seen2)
+      Why(False, seen2) -> decl_not_data(adts, n, seen2)
+    }
+    _ -> Why(False, seen)
+  }
+}
+fn not_data_list(adts: List(Adt), ts: List(Ty), seen: List(String)) -> Why {
+  match ts {
+    Nil -> Why(False, seen)
+    Cons(t, rest) -> match not_data(adts, t, seen) { Why(True, s2) -> Why(True, s2)  Why(False, s2) -> not_data_list(adts, rest, s2) }
   }
 }
 fn close_phantoms(s: St, v: Int, n: Int) -> St {
@@ -2813,7 +3666,7 @@ fn close_phantoms(s: St, v: Int, n: Int) -> St {
 fn schemes_of(s: St, fns: List(FnInfo), ms: List(Mem), env: List(Entry), lines: List(SchemeLine)) -> R(Out) {
   match ms {
     Nil -> R(Out(env, lines), s)
-    Cons(Mem(i, ps, amb, result, _, _), rest) -> match nth_fn(fns, i) {
+    Cons(Mem(i, ps, amb, result, _, _, _), rest) -> match nth_fn(fns, i) {
       FnInfo(name, _, _, _, _, _, _) -> match resolve(s, TFn(ps, ropen(amb), result)) {
         R(rt, s2) -> {
           let sc = Scheme(rev(free_vars(rt, Nil)), rev(free_rows(rt, Nil)), rt)
@@ -2868,18 +3721,30 @@ fn show_row(rw: Row, names: Names) -> Shown {
 }
 fn write_row(rw: Row, names: Names) -> Shown {
   match rw {
-    Row(ls, t) -> {
-      let labs = show_labs(ls, "")
-      match t {
-        ROpen(v) -> match row_name(names, v) { Shown(n, n2) -> Shown("{" <> labs <> (if labs == "" { "" } else { " | " }) <> n <> "}", n2) }
-        RError -> Shown("{" <> labs <> " | <error>}", names)
-        _ -> Shown("{" <> labs <> "}", names)
+    Row(ls, t) -> match write_labs(ls, names, "") {
+      Shown(labs, names2) -> match t {
+        ROpen(v) -> match row_name(names2, v) { Shown(n, n2) -> Shown("{" <> labs <> (if labs == "" { "" } else { " | " }) <> n <> "}", n2) }
+        RError -> Shown("{" <> labs <> " | <error>}", names2)
+        _ -> Shown("{" <> labs <> "}", names2)
+      }
+    }
+  }
+}
+// A parametric effect prints its arguments (`State(Int)`).
+fn write_labs(ls: List(Lab), names: Names, acc: String) -> Shown {
+  match ls {
+    Nil -> Shown(acc, names)
+    Cons(Lab(n, args, _, _), rest) -> {
+      let pre = if acc == "" { n } else { acc <> ", " <> n }
+      match args {
+        Nil -> write_labs(rest, names, pre)
+        _ -> match show_list(args, names, "") { Shown(a, n2) -> write_labs(rest, n2, pre <> "(" <> a <> ")") }
       }
     }
   }
 }
 fn show_labs(ls: List(Lab), acc: String) -> String {
-  match ls { Nil -> acc  Cons(Lab(n, _, _), rest) -> show_labs(rest, if acc == "" { n } else { acc <> ", " <> n }) }
+  match ls { Nil -> acc  Cons(Lab(n, _, _, _), rest) -> show_labs(rest, if acc == "" { n } else { acc <> ", " <> n }) }
 }
 fn show(t: Ty, names: Names) -> Shown {
   match t {
@@ -2887,6 +3752,10 @@ fn show(t: Ty, names: Names) -> Shown {
     TB(c) -> Shown(if c == 0 { "Int" } else { if c == 1 { "Float" } else { if c == 2 { "Bool" } else { if c == 3 { "String" } else { "Unit" } } } }, names)
     // A row argument is its row: `Task({Log | a})`, not its phantom.
     TFn(Nil, rw, TCon("$Row", Nil)) -> write_row(rw, names)
+    // A `with any` clause's operation: `Op(t / {E})`.
+    TCon("$Op", Cons(t, Cons(TFn(_, rw, _), Nil))) -> match show(t, names) {
+      Shown(ts, n2) -> match write_row(rw, n2) { Shown(w, n3) -> Shown("Op(" <> ts <> " / " <> w <> ")", n3) }
+    }
     TFn(ps, rw, r) -> match show_list(ps, names, "") {
       Shown(p, n2) -> match show_row(rw, n2) {
         Shown(w, n2b) -> match show(r, n2b) { Shown(rs, n3) -> Shown("fn(" <> p <> ")" <> w <> " -> " <> rs, n3) }
@@ -3022,8 +3891,8 @@ pub fn check_dump(m: Module) -> String {
       let fns = fn_infos(decls, Nil)
       let order = tarjan(all_edges(fns, fns, Nil), len(fns))
       let known = Cons(Arity("Array", 1), known_types(decls, Nil))
-      let st0 = St(array.new(), array.new(), 0, Nil, Nil, Ctx(Nil, known, Nil, Nil, Nil, decl_kinds(decls)), Rows(array.new(), array.new(), array.new()), Gx(Nil, Nil, Nil, Nil, Nil, Nil, Nil), Eqs(Nil, Nil, Nil), Hx(Nil, Nil, 0, Nil, Nil, Nil, Nil))
-      let st1 = set_hx(st0, Hx(Nil, Nil, 0, Nil, effect_names(decls, Nil), Nil, multi_names(decls, Nil)))
+      let st0 = St(array.new(), array.new(), 0, Nil, Nil, Ctx(Nil, known, Nil, Nil, Nil, decl_kinds(decls)), Rows(array.new(), array.new(), array.new()), Gx(Nil, Nil, Nil, Nil, Nil, Nil, Nil), Eqs(Nil, Nil, Nil), Hx(Nil, Nil, 0, Nil, Nil, Nil, Nil, Gn(0, Nil, Nil)))
+      let st1 = set_hx(st0, Hx(Nil, Nil, 0, Nil, effect_names(decls, Nil), Nil, multi_names(decls, Nil), Gn(0, Nil, Nil)))
       let declared = match type_decls(st1, decls, Nil) { R(env0, s0) -> R(env0, effect_decls(s0, decls)) }
       match match declared { R(env0, s0) -> groups(s0, fns, order, env0, Nil) } {
         R(lines, s) -> match s {
