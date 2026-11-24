@@ -176,7 +176,7 @@ use elya::eval::{Host, World};
 use std::path::Path;
 
 /// The stages `selfhost/check.elya` covers.
-const BUILT: u8 = 7;
+const BUILT: u8 = 8;
 
 #[test]
 fn the_checker_in_elya_agrees_on_its_stages() {

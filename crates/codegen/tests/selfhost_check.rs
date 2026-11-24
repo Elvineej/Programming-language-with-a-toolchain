@@ -12,7 +12,7 @@ mod support;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const BUILT: u8 = 7;
+const BUILT: u8 = 8;
 
 fn median(mut times: Vec<Duration>) -> Duration {
     times.sort_unstable();

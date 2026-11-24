@@ -298,21 +298,21 @@ fn is_borrow(pos: List(Bool), i: Int, arg: Sp(Expr), borrow occ: Array(List(KV))
 
 // ---- Counter: the bindings used many times ---------------------------------
 
-type Why { WTwice, WClosure(Int), WClause(Int) }
-type Many { Many(Int, Why) }
+type AWhy { WTwice, WClosure(Int), WClause(Int) }
+type Many { Many(Int, AWhy) }
 // A count: uses many?, calls many?, the first use, why many.
 type Cnt { Cnt(Bool, Bool, Int, Maybe(Many)) }
 type FE { FE(Int, Cnt) }
 // A frame: its size, its entries.
-type Frame { Frame(Int, List(FE)) }
-type BE { BE(Int, Frame) }
+type CFrame { CFrame(Int, List(FE)) }
+type BE { BE(Int, CFrame) }
 type ME { ME(Int, Many) }
 
 fn fe_get(xs: List(FE), k: Int) -> Maybe(Cnt) {
   match xs { Nil -> No  Cons(FE(a, c), rest) -> if a == k { Yes(c) } else { fe_get(rest, k) } }
 }
-fn fr_put(f: Frame, k: Int, c: Cnt) -> Frame {
-  match f { Frame(n, xs) -> match fe_get(xs, k) { Yes(_) -> Frame(n, fe_replace(xs, k, c))  No -> Frame(n + 1, Cons(FE(k, c), xs)) } }
+fn fr_put(f: CFrame, k: Int, c: Cnt) -> CFrame {
+  match f { CFrame(n, xs) -> match fe_get(xs, k) { Yes(_) -> CFrame(n, fe_replace(xs, k, c))  No -> CFrame(n + 1, Cons(FE(k, c), xs)) } }
 }
 fn fe_replace(xs: List(FE), k: Int, c: Cnt) -> List(FE) {
   match xs { Nil -> Nil  Cons(FE(a, d), rest) -> if a == k { Cons(FE(k, c), rest) } else { Cons(FE(a, d), fe_replace(rest, k, c)) } }
@@ -320,7 +320,7 @@ fn fe_replace(xs: List(FE), k: Int, c: Cnt) -> List(FE) {
 fn fe_remove(xs: List(FE), k: Int) -> List(FE) {
   match xs { Nil -> Nil  Cons(FE(a, d), rest) -> if a == k { rest } else { Cons(FE(a, d), fe_remove(rest, k)) } }
 }
-fn empty() -> Frame { Frame(0, Nil) }
+fn empty() -> CFrame { CFrame(0, Nil) }
 fn many_or(a: Maybe(Many), b: Maybe(Many)) -> Maybe(Many) { match a { Yes(_) -> a  No -> b } }
 // Two counts in sequence: many, the later use named.
 fn seq(a: Cnt, b: Cnt) -> Cnt {
@@ -350,47 +350,47 @@ fn larger(a: Cnt, b: Cnt) -> Cnt {
     }
   }
 }
-fn add(acc: Frame, other: Frame) -> Frame {
+fn add(acc: CFrame, other: CFrame) -> CFrame {
   match acc {
-    Frame(n, _) -> match other {
-      Frame(m, _) -> if m > n { add_into(other, acc) } else { add_into(acc, other) }
+    CFrame(n, _) -> match other {
+      CFrame(m, _) -> if m > n { add_into(other, acc) } else { add_into(acc, other) }
     }
   }
 }
-fn add_into(acc: Frame, other: Frame) -> Frame {
+fn add_into(acc: CFrame, other: CFrame) -> CFrame {
   match other {
-    Frame(_, xs) -> add_each(acc, xs)
+    CFrame(_, xs) -> add_each(acc, xs)
   }
 }
-fn add_each(acc: Frame, xs: List(FE)) -> Frame {
+fn add_each(acc: CFrame, xs: List(FE)) -> CFrame {
   match xs {
     Nil -> acc
     Cons(FE(k, c), rest) -> match acc {
-      Frame(_, ys) -> add_each(fr_put(acc, k, match fe_get(ys, k) { Yes(a) -> seq(a, c)  No -> c }), rest)
+      CFrame(_, ys) -> add_each(fr_put(acc, k, match fe_get(ys, k) { Yes(a) -> seq(a, c)  No -> c }), rest)
     }
   }
 }
-fn max_of(a: Frame, b: Frame) -> Frame {
+fn max_of(a: CFrame, b: CFrame) -> CFrame {
   match a {
-    Frame(n, _) -> match b {
-      Frame(m, _) -> if m > n { max_each(b, frame_list(a)) } else { max_each(a, frame_list(b)) }
+    CFrame(n, _) -> match b {
+      CFrame(m, _) -> if m > n { max_each(b, frame_list(a)) } else { max_each(a, frame_list(b)) }
     }
   }
 }
-fn frame_list(f: Frame) -> List(FE) { match f { Frame(_, xs) -> xs } }
-fn max_each(acc: Frame, xs: List(FE)) -> Frame {
+fn frame_list(f: CFrame) -> List(FE) { match f { CFrame(_, xs) -> xs } }
+fn max_each(acc: CFrame, xs: List(FE)) -> CFrame {
   match xs {
     Nil -> acc
     Cons(FE(k, c), rest) -> match acc {
-      Frame(_, ys) -> max_each(fr_put(acc, k, match fe_get(ys, k) { Yes(a) -> larger(a, c)  No -> c }), rest)
+      CFrame(_, ys) -> max_each(fr_put(acc, k, match fe_get(ys, k) { Yes(a) -> larger(a, c)  No -> c }), rest)
     }
   }
 }
 // A body's counts when it runs many times.
-fn scale_many(f: Frame, why: Why) -> Frame {
-  match f { Frame(n, xs) -> Frame(n, scale_list(xs, why)) }
+fn scale_many(f: CFrame, why: AWhy) -> CFrame {
+  match f { CFrame(n, xs) -> CFrame(n, scale_list(xs, why)) }
 }
-fn scale_list(xs: List(FE), why: Why) -> List(FE) {
+fn scale_list(xs: List(FE), why: AWhy) -> List(FE) {
   match xs {
     Nil -> Nil
     Cons(FE(k, Cnt(_, _, first, m)), rest) -> Cons(FE(k, Cnt(True, True, first, many_or(m, Yes(Many(first, why))))), scale_list(rest, why))
@@ -400,15 +400,15 @@ fn scale_list(xs: List(FE), why: Why) -> List(FE) {
 // The counter's state: the tables, the modes, the uses that are borrows
 // (value 1), the bindings used many times, the `let`-bound lambdas' bodies.
 type CS { CS(Tabs, List(Mode), Array(List(KV)), List(ME), List(BE)) }
-type CR { CR(Frame, CS) }
+type CR { CR(CFrame, CS) }
 
 fn me_put(xs: List(ME), k: Int, m: Many) -> List(ME) {
   match xs { Nil -> Cons(ME(k, m), Nil)  Cons(ME(a, w), rest) -> if a == k { Cons(ME(k, m), rest) } else { Cons(ME(a, w), me_put(rest, k, m)) } }
 }
-fn be_get(xs: List(BE), k: Int) -> Maybe(Frame) {
+fn be_get(xs: List(BE), k: Int) -> Maybe(CFrame) {
   match xs { Nil -> No  Cons(BE(a, f), rest) -> if a == k { Yes(f) } else { be_get(rest, k) } }
 }
-fn be_put(xs: List(BE), k: Int, f: Frame) -> List(BE) {
+fn be_put(xs: List(BE), k: Int, f: CFrame) -> List(BE) {
   match xs { Nil -> Cons(BE(k, f), Nil)  Cons(BE(a, g), rest) -> if a == k { Cons(BE(k, f), rest) } else { Cons(BE(a, g), be_put(rest, k, f)) } }
 }
 fn be_remove(xs: List(BE), k: Int) -> List(BE) {
@@ -417,11 +417,11 @@ fn be_remove(xs: List(BE), k: Int) -> List(BE) {
 // `key`'s scope ends: its count is final.
 fn finish(c: CR, k: Int) -> CR {
   match c {
-    CR(Frame(n, xs), CS(t, ms, bo, many, bodies)) -> match fe_get(xs, k) {
-      No -> CR(Frame(n, xs), CS(t, ms, bo, many, bodies))
+    CR(CFrame(n, xs), CS(t, ms, bo, many, bodies)) -> match fe_get(xs, k) {
+      No -> CR(CFrame(n, xs), CS(t, ms, bo, many, bodies))
       Yes(Cnt(u, _, _, m)) -> {
         let many2 = if u { match m { Yes(mm) -> me_put(many, k, mm)  No -> many } } else { many }
-        CR(Frame(n - 1, fe_remove(xs, k)), CS(t, ms, bo, many2, bodies))
+        CR(CFrame(n - 1, fe_remove(xs, k)), CS(t, ms, bo, many2, bodies))
       }
     }
   }
@@ -532,7 +532,7 @@ fn c_args(c: CR, pos: List(Bool), args: List(Sp(Expr)), i: Int) -> CR {
     }
   }
 }
-fn c_arms(cs: CS, arms: List(Sp(MatchArm)), best: Frame) -> CR {
+fn c_arms(cs: CS, arms: List(Sp(MatchArm)), best: CFrame) -> CR {
   match arms {
     Nil -> CR(best, cs)
     Cons(Sp(MatchArm(p, body), _, _), rest) -> match finish_all(c_expr(cs, body), pattern_vars(p, Nil)) {
@@ -973,7 +973,7 @@ fn first_given(uses: List(KV), b: Int, borrow bo: Array(List(KV))) -> Maybe(Int)
   match uses { Nil -> No  Cons(KV(at, bb), rest) -> if bb == b && tab_get(bo, at) < 0 { Yes(at) } else { first_given(rest, b, bo) } }
 }
 
-fn why_text(w: Why) -> String {
+fn why_text(w: AWhy) -> String {
   match w { WTwice -> "twice"  WClosure(k) -> "closure " <> show_key(k)  WClause(k) -> "clause " <> show_key(k) }
 }
 fn insert_me(xs: List(ME), e: ME) -> List(ME) {
@@ -1017,7 +1017,12 @@ fn sort_by_insert(xs: List(a), acc: List(a), ins: fn(List(a), a) -> List(a)) -> 
   match xs { Nil -> acc  Cons(x, rest) -> sort_by_insert(rest, ins(acc, x), ins) }
 }
 
-fn affine_dump(m: Module, size: Int) -> String {
+// The facts, for inference (the checker in Elya's stage F5): the bindings
+// used many times, what each point holds, each handler's resumes, the
+// reads after a binding was given away, the `borrow` parameters given
+// away, and the functions with `borrow` parameters used as values.
+type Facts { Facts(List(ME), List(LP), List(LP), List(LE), List(KV), List(BV)) }
+pub fn facts(m: Module, size: Int) -> Facts {
   match m {
     Module(_, decls) -> {
       let fs = fns_of(decls)
@@ -1031,23 +1036,27 @@ fn affine_dump(m: Module, size: Int) -> String {
                 let uses = tab_entries(occ, size + 1, Nil)
                 let given = given_fns(fs, uses, bo, Nil)
                 let bvs = match ms { Nil -> Nil  _ -> values_fns(occ, ms, fs, Nil) }
-                let b1 = d_many(sort_by_insert(many, Nil, insert_me), buffer.new())
+                let mny = sort_by_insert(many, Nil, insert_me)
+                let lt = sort_by_insert(late, Nil, insert_le)
+                let gv = sort_kv(given, Nil)
+                let bv = sort_by_insert(bvs, Nil, insert_bv)
                 if any_multi(decls) {
                   match live_fns(LS(Tabs(occ, caps, outer), ctors_of(decls, Nil), Nil, Nil, Nil, Nil), fs) {
-                    LS(_, _, held, res, _, _) -> {
-                      let b2 = d_resumes(sort_by_insert(res, Nil, insert_lp), d_held(sort_by_insert(held, Nil, insert_lp), b1))
-                      buffer.finish(d_bv(sort_by_insert(bvs, Nil, insert_bv), d_given(sort_kv(given, Nil), d_late(sort_by_insert(late, Nil, insert_le), b2))))
-                    }
+                    LS(_, _, held, res, _, _) -> Facts(mny, sort_by_insert(held, Nil, insert_lp), sort_by_insert(res, Nil, insert_lp), lt, gv, bv)
                   }
-                } else {
-                  buffer.finish(d_bv(sort_by_insert(bvs, Nil, insert_bv), d_given(sort_kv(given, Nil), d_late(sort_by_insert(late, Nil, insert_le), b1))))
-                }
+                } else { Facts(mny, Nil, Nil, lt, gv, bv) }
               }
             }
           }
         }
       }
     }
+  }
+}
+fn affine_dump(m: Module, size: Int) -> String {
+  match facts(m, size) {
+    Facts(many, held, res, late, given, bvs) ->
+      buffer.finish(d_bv(bvs, d_given(given, d_late(late, d_resumes(res, d_held(held, d_many(many, buffer.new())))))))
   }
 }
 

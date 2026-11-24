@@ -4,6 +4,7 @@
 // Stages F1 (first order), F2a (declared types, constructors, `match`, the
 // pure builtins) and F2b (higher order, with the effect rows' tails).
 import parse / {IO}
+import affine / {IO}
 
 // ---- Types, schemes, the state ------------------------------------------
 
@@ -80,7 +81,23 @@ type OpInfo { OpInfo(String, String, List(RPair), List(Ty), Ty) }
 // the group (`pending_generic`).
 type GSite { GSite(List(Lab), Tail, Bool, Int, Int) }
 type Gn { Gn(Int, List(Int), List(GSite)) }
-type Hx { Hx(List(Resume), List(Int), Int, List(OpInfo), List(String), List(Incl), List(String), Gn) }
+// The affine part (stage F5, spec 2026-11-06-elya-affine-across-functions):
+// the affine pass's facts; the duplicable type variables, each with why
+// (`dup_vars`); the holds riding on row variables (`row_holds`); each local
+// binding by its binder (`binders`); the spans already blamed
+// (`dup_reported`); the diagnostics reported apart, after the others (D7);
+// the `linear` types.
+type DK { KMany, KHeld(Int, Int, String), KAnyOp(String), KLate, KGiven, KElement, KValue }
+// Why a type must be duplicable: the binding's name ("" for none), the use
+// that requires it, the kind, and the instantiation it came through (-1:
+// none).
+type Mark { Mark(String, Int, Int, DK, Int, Int) }
+type DV { DV(Int, Mark) }
+type Hold { Hold(Maybe(Ty), List(Int), Mark) }
+type RH { RH(Int, List(Hold)) }
+type BD { BD(Int, Int, String, Ty, List(Int)) }
+type Af { Af(Facts, List(DV), List(RH), List(BD), List(Int), List(Diag), List(String)) }
+type Hx { Hx(List(Resume), List(Int), Int, List(OpInfo), List(String), List(Incl), List(String), Gn, Af) }
 linear type St { St(Array(Ty), Array(Int), Int, List(Diag), List(Rec), Ctx, Rows, Gx, Eqs, Hx) }
 linear type R(a) { R(a, St) }
 
@@ -148,10 +165,10 @@ fn add_level(s: St, d: Int) -> St {
   match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> St(sub, lv, cur + d, ds, rs, cx, rw, gx, eq, hx) }
 }
 fn get_gn(s: St) -> R(Gn) {
-  match get_hx(s) { R(Hx(_, _, _, _, _, _, _, gn), s2) -> R(gn, s2) }
+  match get_hx(s) { R(Hx(_, _, _, _, _, _, _, gn, af), s2) -> R(gn, s2) }
 }
 fn set_gn(s: St, gn: Gn) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, _), s2) -> set_hx(s2, Hx(rs, cr, d, ops, effs, dead, mu, gn)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, _, af), s2) -> set_hx(s2, Hx(rs, cr, d, ops, effs, dead, mu, gn, af)) }
 }
 fn push_site(s: St, g: GSite) -> St {
   match get_gn(s) { R(Gn(k, gr, pg), s2) -> set_gn(s2, Gn(k, gr, append(pg, Cons(g, Nil)))) }
@@ -254,6 +271,355 @@ fn shape_not_data(adts: List(Adt), t: Ty, ps: List(Int), seen: List(String)) -> 
       Why(False, seen2) -> decl_not_data(adts, n, seen2)
     }
     _ -> Why(False, seen)
+  }
+}
+// ---- Duplicability (stage F5; spec 2026-11-06-elya-affine-across-functions) --
+
+fn linear_names(decls: List(Sp(Decl)), acc: List(String)) -> List(String) {
+  match decls {
+    Nil -> acc
+    Cons(Sp(DType(name, _, True, _), _, _), rest) -> linear_names(rest, Cons(name, acc))
+    Cons(_, rest) -> linear_names(rest, acc)
+  }
+}
+fn get_af(s: St) -> R(Af) {
+  match get_hx(s) { R(Hx(_, _, _, _, _, _, _, _, af), s2) -> R(af, s2) }
+}
+fn set_af(s: St, af: Af) -> St {
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn, _), s2) -> set_hx(s2, Hx(rs, cr, d, ops, effs, dead, mu, gn, af)) }
+}
+// The affine pass keys a span as one Int.
+fn skey(a: Int, b: Int) -> Int { a * 1048576 + b }
+fn kstart(k: Int) -> Int { k / 1048576 }
+fn kend(k: Int) -> Int { k - (k / 1048576) * 1048576 }
+fn is_linear_name(s: St, n: String) -> R(Bool) {
+  match get_af(s) { R(Af(_, _, _, _, _, _, lin), s2) -> R(has_name(lin, n), s2) }
+}
+type DD { DD(Maybe(String), List(String)) }
+// The `linear` type a declared type's fields hold, its parameters taken as
+// duplicable (`decl_not_dup`).
+fn decl_not_dup(adts: List(Adt), lin: List(String), name: String, seen: List(String)) -> DD {
+  if has_name(seen, name) { DD(No, seen) } else {
+    match adt_of(adts, name) {
+      No -> DD(No, Cons(name, seen))
+      Yes(Adt(_, _, cs)) -> shapes_not_dup(adts, lin, flatten_tys(cs), Cons(name, seen))
+    }
+  }
+}
+fn flatten_tys(cs: List(List(Ty))) -> List(Ty) {
+  match cs { Nil -> Nil  Cons(fs, rest) -> append(fs, flatten_tys(rest)) }
+}
+fn shapes_not_dup(adts: List(Adt), lin: List(String), ts: List(Ty), seen: List(String)) -> DD {
+  match ts {
+    Nil -> DD(No, seen)
+    Cons(t, rest) -> match shape_not_dup(adts, lin, t, seen) {
+      DD(Yes(n), seen2) -> DD(Yes(n), seen2)
+      DD(No, seen2) -> shapes_not_dup(adts, lin, rest, seen2)
+    }
+  }
+}
+fn shape_not_dup(adts: List(Adt), lin: List(String), t: Ty, seen: List(String)) -> DD {
+  match t {
+    TCon(n, args) -> if n == "$Op" { DD(No, seen) } else { if has_name(lin, n) { DD(Yes(n), seen) } else {
+      match shapes_not_dup(adts, lin, args, seen) {
+        DD(Yes(x), seen2) -> DD(Yes(x), seen2)
+        DD(No, seen2) -> decl_not_dup(adts, lin, n, seen2)
+      }
+    } }
+    _ -> DD(No, seen)
+  }
+}
+fn not_dup_decl(s: St, n: String) -> R(Maybe(String)) {
+  match get_eq(s) {
+    R(Eqs(_, _, adts), s2) -> match get_af(s2) {
+      R(Af(_, _, _, _, _, _, lin), s3) -> match decl_not_dup(adts, lin, n, Nil) { DD(r, _) -> R(r, s3) }
+    }
+  }
+}
+// Whether `t` is duplicable already, nothing in it to mark (`dup_known`).
+fn dup_known(s: St, t: Ty) -> R(Bool) {
+  match resolve(s, t) {
+    R(rt, s2) -> match rt {
+      TVar(_) -> R(False, s2)
+      TCon(n, args) -> if n == "$Op" { R(True, s2) } else {
+        match is_linear_name(s2, n) {
+          R(True, s3) -> R(False, s3)
+          R(False, s3) -> match not_dup_decl(s3, n) {
+            R(Yes(_), s4) -> R(False, s4)
+            R(No, s4) -> dup_known_all(s4, args)
+          }
+        }
+      }
+      _ -> R(True, s2)
+    }
+  }
+}
+fn dup_known_all(s: St, ts: List(Ty)) -> R(Bool) {
+  match ts { Nil -> R(True, s)  Cons(t, rest) -> match dup_known(s, t) { R(True, s2) -> dup_known_all(s2, rest)  R(False, s2) -> R(False, s2) } }
+}
+// D1 (`require_dup`): `t` must be duplicable: no `linear` type in it, nor
+// in its declared types' fields; its variables (but `skip`) marked.
+fn require_dup(s: St, t: Ty, m: Mark, skip: List(Int)) -> St {
+  match resolve(s, t) {
+    R(rt, s2) -> match rt {
+      TVar(v) -> if has_int(skip, v) { s2 } else {
+        match get_af(s2) {
+          R(Af(fa, dv, rh, bd, rep, ad, lin), s3) -> if has_dv(dv, v) { s3 } else { set_af(s3, Af(fa, Cons(DV(v, m), dv), rh, bd, rep, ad, lin)) }
+        }
+      }
+      TCon(n, args) -> if n == "$Op" { s2 } else {
+        match is_linear_name(s2, n) {
+          R(True, s3) -> dup_violation(s3, m, n)
+          R(False, s3) -> match not_dup_decl(s3, n) {
+            R(Yes(inner), s4) -> dup_violation(s4, m, inner)
+            R(No, s4) -> require_dup_all(s4, args, m, skip)
+          }
+        }
+      }
+      _ -> s2
+    }
+  }
+}
+fn require_dup_all(s: St, ts: List(Ty), m: Mark, skip: List(Int)) -> St {
+  match ts { Nil -> s  Cons(t, rest) -> require_dup_all(require_dup(s, t, m, skip), rest, m, skip) }
+}
+fn has_dv(dv: List(DV), v: Int) -> Bool {
+  match dv { Nil -> False  Cons(DV(u, _), rest) -> u == v || has_dv(rest, v) }
+}
+fn dv_get(dv: List(DV), v: Int) -> Maybe(Mark) {
+  match dv { Nil -> No  Cons(DV(u, m), rest) -> if u == v { Yes(m) } else { dv_get(rest, v) } }
+}
+fn through(m: Mark, a: Int, b: Int) -> Mark {
+  match m { Mark(n, x, y, k, _, _) -> Mark(n, x, y, k, a, b) }
+}
+// D6 (`dup_violation`): a value holding the `linear` type would be
+// duplicated; each use (or instantiation) blamed once.
+fn dup_violation(s: St, m: Mark, what: String) -> St {
+  match m {
+    Mark(name, a, b, k, va, vb) -> {
+      let via = va >= 0
+      let kk = if via { skey(va, vb) } else { skey(a, b) }
+      match get_af(s) {
+        R(Af(fa, dv, rh, bd, rep, ad, lin), s2) -> if has_int(rep, kk) { s2 } else {
+          let who = if name == "" { "an affine value" } else { "affine value `" <> name <> "`" }
+          let d = match k {
+            KAnyOp(_) -> Diag("error", "E0437", "an operation taking an affine value cannot be handled by `with any`", a, b)
+            KMany -> if via { Diag("error", "E0437", "this would use an affine value more than once", va, vb) } else { Diag("error", "E0428", who <> " used more than once", a, b) }
+            KHeld(_, _, _) -> if via { Diag("error", "E0437", "this would keep an affine value across a multi-shot perform", va, vb) } else { Diag("error", "E0429", who <> " may be captured by a multi-shot handler", a, b) }
+            KLate -> if via { Diag("error", "E0437", "this would read an affine value after it was given away", va, vb) } else { Diag("error", "E0438", "`" <> name <> "` is read here after it was given away", a, b) }
+            KGiven -> if via { Diag("error", "E0437", "this would give away a borrowed value", va, vb) } else { Diag("error", "E0439", "a borrowed value is given away here", a, b) }
+            KElement -> Diag("error", "E0437", "an array's elements must not be affine", a, b)
+            KValue -> Diag("error", "E0439", "`" <> name <> "` borrows its argument: it must be called by its name", a, b)
+          }
+          set_af(s2, Af(fa, dv, rh, bd, Cons(kk, rep), Cons(d, ad), lin))
+        }
+      }
+    }
+  }
+}
+// A local binding noted (`note_binder`): its type, read by the points that
+// hold it; used many times, read after it was given away, or a `borrow`
+// parameter given away, its type must be duplicable (a generalized `let`'s
+// quantified variables aside, D8).
+fn note_binder(s: St, a: Int, b: Int, name: String, sc: Scheme) -> St {
+  match sc {
+    Scheme(vars, _, t) -> match get_af(s) {
+      R(Af(fa, dv, rh, bd, rep, ad, lin), s2) -> {
+        let s3 = set_af(s2, Af(fa, dv, rh, Cons(BD(a, b, name, t, vars), bd), rep, ad, lin))
+        let k = skey(a, b)
+        match fa {
+          Facts(many, _, _, late, given, _) -> {
+            let s4 = match me_get(many, k) { Yes(at) -> require_dup(s3, t, Mark(name, kstart(at), kend(at), KMany, 0 - 1, 0 - 1), vars)  No -> s3 }
+            let s5 = match le_get(late, k) { Yes(at) -> require_dup(s4, t, Mark(name, kstart(at), kend(at), KLate, 0 - 1, 0 - 1), vars)  No -> s4 }
+            match kv_get(given, k) { Yes(at) -> require_dup(s5, t, Mark(name, kstart(at), kend(at), KGiven, 0 - 1, 0 - 1), vars)  No -> s5 }
+          }
+        }
+      }
+    }
+  }
+}
+fn me_get(xs: List(ME), k: Int) -> Maybe(Int) {
+  match xs { Nil -> No  Cons(ME(x, Many(at, _)), rest) -> if x == k { Yes(at) } else { me_get(rest, k) } }
+}
+fn le_get(xs: List(LE), k: Int) -> Maybe(Int) {
+  match xs { Nil -> No  Cons(LE(x, r, _), rest) -> if x == k { Yes(r) } else { le_get(rest, k) } }
+}
+fn kv_get(xs: List(KV), k: Int) -> Maybe(Int) {
+  match xs { Nil -> No  Cons(KV(x, v), rest) -> if x == k { Yes(v) } else { kv_get(rest, k) } }
+}
+// A function with a `borrow` parameter used as a value (D5): what it
+// borrows must be duplicable.
+fn borrow_value(s: St, a: Int, b: Int, t: Ty) -> St {
+  match get_af(s) {
+    R(Af(Facts(_, _, _, _, _, bvs), _, _, _, _, _, _), s2) -> match bv_get(bvs, skey(a, b)) {
+      No -> s2
+      Yes(BV(_, f, modes)) -> match resolve(s2, t) {
+        R(TFn(ps, _, _), s3) -> borrowed_dup(s3, ps, modes, Mark(f, a, b, KValue, 0 - 1, 0 - 1))
+        R(_, s3) -> s3
+      }
+    }
+  }
+}
+fn bv_get(xs: List(BV), k: Int) -> Maybe(BV) {
+  match xs { Nil -> No  Cons(BV(x, n, m), rest) -> if x == k { Yes(BV(x, n, m)) } else { bv_get(rest, k) } }
+}
+fn borrowed_dup(s: St, ps: List(Ty), modes: List(Bool), m: Mark) -> St {
+  match ps {
+    Nil -> s
+    Cons(p, pr) -> match modes { Nil -> s  Cons(md, mr) -> borrowed_dup(if md { require_dup(s, p, m, Nil) } else { s }, pr, mr, m) }
+  }
+}
+// The `multi` effect a row has, the first by name.
+fn multi_label(s: St, ls: List(Lab)) -> R(String) {
+  match ls {
+    Nil -> R("", s)
+    Cons(Lab(n, _, _, _), rest) -> match is_multi(s, n) { R(True, s2) -> R(n, s2)  R(False, s2) -> multi_label(s2, rest) }
+  }
+}
+// D3 (`hold_point`): what a point holds must be duplicable when its row has a
+// `multi` effect, or when its tail variable takes one.
+fn hold_point(s: St, a: Int, b: Int, row: Row) -> St {
+  match get_af(s) {
+    R(Af(Facts(_, held, _, _, _, _), _, _, _, _, _, _), s2) -> match lp_get(held, skey(a, b)) {
+      No -> s2
+      Yes(es) -> match resolve_row(s2, row) {
+        R(Row(ls, t), s3) -> match multi_label(s3, ls) {
+          R(mlabel, s4) -> {
+            let tail = match t { ROpen(w) -> w  _ -> 0 - 1 }
+            if mlabel == "" && tail < 0 { s4 } else { held_entries(s4, es, a, b, mlabel, tail) }
+          }
+        }
+      }
+    }
+  }
+}
+fn lp_get(xs: List(LP), k: Int) -> Maybe(List(KV)) {
+  match xs { Nil -> No  Cons(LP(x, es), rest) -> if x == k { Yes(es) } else { lp_get(rest, k) } }
+}
+fn held_entries(s: St, es: List(KV), a: Int, b: Int, mlabel: String, tail: Int) -> St {
+  match es {
+    Nil -> s
+    Cons(KV(bk, u), rest) -> match held_binding(s, bk) {
+      R(No, s2) -> held_entries(s2, rest, a, b, mlabel, tail)
+      R(Yes(BD(_, _, name, ty, skip)), s2) -> match dup_known(s2, ty) {
+        R(True, s3) -> held_entries(s3, rest, a, b, mlabel, tail)
+        R(False, s3) -> {
+          let m = Mark(name, kstart(u), kend(u), KHeld(a, b, mlabel), 0 - 1, 0 - 1)
+          let s4 = if mlabel != "" { require_dup(s3, ty, m, skip) } else { add_hold(s3, tail, Hold(Yes(ty), skip, m)) }
+          held_entries(s4, rest, a, b, mlabel, tail)
+        }
+      }
+    }
+  }
+}
+// A binding, or a value already computed for a call a later argument's
+// point re-runs: an expression's type.
+fn held_binding(s: St, k: Int) -> R(Maybe(BD)) {
+  match get_af(s) {
+    R(Af(_, _, _, bd, _, _, _), s2) -> match bd_get(bd, k) {
+      Yes(x) -> R(Yes(x), s2)
+      No -> match s2 { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> R(match rec_get(rs, kstart(k), kend(k)) { Yes(t) -> Yes(BD(0, 0, "", t, Nil))  No -> No }, St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx)) }
+    }
+  }
+}
+fn bd_get(xs: List(BD), k: Int) -> Maybe(BD) {
+  match xs { Nil -> No  Cons(BD(a, b, n, t, sk), rest) -> if skey(a, b) == k { Yes(BD(a, b, n, t, sk)) } else { bd_get(rest, k) } }
+}
+fn rec_get(rs: List(Rec), a: Int, b: Int) -> Maybe(Ty) {
+  match rs { Nil -> No  Cons(Rec(x, y, t), rest) -> if x == a && y == b { Yes(t) } else { rec_get(rest, a, b) } }
+}
+fn add_hold(s: St, w: Int, h: Hold) -> St { add_holds(s, w, Cons(h, Nil)) }
+fn add_holds(s: St, w: Int, hs: List(Hold)) -> St {
+  match get_af(s) {
+    R(Af(fa, dv, rh, bd, rep, ad, lin), s2) -> set_af(s2, Af(fa, dv, rh_add(rh, w, hs), bd, rep, ad, lin))
+  }
+}
+fn rh_add(rh: List(RH), w: Int, hs: List(Hold)) -> List(RH) {
+  match rh { Nil -> Cons(RH(w, hs), Nil)  Cons(RH(v, xs), rest) -> if v == w { Cons(RH(v, append(xs, hs)), rest) } else { Cons(RH(v, xs), rh_add(rest, w, hs)) } }
+}
+fn rh_get(rh: List(RH), w: Int) -> Maybe(List(Hold)) {
+  match rh { Nil -> No  Cons(RH(v, xs), rest) -> if v == w { Yes(xs) } else { rh_get(rest, w) } }
+}
+fn rh_remove(rh: List(RH), w: Int) -> List(RH) {
+  match rh { Nil -> Nil  Cons(RH(v, xs), rest) -> if v == w { rest } else { Cons(RH(v, xs), rh_remove(rest, w)) } }
+}
+// A `handle` and the `resume`s in its clauses: points whose rows are what
+// escapes it (`hold_handle`).
+fn hold_handle(s: St, a: Int, b: Int, rows: List(Row)) -> St {
+  match get_af(s) {
+    R(Af(Facts(_, _, res, _, _, _), _, _, _, _, _, _), s2) -> {
+      let rs = match lp_get(res, skey(a, b)) { Yes(xs) -> xs  No -> Nil }
+      hold_rows(s2, a, b, rows, rs)
+    }
+  }
+}
+fn hold_rows(s: St, a: Int, b: Int, rows: List(Row), rs: List(KV)) -> St {
+  match rows {
+    Nil -> s
+    Cons(r, rest) -> hold_rows(hold_resumes(hold_point(s, a, b, r), rs, r), a, b, rest, rs)
+  }
+}
+fn hold_resumes(s: St, rs: List(KV), r: Row) -> St {
+  match rs { Nil -> s  Cons(KV(k, _), rest) -> hold_resumes(hold_point(s, kstart(k), kend(k), r), rest, r) }
+}
+// A row variable holding `hs` was bound to `row` (`apply_holds`).
+fn apply_holds(s: St, hs: List(Hold), row: Row) -> St {
+  match resolve_row(s, row) {
+    R(Row(ls, t), s2) -> match multi_label(s2, ls) {
+      R(mlabel, s3) -> match apply_each(s3, hs, Row(ls, t), mlabel, Nil) {
+        R(rest, s4) -> match t {
+          ROpen(w) -> match rest { Nil -> s4  _ -> add_holds(s4, w, rest) }
+          _ -> s4
+        }
+      }
+    }
+  }
+}
+fn apply_each(s: St, hs: List(Hold), row: Row, mlabel: String, acc: List(Hold)) -> R(List(Hold)) {
+  match hs {
+    Nil -> R(rev(acc), s)
+    Cons(Hold(No, sk, m), rest) -> apply_each(require_dup_ops(s, row, m), rest, row, mlabel, Cons(Hold(No, sk, m), acc))
+    Cons(Hold(Yes(t), sk, m), rest) -> if mlabel == "" { apply_each(s, rest, row, mlabel, Cons(Hold(Yes(t), sk, m), acc)) } else {
+      let m2 = match m { Mark(n, x, y, KHeld(pa, pb, _), va, vb) -> Mark(n, x, y, KHeld(pa, pb, mlabel), va, vb)  _ -> m }
+      apply_each(require_dup(s, t, m2, sk), rest, row, mlabel, acc)
+    }
+  }
+}
+// D5 (`require_dup_ops`): every operation of each label but `IO`'s takes
+// duplicable arguments (`op.perform` performs it again).
+fn require_dup_ops(s: St, row: Row, m: Mark) -> St {
+  match row {
+    Row(ls, _) -> dup_ops_labs(s, ls, m)
+  }
+}
+fn dup_ops_labs(s: St, ls: List(Lab), m: Mark) -> St {
+  match ls {
+    Nil -> s
+    Cons(Lab(n, args, _, _), rest) -> if n == "IO" { dup_ops_labs(s, rest, m) } else {
+      match get_hx(s) {
+        R(Hx(_, _, _, ops, _, _, _, _, _), s2) -> dup_ops_labs(dup_ops(s2, sort_ops(ops_of(ops, n)), n, args, m), rest, m)
+      }
+    }
+  }
+}
+fn dup_ops(s: St, ops: List(OpInfo), eff: String, args: List(Ty), m: Mark) -> St {
+  match ops {
+    Nil -> s
+    Cons(OpInfo(name, _, all, ps, _), rest) -> {
+      let em = zip_params(all, args)
+      let m2 = match m { Mark(n, a, b, _, va, vb) -> Mark(n, a, b, KAnyOp(eff <> "." <> name), va, vb) }
+      dup_ops(require_dup_all(s, subst_list(ps, em, Nil, Nil), m2, Nil), rest, eff, args, m)
+    }
+  }
+}
+// D5 at a `with any` handle: the row it handles, now and as its tail fills.
+fn hold_any_ops(s: St, a: Int, b: Int, handled: Row) -> St {
+  match resolve_row(s, handled) {
+    R(Row(ls, t), s2) -> {
+      let m = Mark("", a, b, KAnyOp(""), 0 - 1, 0 - 1)
+      let s3 = require_dup_ops(s2, Row(ls, t), m)
+      match t { ROpen(w) -> add_hold(s3, w, Hold(No, Nil, m))  _ -> s3 }
+    }
   }
 }
 // `eq_not_data`: a variable is marked, not refused; every argument of a
@@ -438,7 +804,7 @@ fn bind_row(s: St, v: Int, r: Row, start: Int, end: Int) -> St {
     R(Row(_, bt), s1) -> match bt {
       RNone -> match resolve_row(s1, r) {
         R(Row(rl, rt), s2) -> if tail_eq(rt, ROpen(v)) || mentions_labs(v, rl) {
-          set_row(diag(s2, "E0424", "cyclic effect row", start, end), v, Row(Nil, RError))
+          drop_holds(set_row(diag(s2, "E0424", "cyclic effect row", start, end), v, Row(Nil, RError)), v)
         } else {
           match is_phantom(s2, v) {
             R(pv, s3) -> {
@@ -446,7 +812,11 @@ fn bind_row(s: St, v: Int, r: Row, start: Int, end: Int) -> St {
               match row_level(s4, v) {
                 R(lvl, s5) -> {
                   let s6 = match rt { ROpen(w) -> lower_row(s5, w, lvl)  _ -> s5 }
-                  set_row(lower_labs(s6, rl, lvl), v, Row(rl, rt))
+                  // What rode on `v` rides on what it is bound to (D3).
+                  match take_holds(s6, v) {
+                    R(No, s7) -> set_row(lower_labs(s7, rl, lvl), v, Row(rl, rt))
+                    R(Yes(hs), s7) -> apply_holds(set_row(lower_labs(s7, rl, lvl), v, Row(rl, rt)), hs, Row(rl, rt))
+                  }
                 }
               }
             }
@@ -911,8 +1281,12 @@ fn bind_checked(s: St, v: Int, t: Ty, start: Int, end: Int) -> St {
       match level_of(s2, v) {
         R(l, s3) -> {
           let s4 = set_var(lower_levels(s3, t, l), v, t)
-          match get_eq(s4) {
+          let s6 = match get_eq(s4) {
             R(Eqs(ms, _, _), s5) -> match mark_of(ms, v) { Yes(o) -> require_data(s5, t, start, end, o)  No -> s5 }
+          }
+          // A duplicable variable's type must be duplicable (D1).
+          match get_af(s6) {
+            R(Af(_, dv, _, _, _, _, _), s7) -> match dv_get(dv, v) { Yes(m) -> require_dup(s7, t, m, Nil)  No -> s7 }
           }
         }
       }
@@ -1032,7 +1406,46 @@ fn instantiate_at(s: St, sc: Scheme, a: Int, b: Int) -> R(Ty) {
 }
 fn instantiate_with(s: St, vars: List(Int), rvars: List(Int), t: Ty, a: Int, b: Int) -> R(Ty) {
   match fresh_map(s, vars, Nil) {
-    R(m, s2) -> match fresh_rmap(s2, rvars, Nil) { R(rm, s3) -> R(subst(t, m, rm), generic_sites(s3, rvars, rm, t, a, b)) }
+    R(m, s2) -> match fresh_rmap(s2, rvars, Nil) {
+      R(rm, s3) -> R(subst(t, m, rm), copy_holds(copy_dups(generic_sites(s3, rvars, rm, t, a, b), m, a, b), rvars, m, rm, a, b))
+    }
+  }
+}
+// A duplicable variable a scheme quantifies marks its fresh copy, the
+// instantiation named (E0437); a hold on a quantified row is copied.
+fn copy_dups(s: St, m: List(Pair), a: Int, b: Int) -> St {
+  match m {
+    Nil -> s
+    Cons(Pair(v, TVar(f)), rest) -> match get_af(s) {
+      R(Af(fa, dv, rh, bd, rep, ad, lin), s2) -> match dv_get(dv, v) {
+        Yes(mk) -> copy_dups(set_af(s2, Af(fa, Cons(DV(f, through(mk, a, b)), dv_without(dv, f)), rh, bd, rep, ad, lin)), rest, a, b)
+        No -> copy_dups(s2, rest, a, b)
+      }
+    }
+    Cons(_, rest) -> copy_dups(s, rest, a, b)
+  }
+}
+fn dv_without(dv: List(DV), v: Int) -> List(DV) {
+  match dv { Nil -> Nil  Cons(DV(u, m), rest) -> if u == v { rest } else { Cons(DV(u, m), dv_without(rest, v)) } }
+}
+fn copy_holds(s: St, rvars: List(Int), m: List(Pair), rm: List(RPair), a: Int, b: Int) -> St {
+  match rvars {
+    Nil -> s
+    Cons(v, rest) -> match get_af(s) {
+      R(Af(_, _, rh, _, _, _, _), s2) -> match rh_get(rh, v) {
+        No -> copy_holds(s2, rest, m, rm, a, b)
+        Yes(hs) -> match copies(s2, hs, m, rm, a, b, Nil) {
+          R(cs, s3) -> copy_holds(add_holds(s3, rsubst_get(rm, v), cs), rest, m, rm, a, b)
+        }
+      }
+    }
+  }
+}
+fn copies(s: St, hs: List(Hold), m: List(Pair), rm: List(RPair), a: Int, b: Int, acc: List(Hold)) -> R(List(Hold)) {
+  match hs {
+    Nil -> R(rev(acc), s)
+    Cons(Hold(No, sk, mk), rest) -> copies(s, rest, m, rm, a, b, Cons(Hold(No, sk, through(mk, a, b)), acc))
+    Cons(Hold(Yes(t), sk, mk), rest) -> match resolve(s, t) { R(rt, s2) -> copies(s2, rest, m, rm, a, b, Cons(Hold(Yes(subst(rt, m, rm)), sk, through(mk, a, b)), acc)) }
   }
 }
 // A generically handled row quantified by a scheme is checked again where
@@ -1091,10 +1504,43 @@ fn above_rows(s: St, vs: List(Int), lvl: Int, kept: List(Int), acc: List(Int)) -
 // The function's annotation variables are part of the environment
 // (`kept_monomorphic`): a lowercase name is one type for the whole function,
 // so an inner `let` must not quantify it, nor the rows inside it.
+fn kept_holds(s: St, rh: List(RH), lvl: Int, acc: List(Int)) -> R(List(Int)) {
+  match rh {
+    Nil -> R(acc, s)
+    Cons(RH(w, hs), rest) -> match row_bound(s, w) {
+      R(Row(_, RNone), s2) -> match row_level(s2, w) {
+        R(l, s3) -> if l <= lvl { match held_vars(s3, hs, acc) { R(acc2, s4) -> kept_holds(s4, rest, lvl, acc2) } } else { kept_holds(s3, rest, lvl, acc) }
+      }
+      R(_, s2) -> kept_holds(s2, rest, lvl, acc)
+    }
+  }
+}
+fn held_vars(s: St, hs: List(Hold), acc: List(Int)) -> R(List(Int)) {
+  match hs {
+    Nil -> R(acc, s)
+    Cons(Hold(Yes(t), _, _), rest) -> match resolve(s, t) { R(rt, s2) -> held_vars(s2, rest, free_vars(rt, acc)) }
+    Cons(_, rest) -> held_vars(s, rest, acc)
+  }
+}
+fn take_holds(s: St, v: Int) -> R(Maybe(List(Hold))) {
+  match get_af(s) {
+    R(Af(fa, dv, rh, bd, rep, ad, lin), s2) -> match rh_get(rh, v) {
+      No -> R(No, s2)
+      Yes(hs) -> R(Yes(hs), set_af(s2, Af(fa, dv, rh_remove(rh, v), bd, rep, ad, lin)))
+    }
+  }
+}
+fn drop_holds(s: St, v: Int) -> St { match take_holds(s, v) { R(_, s2) -> s2 } }
 fn kept_vars(s: St) -> R(List(Int)) {
   match get_cx(s) {
     R(Ctx(avs, _, _, _, _, _), s2) -> match kept_from(s2, avs, Nil) {
-      R(acc, s3) -> match get_hx(s3) { R(Hx(rs, _, _, _, _, _, _, _), s4) -> kept_resume_vars(s4, rs, acc) }
+      R(acc, s3) -> match get_hx(s3) {
+        R(Hx(rs, _, _, _, _, _, _, _, Af(_, _, rh, _, _, _, _)), s4) -> match kept_resume_vars(s4, rs, acc) {
+          // A type held on a row this `let` leaves to its scope is the
+          // scope's (D3, the review's U-B).
+          R(acc2, s5) -> match cur_level(s5) { R(lvl, s6) -> kept_holds(s6, rh, lvl, acc2) }
+        }
+      }
     }
   }
 }
@@ -1147,7 +1593,7 @@ fn kept_rows(s: St) -> R(List(Int)) {
       R(acc, s3) -> match get_gx(s3) {
         R(Gx(_, _, _, _, ds, _, _), s4) -> match kept_deferred(s4, ds, acc) {
           R(acc2, s5) -> match get_hx(s5) {
-            R(Hx(rs, crs, _, _, _, _, _, Gn(_, _, pg)), s6) -> match kept_resume_rows(s6, rs, acc2) {
+            R(Hx(rs, crs, _, _, _, _, _, Gn(_, _, pg), _), s6) -> match kept_resume_rows(s6, rs, acc2) {
               R(acc3, s7) -> match kept_tails(s7, crs, acc3) { R(acc4, s8) -> kept_sites(s8, pg, acc4) }
             }
           }
@@ -1238,9 +1684,11 @@ fn is_lower(name: String) -> Bool {
     c >= 97 && c <= 122
   }
 }
+// `Buffer` is written as a base type, a builtin linear one.
+fn base_ty(b: Int) -> Ty { if b == 5 { TCon("Buffer", Nil) } else { TB(b) } }
 fn base_code(name: String) -> Int {
   if name == "Int" { 0 } else { if name == "Float" { 1 } else { if name == "Bool" { 2 } else {
-    if name == "String" { 3 } else { if name == "Unit" { 4 } else { 0 - 1 } } } } }
+    if name == "String" { 3 } else { if name == "Unit" { 4 } else { if name == "Buffer" { 5 } else { 0 - 1 } } } } } }
 }
 fn ann_vars(s: St) -> R(List(Named)) {
   match get_cx(s) { R(Ctx(vs, _, _, _, _, _), s2) -> R(vs, s2) }
@@ -1356,7 +1804,7 @@ fn elaborate_inner(s: St, a: Sp(TypeAnn), cov: Bool) -> R(Ty) {
         if b >= 0 && n > 0 {
           R(TErr, diag(s, "E0400", "`" <> name <> "` takes no type arguments", start, end))
         } else {
-          if b >= 0 { R(TB(b), s) } else {
+          if b >= 0 { R(base_ty(b), s) } else {
             match known_arity(s, name) {
               R(k, s2) -> if k < 0 {
                 R(TErr, diag(s2, "E0432", "unknown type `" <> name <> "`", start, end))
@@ -1445,7 +1893,7 @@ fn ann_label_args(s: St, ek: List(Kind), eff: String, xs: List(Sp(TypeAnn)), j: 
   }
 }
 fn is_effect(s: St, name: String) -> R(Bool) {
-  match get_hx(s) { R(Hx(_, _, _, _, effs, _, _, _), s2) -> R(has_str(effs, name), s2) }
+  match get_hx(s) { R(Hx(_, _, _, _, effs, _, _, _, _), s2) -> R(has_str(effs, name), s2) }
 }
 fn last_ann(xs: List(Sp(TypeAnn))) -> Sp(TypeAnn) {
   match xs {
@@ -1524,7 +1972,7 @@ fn elaborate_adt_inner(s: St, a: Sp(TypeAnn), cx: DeclCx) -> R(Ty) {
                 R(TErr, diag(s, "E0400", "`" <> name <> "` is a row parameter of `" <> decl <> "`: a type goes here", start, end))
               } else {
                 let b = base_code(name)
-                if b >= 0 { R(TB(b), s) } else {
+                if b >= 0 { R(base_ty(b), s) } else {
                   match known_arity(s, name) {
                     R(k, s2) -> if k < 0 {
                       R(TErr, diag(s2, "E0432", "unknown type `" <> name <> "`", start, end))
@@ -1910,7 +2358,7 @@ fn infer_stmts(s: St, stmts: List(Sp(Stmt)), env: List(Entry), amb: Int) -> R(Li
       Sp(SLet(name, ann, value), _, _) -> match infer_expr(add_level(s, 1), value, env, amb) {
         R(t, s2) -> {
           let s3 = add_level(check_ann(s2, ann, t, True), 0 - 1)
-          match let_scheme(s3, value, t) { R(sc, s4) -> infer_stmts(s4, rest, Cons(Entry(name, sc), env), amb) }
+          match let_scheme(s3, value, t) { R(sc, s4) -> match value { Sp(_, va, vb) -> infer_stmts(note_binder(s4, va, vb, name, sc), rest, Cons(Entry(name, sc), env), amb) } }
         }
       }
     }
@@ -1957,7 +2405,7 @@ fn infer_inner(s: St, node: Expr, start: Int, end: Int, env: List(Entry), amb: I
     EUnit -> R(TB(4), s)
     EError -> R(TErr, s)
     EVar(name) -> match lookup(env, name) {
-      Yes(sc) -> match instantiate_at(s, sc, start, end) { R(t, s2) -> open_covariant(s2, t) }
+      Yes(sc) -> match instantiate_at(s, sc, start, end) { R(t, s2) -> open_covariant(borrow_value(s2, start, end, t), t) }
       No -> R(TErr, s)
     }
     EQualified(_, _) -> R(TErr, s)
@@ -2018,7 +2466,7 @@ fn check_pattern(s: St, pat: Sp(Pattern), expected: Ty, env: List(Entry), acc: L
   match pat {
     Sp(node, start, end) -> match node {
       PWild -> R(acc, s)
-      PVar(x) -> R(Cons(Entry(x, Scheme(Nil, Nil, expected)), acc), s)
+      PVar(x) -> R(Cons(Entry(x, Scheme(Nil, Nil, expected)), acc), note_binder(s, start, end, x, Scheme(Nil, Nil, expected)))
       PInt(_) -> R(acc, unify(s, expected, TB(0), start, end))
       PBool(_) -> R(acc, unify(s, expected, TB(2), start, end))
       PStr(_) -> R(acc, unify(s, expected, TB(3), start, end))
@@ -2124,6 +2572,35 @@ fn host_signature(m: String, n: String) -> Sig {
     if m == "time" && n == "now_ms" { Sig(Nil, TB(0)) } else { if m == "time" && n == "sleep_ms" { Sig(Cons(TB(0), Nil), TB(4)) } else { NoSig } }
   }
 }
+// The array builtins (spec 2026-11-14-elya-arrays-and-borrowing D2), pure,
+// at a fresh element type; where an array is made its element must be
+// duplicable (D1: a read copies one out).
+fn array_call(s: St, n: String, args: List(Sp(Expr)), cs: Int, ce: Int, start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
+  match infer_args(s, args, env, Nil, amb) {
+    R(ts, s1) -> match fresh(s1) {
+      R(a, s2) -> {
+        let xs = TCon("Array", Cons(a, Nil))
+        let params = if n == "new" { Nil } else { if n == "push" { Cons(xs, Cons(a, Nil)) } else { if n == "set" { Cons(xs, Cons(TB(0), Cons(a, Nil))) } else { if n == "get" { Cons(xs, Cons(TB(0), Nil)) } else { Cons(xs, Nil) } } } }
+        let ret = if n == "new" || n == "push" || n == "set" { xs } else { if n == "get" { a } else { TB(0) } }
+        let want = TFn(params, pure_row(), ret)
+        let s3 = unify(s2, want, TFn(ts, pure_row(), ret), start, end)
+        let s4 = if n == "new" { require_dup(s3, a, Mark("", start, end, KElement, 0 - 1, 0 - 1), Nil) } else { s3 }
+        R(ret, record(s4, cs, ce, want))
+      }
+    }
+  }
+}
+fn buffer_call(s: St, n: String, args: List(Sp(Expr)), cs: Int, ce: Int, start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
+  match infer_args(s, args, env, Nil, amb) {
+    R(ts, s1) -> {
+      let bt = TCon("Buffer", Nil)
+      let params = if n == "new" { Nil } else { if n == "push" { Cons(bt, Cons(TB(3), Nil)) } else { Cons(bt, Nil) } }
+      let ret = if n == "new" || n == "push" { bt } else { if n == "finish" { TB(3) } else { TB(0) } }
+      let want = TFn(params, pure_row(), ret)
+      R(ret, record(unify(s1, want, TFn(ts, pure_row(), ret), start, end), cs, ce, want))
+    }
+  }
+}
 // The builtins on a `with any` clause's operation: `o : Op(t, fn() / H ->
 // t)`; `op.perform` performs `H`.
 fn op_ty(t: Ty, h: Int) -> Ty { TCon("$Op", Cons(t, Cons(TFn(Nil, ropen(h), t), Nil))) }
@@ -2137,7 +2614,7 @@ fn op_builtin(s: St, n: String, args: List(Sp(Expr)), cs: Int, ce: Int, start: I
           let ret = if n == "name" || n == "show" || n == "encode" { TB(3) } else { t }
           let s4 = unify(s3, TFn(params, pure_row(), ret), TFn(ts, pure_row(), ret), start, end)
           let s5 = if n == "perform" {
-            match resolve_row(s4, ropen(h)) { R(performed, s4b) -> surface(add_row(s4b, amb, performed, start, end)) }
+            match resolve_row(s4, ropen(h)) { R(performed, s4b) -> hold_point(surface(add_row(s4b, amb, performed, start, end)), start, end, performed) }
           } else { s4 }
           R(ret, record(s5, cs, ce, TFn(params, if n == "perform" { ropen(h) } else { pure_row() }, ret)))
         }
@@ -2147,7 +2624,7 @@ fn op_builtin(s: St, n: String, args: List(Sp(Expr)), cs: Int, ce: Int, start: I
 }
 fn infer_call(s: St, callee: Sp(Expr), args: List(Sp(Expr)), start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
   match callee {
-    Sp(EQualified(m, n), cs, ce) -> match host_signature(m, n) {
+    Sp(EQualified(m, n), cs, ce) -> if m == "array" && (n == "new" || n == "push" || n == "set" || n == "get" || n == "length") { array_call(s, n, args, cs, ce, start, end, env, amb) } else { if m == "buffer" && (n == "new" || n == "push" || n == "finish" || n == "length") { buffer_call(s, n, args, cs, ce, start, end, env, amb) } else { match host_signature(m, n) {
       // The host's builtins perform `IO` (`type_builtin_call`).
       Sig(params, ret) -> match infer_args(s, args, env, Nil, amb) {
         R(ts, s2) -> {
@@ -2165,7 +2642,7 @@ fn infer_call(s: St, callee: Sp(Expr), args: List(Sp(Expr)), start: Int, end: In
           }
         }
       } }
-    }
+    } } }
     Sp(EVar(name), cs, ce) -> match ctor_arity(s, name) {
       R(k, s1) -> if k >= 0 {
         match infer_args(s1, args, env, Nil, amb) { R(ts, s2) -> ctor_call(s2, name, k, ts, start, end, env) }
@@ -2220,12 +2697,12 @@ fn call_with(s: St, f: Ty, args: List(Sp(Expr)), start: Int, end: Int, env: List
         R(cr, s4) -> {
           let s5 = unify(s4, f, TFn(ts, ropen(cr), result), start, end)
           match resolve_row(s5, ropen(cr)) {
-            R(Row(ls, t), s6) -> match t {
+            R(Row(ls, t), s6a) -> match hold_point(s6a, start, end, Row(ls, t)) { s6 -> match t {
               ROpen(v) -> match call_open(s6, v, amb, start, end) {
                 R(keep, s7) -> R(result, surface(add_row(s7, amb, Row(ls, if keep { t } else { RClosed }), start, end)))
               }
               _ -> R(result, surface(add_row(s6, amb, Row(ls, t), start, end)))
-            }
+            } }
           }
         }
       }
@@ -2323,7 +2800,7 @@ fn infer_lambda(s: St, params: List(Sp(Param)), body: Sp(Block), env: List(Entry
   }
 }
 fn add_depth(s: St, d: Int) -> St {
-  match get_hx(s) { R(Hx(rs, cr, depth, ops, effs, dead, mu, gn), s2) -> set_hx(s2, Hx(rs, cr, depth + d, ops, effs, dead, mu, gn)) }
+  match get_hx(s) { R(Hx(rs, cr, depth, ops, effs, dead, mu, gn, af), s2) -> set_hx(s2, Hx(rs, cr, depth + d, ops, effs, dead, mu, gn, af)) }
 }
 type LamIn { LamIn(List(Entry), List(Ty)) }
 fn lambda_params(s: St, params: List(Sp(Param)), env: List(Entry), acc: List(Ty)) -> R(LamIn) {
@@ -2331,7 +2808,7 @@ fn lambda_params(s: St, params: List(Sp(Param)), env: List(Entry), acc: List(Ty)
     Nil -> R(LamIn(env, rev(acc)), s)
     Cons(Sp(Param(name, ann, _), start, end), rest) -> match fresh(s) {
       R(pv, s2) -> {
-        let s3 = check_ann(record(s2, start, end, pv), ann, pv, False)
+        let s3 = check_ann(record(note_binder(s2, start, end, name, Scheme(Nil, Nil, pv)), start, end, pv), ann, pv, False)
         lambda_params(s3, rest, Cons(Entry(name, Scheme(Nil, Nil, pv)), env), Cons(pv, acc))
       }
     }
@@ -2372,7 +2849,7 @@ fn close_residual(s: St, amb: Int, params: List(Ty)) -> St {
   match rhead(s, ROpen(amb)) {
     R(t, s2) -> match t {
       ROpen(rho) -> match get_hx(s2) {
-        R(Hx(_, crs, _, _, _, _, _, _), s3) -> match tail_in(s3, crs, rho) {
+        R(Hx(_, crs, _, _, _, _, _, _, _), s3) -> match tail_in(s3, crs, rho) {
           R(pending, s4) -> if pending { s4 } else {
             match rows_in(s4, params, Nil) {
               R(in_params, s5) -> if has_int(in_params, rho) { s5 } else { bind_row(s5, rho, pure_row(), 0, 0) }
@@ -2409,10 +2886,10 @@ fn without_incls(xs: List(Incl), gone: List(Incl)) -> List(Incl) {
   match xs { Nil -> Nil  Cons(x, rest) -> if has_incl(gone, x) { without_incls(rest, gone) } else { Cons(x, without_incls(rest, gone)) } }
 }
 fn get_dead(s: St) -> R(List(Incl)) {
-  match get_hx(s) { R(Hx(_, _, _, _, _, dead, mu, gn), s2) -> R(dead, s2) }
+  match get_hx(s) { R(Hx(_, _, _, _, _, dead, mu, gn, af), s2) -> R(dead, s2) }
 }
 fn kill_incl(s: St, x: Incl) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn), s2) -> set_hx(s2, Hx(rs, cr, d, ops, effs, Cons(x, dead), mu, gn)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn, af), s2) -> set_hx(s2, Hx(rs, cr, d, ops, effs, Cons(x, dead), mu, gn, af)) }
 }
 fn flush(s: St) -> St {
   match row_count(s) {
@@ -2536,7 +3013,7 @@ fn op_get(ops: List(OpInfo), name: String) -> Maybe(OpInfo) {
   match ops { Nil -> No  Cons(OpInfo(n, e, ep, ps, r), rest) -> if n == name { Yes(OpInfo(n, e, ep, ps, r)) } else { op_get(rest, name) } }
 }
 fn find_op(s: St, name: String) -> R(Maybe(OpInfo)) {
-  match get_hx(s) { R(Hx(_, _, _, ops, _, _, _, _), s2) -> R(op_get(ops, name), s2) }
+  match get_hx(s) { R(Hx(_, _, _, ops, _, _, _, _, _), s2) -> R(op_get(ops, name), s2) }
 }
 // The effect declarations' operations (`ops`), after every type: each
 // operation's parameters and result as a declaration's fields are read.
@@ -2560,7 +3037,7 @@ fn op_sigs(s: St, eff: String, all: List(RPair), cx: DeclCx, sigs: List(Sp(OpSig
     Cons(Sp(OpSig(name, _, ptys, ret), _, _), rest) -> match elaborate_adt_list(s, ptys, cx, Nil) {
       R(ps, s2) -> match elaborate_adt(s2, ret, cx) {
         R(rt, s3) -> match get_hx(s3) {
-          R(Hx(rs, cr, d, ops, effs, dead, mu, gn), s4) -> op_sigs(set_hx(s4, Hx(rs, cr, d, Cons(OpInfo(name, eff, all, ps, rt), ops), effs, dead, mu, gn)), eff, all, cx, rest)
+          R(Hx(rs, cr, d, ops, effs, dead, mu, gn, af), s4) -> op_sigs(set_hx(s4, Hx(rs, cr, d, Cons(OpInfo(name, eff, all, ps, rt), ops), effs, dead, mu, gn, af)), eff, all, cx, rest)
         }
       }
     }
@@ -2575,7 +3052,7 @@ fn multi_names(decls: List(Sp(Decl)), acc: List(String)) -> List(String) {
   }
 }
 fn is_multi(s: St, name: String) -> R(Bool) {
-  match get_hx(s) { R(Hx(_, _, _, _, _, _, mu, gn), s2) -> R(has_str(mu, name), s2) }
+  match get_hx(s) { R(Hx(_, _, _, _, _, _, mu, gn, af), s2) -> R(has_str(mu, name), s2) }
 }
 fn effect_names(decls: List(Sp(Decl)), acc: List(String)) -> List(String) {
   match decls {
@@ -2598,7 +3075,7 @@ fn type_perform(s: St, op: OpInfo, args: List(Sp(Expr)), cs: Int, ce: Int, start
           R(ts, s2) -> {
             let s3 = record(s2, cs, ce, TFn(ps, Row(Cons(Lab(eff, eargs, cs, ce), Nil), RClosed), ret))
             let s4 = unify(s3, TFn(ps, pure_row(), ret), TFn(ts, pure_row(), ret), start, end)
-            R(ret, surface(add_effect_args(s4, amb, eff, eargs, start, end)))
+            R(ret, hold_point(surface(add_effect_args(s4, amb, eff, eargs, start, end)), start, end, Row(Cons(Lab(eff, Nil, cs, ce), Nil), RClosed)))
           }
         }
       }
@@ -2672,7 +3149,7 @@ fn infer_handle(s: St, body: Sp(Expr), h: Handler, start: Int, end: Int, env: Li
               R(result, s5) -> match fresh_row(s5) {
                 R(ret_amb, s6) -> {
                   let s7 = match ret {
-                    Yes(ReturnClause(binder, rbody)) -> match infer_expr(push_region(s6, Region(ret_amb, False)), rbody, Cons(Entry(binder, Scheme(Nil, Nil, body_ty)), env), ret_amb) {
+                    Yes(ReturnClause(binder, rbody)) -> match infer_expr(push_region(note_ret(s6, binder, rbody, body_ty), Region(ret_amb, False)), rbody, Cons(Entry(binder, Scheme(Nil, Nil, body_ty)), env), ret_amb) {
                       R(ret_ty, s6b) -> match rbody { Sp(_, rs, re) -> unify(pop_region(s6b), ret_ty, result, rs, re) }
                     }
                     No -> unify(s6, result, body_ty, start, end)
@@ -2689,7 +3166,12 @@ fn infer_handle(s: St, body: Sp(Expr), h: Handler, start: Int, end: Int, env: Li
                                   R(ct, s15) -> {
                                     let s16 = if tail_eq(ct, own) { s15 } else { match get_ptys(s15) { R(sp, s15b) -> close_residual(s15b, clauses_row, sp) } }
                                     match resolve_row(if many { repeats(s16, amb_in, start, end) } else { s16 }, ropen(amb_in)) {
-                                      R(Row(ls, t), s17) -> R(result, surface(add_row(s17, amb, Row(remove_lab(ls, eff), t), start, end)))
+                                      R(Row(ls, t), s17) -> {
+                                        let residual = Row(remove_lab(ls, eff), t)
+                                        let s18 = surface(add_row(s17, amb, residual, start, end))
+                                        // What escapes the handle holds what its points hold (D3).
+                                        R(result, hold_handle(s18, start, end, Cons(residual, Cons(ropen(ret_amb), ropens(rev(cambs))))))
+                                      }
                                     }
                                   }
                                 }
@@ -2723,7 +3205,7 @@ fn infer_any_handle(s: St, body: Sp(Expr), clauses: List(Sp(OpClause)), ret: May
         R(result, s3) -> match fresh_row(s3) {
           R(ret_amb, s4) -> {
             let s5 = match ret {
-              Yes(ReturnClause(binder, rbody)) -> match infer_expr(push_region(s4, Region(ret_amb, False)), rbody, Cons(Entry(binder, Scheme(Nil, Nil, body_ty)), env), ret_amb) {
+              Yes(ReturnClause(binder, rbody)) -> match infer_expr(push_region(note_ret(s4, binder, rbody, body_ty), Region(ret_amb, False)), rbody, Cons(Entry(binder, Scheme(Nil, Nil, body_ty)), env), ret_amb) {
                 R(ret_ty, s4b) -> match rbody { Sp(_, rs, re) -> unify(pop_region(s4b), ret_ty, result, rs, re) }
               }
               No -> unify(s4, result, body_ty, start, end)
@@ -2752,7 +3234,8 @@ fn infer_any_handle(s: St, body: Sp(Expr), clauses: List(Sp(OpClause)), ret: May
                                       R(htail, s17) -> match forwards(s17, cambs, htail) {
                                         R(fw, s18) -> {
                                           let s19 = push_site(s18, GSite(hl, bt, fw, start, end))
-                                          R(result, escapes(s19, sks, result, env, amb))
+                                          let s20 = hold_any_ops(escapes(s19, sks, result, env, amb), start, end, Row(hl, bt))
+                                          R(result, hold_handle(s20, start, end, Cons(ropen(ret_amb), ropens(cambs))))
                                         }
                                       }
                                     }
@@ -2775,6 +3258,9 @@ fn infer_any_handle(s: St, body: Sp(Expr), clauses: List(Sp(OpClause)), ret: May
   }
 }
 type Clauses { Clauses(List(Int), List(Skol)) }
+fn ropens(vs: List(Int)) -> List(Row) {
+  match vs { Nil -> Nil  Cons(v, rest) -> Cons(ropen(v), ropens(rest)) }
+}
 fn forwards(s: St, cambs: List(Int), htail: Tail) -> R(Bool) {
   match htail {
     ROpen(_) -> forwards_any(s, cambs, htail)
@@ -2798,7 +3284,7 @@ fn any_clauses(s: St, cs: List(Sp(OpClause)), handled: Row, result: Ty, amb_in: 
         match any_params(set_gn(s1, Gn(k + 1, gr, pg)), params, o, env) {
           R(env2, s2) -> match fresh_row(s2) {
             R(camb, s3) -> match get_hx(s3) {
-              R(Hx(_, _, depth, _, _, _, _, _), s4) -> match get_ptys(s4) {
+              R(Hx(_, _, depth, _, _, _, _, _, _), s4) -> match get_ptys(s4) {
                 R(saved, s5) -> {
                   let s6 = push_region(set_ptys(push_resume(s5, Resume(t, result, amb_in, ret_amb, "*", depth, crow)), append(saved, Cons(o, Nil))), Region(camb, False))
                   match infer_expr(s6, cbody, env2, camb) {
@@ -2825,7 +3311,7 @@ fn any_clauses(s: St, cs: List(Sp(OpClause)), handled: Row, result: Ty, amb_in: 
 fn any_params(s: St, ps: List(Sp(Param)), o: Ty, env: List(Entry)) -> R(List(Entry)) {
   match ps {
     Nil -> R(env, s)
-    Cons(Sp(Param(name, _, _), a, b), rest) -> any_params(record(s, a, b, o), rest, o, Cons(Entry(name, Scheme(Nil, Nil, o)), env))
+    Cons(Sp(Param(name, _, _), a, b), rest) -> any_params(note_binder(record(s, a, b, o), a, b, name, Scheme(Nil, Nil, o)), rest, o, Cons(Entry(name, Scheme(Nil, Nil, o)), env))
   }
 }
 // E0435: a clause's answer type in the handle's result, in a binding
@@ -2867,6 +3353,10 @@ fn mentions_con(t: Ty, name: String) -> Bool {
 }
 fn mentions_con_list(xs: List(Ty), name: String) -> Bool { match xs { Nil -> False  Cons(x, rest) -> mentions_con(x, name) || mentions_con_list(rest, name) } }
 fn labs_mention_con(ls: List(Lab), name: String) -> Bool { match ls { Nil -> False  Cons(Lab(_, a, _, _), rest) -> mentions_con_list(a, name) || labs_mention_con(rest, name) } }
+// A return clause's binder is keyed by the clause's body.
+fn note_ret(s: St, binder: String, rbody: Sp(Expr), t: Ty) -> St {
+  match rbody { Sp(_, a, b) -> note_binder(s, a, b, binder, Scheme(Nil, Nil, t)) }
+}
 // E0427: `with multi` over an effect not declared `multi`.
 fn one_shot(r: R(String), many: Bool, start: Int, end: Int) -> R(String) {
   match r {
@@ -2888,7 +3378,7 @@ fn repeats(s: St, amb_in: Int, start: Int, end: Int) -> St {
 // body's row and every clause.
 fn handle_args(s: St, eff: String) -> R(EffArgs) {
   match get_hx(s) {
-    R(Hx(_, _, _, ops, _, _, _, _), s2) -> match op_of_effect(ops, eff) {
+    R(Hx(_, _, _, ops, _, _, _, _, _), s2) -> match op_of_effect(ops, eff) {
       Yes(all) -> fresh_effect_args(s2, all, EffArgs(Nil, Nil, Nil))
       No -> R(EffArgs(Nil, Nil, Nil), s2)
     }
@@ -2898,16 +3388,16 @@ fn op_of_effect(ops: List(OpInfo), eff: String) -> Maybe(List(RPair)) {
   match ops { Nil -> No  Cons(OpInfo(_, e, all, _, _), rest) -> if e == eff && eff != "" { Yes(all) } else { op_of_effect(rest, eff) } }
 }
 fn push_clause_row(s: St, r: Int) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn), s2) -> set_hx(s2, Hx(rs, Cons(r, cr), d, ops, effs, dead, mu, gn)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn, af), s2) -> set_hx(s2, Hx(rs, Cons(r, cr), d, ops, effs, dead, mu, gn, af)) }
 }
 fn pop_clause_row(s: St) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn), s2) -> set_hx(s2, Hx(rs, match cr { Cons(_, rest) -> rest  Nil -> Nil }, d, ops, effs, dead, mu, gn)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn, af), s2) -> set_hx(s2, Hx(rs, match cr { Cons(_, rest) -> rest  Nil -> Nil }, d, ops, effs, dead, mu, gn, af)) }
 }
 fn push_resume(s: St, r: Resume) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn), s2) -> set_hx(s2, Hx(Cons(r, rs), cr, d, ops, effs, dead, mu, gn)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn, af), s2) -> set_hx(s2, Hx(Cons(r, rs), cr, d, ops, effs, dead, mu, gn, af)) }
 }
 fn pop_resume(s: St) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn), s2) -> set_hx(s2, Hx(match rs { Cons(_, rest) -> rest  Nil -> Nil }, cr, d, ops, effs, dead, mu, gn)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu, gn, af), s2) -> set_hx(s2, Hx(match rs { Cons(_, rest) -> rest  Nil -> Nil }, cr, d, ops, effs, dead, mu, gn, af)) }
 }
 fn set_ptys(s: St, p: List(Ty)) -> St {
   match get_gx(s) { R(Gx(i, mi, _, rs, d, gp, ga), s2) -> set_gx(s2, Gx(i, mi, p, rs, d, gp, ga)) }
@@ -2932,7 +3422,7 @@ fn op_clauses(s: St, cs: List(Sp(OpClause)), cx: Resume, ea: EffArgs, env: List(
           Sig(ops, b) -> match clause_params(s1, params, ops, env) {
             R(env2, s2) -> match fresh_row(s2) {
               R(camb, s3) -> match get_hx(s3) {
-                R(Hx(_, _, depth, _, _, _, _, _), s4) -> match cx {
+                R(Hx(_, _, depth, _, _, _, _, _, _), s4) -> match cx {
                   Resume(_, result, body_amb, ret_amb, handled, _, crow) -> match get_ptys(s4) {
                     R(saved, s5) -> {
                       let s6 = push_region(set_ptys(push_resume(s5, Resume(b, result, body_amb, ret_amb, handled, depth, crow)), append(saved, ops)), Region(camb, False))
@@ -2965,7 +3455,7 @@ fn clause_params(s: St, ps: List(Sp(Param)), ts: List(Ty), env: List(Entry)) -> 
     Nil -> R(env, s)
     Cons(Sp(Param(name, _, _), a, b), rest) -> {
       let got = match ts { Cons(t, _) -> R(t, s)  Nil -> fresh(s) }
-      match got { R(t, s2) -> clause_params(record(s2, a, b, t), rest, match ts { Cons(_, tr) -> tr  Nil -> Nil }, Cons(Entry(name, Scheme(Nil, Nil, t)), env)) }
+      match got { R(t, s2) -> clause_params(record(note_binder(s2, a, b, name, Scheme(Nil, Nil, t)), a, b, t), rest, match ts { Cons(_, tr) -> tr  Nil -> Nil }, Cons(Entry(name, Scheme(Nil, Nil, t)), env)) }
     }
   }
 }
@@ -2995,7 +3485,7 @@ fn clause_labs(s: St, ls: List(Lab), crow: Int, eff: String) -> St {
 // into a lambda, every clause's effects and the body's member rows too.
 fn type_resume(s: St, arg_ty: Ty, start: Int, end: Int, amb: Int) -> R(Ty) {
   match get_hx(s) {
-    R(Hx(rs, _, depth, _, _, _, _, _), s1) -> match rs {
+    R(Hx(rs, _, depth, _, _, _, _, _, _), s1) -> match rs {
       Nil -> R(TErr, s1)
       Cons(Resume(arg, result, body_amb, ret_amb, handled, d, crow), _) -> {
         let s2 = unify(s1, arg_ty, arg, start, end)
@@ -3309,7 +3799,7 @@ fn bind_params(s: St, params: List(Sp(Param)), tys: List(Ty), env: List(Entry)) 
     Cons(p, rest) -> match tys {
       Nil -> R(env, s)
       Cons(t, trest) -> match p {
-        Sp(Param(name, _, _), start, end) -> bind_params(record(s, start, end, t), rest, trest, Cons(Entry(name, Scheme(Nil, Nil, t)), env))
+        Sp(Param(name, _, _), start, end) -> bind_params(note_binder(record(s, start, end, t), start, end, name, Scheme(Nil, Nil, t)), rest, trest, Cons(Entry(name, Scheme(Nil, Nil, t)), env))
       }
     }
   }
@@ -3358,7 +3848,7 @@ fn close_group(s: St, fns: List(FnInfo), ms: List(Mem)) -> St {
         match get_gx(flush(s6b)) {
           R(Gx(_, _, ptys, regions, _, _, _), s7) -> match row_count(s7) {
             R(n, s8) -> match get_hx(s8) {
-              R(Hx(rs9, cr9, d9, ops9, effs9, _, mu9, gn9), s9) -> check_generic_rows(close_phantoms(set_hx(set_gx(s9, Gx(Nil, Nil, ptys, regions, Nil, Nil, Nil)), Hx(rs9, cr9, d9, ops9, effs9, Nil, mu9, gn9)), 0, n))
+              R(Hx(rs9, cr9, d9, ops9, effs9, _, mu9, gn9, af9), s9) -> check_generic_rows(close_phantoms(set_hx(set_gx(s9, Gx(Nil, Nil, ptys, regions, Nil, Nil, Nil)), Hx(rs9, cr9, d9, ops9, effs9, Nil, mu9, gn9, af9)), 0, n))
             }
           }
         }
@@ -3585,7 +4075,7 @@ fn site_labels(s: St, ls: List(Lab), a: Int, b: Int) -> St {
       site_labels(diag(s, "E0434", "`IO` cannot be handled by `with any`", a, b), rest, a, b)
     } else {
       match get_hx(s) {
-        R(Hx(_, _, _, ops, _, _, _, _), s2) -> site_labels(ops_data(s2, sort_ops(ops_of(ops, n)), args, a, b), rest, a, b)
+        R(Hx(_, _, _, ops, _, _, _, _, _), s2) -> site_labels(ops_data(s2, sort_ops(ops_of(ops, n)), args, a, b), rest, a, b)
       }
     }
   }
@@ -3885,18 +4375,21 @@ fn dump_diags(ds: List(Diag), b: Buffer) -> Buffer {
   }
 }
 
-pub fn check_dump(m: Module) -> String {
+pub fn check_dump(m: Module, size: Int) -> String {
   match m {
     Module(_, decls) -> {
+      let af0 = Af(affine.facts(m, size), Nil, Nil, Nil, Nil, Nil, Cons("Buffer", Cons("Array", linear_names(decls, Nil))))
       let fns = fn_infos(decls, Nil)
       let order = tarjan(all_edges(fns, fns, Nil), len(fns))
       let known = Cons(Arity("Array", 1), known_types(decls, Nil))
-      let st0 = St(array.new(), array.new(), 0, Nil, Nil, Ctx(Nil, known, Nil, Nil, Nil, decl_kinds(decls)), Rows(array.new(), array.new(), array.new()), Gx(Nil, Nil, Nil, Nil, Nil, Nil, Nil), Eqs(Nil, Nil, Nil), Hx(Nil, Nil, 0, Nil, Nil, Nil, Nil, Gn(0, Nil, Nil)))
-      let st1 = set_hx(st0, Hx(Nil, Nil, 0, Nil, effect_names(decls, Nil), Nil, multi_names(decls, Nil), Gn(0, Nil, Nil)))
+      let st0 = St(array.new(), array.new(), 0, Nil, Nil, Ctx(Nil, known, Nil, Nil, Nil, decl_kinds(decls)), Rows(array.new(), array.new(), array.new()), Gx(Nil, Nil, Nil, Nil, Nil, Nil, Nil), Eqs(Nil, Nil, Nil), Hx(Nil, Nil, 0, Nil, Nil, Nil, Nil, Gn(0, Nil, Nil), af0))
+      let st1 = set_hx(st0, Hx(Nil, Nil, 0, Nil, effect_names(decls, Nil), Nil, multi_names(decls, Nil), Gn(0, Nil, Nil), af0))
       let declared = match type_decls(st1, decls, Nil) { R(env0, s0) -> R(env0, effect_decls(s0, decls)) }
       match match declared { R(env0, s0) -> groups(s0, fns, order, env0, Nil) } {
         R(lines, s) -> match s {
-          St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> {
+          St(sub, lv, cur, ds0, rs, cx, rw, gx, eq, hx) -> {
+            // D7: the affine diagnostics after the others.
+            let ds = match hx { Hx(_, _, _, _, _, _, _, _, Af(_, _, _, _, _, ad, _)) -> append(ad, ds0) }
             let b1 = dump_schemes(sort_by(rev(lines), line_le), buffer.new())
             let recs = last_per_span(sort_by(rs, rec_le), 0 - 1, 0 - 1, Nil)
             match dump_types(St(sub, lv, cur, Nil, Nil, cx, rw, gx, eq, hx), recs, b1) {
@@ -3913,7 +4406,7 @@ pub fn main() / {IO} {
   let text = io.read_file(io.arg(0))
   match parse.parse_tree(text) {
     Parsed(m, _) -> {
-      let out = check_dump(m)
+      let out = check_dump(m, string.length(text))
       if string.length(out) == 0 { Unit } else { io.println(string.slice(out, 0, string.length(out) - 1)) }
     }
     ParseError(_, _, _) -> Unit

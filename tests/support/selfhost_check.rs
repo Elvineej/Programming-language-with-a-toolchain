@@ -392,11 +392,13 @@ pub const FOCUSED_F4D: &[&str] = &[
     "effect Bx(t) { fn bx(x: t) -> Unit }\nfn f() { bx(1)\n handle { bx(True) } with any { op(p) -> op.perform(p) }\n io.println(\"x\") }\npub fn main() -> Int { 0 }\n",
 ];
 
-/// The checker's imports: the parser in Elya and its lexer.
+/// The checker's imports: the parser in Elya, its lexer, and the affine pass
+/// (its facts, from stage F5).
 pub fn reader(name: &str) -> Option<(String, String)> {
     let file = match name {
         "parse" => "selfhost/parse.elya",
         "lex" => "selfhost/lex.elya",
+        "affine" => "selfhost/affine.elya",
         _ => return None,
     };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
