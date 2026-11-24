@@ -3,6 +3,8 @@
 //! largest is timed against Rust. Native entry points append main's value
 //! line (`0\n` for Unit), removed before comparing.
 
+// Only the module reader is used here.
+#[allow(dead_code)]
 #[path = "../../../tests/support/selfhost_check.rs"]
 mod check_support;
 #[path = "../../../tests/support/selfhost_parse.rs"]

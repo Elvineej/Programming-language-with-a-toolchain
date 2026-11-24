@@ -38,6 +38,8 @@
 //! follows, so the join holds it either way, and a pattern's variables are
 //! never live after the `match`.
 
+// Only the module reader is used here.
+#[allow(dead_code)]
 #[path = "support/selfhost_check.rs"]
 mod check_support;
 #[path = "support/selfhost_parse.rs"]
