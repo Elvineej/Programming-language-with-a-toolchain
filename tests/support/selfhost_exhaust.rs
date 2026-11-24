@@ -32,4 +32,15 @@ pub const FOCUSED: &[&str] = &[
     "type P { P(Bool, Bool) }\nfn f(p) { match p { P(True, True) -> 1  P(False, True) -> 2 } }\npub fn main() -> Int { 0 }\n",
     // A ragged row run out of columns matches nothing (E13).
     "type T { A, B(Int, Int) }\nfn f(t) { match t { B(_) -> 1  B(_, 1) -> 2  _ -> 3 } }\npub fn main() -> Int { 0 }\n",
+    // Review 2026-11-24: one program per surviving mutant.
+    "type T { A(Bool), B }\nfn f(t) { match t { A(True) -> 1 } }\npub fn main() -> Int { 0 }\n",
+    "type L { N, C(Int, L) }\nfn f(xs) { match xs { N -> 0  C(1, N) -> 1  _ -> 2 } }\npub fn main() -> Int { 0 }\n",
+    "type Q { Q(Bool) }\ntype P { P(Q, Bool) }\nfn f(p) { match p { P(Q(True), False) -> 1  P(Q(False), True) -> 2  _ -> 3 } }\npub fn main() -> Int { 0 }\n",
+    "type T { A, B }\ntype U { X, Y }\nfn f(t) { match t { A -> 1  B -> 2  X -> 3  _ -> 4 } }\npub fn main() -> Int { 0 }\n",
+    "fn g(x) { x }\nfn f(a) { (match a { 1 -> g })(match a { True -> 0 }) }\npub fn main() -> Int { 0 }\n",
+    "fn f(a) { (match a { 1 -> 2 }) + (match a { True -> 3 }) }\npub fn main() -> Int { 0 }\n",
+    "fn f(a) { match a { 1 -> match a { True -> 1 }\n  _ -> match a { 2 -> 3 } } }\npub fn main() -> Int { 0 }\n",
+    "effect E { fn e() -> Int  fn d() -> Int }\nfn f(a) { handle { e() } with { e() -> resume(match a { 1 -> 2 })  d() -> resume(match a { True -> 3 }) } }\npub fn main() -> Int { 0 }\n",
+    "fn f(a) { match a { 1 -> 2 }\n match a { True -> 3 }\n 0 }\npub fn main() -> Int { 0 }\n",
+    "type T { A, B(Int, Int) }\ntype P { P(T, Bool) }\nfn f(p) { match p { P(B(_, _, True), False) -> 1  P(A, _) -> 2 } }\npub fn main() -> Int { 0 }\n",
 ];
