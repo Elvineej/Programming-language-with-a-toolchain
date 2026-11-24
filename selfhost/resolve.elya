@@ -1144,7 +1144,7 @@ pub fn resolve_dump(file: String, std: String) -> String {
 }
 
 // `--tables`: the builtin tables, one a line, for their Rust twins' test.
-fn table_line(name: String, xs: List(String)) -> String { name <> ":" <> join_loop(xs, " ", "") <> "\n" }
+fn table_line(name: String, xs: List(String)) -> String { name <> ":" <> join(xs, " ") <> "\n" }
 fn tables() -> String {
   table_line("builtins", builtin_names()) <> table_line("INT_BINARY_BUILTINS", int_binary_builtins()) <>
   table_line("FLOAT_CONVERSIONS", float_conversions()) <> table_line("STRING_BUILTINS", string_builtins()) <>
