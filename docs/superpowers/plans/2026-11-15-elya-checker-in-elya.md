@@ -14,7 +14,22 @@ Spec: `docs/superpowers/specs/2026-11-15-elya-checker-in-elya-design.md`.
    ill-typed programs on purpose; `resumes` keeps the walk's order; inference
    analyzes the same module. Docs only after the gate.
 2. [ ] 4d, `selfhost/exhaust.elya`: Codex, after 4c.
-3. [ ] 4e, `selfhost/affine.elya`: Codex, after 4d.
+3. [x] 4e, `selfhost/affine.elya` (**built** 2026-11-24 by Claude, since
+   the checker's F5 stage needed its facts first; `pub fn facts` is the
+   entry F5 calls, and `Frame`/`Why` became `CFrame`/`AWhy` so the names do
+   not clash with check.elya's). Tests: tests/selfhost_affine.rs and
+   crates/codegen/tests/selfhost_affine.rs compare `elya affine --dump` on
+   every corpus program that resolves, in the evaluator and natively.
+   Review: no defect; 16,000 random programs agree natively (about 1.9M
+   fact lines), and the read-through found every HashMap order that could
+   reach the output replicated (the size swaps in `add`/`max_of`, the walk
+   order of `resumes`). Of 128 mutants, 23 are argued equivalent (D9 among
+   them: an arm's walk only adds earlier uses or removes its own binders,
+   so joining onto what follows the match equals joining onto nothing);
+   46 of the rest lived through the corpus and the focused set, and 44 more
+   focused programs, one per mutant and named in the comments, kill them
+   all. Known limit: a span key is `start * 2^20 + end`, so a file of 1 MiB
+   or more would order keys wrongly.
 4. [ ] 4f, inference in Elya (`selfhost/check.elya`): Claude. Staged by
    the fragment of the language a program uses. Each stage compares `elya
    check --dump` byte for byte on every corpus program inside its fragment.
