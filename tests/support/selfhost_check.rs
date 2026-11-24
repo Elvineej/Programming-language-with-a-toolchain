@@ -198,6 +198,72 @@ pub const FOCUSED_F4A: &[&str] = &[
     "effect Ask { fn ask() -> Int }\neffect Log { fn log(msg: String) -> Unit }\nfn h() { handle { ask() } with { ask() -> { let k = fn() { resume(1) }\n k }  return(x) -> { log(\"r\")\n fn() { x } } } }\npub fn main() -> Int { 0 }\n",
 ];
 
+/// Stage F4b's focused programs: `with multi` (E0427 over a one-shot
+/// effect, the E0426 warning when the body performs `IO`), named row
+/// variables (shared across a function's annotations, its declared row
+/// checked before anything closes, E0432 spelled like an effect, E0400 a
+/// type and a row), row parameters of declared types (the kinds' fixpoint,
+/// a row argument printed as its row, E0400 either way round, E0432 an
+/// undeclared row variable), and equality on a type holding a row.
+pub const FOCUSED_F4B: &[&str] = &[
+    "effect Ask { fn ask() -> Int }\nfn h() { handle { ask() } with multi { ask() -> resume(1) } }\npub fn main() -> Int { 0 }\n",
+    "effect multi Flip { fn flip() -> Bool }\nfn h() { handle { if flip() { 1 } else { 2 } } with multi { flip() -> resume(True) + resume(False) } }\npub fn main() -> Int { h() }\n",
+    "effect multi Flip { fn flip() -> Bool }\nfn h() { handle { io.println(\"x\")\n if flip() { 1 } else { 2 } } with multi { flip() -> resume(True) + resume(False) } }\npub fn main() / {IO} -> Int { h() }\n",
+    "effect multi Flip { fn flip() -> Bool }\nfn h() { handle { if flip() { 1 } else { 2 } } with multi { flip() -> { io.println(\"c\")\n resume(True) } } }\npub fn main() / {IO} -> Int { h() }\n",
+    "effect Ask { fn ask() -> Int }\nfn h() { handle { io.println(\"x\")\n ask() } with multi { Ask.ask() -> resume(1) } }\npub fn main() / {IO} -> Int { h() }\n",
+    "effect multi Flip { fn flip() -> Bool }\neffect Ask { fn ask() -> Int }\nfn h() { handle { if flip() { ask() } else { 2 } } with multi { flip() -> resume(True) } }\nfn g() { handle { h() } with { ask() -> resume(3) } }\npub fn main() -> Int { g() }\n",
+    "effect Log { fn log(m: String) -> Unit }\nfn f(g: fn() / {Log | e} -> Int) / {Log | e} -> Int { g() }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn f(g: fn() / {e} -> Int) / {Log | e} -> Int { g() }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\nfn f(g: fn() / {e} -> Int) / {Log | e} -> Int { log(\"a\")\n g() }\nfn k() { f(fn() { 2 }) }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\nfn f(g: fn() / {log} -> Int) -> Int { g() }\npub fn main() -> Int { 0 }\n",
+    "fn f(x: e, g: fn() / {e} -> Int) -> Int { g() }\npub fn main() -> Int { 0 }\n",
+    "fn f(g: fn() / {e} -> Int, x: e) -> Int { g() }\npub fn main() -> Int { 0 }\n",
+    "fn f(g: fn() / {io} -> Int) -> Int { g() }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\nfn f(g: fn() / {e} -> Int) / {e} -> Int { let h = fn() { g() }\n let k = h\n k() + h() }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\nfn f(g: fn() / {e} -> Int) -> fn() / {e} -> Int { g }\nfn u() { f(fn() { log(\"x\")\n 1 }) }\npub fn main() -> Int { 0 }\n",
+    "type Task(e) { Task(fn() / {e} -> Int) }\nfn mk() { Task(fn() { 1 }) }\nfn run(t) { match t { Task(f) -> f() } }\npub fn main() -> Int { run(mk()) }\n",
+    "effect Log { fn log(m: String) -> Unit }\ntype Task(e) { Task(fn() / {e} -> Int) }\nfn mk() { Task(fn() { log(\"a\")\n 1 }) }\nfn keep(t: Task({Log})) -> Task({Log}) { t }\nfn more(t: Task({Log | r})) -> Task({Log | r}) { t }\npub fn main() -> Int { 0 }\n",
+    "type Task(e) { Task(fn() / {e} -> Int) }\nfn bad(t: Task(Int)) -> Int { 0 }\npub fn main() -> Int { 0 }\n",
+    "type Box(a) { Box(a) }\nfn bad(t: Box({IO})) -> Int { 0 }\npub fn main() -> Int { 0 }\n",
+    "type U(a) { U(Task(a)) }\ntype Task(e) { Task(fn() / {e} -> Int) }\nfn mk(t) { U(t) }\npub fn main() -> Int { 0 }\n",
+    "type Task(e) { Task(fn() / {e} -> Int) }\ntype V(a) { V(Task(a), a) }\npub fn main() -> Int { 0 }\n",
+    "type Two(e, a) { Two(fn(a) / {e} -> a) }\nfn ap(t: Two(e, b), x: b) / {e} -> b { match t { Two(f) -> f(x) } }\npub fn main() -> Int { ap(Two(fn(x) { x + 1 }), 2) }\n",
+    "effect Log { fn log(m: String) -> Unit }\ntype Task(e) { Task(fn() / {e} -> Int) }\nfn run(t: Task(e)) / {e} -> Int { match t { Task(f) -> f() } }\npub fn main() -> Int { run(Task(fn() { log(\"x\")\n 1 })) }\n",
+    "effect Log { fn log(m: String) -> Unit }\nfn f(g: fn() / {Log, Log | e} -> Int) / {Log | e} -> Int { g() }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn f(g: fn() / {e} -> Int) / {Ask, Log | e} -> Int { log(\"a\")\n g() }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\nfn a(g: fn() / {e} -> Int) / {e} -> Int { b(g) }\nfn b(g: fn() / {e} -> Int) / {e} -> Int { if True { g() } else { a(g) } }\npub fn main() -> Int { 0 }\n",
+    "type Task(e) { Task(fn() / {e} -> Int), Done }\nfn eq(a: Task({}), b: Task({})) -> Bool { a == b }\npub fn main() -> Int { 0 }\n",
+    // Written for controls K36, K39 and K40, which survived the rest.
+    "effect Log { fn log(m: String) -> Unit }\nfn f(g: fn() / {Log} -> Int) -> Int {\n  let h = { let k: fn() / {e} -> Int = fn() { 1 }\n k }\n  let j: fn() / {e} -> Int = g\n  h()\n}\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\nfn f(g: fn() / {Log} -> Int) {\n  let h = fn(x: fn() / {e} -> Int) { x }\n  let a = h(g)\n  let b = h(fn() { 1 })\n  b\n}\npub fn main() -> Int { 0 }\n",
+    "type Task(e) { Task(fn() / {e} -> Int) }\ntype X { X(Task(b)) }\ntype W(a) { W(Task(Int)) }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\nfn f() / {Log | e} -> Int { let k: fn() / {e} -> Int = fn() { 1 }\n log(\"x\")\n 0 }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\neffect Ask { fn ask() -> Int }\nfn f() / {Log | e} -> Int { let k: fn() / {e} -> Int = fn() { ask() }\n log(\"x\")\n 0 }\npub fn main() -> Int { 0 }\n",
+    // The review's mutants A1, A3/N8, C2, C5, D2, D4, D11, E4, E5b, E6, E10,
+    // G1, H4, H9, C4b, C7, N1 (a Rust quirk, kept: 2.48 reads the last
+    // member's annotation variables), N2, N3, N4.
+    "fn f(g: fn() / {iO} -> Int) -> Int { 1 }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\nfn f(x: log) / {log} -> Int { 0 }\npub fn main() -> Int { 0 }\n",
+    "type Two(a, e) { Two(fn(a) / {e} -> a) }\nfn f(t: Two(Int, Int)) -> Int { 0 }\npub fn main() -> Int { 0 }\n",
+    "type Box(a) { Box(a) }\nfn f(b: Box(fn() -> Int)) -> Int { 0 }\npub fn main() -> Int { 0 }\n",
+    "type Task(e) { Task(fn() / {e} -> Int) }\ntype U { U(Task({})) }\npub fn main() -> Int { 0 }\n",
+    "type T { T(fn() / {r} -> Int) }\nfn g(t: T) { match t { T(h) -> h } }\npub fn main() -> Int { 0 }\n",
+    "type Box(a) { Box(a) }\ntype U(e) { U(Box({})) }\npub fn main() -> Int { 0 }\n",
+    "type Task(e) { Task(fn() / {e} -> Int) }\ntype Box(a) { Box(a) }\ntype U(a) { U(Box(Task(a))) }\nfn f(u: U({})) -> Int { 0 }\npub fn main() -> Int { 0 }\n",
+    "type Task(e) { Task(fn() / {e} -> Int) }\ntype W(a) { W(Task(a(Int)), a) }\npub fn main() -> Int { 0 }\n",
+    "type U(a) { U(V(a)) }\ntype V(b) { V(W(b)) }\ntype W(c) { W(fn() / {c} -> Int) }\nfn f(u: U({})) -> Int { 0 }\npub fn main() -> Int { 0 }\n",
+    "type Task(e) { Task(fn() / {e} -> Int) }\ntype U { U(Task({}, {})) }\npub fn main() -> Int { 0 }\n",
+    "effect multi Flip { fn flip() -> Bool }\nfn h() { handle { 1 } with multi { return(x) -> x } }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\nfn f() / {Log | log} -> Int { 1 }\npub fn main() -> Int { 0 }\n",
+    "fn b(x: e) -> Int { a(fn() { 0 }) }\nfn a(g: fn() / {e} -> Int) -> Int { b(1) }\npub fn main() -> Int { 0 }\n",
+    "type Task(e) { Task(fn() / {e} -> Int) }\nfn f(t: Task(e(Int))) -> Int { 0 }\npub fn main() -> Int { 0 }\n",
+    "type Task(e) { Task(fn() / {e} -> Int) }\nfn f(t: Task(Task({}))) -> Int { 0 }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\nfn b(y) -> Int { a(y) }\nfn a(x: e) / {e} -> Int { b(x) }\npub fn main() -> Int { 0 }\n",
+    "effect Log { fn log(m: String) -> Unit }\nfn a(x: e) / {e} -> Int { b(x) }\nfn b(y: e) / {e} -> Int { a(y) }\npub fn main() -> Int { 0 }\n",
+    "effect Zed { fn zed() -> Int }\nfn f(g: fn() / {zed} -> Int) -> Int { 0 }\npub fn main() -> Int { 0 }\n",
+    "effect Abc { fn abc() -> Int }\nfn f(g: fn() / {abc} -> Int) -> Int { 0 }\npub fn main() -> Int { 0 }\n",
+];
+
 /// The checker's imports: the parser in Elya and its lexer.
 pub fn reader(name: &str) -> Option<(String, String)> {
     let file = match name {
@@ -215,15 +281,16 @@ pub fn reader(name: &str) -> Option<(String, String)> {
 
 const BASE: &[&str] = &["Int", "Float", "Bool", "String", "Unit"];
 
-/// The stage a program needs, 1 to 6: F1 first order; F2a (2) declared
+/// The stage a program needs, 1 to 8: F1 first order; F2a (2) declared
 /// types, constructors, `match`, the pure builtins, annotations naming types
 /// and type variables; F2b (3) higher order: lambdas, functions as values,
 /// calls of locals or of expressions, function types in annotations, all of
 /// which bring effect rows into types; F4 effects; F5 linearity, `Buffer`,
 /// `Array`, `borrow`; F6 imports.
 /// Numbered: 1 F1, 2 F2a, 3 F2b, 4 F4a (effects: declarations, performs,
-/// handlers, `resume`, labelled rows), 5 F4b (`multi`, `with any`,
-/// parametric effects, named row variables), 6 F5, 7 F6.
+/// handlers, `resume`, labelled rows), 5 F4b (`multi`, named row variables,
+/// rows as type arguments), 6 F4c (parametric effects, `with any`, `op.*`),
+/// 7 F5, 8 F6.
 pub fn stage(m: &Module) -> u8 {
     let fns = m
         .decls
@@ -247,12 +314,14 @@ pub fn stage(m: &Module) -> u8 {
         .collect();
     let mut s = Stage(1, fns, ctors);
     if !m.imports.is_empty() {
-        s.at(7);
+        s.at(8);
     }
     for d in &m.decls {
         match &d.node {
             Decl::Effect(e) => {
-                s.at(if e.is_multi || !e.params.is_empty() {
+                s.at(if !e.params.is_empty() {
+                    6
+                } else if e.is_multi {
                     5
                 } else {
                     4
@@ -265,7 +334,7 @@ pub fn stage(m: &Module) -> u8 {
                 }
             }
             Decl::Type(t) => {
-                s.at(if t.is_linear { 6 } else { 2 });
+                s.at(if t.is_linear { 7 } else { 2 });
                 for v in &t.variants {
                     for f in &v.node.fields {
                         s.ann(f);
@@ -279,7 +348,7 @@ pub fn stage(m: &Module) -> u8 {
                 for p in &f.params {
                     s.binder(&p.node.name);
                     if p.node.borrow {
-                        s.at(6);
+                        s.at(7);
                     }
                     if let Some(a) = &p.node.ann {
                         s.ann(a);
@@ -323,11 +392,14 @@ impl Stage {
     }
 
     /// A written row: labels without arguments are F4a; a named row variable
-    /// or a label with arguments (a parametric effect) is F4b.
+    /// is F4b; a label with arguments (a parametric effect) is F4c.
     fn row(&mut self, r: &RowAnn) {
         self.at(4);
-        if r.tail.is_some() || r.labels.iter().any(|l| l.args.is_some()) {
+        if r.tail.is_some() {
             self.at(5);
+        }
+        if r.labels.iter().any(|l| l.args.is_some()) {
+            self.at(6);
         }
     }
 
@@ -341,7 +413,7 @@ impl Stage {
             self.row(r);
         }
         if t.name == "Array" || t.name == "Buffer" {
-            self.at(6);
+            self.at(7);
         } else if t.name == "fn" {
             self.at(3);
         } else if !BASE.contains(&t.name.as_str()) || !t.args.is_empty() {
@@ -386,9 +458,9 @@ impl Stage {
             Expr::Error => {}
             Expr::Qualified { module, .. } => match module.as_str() {
                 "int" | "float" | "string" => self.at(2),
-                "array" | "buffer" => self.at(6),
+                "array" | "buffer" => self.at(7),
                 // An operation of a `with any` clause.
-                "op" => self.at(5),
+                "op" => self.at(6),
                 _ => self.at(4),
             },
             Expr::Call { callee, args } => {
@@ -427,7 +499,13 @@ impl Stage {
             }
             Expr::Block(b) => self.block(b),
             Expr::Handle { body, handler } => {
-                self.at(if handler.multi || handler.any { 5 } else { 4 });
+                self.at(if handler.any {
+                    6
+                } else if handler.multi {
+                    5
+                } else {
+                    4
+                });
                 self.expr(body);
                 for c in &handler.clauses {
                     for p in &c.node.params {

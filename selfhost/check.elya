@@ -20,12 +20,12 @@ type Ty { TVar(Int), TB(Int), TFn(List(Ty), Row, Ty), TCon(String, List(Ty)), TE
 type Scheme { Scheme(List(Int), List(Int), Ty) }
 type Entry { Entry(String, Scheme) }
 // A diagnostic: code, message, span.
-type Diag { Diag(String, String, Int, Int) }
+type Diag { Diag(String, String, String, Int, Int) }
 // A node's type as recorded, at its span (the last record at a span wins).
 type Rec { Rec(Int, Int, Ty) }
 // A group member: its index, parameter types, ambient row, result type,
 // annotation variables.
-type Mem { Mem(Int, List(Ty), Int, Ty, List(Named)) }
+type Mem { Mem(Int, List(Ty), Int, Ty, List(Named), List(Arity)) }
 // A top-level function: name, declaration span, parameters, return
 // annotation, body, declared row.
 type FnInfo { FnInfo(String, Int, Int, List(Sp(Param)), Maybe(Sp(TypeAnn)), Sp(Block), Maybe(RowAnn)) }
@@ -35,7 +35,11 @@ type FnInfo { FnInfo(String, Int, Int, List(Sp(Param)), Maybe(Sp(TypeAnn)), Sp(B
 // constructors' arities (the last of a name first), the empty types.
 type Named { Named(String, Ty) }
 type Arity { Arity(String, Int) }
-type Ctx { Ctx(List(Named), List(Arity), List(Arity), List(String)) }
+// And the function's named rows (`ann_rows`, each name's row variable) and
+// each declared type's parameters' kinds (a row parameter: True).
+type KP { KP(String, Bool) }
+type Kind { Kind(String, List(KP)) }
+type Ctx { Ctx(List(Named), List(Arity), List(Arity), List(String), List(Arity), List(Kind)) }
 // A pending inclusion: the source row variable's effects reach the
 // destination's (`pending_incl`, and `pending_member_incl` for a group
 // member's row deferred inside a lambda).
@@ -66,7 +70,7 @@ type Eqs { Eqs(List(EqMark), List(Span2), List(Adt)) }
 // effects; the inclusions a conflict ended (`incl_dead`).
 type Resume { Resume(Ty, Ty, Int, Int, String, Int, Int) }
 type OpInfo { OpInfo(String, String, List(Ty), Ty) }
-type Hx { Hx(List(Resume), List(Int), Int, List(OpInfo), List(String), List(Incl)) }
+type Hx { Hx(List(Resume), List(Int), Int, List(OpInfo), List(String), List(Incl), List(String)) }
 linear type St { St(Array(Ty), Array(Int), Int, List(Diag), List(Rec), Ctx, Rows, Gx, Eqs, Hx) }
 linear type R(a) { R(a, St) }
 
@@ -134,7 +138,10 @@ fn add_level(s: St, d: Int) -> St {
   match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> St(sub, lv, cur + d, ds, rs, cx, rw, gx, eq, hx) }
 }
 fn diag(s: St, code: String, msg: String, start: Int, end: Int) -> St {
-  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> St(sub, lv, cur, Cons(Diag(code, msg, start, end), ds), rs, cx, rw, gx, eq, hx) }
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> St(sub, lv, cur, Cons(Diag("error", code, msg, start, end), ds), rs, cx, rw, gx, eq, hx) }
+}
+fn warn(s: St, code: String, msg: String, start: Int, end: Int) -> St {
+  match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> St(sub, lv, cur, Cons(Diag("warning", code, msg, start, end), ds), rs, cx, rw, gx, eq, hx) }
 }
 fn get_cx(s: St) -> R(Ctx) {
   match s { St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx) -> R(cx, St(sub, lv, cur, ds, rs, cx, rw, gx, eq, hx)) }
@@ -779,8 +786,8 @@ fn above_rows(s: St, vs: List(Int), lvl: Int, kept: List(Int), acc: List(Int)) -
 // so an inner `let` must not quantify it, nor the rows inside it.
 fn kept_vars(s: St) -> R(List(Int)) {
   match get_cx(s) {
-    R(Ctx(avs, _, _, _), s2) -> match kept_from(s2, avs, Nil) {
-      R(acc, s3) -> match get_hx(s3) { R(Hx(rs, _, _, _, _, _), s4) -> kept_resume_vars(s4, rs, acc) }
+    R(Ctx(avs, _, _, _, _, _), s2) -> match kept_from(s2, avs, Nil) {
+      R(acc, s3) -> match get_hx(s3) { R(Hx(rs, _, _, _, _, _, _), s4) -> kept_resume_vars(s4, rs, acc) }
     }
   }
 }
@@ -823,16 +830,21 @@ fn kept_from(s: St, avs: List(Named), acc: List(Int)) -> R(List(Int)) {
 // defect: quantified, each use copied it instead of sharing it).
 fn kept_rows(s: St) -> R(List(Int)) {
   match get_cx(s) {
-    R(Ctx(avs, _, _, _), s2) -> match kept_rows_from(s2, avs, Nil) {
+    R(Ctx(avs, _, _, _, ar, _), s2) -> match kept_rows_from(s2, avs, Nil) {
+      R(acc0, s2b) -> match kept_tails(s2b, arity_vals(ar), acc0) {
       R(acc, s3) -> match get_gx(s3) {
         R(Gx(_, _, _, _, ds, _, _), s4) -> match kept_deferred(s4, ds, acc) {
           R(acc2, s5) -> match get_hx(s5) {
-            R(Hx(rs, crs, _, _, _, _), s6) -> match kept_resume_rows(s6, rs, acc2) { R(acc3, s7) -> kept_tails(s7, crs, acc3) }
+            R(Hx(rs, crs, _, _, _, _, _), s6) -> match kept_resume_rows(s6, rs, acc2) { R(acc3, s7) -> kept_tails(s7, crs, acc3) }
           }
         }
       }
+      }
     }
   }
+}
+fn arity_vals(xs: List(Arity)) -> List(Int) {
+  match xs { Nil -> Nil  Cons(Arity(_, v), rest) -> Cons(v, arity_vals(rest)) }
 }
 fn kept_deferred(s: St, ds: List(Deferred), acc: List(Int)) -> R(List(Int)) {
   match ds {
@@ -907,16 +919,55 @@ fn base_code(name: String) -> Int {
     if name == "String" { 3 } else { if name == "Unit" { 4 } else { 0 - 1 } } } } }
 }
 fn ann_vars(s: St) -> R(List(Named)) {
-  match get_cx(s) { R(Ctx(vs, _, _, _), s2) -> R(vs, s2) }
+  match get_cx(s) { R(Ctx(vs, _, _, _, _, _), s2) -> R(vs, s2) }
 }
 fn set_ann_vars(s: St, vs: List(Named)) -> St {
-  match get_cx(s) { R(Ctx(_, k, c, e), s2) -> set_cx(s2, Ctx(vs, k, c, e)) }
+  match get_cx(s) { R(Ctx(_, k, c, e, ar, kd), s2) -> set_cx(s2, Ctx(vs, k, c, e, ar, kd)) }
 }
 fn known_arity(s: St, name: String) -> R(Int) {
-  match get_cx(s) { R(Ctx(v, k, c, e), s2) -> R(arity_of(k, name), s2) }
+  match get_cx(s) { R(Ctx(v, k, c, e, ar, kd), s2) -> R(arity_of(k, name), s2) }
 }
 fn ctor_arity(s: St, name: String) -> R(Int) {
-  match get_cx(s) { R(Ctx(v, k, c, e), s2) -> R(arity_of(c, name), s2) }
+  match get_cx(s) { R(Ctx(v, k, c, e, ar, kd), s2) -> R(arity_of(c, name), s2) }
+}
+fn ann_rows(s: St) -> R(List(Arity)) {
+  match get_cx(s) { R(Ctx(_, _, _, _, ar, _), s2) -> R(ar, s2) }
+}
+fn set_ann_rows(s: St, ar: List(Arity)) -> St {
+  match get_cx(s) { R(Ctx(v, k, c, e, _, kd), s2) -> set_cx(s2, Ctx(v, k, c, e, ar, kd)) }
+}
+fn arity_get(xs: List(Arity), name: String) -> Maybe(Int) {
+  match xs { Nil -> No  Cons(Arity(n, k), rest) -> if n == name { Yes(k) } else { arity_get(rest, name) } }
+}
+fn capitalized(name: String) -> String {
+  let c = string.byte_at(name, 0)
+  if c >= 97 && c <= 122 { string.slice("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c - 97, c - 96) <> string.slice(name, 1, string.length(name)) } else { name }
+}
+// `ann_row`: the function's row variable of the name, the same one at every
+// mention, meaningful (not phantom). Where a name first appears: an
+// effect's name in lowercase is E0432; a name that is also a type, E0400.
+fn ann_row(s: St, name: String, start: Int, end: Int) -> R(Int) {
+  match ann_rows(s) {
+    R(ar, s2) -> match arity_get(ar, name) {
+      Yes(v) -> R(v, s2)
+      No -> {
+        let cap = capitalized(name)
+        match is_effect(s2, cap) {
+          R(eff, s3) -> match ann_vars(s3) {
+            R(avs, s4) -> {
+              let s5 = if eff || cap == "IO" {
+                diag(s4, "E0432", "row variable `" <> name <> "` is spelled like an effect", start, end)
+              } else { match named_get(avs, name) {
+                Yes(_) -> diag(s4, "E0400", "`" <> name <> "` names a type and a row", start, end)
+                No -> s4
+              } }
+              match fresh_row(s5) { R(v, s6) -> R(v, set_ann_rows(s6, Cons(Arity(name, v), ar))) }
+            }
+          }
+        }
+      }
+    }
+  }
 }
 // A function's annotation (`elaborate_ann`): a lowercase name is that
 // function's variable of the name; a function type's unwritten row is an
@@ -924,8 +975,27 @@ fn ctor_arity(s: St, name: String) -> R(Int) {
 // where it is consumed.
 fn elaborate(s: St, a: Sp(TypeAnn), cov: Bool) -> R(Ty) {
   match a {
+    Sp(_, start, end) -> if is_row_arg(a) {
+      // A row where a type goes (a type's row argument is read by
+      // `ann_row_arg`).
+      R(TErr, diag(s, "E0400", row_not_here(), start, end))
+    } else { elaborate_inner(s, a, cov) }
+  }
+}
+fn row_not_here() -> String { "a row is written only where a type or an effect takes one" }
+// A row written as a type argument, `{Log | e}`: the parser's phantom
+// function type `fn() / {Log | e} -> $Row` (`as_row_arg`).
+fn is_row_arg(a: Sp(TypeAnn)) -> Bool {
+  match a {
+    Sp(TypeAnn("fn", Cons(Sp(TypeAnn(r, _, _), _, _), Nil), Yes(_)), _, _) -> r == "$Row"
+    _ -> False
+  }
+}
+fn elaborate_inner(s: St, a: Sp(TypeAnn), cov: Bool) -> R(Ty) {
+  match a {
     Sp(TypeAnn(name, args, written), start, end) -> {
       let n = len(args)
+      if name == "$Row" && n == 0 { R(TCon("$Row", Nil), s) } else {
       if name == "fn" && n > 0 {
         match elaborate_fn_params(s, args, n - 1, !cov, Nil) {
           R(ps, s2) -> match elaborate(s2, last_ann(args), cov) {
@@ -933,7 +1003,12 @@ fn elaborate(s: St, a: Sp(TypeAnn), cov: Bool) -> R(Ty) {
               // Unwritten: an upcast tail where the value is produced, a
               // real variable where it is consumed.
               No -> match fresh_row_marked(s3, cov) { R(w, s4) -> R(TFn(ps, ropen(w), ret), s4) }
-              Yes(RowAnn(labels, _)) -> match ann_labels(s3, labels, Nil) { R(ls, s4) -> R(TFn(ps, Row(ls, RClosed), ret), s4) }
+              Yes(RowAnn(labels, tail)) -> match ann_labels(s3, labels, Nil) {
+                R(ls, s4) -> match tail {
+                  No -> R(TFn(ps, Row(ls, RClosed), ret), s4)
+                  Yes(Sp(v, vs, ve)) -> match ann_row(s4, v, vs, ve) { R(w, s5) -> R(TFn(ps, Row(ls, ROpen(w)), ret), s5) }
+                }
+              }
             }
           }
         }
@@ -941,7 +1016,15 @@ fn elaborate(s: St, a: Sp(TypeAnn), cov: Bool) -> R(Ty) {
         match ann_vars(s) {
           R(vs, s2) -> match named_get(vs, name) {
             Yes(t) -> R(t, s2)
-            No -> match fresh(s2) { R(t, s3) -> R(t, set_ann_vars(s3, Cons(Named(name, t), vs))) }
+            No -> match ann_rows(s2) {
+              R(ar, s2b) -> {
+                let s2c = match arity_get(ar, name) {
+                  Yes(_) -> diag(s2b, "E0400", "`" <> name <> "` names a type and a row", start, end)
+                  No -> s2b
+                }
+                match fresh(s2c) { R(t, s3) -> R(t, set_ann_vars(s3, Cons(Named(name, t), vs))) }
+              }
+            }
           }
         }
       } else {
@@ -957,16 +1040,50 @@ fn elaborate(s: St, a: Sp(TypeAnn), cov: Bool) -> R(Ty) {
                 if k != n {
                   R(TErr, diag(s2, "E0400", "type `" <> name <> "` expects " <> int.to_string(k) <> " argument(s), found " <> int.to_string(n), start, end))
                 } else {
-                  match elaborate_list(s2, args, Nil) { R(ts, s3) -> R(TCon(name, ts), s3) }
+                  match ann_args(s2, name, args, 0, Nil) { R(ts, s3) -> R(TCon(name, ts), s3) }
                 }
               }
             }
           }
         }
-      } }
+      } } }
     }
   }
 }
+// A named type's arguments are invariant (consumed positions); a row
+// parameter's argument is a row (`ann_row_arg`), a type parameter's a type
+// (`ann_type_arg`).
+fn ann_args(s: St, decl: String, xs: List(Sp(TypeAnn)), j: Int, acc: List(Ty)) -> R(List(Ty)) {
+  match xs {
+    Nil -> R(rev(acc), s)
+    Cons(x, rest) -> match get_kinds(s) {
+      R(kd, s2) -> {
+        let param = param_name(kd, decl, j)
+        let got = if kind_at(kd, decl, j) { ann_row_arg(s2, x, decl, param) } else { ann_type_arg(s2, x, decl, param) }
+        match got { R(t, s3) -> ann_args(s3, decl, rest, j + 1, Cons(t, acc)) }
+      }
+    }
+  }
+}
+fn wants_row(decl: String, param: String) -> String { "`" <> decl <> "`'s parameter `" <> param <> "` is a row: write one, `{Log}`" }
+fn wants_type(decl: String, param: String) -> String { "`" <> decl <> "`'s parameter `" <> param <> "` is a type, not a row" }
+fn ann_row_arg(s: St, a: Sp(TypeAnn), decl: String, param: String) -> R(Ty) {
+  if is_row_arg(a) { elaborate_inner(s, a, False) } else {
+    match a {
+      Sp(TypeAnn(n, Nil, No), start, end) -> if is_lower(n) {
+        match ann_row(s, n, start, end) { R(v, s2) -> R(phantom(ropen(v)), s2) }
+      } else { R(TErr, diag(s, "E0400", wants_row(decl, param), start, end)) }
+      Sp(_, start, end) -> R(TErr, diag(s, "E0400", wants_row(decl, param), start, end))
+    }
+  }
+}
+fn ann_type_arg(s: St, a: Sp(TypeAnn), decl: String, param: String) -> R(Ty) {
+  match a {
+    Sp(_, start, end) -> if is_row_arg(a) { R(TErr, diag(s, "E0400", wants_type(decl, param), start, end)) } else { elaborate(s, a, False) }
+  }
+}
+// A row argument as a type (`phantom`): `fn() / R -> $Row`.
+fn phantom(r: Row) -> Ty { TFn(Nil, r, TCon("$Row", Nil)) }
 // A written row's labels (`ann_labels`): each a declared effect or `IO`.
 fn ann_labels(s: St, xs: List(LabelAnn), acc: List(Lab)) -> R(List(Lab)) {
   match xs {
@@ -979,7 +1096,7 @@ fn ann_labels(s: St, xs: List(LabelAnn), acc: List(Lab)) -> R(List(Lab)) {
   }
 }
 fn is_effect(s: St, name: String) -> R(Bool) {
-  match get_hx(s) { R(Hx(_, _, _, _, effs, _), s2) -> R(has_str(effs, name), s2) }
+  match get_hx(s) { R(Hx(_, _, _, _, effs, _, _), s2) -> R(has_str(effs, name), s2) }
 }
 fn last_ann(xs: List(Sp(TypeAnn))) -> Sp(TypeAnn) {
   match xs {
@@ -1012,52 +1129,121 @@ fn check_ann(s: St, ann: Maybe(Sp(TypeAnn)), t: Ty, cov: Bool) -> St {
   }
 }
 // A declared type's field (`elaborate_adt_ty`): its parameters are the
-// declaration's; a base type's arguments are not looked at; a wrong count
-// of arguments is reported and the arguments still read.
-fn elaborate_adt(s: St, a: Sp(TypeAnn), params: List(Named)) -> R(Ty) {
+// declaration's (`DeclCx`: its name, its type parameters, its row
+// parameters); a base type's arguments are not looked at; a wrong count of
+// arguments is reported and the arguments still read.
+type DeclCx { DeclCx(String, List(Named), List(Arity)) }
+fn elaborate_adt(s: St, a: Sp(TypeAnn), cx: DeclCx) -> R(Ty) {
   match a {
-    Sp(TypeAnn(name, args, written), start, end) -> if name == "fn" && len(args) > 0 {
-      // A declaration's rows are exactly what is written: none is pure.
+    Sp(_, start, end) -> if is_row_arg(a) { R(TErr, diag(s, "E0400", row_not_here(), start, end)) } else { elaborate_adt_inner(s, a, cx) }
+  }
+}
+fn elaborate_adt_inner(s: St, a: Sp(TypeAnn), cx: DeclCx) -> R(Ty) {
+  match a {
+    Sp(TypeAnn(name, args, written), start, end) -> {
       let n = len(args)
-      match elaborate_adt_list(s, first_anns(args, n - 1, Nil), params, Nil) {
-        R(ps, s2) -> match elaborate_adt(s2, last_ann(args), params) {
-          R(ret, s3) -> match written {
-            No -> R(TFn(ps, pure_row(), ret), s3)
-            Yes(RowAnn(labels, _)) -> match ann_labels(s3, labels, Nil) { R(ls, s4) -> R(TFn(ps, Row(ls, RClosed), ret), s4) }
-          }
-        }
-      }
-    } else {
-      let n = len(args)
-      let p = if n == 0 { named_get(params, name) } else { No }
-      match p {
-        Yes(t) -> R(t, s)
-        No -> {
-          let b = base_code(name)
-          if b >= 0 { R(TB(b), s) } else {
-            match known_arity(s, name) {
-              R(k, s2) -> if k < 0 {
-                R(TErr, diag(s2, "E0432", "unknown type `" <> name <> "`", start, end))
-              } else {
-                let s3 = if k != n {
-                  diag(s2, "E0400", "type `" <> name <> "` expects " <> int.to_string(k) <> " argument(s), found " <> int.to_string(n), start, end)
-                } else { s2 }
-                match elaborate_adt_list(s3, args, params, Nil) { R(ts, s4) -> R(TCon(name, ts), s4) }
+      if name == "$Row" && n == 0 { R(TCon("$Row", Nil), s) } else {
+      if name == "fn" && n > 0 {
+        // A declaration's rows are exactly what is written: none is pure.
+        match elaborate_adt_list(s, first_anns(args, n - 1, Nil), cx, Nil) {
+          R(ps, s2) -> match elaborate_adt(s2, last_ann(args), cx) {
+            R(ret, s3) -> match written {
+              No -> R(TFn(ps, pure_row(), ret), s3)
+              Yes(RowAnn(labels, tail)) -> match ann_labels(s3, labels, Nil) {
+                R(ls, s4) -> match tail {
+                  No -> R(TFn(ps, Row(ls, RClosed), ret), s4)
+                  Yes(Sp(v, vs, ve)) -> match cx {
+                    DeclCx(decl, _, re) -> match arity_get(re, v) {
+                      Yes(rv) -> R(TFn(ps, Row(ls, ROpen(rv)), ret), s4)
+                      No -> R(TFn(ps, Row(ls, RClosed), ret), undeclared_row_var(s4, v, vs, ve))
+                    }
+                  }
+                }
               }
             }
           }
         }
+      } else {
+        match cx {
+          DeclCx(decl, pe, re) -> {
+            let p = if n == 0 { named_get(pe, name) } else { No }
+            match p {
+              Yes(t) -> R(t, s)
+              No -> if n == 0 && has_arity(re, name) {
+                R(TErr, diag(s, "E0400", "`" <> name <> "` is a row parameter of `" <> decl <> "`: a type goes here", start, end))
+              } else {
+                let b = base_code(name)
+                if b >= 0 { R(TB(b), s) } else {
+                  match known_arity(s, name) {
+                    R(k, s2) -> if k < 0 {
+                      R(TErr, diag(s2, "E0432", "unknown type `" <> name <> "`", start, end))
+                    } else {
+                      let s3 = if k != n {
+                        diag(s2, "E0400", "type `" <> name <> "` expects " <> int.to_string(k) <> " argument(s), found " <> int.to_string(n), start, end)
+                      } else { s2 }
+                      match adt_args(s3, name, args, 0, cx, Nil) { R(ts, s4) -> R(TCon(name, ts), s4) }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      } }
+    }
+  }
+}
+fn has_arity(xs: List(Arity), name: String) -> Bool {
+  match arity_get(xs, name) { Yes(_) -> True  No -> False }
+}
+// E0432 for a row variable a declaration does not declare.
+fn undeclared_row_var(s: St, v: String, start: Int, end: Int) -> St {
+  diag(s, "E0432", "a declaration's row cannot name a row variable (`" <> v <> "`) it does not declare", start, end)
+}
+fn adt_args(s: St, decl: String, xs: List(Sp(TypeAnn)), j: Int, cx: DeclCx, acc: List(Ty)) -> R(List(Ty)) {
+  match xs {
+    Nil -> R(rev(acc), s)
+    Cons(x, rest) -> match get_kinds(s) {
+      R(kd, s2) -> {
+        let param = param_name(kd, decl, j)
+        let got = if kind_at(kd, decl, j) { decl_row_arg(s2, x, cx, decl, param) } else { decl_type_arg(s2, x, cx, decl, param) }
+        match got { R(t, s3) -> adt_args(s3, decl, rest, j + 1, cx, Cons(t, acc)) }
       }
     }
+  }
+}
+// A row parameter's argument in a declaration: a row, or one of the
+// declaration's row parameters alone.
+fn decl_row_arg(s: St, a: Sp(TypeAnn), cx: DeclCx, decl: String, param: String) -> R(Ty) {
+  if is_row_arg(a) { elaborate_adt_inner(s, a, cx) } else {
+    match cx {
+      DeclCx(own, pe, re) -> match a {
+        Sp(TypeAnn(n, Nil, No), start, end) -> if is_lower(n) {
+          match arity_get(re, n) {
+            Yes(rv) -> R(phantom(ropen(rv)), s)
+            No -> match named_get(pe, n) {
+              No -> R(TErr, undeclared_row_var(s, n, start, end))
+              Yes(_) -> R(TErr, diag(s, "E0400", wants_row(decl, param), start, end))
+            }
+          }
+        } else { R(TErr, diag(s, "E0400", wants_row(decl, param), start, end)) }
+        Sp(_, start, end) -> R(TErr, diag(s, "E0400", wants_row(decl, param), start, end))
+      }
+    }
+  }
+}
+fn decl_type_arg(s: St, a: Sp(TypeAnn), cx: DeclCx, decl: String, param: String) -> R(Ty) {
+  match a {
+    Sp(_, start, end) -> if is_row_arg(a) { R(TErr, diag(s, "E0400", wants_type(decl, param), start, end)) } else { elaborate_adt(s, a, cx) }
   }
 }
 fn first_anns(xs: List(Sp(TypeAnn)), n: Int, acc: List(Sp(TypeAnn))) -> List(Sp(TypeAnn)) {
   if n == 0 { rev(acc) } else { match xs { Nil -> rev(acc)  Cons(x, rest) -> first_anns(rest, n - 1, Cons(x, acc)) } }
 }
-fn elaborate_adt_list(s: St, xs: List(Sp(TypeAnn)), params: List(Named), acc: List(Ty)) -> R(List(Ty)) {
+fn elaborate_adt_list(s: St, xs: List(Sp(TypeAnn)), cx: DeclCx, acc: List(Ty)) -> R(List(Ty)) {
   match xs {
     Nil -> R(rev(acc), s)
-    Cons(x, rest) -> match elaborate_adt(s, x, params) { R(t, s2) -> elaborate_adt_list(s2, rest, params, Cons(t, acc)) }
+    Cons(x, rest) -> match elaborate_adt(s, x, cx) { R(t, s2) -> elaborate_adt_list(s2, rest, cx, Cons(t, acc)) }
   }
 }
 
@@ -1080,10 +1266,10 @@ fn zip_named(ns: List(String), ts: List(Ty), acc: List(Named)) -> List(Named) {
   }
 }
 fn add_ctor(s: St, name: String, k: Int) -> St {
-  match get_cx(s) { R(Ctx(v, kn, c, e), s2) -> set_cx(s2, Ctx(v, kn, Cons(Arity(name, k), c), e)) }
+  match get_cx(s) { R(Ctx(v, kn, c, e, ar, kd), s2) -> set_cx(s2, Ctx(v, kn, Cons(Arity(name, k), c), e, ar, kd)) }
 }
 fn add_empty(s: St, name: String) -> St {
-  match get_cx(s) { R(Ctx(v, kn, c, e), s2) -> set_cx(s2, Ctx(v, kn, c, Cons(name, e))) }
+  match get_cx(s) { R(Ctx(v, kn, c, e, ar, kd), s2) -> set_cx(s2, Ctx(v, kn, c, Cons(name, e), ar, kd)) }
 }
 fn add_adt_fields(s: St, result: Ty, vars: List(Int), fts: List(Ty)) -> St {
   match result {
@@ -1096,33 +1282,168 @@ fn add_adt_fields(s: St, result: Ty, vars: List(Int), fts: List(Ty)) -> St {
     _ -> s
   }
 }
+// Each declared type's parameters' kinds (`decl_kinds`, spec
+// 2026-10-30-elya-row-variables D3): a parameter is a row parameter when its
+// declaration uses it where a row goes -- a row's tail, or the argument at
+// another declaration's row parameter. A fixpoint: a parameter only turns
+// from type to row.
+type KindPass { KindPass(List(Kind), Bool) }
+fn decl_kinds(decls: List(Sp(Decl))) -> List(Kind) { kinds_fix(decls, kinds_init(decls, Nil)) }
+fn kinds_init(decls: List(Sp(Decl)), acc: List(Kind)) -> List(Kind) {
+  match decls {
+    Nil -> rev(acc)
+    Cons(Sp(DType(name, params, _, _), _, _), rest) -> kinds_init(rest, Cons(Kind(name, kps(params)), acc))
+    Cons(_, rest) -> kinds_init(rest, acc)
+  }
+}
+fn kps(ps: List(String)) -> List(KP) {
+  match ps { Nil -> Nil  Cons(p, rest) -> Cons(KP(p, False), kps(rest)) }
+}
+fn kinds_fix(decls: List(Sp(Decl)), kd: List(Kind)) -> List(Kind) {
+  match kinds_pass(decls, kd, False) {
+    KindPass(kd2, changed) -> if changed { kinds_fix(decls, kd2) } else { kd2 }
+  }
+}
+fn kinds_pass(decls: List(Sp(Decl)), kd: List(Kind), changed: Bool) -> KindPass {
+  match decls {
+    Nil -> KindPass(kd, changed)
+    Cons(Sp(DType(name, params, _, variants), _, _), rest) -> {
+      let rows = variant_uses(variants, params, kd, Nil)
+      match mark_kinds(kd, name, rows) {
+        KindPass(kd2, c) -> kinds_pass(rest, kd2, changed || c)
+      }
+    }
+    Cons(_, rest) -> kinds_pass(rest, kd, changed)
+  }
+}
+fn variant_uses(vs: List(Sp(VariantDecl)), params: List(String), kd: List(Kind), out: List(String)) -> List(String) {
+  match vs {
+    Nil -> out
+    Cons(Sp(VariantDecl(_, fields), _, _), rest) -> variant_uses(rest, params, kd, anns_uses(fields, params, kd, out))
+  }
+}
+fn anns_uses(xs: List(Sp(TypeAnn)), params: List(String), kd: List(Kind), out: List(String)) -> List(String) {
+  match xs { Nil -> out  Cons(x, rest) -> anns_uses(rest, params, kd, row_uses(x, params, kd, out)) }
+}
+// `row_uses`: the parameters (of `params`) an annotation uses where a row
+// goes.
+fn row_uses(a: Sp(TypeAnn), params: List(String), kd: List(Kind), out: List(String)) -> List(String) {
+  match a {
+    Sp(TypeAnn(name, args, written), _, _) -> {
+      let o1 = match written {
+        Yes(RowAnn(labels, tail)) -> {
+          let o = match tail { Yes(Sp(v, _, _)) -> if has_str(params, v) { Cons(v, out) } else { out }  No -> out }
+          label_uses(labels, params, kd, o)
+        }
+        No -> out
+      }
+      arg_uses(name, args, 0, params, kd, o1)
+    }
+  }
+}
+fn label_uses(ls: List(LabelAnn), params: List(String), kd: List(Kind), out: List(String)) -> List(String) {
+  match ls {
+    Nil -> out
+    Cons(LabelAnn(_, Yes(xs)), rest) -> label_uses(rest, params, kd, anns_uses(xs, params, kd, out))
+    Cons(_, rest) -> label_uses(rest, params, kd, out)
+  }
+}
+fn arg_uses(name: String, args: List(Sp(TypeAnn)), j: Int, params: List(String), kd: List(Kind), out: List(String)) -> List(String) {
+  match args {
+    Nil -> out
+    Cons(x, rest) -> {
+      let o = if name != "fn" && kind_at(kd, name, j) { bare_use(x, params, out) } else { out }
+      arg_uses(name, rest, j + 1, params, kd, row_uses(x, params, kd, o))
+    }
+  }
+}
+fn bare_use(x: Sp(TypeAnn), params: List(String), out: List(String)) -> List(String) {
+  match x {
+    Sp(TypeAnn(n, Nil, No), _, _) -> if has_str(params, n) { Cons(n, out) } else { out }
+    _ -> out
+  }
+}
+fn mark_kinds(kd: List(Kind), name: String, rows: List(String)) -> KindPass {
+  match kd {
+    Nil -> KindPass(Nil, False)
+    Cons(Kind(n, ps), rest) -> if n == name {
+      match mark_kps(ps, rows) { KindPass(_, c) -> KindPass(Cons(Kind(n, marked(ps, rows)), rest), c) }
+    } else {
+      match mark_kinds(rest, name, rows) { KindPass(r2, c) -> KindPass(Cons(Kind(n, ps), r2), c) }
+    }
+  }
+}
+fn marked(ps: List(KP), rows: List(String)) -> List(KP) {
+  match ps { Nil -> Nil  Cons(KP(p, r), rest) -> Cons(KP(p, r || has_str(rows, p)), marked(rest, rows)) }
+}
+fn mark_kps(ps: List(KP), rows: List(String)) -> KindPass {
+  match ps {
+    Nil -> KindPass(Nil, False)
+    Cons(KP(p, r), rest) -> if !r && has_str(rows, p) { KindPass(Nil, True) } else { mark_kps(rest, rows) }
+  }
+}
+fn kind_params(kd: List(Kind), name: String) -> List(KP) {
+  match kd { Nil -> Nil  Cons(Kind(n, ps), rest) -> if n == name { ps } else { kind_params(rest, name) } }
+}
+fn kind_at(kd: List(Kind), name: String, j: Int) -> Bool {
+  match kp_at(kind_params(kd, name), j) { Yes(KP(_, r)) -> r  No -> False }
+}
+fn kp_at(ps: List(KP), j: Int) -> Maybe(KP) {
+  match ps { Nil -> No  Cons(p, rest) -> if j == 0 { Yes(p) } else { kp_at(rest, j - 1) } }
+}
+fn param_name(kd: List(Kind), name: String, j: Int) -> String {
+  match kp_at(kind_params(kd, name), j) { Yes(KP(p, _)) -> p  No -> "?" }
+}
+fn get_kinds(s: St) -> R(List(Kind)) {
+  match get_cx(s) { R(Ctx(_, _, _, _, _, kd), s2) -> R(kd, s2) }
+}
+// A declaration's parameters (`decl_params`): each a fresh type variable; a
+// row parameter also a fresh row variable, its argument that row's phantom.
+// The arguments, the type parameters' variables, the type and the row
+// parameters by name, the row parameters' variables.
+type DeclParams { DeclParams(List(Ty), List(Int), List(Named), List(Arity), List(Int)) }
+fn decl_params(s: St, ps: List(KP), acc: DeclParams) -> R(DeclParams) {
+  match ps {
+    Nil -> match acc { DeclParams(args, vs, pe, re, rvs) -> R(DeclParams(rev(args), rev(vs), pe, re, rev(rvs)), s) }
+    Cons(KP(p, is_row), rest) -> match fresh(s) {
+      R(v, s2) -> match acc {
+        DeclParams(args, vs, pe, re, rvs) -> if is_row {
+          match fresh_row(s2) { R(rv, s3) -> decl_params(s3, rest, DeclParams(Cons(phantom(ropen(rv)), args), vs, pe, Cons(Arity(p, rv), re), Cons(rv, rvs))) }
+        } else {
+          let id = match v { TVar(i) -> i  _ -> 0 }
+          decl_params(s2, rest, DeclParams(Cons(v, args), Cons(id, vs), Cons(Named(p, v), pe), re, rvs))
+        }
+      }
+    }
+  }
+}
 // The constructors' schemes, in declaration order (`infer_all`'s type pass).
 fn type_decls(s: St, decls: List(Sp(Decl)), env: List(Entry)) -> R(List(Entry)) {
   match decls {
     Nil -> R(env, s)
-    Cons(Sp(DType(name, params, _, variants), _, _), rest) -> match fresh_list(s, len(params), Nil) {
-      R(vars, s2) -> {
-        let pe = zip_named(params, vars, Nil)
-        // Every declared type has its entry, a type without constructors too.
-        let s2b = match get_eq(s2) { R(Eqs(ms, rep, adts), s2a) -> set_eq(s2a, Eqs(ms, rep, Cons(Adt(name, ids(vars, Nil), Nil), adts))) }
-        let s3 = match variants { Nil -> add_empty(s2b, name)  _ -> s2b }
-        match ctors(s3, variants, TCon(name, vars), ids(vars, Nil), pe, env) {
-          R(env2, s4) -> type_decls(s4, rest, env2)
+    Cons(Sp(DType(name, _, _, variants), _, _), rest) -> match get_kinds(s) {
+      R(kd, s1) -> match decl_params(s1, kind_params(kd, name), DeclParams(Nil, Nil, Nil, Nil, Nil)) {
+        R(DeclParams(args, vars, pe, re, rvs), s2) -> {
+          // Every declared type has its entry, a type without constructors too.
+          let s2b = match get_eq(s2) { R(Eqs(ms, rep, adts), s2a) -> set_eq(s2a, Eqs(ms, rep, Cons(Adt(name, vars, Nil), adts))) }
+          let s3 = match variants { Nil -> add_empty(s2b, name)  _ -> s2b }
+          match ctors(s3, variants, TCon(name, args), vars, rvs, DeclCx(name, pe, re), env) {
+            R(env2, s4) -> type_decls(s4, rest, env2)
+          }
         }
       }
     }
     Cons(_, rest) -> type_decls(s, rest, env)
   }
 }
-fn ctors(s: St, vs: List(Sp(VariantDecl)), result: Ty, vars: List(Int), pe: List(Named), env: List(Entry)) -> R(List(Entry)) {
+fn ctors(s: St, vs: List(Sp(VariantDecl)), result: Ty, vars: List(Int), rvs: List(Int), cx: DeclCx, env: List(Entry)) -> R(List(Entry)) {
   match vs {
     Nil -> R(env, s)
-    Cons(Sp(VariantDecl(cname, fields), _, _), rest) -> match elaborate_adt_list(add_ctor(s, cname, len(fields)), fields, pe, Nil) {
-      R(fts0, s1) -> {
-        let fts = fts0
+    Cons(Sp(VariantDecl(cname, fields), _, _), rest) -> match elaborate_adt_list(add_ctor(s, cname, len(fields)), fields, cx, Nil) {
+      R(fts, s1) -> {
         let s2 = add_adt_fields(s1, result, vars, fts)
         let t = match fts { Nil -> result  _ -> TFn(fts, pure_row(), result) }
-        ctors(s2, rest, result, vars, pe, Cons(Entry(cname, Scheme(vars, Nil, t)), env))
+        ctors(s2, rest, result, vars, rvs, cx, Cons(Entry(cname, Scheme(vars, rvs, t)), env))
       }
     }
   }
@@ -1294,7 +1615,7 @@ fn check_fields(s: St, ps: List(Sp(Pattern)), ts: List(Ty), env: List(Entry), ac
   }
 }
 fn is_empty_type(s: St, name: String) -> R(Bool) {
-  match get_cx(s) { R(Ctx(v, k, c, e), s2) -> R(has_str(e, name), s2) }
+  match get_cx(s) { R(Ctx(v, k, c, e, ar, kd), s2) -> R(has_str(e, name), s2) }
 }
 fn check_empty_match(s: St, t: Ty, start: Int, end: Int) -> St {
   match resolve(s, t) {
@@ -1544,7 +1865,7 @@ fn infer_lambda(s: St, params: List(Sp(Param)), body: Sp(Block), env: List(Entry
   }
 }
 fn add_depth(s: St, d: Int) -> St {
-  match get_hx(s) { R(Hx(rs, cr, depth, ops, effs, dead), s2) -> set_hx(s2, Hx(rs, cr, depth + d, ops, effs, dead)) }
+  match get_hx(s) { R(Hx(rs, cr, depth, ops, effs, dead, mu), s2) -> set_hx(s2, Hx(rs, cr, depth + d, ops, effs, dead, mu)) }
 }
 type LamIn { LamIn(List(Entry), List(Ty)) }
 fn lambda_params(s: St, params: List(Sp(Param)), env: List(Entry), acc: List(Ty)) -> R(LamIn) {
@@ -1593,7 +1914,7 @@ fn close_residual(s: St, amb: Int, params: List(Ty)) -> St {
   match rhead(s, ROpen(amb)) {
     R(t, s2) -> match t {
       ROpen(rho) -> match get_hx(s2) {
-        R(Hx(_, crs, _, _, _, _), s3) -> match tail_in(s3, crs, rho) {
+        R(Hx(_, crs, _, _, _, _, _), s3) -> match tail_in(s3, crs, rho) {
           R(pending, s4) -> if pending { s4 } else {
             match rows_in(s4, params, Nil) {
               R(in_params, s5) -> if has_int(in_params, rho) { s5 } else { bind_row(s5, rho, pure_row(), 0, 0) }
@@ -1630,10 +1951,10 @@ fn without_incls(xs: List(Incl), gone: List(Incl)) -> List(Incl) {
   match xs { Nil -> Nil  Cons(x, rest) -> if has_incl(gone, x) { without_incls(rest, gone) } else { Cons(x, without_incls(rest, gone)) } }
 }
 fn get_dead(s: St) -> R(List(Incl)) {
-  match get_hx(s) { R(Hx(_, _, _, _, _, dead), s2) -> R(dead, s2) }
+  match get_hx(s) { R(Hx(_, _, _, _, _, dead, mu), s2) -> R(dead, s2) }
 }
 fn kill_incl(s: St, x: Incl) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead), s2) -> set_hx(s2, Hx(rs, cr, d, ops, effs, Cons(x, dead))) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu), s2) -> set_hx(s2, Hx(rs, cr, d, ops, effs, Cons(x, dead), mu)) }
 }
 fn flush(s: St) -> St {
   match row_count(s) {
@@ -1750,7 +2071,7 @@ fn op_get(ops: List(OpInfo), name: String) -> Maybe(OpInfo) {
   match ops { Nil -> No  Cons(OpInfo(n, e, ps, r), rest) -> if n == name { Yes(OpInfo(n, e, ps, r)) } else { op_get(rest, name) } }
 }
 fn find_op(s: St, name: String) -> R(Maybe(OpInfo)) {
-  match get_hx(s) { R(Hx(_, _, _, ops, _, _), s2) -> R(op_get(ops, name), s2) }
+  match get_hx(s) { R(Hx(_, _, _, ops, _, _, _), s2) -> R(op_get(ops, name), s2) }
 }
 // The effect declarations' operations (`ops`), after every type: each
 // operation's parameters and result as a declaration's fields are read.
@@ -1764,14 +2085,25 @@ fn effect_decls(s: St, decls: List(Sp(Decl))) -> St {
 fn op_sigs(s: St, eff: String, sigs: List(Sp(OpSig))) -> St {
   match sigs {
     Nil -> s
-    Cons(Sp(OpSig(name, _, ptys, ret), _, _), rest) -> match elaborate_adt_list(s, ptys, Nil, Nil) {
-      R(ps, s2) -> match elaborate_adt(s2, ret, Nil) {
+    Cons(Sp(OpSig(name, _, ptys, ret), _, _), rest) -> match elaborate_adt_list(s, ptys, DeclCx(eff, Nil, Nil), Nil) {
+      R(ps, s2) -> match elaborate_adt(s2, ret, DeclCx(eff, Nil, Nil)) {
         R(rt, s3) -> match get_hx(s3) {
-          R(Hx(rs, cr, d, ops, effs, dead), s4) -> op_sigs(set_hx(s4, Hx(rs, cr, d, Cons(OpInfo(name, eff, ps, rt), ops), effs, dead)), eff, rest)
+          R(Hx(rs, cr, d, ops, effs, dead, mu), s4) -> op_sigs(set_hx(s4, Hx(rs, cr, d, Cons(OpInfo(name, eff, ps, rt), ops), effs, dead, mu)), eff, rest)
         }
       }
     }
   }
+}
+// The effects declared `multi` (a `with multi` handler needs one).
+fn multi_names(decls: List(Sp(Decl)), acc: List(String)) -> List(String) {
+  match decls {
+    Nil -> acc
+    Cons(Sp(DEffect(name, _, True, _), _, _), rest) -> multi_names(rest, Cons(name, acc))
+    Cons(_, rest) -> multi_names(rest, acc)
+  }
+}
+fn is_multi(s: St, name: String) -> R(Bool) {
+  match get_hx(s) { R(Hx(_, _, _, _, _, _, mu), s2) -> R(has_str(mu, name), s2) }
 }
 fn effect_names(decls: List(Sp(Decl)), acc: List(String)) -> List(String) {
   match decls {
@@ -1828,7 +2160,7 @@ fn remove_lab(xs: List(Lab), n: String) -> List(Lab) {
 // the clauses row an escaped `resume` reads.
 fn infer_handle(s: St, body: Sp(Expr), h: Handler, start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
   match h {
-    Handler(_, _, clauses, ret) -> match handler_effect(s, clauses, "") {
+    Handler(many, _, clauses, ret) -> match one_shot(handler_effect(s, clauses, ""), many, start, end) {
       R(eff, s1) -> match fresh_row(s1) {
         R(amb_in, s2) -> {
           let s3 = if eff == "" { s2 } else { surface(add_effect(s2, amb_in, eff, start, end)) }
@@ -1853,7 +2185,7 @@ fn infer_handle(s: St, body: Sp(Expr), h: Handler, start: Int, end: Int, env: Li
                                 R(own, s14) -> match rhead(s14, ROpen(clauses_row)) {
                                   R(ct, s15) -> {
                                     let s16 = if tail_eq(ct, own) { s15 } else { match get_ptys(s15) { R(sp, s15b) -> close_residual(s15b, clauses_row, sp) } }
-                                    match resolve_row(s16, ropen(amb_in)) {
+                                    match resolve_row(if many { repeats(s16, amb_in, start, end) } else { s16 }, ropen(amb_in)) {
                                       R(Row(ls, t), s17) -> R(result, surface(add_row(s17, amb, Row(remove_lab(ls, eff), t), start, end)))
                                     }
                                   }
@@ -1874,17 +2206,34 @@ fn infer_handle(s: St, body: Sp(Expr), h: Handler, start: Int, end: Int, env: Li
     }
   }
 }
+// E0427: `with multi` over an effect not declared `multi`.
+fn one_shot(r: R(String), many: Bool, start: Int, end: Int) -> R(String) {
+  match r {
+    R(eff, s) -> if many && eff != "" {
+      match is_multi(s, eff) {
+        R(yes, s2) -> R(eff, if yes { s2 } else { diag(s2, "E0427", "a one-shot effect cannot be handled with `multi`", start, end) })
+      }
+    } else { R(eff, s) }
+  }
+}
+// E0426, a warning: a `with multi` handler's body performing an observable
+// effect (`IO`), which a second resume repeats.
+fn repeats(s: St, amb_in: Int, start: Int, end: Int) -> St {
+  match resolve_row(s, ropen(amb_in)) {
+    R(Row(ls, _), s2) -> if has_lab(ls, "IO") { warn(s2, "E0426", "a multi-shot handler may run its continuation's effects more than once", start, end) } else { s2 }
+  }
+}
 fn push_clause_row(s: St, r: Int) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead), s2) -> set_hx(s2, Hx(rs, Cons(r, cr), d, ops, effs, dead)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu), s2) -> set_hx(s2, Hx(rs, Cons(r, cr), d, ops, effs, dead, mu)) }
 }
 fn pop_clause_row(s: St) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead), s2) -> set_hx(s2, Hx(rs, match cr { Cons(_, rest) -> rest  Nil -> Nil }, d, ops, effs, dead)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu), s2) -> set_hx(s2, Hx(rs, match cr { Cons(_, rest) -> rest  Nil -> Nil }, d, ops, effs, dead, mu)) }
 }
 fn push_resume(s: St, r: Resume) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead), s2) -> set_hx(s2, Hx(Cons(r, rs), cr, d, ops, effs, dead)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu), s2) -> set_hx(s2, Hx(Cons(r, rs), cr, d, ops, effs, dead, mu)) }
 }
 fn pop_resume(s: St) -> St {
-  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead), s2) -> set_hx(s2, Hx(match rs { Cons(_, rest) -> rest  Nil -> Nil }, cr, d, ops, effs, dead)) }
+  match get_hx(s) { R(Hx(rs, cr, d, ops, effs, dead, mu), s2) -> set_hx(s2, Hx(match rs { Cons(_, rest) -> rest  Nil -> Nil }, cr, d, ops, effs, dead, mu)) }
 }
 fn set_ptys(s: St, p: List(Ty)) -> St {
   match get_gx(s) { R(Gx(i, mi, _, rs, d, gp, ga), s2) -> set_gx(s2, Gx(i, mi, p, rs, d, gp, ga)) }
@@ -1903,7 +2252,7 @@ fn op_clauses(s: St, cs: List(Sp(OpClause)), cx: Resume, env: List(Entry), amb: 
           Sig(ops, b) -> match clause_params(s1, params, ops, env) {
             R(env2, s2) -> match fresh_row(s2) {
               R(camb, s3) -> match get_hx(s3) {
-                R(Hx(_, _, depth, _, _, _), s4) -> match cx {
+                R(Hx(_, _, depth, _, _, _, _), s4) -> match cx {
                   Resume(_, result, body_amb, ret_amb, handled, _, crow) -> match get_ptys(s4) {
                     R(saved, s5) -> {
                       let s6 = push_region(set_ptys(push_resume(s5, Resume(b, result, body_amb, ret_amb, handled, depth, crow)), append(saved, ops)), Region(camb, False))
@@ -1966,7 +2315,7 @@ fn clause_labs(s: St, ls: List(Lab), crow: Int, eff: String) -> St {
 // into a lambda, every clause's effects and the body's member rows too.
 fn type_resume(s: St, arg_ty: Ty, start: Int, end: Int, amb: Int) -> R(Ty) {
   match get_hx(s) {
-    R(Hx(rs, _, depth, _, _, _), s1) -> match rs {
+    R(Hx(rs, _, depth, _, _, _, _), s1) -> match rs {
       Nil -> R(TErr, s1)
       Cons(Resume(arg, result, body_amb, ret_amb, handled, d, crow), _) -> {
         let s2 = unify(s1, arg_ty, arg, start, end)
@@ -2229,8 +2578,8 @@ fn group(s: St, fns: List(FnInfo), g: List(Int), env: List(Entry)) -> R(Out) {
       match get_gx(s2) {
         R(Gx(incl, mincl, ptys, regions, deferred, _, _), s3) -> {
           let s4 = set_gx(s3, Gx(incl, mincl, ptys, regions, deferred, mem_params(ms, Nil), mem_ambs(ms, Nil)))
-          match bodies(s4, fns, ms, env2) {
-            s5 -> schemes_of(close_group(s5, fns, ms), fns, ms, env2, Nil)
+          match bodies(s4, fns, ms, env2, Nil) {
+            R(ms2, s5) -> schemes_of(close_group(s5, fns, ms2), fns, ms2, env2, Nil)
           }
         }
       }
@@ -2238,10 +2587,10 @@ fn group(s: St, fns: List(FnInfo), g: List(Int), env: List(Entry)) -> R(Out) {
   }
 }
 fn mem_params(ms: List(Mem), acc: List(Ty)) -> List(Ty) {
-  match ms { Nil -> acc  Cons(Mem(_, ps, _, _, _), rest) -> mem_params(rest, append(acc, ps)) }
+  match ms { Nil -> acc  Cons(Mem(_, ps, _, _, _, _), rest) -> mem_params(rest, append(acc, ps)) }
 }
 fn mem_ambs(ms: List(Mem), acc: List(Int)) -> List(Int) {
-  match ms { Nil -> rev(acc)  Cons(Mem(_, _, amb, _, _), rest) -> mem_ambs(rest, Cons(amb, acc)) }
+  match ms { Nil -> rev(acc)  Cons(Mem(_, _, amb, _, _, _), rest) -> mem_ambs(rest, Cons(amb, acc)) }
 }
 // Step 1: a fresh monotype per member, its annotations checked, its type
 // recorded at its declaration.
@@ -2254,9 +2603,11 @@ fn members_list(s: St, fns: List(FnInfo), g: List(Int), env: List(Entry), acc: L
           R(amb, s2b) -> match fresh(s2b) {
             R(result, s3) -> {
               let ft = TFn(ps, ropen(amb), result)
-              let s4 = check_ann(check_anns(set_ann_vars(s3, Nil), params, ps), ret, result, True)
+              let s4 = check_ann(check_anns(set_ann_rows(set_ann_vars(s3, Nil), Nil), params, ps), ret, result, True)
               match ann_vars(s4) {
-                R(avs, s5) -> members_list(record(s5, ds, de, ft), fns, rest, Cons(Entry(name, Scheme(Nil, Nil, ft)), env), Cons(Mem(i, ps, amb, result, avs), acc))
+                R(avs, s4b) -> match ann_rows(s4b) {
+                  R(ar, s5) -> members_list(record(s5, ds, de, ft), fns, rest, Cons(Entry(name, Scheme(Nil, Nil, ft)), env), Cons(Mem(i, ps, amb, result, avs, ar), acc))
+                }
               }
             }
           }
@@ -2280,15 +2631,18 @@ fn set_param_tys(s: St, ptys: List(Ty)) -> St {
   match get_gx(s) { R(Gx(i, mi, _, r, d, gp, ga), s2) -> set_gx(s2, Gx(i, mi, ptys, r, d, gp, ga)) }
 }
 // Step 2: each body under its parameters and its ambient row, the group
-// monomorphic.
-fn bodies(s: St, fns: List(FnInfo), ms: List(Mem), env: List(Entry)) -> St {
+// monomorphic. Each member's named rows, its body's included, kept for its
+// declared row (2.48).
+fn bodies(s: St, fns: List(FnInfo), ms: List(Mem), env: List(Entry), acc: List(Mem)) -> R(List(Mem)) {
   match ms {
-    Nil -> s
-    Cons(Mem(i, ps, amb, result, avs), rest) -> match nth_fn(fns, i) {
-      FnInfo(_, _, _, params, _, body, _) -> match bind_params(set_ann_vars(s, avs), params, ps, env) {
+    Nil -> R(rev(acc), set_ann_rows(s, Nil))
+    Cons(Mem(i, ps, amb, result, avs, ar), rest) -> match nth_fn(fns, i) {
+      FnInfo(_, _, _, params, _, body, _) -> match bind_params(set_ann_rows(set_ann_vars(s, avs), ar), params, ps, env) {
         R(benv, s2) -> match body {
           Sp(b, bs, be) -> match infer_block(set_param_tys(s2, ps), b, benv, amb) {
-            R(bt, s3) -> bodies(unify(set_param_tys(s3, Nil), result, bt, bs, be), fns, rest, env)
+            R(bt, s3) -> match ann_rows(unify(set_param_tys(s3, Nil), result, bt, bs, be)) {
+              R(ar2, s4) -> bodies(s4, fns, rest, env, Cons(Mem(i, ps, amb, result, avs, ar2), acc))
+            }
           }
         }
       }
@@ -2304,8 +2658,10 @@ fn close_group(s: St, fns: List(FnInfo), ms: List(Mem)) -> St {
         let s4 = flush(unmark_relayed(s3, incl, in_params))
         // 2.45: the lambdas' deferred rows, with the group's parameters.
         let s5 = close_deferred(s4, deferred, gparams)
+        // 2.48: a declared row ending in a named variable, with its own
+        // member's names, before anything closes.
         // 2.5: each member's residual ambient row.
-        let s6 = close_members(s5, ms)
+        let s6 = close_members(set_ann_rows(named_rows(s5, fns, ms), Nil), ms)
         // 2.6: the declared rows, exactly, and what `main` may perform.
         let s6b = exact_rows(s6, fns, ms)
         // 2.7: what is still pending reaches its rows; the group's phantoms
@@ -2313,7 +2669,7 @@ fn close_group(s: St, fns: List(FnInfo), ms: List(Mem)) -> St {
         match get_gx(flush(s6b)) {
           R(Gx(_, _, ptys, regions, _, _, _), s7) -> match row_count(s7) {
             R(n, s8) -> match get_hx(s8) {
-              R(Hx(rs9, cr9, d9, ops9, effs9, _), s9) -> close_phantoms(set_hx(set_gx(s9, Gx(Nil, Nil, ptys, regions, Nil, Nil, Nil)), Hx(rs9, cr9, d9, ops9, effs9, Nil)), 0, n)
+              R(Hx(rs9, cr9, d9, ops9, effs9, _, mu9), s9) -> close_phantoms(set_hx(set_gx(s9, Gx(Nil, Nil, ptys, regions, Nil, Nil, Nil)), Hx(rs9, cr9, d9, ops9, effs9, Nil, mu9)), 0, n)
             }
           }
         }
@@ -2341,13 +2697,54 @@ fn close_deferred(s: St, ds: List(Deferred), gparams: List(Ty)) -> St {
 fn close_members(s: St, ms: List(Mem)) -> St {
   match ms {
     Nil -> s
-    Cons(Mem(_, ps, amb, _, _), rest) -> close_members(close_residual(s, amb, ps), rest)
+    Cons(Mem(_, ps, amb, _, _, _), rest) -> close_members(close_residual(s, amb, ps), rest)
   }
+}
+fn named_rows(s: St, fns: List(FnInfo), ms: List(Mem)) -> St {
+  match ms {
+    Nil -> s
+    Cons(Mem(i, _, amb, _, _, ar), rest) -> match nth_fn(fns, i) {
+      FnInfo(_, _, _, _, _, _, declared) -> named_rows(match declared {
+        Yes(RowAnn(labels, Yes(v))) -> check_named_row(set_ann_rows(s, ar), amb, labels, v)
+        _ -> s
+      }, fns, rest)
+    }
+  }
+}
+// `check_named_row`: a declared row `{A, B | e}`. A declared label the body
+// never performs is E0423 at it; otherwise the performed row is the declared
+// labels (as performed) and the named variable.
+fn check_named_row(s: St, amb: Int, labels: List(LabelAnn), v: Sp(String)) -> St {
+  match resolve_row(s, ropen(amb)) {
+    R(Row(performed, _), s2) -> match unused_labs(labels, performed) {
+      Cons(Lab(_, a, b), _) -> diag(s2, "E0423", "effect row mismatch", a, b)
+      Nil -> match v {
+        Sp(name, vs, ve) -> match ann_row(s2, name, vs, ve) {
+          R(tail, s3) -> {
+            let m = performed_of(labels, performed, Nil)
+            match labels {
+              Cons(LabelAnn(Sp(_, a, b), _), _) -> surface(unify_row(s3, ropen(amb), Row(m, ROpen(tail)), a, b))
+              Nil -> surface(unify_row(s3, ropen(amb), Row(m, ROpen(tail)), 0, 0))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+fn performed_of(labels: List(LabelAnn), performed: List(Lab), acc: List(Lab)) -> List(Lab) {
+  match labels {
+    Nil -> acc
+    Cons(LabelAnn(Sp(n, _, _), _), rest) -> performed_of(rest, performed, match lab_get(performed, n) { Yes(l) -> put_lab(acc, l)  No -> acc })
+  }
+}
+fn lab_get(ls: List(Lab), n: String) -> Maybe(Lab) {
+  match ls { Nil -> No  Cons(l, rest) -> if lab_name(l) == n { Yes(l) } else { lab_get(rest, n) } }
 }
 fn exact_rows(s: St, fns: List(FnInfo), ms: List(Mem)) -> St {
   match ms {
     Nil -> s
-    Cons(Mem(i, _, amb, _, _), rest) -> match nth_fn(fns, i) {
+    Cons(Mem(i, _, amb, _, _, _), rest) -> match nth_fn(fns, i) {
       FnInfo(name, _, _, _, _, _, declared) -> {
         let s2 = match declared { Yes(RowAnn(labels, No)) -> check_exact_row(s, amb, labels)  _ -> s }
         exact_rows(if name == "main" { check_main_discharge(s2, amb) } else { s2 }, fns, rest)
@@ -2416,7 +2813,7 @@ fn close_phantoms(s: St, v: Int, n: Int) -> St {
 fn schemes_of(s: St, fns: List(FnInfo), ms: List(Mem), env: List(Entry), lines: List(SchemeLine)) -> R(Out) {
   match ms {
     Nil -> R(Out(env, lines), s)
-    Cons(Mem(i, ps, amb, result, _), rest) -> match nth_fn(fns, i) {
+    Cons(Mem(i, ps, amb, result, _, _), rest) -> match nth_fn(fns, i) {
       FnInfo(name, _, _, _, _, _, _) -> match resolve(s, TFn(ps, ropen(amb), result)) {
         R(rt, s2) -> {
           let sc = Scheme(rev(free_vars(rt, Nil)), rev(free_rows(rt, Nil)), rt)
@@ -2462,17 +2859,21 @@ fn name_kind(names: Names, k: Int, v: Int) -> Shown {
 }
 fn name_of(names: Names, v: Int) -> Shown { name_kind(names, 0, v) }
 fn row_name(names: Names, v: Int) -> Shown { name_kind(names, 1, v) }
-// `write_row` without labels: a pure row is not printed.
 // A pure row is invisible; another prints ` / {E, F | e}` (`write_row`).
 fn show_row(rw: Row, names: Names) -> Shown {
   match rw {
     Row(Nil, RClosed) -> Shown("", names)
+    _ -> match write_row(rw, names) { Shown(w, n2) -> Shown(" / " <> w, n2) }
+  }
+}
+fn write_row(rw: Row, names: Names) -> Shown {
+  match rw {
     Row(ls, t) -> {
       let labs = show_labs(ls, "")
       match t {
-        ROpen(v) -> match row_name(names, v) { Shown(n, n2) -> Shown(" / {" <> labs <> (if labs == "" { "" } else { " | " }) <> n <> "}", n2) }
-        RError -> Shown(" / {" <> labs <> " | <error>}", names)
-        _ -> Shown(" / {" <> labs <> "}", names)
+        ROpen(v) -> match row_name(names, v) { Shown(n, n2) -> Shown("{" <> labs <> (if labs == "" { "" } else { " | " }) <> n <> "}", n2) }
+        RError -> Shown("{" <> labs <> " | <error>}", names)
+        _ -> Shown("{" <> labs <> "}", names)
       }
     }
   }
@@ -2484,6 +2885,8 @@ fn show(t: Ty, names: Names) -> Shown {
   match t {
     TVar(v) -> name_of(names, v)
     TB(c) -> Shown(if c == 0 { "Int" } else { if c == 1 { "Float" } else { if c == 2 { "Bool" } else { if c == 3 { "String" } else { "Unit" } } } }, names)
+    // A row argument is its row: `Task({Log | a})`, not its phantom.
+    TFn(Nil, rw, TCon("$Row", Nil)) -> write_row(rw, names)
     TFn(ps, rw, r) -> match show_list(ps, names, "") {
       Shown(p, n2) -> match show_row(rw, n2) {
         Shown(w, n2b) -> match show(r, n2b) { Shown(rs, n3) -> Shown("fn(" <> p <> ")" <> w <> " -> " <> rs, n3) }
@@ -2609,7 +3012,7 @@ fn dump_schemes(ls: List(SchemeLine), b: Buffer) -> Buffer {
 fn dump_diags(ds: List(Diag), b: Buffer) -> Buffer {
   match ds {
     Nil -> b
-    Cons(Diag(code, msg, start, end), rest) -> dump_diags(rest, buffer.push(b, "error " <> code <> " " <> int.to_string(start) <> " " <> int.to_string(end) <> " " <> quoted(msg) <> "\n"))
+    Cons(Diag(kind, code, msg, start, end), rest) -> dump_diags(rest, buffer.push(b, kind <> " " <> code <> " " <> int.to_string(start) <> " " <> int.to_string(end) <> " " <> quoted(msg) <> "\n"))
   }
 }
 
@@ -2619,8 +3022,8 @@ pub fn check_dump(m: Module) -> String {
       let fns = fn_infos(decls, Nil)
       let order = tarjan(all_edges(fns, fns, Nil), len(fns))
       let known = Cons(Arity("Array", 1), known_types(decls, Nil))
-      let st0 = St(array.new(), array.new(), 0, Nil, Nil, Ctx(Nil, known, Nil, Nil), Rows(array.new(), array.new(), array.new()), Gx(Nil, Nil, Nil, Nil, Nil, Nil, Nil), Eqs(Nil, Nil, Nil), Hx(Nil, Nil, 0, Nil, Nil, Nil))
-      let st1 = set_hx(st0, Hx(Nil, Nil, 0, Nil, effect_names(decls, Nil), Nil))
+      let st0 = St(array.new(), array.new(), 0, Nil, Nil, Ctx(Nil, known, Nil, Nil, Nil, decl_kinds(decls)), Rows(array.new(), array.new(), array.new()), Gx(Nil, Nil, Nil, Nil, Nil, Nil, Nil), Eqs(Nil, Nil, Nil), Hx(Nil, Nil, 0, Nil, Nil, Nil, Nil))
+      let st1 = set_hx(st0, Hx(Nil, Nil, 0, Nil, effect_names(decls, Nil), Nil, multi_names(decls, Nil)))
       let declared = match type_decls(st1, decls, Nil) { R(env0, s0) -> R(env0, effect_decls(s0, decls)) }
       match match declared { R(env0, s0) -> groups(s0, fns, order, env0, Nil) } {
         R(lines, s) -> match s {

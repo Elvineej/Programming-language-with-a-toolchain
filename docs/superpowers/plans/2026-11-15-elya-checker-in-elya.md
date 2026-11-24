@@ -100,8 +100,32 @@ Spec: `docs/superpowers/specs/2026-11-15-elya-checker-in-elya-design.md`.
        it tried. The classifier's `Op` rule was dropped: a written `Op` is
        an ordinary name in Rust (`$Op` is internal), so F2b's focused #12
        is compared again.
-     - F4b: `multi` (E0426, E0427), `with any` and `op.*`, parametric
-       effects, named row variables, rows as type arguments.
+     - F4b (**built** 2026-11-23; the classifier's stage 5, stage 4's
+       remainder split in two by measuring: 27 corpus programs here, 65 in
+       F4c): `with multi` (E0427 over a one-shot effect, the warning E0426
+       when the body performs `IO`; diagnostics gained their kind), named
+       row variables (one row per function, kept from a `let`'s
+       quantifying, a declared row ending in one checked at Rust's step
+       2.48 with its member's names, E0432 and E0400 where a name first
+       appears), and row parameters of declared types (their kinds by
+       Rust's fixpoint, a row argument as its phantom `fn() / R -> $Row`,
+       printed as its row; E0400 either way round, E0432 for an undeclared
+       row variable). 27 corpus programs and 32 focused ones agree, in the
+       evaluator and natively, all at the first run; controls K29-K43 in
+       the test's header (three survived the corpus and got focused
+       programs; K41 cannot be caught, and the header says why). Review
+       (21,104 handwritten and random stage-5 programs agree; no classifier
+       hole; the port read against Rust): no defect; of its 74 mutants, 21
+       survived and are now pinned by 20 focused programs, 16 argued
+       equivalent. It found two quirks in Rust, kept by the port and left
+       for a decision: step 2.48 checks a declared row's name against the
+       annotation variables of the group's last member, not its own
+       (`fn a(x: e) / {e} -> Int` reports E0400 or not by declaration
+       order); and `{io}` is a row variable, since only its first letter
+       is capitalized before the comparison with `IO`.
+     - F4c (the classifier's stage 6): parametric effects (labels with
+       arguments, `unify_effect_args`, `settle_duplicates`), `with any` and
+       `op.*` (E0434).
    - F5: duplicability (the marks on type variables, E0428, E0429, E0437),
      `linear` types, `Buffer` and `Array`, and the borrow facts (E0438,
      E0439). These read 4e's facts, so F5 waits for 4e.

@@ -4,8 +4,9 @@
 //! F2a (declared types, constructors, `match`, the pure builtins,
 //! annotations naming types and type variables), F2b (higher order:
 //! lambdas, functions as values, function types, with effect rows' tails)
-//! and F4a (effects: rows with labels, performs, handlers, `resume`, the
-//! host's builtins, declared rows, `main`'s discharge).
+//! F4a (effects: rows with labels, performs, handlers, `resume`, the
+//! host's builtins, declared rows, `main`'s discharge) and F4b (`with
+//! multi`, named row variables, row parameters of declared types).
 //!
 //! Negative controls, each run, reverted and compared byte for byte:
 //! K1, every scheme left unquantified: fails on `scheme id fn(a) -> a`
@@ -61,6 +62,31 @@
 //! killed: `flush` never ends), M30 (no flush before closing the return
 //! clause's row), M37 (an inclusion's label keeping its own span, not the
 //! call's).
+//! F4b's, each failing on the first program named:
+//! K29, `with multi` over a one-shot effect accepted:
+//! tests/ui/multi_on_oneshot.elya.
+//! K30, no E0426 warning: tests/effect_types.rs.
+//! K31, E0426 whatever the body performs: examples/07_search.elya.
+//! K32, a named row fresh at each mention: tests/row_variables.rs.
+//! K33, a row variable spelled like an effect accepted: focused F4b #9.
+//! K34, the kinds in one pass (no fixpoint): focused F4b #19.
+//! K35, a declared row's unused label not reported: focused F4b #7.
+//! K36, a `let` quantifying the named rows: survived; focused F4b #27.
+//! K37, the named rows checked after the residuals close:
+//! tests/row_variables.rs.
+//! K38, a row argument printed as its phantom function type:
+//! tests/row_parameters.rs.
+//! K39, an undeclared row variable in a declaration's argument reported as
+//! E0400: survived; focused F4b #29.
+//! K40, the body's named rows not kept for the declared row: survived;
+//! focused F4b #30.
+//! K42, a row parameter's argument a type variable: focused F4b #15.
+//! K43, a type and a row of one name accepted where a type goes: focused
+//! F4b #11.
+//! One survives and cannot be caught: K41 (the declared row's labels at
+//! their written spans, not the performed ones'), since every label of that
+//! row is already in the performed row, so unifying never moves one into a
+//! tail, and a label's span is read only from a row it was moved into.
 
 #[path = "support/selfhost_parse.rs"]
 mod parse_support;
@@ -71,7 +97,7 @@ use elya::eval::{Host, World};
 use std::path::Path;
 
 /// The stages `selfhost/check.elya` covers.
-const BUILT: u8 = 4;
+const BUILT: u8 = 5;
 
 #[test]
 fn the_checker_in_elya_agrees_on_its_stages() {
@@ -86,7 +112,7 @@ fn the_checker_in_elya_agrees_on_its_stages() {
     );
     let corpus = parse_support::corpus(Path::new(env!("CARGO_MANIFEST_DIR")));
     let scratch = parse_support::Scratch::new("checker");
-    let mut counts = [0usize; 8];
+    let mut counts = [0usize; 9];
     let mut compared = 0;
     let focused = support::FOCUSED_F1
         .iter()
@@ -109,6 +135,12 @@ fn the_checker_in_elya_agrees_on_its_stages() {
                 .iter()
                 .enumerate()
                 .map(|(i, t)| (format!("focused F4a #{i}"), t.to_string())),
+        )
+        .chain(
+            support::FOCUSED_F4B
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (format!("focused F4b #{i}"), t.to_string())),
         );
     let cases = corpus
         .cases
@@ -138,16 +170,17 @@ fn the_checker_in_elya_agrees_on_its_stages() {
         compared += 1;
     }
     println!(
-        "compared {compared}; resolved cleanly by stage 1..7: {:?}",
+        "compared {compared}; resolved cleanly by stage 1..8: {:?}",
         &counts[1..]
     );
     assert!(
         compared
-            >= 340
+            >= 365
                 + support::FOCUSED_F1.len()
                 + support::FOCUSED_F2A.len()
                 + support::FOCUSED_F2B.len()
-                + support::FOCUSED_F4A.len(),
-        "F1 to F4a: at least 340 corpus programs, and the focused sets"
+                + support::FOCUSED_F4A.len()
+                + support::FOCUSED_F4B.len(),
+        "F1 to F4b: at least 365 corpus programs, and the focused sets"
     );
 }
