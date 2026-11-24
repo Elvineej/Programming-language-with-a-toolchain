@@ -7,8 +7,8 @@
 //! F4a (effects: rows with labels, performs, handlers, `resume`, the
 //! host's builtins, declared rows, `main`'s discharge), F4b (`with
 //! multi`, named row variables, row parameters of declared types), F4c
-//! (parametric effects: labels with arguments) and F4d (`with any`,
-//! `op.*`).
+//! (parametric effects: labels with arguments), F4d (`with any`, `op.*`)
+//! and F5 (duplicability: `linear` types, `Buffer`, `Array`, borrows).
 //!
 //! Negative controls, each run, reverted and compared byte for byte:
 //! K1, every scheme left unquantified: fails on `scheme id fn(a) -> a`
@@ -166,6 +166,31 @@
 //! its block too (Rust walks each scope's open entries): focused F4d #40;
 //! K83, a settled chain not compressed, so its duplicate was reported again
 //! where the next row met it: focused F4d #41.
+//! F5's:
+//! K84, binding a duplicable variable not checked:
+//! tests/ui/affine_through_generic.elya.
+//! K85, a binding used many times not checked: tests/ui/affine_double_use.elya.
+//! K86, a read after the binding was given away not checked: tests/array.rs.
+//! K87, a `borrow` parameter given away not checked: tests/array.rs.
+//! K88, a borrowing function as a value not checked: focused F5 #10.
+//! K89, a `multi` point not requiring what it holds:
+//! tests/ui/affine_multi_capture.elya.
+//! K90, a point's open tail not holding: focused F5 #13.
+//! K91, a row's holds dropped when it is bound: focused F5 #13.
+//! K92, an instantiation not copying duplicable marks:
+//! tests/ui/affine_through_generic.elya.
+//! K93, an instantiation not copying holds: focused F5 #13.
+//! K94, a `let` quantifying what a row holds (the review's U-B): survived;
+//! focused F5 #31.
+//! K95, an array's element not required duplicable: tests/array.rs.
+//! K96, a declared type holding a linear one duplicable: focused F5 #17.
+//! K97, a function type not known duplicable: survived; focused F5 #35.
+//! K98, the affine diagnostics shown beside other errors: focused F5 #15.
+//! K99, a use blamed more than once: survived; focused F5 #32.
+//! K100, a generalized `let`'s quantified variables marked: survived;
+//! focused F5 #33.
+//! K101, a handle's resumes not points: survived; focused F5 #34.
+//! K102, `Buffer` not a type name: selfhost/lex.elya.
 
 #[path = "support/selfhost_parse.rs"]
 mod parse_support;
@@ -232,6 +257,12 @@ fn the_checker_in_elya_agrees_on_its_stages() {
                 .iter()
                 .enumerate()
                 .map(|(i, t)| (format!("focused F4d #{i}"), t.to_string())),
+        )
+        .chain(
+            support::FOCUSED_F5
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (format!("focused F5 #{i}"), t.to_string())),
         );
     let cases = corpus
         .cases
@@ -266,14 +297,15 @@ fn the_checker_in_elya_agrees_on_its_stages() {
     );
     assert!(
         compared
-            >= 420
+            >= 450
                 + support::FOCUSED_F1.len()
                 + support::FOCUSED_F2A.len()
                 + support::FOCUSED_F2B.len()
                 + support::FOCUSED_F4A.len()
                 + support::FOCUSED_F4B.len()
                 + support::FOCUSED_F4C.len()
-                + support::FOCUSED_F4D.len(),
-        "F1 to F4d: at least 420 corpus programs, and the focused sets"
+                + support::FOCUSED_F4D.len()
+                + support::FOCUSED_F5.len(),
+        "F1 to F5: at least 450 corpus programs, and the focused sets"
     );
 }

@@ -4368,6 +4368,9 @@ fn dump_schemes(ls: List(SchemeLine), b: Buffer) -> Buffer {
     Cons(SchemeLine(n, sc), rest) -> dump_schemes(rest, buffer.push(b, "scheme " <> n <> " " <> sc <> "\n"))
   }
 }
+fn any_error(ds: List(Diag)) -> Bool {
+  match ds { Nil -> False  Cons(Diag(k, _, _, _, _), rest) -> k == "error" || any_error(rest) }
+}
 fn dump_diags(ds: List(Diag), b: Buffer) -> Buffer {
   match ds {
     Nil -> b
@@ -4388,8 +4391,9 @@ pub fn check_dump(m: Module, size: Int) -> String {
       match match declared { R(env0, s0) -> groups(s0, fns, order, env0, Nil) } {
         R(lines, s) -> match s {
           St(sub, lv, cur, ds0, rs, cx, rw, gx, eq, hx) -> {
-            // D7: the affine diagnostics after the others.
-            let ds = match hx { Hx(_, _, _, _, _, _, _, _, Af(_, _, _, _, _, ad, _)) -> append(ad, ds0) }
+            // D7: the affine diagnostics after the others, and only when
+            // there is no other error (`with_affine`).
+            let ds = match hx { Hx(_, _, _, _, _, _, _, _, Af(_, _, _, _, _, ad, _)) -> if any_error(ds0) { ds0 } else { append(ad, ds0) } }
             let b1 = dump_schemes(sort_by(rev(lines), line_le), buffer.new())
             let recs = last_per_span(sort_by(rs, rec_le), 0 - 1, 0 - 1, Nil)
             match dump_types(St(sub, lv, cur, Nil, Nil, cx, rw, gx, eq, hx), recs, b1) {

@@ -392,6 +392,54 @@ pub const FOCUSED_F4D: &[&str] = &[
     "effect Bx(t) { fn bx(x: t) -> Unit }\nfn f() { bx(1)\n handle { bx(True) } with any { op(p) -> op.perform(p) }\n io.println(\"x\") }\npub fn main() -> Int { 0 }\n",
 ];
 
+/// Stage F5's focused programs: duplicability (spec
+/// 2026-11-06-elya-affine-across-functions). A `linear` type, `Buffer` or
+/// `Array` used twice (E0428), held across a `multi` perform or a call whose
+/// row may take one (E0429, through a row's holds), reaching a generic
+/// function (E0437), an array's element (E0437), read after it was given
+/// away (E0438), a `borrow` parameter given away or a borrowing function as
+/// a value (E0439); the affine diagnostics reported only without others.
+pub const FOCUSED_F5: &[&str] = &[
+    "fn f() { let b = buffer.new()\n let c = buffer.push(b, \"a\")\n let d = buffer.push(b, \"b\")\n buffer.finish(d) }\npub fn main() -> Int { 0 }\n",
+    "linear type Tok { Tok(Int) }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn f() { let t = Tok(1)\n use(t) + use(t) }\npub fn main() -> Int { 0 }\n",
+    "linear type Tok { Tok(Int) }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn f() { let t = Tok(1)\n let g = fn() { use(t) }\n g() + g() }\npub fn main() -> Int { 0 }\n",
+    "fn twice(x) { let a = x\n let b = x\n a }\nfn f() { twice(buffer.new()) }\npub fn main() -> Int { 0 }\n",
+    "fn twice(x) { let a = x\n let b = x\n a }\nfn f() { twice(1) }\npub fn main() -> Int { 0 }\n",
+    "fn f() { let xs = array.new()\n let ys = array.push(xs, buffer.new())\n 0 }\npub fn main() -> Int { 0 }\n",
+    "fn f() { let xs = array.push(array.new(), 1)\n let n = array.get(xs, 0)\n let ys = array.set(xs, 0, 2)\n array.length(ys) + n }\npub fn main() -> Int { 0 }\n",
+    "fn len(borrow xs: Array(Int)) -> Int { array.length(xs) }\nfn f() { let xs = array.push(array.new(), 1)\n let n = len(xs)\n let ys = array.push(xs, 2)\n n + len(ys) }\npub fn main() -> Int { 0 }\n",
+    "fn len(borrow xs: Array(Int)) -> Int { array.length(xs) }\nfn f() { let xs = array.push(array.new(), 1)\n let ys = array.push(xs, 2)\n len(xs) }\npub fn main() -> Int { 0 }\n",
+    "fn bad(borrow xs: Array(Int)) -> Array(Int) { xs }\npub fn main() -> Int { 0 }\n",
+    "fn len(borrow xs: Array(Int)) -> Int { array.length(xs) }\nfn f() { let g = len\n 0 }\npub fn main() -> Int { 0 }\n",
+    "effect multi Amb { fn flip() -> Bool }\nfn f() { let b = buffer.new()\n let x = flip()\n buffer.finish(b) }\npub fn main() -> Int { 0 }\n",
+    "effect multi Amb { fn flip() -> Bool }\nfn call(k) { k() }\nfn f() { let b = buffer.new()\n let x = call(fn() { flip() })\n buffer.finish(b) }\npub fn main() -> Int { 0 }\n",
+    "effect multi Amb { fn flip() -> Bool }\nfn g(k) { let b = buffer.new()\n let x = k()\n buffer.finish(b) }\nfn f() { g(fn() { flip() }) }\npub fn main() -> Int { 0 }\n",
+    "effect multi Amb { fn flip() -> Bool }\nfn g(k, v) { let x = k()\n v }\nfn f() { g(fn() { flip() }, buffer.new()) }\npub fn main() -> Int { 0 }\n",
+    "effect Put { fn put(b: Buffer) -> Unit }\nfn f() { handle { put(buffer.new()) } with any { op(o) -> resume(op.decode(o, \"\")) } }\npub fn main() -> Int { 0 }\n",
+    "effect Put { fn put(b: Buffer) -> Unit }\nfn h(body) { handle { body() } with any { op(o) -> resume(op.decode(o, \"\")) } }\nfn f() { h(fn() { put(buffer.new()) }) }\npub fn main() -> Int { 0 }\n",
+    "linear type Tok { Tok(Int) }\ntype Box { Box(Tok) }\nfn f(b: Box) { let x = b\n let y = b\n 0 }\npub fn main() -> Int { 0 }\n",
+    "effect Ask { fn ask() -> Int }\nlinear type Tok { Tok(Int) }\nfn f() { handle { ask() } with { ask() -> { let t = Tok(1)\n resume(1) } } }\nfn g(t: Tok) { handle { ask() } with { ask() -> { let u = t\n resume(1) } } }\npub fn main() -> Int { 0 }\n",
+    "fn f() { let b = buffer.new()\n let k = fn(x) { x }\n let c = k(b)\n let d = k(c)\n buffer.finish(d) }\npub fn main() -> Int { 0 }\n",
+    "fn id(x) { x }\nfn f() { let i = id\n let b = buffer.new()\n let c = i(b)\n buffer.finish(c) }\npub fn main() -> Int { 0 }\n",
+    "fn f(b: Buffer) -> String { match True { True -> buffer.finish(b)  False -> buffer.finish(b) } }\npub fn main() -> Int { 0 }\n",
+    "fn f(b: Buffer) -> Bool { b == b }\npub fn main() -> Int { 0 }\n",
+    "fn f(b: Buffer(Int)) -> Int { 0 }\nfn g(xs: Array(Buffer)) -> Int { 0 }\npub fn main() -> Int { 0 }\n",
+    "effect multi Amb { fn flip() -> Bool }\nfn h() { handle { let b = buffer.new()\n let x = flip()\n buffer.finish(b) } with multi { flip() -> resume(True) } }\npub fn main() -> Int { 0 }\n",
+    "fn get2(borrow xs: Array(Int), i: Int) -> Int { array.get(xs, i) }\nfn f() { let xs = array.push(array.new(), 1)\n get2(xs, 0) + get2(xs, 0) }\npub fn main() -> Int { 0 }\n",
+    "fn rd(borrow xs: Array(Int)) -> Int { array.length(xs) }\nfn twice_read(xs) { let a = rd(xs)\n let ys = array.push(xs, 1)\n a + rd(xs) }\nfn f() { twice_read(array.new()) }\npub fn main() -> Int { 0 }\n",
+    "fn keep(borrow b: Buffer) -> Int { let c = b\n 0 }\npub fn main() -> Int { 0 }\n",
+    "effect multi Amb { fn flip() -> Bool }\nfn f(k) { let b = buffer.new()\n let g = fn() { let x = k()\n buffer.finish(b) }\n g }\nfn h() { let g = f(fn() { flip() })\n g() }\npub fn main() -> Int { 0 }\n",
+    "linear type Tok { Tok(Int) }\nfn f(t: Tok) { match t { Tok(n) -> n + n } }\nfn g(t: Tok) { let k = fn() { t }\n k }\npub fn main() -> Int { 0 }\n",
+    "fn f() { let xs = array.new()\n let ys = array.push(xs, fn() { 1 })\n 0 }\npub fn main() -> Int { 0 }\n",
+    // Written for controls K94, K99, K100, K101 and K97, which survived the
+    // rest.
+    "linear type File { File(Int) }\nfn read(f: File) -> Int { match f { File(n) -> n } }\neffect multi Flip { fn flip() -> Bool }\nfn coin() / {Flip} -> Bool { flip() }\nfn outer(g) {\n  let keep = fn(x) {\n    let _ = g()\n    x\n  }\n  read(keep(File(1)))\n}\npub fn main() -> Int {\n  handle { outer(coin) } with multi { Flip.flip() -> resume(True) + resume(False) }\n}\n",
+    "linear type File { File(Int) }\nfn read(f: File) -> Int { match f { File(n) -> n } }\ntype P(a, b) { P(a, b) }\nfn f(x: P(File, File)) -> Int { let a = x\n let b = x\n 0 }\npub fn main() -> Int { 0 }\n",
+    "linear type File { File(Int) }\nfn read(f: File) -> Int { match f { File(n) -> n } }\ntype L(a) { N, C(a, L(a)) }\nfn f() -> Int { let n = N\n let x = C(File(1), n)\n let y = n\n 0 }\npub fn main() -> Int { 0 }\n",
+    "linear type File { File(Int) }\nfn read(f: File) -> Int { match f { File(n) -> n } }\neffect multi Flip { fn flip() -> Bool }\neffect Ask { fn ask() -> Int }\nfn h() -> Int { handle { ask() + if flip() { 1 } else { 2 } } with { Ask.ask() -> { let f = File(2)\n let a = resume(1)\n a + read(f) } } }\npub fn main() -> Int { 0 }\n",
+    "effect multi Flip { fn flip() -> Bool }\nfn outer(g) {\n  let keep = fn(x) {\n    let w = x(1)\n    let _ = g()\n    x(2)\n  }\n  let a = keep(fn(n) { n })\n  let b = keep(fn(n) { True })\n  0\n}\npub fn main() -> Int { 0 }\n",
+];
+
 /// The checker's imports: the parser in Elya, its lexer, and the affine pass
 /// (its facts, from stage F5).
 pub fn reader(name: &str) -> Option<(String, String)> {
