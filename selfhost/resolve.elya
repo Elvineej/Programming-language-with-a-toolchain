@@ -1,0 +1,1159 @@
+// Modules and name resolution in Elya, self-hosting part 4c (spec
+// docs/superpowers/specs/2026-11-15-elya-resolution-in-elya-design.md).
+// Oracle: `elya resolve --dump`, `elya::resolved` (src/modules.rs `load`,
+// then src/resolve.rs `check` with the R3 filter) printed by
+// `ast_dump::dump` over `elya::merged_text`, then `dump_diagnostics`.
+// io.arg(0) is the root file, io.arg(1) the standard modules' directory
+// (src/std); a user import `a/b` is the file `a/b.elya` next to the root.
+import parse / {IO}
+import elya/map
+
+// ---- Builtin tables (D3): twins of src/resolve.rs and src/modules.rs ----
+
+// `resolve::builtins()`.
+fn builtin_names() -> List(String) {
+  Cons("io.println", Cons("io.read_file", Cons("io.file_exists", Cons("io.write_file",
+  Cons("io.read_stdin", Cons("io.arg_count", Cons("io.arg",
+  Cons("buffer.new", Cons("buffer.push", Cons("buffer.finish", Cons("buffer.length",
+  Cons("array.new", Cons("array.push", Cons("array.set", Cons("array.get", Cons("array.length",
+  Cons("int.to_string", Cons("float.to_string", Cons("float.of_int", Cons("float.truncate", Cons("float.round",
+  Cons("string.length", Cons("string.byte_at", Cons("string.slice",
+  Cons("int.wrapping_add", Cons("int.wrapping_sub", Cons("int.wrapping_mul",
+  Cons("int.and", Cons("int.or", Cons("int.xor", Cons("int.shl", Cons("int.shr", Cons("int.ushr",
+  Cons("time.now_ms", Cons("time.sleep_ms",
+  Cons("op.name", Cons("op.show", Cons("op.perform", Cons("op.encode", Cons("op.decode",
+  Nil))))))))))))))))))))))))))))))))))))))))
+}
+// `resolve::INT_BINARY_BUILTINS`.
+fn int_binary_builtins() -> List(String) {
+  Cons("wrapping_add", Cons("wrapping_sub", Cons("wrapping_mul", Cons("and", Cons("or",
+  Cons("xor", Cons("shl", Cons("shr", Cons("ushr", Nil)))))))))
+}
+// `resolve::FLOAT_CONVERSIONS`.
+fn float_conversions() -> List(String) { Cons("of_int", Cons("truncate", Cons("round", Nil))) }
+// `resolve::STRING_BUILTINS`.
+fn string_builtins() -> List(String) { Cons("length", Cons("byte_at", Cons("slice", Nil))) }
+// `resolve::BUFFER_BUILTINS`.
+fn buffer_builtins() -> List(String) { Cons("new", Cons("push", Cons("finish", Cons("length", Nil)))) }
+// `resolve::ARRAY_BUILTINS`.
+fn array_builtins() -> List(String) { Cons("new", Cons("push", Cons("set", Cons("get", Cons("length", Nil))))) }
+// `resolve::IO_BUILTINS`.
+fn io_builtins() -> List(String) {
+  Cons("read_file", Cons("file_exists", Cons("write_file", Cons("read_stdin", Cons("arg_count", Cons("arg", Nil))))))
+}
+// `modules::BUILTIN_MODULES`.
+fn builtin_modules() -> List(String) {
+  Cons("io", Cons("int", Cons("float", Cons("string", Cons("time", Cons("op", Nil))))))
+}
+// The paths of `modules::STD_SOURCES`: `elya/<name>` is the file
+// `<name>.elya` in the standard modules' directory.
+fn std_modules() -> List(String) {
+  Cons("elya/replay", Cons("elya/console", Cons("elya/clock", Cons("elya/host", Cons("elya/files",
+  Cons("elya/async", Cons("elya/async_host", Cons("elya/map", Nil))))))))
+}
+
+// ---- Lists and strings --------------------------------------------------
+
+fn reverse_into(xs: List(a), acc: List(a)) -> List(a) {
+  match xs { Nil -> acc Cons(x, rest) -> reverse_into(rest, Cons(x, acc)) }
+}
+fn rev(xs: List(a)) -> List(a) { reverse_into(xs, Nil) }
+fn count_from(xs: List(a), n: Int) -> Int {
+  match xs { Nil -> n Cons(_, rest) -> count_from(rest, n + 1) }
+}
+fn count(xs: List(a)) -> Int { count_from(xs, 0) }
+fn sp_start(x: Sp(a)) -> Int { match x { Sp(_, start, _) -> start } }
+fn sp_end(x: Sp(a)) -> Int { match x { Sp(_, _, end) -> end } }
+
+fn has_str(xs: List(String), x: String) -> Bool {
+  match xs { Nil -> False Cons(y, rest) -> y == x || has_str(rest, x) }
+}
+fn has_in_scopes(xs: List(List(String)), x: String) -> Bool {
+  match xs { Nil -> False Cons(s, rest) -> has_str(s, x) || has_in_scopes(rest, x) }
+}
+fn nth_str(xs: List(String), i: Int) -> String {
+  match xs { Nil -> "" Cons(x, rest) -> if i == 0 { x } else { nth_str(rest, i - 1) } }
+}
+fn index_of(xs: List(String), x: String, i: Int) -> Int {
+  match xs { Nil -> -1 Cons(y, rest) -> if y == x { i } else { index_of(rest, x, i + 1) } }
+}
+fn last_str(xs: List(String), d: String) -> String {
+  match xs { Nil -> d Cons(x, rest) -> last_str(rest, x) }
+}
+fn join_loop(xs: List(String), sep: String, acc: String) -> String {
+  match xs { Nil -> acc Cons(x, rest) -> join_loop(rest, sep, acc <> sep <> x) }
+}
+fn join(xs: List(String), sep: String) -> String {
+  match xs { Nil -> "" Cons(x, rest) -> join_loop(rest, sep, x) }
+}
+fn ticked(xs: List(String)) -> List(String) {
+  match xs { Nil -> Nil Cons(x, rest) -> Cons("`" <> x <> "`", ticked(rest)) }
+}
+fn drop_until(xs: List(String), x: String) -> List(String) {
+  match xs { Nil -> Nil Cons(y, rest) -> if y == x { xs } else { drop_until(rest, x) } }
+}
+fn its(n: Int) -> String { int.to_string(n) }
+fn is_upper(name: String) -> Bool {
+  string.length(name) > 0 && string.byte_at(name, 0) >= 65 && string.byte_at(name, 0) <= 90
+}
+// `path.replace('/', ".")`.
+fn dotted(path: String, i: Int, from: Int, acc: String) -> String {
+  if i >= string.length(path) { acc <> string.slice(path, from, i) } else {
+    if string.byte_at(path, i) == 47 { dotted(path, i + 1, i + 1, acc <> string.slice(path, from, i) <> ".") }
+    else { dotted(path, i + 1, from, acc) }
+  }
+}
+// `modules::mangle`.
+fn mangle(path: String, f: String) -> String { dotted(path, 0, 0, "") <> "." <> f }
+// The last index of `/` or `\`, or -1.
+fn last_slash(s: String, i: Int, found: Int) -> Int {
+  if i >= string.length(s) { found } else {
+    let c = string.byte_at(s, i)
+    last_slash(s, i + 1, if c == 47 || c == 92 { i } else { found })
+  }
+}
+fn last_fwd_slash(s: String, i: Int, found: Int) -> Int {
+  if i >= string.length(s) { found } else {
+    last_fwd_slash(s, i + 1, if string.byte_at(s, i) == 47 { i } else { found })
+  }
+}
+// `modules::root_path`: the file's stem, or "" without the extension.
+fn root_path(name: String) -> String {
+  let file = string.slice(name, last_slash(name, 0, -1) + 1, string.length(name))
+  let n = string.length(file)
+  if n >= 5 && string.slice(file, n - 5, n) == ".elya" { string.slice(file, 0, n - 5) } else { "" }
+}
+// The CLI's reader: `Path::new(program).parent()`, joined with the module.
+fn root_dir(name: String) -> String {
+  let i = last_fwd_slash(name, 0, -1)
+  if i < 0 { "" } else { if i == 0 { "/" } else { string.slice(name, 0, i) } }
+}
+fn in_dir(dir: String, file: String) -> String {
+  if dir == "" { file } else {
+    if string.byte_at(dir, string.length(dir) - 1) == 47 { dir <> file } else { dir <> "/" <> file }
+  }
+}
+
+// ---- Shifting a file's tree to its base in the program ------------------
+
+fn sh_names(xs: List(Sp(String)), d: Int) -> List(Sp(String)) {
+  match xs { Nil -> Nil Cons(Sp(n, a, b), rest) -> Cons(Sp(n, a + d, b + d), sh_names(rest, d)) }
+}
+fn sh_imports(xs: List(Sp(Import)), d: Int) -> List(Sp(Import)) {
+  match xs {
+    Nil -> Nil
+    Cons(Sp(Import(path, alias, effs), a, b), rest) -> {
+      let effs = match effs { No -> No Yes(es) -> Yes(sh_names(es, d)) }
+      Cons(Sp(Import(path, alias, effs), a + d, b + d), sh_imports(rest, d))
+    }
+  }
+}
+fn sh_ty(t: Sp(TypeAnn), d: Int) -> Sp(TypeAnn) {
+  match t { Sp(TypeAnn(n, args, row), a, b) -> Sp(TypeAnn(n, sh_tys(args, d), sh_mrow(row, d)), a + d, b + d) }
+}
+fn sh_tys(xs: List(Sp(TypeAnn)), d: Int) -> List(Sp(TypeAnn)) {
+  match xs { Nil -> Nil Cons(t, rest) -> Cons(sh_ty(t, d), sh_tys(rest, d)) }
+}
+fn sh_mty(t: Maybe(Sp(TypeAnn)), d: Int) -> Maybe(Sp(TypeAnn)) {
+  match t { No -> No Yes(t) -> Yes(sh_ty(t, d)) }
+}
+fn sh_row(r: RowAnn, d: Int) -> RowAnn {
+  match r {
+    RowAnn(labels, tail) -> {
+      let tail = match tail { No -> No Yes(Sp(n, a, b)) -> Yes(Sp(n, a + d, b + d)) }
+      RowAnn(sh_labels(labels, d), tail)
+    }
+  }
+}
+fn sh_mrow(r: Maybe(RowAnn), d: Int) -> Maybe(RowAnn) {
+  match r { No -> No Yes(r) -> Yes(sh_row(r, d)) }
+}
+fn sh_labels(xs: List(LabelAnn), d: Int) -> List(LabelAnn) {
+  match xs {
+    Nil -> Nil
+    Cons(LabelAnn(Sp(n, a, b), args), rest) -> {
+      let args = match args { No -> No Yes(ts) -> Yes(sh_tys(ts, d)) }
+      Cons(LabelAnn(Sp(n, a + d, b + d), args), sh_labels(rest, d))
+    }
+  }
+}
+fn sh_params(xs: List(Sp(Param)), d: Int) -> List(Sp(Param)) {
+  match xs {
+    Nil -> Nil
+    Cons(Sp(Param(n, ann, bw), a, b), rest) -> Cons(Sp(Param(n, sh_mty(ann, d), bw), a + d, b + d), sh_params(rest, d))
+  }
+}
+fn sh_ops(xs: List(Sp(OpSig)), d: Int) -> List(Sp(OpSig)) {
+  match xs {
+    Nil -> Nil
+    Cons(Sp(OpSig(n, ps, tys, ret), a, b), rest) -> Cons(Sp(OpSig(n, sh_params(ps, d), sh_tys(tys, d), sh_ty(ret, d)), a + d, b + d), sh_ops(rest, d))
+  }
+}
+fn sh_variants(xs: List(Sp(VariantDecl)), d: Int) -> List(Sp(VariantDecl)) {
+  match xs {
+    Nil -> Nil
+    Cons(Sp(VariantDecl(n, fs), a, b), rest) -> Cons(Sp(VariantDecl(n, sh_tys(fs, d)), a + d, b + d), sh_variants(rest, d))
+  }
+}
+fn sh_decls(xs: List(Sp(Decl)), d: Int) -> List(Sp(Decl)) {
+  match xs {
+    Nil -> Nil
+    Cons(Sp(decl, a, b), rest) -> {
+      let decl = match decl {
+        DFn(p, n, ps, row, ret, body) -> DFn(p, n, sh_params(ps, d), sh_mrow(row, d), sh_mty(ret, d), sh_block(body, d))
+        DEffect(n, ps, m, ops) -> DEffect(n, ps, m, sh_ops(ops, d))
+        DType(n, ps, l, vs) -> DType(n, ps, l, sh_variants(vs, d))
+      }
+      Cons(Sp(decl, a + d, b + d), sh_decls(rest, d))
+    }
+  }
+}
+fn sh_block_node(b: Block, d: Int) -> Block {
+  match b {
+    Block(stmts, tail) -> Block(sh_stmts(stmts, d), match tail { No -> No Yes(t) -> Yes(sh_expr(t, d)) })
+  }
+}
+fn sh_block(b: Sp(Block), d: Int) -> Sp(Block) {
+  match b { Sp(node, x, y) -> Sp(sh_block_node(node, d), x + d, y + d) }
+}
+fn sh_stmts(xs: List(Sp(Stmt)), d: Int) -> List(Sp(Stmt)) {
+  match xs {
+    Nil -> Nil
+    Cons(Sp(st, a, b), rest) -> {
+      let st = match st { SLet(n, ann, v) -> SLet(n, sh_mty(ann, d), sh_expr(v, d)) SExpr(e) -> SExpr(sh_expr(e, d)) }
+      Cons(Sp(st, a + d, b + d), sh_stmts(rest, d))
+    }
+  }
+}
+fn sh_pattern(p: Sp(Pattern), d: Int) -> Sp(Pattern) {
+  match p {
+    Sp(pat, a, b) -> {
+      let pat = match pat { PCtor(n, args) -> PCtor(n, sh_patterns(args, d)) _ -> pat }
+      Sp(pat, a + d, b + d)
+    }
+  }
+}
+fn sh_patterns(xs: List(Sp(Pattern)), d: Int) -> List(Sp(Pattern)) {
+  match xs { Nil -> Nil Cons(p, rest) -> Cons(sh_pattern(p, d), sh_patterns(rest, d)) }
+}
+fn sh_exprs(xs: List(Sp(Expr)), d: Int) -> List(Sp(Expr)) {
+  match xs { Nil -> Nil Cons(e, rest) -> Cons(sh_expr(e, d), sh_exprs(rest, d)) }
+}
+fn sh_clauses(xs: List(Sp(OpClause)), d: Int) -> List(Sp(OpClause)) {
+  match xs {
+    Nil -> Nil
+    Cons(Sp(OpClause(q, op, ps, body), a, b), rest) -> Cons(Sp(OpClause(q, op, sh_params(ps, d), sh_expr(body, d)), a + d, b + d), sh_clauses(rest, d))
+  }
+}
+fn sh_arms(xs: List(Sp(MatchArm)), d: Int) -> List(Sp(MatchArm)) {
+  match xs {
+    Nil -> Nil
+    Cons(Sp(MatchArm(p, body), a, b), rest) -> Cons(Sp(MatchArm(sh_pattern(p, d), sh_expr(body, d)), a + d, b + d), sh_arms(rest, d))
+  }
+}
+fn sh_expr(e: Sp(Expr), d: Int) -> Sp(Expr) {
+  match e {
+    Sp(x, a, b) -> {
+      let x = match x {
+        ECall(c, args) -> ECall(sh_expr(c, d), sh_exprs(args, d))
+        EUnary(op, v) -> EUnary(op, sh_expr(v, d))
+        EBinary(op, l, r) -> EBinary(op, sh_expr(l, d), sh_expr(r, d))
+        EIf(c, t, f) -> EIf(sh_expr(c, d), sh_block(t, d), sh_block(f, d))
+        EBlock(blk) -> EBlock(sh_block_node(blk, d))
+        EHandle(body, Handler(m, any, cs, ret)) -> {
+          let ret = match ret { No -> No Yes(ReturnClause(binder, v)) -> Yes(ReturnClause(binder, sh_expr(v, d))) }
+          EHandle(sh_expr(body, d), Handler(m, any, sh_clauses(cs, d), ret))
+        }
+        EResume(v) -> EResume(sh_expr(v, d))
+        EMatch(s, arms) -> EMatch(sh_expr(s, d), sh_arms(arms, d))
+        ELambda(ps, body) -> ELambda(sh_params(ps, d), sh_block(body, d))
+        _ -> x
+      }
+      Sp(x, a + d, b + d)
+    }
+  }
+}
+fn sh_module(m: Module, d: Int) -> Module {
+  if d == 0 { m } else { match m { Module(imps, decls) -> Module(sh_imports(imps, d), sh_decls(decls, d)) } }
+}
+fn sh_diags(xs: List(ParseDiag), d: Int) -> List(ParseDiag) {
+  match xs { Nil -> Nil Cons(ParseDiag(c, a, b, m), rest) -> Cons(ParseDiag(c, a + d, b + d, m), sh_diags(rest, d)) }
+}
+
+// ---- Loading (modules::load) --------------------------------------------
+
+// An import's name and the module path it binds.
+type RBind { RBind(String, String) }
+// One file: its path, its tree, its binds, the paths it imports, the
+// import names whose module failed to load.
+type RUnit { RUnit(String, Module, List(RBind), List(String), List(String)) }
+// The files' texts (newest first), the next file's base, the units (newest
+// first), the loaded paths, the paths being loaded (innermost first), the
+// diagnostics (newest first), the root's directory, the standard modules'.
+type LS { LS(List(String), Int, List(RUnit), List(String), List(String), List(ParseDiag), String, String) }
+type LI { LI(LS, List(RBind), List(String), List(String)) }
+
+fn bind_get(xs: List(RBind), k: String) -> Maybe(String) {
+  match xs { Nil -> No Cons(RBind(n, p), rest) -> if n == k { Yes(p) } else { bind_get(rest, k) } }
+}
+fn bind_has(xs: List(RBind), k: String) -> Bool { match bind_get(xs, k) { No -> False Yes(_) -> True } }
+fn ls_diag(ls: LS, d: ParseDiag) -> LS {
+  match ls { LS(t, nb, us, ld, st, ds, dir, std) -> LS(t, nb, us, ld, st, Cons(d, ds), dir, std) }
+}
+fn ls_stack(ls: LS) -> List(String) { match ls { LS(_, _, _, _, st, _, _, _) -> st } }
+fn ls_loaded(ls: LS) -> List(String) { match ls { LS(_, _, _, ld, _, _, _, _) -> ld } }
+fn first_seg(xs: List(String)) -> String { match xs { Nil -> "" Cons(x, _) -> x } }
+
+// The module's text: a standard module from its directory, a user module
+// next to the root, or none.
+fn read_module(ls: LS, target: String) -> Maybe(String) {
+  match ls {
+    LS(_, _, _, _, _, _, dir, std) -> {
+      let file = if has_str(std_modules(), target) {
+        in_dir(std, string.slice(target, 5, string.length(target)) <> ".elya")
+      } else { in_dir(dir, target <> ".elya") }
+      if io.file_exists(file) { Yes(io.read_file(file)) } else { No }
+    }
+  }
+}
+
+fn load_unit(ls: LS, path: String, m: Module) -> LS {
+  let ls = match ls { LS(t, nb, us, ld, st, ds, dir, std) -> LS(t, nb, us, ld, Cons(path, st), ds, dir, std) }
+  match m {
+    Module(imps, _) -> match load_imports(ls, imps, Nil, Nil, Nil) {
+      LI(LS(t, nb, us, ld, st, ds, dir, std), binds, imports, failed) -> {
+        let st = match st { Nil -> Nil Cons(_, rest) -> rest }
+        LS(t, nb, Cons(RUnit(path, m, binds, imports, failed), us), ld, st, ds, dir, std)
+      }
+    }
+  }
+}
+
+fn load_imports(ls: LS, imps: List(Sp(Import)), binds: List(RBind), imports: List(String), failed: List(String)) -> LI {
+  match imps {
+    Nil -> LI(ls, binds, imports, failed)
+    Cons(Sp(Import(path, alias, effs), a, b), rest) -> {
+      let target = join(path, "/")
+      if first_seg(path) == "elya" && !has_str(std_modules(), target) {
+        let ls = match effs {
+          No -> ls
+          Yes(es) -> {
+            let at = match es { Nil -> Sp("", a, b) Cons(e, _) -> e }
+            ls_diag(ls, ParseDiag("E0608", sp_start(at), sp_end(at), "a standard module takes no effect list"))
+          }
+        }
+        let m = nth_str(path, 1)
+        let std_ok = count(path) == 2 && has_str(builtin_modules(), m)
+        let ls = match alias {
+          Yes(_) -> if std_ok { ls_diag(ls, ParseDiag("E0604", a, b, "the standard module `" <> target <> "` keeps its name `" <> m <> "`")) } else { ls }
+          No -> ls
+        }
+        let ls = if std_ok { ls } else { ls_diag(ls, ParseDiag("E0600", a, b, "no module `" <> target <> "`")) }
+        load_imports(ls, rest, binds, imports, failed)
+      } else {
+        let name = match alias { Yes(n) -> n No -> last_str(path, "") }
+        if has_str(builtin_modules(), name) || bind_has(binds, name) {
+          let what = if has_str(builtin_modules(), name) { "a builtin module" } else { "another import" }
+          load_imports(ls_diag(ls, ParseDiag("E0604", a, b, "the import name `" <> name <> "` is already " <> what)), rest, binds, imports, failed)
+        } else {
+          if has_str(ls_stack(ls), target) {
+            let chain = reverse_into(rev(drop_until(rev(ls_stack(ls)), target)), Cons(target, Nil))
+            let d = ParseDiag("E0601", a, b, "an import cycle: " <> join(ticked(chain), " -> "))
+            load_imports(ls_diag(ls, d), rest, binds, imports, Cons(name, failed))
+          } else {
+            if has_str(ls_loaded(ls), target) {
+              load_imports(ls, rest, Cons(RBind(name, target), binds), Cons(target, imports), failed)
+            } else {
+              match read_module(ls, target) {
+                No -> {
+                  let d = ParseDiag("E0600", a, b, "no module `" <> target <> "`")
+                  load_imports(ls_diag(ls, d), rest, binds, imports, Cons(name, failed))
+                }
+                Yes(text) -> match ls {
+                  LS(t, base, us, ld, st, ds, dir, std) -> match parse.parse_full(text) {
+                    ParsedSource(m, pds, _) -> {
+                      let ds = reverse_into(sh_diags(pds, base), ds)
+                      let ls = LS(Cons(text, t), base + string.length(text) + 1, us, ld, st, ds, dir, std)
+                      let ls = load_unit(ls, target, sh_module(m, base))
+                      let ls = match ls { LS(t, nb, us, ld, st, ds, dir, std) -> LS(t, nb, us, Cons(target, ld), st, ds, dir, std) }
+                      load_imports(ls, rest, Cons(RBind(name, target), binds), Cons(target, imports), failed)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn u_path(u: RUnit) -> String { match u { RUnit(p, _, _, _, _) -> p } }
+fn u_decls(u: RUnit) -> List(Sp(Decl)) { match u { RUnit(_, Module(_, ds), _, _, _) -> ds } }
+fn u_imports(u: RUnit) -> List(String) { match u { RUnit(_, _, _, im, _) -> im } }
+fn u_paths(us: List(RUnit)) -> List(String) {
+  match us { Nil -> Nil Cons(u, rest) -> Cons(u_path(u), u_paths(rest)) }
+}
+fn nth_unit(us: List(RUnit), i: Int) -> RUnit {
+  match us { Nil -> RUnit("", Module(Nil, Nil), Nil, Nil, Nil) Cons(u, rest) -> if i == 0 { u } else { nth_unit(rest, i - 1) } }
+}
+
+// ---- E0607 (modules::grants) --------------------------------------------
+
+fn declares_effect(ds: List(Sp(Decl)), name: String) -> Bool {
+  match ds {
+    Nil -> False
+    Cons(Sp(DEffect(n, _, _, _), _, _), rest) -> n == name || declares_effect(rest, name)
+    Cons(_, rest) -> declares_effect(rest, name)
+  }
+}
+fn effect_owner(us: List(RUnit), name: String, i: Int) -> Int {
+  match us { Nil -> -1 Cons(u, rest) -> if declares_effect(u_decls(u), name) { i } else { effect_owner(rest, name, i + 1) } }
+}
+fn grant_list(all: List(RUnit), u: RUnit, me: Int, es: List(Sp(String)), seen: List(String), ds: List(ParseDiag)) -> List(ParseDiag) {
+  match es {
+    Nil -> ds
+    Cons(Sp(e, a, b), rest) -> {
+      if has_str(seen, e) {
+        grant_list(all, u, me, rest, seen, Cons(ParseDiag("E0607", a, b, "`" <> e <> "` is listed twice"), ds))
+      } else {
+        let o = effect_owner(all, e, 0)
+        let visible = e == "IO" || (o >= 0 && (o == me || has_str(u_imports(u), u_path(nth_unit(all, o)))))
+        let ds = if visible { ds } else { Cons(ParseDiag("E0607", a, b, "no effect `" <> e <> "` here"), ds) }
+        grant_list(all, u, me, rest, Cons(e, seen), ds)
+      }
+    }
+  }
+}
+fn grant_imports(all: List(RUnit), u: RUnit, me: Int, imps: List(Sp(Import)), ds: List(ParseDiag)) -> List(ParseDiag) {
+  match imps {
+    Nil -> ds
+    Cons(Sp(Import(path, _, effs), _, _), rest) -> {
+      let builtin = first_seg(path) == "elya" && !has_str(std_modules(), join(path, "/"))
+      let ds = if builtin { ds } else {
+        match effs { No -> ds Yes(es) -> grant_list(all, u, me, es, Nil, ds) }
+      }
+      grant_imports(all, u, me, rest, ds)
+    }
+  }
+}
+fn grants(all: List(RUnit), us: List(RUnit), me: Int, ds: List(ParseDiag)) -> List(ParseDiag) {
+  match us {
+    Nil -> ds
+    Cons(u, rest) -> match u {
+      RUnit(_, Module(imps, _), _, _, _) -> grants(all, rest, me + 1, grant_imports(all, u, me, imps, ds))
+    }
+  }
+}
+
+// ---- Merging (modules::merge) -------------------------------------------
+
+// A table's value: a flag or index, a name, a list of names.
+type RV { RI(Int), RS(String), RL(List(String)) }
+
+fn put_new(m: Array(MapSlot(RV)), k: String, v: RV) -> Array(MapSlot(RV)) {
+  if map.has(m, k) { m } else { map.put(m, k, v) }
+}
+fn get_int(borrow m: Array(MapSlot(RV)), k: String) -> Int {
+  match map.get(m, k) { MapFound(RI(n)) -> n _ -> -1 }
+}
+// `decls`: "f<i>:<name>" a function of unit i (1 when `pub`), "o<kind><name>"
+// the first unit declaring it, "d<i>:<kind><name>" its own declarations,
+// "x<op>" the first effect declaring an operation. Kinds: T, C, E, O.
+fn tab_variants(m: Array(MapSlot(RV)), i: String, vs: List(Sp(VariantDecl)), u: RV) -> Array(MapSlot(RV)) {
+  match vs {
+    Nil -> m
+    Cons(Sp(VariantDecl(n, _), _, _), rest) -> tab_variants(map.put(put_new(m, "oC" <> n, u), "d" <> i <> ":C" <> n, RI(1)), i, rest, u)
+  }
+}
+fn tab_ops(m: Array(MapSlot(RV)), i: String, ops: List(Sp(OpSig)), u: RV, eff: String) -> Array(MapSlot(RV)) {
+  match ops {
+    Nil -> m
+    Cons(Sp(OpSig(n, _, _, _), _, _), rest) -> {
+      let m = map.put(put_new(m, "oO" <> n, u), "d" <> i <> ":O" <> n, RI(1))
+      tab_ops(put_new(m, "x" <> n, RS(eff)), i, rest, u, eff)
+    }
+  }
+}
+fn tab_decls(m: Array(MapSlot(RV)), i: Int, ds: List(Sp(Decl))) -> Array(MapSlot(RV)) {
+  match ds {
+    Nil -> m
+    Cons(Sp(d, _, _), rest) -> {
+      let s = its(i)
+      let m = match d {
+        DFn(p, n, _, _, _, _) -> map.put(m, "f" <> s <> ":" <> n, RI(if p { 1 } else { 0 }))
+        DType(n, _, _, vs) -> tab_variants(map.put(put_new(m, "oT" <> n, RI(i)), "d" <> s <> ":T" <> n, RI(1)), s, vs, RI(i))
+        DEffect(n, _, _, ops) -> tab_ops(map.put(put_new(m, "oE" <> n, RI(i)), "d" <> s <> ":E" <> n, RI(1)), s, ops, RI(i), n)
+      }
+      tab_decls(m, i, rest)
+    }
+  }
+}
+fn tab_units(m: Array(MapSlot(RV)), us: List(RUnit), i: Int) -> Array(MapSlot(RV)) {
+  match us { Nil -> m Cons(u, rest) -> tab_units(tab_decls(m, i, u_decls(u)), rest, i + 1) }
+}
+// E0205 in a module (the review's R2).
+fn op_named_fns(borrow m: Array(MapSlot(RV)), ds: List(Sp(Decl)), out: List(ParseDiag)) -> List(ParseDiag) {
+  match ds {
+    Nil -> out
+    Cons(Sp(DFn(_, n, _, _, _, _), a, b), rest) -> {
+      let out = match map.get(m, "x" <> n) {
+        MapFound(RS(eff)) -> Cons(ParseDiag("E0205", a, b, "function `" <> n <> "` has the name of an operation of `" <> eff <> "`"), out)
+        _ -> out
+      }
+      op_named_fns(m, rest, out)
+    }
+    Cons(_, rest) -> op_named_fns(m, rest, out)
+  }
+}
+fn module_e0205(borrow m: Array(MapSlot(RV)), us: List(RUnit), i: Int, root: Int, out: List(ParseDiag)) -> List(ParseDiag) {
+  if i >= root { out } else {
+    match us { Nil -> out Cons(u, rest) -> module_e0205(m, rest, i + 1, root, op_named_fns(m, u_decls(u), out)) }
+  }
+}
+
+// The rewriter's context: this unit's index, whether it is the root, the
+// root's index, every unit's path, this unit's binds, imports and failed
+// import names.
+type RCx { RCx(Int, Bool, Int, List(String), List(RBind), List(String), List(String)) }
+type RSpan { RSpan(Int, Int) }
+// Scopes (innermost first), diagnostics (newest first), refused spans.
+type RW { RW(List(List(String)), List(ParseDiag), List(RSpan)) }
+type RR(a) { RR(a, RW) }
+
+fn rw_push(rw: RW) -> RW { match rw { RW(sc, ds, rf) -> RW(Cons(Nil, sc), ds, rf) } }
+fn rw_pop(rw: RW) -> RW { match rw { RW(sc, ds, rf) -> RW(match sc { Nil -> Nil Cons(_, r) -> r }, ds, rf) } }
+fn rw_bind(rw: RW, n: String) -> RW {
+  match rw { RW(sc, ds, rf) -> RW(match sc { Nil -> Nil Cons(s, r) -> Cons(Cons(n, s), r) }, ds, rf) }
+}
+fn rw_local(rw: RW, n: String) -> Bool { match rw { RW(sc, _, _) -> has_in_scopes(sc, n) } }
+fn rw_diag(rw: RW, d: ParseDiag) -> RW { match rw { RW(sc, ds, rf) -> RW(sc, Cons(d, ds), rf) } }
+fn rw_refuse(rw: RW, a: Int, b: Int) -> RW { match rw { RW(sc, ds, rf) -> RW(sc, ds, Cons(RSpan(a, b), rf)) } }
+
+fn cx_me(cx: RCx) -> Int { match cx { RCx(me, _, _, _, _, _, _) -> me } }
+fn cx_root(cx: RCx) -> Bool { match cx { RCx(_, r, _, _, _, _, _) -> r } }
+fn cx_root_index(cx: RCx) -> Int { match cx { RCx(_, _, r, _, _, _, _) -> r } }
+fn cx_paths(cx: RCx) -> List(String) { match cx { RCx(_, _, _, ps, _, _, _) -> ps } }
+fn cx_binds(cx: RCx) -> List(RBind) { match cx { RCx(_, _, _, _, bs, _, _) -> bs } }
+fn cx_imports(cx: RCx) -> List(String) { match cx { RCx(_, _, _, _, _, im, _) -> im } }
+fn cx_failed(cx: RCx) -> List(String) { match cx { RCx(_, _, _, _, _, _, f) -> f } }
+// This file's name for its own function.
+fn own(cx: RCx, f: String) -> String {
+  if cx_root(cx) { f } else { mangle(nth_str(cx_paths(cx), cx_me(cx)), f) }
+}
+
+fn any_declares(borrow tab: Array(MapSlot(RV)), paths: List(String), imports: List(String), key: String) -> Bool {
+  match imports {
+    Nil -> False
+    Cons(p, rest) -> map.has(tab, "d" <> its(index_of(paths, p, 0)) <> ":" <> key) || any_declares(tab, paths, rest, key)
+  }
+}
+// E0605 unless a type-level name is declared here or in an imported file.
+fn visible(borrow tab: Array(MapSlot(RV)), cx: RCx, kind: String, name: String, a: Int, b: Int, rw: RW) -> RW {
+  let owner = get_int(tab, "o" <> kind <> name)
+  if owner < 0 { rw } else {
+    let key = kind <> name
+    let me = cx_me(cx)
+    let paths = cx_paths(cx)
+    let ok = owner == me || map.has(tab, "d" <> its(me) <> ":" <> key) ||
+      any_declares(tab, paths, cx_imports(cx), key) ||
+      has_str(cx_imports(cx), nth_str(paths, owner))
+    if ok { rw } else {
+      let message = if owner == cx_root_index(cx) {
+        "`" <> name <> "` is declared in the root program, which no module can import"
+      } else {
+        "`" <> name <> "` is declared in module `" <> nth_str(paths, owner) <> "`, which this file does not import"
+      }
+      rw_diag(rw, ParseDiag("E0605", a, b, message))
+    }
+  }
+}
+fn rw_ann(borrow tab: Array(MapSlot(RV)), cx: RCx, t: Sp(TypeAnn), rw: RW) -> RW {
+  match t {
+    Sp(TypeAnn(n, args, row), a, b) -> {
+      let rw = rw_anns(tab, cx, args, visible(tab, cx, "T", n, a, b, rw))
+      match row { No -> rw Yes(r) -> rw_row(tab, cx, r, rw) }
+    }
+  }
+}
+fn rw_anns(borrow tab: Array(MapSlot(RV)), cx: RCx, ts: List(Sp(TypeAnn)), rw: RW) -> RW {
+  match ts { Nil -> rw Cons(t, rest) -> rw_anns(tab, cx, rest, rw_ann(tab, cx, t, rw)) }
+}
+fn rw_mann(borrow tab: Array(MapSlot(RV)), cx: RCx, t: Maybe(Sp(TypeAnn)), rw: RW) -> RW {
+  match t { No -> rw Yes(t) -> rw_ann(tab, cx, t, rw) }
+}
+fn rw_row(borrow tab: Array(MapSlot(RV)), cx: RCx, r: RowAnn, rw: RW) -> RW {
+  match r { RowAnn(labels, _) -> rw_labels(tab, cx, labels, rw) }
+}
+fn rw_labels(borrow tab: Array(MapSlot(RV)), cx: RCx, ls: List(LabelAnn), rw: RW) -> RW {
+  match ls {
+    Nil -> rw
+    Cons(LabelAnn(Sp(n, a, b), args), rest) -> {
+      let rw = visible(tab, cx, "E", n, a, b, rw)
+      let rw = match args { No -> rw Yes(ts) -> rw_anns(tab, cx, ts, rw) }
+      rw_labels(tab, cx, rest, rw)
+    }
+  }
+}
+// Bind each parameter, then check its annotation.
+fn rw_params(borrow tab: Array(MapSlot(RV)), cx: RCx, ps: List(Sp(Param)), rw: RW) -> RW {
+  match ps {
+    Nil -> rw
+    Cons(Sp(Param(n, ann, _), _, _), rest) -> rw_params(tab, cx, rest, rw_mann(tab, cx, ann, rw_bind(rw, n)))
+  }
+}
+fn rw_op_sigs(borrow tab: Array(MapSlot(RV)), cx: RCx, ops: List(Sp(OpSig)), rw: RW) -> RW {
+  match ops {
+    Nil -> rw
+    Cons(Sp(OpSig(_, ps, tys, ret), _, _), rest) -> {
+      let rw = rw_anns(tab, cx, tys, rw)
+      let rw = rw_param_anns(tab, cx, ps, rw)
+      rw_op_sigs(tab, cx, rest, rw_ann(tab, cx, ret, rw))
+    }
+  }
+}
+fn rw_param_anns(borrow tab: Array(MapSlot(RV)), cx: RCx, ps: List(Sp(Param)), rw: RW) -> RW {
+  match ps { Nil -> rw Cons(Sp(Param(_, ann, _), _, _), rest) -> rw_param_anns(tab, cx, rest, rw_mann(tab, cx, ann, rw)) }
+}
+fn rw_variant_fields(borrow tab: Array(MapSlot(RV)), cx: RCx, vs: List(Sp(VariantDecl)), rw: RW) -> RW {
+  match vs { Nil -> rw Cons(Sp(VariantDecl(_, fs), _, _), rest) -> rw_variant_fields(tab, cx, rest, rw_anns(tab, cx, fs, rw)) }
+}
+fn rw_decl(borrow tab: Array(MapSlot(RV)), cx: RCx, d: Sp(Decl), rw: RW) -> RR(Sp(Decl)) {
+  match d {
+    Sp(decl, a, b) -> match decl {
+      DFn(p, n, ps, row, ret, body) -> {
+        let rw = rw_params(tab, cx, ps, rw_push(rw))
+        let rw = rw_mann(tab, cx, ret, rw)
+        let rw = match row { No -> rw Yes(r) -> rw_row(tab, cx, r, rw) }
+        match rw_block(tab, cx, body, rw) {
+          RR(body, rw) -> RR(Sp(DFn(p, own(cx, n), ps, row, ret, body), a, b), rw_pop(rw))
+        }
+      }
+      DType(_, _, _, vs) -> RR(d, rw_variant_fields(tab, cx, vs, rw))
+      DEffect(_, _, _, ops) -> RR(d, rw_op_sigs(tab, cx, ops, rw))
+    }
+  }
+}
+fn rw_block_node(borrow tab: Array(MapSlot(RV)), cx: RCx, blk: Block, rw: RW) -> RR(Block) {
+  match blk {
+    Block(stmts, tail) -> match rw_stmts(tab, cx, stmts, rw_push(rw), Nil) {
+      RR(stmts, rw) -> match tail {
+        No -> RR(Block(stmts, No), rw_pop(rw))
+        Yes(t) -> match rw_expr(tab, cx, t, rw) { RR(t, rw) -> RR(Block(stmts, Yes(t)), rw_pop(rw)) }
+      }
+    }
+  }
+}
+fn rw_block(borrow tab: Array(MapSlot(RV)), cx: RCx, blk: Sp(Block), rw: RW) -> RR(Sp(Block)) {
+  match blk { Sp(node, a, b) -> match rw_block_node(tab, cx, node, rw) { RR(node, rw) -> RR(Sp(node, a, b), rw) } }
+}
+fn rw_stmts(borrow tab: Array(MapSlot(RV)), cx: RCx, xs: List(Sp(Stmt)), rw: RW, acc: List(Sp(Stmt))) -> RR(List(Sp(Stmt))) {
+  match xs {
+    Nil -> RR(rev(acc), rw)
+    Cons(Sp(st, a, b), rest) -> match st {
+      SLet(n, ann, v) -> match rw_expr(tab, cx, v, rw_mann(tab, cx, ann, rw)) {
+        RR(v, rw) -> rw_stmts(tab, cx, rest, rw_bind(rw, n), Cons(Sp(SLet(n, ann, v), a, b), acc))
+      }
+      SExpr(e) -> match rw_expr(tab, cx, e, rw) {
+        RR(e, rw) -> rw_stmts(tab, cx, rest, rw, Cons(Sp(SExpr(e), a, b), acc))
+      }
+    }
+  }
+}
+fn rw_pattern(borrow tab: Array(MapSlot(RV)), cx: RCx, p: Sp(Pattern), rw: RW) -> RW {
+  match p {
+    Sp(PVar(n), _, _) -> rw_bind(rw, n)
+    Sp(PCtor(n, args), a, b) -> rw_patterns(tab, cx, args, visible(tab, cx, "C", n, a, b, rw))
+    _ -> rw
+  }
+}
+fn rw_patterns(borrow tab: Array(MapSlot(RV)), cx: RCx, ps: List(Sp(Pattern)), rw: RW) -> RW {
+  match ps { Nil -> rw Cons(p, rest) -> rw_patterns(tab, cx, rest, rw_pattern(tab, cx, p, rw)) }
+}
+fn rw_exprs(borrow tab: Array(MapSlot(RV)), cx: RCx, xs: List(Sp(Expr)), rw: RW, acc: List(Sp(Expr))) -> RR(List(Sp(Expr))) {
+  match xs {
+    Nil -> RR(rev(acc), rw)
+    Cons(x, rest) -> match rw_expr(tab, cx, x, rw) { RR(x, rw) -> rw_exprs(tab, cx, rest, rw, Cons(x, acc)) }
+  }
+}
+fn rw_var(borrow tab: Array(MapSlot(RV)), cx: RCx, n: String, a: Int, b: Int, rw: RW) -> RR(Expr) {
+  if rw_local(rw, n) { RR(EVar(n), rw) } else {
+    if map.has(tab, "f" <> its(cx_me(cx)) <> ":" <> n) { RR(EVar(own(cx, n)), rw) } else {
+      let kind = if is_upper(n) { "C" } else { "O" }
+      let program_name = map.has(tab, "o" <> kind <> n)
+      if !cx_root(cx) && !program_name && map.has(tab, "f" <> its(cx_root_index(cx)) <> ":" <> n) {
+        RR(EVar(n), rw_diag(rw, ParseDiag("E0200", a, b, "unresolved name `" <> n <> "`")))
+      } else { RR(EVar(n), visible(tab, cx, kind, n, a, b, rw)) }
+    }
+  }
+}
+fn rw_qualified(borrow tab: Array(MapSlot(RV)), cx: RCx, md: String, n: String, a: Int, b: Int, rw: RW) -> RR(Expr) {
+  let rw = if has_str(cx_failed(cx), md) { rw_refuse(rw, a, b) } else { rw }
+  match bind_get(cx_binds(cx), md) {
+    No -> RR(EQualified(md, n), rw)
+    Yes(path) -> {
+      let t = index_of(cx_paths(cx), path, 0)
+      let f = get_int(tab, "f" <> its(t) <> ":" <> n)
+      if f == 1 { RR(EVar(mangle(path, n)), rw) } else {
+        if f == 0 {
+          RR(EVar(mangle(path, n)), rw_diag(rw, ParseDiag("E0602", a, b, "`" <> n <> "` is private to module `" <> path <> "`")))
+        } else {
+          let rw = rw_diag(rw, ParseDiag("E0603", a, b, "module `" <> path <> "` has no function `" <> n <> "`"))
+          RR(EQualified(md, n), rw_refuse(rw, a, b))
+        }
+      }
+    }
+  }
+}
+fn rw_clauses(borrow tab: Array(MapSlot(RV)), cx: RCx, any: Bool, cs: List(Sp(OpClause)), rw: RW, acc: List(Sp(OpClause))) -> RR(List(Sp(OpClause))) {
+  match cs {
+    Nil -> RR(rev(acc), rw)
+    Cons(Sp(OpClause(q, op, ps, body), a, b), rest) -> {
+      let rw = if any { rw } else {
+        let rw = match q { No -> rw Yes(eff) -> visible(tab, cx, "E", eff, a, b, rw) }
+        visible(tab, cx, "O", op, a, b, rw)
+      }
+      let rw = rw_params(tab, cx, ps, rw_push(rw))
+      match rw_expr(tab, cx, body, rw) {
+        RR(body, rw) -> rw_clauses(tab, cx, any, rest, rw_pop(rw), Cons(Sp(OpClause(q, op, ps, body), a, b), acc))
+      }
+    }
+  }
+}
+fn rw_arms(borrow tab: Array(MapSlot(RV)), cx: RCx, arms: List(Sp(MatchArm)), rw: RW, acc: List(Sp(MatchArm))) -> RR(List(Sp(MatchArm))) {
+  match arms {
+    Nil -> RR(rev(acc), rw)
+    Cons(Sp(MatchArm(p, body), a, b), rest) -> {
+      let rw = rw_pattern(tab, cx, p, rw_push(rw))
+      match rw_expr(tab, cx, body, rw) {
+        RR(body, rw) -> rw_arms(tab, cx, rest, rw_pop(rw), Cons(Sp(MatchArm(p, body), a, b), acc))
+      }
+    }
+  }
+}
+fn rw_handle(borrow tab: Array(MapSlot(RV)), cx: RCx, body: Sp(Expr), h: Handler, rw: RW) -> RR(Expr) {
+  match rw_expr(tab, cx, body, rw) {
+    RR(body, rw) -> match h {
+      Handler(m, any, cs, ret) -> match rw_clauses(tab, cx, any, cs, rw, Nil) {
+        RR(cs, rw) -> match ret {
+          No -> RR(EHandle(body, Handler(m, any, cs, No)), rw)
+          Yes(ReturnClause(binder, v)) -> match rw_expr(tab, cx, v, rw_bind(rw_push(rw), binder)) {
+            RR(v, rw) -> RR(EHandle(body, Handler(m, any, cs, Yes(ReturnClause(binder, v)))), rw_pop(rw))
+          }
+        }
+      }
+    }
+  }
+}
+fn rw_expr(borrow tab: Array(MapSlot(RV)), cx: RCx, e: Sp(Expr), rw: RW) -> RR(Sp(Expr)) {
+  match e {
+    Sp(x, a, b) -> {
+      let r = match x {
+        EVar(n) -> rw_var(tab, cx, n, a, b, rw)
+        EQualified(md, n) -> rw_qualified(tab, cx, md, n, a, b, rw)
+        ECall(c, args) -> match rw_expr(tab, cx, c, rw) {
+          RR(c, rw) -> match rw_exprs(tab, cx, args, rw, Nil) { RR(args, rw) -> RR(ECall(c, args), rw) }
+        }
+        EUnary(op, v) -> match rw_expr(tab, cx, v, rw) { RR(v, rw) -> RR(EUnary(op, v), rw) }
+        EBinary(op, l, r) -> match rw_expr(tab, cx, l, rw) {
+          RR(l, rw) -> match rw_expr(tab, cx, r, rw) { RR(r, rw) -> RR(EBinary(op, l, r), rw) }
+        }
+        EIf(c, t, f) -> match rw_expr(tab, cx, c, rw) {
+          RR(c, rw) -> match rw_block(tab, cx, t, rw) {
+            RR(t, rw) -> match rw_block(tab, cx, f, rw) { RR(f, rw) -> RR(EIf(c, t, f), rw) }
+          }
+        }
+        EBlock(blk) -> match rw_block_node(tab, cx, blk, rw) { RR(blk, rw) -> RR(EBlock(blk), rw) }
+        EHandle(body, h) -> rw_handle(tab, cx, body, h, rw)
+        EResume(v) -> match rw_expr(tab, cx, v, rw) { RR(v, rw) -> RR(EResume(v), rw) }
+        EMatch(s, arms) -> match rw_expr(tab, cx, s, rw) {
+          RR(s, rw) -> match rw_arms(tab, cx, arms, rw, Nil) { RR(arms, rw) -> RR(EMatch(s, arms), rw) }
+        }
+        ELambda(ps, body) -> {
+          let rw = rw_params(tab, cx, ps, rw_push(rw))
+          match rw_block(tab, cx, body, rw) { RR(body, rw) -> RR(ELambda(ps, body), rw_pop(rw)) }
+        }
+        _ -> RR(x, rw)
+      }
+      match r { RR(x, rw) -> RR(Sp(x, a, b), rw) }
+    }
+  }
+}
+fn rw_decls(borrow tab: Array(MapSlot(RV)), cx: RCx, ds: List(Sp(Decl)), rw: RW, acc: List(Sp(Decl))) -> RR(List(Sp(Decl))) {
+  match ds {
+    Nil -> RR(acc, rw)
+    Cons(d, rest) -> match rw_decl(tab, cx, d, rw) { RR(d, rw) -> rw_decls(tab, cx, rest, rw, Cons(d, acc)) }
+  }
+}
+// Every unit's declarations, rewritten in post-order; the merged decls come
+// back newest first.
+fn rw_units(borrow tab: Array(MapSlot(RV)), all: List(RUnit), us: List(RUnit), i: Int, root: Int, rw: RW, acc: List(Sp(Decl))) -> RR(List(Sp(Decl))) {
+  match us {
+    Nil -> RR(acc, rw)
+    Cons(RUnit(_, Module(_, ds), binds, imports, failed), rest) -> {
+      let cx = RCx(i, i == root, root, u_paths(all), binds, imports, failed)
+      match rw_decls(tab, cx, ds, rw, acc) {
+        RR(acc, rw) -> rw_units(tab, all, rest, i + 1, root, rw, acc)
+      }
+    }
+  }
+}
+type Merged { Merged(Module, List(ParseDiag), List(RSpan)) }
+fn root_imports(us: List(RUnit)) -> List(Sp(Import)) {
+  match us { Nil -> Nil Cons(RUnit(_, Module(imps, _), _, _, _), Nil) -> imps Cons(_, rest) -> root_imports(rest) }
+}
+fn unit_failed(u: RUnit) -> List(String) { match u { RUnit(_, _, _, _, f) -> f } }
+fn merge(us: List(RUnit), ds: List(ParseDiag)) -> Merged {
+  let n = count_units(us, 0)
+  let single = match us { Cons(u, Nil) -> match unit_failed(u) { Nil -> True _ -> False } _ -> False }
+  if single {
+    match us { Cons(RUnit(_, m, _, _, _), _) -> Merged(m, ds, Nil) Nil -> Merged(Module(Nil, Nil), ds, Nil) }
+  } else {
+    let tab: Array(MapSlot(RV)) = tab_units(map.new(), us, 0)
+    let ds = module_e0205(tab, us, 0, n - 1, ds)
+    match rw_units(tab, us, us, 0, n - 1, RW(Nil, ds, Nil), Nil) {
+      RR(decls, RW(_, ds, refused)) -> Merged(Module(root_imports(us), rev(decls)), ds, refused)
+    }
+  }
+}
+fn count_units(us: List(RUnit), n: Int) -> Int { match us { Nil -> n Cons(_, rest) -> count_units(rest, n + 1) } }
+
+// ---- Resolution (resolve::check) ----------------------------------------
+
+// The program's names: "F" functions, "P" operations, "C" constructors,
+// "E" effects, "Q" effects declared twice, "D" operations declared twice,
+// "X" an operation's effect, "A" its arity, "L" an effect's operations
+// (newest first), "S<kind>:" names already declared (E0209).
+linear type RTab { RTab(Array(MapSlot(RV)), List(ParseDiag)) }
+
+fn dup(t: RTab, kind: String, n: String, a: Int, b: Int) -> RTab {
+  match t {
+    RTab(m, ds) -> {
+      let k = "S" <> kind <> ":" <> n
+      if map.has(m, k) {
+        RTab(m, Cons(ParseDiag("E0209", a, b, kind <> " `" <> n <> "` is declared more than once"), ds))
+      } else { RTab(map.put(m, k, RI(1)), ds) }
+    }
+  }
+}
+fn rt_put(t: RTab, k: String, v: RV) -> RTab { match t { RTab(m, ds) -> RTab(map.put(m, k, v), ds) } }
+fn rt_diag(t: RTab, d: ParseDiag) -> RTab { match t { RTab(m, ds) -> RTab(m, Cons(d, ds)) } }
+fn rt_ops(t: RTab, eff: String, ops: List(Sp(OpSig))) -> RTab {
+  match ops {
+    Nil -> t
+    Cons(Sp(OpSig(n, _, tys, _), a, b), rest) -> match t {
+      RTab(m, ds) -> {
+        let t = if map.has(m, "X" <> n) {
+          let m = map.put(m, "D" <> n, RI(1))
+          RTab(m, Cons(ParseDiag("E0202", a, b, "operation `" <> n <> "` is declared more than once"), ds))
+        } else {
+          let m = map.put(map.put(m, "X" <> n, RS(eff)), "A" <> n, RI(count(tys)))
+          let known = match map.get(m, "L" <> eff) { MapFound(RL(xs)) -> xs _ -> Nil }
+          RTab(map.put(m, "L" <> eff, RL(Cons(n, known))), ds)
+        }
+        rt_ops(rt_put(t, "P" <> n, RI(1)), eff, rest)
+      }
+    }
+  }
+}
+fn rt_variants(t: RTab, vs: List(Sp(VariantDecl))) -> RTab {
+  match vs {
+    Nil -> t
+    Cons(Sp(VariantDecl(n, _), a, b), rest) -> rt_variants(rt_put(dup(t, "constructor", n, a, b), "C" <> n, RI(1)), rest)
+  }
+}
+fn rt_decls(t: RTab, ds: List(Sp(Decl))) -> RTab {
+  match ds {
+    Nil -> t
+    Cons(Sp(d, a, b), rest) -> {
+      let t = match d {
+        DFn(_, n, _, _, _, _) -> rt_put(dup(t, "function", n, a, b), "F" <> n, RI(1))
+        DEffect(n, _, _, ops) -> {
+          let t = dup(t, "effect", n, a, b)
+          let t = if n == "IO" { rt_diag(t, ParseDiag("E0209", a, b, "effect `IO` is built in")) } else { t }
+          let t = match t { RTab(m, ds) -> if map.has(m, "E" <> n) { RTab(map.put(m, "Q" <> n, RI(1)), ds) } else { RTab(map.put(m, "E" <> n, RI(1)), ds) } }
+          rt_ops(t, n, ops)
+        }
+        DType(n, _, _, vs) -> {
+          let t = dup(t, "type", n, a, b)
+          let t = if n == "Buffer" { rt_diag(t, ParseDiag("E0211", a, b, "`Buffer` is a builtin type")) } else { t }
+          let t = if n == "Array" { rt_diag(t, ParseDiag("E0211", a, b, "`Array` is a builtin type")) } else { t }
+          rt_variants(t, vs)
+        }
+      }
+      rt_decls(t, rest)
+    }
+  }
+}
+// E0205 (slice 5c-2), after every declaration is seen.
+fn op_fns(borrow m: Array(MapSlot(RV)), ds: List(Sp(Decl)), out: List(ParseDiag)) -> List(ParseDiag) {
+  match ds {
+    Nil -> out
+    Cons(Sp(DFn(_, n, _, _, _, _), a, b), rest) -> {
+      let out = match map.get(m, "X" <> n) {
+        MapFound(RS(eff)) -> Cons(ParseDiag("E0205", a, b, "function `" <> n <> "` has the name of an operation of `" <> eff <> "`"), out)
+        _ -> out
+      }
+      op_fns(m, rest, out)
+    }
+    Cons(_, rest) -> op_fns(m, rest, out)
+  }
+}
+fn add_head(sc: List(List(String)), n: String) -> List(List(String)) {
+  match sc { Nil -> Cons(Cons(n, Nil), Nil) Cons(s, rest) -> Cons(Cons(n, s), rest) }
+}
+fn param_names(ps: List(Sp(Param))) -> List(String) {
+  match ps { Nil -> Nil Cons(Sp(Param(n, _, _), _, _), rest) -> Cons(n, param_names(rest)) }
+}
+fn has_key(borrow r: Array(MapSlot(RV)), k: String) -> Bool { map.has(r, k) }
+fn resolves_var(borrow r: Array(MapSlot(RV)), n: String, sc: List(List(String))) -> Bool {
+  has_in_scopes(sc, n) || map.has(r, "F" <> n) || map.has(r, "P" <> n) || map.has(r, "C" <> n)
+}
+fn check_name(borrow r: Array(MapSlot(RV)), n: String, a: Int, b: Int, sc: List(List(String)), ds: List(ParseDiag)) -> List(ParseDiag) {
+  if resolves_var(r, n, sc) { ds } else { Cons(ParseDiag("E0200", a, b, "unresolved name `" <> n <> "`"), ds) }
+}
+fn check_var(borrow r: Array(MapSlot(RV)), n: String, a: Int, b: Int, sc: List(List(String)), ds: List(ParseDiag)) -> List(ParseDiag) {
+  let ds = check_name(r, n, a, b, sc, ds)
+  if map.has(r, "P" <> n) && !has_in_scopes(sc, n) && !map.has(r, "F" <> n) {
+    Cons(ParseDiag("E0206", a, b, "operation `" <> n <> "` used as a value"), ds)
+  } else { ds }
+}
+fn check_builtin(md: String, n: String, a: Int, b: Int, called: Bool, ds: List(ParseDiag)) -> List(ParseDiag) {
+  let full = md <> "." <> n
+  if !has_str(builtin_names(), full) { Cons(ParseDiag("E0201", a, b, "unknown builtin `" <> full <> "`"), ds) } else {
+    if called { ds } else { Cons(ParseDiag("E0208", a, b, "builtin `" <> full <> "` used as a value"), ds) }
+  }
+}
+fn check_block(borrow r: Array(MapSlot(RV)), blk: Block, sc: List(List(String)), inh: Int, ds: List(ParseDiag)) -> List(ParseDiag) {
+  match blk { Block(stmts, tail) -> check_stmts(r, stmts, tail, Cons(Nil, sc), inh, ds) }
+}
+fn check_stmts(borrow r: Array(MapSlot(RV)), xs: List(Sp(Stmt)), tail: Maybe(Sp(Expr)), sc: List(List(String)), inh: Int, ds: List(ParseDiag)) -> List(ParseDiag) {
+  match xs {
+    Nil -> match tail { No -> ds Yes(t) -> check_expr(r, t, sc, inh, ds) }
+    Cons(Sp(SLet(n, _, v), _, _), rest) -> check_stmts(r, rest, tail, add_head(sc, n), inh, check_expr(r, v, sc, inh, ds))
+    Cons(Sp(SExpr(e), _, _), rest) -> check_stmts(r, rest, tail, sc, inh, check_expr(r, e, sc, inh, ds))
+  }
+}
+fn check_exprs(borrow r: Array(MapSlot(RV)), xs: List(Sp(Expr)), sc: List(List(String)), inh: Int, ds: List(ParseDiag)) -> List(ParseDiag) {
+  match xs { Nil -> ds Cons(x, rest) -> check_exprs(r, rest, sc, inh, check_expr(r, x, sc, inh, ds)) }
+}
+fn bind_pattern(borrow r: Array(MapSlot(RV)), p: Sp(Pattern), bound: List(String), ds: List(ParseDiag)) -> RPat {
+  match p {
+    Sp(PVar(n), _, _) -> RPat(Cons(n, bound), ds)
+    Sp(PCtor(n, args), a, b) -> {
+      let ds = if map.has(r, "C" <> n) { ds } else { Cons(ParseDiag("E0432", a, b, "unknown constructor `" <> n <> "`"), ds) }
+      bind_patterns(r, args, bound, ds)
+    }
+    _ -> RPat(bound, ds)
+  }
+}
+type RPat { RPat(List(String), List(ParseDiag)) }
+fn bind_patterns(borrow r: Array(MapSlot(RV)), ps: List(Sp(Pattern)), bound: List(String), ds: List(ParseDiag)) -> RPat {
+  match ps {
+    Nil -> RPat(bound, ds)
+    Cons(p, rest) -> match bind_pattern(r, p, bound, ds) { RPat(bound, ds) -> bind_patterns(r, rest, bound, ds) }
+  }
+}
+fn check_arms(borrow r: Array(MapSlot(RV)), arms: List(Sp(MatchArm)), sc: List(List(String)), inh: Int, ds: List(ParseDiag)) -> List(ParseDiag) {
+  match arms {
+    Nil -> ds
+    Cons(Sp(MatchArm(p, body), _, _), rest) -> match bind_pattern(r, p, Nil, ds) {
+      RPat(bound, ds) -> check_arms(r, rest, sc, inh, check_expr(r, body, Cons(bound, sc), inh, ds))
+    }
+  }
+}
+fn check_expr(borrow r: Array(MapSlot(RV)), e: Sp(Expr), sc: List(List(String)), inh: Int, ds: List(ParseDiag)) -> List(ParseDiag) {
+  match e {
+    Sp(x, a, b) -> match x {
+      EVar(n) -> check_var(r, n, a, b, sc, ds)
+      EQualified(md, n) -> check_builtin(md, n, a, b, False, ds)
+      ECall(Sp(c, ca, cb), args) -> {
+        let ds = match c {
+          EVar(n) -> check_name(r, n, ca, cb, sc, ds)
+          EQualified(md, n) -> check_builtin(md, n, ca, cb, True, ds)
+          _ -> check_expr(r, Sp(c, ca, cb), sc, inh, ds)
+        }
+        check_exprs(r, args, sc, inh, ds)
+      }
+      EUnary(_, v) -> check_expr(r, v, sc, inh, ds)
+      EBinary(_, l, rr) -> check_expr(r, rr, sc, inh, check_expr(r, l, sc, inh, ds))
+      EIf(c, Sp(t, _, _), Sp(f, _, _)) -> check_block(r, f, sc, inh, check_block(r, t, sc, inh, check_expr(r, c, sc, inh, ds)))
+      EBlock(blk) -> check_block(r, blk, sc, inh, ds)
+      EHandle(body, h) -> check_handle(r, body, h, a, b, sc, inh, ds)
+      EResume(v) -> {
+        let ds = if inh == 0 { Cons(ParseDiag("E0210", a, b, "`resume` used outside a handler"), ds) } else { ds }
+        check_expr(r, v, sc, inh, ds)
+      }
+      EMatch(s, arms) -> check_arms(r, arms, sc, inh, check_expr(r, s, sc, inh, ds))
+      ELambda(ps, Sp(body, _, _)) -> check_block(r, body, Cons(param_names(ps), sc), inh, ds)
+      _ -> ds
+    }
+  }
+}
+// E0203: whether the clause names no declared operation (or is malformed).
+fn clause_bad(borrow r: Array(MapSlot(RV)), q: Maybe(String), op: String, n: Int) -> Bool {
+  if map.has(r, "D" <> op) { False } else {
+    match map.get(r, "X" <> op) {
+      MapFound(RS(owner)) -> {
+        let wrong = match q { No -> False Yes(q) -> !map.has(r, "E" <> q) || owner != q }
+        wrong || get_int(r, "A" <> op) != n
+      }
+      _ -> True
+    }
+  }
+}
+type RHs { RHs(List(String), List(ParseDiag)) }
+fn check_clauses(borrow r: Array(MapSlot(RV)), any: Bool, cs: List(Sp(OpClause)), sc: List(List(String)), inh: Int, handled: List(String), ds: List(ParseDiag)) -> List(ParseDiag) {
+  match cs {
+    Nil -> ds
+    Cons(Sp(OpClause(q, op, ps, body), a, b), rest) -> {
+      let hs = if any { RHs(handled, ds) } else {
+        let malformed = clause_bad(r, q, op, count(ps))
+        let ds = if malformed { Cons(ParseDiag("E0203", a, b, "this clause does not match a declared operation"), ds) } else { ds }
+        let known = !malformed && map.has(r, "X" <> op) && !map.has(r, "D" <> op)
+        if known {
+          if has_str(handled, op) {
+            RHs(handled, Cons(ParseDiag("E0204", a, b, "a handler has more than one clause for an operation"), ds))
+          } else { RHs(Cons(op, handled), ds) }
+        } else { RHs(handled, ds) }
+      }
+      match hs { RHs(handled, ds) -> check_clauses(r, any, rest, sc, inh, handled, check_expr(r, body, Cons(param_names(ps), sc), inh, ds)) }
+    }
+  }
+}
+fn clause_ops(cs: List(Sp(OpClause))) -> List(String) {
+  match cs { Nil -> Nil Cons(Sp(OpClause(_, op, _, _), _, _), rest) -> Cons(op, clause_ops(rest)) }
+}
+// The distinct effects of the clauses' known, undoubled operations.
+fn clause_effects(borrow r: Array(MapSlot(RV)), ops: List(String), acc: List(String)) -> List(String) {
+  match ops {
+    Nil -> acc
+    Cons(op, rest) -> {
+      let acc = if map.has(r, "D" <> op) { acc } else {
+        match map.get(r, "X" <> op) { MapFound(RS(eff)) -> if has_str(acc, eff) { acc } else { Cons(eff, acc) } _ -> acc }
+      }
+      clause_effects(r, rest, acc)
+    }
+  }
+}
+fn missing_ops(borrow r: Array(MapSlot(RV)), ops: List(String), named: List(String)) -> Bool {
+  match ops { Nil -> False Cons(op, rest) -> (!has_str(named, op) && !map.has(r, "D" <> op)) || missing_ops(r, rest, named) }
+}
+// E0207: a handler covers every operation of its effect.
+fn check_covers(borrow r: Array(MapSlot(RV)), cs: List(Sp(OpClause)), a: Int, b: Int, ds: List(ParseDiag)) -> List(ParseDiag) {
+  let named = clause_ops(cs)
+  match clause_effects(r, named, Nil) {
+    Cons(eff, Nil) -> {
+      if map.has(r, "Q" <> eff) { ds } else {
+        match map.get(r, "L" <> eff) {
+          MapFound(RL(ops)) -> if missing_ops(r, ops, named) { Cons(ParseDiag("E0207", a, b, "this handler does not cover every operation of `" <> eff <> "`"), ds) } else { ds }
+          _ -> ds
+        }
+      }
+    }
+    _ -> ds
+  }
+}
+fn check_handle(borrow r: Array(MapSlot(RV)), body: Sp(Expr), h: Handler, a: Int, b: Int, sc: List(List(String)), inh: Int, ds: List(ParseDiag)) -> List(ParseDiag) {
+  let ds = check_expr(r, body, sc, inh, ds)
+  match h {
+    Handler(_, any, cs, ret) -> {
+      let ds = check_clauses(r, any, cs, sc, inh + 1, Nil, ds)
+      let ds = if any { ds } else { check_covers(r, cs, a, b, ds) }
+      match ret { No -> ds Yes(ReturnClause(binder, v)) -> check_expr(r, v, Cons(Cons(binder, Nil), sc), inh, ds) }
+    }
+  }
+}
+fn check_fns(borrow r: Array(MapSlot(RV)), decls: List(Sp(Decl)), ds: List(ParseDiag)) -> List(ParseDiag) {
+  match decls {
+    Nil -> ds
+    Cons(Sp(DFn(_, _, ps, _, _, Sp(body, _, _)), _, _), rest) -> check_fns(r, rest, check_block(r, body, Cons(param_names(ps), Nil), 0, ds))
+    Cons(_, rest) -> check_fns(r, rest, ds)
+  }
+}
+// `resolve::check`: its diagnostics, oldest first.
+fn resolve_check(m: Module) -> List(ParseDiag) {
+  match m {
+    Module(_, decls) -> match rt_decls(RTab(map.new(), Nil), decls) {
+      RTab(r, ds) -> rev(check_fns(r, decls, op_fns(r, decls, ds)))
+    }
+  }
+}
+
+// ---- The two passes and the dump ----------------------------------------
+
+fn refused(xs: List(RSpan), a: Int, b: Int) -> Bool {
+  match xs { Nil -> False Cons(RSpan(x, y), rest) -> (x == a && y == b) || refused(rest, a, b) }
+}
+// The modules review's R3: a name a module diagnostic refused is not
+// reported again.
+fn r3(ds: List(ParseDiag), rf: List(RSpan)) -> List(ParseDiag) {
+  match ds {
+    Nil -> Nil
+    Cons(ParseDiag(c, a, b, m), rest) -> if refused(rf, a, b) { r3(rest, rf) } else { Cons(ParseDiag(c, a, b, m), r3(rest, rf)) }
+  }
+}
+// `ast_dump::quoted`.
+fn quote_loop(s: String, i: Int, from: Int, b: Buffer) -> Buffer {
+  if i >= string.length(s) { buffer.push(b, string.slice(s, from, i)) } else {
+    let c = string.byte_at(s, i)
+    let esc = if c == 10 { "\\n" } else { if c == 9 { "\\t" } else { if c == 13 { "\\r" } else { if c == 92 { "\\\\" } else { if c == 34 { "\\\"" } else { "" } } } } }
+    if esc == "" { quote_loop(s, i + 1, from, b) } else {
+      quote_loop(s, i + 1, i + 1, buffer.push(buffer.push(b, string.slice(s, from, i)), esc))
+    }
+  }
+}
+fn diag_lines(ds: List(ParseDiag), b: Buffer) -> Buffer {
+  match ds {
+    Nil -> b
+    Cons(ParseDiag(code, x, y, m), rest) -> {
+      let b = buffer.push(b, "error " <> code <> " " <> its(x) <> " " <> its(y) <> " \"")
+      diag_lines(rest, buffer.push(quote_loop(m, 0, 0, b), "\"\n"))
+    }
+  }
+}
+fn texts_joined(ts: List(String), b: Buffer, first: Bool) -> Buffer {
+  match ts {
+    Nil -> b
+    Cons(t, rest) -> texts_joined(rest, buffer.push(if first { b } else { buffer.push(b, "\n") }, t), False)
+  }
+}
+pub fn resolve_dump(file: String, std: String) -> String {
+  let text = io.read_file(file)
+  match parse.parse_full(text) {
+    ParsedSource(root, pds, _) -> {
+      let ls = LS(Cons(text, Nil), string.length(text) + 1, Nil, Nil, Nil, rev(pds), root_dir(file), std)
+      match load_unit(ls, root_path(file), root) {
+        LS(texts, _, us, _, _, ds, _, _) -> {
+          let us = rev(us)
+          let ds = grants(us, us, 0, ds)
+          match merge(us, ds) {
+            Merged(m, ds, rf) -> {
+              let merged = buffer.finish(texts_joined(rev(texts), buffer.new(), True))
+              let tree = parse.dump_tree(m, merged)
+              let out = buffer.push(buffer.new(), tree)
+              let out = diag_lines(rev(ds), out)
+              buffer.finish(diag_lines(r3(resolve_check(m), rf), out))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// `--tables`: the builtin tables, one a line, for their Rust twins' test.
+fn table_line(name: String, xs: List(String)) -> String { name <> ":" <> join_loop(xs, " ", "") <> "\n" }
+fn tables() -> String {
+  table_line("builtins", builtin_names()) <> table_line("INT_BINARY_BUILTINS", int_binary_builtins()) <>
+  table_line("FLOAT_CONVERSIONS", float_conversions()) <> table_line("STRING_BUILTINS", string_builtins()) <>
+  table_line("BUFFER_BUILTINS", buffer_builtins()) <> table_line("ARRAY_BUILTINS", array_builtins()) <>
+  table_line("IO_BUILTINS", io_builtins()) <> table_line("BUILTIN_MODULES", builtin_modules()) <>
+  table_line("STD_SOURCES", std_modules())
+}
+
+pub fn main() / {IO} {
+  let result = if io.arg_count() > 2 && io.arg(2) == "--tables" { tables() } else { resolve_dump(io.arg(0), io.arg(1)) }
+  io.println(string.slice(result, 0, string.length(result) - 1))
+}
