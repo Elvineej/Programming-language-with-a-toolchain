@@ -1,0 +1,392 @@
+// The back end in Elya, stage B1 (spec
+// docs/superpowers/specs/2026-11-27-elya-backend-in-elya-design.md D6):
+// first-order `Int`, `Bool` and `Unit` programs, written as LLVM IR text
+// that `clang` compiles with the runtime the Rust back end links
+// (crates/codegen/src/runtime.c). Checked by running both programs (D2).
+//
+// Values as the Rust back end lays them out (D4): `Int` and `Unit` an `i64`,
+// `Bool` an `i1`, a `String` a `ptr` the runtime made. Every function is
+// `tailcc` and a call in tail position `musttail` (D5). Anything outside the
+// stage is refused by name before any IR is written.
+import parse / {IO}
+import check / {IO}
+import core / {IO}
+
+fn rev_onto(xs: List(a), acc: List(a)) -> List(a) {
+  match xs { Nil -> acc  Cons(x, rest) -> rev_onto(rest, Cons(x, acc)) }
+}
+fn rev(xs: List(a)) -> List(a) { rev_onto(xs, Nil) }
+
+// ---- Types ------------------------------------------------------------------
+
+type LTy { LI64, LI1, LPtr, LNone }
+fn lt_of(t: Ty) -> LTy {
+  match t {
+    TB(0) -> LI64
+    TB(2) -> LI1
+    TB(4) -> LI64
+    TB(3) -> LPtr
+    _ -> LNone
+  }
+}
+fn lt_text(t: LTy) -> String {
+  match t { LI64 -> "i64"  LI1 -> "i1"  LPtr -> "ptr"  LNone -> "?" }
+}
+
+// ---- Refusal: the stage's fragment -----------------------------------------
+
+type Stage { InStage, Outside(String) }
+fn first(a: Stage, b: Stage) -> Stage { match a { InStage -> b  Outside(w) -> Outside(w) } }
+fn ty_ok(t: Ty) -> Stage { match lt_of(t) { LNone -> Outside("a value of a type outside the stage")  LPtr -> match t { TB(3) -> InStage  _ -> Outside("a type outside the stage") }  _ -> InStage } }
+fn builtin_ok(n: String) -> Stage {
+  if n == "io.println" || n == "int.to_string" { InStage } else { Outside("builtin " <> n) }
+}
+fn prim_ok(op: String) -> Stage {
+  if op == "Add" || op == "Sub" || op == "Mul" || op == "Div" || op == "Rem" || op == "Eq" || op == "Ne" || op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" { InStage } else { Outside("operator " <> op) }
+}
+fn has_fn(fs: List(CFn), n: String) -> Bool {
+  match fs { Nil -> False  Cons(CFn(m, _, _), rest) -> m == n || has_fn(rest, n) }
+}
+fn has(xs: List(String), x: String) -> Bool { match xs { Nil -> False  Cons(y, rest) -> y == x || has(rest, x) } }
+fn param_names(ps: List(CParam), acc: List(String)) -> List(String) {
+  match ps { Nil -> acc  Cons(CParam(n, _), rest) -> param_names(rest, Cons(n, acc)) }
+}
+fn check_all(fs: List(CFn), locals: List(String), xs: List(CExpr)) -> Stage {
+  match xs { Nil -> InStage  Cons(x, rest) -> first(check_expr(fs, locals, x), check_all(fs, locals, rest)) }
+}
+fn eq_operand(op: String, x: CExpr) -> Stage {
+  match x {
+    CExpr(_, _, t, _) -> if (op == "Eq" || op == "Ne") { match t { TB(0) -> InStage  TB(2) -> InStage  TB(4) -> InStage  _ -> Outside("== on a type outside the stage") } } else {
+      if op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" { match t { TB(0) -> InStage  _ -> Outside("an ordering of a type outside the stage") } } else { InStage }
+    }
+  }
+}
+fn check_expr(fs: List(CFn), locals: List(String), e: CExpr) -> Stage {
+  match e {
+    CExpr(_, _, t, k) -> first(ty_ok(t), match k {
+      KLit(LStr(_)) -> InStage
+      KLit(_) -> InStage
+      KVar(n) -> if has(locals, n) { InStage } else { Outside("a function used as a value") }
+      KApp(CExpr(_, _, _, KVar(n)), args) -> if has(locals, n) || !has_fn(fs, n) { Outside("a call of a local") } else { check_all(fs, locals, args) }
+      KApp(_, _) -> Outside("a computed callee")
+      KBuiltin(n, args) -> first(builtin_ok(n), check_all(fs, locals, args))
+      KPrim(op, args) -> first(prim_ok(op), first(match args { Cons(x, _) -> eq_operand(op, x)  Nil -> InStage }, check_all(fs, locals, args)))
+      KLet(n, v, b) -> first(check_expr(fs, locals, v), check_expr(fs, Cons(n, locals), b))
+      KIf(c, a, b) -> first(check_expr(fs, locals, c), first(check_expr(fs, locals, a), check_expr(fs, locals, b)))
+      KCtor(_, _) -> Outside("a constructor")
+      KLambda(_, _) -> Outside("a lambda")
+      KMatch(_, _) -> Outside("a match")
+      KHandle(_, _, _, _) -> Outside("a handler")
+      KResume(_) -> Outside("a resume")
+      KPerform(_, _, _, _) -> Outside("an effect operation")
+    })
+  }
+}
+fn check_params(ps: List(CParam)) -> Stage {
+  match ps { Nil -> InStage  Cons(CParam(_, t), rest) -> first(ty_ok(t), check_params(rest)) }
+}
+fn check_fns(all: List(CFn), fs: List(CFn)) -> Stage {
+  match fs {
+    Nil -> match main_type(all) { LI64 -> InStage  LI1 -> InStage  _ -> Outside("`main` of a type outside the stage") }
+    Cons(CFn(_, ps, body), rest) -> first(check_params(ps), first(check_expr(all, param_names(ps, Nil), body), check_fns(all, rest)))
+  }
+}
+fn main_type(fs: List(CFn)) -> LTy {
+  match fs { Nil -> LNone  Cons(CFn(n, _, CExpr(_, _, t, _)), rest) -> if n == "main" { lt_of(t) } else { main_type(rest) } }
+}
+fn check_module(m: CModule) -> Stage {
+  match m { CModule(ts, fs) -> match ts { Nil -> check_fns(fs, fs)  _ -> Outside("a declared type") } }
+}
+
+// ---- Emission state ---------------------------------------------------------
+
+// The function's lines so far (newest first), the next fresh number, the
+// current block's label, and the module's string constants (newest first).
+type SConst { SConst(String, String) }
+linear type Emit { Emit(Buffer, Int, String, List(SConst), Int) }
+type Val { Val(String, LTy) }
+linear type Gotv { Gotv(Val, Emit) }
+type EBind { EBind(String, Val) }
+type ESig { ESig(String, List(LTy), LTy) }
+
+fn line(em: Emit, s: String) -> Emit {
+  match em { Emit(b, n, l, ss, k) -> Emit(buffer.push(b, "  " <> s <> "\n"), n, l, ss, k) }
+}
+fn fresh(em: Emit) -> Fresh1 {
+  match em { Emit(b, n, l, ss, k) -> Fresh1("%t" <> int.to_string(n), Emit(b, n + 1, l, ss, k)) }
+}
+linear type Fresh1 { Fresh1(String, Emit) }
+fn new_label(em: Emit) -> Fresh1 {
+  match em { Emit(b, n, l, ss, k) -> Fresh1("L" <> int.to_string(n), Emit(b, n + 1, l, ss, k)) }
+}
+fn start_block(em: Emit, label: String) -> Emit {
+  match em { Emit(b, n, _, ss, k) -> Emit(buffer.push(b, label <> ":\n"), n, label, ss, k) }
+}
+fn label_of(em: Emit) -> AtLabel {
+  match em { Emit(b, n, l, ss, k) -> AtLabel(l, Emit(b, n, l, ss, k)) }
+}
+linear type AtLabel { AtLabel(String, Emit) }
+
+fn lookup(env: List(EBind), n: String) -> Val {
+  match env { Nil -> Val("undef", LI64)  Cons(EBind(m, v), rest) -> if m == n { v } else { lookup(rest, n) } }
+}
+fn sig_of(sigs: List(ESig), n: String) -> ESig {
+  match sigs { Nil -> ESig(n, Nil, LI64)  Cons(ESig(m, ps, r), rest) -> if m == n { ESig(m, ps, r) } else { sig_of(rest, n) } }
+}
+
+// ---- Expressions ------------------------------------------------------------
+
+fn ty_lt(e: CExpr) -> LTy { match e { CExpr(_, _, t, _) -> lt_of(t) } }
+
+fn lit_value(l: CLit) -> String {
+  match l { LInt(n) -> int.to_string(n)  LBool(b) -> if b { "true" } else { "false" }  LUnit -> "0"  _ -> "0" }
+}
+
+// A string literal: a private constant of its bytes, made a runtime string
+// by `elya_str_lit` (the string tag, the bytes, their length).
+fn hex_digit(n: Int) -> String { string.slice("0123456789ABCDEF", n, n + 1) }
+fn ir_bytes(s: String, i: Int, from: Int, b: Buffer) -> Buffer {
+  if i >= string.length(s) { buffer.push(b, string.slice(s, from, i)) } else {
+    let c = string.byte_at(s, i)
+    if c < 32 || c > 126 || c == 34 || c == 92 {
+      ir_bytes(s, i + 1, i + 1, buffer.push(buffer.push(b, string.slice(s, from, i)), "\\" <> hex_digit(c / 16) <> hex_digit(c % 16)))
+    } else { ir_bytes(s, i + 1, from, b) }
+  }
+}
+fn str_lit(em: Emit, v: String) -> Gotv {
+  match em {
+    Emit(b, n, l, ss, k) -> {
+      let name = "@.str." <> int.to_string(k)
+      match fresh(Emit(b, n, l, Cons(SConst(name, v), ss), k + 1)) {
+        Fresh1(t, em2) -> Gotv(Val(t, LPtr), line(em2, t <> " = call ptr @elya_str_lit(i64 0, ptr " <> name <> ", i64 " <> int.to_string(string.length(v)) <> ")"))
+      }
+    }
+  }
+}
+
+linear type Gotvs { Gotvs(List(Val), Emit) }
+fn emit_args(sigs: List(ESig), env: List(EBind), xs: List(CExpr), em: Emit, acc: List(Val)) -> Gotvs {
+  match xs {
+    Nil -> Gotvs(rev(acc), em)
+    Cons(x, rest) -> match emit(sigs, env, x, em) { Gotv(v, em2) -> emit_args(sigs, env, rest, em2, Cons(v, acc)) }
+  }
+}
+fn arg_list(vs: List(Val)) -> String {
+  match vs { Nil -> ""  Cons(Val(s, t), Nil) -> lt_text(t) <> " " <> s  Cons(Val(s, t), rest) -> lt_text(t) <> " " <> s <> ", " <> arg_list(rest) }
+}
+
+// A check that stops the program through the runtime when `cond` holds.
+fn trap(em: Emit, cond: String, fail: String) -> Emit {
+  match new_label(em) {
+    Fresh1(bad, em2) -> match new_label(em2) {
+      Fresh1(ok, em3) -> start_block(line(line(start_block(line(em3, "br i1 " <> cond <> ", label %" <> bad <> ", label %" <> ok), bad), "call void @" <> fail <> "()"), "unreachable"), ok)
+    }
+  }
+}
+fn checked(em: Emit, intr: String, a: String, b: String) -> Gotv {
+  match fresh(em) {
+    Fresh1(pair, em2) -> match fresh(line(em2, pair <> " = call { i64, i1 } @llvm." <> intr <> ".with.overflow.i64(i64 " <> a <> ", i64 " <> b <> ")")) {
+      Fresh1(v, em3) -> match fresh(line(em3, v <> " = extractvalue { i64, i1 } " <> pair <> ", 0")) {
+        Fresh1(o, em4) -> Gotv(Val(v, LI64), trap(line(em4, o <> " = extractvalue { i64, i1 } " <> pair <> ", 1"), o, "elya_int_overflow"))
+      }
+    }
+  }
+}
+fn assign(em: Emit, rhs: String, t: LTy) -> Gotv {
+  match fresh(em) { Fresh1(v, em2) -> Gotv(Val(v, t), line(em2, v <> " = " <> rhs)) }
+}
+fn prim(op: String, a: Val, b: Val, em: Emit) -> Gotv {
+  match a {
+    Val(x, at) -> match b {
+      Val(y, _) -> if op == "Add" { checked(em, "sadd", x, y) } else { if op == "Sub" { checked(em, "ssub", x, y) } else { if op == "Mul" { checked(em, "smul", x, y) } else {
+        if op == "Div" {
+          match fresh(em) {
+            Fresh1(z, em2) -> match fresh(trap(line(em2, z <> " = icmp eq i64 " <> y <> ", 0"), z, "elya_div_zero")) {
+              Fresh1(mn, em3) -> match fresh(line(em3, mn <> " = icmp eq i64 " <> x <> ", -9223372036854775808")) {
+                Fresh1(m1, em4) -> match fresh(line(em4, m1 <> " = icmp eq i64 " <> y <> ", -1")) {
+                  Fresh1(ov, em5) -> assign(trap(line(em5, ov <> " = and i1 " <> mn <> ", " <> m1), ov, "elya_int_overflow"), "sdiv i64 " <> x <> ", " <> y, LI64)
+                }
+              }
+            }
+          }
+        } else { if op == "Rem" {
+          match fresh(em) {
+            Fresh1(z, em2) -> match fresh(trap(line(em2, z <> " = icmp eq i64 " <> y <> ", 0"), z, "elya_rem_zero")) {
+              Fresh1(m1, em3) -> match fresh(line(em3, m1 <> " = icmp eq i64 " <> y <> ", -1")) {
+                Fresh1(d, em4) -> assign(line(em4, d <> " = select i1 " <> m1 <> ", i64 1, i64 " <> y), "srem i64 " <> x <> ", " <> d, LI64)
+              }
+            }
+          }
+        } else {
+          let cc = if op == "Eq" { "eq" } else { if op == "Ne" { "ne" } else { if op == "Lt" { "slt" } else { if op == "Le" { "sle" } else { if op == "Gt" { "sgt" } else { "sge" } } } } }
+          assign(em, "icmp " <> cc <> " " <> lt_text(at) <> " " <> x <> ", " <> y, LI1)
+        } }
+      } } }
+    }
+  }
+}
+
+fn emit(sigs: List(ESig), env: List(EBind), e: CExpr, em: Emit) -> Gotv {
+  match e {
+    CExpr(_, _, t, k) -> match k {
+      KLit(LStr(v)) -> str_lit(em, v)
+      KLit(l) -> Gotv(Val(lit_value(l), lt_of(t)), em)
+      KVar(n) -> Gotv(lookup(env, n), em)
+      KLet(n, v, b) -> match emit(sigs, env, v, em) { Gotv(val, em2) -> emit(sigs, Cons(EBind(n, val), env), b, em2) }
+      KPrim(op, Cons(a, Cons(b, Nil))) -> match emit(sigs, env, a, em) {
+        Gotv(va, em2) -> match emit(sigs, env, b, em2) { Gotv(vb, em3) -> prim(op, va, vb, em3) }
+      }
+      KBuiltin(n, args) -> match emit_args(sigs, env, args, em, Nil) {
+        Gotvs(vs, em2) -> if n == "int.to_string" { assign(em2, "call ptr @elya_int_to_string(i64 0, " <> arg_list(vs) <> ")", LPtr) } else {
+          Gotv(Val("0", LI64), line(em2, "call void @elya_println(" <> arg_list(vs) <> ")"))
+        }
+      }
+      KApp(CExpr(_, _, _, KVar(f)), args) -> match emit_args(sigs, env, args, em, Nil) {
+        Gotvs(vs, em2) -> match sig_of(sigs, f) { ESig(_, _, r) -> assign(em2, "call tailcc " <> lt_text(r) <> " @elya." <> f <> "(" <> arg_list(vs) <> ")", r) }
+      }
+      KIf(c, a, b) -> match emit(sigs, env, c, em) {
+        Gotv(Val(cv, _), em2) -> match new_label(em2) {
+          Fresh1(lt, em3) -> match new_label(em3) {
+            Fresh1(lf, em4) -> match new_label(em4) {
+              Fresh1(lj, em5) -> match emit(sigs, env, a, start_block(line(em5, "br i1 " <> cv <> ", label %" <> lt <> ", label %" <> lf), lt)) {
+                Gotv(Val(av, _), em6) -> match label_of(em6) {
+                  AtLabel(la, em7) -> match emit(sigs, env, b, start_block(line(em7, "br label %" <> lj), lf)) {
+                    Gotv(Val(bv, _), em8) -> match label_of(em8) {
+                      AtLabel(lb, em9) -> assign(start_block(line(em9, "br label %" <> lj), lj), "phi " <> lt_text(lt_of(t)) <> " [ " <> av <> ", %" <> la <> " ], [ " <> bv <> ", %" <> lb <> " ]", lt_of(t))
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      _ -> Gotv(Val("undef", LI64), em)
+    }
+  }
+}
+
+// An expression in tail position: its value returned, a call of a function
+// `musttail` (the caller's and the callee's results are one type there).
+fn emit_tail(sigs: List(ESig), env: List(EBind), e: CExpr, em: Emit, r: LTy) -> Emit {
+  match e {
+    CExpr(_, _, t, k) -> match k {
+      KLet(n, v, b) -> match emit(sigs, env, v, em) { Gotv(val, em2) -> emit_tail(sigs, Cons(EBind(n, val), env), b, em2, r) }
+      KIf(c, a, b) -> match emit(sigs, env, c, em) {
+        Gotv(Val(cv, _), em2) -> match new_label(em2) {
+          Fresh1(lt, em3) -> match new_label(em3) {
+            Fresh1(lf, em4) -> emit_tail(sigs, env, b, start_block(emit_tail(sigs, env, a, start_block(line(em4, "br i1 " <> cv <> ", label %" <> lt <> ", label %" <> lf), lt), r), lf), r)
+          }
+        }
+      }
+      KApp(CExpr(_, _, _, KVar(f)), args) -> match emit_args(sigs, env, args, em, Nil) {
+        Gotvs(vs, em2) -> match fresh(em2) {
+          Fresh1(v, em3) -> line(line(em3, v <> " = musttail call tailcc " <> lt_text(r) <> " @elya." <> f <> "(" <> arg_list(vs) <> ")"), "ret " <> lt_text(r) <> " " <> v)
+        }
+      }
+      _ -> match emit(sigs, env, e, em) { Gotv(Val(v, _), em2) -> line(em2, "ret " <> lt_text(r) <> " " <> v) }
+    }
+  }
+}
+
+// ---- Functions and the module ----------------------------------------------
+
+fn param_lts(ps: List(CParam)) -> List(LTy) {
+  match ps { Nil -> Nil  Cons(CParam(_, t), rest) -> Cons(lt_of(t), param_lts(rest)) }
+}
+fn sigs_of(fs: List(CFn)) -> List(ESig) {
+  match fs { Nil -> Nil  Cons(CFn(n, ps, CExpr(_, _, t, _)), rest) -> Cons(ESig(n, param_lts(ps), lt_of(t)), sigs_of(rest)) }
+}
+type Hdr { Hdr(String, List(EBind)) }
+fn header(ps: List(CParam), i: Int, text: String, env: List(EBind)) -> Hdr {
+  match ps {
+    Nil -> Hdr(text, env)
+    Cons(CParam(n, t), rest) -> {
+      let v = "%p" <> int.to_string(i)
+      header(rest, i + 1, if i == 0 { lt_text(lt_of(t)) <> " " <> v } else { text <> ", " <> lt_text(lt_of(t)) <> " " <> v }, Cons(EBind(n, Val(v, lt_of(t))), env))
+    }
+  }
+}
+fn emit_fns(sigs: List(ESig), fs: List(CFn), em: Emit) -> Emit {
+  match fs {
+    Nil -> em
+    Cons(CFn(n, ps, body), rest) -> match header(ps, 0, "", Nil) {
+      Hdr(text, env) -> {
+        let r = ty_lt(body)
+        match em {
+          Emit(b, k, _, ss, sk) -> {
+            let em2 = Emit(buffer.push(b, "define tailcc " <> lt_text(r) <> " @elya." <> n <> "(" <> text <> ") {\nentry:\n"), k, "entry", ss, sk)
+            match emit_tail(sigs, env, body, em2, r) {
+              Emit(b2, k2, l2, ss2, sk2) -> emit_fns(sigs, rest, Emit(buffer.push(b2, "}\n\n"), k2, l2, ss2, sk2))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+fn emit_strs(ss: List(SConst), b: Buffer) -> Buffer {
+  match ss {
+    Nil -> b
+    Cons(SConst(name, v), rest) -> emit_strs(rest, buffer.push(ir_bytes(v, 0, 0, buffer.push(b, name <> " = private unnamed_addr constant [" <> int.to_string(string.length(v)) <> " x i8] c\"")), "\"\n"))
+  }
+}
+fn prelude() -> String {
+  "; The back end in Elya, stage B1.\n" <>
+  "@.gc_desc = private unnamed_addr constant [4 x i64] [i64 0, i64 0, i64 -1, i64 0]\n" <>
+  "@.eq_float = private unnamed_addr constant [1 x i64] zeroinitializer\n" <>
+  "declare ptr @elya_str_lit(i64, ptr, i64)\n" <>
+  "declare ptr @elya_int_to_string(i64, i64)\n" <>
+  "declare void @elya_println(ptr)\n" <>
+  "declare void @elya_int_overflow()\n" <>
+  "declare void @elya_div_zero()\n" <>
+  "declare void @elya_rem_zero()\n" <>
+  "declare void @elya_gc_init(ptr, i64)\n" <>
+  "declare void @elya_eq_init(ptr, i64)\n" <>
+  "declare void @elya_args_init(i32, ptr)\n" <>
+  "declare i64 @elya_start(ptr)\n" <>
+  "declare void @elya_main_int(i64)\n" <>
+  "declare void @elya_gc_report()\n" <>
+  "declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)\n" <>
+  "declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)\n" <>
+  "declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)\n\n"
+}
+// The entry: `main`'s value printed as the Rust back end prints it, an
+// `Int` (or `Unit`, 0) by `elya_main_int` after the program, a `Bool` by
+// name.
+fn entry(main_lt: LTy) -> String {
+  "@.true = private unnamed_addr constant [4 x i8] c\"True\"\n@.false = private unnamed_addr constant [5 x i8] c\"False\"\n\n" <>
+  "define i64 @elya_entry() {\nentry:\n  %v = call tailcc " <> lt_text(main_lt) <> " @elya.main()\n" <>
+  (if main_lt == LI1 {
+    "  %t = call ptr @elya_str_lit(i64 0, ptr @.true, i64 4)\n  %f = call ptr @elya_str_lit(i64 0, ptr @.false, i64 5)\n  %s = select i1 %v, ptr %t, ptr %f\n  call void @elya_println(ptr %s)\n  ret i64 0\n}\n\n"
+  } else { "  ret i64 %v\n}\n\n" }) <>
+  "define i32 @main(i32 %0, ptr %1) {\nentry:\n  call void @elya_gc_init(ptr @.gc_desc, i64 2)\n  call void @elya_eq_init(ptr @.eq_float, i64 0)\n" <>
+  "  call void @elya_args_init(i32 %0, ptr %1)\n  %v = call i64 @elya_start(ptr @elya_entry)\n" <>
+  (if main_lt == LI1 { "" } else { "  call void @elya_main_int(i64 %v)\n" }) <>
+  "  call void @elya_gc_report()\n  ret i32 0\n}\n"
+}
+
+pub fn emit_module(m: CModule) -> String {
+  match m {
+    CModule(_, fs) -> {
+      let sigs = sigs_of(fs)
+      match emit_fns(sigs, fs, Emit(buffer.new(), 0, "entry", Nil, 0)) {
+        Emit(body, _, _, ss, _) -> buffer.finish(buffer.push(emit_strs(rev(ss), buffer.push(buffer.new(), prelude())), buffer.finish(body) <> entry(match sig_of(sigs, "main") { ESig(_, _, r) -> r })))
+      }
+    }
+  }
+}
+
+pub fn main() / {IO} {
+  let text = io.read_file(io.arg(0))
+  match parse.parse_tree(text) {
+    Parsed(m, _) -> match core.lower(m, string.length(text)) {
+      Refused(w) -> io.println("unsupported " <> w)
+      Ok(cm) -> match check_module(cm) {
+        Outside(w) -> io.println("unsupported " <> w)
+        InStage -> io.println(emit_module(cm))
+      }
+    }
+    ParseError(_, _, _) -> Unit
+  }
+}

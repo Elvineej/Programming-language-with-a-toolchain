@@ -18,9 +18,19 @@ count, Windows CI, then `main`.
    (the dump has no spans). First run: all 358 corpus programs agreed.
    Natively the pass takes 87 ms on selfhost/lex.elya against Rust's 9 ms
    (the checker dominates, as it does for `check --dump`).
-2. [ ] **B1**: first-order `Int`/`Bool`/`Unit` programs, emission as text
-   (`selfhost/emit.elya`), the harness that links the IR with the runtime
-   and runs both programs (D2). Needs a classifier for the fragment.
+2. [x] **B1** (2026-11-27): first-order `Int`/`Bool`/`Unit` programs and
+   string literals printed (`selfhost/emit.elya`, importing Core in Elya).
+   The harness, crates/codegen/tests/selfhost_backend.rs, builds the back
+   end natively, runs it on every corpus program without imports, and for
+   each it does not refuse links the IR with the runtime (`clang` takes the
+   `.ll` in place of an object) and runs it beside the Rust-built program:
+   standard output, standard error and the exit code compared. 35 corpus
+   programs and 16 focused ones agree (the traps: overflow, zero
+   divisors, `MIN / -1`; a hundred million tail calls); 669 are refused by
+   name. Controls D1-D9 in the test's header, all caught (D3, D5 and D7
+   after focused programs were added for them). `main`'s value is printed
+   as the Rust back end prints it: an `Int` or `Unit` by `elya_main_int`, a
+   `Bool` by name.
 3. [ ] **B2-B3**: strings and builtins; ground ADTs and `match` (pattern
    flattening in `selfhost/lower.elya`).
 4. [ ] **B4**: monomorphization (`selfhost/mono.elya`).
