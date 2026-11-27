@@ -72,7 +72,7 @@ Rust, written in section 3 here, as the parser's spec does.
 
 ## 3. Measured after
 
-`selfhost/resolve.elya` (1,160 lines) imports the parser in Elya, which gains
+`selfhost/resolve.elya` (1,169 lines) imports the parser in Elya, which gains
 two public functions for it (`parse_full`, the tree and every diagnostic;
 `dump_tree`). Each imported file is parsed at offset 0 and its tree and
 diagnostics shifted to its base; the merged text is the files' texts joined
