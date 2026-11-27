@@ -6,17 +6,21 @@
 //! builtin tables are their Rust twins (D3).
 //!
 //! Negative controls, each run on selfhost/resolve.elya, reverted and
-//! compared byte for byte (`cmp`), with the first program each failed on:
+//! compared byte for byte (`cmp`); each failed this test and the native
+//! one (crates/codegen/tests/selfhost_resolve.rs), first on the program named
+//! (the evaluator's workers take the largest programs first):
 //! K1, a shadowed reference renamed anyway (`rw_var` asking the unit's
-//! functions before the scopes): the corpus has no multi-file program, so
-//! the first is tests/any_handler.rs's (a test's root over its files),
-//! where a parameter named like a module function was renamed.
-//! K2, the R3 filter dropped (`r3` keeping every diagnostic): tests/modules.rs
-//! (E0201 after E0600 for `nope.f()`).
-//! K3, the two passes' diagnostics in the other order: the first corpus
-//! program with both (tests/modules.rs).
-//! (The programs each control failed on first are recorded in the plan's
-//! step 2.)
+//! functions before the scopes): here delete-token-380-from-
+//! examples/08_timers.elya, natively examples/06_structured.elya (`step`, a
+//! parameter of `elya/async`, renamed `elya.async.step`).
+//! K2, the R3 filter dropped (`r3` keeping every diagnostic): here
+//! delete-token-23988-from-selfhost/check.elya, natively selfhost/check.elya
+//! (E0201 for `parse.parse_tree` after E0600 for `import parse`).
+//! K3, the two passes' diagnostics in the other order: the same two
+//! programs (resolution's E0200 printed before the parse and module
+//! diagnostics).
+//! The focused set has a program for each besides (shadowing by every kind
+//! of binder; a refused name; both passes in one program).
 
 #[path = "support/selfhost_parse.rs"]
 mod parse_support;
