@@ -81,5 +81,12 @@ count, Windows CI, then `main`.
    instances drop effect rows, which do not change a value's layout (a
    generic function's row variable left one in). 82 corpus programs and
    40 focused ones agree; controls H2-H4 and H6 in the header.
-7. [ ] **B6-B8**: arrays, buffers, `io.*`; imports (after part 4c); the
-   self-hosted sources themselves.
+7. [x] **B6** (2026-11-27): `Array` (traced, with its own tag after the
+   string's, when its elements are heap values; else the string's tag,
+   traced nowhere, as the Rust back end makes them), `Buffer`, and `io.*`
+   (files, standard input, arguments), each call that may allocate rooted.
+   101 corpus programs (selfhost/lex.elya among them) and 46 focused ones
+   agree; controls I1 and I3-I5 in the header.
+8. [ ] **B7-B8**: imports (the merged module; after part 4c), then the
+   self-hosted sources built by the back end in Elya agreeing with their
+   Rust-built twins on their whole corpus.

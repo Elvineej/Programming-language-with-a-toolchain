@@ -27,8 +27,6 @@ fn lt_of(t: Ty) -> LTy {
     TB(2) -> LI1
     TB(4) -> LI64
     TB(3) -> LPtr
-    TCon("Buffer", _) -> LNone
-    TCon("Array", _) -> LNone
     TCon(_, _) -> LPtr
     TFn(_, _, _) -> LPtr
     _ -> LNone
@@ -43,10 +41,11 @@ fn lt_text(t: LTy) -> String {
 type Stage { InStage, Outside(String) }
 fn first(a: Stage, b: Stage) -> Stage { match a { InStage -> b  Outside(w) -> Outside(w) } }
 fn ty_ok(t: Ty) -> Stage { match lt_of(t) { LNone -> Outside("a value of a type outside the stage")  LPtr -> InStage  _ -> InStage } }
+fn builtins() -> List(String) {
+  Cons("io.println", Cons("int.to_string", Cons("string.length", Cons("string.byte_at", Cons("string.slice", Cons("int.wrapping_add", Cons("int.wrapping_sub", Cons("int.wrapping_mul", Cons("int.and", Cons("int.or", Cons("int.xor", Cons("int.shl", Cons("int.shr", Cons("int.ushr", Cons("array.new", Cons("array.push", Cons("array.set", Cons("array.get", Cons("array.length", Cons("buffer.new", Cons("buffer.push", Cons("buffer.finish", Cons("buffer.length", Cons("io.read_file", Cons("io.file_exists", Cons("io.write_file", Cons("io.read_stdin", Cons("io.arg_count", Cons("io.arg", Nil)))))))))))))))))))))))))))))
+}
 fn builtin_ok(n: String) -> Stage {
-  if has(Cons("io.println", Cons("int.to_string", Cons("string.length", Cons("string.byte_at", Cons("string.slice",
-    Cons("int.wrapping_add", Cons("int.wrapping_sub", Cons("int.wrapping_mul", Cons("int.and", Cons("int.or", Cons("int.xor",
-    Cons("int.shl", Cons("int.shr", Cons("int.ushr", Nil)))))))))))))), n) { InStage } else { Outside("builtin " <> n) }
+  if has(builtins(), n) { InStage } else { Outside("builtin " <> n) }
 }
 fn prim_ok(op: String) -> Stage {
   if op == "Add" || op == "Sub" || op == "Mul" || op == "Div" || op == "Rem" || op == "Eq" || op == "Ne" || op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" || op == "Concat" { InStage } else { Outside("operator " <> op) }
@@ -310,9 +309,15 @@ fn prim(cx: ECx, env: List(EBind), pend: List(Val), op: String, is_str: Bool, a:
   }
 }
 
-fn builtin(cx: ECx, env: List(EBind), pend: List(Val), n: String, vs: List(Val), em: Emit) -> Gotv {
+// An array's words: a traced array (its own tag, after the string's) when
+// its elements are heap values, else the string's tag, traced nowhere.
+fn elem_of(t: Ty) -> Ty { match t { TCon("Array", Cons(e, _)) -> e  _ -> TB(0) } }
+fn array_tag(cx: ECx, t: Ty) -> String { match cx { ECx(_, _, st) -> int.to_string(if lt_of(elem_of(t)) == LPtr { st + 1 } else { st }) } }
+fn builtin(cx: ECx, env: List(EBind), pend: List(Val), n: String, args: List(CExpr), t: Ty, vs: List(Val), em: Emit) -> Gotv {
   let a = vtext(nth(vs, 0))
   let b = vtext(nth(vs, 1))
+  let rs = roots(env, pend, vs)
+  if string.slice(n, 0, 3) == "arr" || string.slice(n, 0, 3) == "buf" || string.slice(n, 0, 3) == "io." && n != "io.println" { io_data(cx, rs, n, args, t, vs, em) } else {
   if n == "int.to_string" { rooted(em, roots(env, pend, vs), "call ptr @elya_int_to_string(i64 " <> stag(cx) <> ", i64 " <> a <> ")", LPtr) } else {
   if n == "io.println" { rooted(em, roots(env, pend, vs), "call void @elya_println(ptr " <> a <> ")", LNone) } else {
   if n == "string.length" { assign(em, "call i64 @elya_str_length(ptr " <> a <> ")", LI64) } else {
@@ -325,7 +330,27 @@ fn builtin(cx: ECx, env: List(EBind), pend: List(Val), n: String, vs: List(Val),
   if n == "int.or" { assign(em, "or i64 " <> a <> ", " <> b, LI64) } else {
   if n == "int.xor" { assign(em, "xor i64 " <> a <> ", " <> b, LI64) } else {
   if n == "int.shl" { shift(em, "shl", "shl", a, b) } else {
-  if n == "int.shr" { shift(em, "shr", "ashr", a, b) } else { shift(em, "ushr", "lshr", a, b) } } } } } } } } } } } } }
+  if n == "int.shr" { shift(em, "shr", "ashr", a, b) } else { shift(em, "ushr", "lshr", a, b) } } } } } } } } } } } } } }
+}
+fn arg_ty(args: List(CExpr)) -> Ty { match args { Cons(CExpr(_, _, t, _), _) -> t  Nil -> TB(4) } }
+fn io_data(cx: ECx, rs: List(String), n: String, args: List(CExpr), t: Ty, vs: List(Val), em: Emit) -> Gotv {
+  let a = vtext(nth(vs, 0))
+  let b = vtext(nth(vs, 1))
+  let st = stag(cx)
+  if n == "array.new" { rooted(em, rs, "call ptr @elya_array_new(i64 " <> array_tag(cx, t) <> ")", LPtr) } else {
+  if n == "array.push" { match to_word(em, nth(vs, 1)) { Gotv(Val(w, _), em2) -> rooted(em2, rs, "call ptr @elya_array_push(ptr " <> a <> ", i64 " <> w <> ")", LPtr) } } else {
+  if n == "array.set" { match to_word(em, nth(vs, 2)) { Gotv(Val(w, _), em2) -> rooted(em2, rs, "call ptr @elya_array_set(ptr " <> a <> ", i64 " <> b <> ", i64 " <> w <> ")", LPtr) } } else {
+  if n == "array.get" { match assign(em, "call i64 @elya_array_get(ptr " <> a <> ", i64 " <> b <> ")", LI64) { Gotv(Val(w, _), em2) -> from_word(em2, w, lt_of(t)) } } else {
+  if n == "array.length" || n == "buffer.length" { assign(em, "call i64 @elya_array_length(ptr " <> a <> ")", LI64) } else {
+  if n == "buffer.new" { rooted(em, rs, "call ptr @elya_buffer_new(i64 " <> st <> ")", LPtr) } else {
+  if n == "buffer.push" { rooted(em, rs, "call ptr @elya_buffer_push(i64 " <> st <> ", ptr " <> a <> ", ptr " <> b <> ")", LPtr) } else {
+  if n == "buffer.finish" { rooted(em, rs, "call ptr @elya_buffer_finish(i64 " <> st <> ", ptr " <> a <> ")", LPtr) } else {
+  if n == "io.read_file" { rooted(em, rs, "call ptr @elya_io_read_file(i64 " <> st <> ", ptr " <> a <> ")", LPtr) } else {
+  if n == "io.file_exists" { match assign(em, "call i64 @elya_io_file_exists(ptr " <> a <> ")", LI64) { Gotv(Val(w, _), em2) -> assign(em2, "icmp ne i64 " <> w <> ", 0", LI1) } } else {
+  if n == "io.write_file" { rooted(em, rs, "call void @elya_io_write_file(ptr " <> a <> ", ptr " <> b <> ")", LNone) } else {
+  if n == "io.read_stdin" { rooted(em, rs, "call ptr @elya_io_read_stdin(i64 " <> st <> ")", LPtr) } else {
+  if n == "io.arg_count" { assign(em, "call i64 @elya_io_arg_count()", LI64) } else {
+  rooted(em, rs, "call ptr @elya_io_arg(i64 " <> st <> ", i64 " <> a <> ")", LPtr) } } } } } } } } } } } } }
 }
 
 fn emit(cx: ECx, env: List(EBind), pend: List(Val), e: CExpr, em: Emit) -> Gotv {
@@ -352,7 +377,7 @@ fn emit(cx: ECx, env: List(EBind), pend: List(Val), e: CExpr, em: Emit) -> Gotv 
           }
         }
       }
-      KBuiltin(n, args) -> match emit_args(cx, env, pend, args, em, Nil) { Gotvs(vs, em2) -> builtin(cx, env, pend, n, vs, em2) }
+      KBuiltin(n, args) -> match emit_args(cx, env, pend, args, em, Nil) { Gotvs(vs, em2) -> builtin(cx, env, pend, n, args, t, vs, em2) }
       KApp(CExpr(_, _, _, KVar(f)), args) -> if bound(env, f) || !is_fn(cx, f) { closure_call(cx, env, pend, e, em, No) } else {
         match emit_args(cx, env, pend, args, em, Nil) {
           Gotvs(vs, em2) -> match sig_of(cx_sigs(cx), f) { ESig(_, _, r) -> rooted(em2, roots(env, pend, vs), "call tailcc " <> lt_text(r) <> " @elya." <> f <> "(" <> arg_list(vs) <> ")", r) }
@@ -741,10 +766,24 @@ fn emit_strs(ss: List(SConst), b: Buffer) -> Buffer {
   }
 }
 fn prelude() -> String {
-  "; The back end in Elya, stage B5.\n" <>
+  "; The back end in Elya, stage B6.\n" <>
   "declare ptr @elya_alloc(i64)\n" <>
   "declare i64 @elya_eq(ptr, ptr, i64, i64)\n" <>
   "declare void @elya_match_fail()\n" <>
+  "declare ptr @elya_array_new(i64)\n" <>
+  "declare ptr @elya_array_push(ptr, i64)\n" <>
+  "declare ptr @elya_array_set(ptr, i64, i64)\n" <>
+  "declare i64 @elya_array_get(ptr, i64)\n" <>
+  "declare i64 @elya_array_length(ptr)\n" <>
+  "declare ptr @elya_buffer_new(i64)\n" <>
+  "declare ptr @elya_buffer_push(i64, ptr, ptr)\n" <>
+  "declare ptr @elya_buffer_finish(i64, ptr)\n" <>
+  "declare ptr @elya_io_read_file(i64, ptr)\n" <>
+  "declare i64 @elya_io_file_exists(ptr)\n" <>
+  "declare void @elya_io_write_file(ptr, ptr)\n" <>
+  "declare ptr @elya_io_read_stdin(i64)\n" <>
+  "declare i64 @elya_io_arg_count()\n" <>
+  "declare ptr @elya_io_arg(i64, i64)\n" <>
   "declare ptr @elya_str_lit(i64, ptr, i64)\n" <>
   "declare ptr @elya_int_to_string(i64, i64)\n" <>
   "declare ptr @elya_str_concat(i64, ptr, ptr)\n" <>

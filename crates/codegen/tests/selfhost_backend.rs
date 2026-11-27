@@ -50,6 +50,11 @@
 //! #38 (a hundred million deep).
 //! H6, an instance keyed with its effect rows: focused #37 (a generic
 //! function's row variable left in a key).
+//! I1, every array untraced: focused #40 (collecting at every allocation).
+//! I3, a buffer's pieces swapped: selfhost/lex.elya.
+//! I4, `io.file_exists` inverted: tests/files_and_arguments.rs.
+//! I5, an array's element stored unwidened: selfhost/lex.elya (the IR does
+//! not build).
 //! E3 (a call's own arguments not rooted) cannot be seen: the runtime roots
 //! its arguments before it allocates (`elya_str_concat`, `elya_str_slice`)
 //! and a function roots its parameters as its scope; they stay rooted, as

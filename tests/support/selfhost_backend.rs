@@ -87,4 +87,16 @@ pub const FOCUSED: &[&str] = &[
     "type K { K(fn(K, Int, Int) -> Int) }\nfn go(k: K, n: Int, acc: Int) -> Int { if n == 0 { acc } else { match k { K(f) -> f(k, n - 1, acc + 1) } } }\npub fn main() -> Int { go(K(go), 100000000, 0) }\n",
     // B5: captured strings kept across collections.
     "fn adder(s: String) -> fn(String) -> String { fn(t) { s <> t <> s } }\nfn loop(n: Int, f: fn(String) -> String, acc: String) -> String { if n == 0 { acc } else { loop(n - 1, adder(int.to_string(n)), f(string.slice(acc, 0, 1))) } }\npub fn main() / {IO} { io.println(loop(300, adder(\"x\"), \"start\")) }\n",
+    // B6: arrays of words and of heap values, grown, set and read back.
+    "fn fill(a: Array(Int), i: Int, n: Int) -> Array(Int) { if i == n { a } else { fill(array.push(a, i * i), i + 1, n) } }\nfn names(a: Array(String), i: Int) -> Array(String) { if i == 0 { a } else { names(array.push(a, \"n\" <> int.to_string(i)), i - 1) } }\nfn sum(borrow a: Array(Int), i: Int, acc: Int) -> Int { if i == array.length(a) { acc } else { sum(a, i + 1, acc + array.get(a, i)) } }\npub fn main() / {IO} { let a = array.set(fill(array.new(), 0, 200), 3, 1000)\n let s = names(array.new(), 50)\n io.println(int.to_string(sum(a, 0, 0)) <> array.get(s, 7) <> int.to_string(array.length(s))) }\n",
+    // B6: an index out of range stops the program by name.
+    "pub fn main() -> Int { let a = array.push(array.new(), 1)\n array.get(a, 1) }\n",
+    // B6: a buffer built in pieces, its length, its text.
+    "fn build(b: Buffer, n: Int) -> Buffer { if n == 0 { b } else { build(buffer.push(b, int.to_string(n) <> \",\"), n - 1) } }\npub fn main() / {IO} { let b = build(buffer.new(), 300)\n let n = buffer.length(b)\n io.println(int.to_string(n) <> \":\" <> string.slice(buffer.finish(b), 0, 20)) }\n",
+    // B6: arrays of Bool and of data in a record.
+    "type R { R(Array(Bool), Array(String)) }\nfn mk() -> R { R(array.push(array.push(array.new(), True), False), array.push(array.new(), \"x\")) }\npub fn main() / {IO} { match mk() { R(bs, ss) -> if array.get(bs, 1) { io.println(\"t\") } else { io.println(array.get(ss, 0) <> int.to_string(array.length(bs))) } } }\n",
+    // B6: a missing argument and a missing file stop the program by name.
+    "pub fn main() / {IO} { if io.file_exists(\"/nonexistent/elya\") { io.println(\"odd\") } else { io.println(int.to_string(io.arg_count())) }\n io.println(io.read_file(\"/nonexistent/elya\")) }\n",
+    // B6: reading an argument that is not there.
+    "pub fn main() / {IO} { io.println(io.arg(0)) }\n",
 ];
