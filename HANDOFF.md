@@ -862,7 +862,10 @@ pinned (controls R1-R5). **Part 6, the switch, is done** (spec
 `selfhost/elya.elya` (`elya build` in Elya), and **the fixed point**: the
 driver built by Rust builds itself, that build builds it again, and the two
 write the same IR byte for byte (`selfhost_switch.rs`, Unix). Left before Rust
-can retire (spec D4): F6; handlers and `Float` in the back end in Elya; a
+can retire (spec D4): F6; argument records in the back end in Elya (it
+passes every parameter as itself, and win64 refuses a `musttail` call to a
+function of more than five, so B8 and the switch run on Unix only; the Rust
+back end spills past three, `spill.rs`); handlers and `Float` in the back end in Elya; a
 diagnostic renderer in Elya; the driver's platform flags and an exit status of
 its own; and the evaluator (`elya run`), or a decision that native `build` is
 the only way to run.

@@ -77,7 +77,9 @@ mod parse_support;
 #[path = "../../../tests/support/selfhost_backend.rs"]
 mod support;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 #[test]
@@ -319,6 +321,14 @@ fn two_modules(root: &Path, scratch: &parse_support::Scratch, emitter: &Path) {
 /// Elya files: the two builds print the same and exit the same. The back end
 /// in Elya is among them, so its Elya-built twin must write the same IR as
 /// its Rust-built self, its own source included (the back end's fixed point).
+///
+/// On Unix only: the back end in Elya passes every parameter as itself, and
+/// the self-hosted sources have functions of up to twelve; LLVM refuses a
+/// `musttail` call to such a function under win64 ("Can't handle guaranteed
+/// tail call under win64 yet"), which the Rust back end avoids with argument
+/// records past three parameters (`spill.rs`). The back end in Elya does not
+/// spill yet.
+#[cfg(unix)]
 #[test]
 fn the_self_hosted_sources_built_by_the_back_end_in_elya_agree() {
     std::thread::Builder::new()
@@ -329,6 +339,7 @@ fn the_self_hosted_sources_built_by_the_back_end_in_elya_agree() {
         .unwrap();
 }
 
+#[cfg(unix)]
 fn build_both(root: &Path, emitter: &Path, scratch: &Path, tool: &str) -> (PathBuf, PathBuf) {
     let source = root.join("selfhost").join(format!("{tool}.elya"));
     let text = std::fs::read_to_string(&source).expect("a self-hosted source");
@@ -366,6 +377,7 @@ fn build_both(root: &Path, emitter: &Path, scratch: &Path, tool: &str) -> (PathB
     (rust, elya)
 }
 
+#[cfg(unix)]
 fn self_hosted() {
     let root = parse_support::root();
     let scratch = parse_support::Scratch::new("native-self-hosted");
