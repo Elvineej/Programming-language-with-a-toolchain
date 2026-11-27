@@ -438,16 +438,60 @@ pub const FOCUSED_F5: &[&str] = &[
     "linear type File { File(Int) }\nfn read(f: File) -> Int { match f { File(n) -> n } }\ntype L(a) { N, C(a, L(a)) }\nfn f() -> Int { let n = N\n let x = C(File(1), n)\n let y = n\n 0 }\npub fn main() -> Int { 0 }\n",
     "linear type File { File(Int) }\nfn read(f: File) -> Int { match f { File(n) -> n } }\neffect multi Flip { fn flip() -> Bool }\neffect Ask { fn ask() -> Int }\nfn h() -> Int { handle { ask() + if flip() { 1 } else { 2 } } with { Ask.ask() -> { let f = File(2)\n let a = resume(1)\n a + read(f) } } }\npub fn main() -> Int { 0 }\n",
     "effect multi Flip { fn flip() -> Bool }\nfn outer(g) {\n  let keep = fn(x) {\n    let w = x(1)\n    let _ = g()\n    x(2)\n  }\n  let a = keep(fn(n) { n })\n  let b = keep(fn(n) { True })\n  0\n}\npub fn main() -> Int { 0 }\n",
+    // Review 2026-11-27: pattern binders noted once the whole pattern is checked (D1).
+    "linear type Tok { Tok(Int) }\ntype D3(a) { D3(a, a, a) }\nfn f(d) { match d { D3(x, y, Tok(n)) -> { let p = x\n let q = x\n let r = y\n let s = y\n n } } }\npub fn main() -> Int { 0 }\n",
+    "linear type Tok { Tok(Int) }\ntype D(a) { D(a, a) }\nfn f(d) { match d { D(x, Tok(n)) -> { let p = x\n let q = x\n let r = d\n n } } }\npub fn main() -> Int { 0 }\n",
+    // Review 2026-11-27: one program per surviving mutant (named).
+    // M1
+    "linear type Tok { Tok(Int) }\neffect multi Flip { fn flip() -> Bool }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn coin() / {Flip} -> Int { if flip() { 1 } else { 2 } }\nfn g(k, v) { let r = fn() { let x = k()\n v }\n r }\nfn f() { let r = g(coin, Tok(1))\n use(r()) }\npub fn main() -> Int { 0 }\n",
+    // M4
+    "linear type Tok { Tok(Int) }\ntype L(a) { N, C(a, L(a)) }\nfn same(borrow x: a) -> Int { 0 }\nfn f() -> Int { let n = N\n let x = C(Tok(1), n)\n same(n) }\npub fn main() -> Int { 0 }\n",
+    // M6
+    "linear type Tok { Tok(Int) }\neffect multi Flip { fn flip() -> Bool }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn coin() / {Flip} -> Int { if flip() { 1 } else { 2 } }\nfn two(a, b) { use(a) }\nfn f() { two(Tok(1), coin()) }\npub fn main() -> Int { 0 }\n",
+    // M9
+    "linear type Tok { Tok(Int) }\neffect multi Flip { fn flip() -> Bool }\neffect Ask { fn ask() -> Int }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn f() { let t = Tok(1)\n let x = handle { flip() } with { ask() -> resume(1) }\n use(t) }\npub fn main() -> Int { 0 }\n",
+    // M13
+    "linear type Tok { Tok(Int) }\neffect Give(s) { fn give(v: s) -> Int }\nfn f() -> Int { handle { give(Tok(1)) } with any { op(o) -> resume(op.perform(o)) } }\npub fn main() -> Int { 0 }\n",
+    // M15
+    "linear type Tok { Tok(Int) }\neffect multi Flip { fn flip() -> Bool }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn coin() / {Flip} -> Int { if flip() { 1 } else { 2 } }\nfn f(x: a, k: fn() / {e} -> Int) / {e} -> a { let n = k()\n x }\nfn g() { use(f(Tok(1), coin)) }\npub fn main() -> Int { 0 }\n",
+    // M20
+    "linear type Tok { Tok(Int) }\nfn mix(borrow n: Int, t: Tok) -> Int { match t { Tok(m) -> m + n } }\nfn f() -> Int { let g = mix\n g(1, Tok(2)) }\npub fn main() -> Int { 0 }\n",
+    // M28
+    "linear type Tok { Tok(Int) }\neffect Ask { fn ask() -> Int }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn f() { handle { Tok(ask()) } with { ask() -> resume(1)  return(v) -> use(v) + use(v) } }\npub fn main() -> Int { 0 }\n",
+    // M29
+    "linear type Tok { Tok(Int) }\neffect Put { fn put(t: Tok) -> Int }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn f() { handle { put(Tok(1)) } with { put(p) -> resume(use(p) + use(p)) } }\npub fn main() -> Int { 0 }\n",
+    // M36
+    "linear type Tok { Tok(Int) }\neffect multi Flip { fn flip() -> Bool }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn f() { handle { io.println(\"x\")\n 1 } with multi { flip() -> resume(True) } }\nfn g(t: Tok) { use(t) + use(t) }\npub fn main() -> Int { 0 }\n",
+    // M40
+    "linear type Tok { Tok(Int) }\neffect multi Flip { fn flip() -> Bool }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn f() { handle { if flip() { 1 } else { 2 } } with any { op(o) -> { let t = Tok(1)\n let v = op.perform(o)\n let n = use(t)\n resume(v) + n } } }\npub fn main() -> Int { 0 }\n",
+    // M42
+    "linear type Tok { Tok(Int) }\nfn f() { let tw = fn(x) { let a = x\n let b = x\n 0 }\n tw(Tok(1)) }\npub fn main() -> Int { 0 }\n",
+    // M48
+    "linear type Tok { Tok(Int) }\neffect multi Flip { fn flip() -> Bool }\neffect Ask { fn ask() -> Int }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn coin() / {Flip} -> Int { if flip() { 1 } else { 2 } }\ntype L(a) { N, C(a, L(a)) }\nfn f() { let n = N\n let _ = coin()\n let x = C(Tok(1), n)\n 0 }\npub fn main() -> Int { 0 }\n",
+    // M49
+    "linear type Tok { Tok(Int) }\neffect multi Flip { fn flip() -> Bool }\neffect Ask { fn ask() -> Int }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn coin() / {Flip} -> Int { if flip() { 1 } else { 2 } }\ntype L(a) { N, C(a, L(a)) }\nfn f(k) { let n = N\n let _ = k()\n let kk = if True { k } else { coin }\n let x = C(Tok(1), n)\n 0 }\npub fn main() -> Int { 0 }\n",
+    // M50
+    "linear type Tok { Tok(Int) }\neffect multi Flip { fn flip() -> Bool }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn coin() / {Flip} -> Int { if flip() { 1 } else { 2 } }\nfn f() { let t = Tok(1)\n let k = fn() { coin() }\n let x = k()\n use(t) }\npub fn main() -> Int { 0 }\n",
+    // M51
+    "linear type Tok { Tok(Int) }\neffect multi Flip { fn flip() -> Bool }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn coin() / {Flip} -> Int { if flip() { 1 } else { 2 } }\nfn g(k1, k2, t1, t2) { let x = k1()\n let a = use(t1)\n let y = k2()\n let b = use(t2)\n let ks = if True { k1 } else { k2 }\n let kk = if True { ks } else { coin }\n a + b }\npub fn main() -> Int { 0 }\n",
+    // M52
+    "linear type Tok { Tok(Int) }\neffect multi Flip { fn flip() -> Bool }\neffect Ask { fn ask() -> Int }\nfn use(t: Tok) -> Int { match t { Tok(n) -> n } }\nfn coin() / {Flip} -> Int { if flip() { 1 } else { 2 } }\nfn f() { let t = Tok(1)\n let r = handle { if flip() { 1 } else { 2 } } with { ask() -> { let u = Tok(2)\n let a = resume(1)\n a + use(u) } }\n use(t) + r }\npub fn main() -> Int { 0 }\n",
+    // M53
+    "linear type Tok { Tok(Int) }\neffect Put { fn put(t: Tok) -> Int }\nfn f() { handle { put(Tok(1)) } with any { op(o) -> resume(op.perform(o)) } }\npub fn main() -> Int { 0 }\n",
+    // M10, M14, M16, M35 (with any holds and their vias)
+    "linear type Tok { Tok(Int) }\neffect Put { fn put(t: Tok) -> Int }\nfn h(body) { handle { body() } with any { op(o) -> resume(op.perform(o)) } }\nfn h2(body) { h(body) }\nfn f() { h2(fn() { put(Tok(1)) }) + h2(fn() { put(Tok(2)) }) }\npub fn main() -> Int { 0 }\n",
 ];
 
 /// The self-hosted passes' imports: the parser in Elya, its lexer, the affine
-/// pass (its facts, from stage F5) and the checker (its types, for Core).
+/// pass (its facts, from stage F5), the checker (its types, for Core) and
+/// Core (for the back end).
 pub fn reader(name: &str) -> Option<(String, String)> {
     let file = match name {
         "parse" => "selfhost/parse.elya",
         "lex" => "selfhost/lex.elya",
         "affine" => "selfhost/affine.elya",
         "check" => "selfhost/check.elya",
+        "core" => "selfhost/core.elya",
         _ => return None,
     };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

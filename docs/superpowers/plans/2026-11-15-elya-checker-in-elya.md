@@ -216,7 +216,17 @@ Spec: `docs/superpowers/specs/2026-11-15-elya-checker-in-elya-design.md`.
      (written as a base type) and `Array` with their builtins. 62 corpus
      programs and 36 focused ones agree, in the evaluator and natively (the
      62 at the first run); controls K84-K102 in the test's header (five
-     survived the corpus and got focused programs).
+     survived the corpus and got focused programs). Review (2026-11-27):
+     one defect, fixed: a pattern's binders were noted as each `PVar` was
+     checked, while its type could still be a variable a later sub-pattern
+     binds, so the first binder's mark claimed it and a later E0428 was
+     lost; they are noted once the whole pattern is checked
+     (`bind_arm_pattern`'s order, `note_pat`), with the two programs that
+     showed it pinned (reverting the fix fails focused F5 #36). 4,800
+     random programs and 148 handwritten ones agree otherwise. Of 46
+     mutants, 11 are argued equivalent (help text the dump does not print,
+     one dedupe key per handle, `$Op` known duplicable) and 19 programs,
+     one per surviving mutant and named, pin the other 23.
    - F6: the grants of modules part 2 (E0606) on multi-file programs, and
      the whole corpus.
    Each stage gets negative controls in the Elya code (a row printed

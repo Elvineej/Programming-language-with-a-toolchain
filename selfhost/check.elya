@@ -2454,7 +2454,7 @@ fn infer_arms(s: St, arms: List(Sp(MatchArm)), st: Ty, result: Ty, env: List(Ent
   match arms {
     Nil -> s
     Cons(Sp(MatchArm(pat, body), _, _), rest) -> match check_pattern(s, pat, st, env, env) {
-      R(env2, s2) -> match infer_expr(s2, body, env2, amb) {
+      R(env2, s2) -> match infer_expr(note_pat(s2, pat, env2), body, env2, amb) {
         R(bt, s3) -> match body { Sp(_, bs, be) -> infer_arms(unify(s3, bt, result, bs, be), rest, st, result, env, amb) }
       }
     }
@@ -2466,7 +2466,7 @@ fn check_pattern(s: St, pat: Sp(Pattern), expected: Ty, env: List(Entry), acc: L
   match pat {
     Sp(node, start, end) -> match node {
       PWild -> R(acc, s)
-      PVar(x) -> R(Cons(Entry(x, Scheme(Nil, Nil, expected)), acc), note_binder(s, start, end, x, Scheme(Nil, Nil, expected)))
+      PVar(x) -> R(Cons(Entry(x, Scheme(Nil, Nil, expected)), acc), s)
       PInt(_) -> R(acc, unify(s, expected, TB(0), start, end))
       PBool(_) -> R(acc, unify(s, expected, TB(2), start, end))
       PStr(_) -> R(acc, unify(s, expected, TB(3), start, end))
@@ -4376,6 +4376,18 @@ fn dump_diags(ds: List(Diag), b: Buffer) -> Buffer {
     Nil -> b
     Cons(Diag(kind, code, msg, start, end), rest) -> dump_diags(rest, buffer.push(b, kind <> " " <> code <> " " <> int.to_string(start) <> " " <> int.to_string(end) <> " " <> quoted(msg) <> "\n"))
   }
+}
+
+// The pattern's bindings noted once it is all checked (`bind_arm_pattern`).
+fn note_pat(s: St, p: Sp(Pattern), env: List(Entry)) -> St {
+  match p {
+    Sp(PVar(x), a, b) -> match lookup(env, x) { Yes(sc) -> note_binder(s, a, b, x, sc)  No -> s }
+    Sp(PCtor(_, args), _, _) -> note_pats(s, args, env)
+    _ -> s
+  }
+}
+fn note_pats(s: St, ps: List(Sp(Pattern)), env: List(Entry)) -> St {
+  match ps { Nil -> s  Cons(p, rest) -> note_pats(note_pat(s, p, env), rest, env) }
 }
 
 type Ran { Ran(List(SchemeLine), St) }
