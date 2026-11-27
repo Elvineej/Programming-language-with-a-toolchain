@@ -3,7 +3,7 @@
 Written 2026-10-05 for whichever agent picks this up next. Read this, then `CLAUDE.md`,
 then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house style.
 
-## State at handoff (updated 2026-11-15, an interactive session on `main`)
+## State at handoff (updated 2026-11-27, an interactive session on `main`)
 
 - **Work lands on `main` directly** (the maintainer, 2026-10-30: "Commit in the main
   tho"). `main` has everything: #24 (2026-10-24), then `auto/elya`'s 15 commits since,
@@ -30,7 +30,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1658 passed, 194 suites, and configuration C
+- Linux gate at the tip of `main`: 1672 passed, 202 suites (2026-11-27), and configuration C
   (the boards on QEMU; `check.sh` fails without its tools unless
   `ELYA_BOARDS=skip`) 8 passed, 2 suites. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
@@ -835,9 +835,25 @@ effects; `with any` and `op.*`; their reviews found four defects, all fixed
 with focused programs). The classifier's stages are now F1, F2a, F2b, F4a,
 F4b, F4c, F4d, F5 (linear types, arrays, borrows), F6 (imports). Codex's
 **4b** landed (75d65d9: the parser's diagnostics and recovery, its 3,345
-inputs agreeing). Next: **4e**, the affine pass in Elya (`selfhost/affine.elya`,
-Claude's, Codex being unreachable; under review), then **F5** (built on it),
-then **4c**, **4d** and **F6**. The checker's verdict has its print form too, `elya
+inputs agreeing). **4e** (e8731cd, 2026-11-27: the affine pass in Elya,
+`selfhost/affine.elya`, Claude's, Codex being unreachable; 16,000 random
+programs agreed, 44 programs from its mutation run pinned), **4d** (c523903:
+exhaustiveness, `selfhost/exhaust.elya`; 7,948 random programs agreed, 10
+pinned) and **F5** (duplicability, reading 4e's facts; its review found one
+defect, a pattern's binders noted too early, fixed, and 21 programs pinned)
+are on `main`. Next: **4c**, modules and resolution (`selfhost/resolve.elya`,
+a subagent's job, under way on branch `resolve4c`), then **F6** (imports,
+E0606). **Part 5 is begun** (spec `2026-11-27-elya-backend-in-elya-design.md`,
+plan beside it, both on the working branch `f5` until they land): Core in
+Elya (`selfhost/core.elya`, compared byte for byte with the new `elya core
+--dump` on every corpus program without imports that checks), then a back
+end in Elya writing LLVM IR text for *Elya-S*, the language the compiler's
+own sources use (no handlers, no `Float`), checked by running both programs:
+stages B1-B6 built (first order, strings and rooting, data and `match`,
+monomorphization, closures, arrays, buffers and `io.*`; 101 corpus programs
+and 46 focused ones agree, every Elya-built program also run collecting at
+every allocation). B7 (imports) waits for 4c; B8 is the self-hosted sources.
+The checker's verdict has its print form too, `elya
 check --dump` (spec D6). The roadmap's "continuation-aware ownership" line takes
 the review's longer proposals (loans through continuations, once-callable
 function types).

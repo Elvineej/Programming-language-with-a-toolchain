@@ -4,6 +4,21 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
+## 2026-11-27 02:45 UTC — IN PROGRESS
+
+- **Landed:** 4e (e8731cd: the affine pass in Elya), 4d (c523903:
+  exhaustiveness in Elya), F5 (the checker's duplicability stage, with its
+  review's fix). Gates 1669 / 199, 1672 / 202, 1672 / 202 as predicted;
+  Windows green for each before `main` moved. The 4d gate's first run failed
+  once on `examples/08_timers.elya`'s real-clock order (the machine loaded by
+  review agents); rerun clean.
+- **Part 5 begun** on the working branch: spec and plan for the back end in
+  Elya; Core in Elya and stages B1-B6 built and controlled, not yet landed
+  (they wait for their review and gate).
+- Usage limits stopped the session twice (the 5-hour one on the 24th at
+  15:40, the weekly one until the 26th at 15:00); the scheduled check resumed
+  it. The PC is still not linked: Codex jobs and the E: copy wait for it.
+
 ## 2026-11-22 03:00 UTC — IN PROGRESS
 
 - **Done: the checker in Elya, stage F1** (plan 2026-11-15-elya-checker-in-elya,
