@@ -821,8 +821,8 @@ fn count_units(us: List(RUnit), n: Int) -> Int { match us { Nil -> n Cons(_, res
 
 // ---- Resolution (resolve::check) ----------------------------------------
 
-// The program's names: "F" functions, "P" operations, "C" constructors,
-// "E" effects, "Q" effects declared twice, "D" operations declared twice,
+// The program's names: "N" functions, operations and constructors (a
+// mask), "E" effects, "Q" effects declared twice, "D" operations declared twice,
 // "X" an operation's effect, "A" its arity, "L" an effect's operations
 // (newest first), "S<kind>:" names already declared (E0209).
 linear type RTab { RTab(Array(MapSlot(RV)), List(ParseDiag)) }
@@ -838,6 +838,14 @@ fn dup(t: RTab, kind: String, n: String, a: Int, b: Int) -> RTab {
   }
 }
 fn rt_put(t: RTab, k: String, v: RV) -> RTab { match t { RTab(m, ds) -> RTab(map.put(m, k, v), ds) } }
+// "N<name>": 1 a function, 2 an operation, 4 a constructor of that name.
+fn rt_mask(t: RTab, n: String, bit: Int) -> RTab {
+  match t { RTab(m, ds) -> {
+    let k = "N" <> n
+    let old = get_int(m, k)
+    RTab(map.put(m, k, RI(if old < 0 { bit } else { int.or(old, bit) })), ds)
+  } }
+}
 fn rt_diag(t: RTab, d: ParseDiag) -> RTab { match t { RTab(m, ds) -> RTab(m, Cons(d, ds)) } }
 fn rt_ops(t: RTab, eff: String, ops: List(Sp(OpSig))) -> RTab {
   match ops {
@@ -852,7 +860,7 @@ fn rt_ops(t: RTab, eff: String, ops: List(Sp(OpSig))) -> RTab {
           let known = match map.get(m, "L" <> eff) { MapFound(RL(xs)) -> xs _ -> Nil }
           RTab(map.put(m, "L" <> eff, RL(Cons(n, known))), ds)
         }
-        rt_ops(rt_put(t, "P" <> n, RI(1)), eff, rest)
+        rt_ops(rt_mask(t, n, 2), eff, rest)
       }
     }
   }
@@ -860,7 +868,7 @@ fn rt_ops(t: RTab, eff: String, ops: List(Sp(OpSig))) -> RTab {
 fn rt_variants(t: RTab, vs: List(Sp(VariantDecl))) -> RTab {
   match vs {
     Nil -> t
-    Cons(Sp(VariantDecl(n, _), a, b), rest) -> rt_variants(rt_put(dup(t, "constructor", n, a, b), "C" <> n, RI(1)), rest)
+    Cons(Sp(VariantDecl(n, _), a, b), rest) -> rt_variants(rt_mask(dup(t, "constructor", n, a, b), n, 4), rest)
   }
 }
 fn rt_decls(t: RTab, ds: List(Sp(Decl))) -> RTab {
@@ -868,7 +876,7 @@ fn rt_decls(t: RTab, ds: List(Sp(Decl))) -> RTab {
     Nil -> t
     Cons(Sp(d, a, b), rest) -> {
       let t = match d {
-        DFn(_, n, _, _, _, _) -> rt_put(dup(t, "function", n, a, b), "F" <> n, RI(1))
+        DFn(_, n, _, _, _, _) -> rt_mask(dup(t, "function", n, a, b), n, 1)
         DEffect(n, _, _, ops) -> {
           let t = dup(t, "effect", n, a, b)
           let t = if n == "IO" { rt_diag(t, ParseDiag("E0209", a, b, "effect `IO` is built in")) } else { t }
@@ -908,14 +916,15 @@ fn param_names(ps: List(Sp(Param))) -> List(String) {
 }
 fn has_key(borrow r: Array(MapSlot(RV)), k: String) -> Bool { map.has(r, k) }
 fn resolves_var(borrow r: Array(MapSlot(RV)), n: String, sc: List(List(String))) -> Bool {
-  has_in_scopes(sc, n) || map.has(r, "F" <> n) || map.has(r, "P" <> n) || map.has(r, "C" <> n)
+  has_in_scopes(sc, n) || map.has(r, "N" <> n)
 }
 fn check_name(borrow r: Array(MapSlot(RV)), n: String, a: Int, b: Int, sc: List(List(String)), ds: List(ParseDiag)) -> List(ParseDiag) {
   if resolves_var(r, n, sc) { ds } else { Cons(ParseDiag("E0200", a, b, "unresolved name `" <> n <> "`"), ds) }
 }
 fn check_var(borrow r: Array(MapSlot(RV)), n: String, a: Int, b: Int, sc: List(List(String)), ds: List(ParseDiag)) -> List(ParseDiag) {
   let ds = check_name(r, n, a, b, sc, ds)
-  if map.has(r, "P" <> n) && !has_in_scopes(sc, n) && !map.has(r, "F" <> n) {
+  let mask = get_int(r, "N" <> n)
+  if mask >= 0 && int.and(mask, 3) == 2 && !has_in_scopes(sc, n) {
     Cons(ParseDiag("E0206", a, b, "operation `" <> n <> "` used as a value"), ds)
   } else { ds }
 }
@@ -942,7 +951,8 @@ fn bind_pattern(borrow r: Array(MapSlot(RV)), p: Sp(Pattern), bound: List(String
   match p {
     Sp(PVar(n), _, _) -> RPat(Cons(n, bound), ds)
     Sp(PCtor(n, args), a, b) -> {
-      let ds = if map.has(r, "C" <> n) { ds } else { Cons(ParseDiag("E0432", a, b, "unknown constructor `" <> n <> "`"), ds) }
+      let mask = get_int(r, "N" <> n)
+      let ds = if mask >= 0 && int.and(mask, 4) == 4 { ds } else { Cons(ParseDiag("E0432", a, b, "unknown constructor `" <> n <> "`"), ds) }
       bind_patterns(r, args, bound, ds)
     }
     _ -> RPat(bound, ds)
