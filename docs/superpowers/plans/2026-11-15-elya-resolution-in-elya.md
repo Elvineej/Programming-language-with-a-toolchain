@@ -13,6 +13,13 @@ Spec: `docs/superpowers/specs/2026-11-15-elya-resolution-in-elya-design.md`.
    output deterministic. It found the spec's "load order" ambiguous (files are
    reached root first, depth first; declarations merge root last), now
    spelled out in D1 and on `merged_text` (comments only after the gate).
-2. [ ] D2-D4, `selfhost/resolve.elya` and its tests: Codex, after part 4b,
-   to a brief from this spec; checked here, a control re-run.
-3. [ ] D5, measured, in the spec's section 3.
+2. [x] D2-D4, `selfhost/resolve.elya` and its tests (built by Claude, not
+   Codex): tests/selfhost_resolve.rs (2 tests: the 4,108 programs in the
+   evaluator; the builtin tables) and crates/codegen/tests/selfhost_resolve.rs
+   (1 test: the same natively, and the timing). Controls K1-K3 each run in
+   both and reverted (spec section 3). Gate predicted: +5 tests (2 in A and B,
+   1 in B) and +3 suites: 1671 passed, 199 suites; measured 1671 and 199 (a
+   first run stopped on examples/08_timers.elya's real-clock lines, reordered
+   under load, a flake that passes alone; the second run clean).
+3. [x] D5, measured, in the spec's section 3: natively 230 ms against
+   Rust's 20 ms (release) on selfhost/check.elya with its imports.

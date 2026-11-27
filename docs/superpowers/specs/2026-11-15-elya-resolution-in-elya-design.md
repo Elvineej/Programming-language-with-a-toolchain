@@ -1,6 +1,6 @@
 # Modules and name resolution in Elya (self-hosting part 4c)
 
-2026-11-15. Status: the Rust side (D1) built; the Elya program (D2-D5) next. Part of R3 item 4 of
+2026-11-15. Status: built (D1-D5); 2026-11-27 the Elya program and its tests. Part of R3 item 4 of
 `2026-11-14-elya-self-hosting-design.md`, after the parser in Elya (4a, 4b).
 
 ## What is reproduced
@@ -72,4 +72,57 @@ Rust, written in section 3 here, as the parser's spec does.
 
 ## 3. Measured after
 
-(To be filled in.)
+`selfhost/resolve.elya` (1,160 lines) imports the parser in Elya, which gains
+two public functions for it (`parse_full`, the tree and every diagnostic;
+`dump_tree`). Each imported file is parsed at offset 0 and its tree and
+diagnostics shifted to its base; the merged text is the files' texts joined
+with `"\n"` in the order reached. The tables of `decls` and of `resolve::walk`
+are one `elya/map` each, keyed by kind and name (and unit); a name's being a
+function, an operation or a constructor is one entry, a mask. No compiler
+change was needed, and nothing in Rust was found refused or crashing.
+
+Compared byte for byte, in the evaluator (tests/selfhost_resolve.rs) and
+natively (crates/codegen/tests/selfhost_resolve.rs), 4,108 programs: the
+parser's whole corpus (3,931, each a root alone, its imports resolved against
+an otherwise empty directory and src/std), 106 multi-file programs found in
+the Rust tests (each test's roots over each set of modules it gives:
+tests/modules.rs 65, native_modules.rs 10, name_clashes.rs 8, std_async.rs 5,
+std_capabilities.rs 5, run_cli.rs 5, files_and_arguments.rs 4,
+string_bytes.rs 2, build_cli.rs 1, diagnostics_edges.rs 1) and 71 focused
+programs. 1,045 have a module or resolution error; by code (programs): E0200
+584, E0201 35, E0202 10, E0203 93, E0204 6, E0205 6, E0206 13, E0207 6, E0208
+14, E0209 21, E0210 5, E0211 7, E0432 41, E0600 301, E0601 19, E0602 3, E0603
+11, E0604 21, E0605 4, E0607 54, E0608 8; the focused set has each. The
+builtin tables (D3) are compared with their Rust twins by
+`the_builtin_tables_are_their_rust_twins` (the private `BUILTIN_MODULES` and
+`STD_SOURCES` read off E0600's help and E0604).
+
+Controls, each run in both tests and reverted (`cmp`): K1 (a shadowed
+reference renamed) fails on examples/06_structured.elya natively, on a
+token-deleted examples/08_timers.elya in the evaluator (`step`, a parameter
+in `elya/async`); K2 (no R3 filter) and K3 (the passes' diagnostics in the
+other order) on selfhost/check.elya (its token-deleted variant in the
+evaluator).
+
+The largest program is selfhost/check.elya in place, with the parser and
+lexer it imports (168,098 bytes of root, a dump of 1,071,082 bytes):
+
+| Measurement | Median | Runs |
+| --- | ---: | ---: |
+| Elya native (O2): process + read + lex + parse + load + resolve + dump | 230 ms | 7 |
+| Rust (release): read + lex + parse + load + resolve | 16.0 ms | 101 |
+| Rust (release): the same and the dump | 20.0 ms | 101 |
+| Rust (test profile): the same and the dump | 99.9 ms | 101 |
+
+Command: `RUST_TEST_THREADS=1 taskset -c 1 cargo test --release -p
+elya-codegen --test selfhost_resolve -- --nocapture` (the test profile's row
+from the same test without `--release`). Natively the Elya program is about
+11 times the release Rust's time, the parser's ratio. The evaluator test
+takes about 2.5 times the parser's in the gate (235 s against 110 s in
+configuration B).
+
+Found in Rust, left as it is (smallest example): a standard path that is not
+a module is E0600 but its name is not marked failed, so R3 does not refuse a
+qualified use of it: `import elya/nope\npub fn main() -> Int { nope.f() }`
+prints E0600 and then E0201 ``unknown builtin `nope.f` `` (a user module's
+`import nope` prints E0600 alone).
