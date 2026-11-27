@@ -122,8 +122,14 @@ fn check_types(ts: List(CType)) -> Stage {
   match ts { Nil -> InStage  Cons(CType(_, cs), rest) -> first(check_ctors(cs), check_types(rest)) }
 }
 fn check_generics(gs: List(CGeneric)) -> Stage {
-  match gs { Nil -> InStage  Cons(CGeneric(_, _, cs), rest) -> first(check_ctors(cs), check_generics(rest)) }
+  match gs { Nil -> InStage  Cons(CGeneric(_, _, cs), rest) -> first(check_ctors(cs), first(if wide_fields(cs) { Outside("a parametric type's field of a function of more than three parameters") } else { InStage }, check_generics(rest))) }
 }
+// A record is a ground type, so a parametric type's field cannot need one.
+fn wide_fn(t: Ty) -> Bool {
+  match t { TFn(ps, _, r) -> len_tys(ps, 0) > 3 || wide_fns(ps) || wide_fn(r)  TCon(_, xs) -> wide_fns(xs)  _ -> False }
+}
+fn wide_fns(ts: List(Ty)) -> Bool { match ts { Nil -> False  Cons(t, rest) -> wide_fn(t) || wide_fns(rest) } }
+fn wide_fields(cs: List(CCtor)) -> Bool { match cs { Nil -> False  Cons(CCtor(_, fs), rest) -> wide_fns(fs) || wide_fields(rest) } }
 fn check_module(m: CModule) -> Stage {
   match m { CModule(ts, gs, fs) -> first(check_types(ts), first(check_generics(gs), check_fns(fs, fs))) }
 }
@@ -984,8 +990,163 @@ fn sites(e: CExpr, n: Int) -> Int {
 fn sites_arms(arms: List(CArm), n: Int) -> Int { match arms { Nil -> n  Cons(CArm(_, b), rest) -> sites_arms(rest, sites(b, n)) } }
 fn sites_fns(fs: List(CFn), n: Int) -> Int { match fs { Nil -> n  Cons(CFn(_, _, b), rest) -> sites_fns(rest, sites(b, n)) } }
 
+// ---- Argument records -------------------------------------------------------
+// As the Rust back end's `spill.rs` (spec 2026-10-16-elya-argument-records):
+// a function, lambda or function type of more than three parameters keeps
+// its first two and carries the rest in ONE record, a constructor of a
+// synthesized ground type named by what its fields look like (a function
+// type by its convention, never its row). Built at the call, taken apart by
+// a one-arm `match` at the callee's entry; win64 cannot guarantee a tail
+// call to a function of more than five parameters, and a closure's code
+// takes the closure too.
+fn spill_ty(t: Ty) -> Ty {
+  match t {
+    TFn(ps, rw, r) -> TFn(spill_group(spill_tys(ps)), rw, spill_ty(r))
+    TCon(n, xs) -> TCon(n, spill_tys(xs))
+    _ -> t
+  }
+}
+fn spill_tys(ts: List(Ty)) -> List(Ty) { match ts { Nil -> Nil  Cons(t, rest) -> Cons(spill_ty(t), spill_tys(rest)) } }
+// Parameter types already rewritten, grouped.
+fn spill_group(ps: List(Ty)) -> List(Ty) {
+  match ps { Cons(a, Cons(b, Cons(c, Cons(d, rest)))) -> Cons(a, Cons(b, Cons(rec_ty(Cons(c, Cons(d, rest))), Nil)))  _ -> ps }
+}
+fn rec_key(fs: List(Ty)) -> String {
+  match fs { Nil -> ""  Cons(t, Nil) -> mono.key_of(t)  Cons(t, rest) -> mono.key_of(t) <> ", " <> rec_key(rest) }
+}
+fn rec_ty(fs: List(Ty)) -> Ty { TCon("$Args(" <> rec_key(fs) <> ")", Nil) }
+fn rec_ctor(fs: List(Ty)) -> String { "$args(" <> rec_key(fs) <> ")" }
+fn drop2(ts: List(Ty)) -> List(Ty) { match ts { Cons(_, Cons(_, rest)) -> rest  _ -> Nil } }
+fn drop2e(xs: List(CExpr)) -> List(CExpr) { match xs { Cons(_, Cons(_, rest)) -> rest  _ -> Nil } }
+
+// The records the module needs, in order of first appearance: every
+// function type of more than three parameters any node, parameter or field
+// mentions, its spilled fields rewritten first.
+type SRec { SRec(String, List(Ty)) }
+fn has_rec(rs: List(SRec), k: String) -> Bool { match rs { Nil -> False  Cons(SRec(j, _), rest) -> j == k || has_rec(rest, k) } }
+fn recs_ty(t: Ty, acc: List(SRec)) -> List(SRec) {
+  match t {
+    TFn(ps, _, r) -> rec_of(ps, recs_ty(r, recs_tys(ps, acc)))
+    TCon(_, xs) -> recs_tys(xs, acc)
+    _ -> acc
+  }
+}
+// The record of a parameter list, if it is spilled.
+fn rec_of(ps: List(Ty), acc: List(SRec)) -> List(SRec) {
+  if len_tys(ps, 0) > 3 {
+    let fs = drop2(spill_tys(ps))
+    let k = rec_key(fs)
+    if has_rec(acc, k) { acc } else { Cons(SRec(k, fs), acc) }
+  } else { acc }
+}
+fn recs_tys(ts: List(Ty), acc: List(SRec)) -> List(SRec) { match ts { Nil -> acc  Cons(t, rest) -> recs_tys(rest, recs_ty(t, acc)) } }
+fn recs_params(ps: List(CParam), acc: List(SRec)) -> List(SRec) { match ps { Nil -> acc  Cons(CParam(_, t), rest) -> recs_params(rest, recs_ty(t, acc)) } }
+fn recs_expr(e: CExpr, acc: List(SRec)) -> List(SRec) {
+  match e {
+    CExpr(_, _, t, k) -> {
+      let acc2 = recs_ty(t, acc)
+      match k {
+        KApp(f, args) -> recs_exprs(Cons(f, args), acc2)
+        KBuiltin(_, xs) -> recs_exprs(xs, acc2)
+        KCtor(_, xs) -> recs_exprs(xs, acc2)
+        KPrim(_, xs) -> recs_exprs(xs, acc2)
+        KLambda(ps, b) -> recs_expr(b, recs_params(ps, acc2))
+        KLet(_, v, b) -> recs_expr(b, recs_expr(v, acc2))
+        KIf(c, x, y) -> recs_exprs(Cons(c, Cons(x, Cons(y, Nil))), acc2)
+        KMatch(sc, arms) -> recs_arms(arms, recs_expr(sc, acc2))
+        _ -> acc2
+      }
+    }
+  }
+}
+fn recs_exprs(xs: List(CExpr), acc: List(SRec)) -> List(SRec) { match xs { Nil -> acc  Cons(x, rest) -> recs_exprs(rest, recs_expr(x, acc)) } }
+fn recs_arms(arms: List(CArm), acc: List(SRec)) -> List(SRec) { match arms { Nil -> acc  Cons(CArm(_, b), rest) -> recs_arms(rest, recs_expr(b, acc)) } }
+fn recs_ctors(cs: List(CCtor), acc: List(SRec)) -> List(SRec) { match cs { Nil -> acc  Cons(CCtor(_, fs), rest) -> recs_ctors(rest, recs_tys(fs, acc)) } }
+fn recs_types(ts: List(CType), acc: List(SRec)) -> List(SRec) { match ts { Nil -> acc  Cons(CType(_, cs), rest) -> recs_types(rest, recs_ctors(cs, acc)) } }
+// A function's own list too: one never mentioned (never called) is still
+// written.
+fn recs_fns(fs: List(CFn), acc: List(SRec)) -> List(SRec) { match fs { Nil -> acc  Cons(CFn(_, ps, b), rest) -> recs_fns(rest, recs_expr(b, rec_of(cparam_tys(ps), recs_params(ps, acc)))) } }
+fn rec_types(rs: List(SRec), acc: List(CType)) -> List(CType) {
+  match rs { Nil -> acc  Cons(SRec(k, fs), rest) -> rec_types(rest, Cons(CType("$Args(" <> k <> ")", Cons(CCtor("$args(" <> k <> ")", fs), Nil)), acc)) }
+}
+
+// The rewriting.
+type SpPb { SpPb(List(CParam), CExpr) }
+fn spill_cparams(ps: List(CParam)) -> List(CParam) { match ps { Nil -> Nil  Cons(CParam(n, t), rest) -> Cons(CParam(n, spill_ty(t)), spill_cparams(rest)) } }
+fn cparam_tys(ps: List(CParam)) -> List(Ty) { match ps { Nil -> Nil  Cons(CParam(_, t), rest) -> Cons(t, cparam_tys(rest)) } }
+fn cparam_pats(ps: List(CParam)) -> List(CPat) { match ps { Nil -> Nil  Cons(CParam(n, _), rest) -> Cons(QVar(n), cparam_pats(rest)) } }
+// Parameters and body already rewritten.
+fn spill_entry(ps: List(CParam), body: CExpr) -> SpPb {
+  match ps {
+    Cons(a, Cons(b, Cons(c, Cons(d, rest)))) -> {
+      let more = Cons(c, Cons(d, rest))
+      let fs = cparam_tys(more)
+      match body {
+        CExpr(s, e, t, _) -> SpPb(Cons(a, Cons(b, Cons(CParam("$rest", rec_ty(fs)), Nil))), CExpr(s, e, t, KMatch(CExpr(s, e, rec_ty(fs), KVar("$rest")), Cons(CArm(QCtor(rec_ctor(fs), cparam_pats(more)), body), Nil))))
+      }
+    }
+    _ -> SpPb(ps, body)
+  }
+}
+// A call's arguments (rewritten), packed as its callee's parameters say.
+fn spill_args(f: CExpr, xs: List(CExpr)) -> List(CExpr) {
+  match xs {
+    Cons(a, Cons(b, Cons(_, Cons(_, _)))) -> match ty_of(f) {
+      TFn(ps, _, _) -> {
+        let fs = drop2(spill_tys(ps))
+        Cons(a, Cons(b, Cons(CExpr(0, 0, rec_ty(fs), KCtor(rec_ctor(fs), drop2e(xs))), Nil)))
+      }
+      _ -> xs
+    }
+    _ -> xs
+  }
+}
+fn spill_list(xs: List(CExpr)) -> List(CExpr) { match xs { Nil -> Nil  Cons(x, rest) -> Cons(spill_expr(x), spill_list(rest)) } }
+fn spill_arms(arms: List(CArm)) -> List(CArm) { match arms { Nil -> Nil  Cons(CArm(p, b), rest) -> Cons(CArm(p, spill_expr(b)), spill_arms(rest)) } }
+fn spill_expr(e: CExpr) -> CExpr {
+  match e {
+    CExpr(a, b, t, k) -> {
+      let t2 = spill_ty(t)
+      match k {
+        KApp(f, args) -> CExpr(a, b, t2, KApp(spill_expr(f), spill_args(f, spill_list(args))))
+        KBuiltin(n, xs) -> CExpr(a, b, t2, KBuiltin(n, spill_list(xs)))
+        // A constructor of more than three fields as a value: its lambda,
+        // written here so that its parameters are spilled.
+        KCtor(n, Nil) -> match t {
+          TFn(ps, _, r) -> if len_tys(ps, 0) > 3 { spill_expr(CExpr(a, b, t, KLambda(ctor_params(ps, 0), CExpr(a, b, r, KCtor(n, ctor_args(ps, 0)))))) } else { CExpr(a, b, t2, k) }
+          _ -> CExpr(a, b, t2, k)
+        }
+        KCtor(n, xs) -> CExpr(a, b, t2, KCtor(n, spill_list(xs)))
+        KPrim(op, xs) -> CExpr(a, b, t2, KPrim(op, spill_list(xs)))
+        KLambda(ps, body) -> match spill_entry(spill_cparams(ps), spill_expr(body)) { SpPb(ps2, body2) -> CExpr(a, b, t2, KLambda(ps2, body2)) }
+        KLet(n, v, body) -> CExpr(a, b, t2, KLet(n, spill_expr(v), spill_expr(body)))
+        KIf(c, x, y) -> CExpr(a, b, t2, KIf(spill_expr(c), spill_expr(x), spill_expr(y)))
+        KMatch(sc, arms) -> CExpr(a, b, t2, KMatch(spill_expr(sc), spill_arms(arms)))
+        _ -> CExpr(a, b, t2, k)
+      }
+    }
+  }
+}
+fn spill_ctors(cs: List(CCtor)) -> List(CCtor) { match cs { Nil -> Nil  Cons(CCtor(n, fs), rest) -> Cons(CCtor(n, spill_tys(fs)), spill_ctors(rest)) } }
+fn spill_types(ts: List(CType)) -> List(CType) { match ts { Nil -> Nil  Cons(CType(n, cs), rest) -> Cons(CType(n, spill_ctors(cs)), spill_types(rest)) } }
+fn spill_generics(gs: List(CGeneric)) -> List(CGeneric) { match gs { Nil -> Nil  Cons(CGeneric(n, k, cs), rest) -> Cons(CGeneric(n, k, spill_ctors(cs)), spill_generics(rest)) } }
+fn spill_fns(fs: List(CFn)) -> List(CFn) {
+  match fs {
+    Nil -> Nil
+    Cons(CFn(n, ps, body), rest) -> match spill_entry(spill_cparams(ps), spill_expr(body)) { SpPb(ps2, body2) -> Cons(CFn(n, ps2, body2), spill_fns(rest)) }
+  }
+}
+pub fn spill(m: CModule) -> CModule {
+  match m {
+    CModule(ts, gs, fs) -> {
+      let recs = recs_fns(fs, recs_types(ts, Nil))
+      CModule(rev_onto(rev(spill_types(ts)), rec_types(recs, Nil)), spill_generics(gs), spill_fns(fs))
+    }
+  }
+}
+
 pub fn emit_module(m0: CModule) -> String {
-  match mono.mono(m0) {
+  match spill(mono.mono(m0)) {
     CModule(ts, gs, fs) -> {
       let sigs = sigs_of(fs)
       let ground_cs = infos(ts, 0, Nil)

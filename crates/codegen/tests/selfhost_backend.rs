@@ -63,6 +63,13 @@
 //! of an integer overflow). R4, a closure of 62 captures not refused: the
 //! refused wide closure (likewise). R5, the stage checker skipping an
 //! `else` branch: focused #57 (compared, not refused).
+//! Argument records' controls (spec 2026-11-27-elya-backend-argument-records):
+//! S1, no spilling: the self-hosted lexer has a function of five parameters
+//! (`narrow`, the Windows failure seen on every platform). S2, records
+//! only from the types nodes mention: focused #66 and selfhost/core.elya (the
+//! IR does not build). S3, a constructor of five fields as a value not
+//! spilled: focused #62. S4, a parametric type's wide field not refused:
+//! the focused refusals (#65 built).
 //! E3 (a call's own arguments not rooted) cannot be seen: the runtime roots
 //! its arguments before it allocates (`elya_str_concat`, `elya_str_slice`)
 //! and a function roots its parameters as its scope; they stay rooted, as
@@ -77,9 +84,7 @@ mod parse_support;
 #[path = "../../../tests/support/selfhost_backend.rs"]
 mod support;
 
-use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 #[test]
@@ -240,6 +245,7 @@ fn proof() {
             );
             continue;
         }
+        narrow(&name, ir);
         let ll = scratch.path().join("program.ll");
         std::fs::write(&ll, ir).expect("write the IR");
         if let Err(e) = elya_codegen::link(&ll, &elya_exe) {
@@ -284,6 +290,22 @@ fn proof() {
     two_modules(&root, &scratch, &emitter);
 }
 
+/// No function of the IR takes more than four parameters (three and a
+/// closure): win64 cannot guarantee a tail call to more than five, so this is
+/// the Windows failure seen on every platform (spec
+/// 2026-11-27-elya-backend-argument-records).
+fn narrow(name: &str, ir: &str) {
+    for line in ir.lines().filter(|l| l.starts_with("define tailcc ")) {
+        let params = &line[line.find('(').expect("(")..];
+        let n = if params.starts_with("()") {
+            0
+        } else {
+            params.matches(',').count() + 1
+        };
+        assert!(n <= 4, "{name}: a function of {n} parameters: {line}");
+    }
+}
+
 /// A module's function named like a function of the program's (`wrap.g`
 /// and `g` as a value): the wrapper's name is one no mangling writes.
 fn two_modules(root: &Path, scratch: &parse_support::Scratch, emitter: &Path) {
@@ -322,13 +344,10 @@ fn two_modules(root: &Path, scratch: &parse_support::Scratch, emitter: &Path) {
 /// in Elya is among them, so its Elya-built twin must write the same IR as
 /// its Rust-built self, its own source included (the back end's fixed point).
 ///
-/// On Unix only: the back end in Elya passes every parameter as itself, and
-/// the self-hosted sources have functions of up to twelve; LLVM refuses a
-/// `musttail` call to such a function under win64 ("Can't handle guaranteed
-/// tail call under win64 yet"), which the Rust back end avoids with argument
-/// records past three parameters (`spill.rs`). The back end in Elya does not
-/// spill yet.
-#[cfg(unix)]
+/// On Windows too since the back end in Elya spills parameters past three
+/// into a record (spec 2026-11-27-elya-backend-argument-records): those
+/// sources have functions of up to twelve, and win64 cannot guarantee a tail
+/// call to a function of more than five.
 #[test]
 fn the_self_hosted_sources_built_by_the_back_end_in_elya_agree() {
     std::thread::Builder::new()
@@ -339,7 +358,6 @@ fn the_self_hosted_sources_built_by_the_back_end_in_elya_agree() {
         .unwrap();
 }
 
-#[cfg(unix)]
 fn build_both(root: &Path, emitter: &Path, scratch: &Path, tool: &str) -> (PathBuf, PathBuf) {
     let source = root.join("selfhost").join(format!("{tool}.elya"));
     let text = std::fs::read_to_string(&source).expect("a self-hosted source");
@@ -370,6 +388,7 @@ fn build_both(root: &Path, emitter: &Path, scratch: &Path, tool: &str) -> (PathB
         !ir.starts_with("unsupported "),
         "{tool}: the back end in Elya refuses it: {ir}"
     );
+    narrow(tool, ir);
     let ll = scratch.join(format!("{tool}.ll"));
     std::fs::write(&ll, ir).expect("write the IR");
     let elya = scratch.join(format!("{tool}-elya{}", std::env::consts::EXE_SUFFIX));
@@ -377,7 +396,6 @@ fn build_both(root: &Path, emitter: &Path, scratch: &Path, tool: &str) -> (PathB
     (rust, elya)
 }
 
-#[cfg(unix)]
 fn self_hosted() {
     let root = parse_support::root();
     let scratch = parse_support::Scratch::new("native-self-hosted");

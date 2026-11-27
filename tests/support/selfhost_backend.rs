@@ -9,7 +9,7 @@ pub const FLOOR: usize = 110;
 /// The focused programs refused on purpose, by index; every other one must
 /// be built and compared (a refusal is never a pass).
 #[allow(dead_code)]
-pub const REFUSED: &[usize] = &[35, 57, 58, 59];
+pub const REFUSED: &[usize] = &[35, 57, 58, 59, 65];
 
 /// A program of one constructor of `fields` strings, each read back: 62 is
 /// the widest a row's one mask word holds, 63 is refused by name.
@@ -163,4 +163,18 @@ pub const FOCUSED: &[&str] = &[
     "effect Ask { fn ask() -> Int }\nfn f(n: Int) -> Int { match n { 0 -> 1  _ -> handle { ask() + 1 } with { Ask.ask() -> resume(41) } } }\npub fn main() -> Int { f(5) }\n",
     // Refused: a handler in a lambda's body.
     "effect Ask { fn ask() -> Int }\nfn ap(f: fn(Int) -> Int) -> Int { f(1) }\npub fn main() -> Int { ap(fn(x) { handle { ask() + x } with { Ask.ask() -> resume(41) } }) }\n",
+    // Records: a six-parameter tail loop.
+    "fn loop(a: Int, b: Int, c: Int, d: Int, e: Int, f: Int) -> Int { if a == 0 { b + c + d + e + f } else { loop(a - 1, b + 1, c, d * 1, e, f + a) } }\npub fn main() -> Int { loop(2000, 0, 1, 2, 3, 4) }\n",
+    // Records: a lambda of five parameters through a higher-order function, strings in the record.
+    "fn ap(f: fn(String, Int, String, Int, String) -> String) -> String { f(\"a\", 1, \"b\" <> \"c\", 2, int.to_string(3)) }\npub fn main() / {IO} { let s = \"!\" <> \"?\"\n io.println(ap(fn(a, b, c, d, e) { a <> int.to_string(b) <> c <> int.to_string(d) <> e <> s })) }\n",
+    // Records: a constructor of five fields as a value; a field of a four-parameter function.
+    "type R { R(Int, String, Int, String, Int) }\ntype H { H(fn(Int, Int, Int, Int) -> Int) }\nfn mk(f: fn(Int, String, Int, String, Int) -> R) -> R { f(1, \"x\", 2, \"y\", 3) }\nfn sum4(a: Int, b: Int, c: Int, d: Int) -> Int { a * 1000 + b * 100 + c * 10 + d }\npub fn main() / {IO} { match mk(R) { R(a, s, b, t, c) -> match H(sum4) { H(g) -> io.println(s <> t <> int.to_string(a + b + c + g(1, 2, 3, 4))) } } }\n",
+    // Records: an instance of a parametric type holding four-parameter functions.
+    "type List(a) { Nil, Cons(a, List(a)) }\nfn run(fs: List(fn(Int, Int, Int, Int) -> Int), acc: Int) -> Int { match fs { Nil -> acc  Cons(f, r) -> run(r, acc + f(1, 2, 3, 4)) } }\nfn add4(a: Int, b: Int, c: Int, d: Int) -> Int { a + b + c + d }\npub fn main() -> Int { run(Cons(add4, Cons(fn(a, b, c, d) { a * b * c * d }, Nil)), 0) }\n",
+    // Records: mutual tail calls of eight parameters.
+    "fn ping(n: Int, a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int) -> Int { if n == 0 { a + b + c + d + e + f + g } else { pong(n - 1, b, c, d, e, f, g, a + 1) } }\nfn pong(n: Int, a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int) -> Int { ping(n, g, a, b, c, d, e, f) }\npub fn main() -> Int { ping(3000, 1, 2, 3, 4, 5, 6, 7) }\n",
+    // Refused: a parametric type's field of a four-parameter function.
+    "type Box(a) { Box(fn(a, a, a, a) -> a) }\nfn get(b: Box(Int)) -> Int { match b { Box(f) -> f(1, 2, 3, 4) } }\npub fn main() -> Int { get(Box(fn(a, b, c, d) { a + b + c + d })) }\n",
+    // Records: a function of four parameters never called is still written.
+    "type T { A(Int) }\nfn unused(a: Int, b: Int, t: T, d: String) -> Int { match t { A(n) -> a + b + n + string.length(d) } }\npub fn main() -> Int { 7 }\n",
 ];
