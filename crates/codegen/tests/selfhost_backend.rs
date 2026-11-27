@@ -82,6 +82,12 @@ fn the_back_end_in_elya_agrees_with_rusts() {
         .unwrap();
 }
 
+/// A path with `/` separators: the resolver in Elya finds a root's directory
+/// at its last `/`, and Windows takes either.
+fn slashed(p: &Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
 fn run(exe: &Path, stress: Option<&str>) -> Output {
     let mut cmd = Command::new(exe);
     // In the scratch directory: a program that writes a file writes it there.
@@ -167,8 +173,8 @@ fn proof() {
     for (name, text) in texts {
         let path = scratch.put(&text);
         let out = Command::new(&emitter)
-            .arg(&path)
-            .arg(root.join("src/std"))
+            .arg(slashed(&path))
+            .arg(slashed(&root.join("src/std")))
             .output()
             .expect("run the back end");
         assert!(
@@ -257,8 +263,8 @@ fn build_both(root: &Path, emitter: &Path, scratch: &Path, tool: &str) -> (PathB
     elya_codegen::compile_module(&core, &object).expect("compiles");
     elya_codegen::link(&object, &rust).expect("links");
     let out = Command::new(emitter)
-        .arg(&source)
-        .arg(root.join("src/std"))
+        .arg(slashed(&source))
+        .arg(slashed(&root.join("src/std")))
         .output()
         .expect("run the back end");
     let ir = String::from_utf8(out.stdout).expect("UTF-8");
@@ -321,8 +327,8 @@ fn self_hosted() {
         for input in these {
             let run = |exe: &Path| {
                 Command::new(exe)
-                    .arg(input)
-                    .arg(root.join("src/std"))
+                    .arg(slashed(input))
+                    .arg(slashed(&root.join("src/std")))
                     .current_dir(scratch.path())
                     .env_remove("ELYA_RECORD")
                     .env_remove("ELYA_REPLAY")

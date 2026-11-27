@@ -15,6 +15,9 @@ mod parse_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// The driver runs `clang` with the Rust back end's Unix flags (`-no-pie`,
+// `-pthread`; spec D2): on Unix only until it knows the platform.
+#[cfg(unix)]
 #[test]
 fn elya_builds_itself_to_a_fixed_point() {
     std::thread::Builder::new()
