@@ -1,0 +1,1072 @@
+// The affine pass in Elya, self-hosting part 4e (spec
+// docs/superpowers/specs/2026-11-15-elya-checker-in-elya-design.md D2).
+// Oracle: src/affine.rs (`affine::analyze`) through `elya affine --dump`
+// (src/check_dump.rs, `affine_facts`). What inference needs to know about
+// uses, read off the syntax: the bindings used many times, what each point
+// holds, each handler's resumes, and the borrow facts.
+//
+// A span is one Int, its key: start * 2^20 + end, so keys order as spans do
+// (start, then end) for files under a mebibyte. A binding is keyed by its
+// binder's span, as in Rust.
+import parse / {IO}
+
+// ---- Lists and keys --------------------------------------------------------
+
+fn rev_onto(xs: List(a), acc: List(a)) -> List(a) {
+  match xs { Nil -> acc  Cons(x, rest) -> rev_onto(rest, Cons(x, acc)) }
+}
+fn rev(xs: List(a)) -> List(a) { rev_onto(xs, Nil) }
+fn append(xs: List(a), ys: List(a)) -> List(a) { rev_onto(rev(xs), ys) }
+fn len_from(xs: List(a), n: Int) -> Int { match xs { Nil -> n  Cons(_, rest) -> len_from(rest, n + 1) } }
+fn len(xs: List(a)) -> Int { len_from(xs, 0) }
+fn has_int(xs: List(Int), v: Int) -> Bool { match xs { Nil -> False  Cons(x, rest) -> x == v || has_int(rest, v) } }
+fn has_str(xs: List(String), v: String) -> Bool { match xs { Nil -> False  Cons(x, rest) -> x == v || has_str(rest, v) } }
+
+fn key(start: Int, end: Int) -> Int { start * 1048576 + end }
+fn kstart(k: Int) -> Int { k / 1048576 }
+fn kend(k: Int) -> Int { k - kstart(k) * 1048576 }
+fn spk(x: Sp(a)) -> Int { match x { Sp(_, a, b) -> key(a, b) } }
+fn show_key(k: Int) -> String { int.to_string(kstart(k)) <> " " <> int.to_string(kend(k)) }
+
+// Sorted, without duplicates.
+fn insert_int(xs: List(Int), v: Int) -> List(Int) {
+  match xs {
+    Nil -> Cons(v, Nil)
+    Cons(x, rest) -> if v == x { xs } else { if v < x { Cons(v, xs) } else { Cons(x, insert_int(rest, v)) } }
+  }
+}
+fn sort_ints(xs: List(Int), acc: List(Int)) -> List(Int) {
+  match xs { Nil -> acc  Cons(x, rest) -> sort_ints(rest, insert_int(acc, x)) }
+}
+
+// ---- Tables by span (`HashMap<Span, _>`): an array indexed by the span's
+// start, each slot the entries starting there --------------------------------
+
+type KV { KV(Int, Int) }
+type KL { KL(Int, List(Int)) }
+fn new_tab(n: Int, t: Array(List(KV))) -> Array(List(KV)) {
+  if n == 0 { t } else { new_tab(n - 1, array.push(t, Nil)) }
+}
+fn new_ltab(n: Int, t: Array(List(KL))) -> Array(List(KL)) {
+  if n == 0 { t } else { new_ltab(n - 1, array.push(t, Nil)) }
+}
+fn kv_get(xs: List(KV), k: Int) -> Int {
+  match xs { Nil -> 0 - 1  Cons(KV(a, v), rest) -> if a == k { v } else { kv_get(rest, k) } }
+}
+fn kv_put(xs: List(KV), k: Int, v: Int) -> List(KV) {
+  match xs { Nil -> Cons(KV(k, v), Nil)  Cons(KV(a, w), rest) -> if a == k { Cons(KV(k, v), rest) } else { Cons(KV(a, w), kv_put(rest, k, v)) } }
+}
+fn tab_get(borrow t: Array(List(KV)), k: Int) -> Int { kv_get(array.get(t, kstart(k)), k) }
+fn tab_put(t: Array(List(KV)), k: Int, v: Int) -> Array(List(KV)) {
+  let i = kstart(k)
+  let slot = kv_put(array.get(t, i), k, v)
+  array.set(t, i, slot)
+}
+fn kl_get(xs: List(KL), k: Int) -> Maybe(List(Int)) {
+  match xs { Nil -> No  Cons(KL(a, v), rest) -> if a == k { Yes(v) } else { kl_get(rest, k) } }
+}
+fn kl_put(xs: List(KL), k: Int, v: List(Int)) -> List(KL) {
+  match xs { Nil -> Cons(KL(k, v), Nil)  Cons(KL(a, w), rest) -> if a == k { Cons(KL(k, v), rest) } else { Cons(KL(a, w), kl_put(rest, k, v)) } }
+}
+fn ltab_get(borrow t: Array(List(KL)), k: Int) -> List(Int) {
+  match kl_get(array.get(t, kstart(k)), k) { Yes(v) -> v  No -> Nil }
+}
+fn ltab_put(t: Array(List(KL)), k: Int, v: List(Int)) -> Array(List(KL)) {
+  let i = kstart(k)
+  let slot = kl_put(array.get(t, i), k, v)
+  array.set(t, i, slot)
+}
+// Every entry, by key.
+fn tab_entries(borrow t: Array(List(KV)), i: Int, acc: List(KV)) -> List(KV) {
+  if i < 0 { acc } else { tab_entries(t, i - 1, append(sort_kv(array.get(t, i), Nil), acc)) }
+}
+fn insert_kv(xs: List(KV), e: KV) -> List(KV) {
+  match xs {
+    Nil -> Cons(e, Nil)
+    Cons(KV(a, v), rest) -> match e { KV(k, _) -> if k < a { Cons(e, xs) } else { Cons(KV(a, v), insert_kv(rest, e)) } }
+  }
+}
+fn sort_kv(xs: List(KV), acc: List(KV)) -> List(KV) {
+  match xs { Nil -> acc  Cons(x, rest) -> sort_kv(rest, insert_kv(acc, x)) }
+}
+
+// ---- The tables the walks share -------------------------------------------
+
+// `occ`: a use (a `Var`'s span) -> its binding. `caps`: a lambda (or the
+// `let` binding it is keyed by) -> what it captures. `outer`: the uses of a
+// binding from outside the body they are in (value 1).
+type Tabs { Tabs(Array(List(KV)), Array(List(KL)), Array(List(KV))) }
+
+// ---- Resolver: each use's binding, what each lambda captures ---------------
+
+type Bind { Bind(String, Int, Int) }
+type Fr { Fr(Int, List(Int)) }
+type RS { RS(List(Bind), Int, List(Fr), List(Int), Tabs) }
+type NK { NK(String, Int) }
+
+fn param_names(ps: List(Sp(Param))) -> List(NK) {
+  match ps { Nil -> Nil  Cons(Sp(Param(n, _, _), a, b), rest) -> Cons(NK(n, key(a, b)), param_names(rest)) }
+}
+fn pattern_vars(p: Sp(Pattern), acc: List(NK)) -> List(NK) {
+  match p {
+    Sp(PVar(x), a, b) -> append(acc, Cons(NK(x, key(a, b)), Nil))
+    Sp(PCtor(_, args), _, _) -> pattern_list(args, acc)
+    _ -> acc
+  }
+}
+fn pattern_list(ps: List(Sp(Pattern)), acc: List(NK)) -> List(NK) {
+  match ps { Nil -> acc  Cons(p, rest) -> pattern_list(rest, pattern_vars(p, acc)) }
+}
+fn bind_all(r: RS, ns: List(NK)) -> RS {
+  match ns {
+    Nil -> r
+    Cons(NK(n, k), rest) -> match r { RS(sc, d, fr, ba, t) -> bind_all(RS(Cons(Bind(n, k, d), sc), d + 1, fr, ba, t), rest) }
+  }
+}
+fn unbind_n(r: RS, n: Int) -> RS {
+  if n == 0 { r } else {
+    match r {
+      RS(sc, d, fr, ba, t) -> match sc {
+        Cons(_, rest) -> unbind_n(RS(rest, d - 1, fr, ba, t), n - 1)
+        Nil -> RS(Nil, d, fr, ba, t)
+      }
+    }
+  }
+}
+fn lookup(sc: List(Bind), name: String) -> Maybe(Bind) {
+  match sc { Nil -> No  Cons(Bind(n, k, i), rest) -> if n == name { Yes(Bind(n, k, i)) } else { lookup(rest, name) } }
+}
+fn add_free(free: List(Int), xs: List(Int)) -> List(Int) {
+  match xs { Nil -> free  Cons(x, rest) -> add_free(if has_int(free, x) { free } else { Cons(x, free) }, rest) }
+}
+// The open lambdas from the innermost out, until one began inside the
+// binding's reach: each captures the binding and what it captures.
+fn capture(fr: List(Fr), i: Int, b: Int, extra: List(Int)) -> List(Fr) {
+  match fr {
+    Nil -> Nil
+    Cons(Fr(start, free), rest) -> if i >= start { fr } else { Cons(Fr(start, add_free(add_free(free, Cons(b, Nil)), extra)), capture(rest, i, b, extra)) }
+  }
+}
+fn r_var(r: RS, name: String, sk: Int) -> RS {
+  match r {
+    RS(sc, d, fr, ba, Tabs(occ, caps, outer)) -> match lookup(sc, name) {
+      No -> RS(sc, d, fr, ba, Tabs(occ, caps, outer))
+      Yes(Bind(_, b, i)) -> {
+        let occ2 = tab_put(occ, sk, b)
+        let out = match ba { Cons(s, _) -> i < s  Nil -> False }
+        let outer2 = if out { tab_put(outer, sk, 1) } else { outer }
+        let extra = ltab_get(caps, b)
+        RS(sc, d, capture(fr, i, b, extra), ba, Tabs(occ2, caps, outer2))
+      }
+    }
+  }
+}
+fn r_function(r: RS, ps: List(Sp(Param)), body: Sp(Block)) -> RS {
+  let names = param_names(ps)
+  match body { Sp(b, _, _) -> unbind_n(r_block(bind_all(r, names), b), len(names)) }
+}
+fn r_block(r: RS, b: Block) -> RS {
+  match b { Block(stmts, tail) -> r_stmts(r, stmts, tail, 0) }
+}
+fn r_stmts(r: RS, stmts: List(Sp(Stmt)), tail: Maybe(Sp(Expr)), n: Int) -> RS {
+  match stmts {
+    Nil -> unbind_n(match tail { Yes(t) -> r_expr(r, t)  No -> r }, n)
+    Cons(Sp(SLet(name, _, value), _, _), rest) -> r_stmts(bind_all(r_expr(r, value), Cons(NK(name, spk(value)), Nil)), rest, tail, n + 1)
+    Cons(Sp(SExpr(e), _, _), rest) -> r_stmts(r_expr(r, e), rest, tail, n)
+  }
+}
+fn r_scoped(r: RS, ns: List(NK), body: Sp(Expr)) -> RS { unbind_n(r_expr(bind_all(r, ns), body), len(ns)) }
+fn push_barrier(r: RS) -> RS { match r { RS(sc, d, fr, ba, t) -> RS(sc, d, fr, Cons(d, ba), t) } }
+fn pop_barrier(r: RS) -> RS { match r { RS(sc, d, fr, ba, t) -> match ba { Cons(_, rest) -> RS(sc, d, fr, rest, t)  Nil -> RS(sc, d, fr, Nil, t) } } }
+fn r_exprs(r: RS, xs: List(Sp(Expr))) -> RS { match xs { Nil -> r  Cons(x, rest) -> r_exprs(r_expr(r, x), rest) } }
+fn r_expr(r: RS, e: Sp(Expr)) -> RS {
+  match e {
+    Sp(EVar(name), a, b) -> r_var(r, name, key(a, b))
+    Sp(ECall(callee, args), _, _) -> r_exprs(r_expr(r, callee), args)
+    Sp(ELambda(params, body), a, b) -> match r {
+      RS(sc, d, fr, ba, t) -> {
+        let names = param_names(params)
+        let inner = match body { Sp(blk, _, _) -> unbind_n(r_block(bind_all(RS(sc, d, Cons(Fr(d, Nil), fr), Cons(d, ba), t), names), blk), len(names)) }
+        match pop_barrier(inner) {
+          RS(sc2, d2, Cons(Fr(_, free), fr2), ba2, Tabs(occ, caps, outer)) -> RS(sc2, d2, fr2, ba2, Tabs(occ, ltab_put(caps, key(a, b), sort_ints(free, Nil)), outer))
+          other -> other
+        }
+      }
+    }
+    Sp(EBinary(_, l, rr), _, _) -> r_expr(r_expr(r, l), rr)
+    Sp(EUnary(_, x), _, _) -> r_expr(r, x)
+    Sp(EIf(c, t, el), _, _) -> match t { Sp(tb, _, _) -> match el { Sp(eb, _, _) -> r_block(r_block(r_expr(r, c), tb), eb) } }
+    Sp(EBlock(b), _, _) -> r_block(r, b)
+    Sp(EMatch(s, arms), _, _) -> r_arms(r_expr(r, s), arms)
+    Sp(EHandle(body, Handler(_, _, clauses, ret)), _, _) -> {
+      // A continuation that may escape: what follows the `handle` can run
+      // while a borrow in the body is pending.
+      let escapes = clauses_escape(clauses)
+      let r1 = if escapes { pop_barrier(r_expr(push_barrier(r), body)) } else { r_expr(r, body) }
+      let r2 = match ret { Yes(ReturnClause(binder, rb)) -> r_scoped(r1, Cons(NK(binder, spk(rb)), Nil), rb)  No -> r1 }
+      r_clauses(r2, clauses)
+    }
+    Sp(EResume(x), _, _) -> r_expr(r, x)
+    _ -> r
+  }
+}
+fn r_arms(r: RS, arms: List(Sp(MatchArm))) -> RS {
+  match arms {
+    Nil -> r
+    Cons(Sp(MatchArm(p, body), _, _), rest) -> r_arms(r_scoped(r, pattern_vars(p, Nil), body), rest)
+  }
+}
+fn r_clauses(r: RS, cs: List(Sp(OpClause))) -> RS {
+  match cs {
+    Nil -> r
+    Cons(Sp(OpClause(_, _, ps, body), _, _), rest) -> r_clauses(pop_barrier(r_scoped(push_barrier(r), param_names(ps), body)), rest)
+  }
+}
+
+// `resume_in_lambda`: a `resume` inside a lambda of a clause.
+fn clauses_escape(cs: List(Sp(OpClause))) -> Bool {
+  match cs { Nil -> False  Cons(Sp(OpClause(_, _, _, body), _, _), rest) -> rl(body, False) || clauses_escape(rest) }
+}
+fn rl_block(b: Block, l: Bool) -> Bool {
+  match b { Block(stmts, tail) -> rl_stmts(stmts, l) || (match tail { Yes(t) -> rl(t, l)  No -> False }) }
+}
+fn rl_stmts(ss: List(Sp(Stmt)), l: Bool) -> Bool {
+  match ss {
+    Nil -> False
+    Cons(Sp(SLet(_, _, v), _, _), rest) -> rl(v, l) || rl_stmts(rest, l)
+    Cons(Sp(SExpr(x), _, _), rest) -> rl(x, l) || rl_stmts(rest, l)
+  }
+}
+fn rl_list(xs: List(Sp(Expr)), l: Bool) -> Bool { match xs { Nil -> False  Cons(x, rest) -> rl(x, l) || rl_list(rest, l) } }
+fn rl(e: Sp(Expr), l: Bool) -> Bool {
+  match e {
+    Sp(EResume(x), _, _) -> l || rl(x, l)
+    Sp(ELambda(_, Sp(b, _, _)), _, _) -> rl_block(b, True)
+    Sp(ECall(c, args), _, _) -> rl(c, l) || rl_list(args, l)
+    Sp(EBinary(_, a, b), _, _) -> rl(a, l) || rl(b, l)
+    Sp(EUnary(_, x), _, _) -> rl(x, l)
+    Sp(EIf(c, Sp(t, _, _), Sp(f, _, _)), _, _) -> rl(c, l) || rl_block(t, l) || rl_block(f, l)
+    Sp(EBlock(b), _, _) -> rl_block(b, l)
+    Sp(EMatch(s, arms), _, _) -> rl(s, l) || rl_arms(arms, l)
+    Sp(EHandle(body, Handler(_, _, cs, ret)), _, _) -> rl(body, l) || (match ret { Yes(ReturnClause(_, rb)) -> rl(rb, l)  No -> False }) || rl_cl(cs, l)
+    _ -> False
+  }
+}
+fn rl_arms(arms: List(Sp(MatchArm)), l: Bool) -> Bool {
+  match arms { Nil -> False  Cons(Sp(MatchArm(_, body), _, _), rest) -> rl(body, l) || rl_arms(rest, l) }
+}
+fn rl_cl(cs: List(Sp(OpClause)), l: Bool) -> Bool {
+  match cs { Nil -> False  Cons(Sp(OpClause(_, _, _, body), _, _), rest) -> rl(body, l) || rl_cl(rest, l) }
+}
+
+// ---- The borrow modes -----------------------------------------------------
+
+type Mode { Mode(String, List(Bool)) }
+fn modes_of(decls: List(Sp(Decl))) -> List(Mode) {
+  match decls {
+    Nil -> Nil
+    Cons(Sp(DFn(_, name, ps, _, _, _), _, _), rest) -> if any_borrow(ps) { Cons(Mode(name, borrow_flags(ps)), modes_of(rest)) } else { modes_of(rest) }
+    Cons(_, rest) -> modes_of(rest)
+  }
+}
+fn any_borrow(ps: List(Sp(Param))) -> Bool { match ps { Nil -> False  Cons(Sp(Param(_, _, b), _, _), rest) -> b || any_borrow(rest) } }
+fn borrow_flags(ps: List(Sp(Param))) -> List(Bool) { match ps { Nil -> Nil  Cons(Sp(Param(_, _, b), _, _), rest) -> Cons(b, borrow_flags(rest)) } }
+fn mode_get(ms: List(Mode), name: String) -> Maybe(List(Bool)) {
+  match ms { Nil -> No  Cons(Mode(n, v), rest) -> if n == name { Yes(v) } else { mode_get(rest, name) } }
+}
+// The borrowed positions of a call: the reading builtins, and a function of
+// the module by name (a local name is a value: its modes are not known).
+fn positions(ms: List(Mode), callee: Sp(Expr), borrow occ: Array(List(KV))) -> List(Bool) {
+  match callee {
+    Sp(EQualified(m, n), _, _) -> if m == "array" && n == "get" { Cons(True, Cons(False, Nil)) } else {
+      if (m == "array" || m == "buffer") && n == "length" { Cons(True, Nil) } else { Nil }
+    }
+    Sp(EVar(name), a, b) -> if tab_get(occ, key(a, b)) >= 0 { Nil } else { match mode_get(ms, name) { Yes(v) -> v  No -> Nil } }
+    _ -> Nil
+  }
+}
+fn nth_bool(xs: List(Bool), i: Int) -> Bool {
+  match xs { Nil -> False  Cons(x, rest) -> if i == 0 { x } else { nth_bool(rest, i - 1) } }
+}
+// A borrowed position given a binding of the body the call is in.
+fn is_borrow(pos: List(Bool), i: Int, arg: Sp(Expr), borrow occ: Array(List(KV)), borrow outer: Array(List(KV))) -> Bool {
+  nth_bool(pos, i) && (match arg {
+    Sp(EVar(_), a, b) -> tab_get(occ, key(a, b)) >= 0 && tab_get(outer, key(a, b)) < 0
+    _ -> False
+  })
+}
+
+// ---- Counter: the bindings used many times ---------------------------------
+
+type AWhy { WTwice, WClosure(Int), WClause(Int) }
+type Many { Many(Int, AWhy) }
+// A count: uses many?, calls many?, the first use, why many.
+type Cnt { Cnt(Bool, Bool, Int, Maybe(Many)) }
+type FE { FE(Int, Cnt) }
+// A frame: its size, its entries.
+type CFrame { CFrame(Int, List(FE)) }
+type BE { BE(Int, CFrame) }
+type ME { ME(Int, Many) }
+
+fn fe_get(xs: List(FE), k: Int) -> Maybe(Cnt) {
+  match xs { Nil -> No  Cons(FE(a, c), rest) -> if a == k { Yes(c) } else { fe_get(rest, k) } }
+}
+fn fr_put(f: CFrame, k: Int, c: Cnt) -> CFrame {
+  match f { CFrame(n, xs) -> match fe_get(xs, k) { Yes(_) -> CFrame(n, fe_replace(xs, k, c))  No -> CFrame(n + 1, Cons(FE(k, c), xs)) } }
+}
+fn fe_replace(xs: List(FE), k: Int, c: Cnt) -> List(FE) {
+  match xs { Nil -> Nil  Cons(FE(a, d), rest) -> if a == k { Cons(FE(k, c), rest) } else { Cons(FE(a, d), fe_replace(rest, k, c)) } }
+}
+fn fe_remove(xs: List(FE), k: Int) -> List(FE) {
+  match xs { Nil -> Nil  Cons(FE(a, d), rest) -> if a == k { rest } else { Cons(FE(a, d), fe_remove(rest, k)) } }
+}
+fn empty() -> CFrame { CFrame(0, Nil) }
+fn many_or(a: Maybe(Many), b: Maybe(Many)) -> Maybe(Many) { match a { Yes(_) -> a  No -> b } }
+// Two counts in sequence: many, the later use named.
+fn seq(a: Cnt, b: Cnt) -> Cnt {
+  match a {
+    Cnt(_, _, fa, ma) -> match b {
+      Cnt(_, _, fb, mb) -> {
+        let early = if kstart(fa) <= kstart(fb) { fa } else { fb }
+        let late = if kstart(fa) <= kstart(fb) { fb } else { fa }
+        Cnt(True, True, early, many_or(ma, many_or(mb, Yes(Many(late, WTwice)))))
+      }
+    }
+  }
+}
+// The larger of two arms' counts.
+fn larger(a: Cnt, b: Cnt) -> Cnt {
+  match a {
+    Cnt(ua, _, _, _) -> match b {
+      Cnt(ub, _, _, _) -> {
+        let x = if ua || !ub { a } else { b }
+        let y = if ua || !ub { b } else { a }
+        match x {
+          Cnt(ux, cx, fx, mx) -> match y {
+            Cnt(_, cy, fy, my) -> Cnt(ux, cx || cy, if kstart(fx) <= kstart(fy) { fx } else { fy }, many_or(mx, my))
+          }
+        }
+      }
+    }
+  }
+}
+fn add(acc: CFrame, other: CFrame) -> CFrame {
+  match acc {
+    CFrame(n, _) -> match other {
+      CFrame(m, _) -> if m > n { add_into(other, acc) } else { add_into(acc, other) }
+    }
+  }
+}
+fn add_into(acc: CFrame, other: CFrame) -> CFrame {
+  match other {
+    CFrame(_, xs) -> add_each(acc, xs)
+  }
+}
+fn add_each(acc: CFrame, xs: List(FE)) -> CFrame {
+  match xs {
+    Nil -> acc
+    Cons(FE(k, c), rest) -> match acc {
+      CFrame(_, ys) -> add_each(fr_put(acc, k, match fe_get(ys, k) { Yes(a) -> seq(a, c)  No -> c }), rest)
+    }
+  }
+}
+fn max_of(a: CFrame, b: CFrame) -> CFrame {
+  match a {
+    CFrame(n, _) -> match b {
+      CFrame(m, _) -> if m > n { max_each(b, frame_list(a)) } else { max_each(a, frame_list(b)) }
+    }
+  }
+}
+fn frame_list(f: CFrame) -> List(FE) { match f { CFrame(_, xs) -> xs } }
+fn max_each(acc: CFrame, xs: List(FE)) -> CFrame {
+  match xs {
+    Nil -> acc
+    Cons(FE(k, c), rest) -> match acc {
+      CFrame(_, ys) -> max_each(fr_put(acc, k, match fe_get(ys, k) { Yes(a) -> larger(a, c)  No -> c }), rest)
+    }
+  }
+}
+// A body's counts when it runs many times.
+fn scale_many(f: CFrame, why: AWhy) -> CFrame {
+  match f { CFrame(n, xs) -> CFrame(n, scale_list(xs, why)) }
+}
+fn scale_list(xs: List(FE), why: AWhy) -> List(FE) {
+  match xs {
+    Nil -> Nil
+    Cons(FE(k, Cnt(_, _, first, m)), rest) -> Cons(FE(k, Cnt(True, True, first, many_or(m, Yes(Many(first, why))))), scale_list(rest, why))
+  }
+}
+
+// The counter's state: the tables, the modes, the uses that are borrows
+// (value 1), the bindings used many times, the `let`-bound lambdas' bodies.
+type CS { CS(Tabs, List(Mode), Array(List(KV)), List(ME), List(BE)) }
+type CR { CR(CFrame, CS) }
+
+fn me_put(xs: List(ME), k: Int, m: Many) -> List(ME) {
+  match xs { Nil -> Cons(ME(k, m), Nil)  Cons(ME(a, w), rest) -> if a == k { Cons(ME(k, m), rest) } else { Cons(ME(a, w), me_put(rest, k, m)) } }
+}
+fn be_get(xs: List(BE), k: Int) -> Maybe(CFrame) {
+  match xs { Nil -> No  Cons(BE(a, f), rest) -> if a == k { Yes(f) } else { be_get(rest, k) } }
+}
+fn be_put(xs: List(BE), k: Int, f: CFrame) -> List(BE) {
+  match xs { Nil -> Cons(BE(k, f), Nil)  Cons(BE(a, g), rest) -> if a == k { Cons(BE(k, f), rest) } else { Cons(BE(a, g), be_put(rest, k, f)) } }
+}
+fn be_remove(xs: List(BE), k: Int) -> List(BE) {
+  match xs { Nil -> Nil  Cons(BE(a, g), rest) -> if a == k { rest } else { Cons(BE(a, g), be_remove(rest, k)) } }
+}
+// `key`'s scope ends: its count is final.
+fn finish(c: CR, k: Int) -> CR {
+  match c {
+    CR(CFrame(n, xs), CS(t, ms, bo, many, bodies)) -> match fe_get(xs, k) {
+      No -> CR(CFrame(n, xs), CS(t, ms, bo, many, bodies))
+      Yes(Cnt(u, _, _, m)) -> {
+        let many2 = if u { match m { Yes(mm) -> me_put(many, k, mm)  No -> many } } else { many }
+        CR(CFrame(n - 1, fe_remove(xs, k)), CS(t, ms, bo, many2, bodies))
+      }
+    }
+  }
+}
+fn finish_all(c: CR, ns: List(NK)) -> CR {
+  match ns { Nil -> c  Cons(NK(_, k), rest) -> finish_all(finish(c, k), rest) }
+}
+fn c_function(cs: CS, ps: List(Sp(Param)), body: Sp(Block)) -> CS {
+  match body { Sp(b, _, _) -> match finish_all(c_block(cs, b), param_names(ps)) { CR(_, cs2) -> cs2 } }
+}
+// Its `let`-bound lambdas' bodies first, forwards; then backwards.
+fn c_block(cs: CS, b: Block) -> CR {
+  match b {
+    Block(stmts, tail) -> {
+      let cs1 = c_lambda_bodies(cs, stmts)
+      let start = match tail { Yes(t) -> c_expr(cs1, t)  No -> CR(empty(), cs1) }
+      c_back(start, rev(stmts))
+    }
+  }
+}
+fn c_lambda_bodies(cs: CS, ss: List(Sp(Stmt))) -> CS {
+  match ss {
+    Nil -> cs
+    Cons(Sp(SLet(_, _, Sp(ELambda(ps, body), a, b)), _, _), rest) -> match c_lambda(cs, ps, body) {
+      CR(inner, CS(t, ms, bo, many, bodies)) -> c_lambda_bodies(CS(t, ms, bo, many, be_put(bodies, key(a, b), inner)), rest)
+    }
+    Cons(_, rest) -> c_lambda_bodies(cs, rest)
+  }
+}
+fn c_back(c: CR, ss: List(Sp(Stmt))) -> CR {
+  match ss {
+    Nil -> c
+    Cons(Sp(SLet(_, _, Sp(ELambda(_, _), a, b)), _, _), rest) -> match finish(c, key(a, b)) {
+      CR(acc, CS(t, ms, bo, many, bodies)) -> c_back(CR(acc, CS(t, ms, bo, many, be_remove(bodies, key(a, b)))), rest)
+    }
+    Cons(Sp(SLet(_, _, v), _, _), rest) -> match finish(c, spk(v)) {
+      CR(acc, cs) -> match c_expr(cs, v) { CR(f, cs2) -> c_back(CR(add(acc, f), cs2), rest) }
+    }
+    Cons(Sp(SExpr(e), _, _), rest) -> match c {
+      CR(acc, cs) -> match c_expr(cs, e) { CR(f, cs2) -> c_back(CR(add(acc, f), cs2), rest) }
+    }
+  }
+}
+fn c_lambda(cs: CS, ps: List(Sp(Param)), body: Sp(Block)) -> CR {
+  match body { Sp(b, _, _) -> finish_all(c_block(cs, b), param_names(ps)) }
+}
+fn occurrence(cs: CS, sk: Int, callee: Bool) -> CR {
+  match cs {
+    CS(Tabs(occ, caps, outer), ms, bo, many, bodies) -> {
+      let b = tab_get(occ, sk)
+      let cs2 = CS(Tabs(occ, caps, outer), ms, bo, many, bodies)
+      if b < 0 { CR(empty(), cs2) } else {
+        let f = match be_get(bodies, b) {
+          Yes(body) -> if callee { body } else { scale_many(body, WClosure(b)) }
+          No -> empty()
+        }
+        CR(fr_put(f, b, Cnt(False, !callee, sk, No)), cs2)
+      }
+    }
+  }
+}
+fn c_expr(cs: CS, e: Sp(Expr)) -> CR {
+  match e {
+    Sp(EVar(_), a, b) -> occurrence(cs, key(a, b), False)
+    Sp(ECall(callee, args), _, _) -> {
+      let first = match callee {
+        Sp(EVar(_), a, b) -> occurrence(cs, key(a, b), True)
+        Sp(ELambda(ps, body), _, _) -> c_lambda(cs, ps, body)
+        _ -> c_expr(cs, callee)
+      }
+      match first {
+        CR(acc, CS(Tabs(occ, caps, outer), ms, bo, many, bodies)) -> {
+          let pos = positions(ms, callee, occ)
+          c_args(CR(acc, CS(Tabs(occ, caps, outer), ms, bo, many, bodies)), pos, args, 0)
+        }
+      }
+    }
+    Sp(ELambda(ps, body), a, b) -> match c_lambda(cs, ps, body) { CR(inner, cs2) -> CR(scale_many(inner, WClosure(key(a, b))), cs2) }
+    Sp(EBinary(_, l, r), _, _) -> match c_expr(cs, l) { CR(fa, cs2) -> match c_expr(cs2, r) { CR(fb, cs3) -> CR(add(fa, fb), cs3) } }
+    Sp(EUnary(_, x), _, _) -> c_expr(cs, x)
+    Sp(EIf(c, Sp(t, _, _), Sp(f, _, _)), _, _) -> match c_expr(cs, c) {
+      CR(fa, cs2) -> match c_block(cs2, t) { CR(ft, cs3) -> match c_block(cs3, f) { CR(fe, cs4) -> CR(add(fa, max_of(ft, fe)), cs4) } }
+    }
+    Sp(EBlock(b), _, _) -> c_block(cs, b)
+    Sp(EMatch(s, arms), _, _) -> match c_expr(cs, s) { CR(fa, cs2) -> match c_arms(cs2, arms, empty()) { CR(best, cs3) -> CR(add(fa, best), cs3) } }
+    Sp(EHandle(body, Handler(_, _, clauses, ret)), _, _) -> match c_expr(cs, body) {
+      CR(fa, cs2) -> {
+        let r1 = match ret {
+          Yes(ReturnClause(_, rb)) -> match finish(c_expr(cs2, rb), spk(rb)) { CR(f, cs3) -> CR(add(fa, f), cs3) }
+          No -> CR(fa, cs2)
+        }
+        c_clauses(r1, clauses)
+      }
+    }
+    Sp(EResume(x), _, _) -> c_expr(cs, x)
+    _ -> CR(empty(), cs)
+  }
+}
+fn c_args(c: CR, pos: List(Bool), args: List(Sp(Expr)), i: Int) -> CR {
+  match args {
+    Nil -> c
+    Cons(a, rest) -> match c {
+      CR(acc, CS(Tabs(occ, caps, outer), ms, bo, many, bodies)) -> if is_borrow(pos, i, a, occ, outer) {
+        c_args(CR(acc, CS(Tabs(occ, caps, outer), ms, tab_put(bo, spk(a), 1), many, bodies)), pos, rest, i + 1)
+      } else {
+        match c_expr(CS(Tabs(occ, caps, outer), ms, bo, many, bodies), a) { CR(f, cs2) -> c_args(CR(add(acc, f), cs2), pos, rest, i + 1) }
+      }
+    }
+  }
+}
+fn c_arms(cs: CS, arms: List(Sp(MatchArm)), best: CFrame) -> CR {
+  match arms {
+    Nil -> CR(best, cs)
+    Cons(Sp(MatchArm(p, body), _, _), rest) -> match finish_all(c_expr(cs, body), pattern_vars(p, Nil)) {
+      CR(f, cs2) -> c_arms(cs2, rest, max_of(best, f))
+    }
+  }
+}
+fn c_clauses(c: CR, cls: List(Sp(OpClause))) -> CR {
+  match cls {
+    Nil -> c
+    Cons(Sp(OpClause(_, _, ps, body), a, b), rest) -> match c {
+      CR(acc, cs) -> match finish_all(c_expr(cs, body), param_names(ps)) {
+        CR(f, cs2) -> c_clauses(CR(add(acc, scale_many(f, WClause(key(a, b)))), cs2), rest)
+      }
+    }
+  }
+}
+
+// ---- Order: a read after the consuming use (E0438) -------------------------
+
+// `Gone`: the bindings given away on a path, each with the use that did it.
+// `late`: a binding read after it was given away, the read and that use.
+type LE { LE(Int, Int, Int) }
+type OS { OS(Tabs, List(Mode), List(LE)) }
+type OR { OR(List(KV), OS) }
+fn or_insert(g: List(KV), k: Int, v: Int) -> List(KV) {
+  if has_k(g, k) { g } else { Cons(KV(k, v), g) }
+}
+fn has_k(xs: List(KV), k: Int) -> Bool { match xs { Nil -> False  Cons(KV(a, _), rest) -> a == k || has_k(rest, k) } }
+fn or_insert_all(g: List(KV), ks: List(Int), v: Int) -> List(KV) {
+  match ks { Nil -> g  Cons(k, rest) -> or_insert_all(or_insert(g, k, v), rest, v) }
+}
+fn join_gone(g: List(KV), t: List(KV)) -> List(KV) {
+  match t { Nil -> g  Cons(KV(k, v), rest) -> join_gone(or_insert(g, k, v), rest) }
+}
+fn has_le(xs: List(LE), k: Int) -> Bool { match xs { Nil -> False  Cons(LE(a, _, _), rest) -> a == k || has_le(rest, k) } }
+fn o_block(o: OS, b: Block, g: List(KV)) -> OR {
+  match b { Block(stmts, tail) -> match o_stmts(o, stmts, g) { OR(g2, o2) -> match tail { Yes(t) -> o_expr(o2, t, g2)  No -> OR(g2, o2) } } }
+}
+fn o_stmts(o: OS, ss: List(Sp(Stmt)), g: List(KV)) -> OR {
+  match ss {
+    Nil -> OR(g, o)
+    Cons(Sp(SLet(_, _, v), _, _), rest) -> match o_expr(o, v, g) { OR(g2, o2) -> o_stmts(o2, rest, g2) }
+    Cons(Sp(SExpr(e), _, _), rest) -> match o_expr(o, e, g) { OR(g2, o2) -> o_stmts(o2, rest, g2) }
+  }
+}
+fn o_expr(o: OS, e: Sp(Expr), g: List(KV)) -> OR {
+  match e {
+    Sp(EVar(_), a, b) -> match o {
+      OS(Tabs(occ, caps, outer), ms, late) -> {
+        let bnd = tab_get(occ, key(a, b))
+        // A `let`-bound lambda used: what it captures may be used by it.
+        let g2 = if bnd < 0 { g } else { or_insert_all(or_insert(g, bnd, key(a, b)), ltab_get(caps, bnd), key(a, b)) }
+        OR(g2, OS(Tabs(occ, caps, outer), ms, late))
+      }
+    }
+    // A binding given as an argument is given away when the call is made,
+    // after the call's other arguments, before its borrows take place.
+    Sp(ECall(callee, args), _, _) -> match o_expr(o, callee, g) {
+      OR(g1, OS(Tabs(occ, caps, outer), ms, late)) -> {
+        let pos = positions(ms, callee, occ)
+        match o_args(OS(Tabs(occ, caps, outer), ms, late), pos, args, 0, g1, Nil, Nil) {
+          OA(g2, o2, reads, given) -> match o_list(o2, rev(given), g2) {
+            OR(g3, o3) -> OR(g3, o_reads(o3, rev(reads), g3))
+          }
+        }
+      }
+    }
+    // Its body is a body of its own; it captures from where it is written.
+    Sp(ELambda(_, Sp(body, _, _)), a, b) -> match o {
+      OS(Tabs(occ, caps, outer), ms, late) -> {
+        let g2 = or_insert_all(g, ltab_get(caps, key(a, b)), key(a, b))
+        match o_block(OS(Tabs(occ, caps, outer), ms, late), body, Nil) { OR(_, o2) -> OR(g2, o2) }
+      }
+    }
+    Sp(EBinary(_, l, r), _, _) -> match o_expr(o, l, g) { OR(g2, o2) -> o_expr(o2, r, g2) }
+    Sp(EUnary(_, x), _, _) -> o_expr(o, x, g)
+    Sp(EIf(c, Sp(t, _, _), Sp(f, _, _)), _, _) -> match o_expr(o, c, g) {
+      OR(g1, o1) -> match o_block(o1, t, g1) {
+        OR(gt, o2) -> match o_block(o2, f, g1) { OR(gf, o3) -> OR(join_gone(gf, gt), o3) }
+      }
+    }
+    Sp(EBlock(b), _, _) -> o_block(o, b, g)
+    Sp(EMatch(s, arms), _, _) -> match o_expr(o, s, g) { OR(g1, o1) -> o_arms(o1, arms, g1, g1) }
+    // A clause is a body of its own.
+    Sp(EHandle(body, Handler(_, _, clauses, ret)), _, _) -> match o_expr(o, body, g) {
+      OR(g1, o1) -> match (match ret { Yes(ReturnClause(_, rb)) -> o_expr(o1, rb, g1)  No -> OR(g1, o1) }) {
+        OR(g2, o2) -> OR(g2, o_clauses(o2, clauses))
+      }
+    }
+    Sp(EResume(x), _, _) -> o_expr(o, x, g)
+    _ -> OR(g, o)
+  }
+}
+type OA { OA(List(KV), OS, List(Int), List(Sp(Expr))) }
+fn o_args(o: OS, pos: List(Bool), args: List(Sp(Expr)), i: Int, g: List(KV), reads: List(Int), given: List(Sp(Expr))) -> OA {
+  match args {
+    Nil -> OA(g, o, reads, given)
+    Cons(a, rest) -> match o {
+      OS(Tabs(occ, caps, outer), ms, late) -> if is_borrow(pos, i, a, occ, outer) { o_args(OS(Tabs(occ, caps, outer), ms, late), pos, rest, i + 1, g, Cons(spk(a), reads), given) } else {
+        match a {
+          Sp(EVar(_), _, _) -> o_args(OS(Tabs(occ, caps, outer), ms, late), pos, rest, i + 1, g, reads, Cons(a, given))
+          _ -> match o_expr(OS(Tabs(occ, caps, outer), ms, late), a, g) { OR(g2, o2) -> o_args(o2, pos, rest, i + 1, g2, reads, given) }
+        }
+      }
+    }
+  }
+}
+fn o_list(o: OS, xs: List(Sp(Expr)), g: List(KV)) -> OR {
+  match xs { Nil -> OR(g, o)  Cons(x, rest) -> match o_expr(o, x, g) { OR(g2, o2) -> o_list(o2, rest, g2) } }
+}
+fn o_reads(o: OS, reads: List(Int), g: List(KV)) -> OS {
+  match reads {
+    Nil -> o
+    Cons(at, rest) -> match o {
+      OS(Tabs(occ, caps, outer), ms, late) -> {
+        let bnd = tab_get(occ, at)
+        let late2 = if bnd >= 0 && has_k(g, bnd) && !has_le(late, bnd) { Cons(LE(bnd, at, kv_get(g, bnd)), late) } else { late }
+        o_reads(OS(Tabs(occ, caps, outer), ms, late2), rest, g)
+      }
+    }
+  }
+}
+fn o_arms(o: OS, arms: List(Sp(MatchArm)), before: List(KV), g: List(KV)) -> OR {
+  match arms {
+    Nil -> OR(g, o)
+    Cons(Sp(MatchArm(_, body), _, _), rest) -> match o_expr(o, body, before) { OR(a, o2) -> o_arms(o2, rest, before, join_gone(g, a)) }
+  }
+}
+fn o_clauses(o: OS, cs: List(Sp(OpClause))) -> OS {
+  match cs { Nil -> o  Cons(Sp(OpClause(_, _, _, body), _, _), rest) -> match o_expr(o, body, Nil) { OR(_, o2) -> o_clauses(o2, rest) } }
+}
+
+// ---- Values: a function with `borrow` parameters used as a value -----------
+
+type BV { BV(Int, String, List(Bool)) }
+fn v_block(borrow occ: Array(List(KV)), ms: List(Mode), b: Block, acc: List(BV)) -> List(BV) {
+  match b { Block(stmts, tail) -> match tail { Yes(t) -> v_expr(occ, ms, t, False, v_stmts(occ, ms, stmts, acc))  No -> v_stmts(occ, ms, stmts, acc) } }
+}
+fn v_stmts(borrow occ: Array(List(KV)), ms: List(Mode), ss: List(Sp(Stmt)), acc: List(BV)) -> List(BV) {
+  match ss {
+    Nil -> acc
+    Cons(Sp(SLet(_, _, v), _, _), rest) -> v_stmts(occ, ms, rest, v_expr(occ, ms, v, False, acc))
+    Cons(Sp(SExpr(e), _, _), rest) -> v_stmts(occ, ms, rest, v_expr(occ, ms, e, False, acc))
+  }
+}
+fn v_list(borrow occ: Array(List(KV)), ms: List(Mode), xs: List(Sp(Expr)), acc: List(BV)) -> List(BV) {
+  match xs { Nil -> acc  Cons(x, rest) -> v_list(occ, ms, rest, v_expr(occ, ms, x, False, acc)) }
+}
+fn v_expr(borrow occ: Array(List(KV)), ms: List(Mode), e: Sp(Expr), callee: Bool, acc: List(BV)) -> List(BV) {
+  match e {
+    Sp(EVar(name), a, b) -> if callee || tab_get(occ, key(a, b)) >= 0 { acc } else {
+      match mode_get(ms, name) { Yes(m) -> Cons(BV(key(a, b), name, m), acc)  No -> acc }
+    }
+    Sp(ECall(c, args), _, _) -> v_list(occ, ms, args, v_expr(occ, ms, c, True, acc))
+    Sp(ELambda(_, Sp(body, _, _)), _, _) -> v_block(occ, ms, body, acc)
+    Sp(EBinary(_, l, r), _, _) -> v_expr(occ, ms, r, False, v_expr(occ, ms, l, False, acc))
+    Sp(EUnary(_, x), _, _) -> v_expr(occ, ms, x, False, acc)
+    Sp(EIf(c, Sp(t, _, _), Sp(f, _, _)), _, _) -> v_block(occ, ms, f, v_block(occ, ms, t, v_expr(occ, ms, c, False, acc)))
+    Sp(EBlock(b), _, _) -> v_block(occ, ms, b, acc)
+    Sp(EMatch(s, arms), _, _) -> v_arms(occ, ms, arms, v_expr(occ, ms, s, False, acc))
+    Sp(EHandle(body, Handler(_, _, cs, ret)), _, _) -> {
+      let a1 = v_expr(occ, ms, body, False, acc)
+      let a2 = match ret { Yes(ReturnClause(_, rb)) -> v_expr(occ, ms, rb, False, a1)  No -> a1 }
+      v_clauses(occ, ms, cs, a2)
+    }
+    Sp(EResume(x), _, _) -> v_expr(occ, ms, x, False, acc)
+    _ -> acc
+  }
+}
+fn v_arms(borrow occ: Array(List(KV)), ms: List(Mode), arms: List(Sp(MatchArm)), acc: List(BV)) -> List(BV) {
+  match arms { Nil -> acc  Cons(Sp(MatchArm(_, body), _, _), rest) -> v_arms(occ, ms, rest, v_expr(occ, ms, body, False, acc)) }
+}
+fn v_clauses(borrow occ: Array(List(KV)), ms: List(Mode), cs: List(Sp(OpClause)), acc: List(BV)) -> List(BV) {
+  match cs { Nil -> acc  Cons(Sp(OpClause(_, _, _, body), _, _), rest) -> v_clauses(occ, ms, rest, v_expr(occ, ms, body, False, acc)) }
+}
+
+// ---- Liveness: what each point holds (read only with a `multi` effect) ----
+
+// `Live`: each binding live at a point of the backward walk, with its first
+// use after the point, sorted by binding.
+type LS { LS(Tabs, List(String), List(LP), List(LP), List(Int), List(KV)) }
+type LP { LP(Int, List(KV)) }
+type LR { LR(List(KV), LS) }
+fn live_put(s: List(KV), b: Int, u: Int) -> List(KV) {
+  match s {
+    Nil -> Cons(KV(b, u), Nil)
+    Cons(KV(k, v), rest) -> if k == b { Cons(KV(b, u), rest) } else { if b < k { Cons(KV(b, u), s) } else { Cons(KV(k, v), live_put(rest, b, u)) } }
+  }
+}
+fn live_or_insert(s: List(KV), b: Int, u: Int) -> List(KV) { if has_k(s, b) { s } else { live_put(s, b, u) } }
+fn live_remove(s: List(KV), b: Int) -> List(KV) {
+  match s { Nil -> Nil  Cons(KV(k, v), rest) -> if k == b { rest } else { Cons(KV(k, v), live_remove(rest, b)) } }
+}
+fn live_remove_all(s: List(KV), ns: List(NK)) -> List(KV) {
+  match ns { Nil -> s  Cons(NK(_, k), rest) -> live_remove_all(live_remove(s, k), rest) }
+}
+// The earlier first use wins.
+fn join(s: List(KV), t: List(KV)) -> List(KV) {
+  match t {
+    Nil -> s
+    Cons(KV(b, u), rest) -> join(if has_k(s, b) { (if kstart(u) < kstart(kv_get(s, b)) { live_put(s, b, u) } else { s }) } else { live_put(s, b, u) }, rest)
+  }
+}
+fn put_all(s: List(KV), ks: List(Int), u: Int) -> List(KV) {
+  match ks { Nil -> s  Cons(k, rest) -> put_all(live_put(s, k, u), rest, u) }
+}
+// The state: the tables, the constructors' names, `held` (by point),
+// `resumes` (by `handle`, newest first), the `handle`s whose clauses the
+// walk is in (innermost first), the values waiting (newest first).
+fn lp_put(xs: List(LP), k: Int, v: List(KV)) -> List(LP) {
+  match xs { Nil -> Cons(LP(k, v), Nil)  Cons(LP(a, w), rest) -> if a == k { Cons(LP(k, v), rest) } else { Cons(LP(a, w), lp_put(rest, k, v)) } }
+}
+fn lp_push(xs: List(LP), k: Int, u: Int) -> List(LP) {
+  match xs { Nil -> Cons(LP(k, Cons(KV(u, 0), Nil)), Nil)  Cons(LP(a, w), rest) -> if a == k { Cons(LP(k, append(w, Cons(KV(u, 0), Nil))), rest) } else { Cons(LP(a, w), lp_push(rest, k, u)) } }
+}
+// What an evaluated operand holds.
+fn value_of(borrow occ: Array(List(KV)), borrow caps: Array(List(KL)), e: Sp(Expr), acc: List(KV)) -> List(KV) {
+  match 0 {
+    _ -> match e {
+      Sp(EVar(_), a, b) -> {
+        let bnd = tab_get(occ, key(a, b))
+        if bnd < 0 { acc } else { pairs_with(ltab_get(caps, bnd), key(a, b), append(acc, Cons(KV(bnd, key(a, b)), Nil))) }
+      }
+      Sp(ELambda(_, _), a, b) -> pairs_with(ltab_get(caps, key(a, b)), key(a, b), acc)
+      Sp(EInt(_), _, _) -> acc
+      Sp(EFloat, _, _) -> acc
+      Sp(EStr(_), _, _) -> acc
+      Sp(EBool(_), _, _) -> acc
+      Sp(EUnit, _, _) -> acc
+      Sp(EQualified(_, _), _, _) -> acc
+      Sp(EError, _, _) -> acc
+      Sp(_, a, b) -> append(acc, Cons(KV(key(a, b), key(a, b)), Nil))
+    }
+  }
+}
+fn pairs_with(cs: List(Int), u: Int, acc: List(KV)) -> List(KV) {
+  match cs { Nil -> acc  Cons(c, rest) -> pairs_with(rest, u, append(acc, Cons(KV(c, u), Nil))) }
+}
+fn point(l: LS, at: Int, s: List(KV)) -> LS {
+  match l {
+    LS(t, ctors, held, res, cls, pending) -> LS(t, ctors, lp_put(held, at, pend_into(s, rev(pending))), res, cls, pending)
+  }
+}
+fn pend_into(s: List(KV), ps: List(KV)) -> List(KV) {
+  match ps { Nil -> s  Cons(KV(b, u), rest) -> pend_into(live_or_insert(s, b, u), rest) }
+}
+fn l_block(l: LS, b: Block, s: List(KV)) -> LR {
+  match b {
+    Block(stmts, tail) -> {
+      let r = match tail { Yes(t) -> l_expr(l, t, s)  No -> LR(s, l) }
+      l_back(r, rev(stmts))
+    }
+  }
+}
+fn l_back(r: LR, ss: List(Sp(Stmt))) -> LR {
+  match ss {
+    Nil -> r
+    Cons(Sp(SLet(_, _, v), _, _), rest) -> match r { LR(s, l) -> l_back(l_expr(l, v, live_remove(s, spk(v))), rest) }
+    Cons(Sp(SExpr(e), _, _), rest) -> match r { LR(s, l) -> l_back(l_expr(l, e, s), rest) }
+  }
+}
+// A call of a constructor, or of a builtin other than `op.perform`, is not a
+// point.
+fn is_point(borrow occ: Array(List(KV)), ctors: List(String), callee: Sp(Expr)) -> Bool {
+  match 0 {
+    _ -> match callee {
+      Sp(EVar(n), a, b) -> tab_get(occ, key(a, b)) >= 0 || !has_str(ctors, n)
+      Sp(EQualified(m, n), _, _) -> m == "op" && n == "perform"
+      _ -> True
+    }
+  }
+}
+fn with_pending(l: LS, extra: List(KV), e: Sp(Expr), s: List(KV)) -> LR {
+  match l {
+    LS(t, ctors, held, res, cls, pending) -> match l_expr(LS(t, ctors, held, res, cls, rev_onto(extra, pending)), e, s) {
+      LR(s2, LS(t2, c2, h2, r2, cl2, _)) -> LR(s2, LS(t2, c2, h2, r2, cl2, pending))
+    }
+  }
+}
+type LPd { LPd(LS, List(KV)) }
+fn split_pending(l: LS) -> LPd { match l { LS(t, c, h, r, cl, p) -> LPd(LS(t, c, h, r, cl, Nil), p) } }
+fn give_pending(l: LS, p: List(KV)) -> LS { match l { LS(t, c, h, r, cl, _) -> LS(t, c, h, r, cl, p) } }
+fn l_expr(l: LS, e: Sp(Expr), s: List(KV)) -> LR {
+  match e {
+    Sp(EVar(_), a, b) -> match l {
+      LS(Tabs(occ, caps, outer), ctors, held, res, cls, pending) -> {
+        let bnd = tab_get(occ, key(a, b))
+        let s2 = if bnd < 0 { s } else { put_all(live_put(s, bnd, key(a, b)), ltab_get(caps, bnd), key(a, b)) }
+        LR(s2, LS(Tabs(occ, caps, outer), ctors, held, res, cls, pending))
+      }
+    }
+    Sp(ECall(callee, args), a, b) -> match l {
+      LS(Tabs(occ, caps, outer), ctors, held, res, cls, pending) -> {
+        let pt = is_point(occ, ctors, callee)
+        let l1 = LS(Tabs(occ, caps, outer), ctors, held, res, cls, pending)
+        let l2 = if pt { point(l1, key(a, b), s) } else { l1 }
+        match l_args(l2, callee, rev(args), len(args), args, s) { LR(s2, l3) -> l_expr(l3, callee, s2) }
+      }
+    }
+    Sp(ELambda(params, Sp(body, _, _)), _, _) -> match split_pending(l) {
+      LPd(l0, saved) -> match l_block(l0, body, Nil) {
+        LR(inner, l2) -> LR(join(s, live_remove_all(inner, param_names(params))), give_pending(l2, saved))
+      }
+    }
+    Sp(EBinary(_, lhs, rhs), _, _) -> match l {
+      LS(Tabs(occ, caps, outer), c, h, r, cl, p) -> {
+        let waiting = value_of(occ, caps, lhs, Nil)
+        match with_pending(LS(Tabs(occ, caps, outer), c, h, r, cl, p), waiting, rhs, s) { LR(s2, l2) -> l_expr(l2, lhs, s2) }
+      }
+    }
+    Sp(EUnary(_, x), _, _) -> l_expr(l, x, s)
+    Sp(EIf(c, Sp(tb, _, _), Sp(fb, _, _)), _, _) -> match l_block(l, tb, s) {
+      LR(t, l2) -> match l_block(l2, fb, s) { LR(s2, l3) -> l_expr(l3, c, join(s2, t)) }
+    }
+    Sp(EBlock(b), _, _) -> l_block(l, b, s)
+    Sp(EMatch(scr, arms), _, _) -> match arms {
+      Nil -> l_expr(l, scr, s)
+      _ -> match l_arms(l, arms, s, Nil) { LR(s2, l2) -> l_expr(l2, scr, s2) }
+    }
+    // Its body, clauses and return clause are bodies of their own: what
+    // escapes the `handle` is held by the `handle` itself.
+    Sp(EHandle(body, Handler(_, _, clauses, ret)), a, b) -> match split_pending(l) {
+      LPd(l0, saved) -> {
+      let rr = match ret {
+        Yes(ReturnClause(_, rb)) -> match l_expr(l0, rb, Nil) { LR(r0, l1) -> LR(live_remove(r0, spk(rb)), l1) }
+        No -> LR(Nil, l0)
+      }
+      match rr {
+        LR(retl, l1) -> match l_clauses(push_clauses(l1, key(a, b)), clauses, Nil) {
+          LR(cl, l2) -> match l_expr(pop_clauses(l2), body, retl) {
+            LR(bl, l3) -> {
+              let l4 = point(give_pending(l3, saved), key(a, b), s)
+              LR(join(join(join(s, bl), cl), retl), l4)
+            }
+          }
+        }
+      }
+      }
+    }
+    Sp(EResume(x), a, b) -> match point(l, key(a, b), s) {
+      LS(t, c, h, r, cl, p) -> {
+        let r2 = match cl { Cons(hk, _) -> lp_push(r, hk, key(a, b))  Nil -> r }
+        l_expr(LS(t, c, h, r2, cl, p), x, s)
+      }
+    }
+    _ -> LR(s, l)
+  }
+}
+fn push_clauses(l: LS, h: Int) -> LS { match l { LS(t, c, he, r, cl, p) -> LS(t, c, he, r, Cons(h, cl), p) } }
+fn pop_clauses(l: LS) -> LS { match l { LS(t, c, he, r, cl, p) -> match cl { Cons(_, rest) -> LS(t, c, he, r, rest, p)  Nil -> LS(t, c, he, r, Nil, p) } } }
+// The arguments from the last: each with the callee and the earlier ones
+// waiting.
+fn l_args(l: LS, callee: Sp(Expr), rargs: List(Sp(Expr)), j: Int, args: List(Sp(Expr)), s: List(KV)) -> LR {
+  match rargs {
+    Nil -> LR(s, l)
+    Cons(a, rest) -> match l {
+      LS(Tabs(occ, caps, outer), c, h, r, cl, p) -> {
+        let waiting = values_of(occ, caps, take(args, j - 1), value_of(occ, caps, callee, Nil))
+        match with_pending(LS(Tabs(occ, caps, outer), c, h, r, cl, p), waiting, a, s) { LR(s2, l2) -> l_args(l2, callee, rest, j - 1, args, s2) }
+      }
+    }
+  }
+}
+fn take(xs: List(a), n: Int) -> List(a) {
+  if n <= 0 { Nil } else { match xs { Nil -> Nil  Cons(x, rest) -> Cons(x, take(rest, n - 1)) } }
+}
+fn values_of(borrow occ: Array(List(KV)), borrow caps: Array(List(KL)), xs: List(Sp(Expr)), acc: List(KV)) -> List(KV) {
+  match xs { Nil -> acc  Cons(x, rest) -> values_of(occ, caps, rest, value_of(occ, caps, x, acc)) }
+}
+fn l_arms(l: LS, arms: List(Sp(MatchArm)), out: List(KV), s: List(KV)) -> LR {
+  match arms {
+    Nil -> LR(s, l)
+    Cons(Sp(MatchArm(p, body), _, _), rest) -> match l_expr(l, body, out) {
+      LR(a, l2) -> l_arms(l2, rest, out, join(s, live_remove_all(a, pattern_vars(p, Nil))))
+    }
+  }
+}
+fn l_clauses(l: LS, cs: List(Sp(OpClause)), cl: List(KV)) -> LR {
+  match cs {
+    Nil -> LR(cl, l)
+    Cons(Sp(OpClause(_, _, ps, body), _, _), rest) -> match l_expr(l, body, Nil) {
+      LR(x, l2) -> l_clauses(l2, rest, join(cl, live_remove_all(x, param_names(ps))))
+    }
+  }
+}
+
+// ---- The pass and its dump ------------------------------------------------
+
+type FnI { FnI(List(Sp(Param)), Sp(Block)) }
+fn fns_of(decls: List(Sp(Decl))) -> List(FnI) {
+  match decls {
+    Nil -> Nil
+    Cons(Sp(DFn(_, _, ps, _, _, body), _, _), rest) -> Cons(FnI(ps, body), fns_of(rest))
+    Cons(_, rest) -> fns_of(rest)
+  }
+}
+fn any_multi(decls: List(Sp(Decl))) -> Bool {
+  match decls { Nil -> False  Cons(Sp(DEffect(_, _, m, _), _, _), rest) -> m || any_multi(rest)  Cons(_, rest) -> any_multi(rest) }
+}
+fn ctors_of(decls: List(Sp(Decl)), acc: List(String)) -> List(String) {
+  match decls {
+    Nil -> acc
+    Cons(Sp(DType(_, _, _, vs), _, _), rest) -> ctors_of(rest, variant_names(vs, acc))
+    Cons(_, rest) -> ctors_of(rest, acc)
+  }
+}
+fn variant_names(vs: List(Sp(VariantDecl)), acc: List(String)) -> List(String) {
+  match vs { Nil -> acc  Cons(Sp(VariantDecl(n, _), _, _), rest) -> variant_names(rest, Cons(n, acc)) }
+}
+fn resolve_fns(r: RS, fs: List(FnI)) -> RS {
+  match fs { Nil -> r  Cons(FnI(ps, body), rest) -> resolve_fns(r_function(r, ps, body), rest) }
+}
+fn count_fns(cs: CS, fs: List(FnI)) -> CS {
+  match fs { Nil -> cs  Cons(FnI(ps, body), rest) -> count_fns(c_function(cs, ps, body), rest) }
+}
+fn order_fns(o: OS, fs: List(FnI)) -> OS {
+  match fs { Nil -> o  Cons(FnI(_, Sp(b, _, _)), rest) -> match o_block(o, b, Nil) { OR(_, o2) -> order_fns(o2, rest) } }
+}
+fn values_fns(borrow occ: Array(List(KV)), ms: List(Mode), fs: List(FnI), acc: List(BV)) -> List(BV) {
+  match fs { Nil -> acc  Cons(FnI(_, Sp(b, _, _)), rest) -> values_fns(occ, ms, rest, v_block(occ, ms, b, acc)) }
+}
+fn live_fns(l: LS, fs: List(FnI)) -> LS {
+  match fs { Nil -> l  Cons(FnI(_, Sp(b, _, _)), rest) -> match l_block(l, b, Nil) { LR(_, l2) -> live_fns(l2, rest) } }
+}
+// D5: a `borrow` parameter's first use (by span) that is not a borrow.
+fn given_fns(fs: List(FnI), uses: List(KV), borrow bo: Array(List(KV)), acc: List(KV)) -> List(KV) {
+  match fs { Nil -> acc  Cons(FnI(ps, _), rest) -> given_fns(rest, uses, bo, given_params(ps, uses, bo, acc)) }
+}
+fn given_params(ps: List(Sp(Param)), uses: List(KV), borrow bo: Array(List(KV)), acc: List(KV)) -> List(KV) {
+  match ps {
+    Nil -> acc
+    Cons(Sp(Param(_, _, True), a, b), rest) -> given_params(rest, uses, bo, match first_given(uses, key(a, b), bo) { Yes(at) -> kv_put(acc, key(a, b), at)  No -> acc })
+    Cons(_, rest) -> given_params(rest, uses, bo, acc)
+  }
+}
+fn first_given(uses: List(KV), b: Int, borrow bo: Array(List(KV))) -> Maybe(Int) {
+  match uses { Nil -> No  Cons(KV(at, bb), rest) -> if bb == b && tab_get(bo, at) < 0 { Yes(at) } else { first_given(rest, b, bo) } }
+}
+
+fn why_text(w: AWhy) -> String {
+  match w { WTwice -> "twice"  WClosure(k) -> "closure " <> show_key(k)  WClause(k) -> "clause " <> show_key(k) }
+}
+fn insert_me(xs: List(ME), e: ME) -> List(ME) {
+  match xs { Nil -> Cons(e, Nil)  Cons(ME(a, m), rest) -> match e { ME(k, _) -> if k < a { Cons(e, xs) } else { Cons(ME(a, m), insert_me(rest, e)) } } }
+}
+fn insert_lp(xs: List(LP), e: LP) -> List(LP) {
+  match xs { Nil -> Cons(e, Nil)  Cons(LP(a, m), rest) -> match e { LP(k, _) -> if k < a { Cons(e, xs) } else { Cons(LP(a, m), insert_lp(rest, e)) } } }
+}
+fn insert_le(xs: List(LE), e: LE) -> List(LE) {
+  match xs { Nil -> Cons(e, Nil)  Cons(LE(a, r, y), rest) -> match e { LE(k, _, _) -> if k < a { Cons(e, xs) } else { Cons(LE(a, r, y), insert_le(rest, e)) } } }
+}
+fn insert_bv(xs: List(BV), e: BV) -> List(BV) {
+  match xs { Nil -> Cons(e, Nil)  Cons(BV(a, n, m), rest) -> match e { BV(k, _, _) -> if k < a { Cons(e, xs) } else { if k == a { Cons(e, rest) } else { Cons(BV(a, n, m), insert_bv(rest, e)) } } } }
+}
+fn d_many(xs: List(ME), b: Buffer) -> Buffer {
+  match xs { Nil -> b  Cons(ME(k, Many(at, w)), rest) -> d_many(rest, buffer.push(b, "many " <> show_key(k) <> " " <> show_key(at) <> " " <> why_text(w) <> "\n")) }
+}
+fn d_held(xs: List(LP), b: Buffer) -> Buffer {
+  match xs { Nil -> b  Cons(LP(p, es), rest) -> d_held(rest, d_entries(p, es, b)) }
+}
+fn d_entries(p: Int, es: List(KV), b: Buffer) -> Buffer {
+  match es { Nil -> b  Cons(KV(x, u), rest) -> d_entries(p, rest, buffer.push(b, "held " <> show_key(p) <> " " <> show_key(x) <> " " <> show_key(u) <> "\n")) }
+}
+fn d_resumes(xs: List(LP), b: Buffer) -> Buffer {
+  match xs { Nil -> b  Cons(LP(h, rs), rest) -> d_resumes(rest, d_res(h, rs, b)) }
+}
+fn d_res(h: Int, rs: List(KV), b: Buffer) -> Buffer {
+  match rs { Nil -> b  Cons(KV(r, _), rest) -> d_res(h, rest, buffer.push(b, "resumes " <> show_key(h) <> " " <> show_key(r) <> "\n")) }
+}
+fn d_late(xs: List(LE), b: Buffer) -> Buffer {
+  match xs { Nil -> b  Cons(LE(k, r, y), rest) -> d_late(rest, buffer.push(b, "late " <> show_key(k) <> " " <> show_key(r) <> " " <> show_key(y) <> "\n")) }
+}
+fn d_given(xs: List(KV), b: Buffer) -> Buffer {
+  match xs { Nil -> b  Cons(KV(k, u), rest) -> d_given(rest, buffer.push(b, "given " <> show_key(k) <> " " <> show_key(u) <> "\n")) }
+}
+fn bits(ms: List(Bool)) -> String { match ms { Nil -> ""  Cons(m, rest) -> (if m { "1" } else { "0" }) <> bits(rest) } }
+fn d_bv(xs: List(BV), b: Buffer) -> Buffer {
+  match xs { Nil -> b  Cons(BV(k, n, m), rest) -> d_bv(rest, buffer.push(b, "borrow-value " <> show_key(k) <> " " <> n <> " " <> bits(m) <> "\n")) }
+}
+fn sort_by_insert(xs: List(a), acc: List(a), ins: fn(List(a), a) -> List(a)) -> List(a) {
+  match xs { Nil -> acc  Cons(x, rest) -> sort_by_insert(rest, ins(acc, x), ins) }
+}
+
+// The facts, for inference (the checker in Elya's stage F5): the bindings
+// used many times, what each point holds, each handler's resumes, the
+// reads after a binding was given away, the `borrow` parameters given
+// away, and the functions with `borrow` parameters used as values.
+type Facts { Facts(List(ME), List(LP), List(LP), List(LE), List(KV), List(BV)) }
+pub fn facts(m: Module, size: Int) -> Facts {
+  match m {
+    Module(_, decls) -> {
+      let fs = fns_of(decls)
+      let tabs = Tabs(new_tab(size + 2, array.new()), new_ltab(size + 2, array.new()), new_tab(size + 2, array.new()))
+      match resolve_fns(RS(Nil, 0, Nil, Nil, tabs), fs) {
+        RS(_, _, _, _, t) -> {
+          let ms = modes_of(decls)
+          match count_fns(CS(t, ms, new_tab(size + 2, array.new()), Nil, Nil), fs) {
+            CS(t2, _, bo, many, _) -> match order_fns(OS(t2, ms, Nil), fs) {
+              OS(Tabs(occ, caps, outer), _, late) -> {
+                let uses = tab_entries(occ, size + 1, Nil)
+                let given = given_fns(fs, uses, bo, Nil)
+                let bvs = match ms { Nil -> Nil  _ -> values_fns(occ, ms, fs, Nil) }
+                let mny = sort_by_insert(many, Nil, insert_me)
+                let lt = sort_by_insert(late, Nil, insert_le)
+                let gv = sort_kv(given, Nil)
+                let bv = sort_by_insert(bvs, Nil, insert_bv)
+                if any_multi(decls) {
+                  match live_fns(LS(Tabs(occ, caps, outer), ctors_of(decls, Nil), Nil, Nil, Nil, Nil), fs) {
+                    LS(_, _, held, res, _, _) -> Facts(mny, sort_by_insert(held, Nil, insert_lp), sort_by_insert(res, Nil, insert_lp), lt, gv, bv)
+                  }
+                } else { Facts(mny, Nil, Nil, lt, gv, bv) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+fn affine_dump(m: Module, size: Int) -> String {
+  match facts(m, size) {
+    Facts(many, held, res, late, given, bvs) ->
+      buffer.finish(d_bv(bvs, d_given(given, d_late(late, d_resumes(res, d_held(held, d_many(many, buffer.new())))))))
+  }
+}
+
+pub fn main() / {IO} {
+  let text = io.read_file(io.arg(0))
+  match parse.parse_tree(text) {
+    Parsed(m, _) -> {
+      let out = affine_dump(m, string.length(text))
+      if string.length(out) == 0 { Unit } else { io.println(string.slice(out, 0, string.length(out) - 1)) }
+    }
+    ParseError(_, _, _) -> Unit
+  }
+}
