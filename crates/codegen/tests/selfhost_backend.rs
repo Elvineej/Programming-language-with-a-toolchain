@@ -172,10 +172,22 @@ fn proof() {
                 .map(|(i, t)| (format!("focused #{i}"), t.to_string())),
         )
         .chain([
-            ("focused wide constructor".to_string(), support::wide_ctor(62)),
-            ("focused wide closure".to_string(), support::wide_closure(61)),
-            ("refused wide constructor".to_string(), support::wide_ctor(63)),
-            ("refused wide closure".to_string(), support::wide_closure(62)),
+            (
+                "focused wide constructor".to_string(),
+                support::wide_ctor(62),
+            ),
+            (
+                "focused wide closure".to_string(),
+                support::wide_closure(61),
+            ),
+            (
+                "refused wide constructor".to_string(),
+                support::wide_ctor(63),
+            ),
+            (
+                "refused wide closure".to_string(),
+                support::wide_closure(62),
+            ),
         ]);
     let (mut compared, mut refused) = (0, 0);
     let mut corpus_compared = 0;
@@ -218,10 +230,7 @@ fn proof() {
             );
             continue;
         }
-        assert!(
-            !name.starts_with("refused "),
-            "{name}: built, not refused"
-        );
+        assert!(!name.starts_with("refused "), "{name}: built, not refused");
         if rust_build(&text, &rust_exe).is_none() {
             assert!(
                 !name.starts_with("focused"),
@@ -278,7 +287,11 @@ fn proof() {
 fn two_modules(root: &Path, scratch: &parse_support::Scratch, emitter: &Path) {
     let dir = scratch.path().join("two");
     std::fs::create_dir_all(&dir).expect("a directory");
-    std::fs::write(dir.join("wrap.elya"), "pub fn g(x: Int) -> Int { x * 100 }\n").expect("write");
+    std::fs::write(
+        dir.join("wrap.elya"),
+        "pub fn g(x: Int) -> Int { x * 100 }\n",
+    )
+    .expect("write");
     std::fs::write(
         dir.join("main.elya"),
         "import wrap\nfn g(x: Int) -> Int { x + 1 }\nfn ap(f: fn(Int) -> Int, x: Int) -> Int { f(x) }\npub fn main() -> Int { ap(g, 1) + wrap.g(2) }\n",
