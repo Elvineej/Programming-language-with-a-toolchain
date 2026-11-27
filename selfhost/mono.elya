@@ -1,0 +1,210 @@
+// Monomorphization in Elya, the back end's stage B4 (spec
+// docs/superpowers/specs/2026-11-27-elya-backend-in-elya-design.md D3
+// piece 2, D4): every function at ground types, as `mono.rs` does. A
+// reference to a top-level function whose signature has a type variable
+// goes to a clone with the variables replaced by the types the reference
+// instantiates them at; a variable left over is unconstrained and is `Unit`
+// (Rust's default). The collector is precise, so the back end must know of
+// every field whether it is a pointer: that is why the types are made ground.
+import parse / {IO}
+import check / {IO}
+import core / {IO}
+
+fn rev_onto(xs: List(a), acc: List(a)) -> List(a) {
+  match xs { Nil -> acc  Cons(x, rest) -> rev_onto(rest, Cons(x, acc)) }
+}
+fn rev(xs: List(a)) -> List(a) { rev_onto(xs, Nil) }
+fn has(xs: List(String), x: String) -> Bool { match xs { Nil -> False  Cons(y, rest) -> y == x || has(rest, x) } }
+
+// ---- Substitutions ----------------------------------------------------------
+
+type MSub { MSub(Int, Ty) }
+fn sub_get(ss: List(MSub), v: Int) -> Maybe(Ty) {
+  match ss { Nil -> No  Cons(MSub(w, t), rest) -> if w == v { Yes(t) } else { sub_get(rest, v) } }
+}
+fn sub_ty(ss: List(MSub), t: Ty) -> Ty {
+  match t {
+    TVar(v) -> match sub_get(ss, v) { Yes(u) -> u  No -> t }
+    TFn(ps, rw, r) -> TFn(sub_tys(ss, ps), rw, sub_ty(ss, r))
+    TCon(n, args) -> TCon(n, sub_tys(ss, args))
+    _ -> t
+  }
+}
+fn sub_tys(ss: List(MSub), ts: List(Ty)) -> List(Ty) {
+  match ts { Nil -> Nil  Cons(t, rest) -> Cons(sub_ty(ss, t), sub_tys(ss, rest)) }
+}
+// A variable nothing constrains is `Unit`.
+pub fn ground(t: Ty) -> Ty {
+  match t {
+    TVar(_) -> TB(4)
+    TFn(ps, rw, r) -> TFn(ground_all(ps), rw, ground(r))
+    TCon(n, args) -> TCon(n, ground_all(args))
+    _ -> t
+  }
+}
+fn ground_all(ts: List(Ty)) -> List(Ty) {
+  match ts { Nil -> Nil  Cons(t, rest) -> Cons(ground(t), ground_all(rest)) }
+}
+fn has_var(t: Ty) -> Bool {
+  match t {
+    TVar(_) -> True
+    TFn(ps, _, r) -> any_var(ps) || has_var(r)
+    TCon(_, args) -> any_var(args)
+    _ -> False
+  }
+}
+fn any_var(ts: List(Ty)) -> Bool { match ts { Nil -> False  Cons(t, rest) -> has_var(t) || any_var(rest) } }
+
+// The variables of a generic signature as a use instantiates them.
+fn match_ty(p: Ty, u: Ty, acc: List(MSub)) -> List(MSub) {
+  match p {
+    TVar(v) -> match sub_get(acc, v) { Yes(_) -> acc  No -> Cons(MSub(v, u), acc) }
+    TFn(ps, _, r) -> match u { TFn(us, _, ur) -> match_ty(r, ur, match_all(ps, us, acc))  _ -> acc }
+    TCon(_, args) -> match u { TCon(_, us) -> match_all(args, us, acc)  _ -> acc }
+    _ -> acc
+  }
+}
+fn match_all(ps: List(Ty), us: List(Ty), acc: List(MSub)) -> List(MSub) {
+  match ps { Nil -> acc  Cons(p, prest) -> match us { Nil -> acc  Cons(u, urest) -> match_all(prest, urest, match_ty(p, u, acc)) } }
+}
+
+// ---- The functions ------------------------------------------------------------
+
+fn param_tys(ps: List(CParam)) -> List(Ty) { match ps { Nil -> Nil  Cons(CParam(_, t), rest) -> Cons(t, param_tys(rest)) } }
+fn sig(f: CFn) -> Ty { match f { CFn(_, ps, CExpr(_, _, t, _)) -> TFn(param_tys(ps), Row(Nil, RClosed), t) } }
+fn generic(f: CFn) -> Bool { has_var(sig(f)) }
+fn find_fn(fs: List(CFn), n: String) -> Maybe(CFn) {
+  match fs { Nil -> No  Cons(CFn(m, ps, b), rest) -> if m == n { Yes(CFn(m, ps, b)) } else { find_fn(rest, n) } }
+}
+
+// An instance: the function, its instantiated signature's text, its name.
+type MInst { MInst(String, String, String) }
+// The module's functions, the instances made so far, those still to write
+// (the function, its new name, the substitution).
+type MJob { MJob(CFn, String, List(MSub)) }
+type MState { MSt(List(CFn), List(MInst), List(MJob), Int) }
+type MR(a) { MR(a, MState) }
+
+// A ground type's text without its effect rows, which do not change how a
+// value is laid out: the key of an instance, of a type or of a function.
+pub fn key_of(t: Ty) -> String {
+  match t {
+    TB(c) -> if c == 0 { "Int" } else { if c == 1 { "Float" } else { if c == 2 { "Bool" } else { if c == 3 { "String" } else { "Unit" } } } }
+    TFn(ps, _, r) -> "fn(" <> keys(ps) <> ") -> " <> key_of(r)
+    TCon(n, Nil) -> n
+    TCon(n, args) -> n <> "(" <> keys(args) <> ")"
+    _ -> "?"
+  }
+}
+fn keys(ts: List(Ty)) -> String {
+  match ts { Nil -> ""  Cons(t, Nil) -> key_of(t)  Cons(t, rest) -> key_of(t) <> ", " <> keys(rest) }
+}
+fn inst_get(is: List(MInst), f: String, key: String) -> Maybe(String) {
+  match is { Nil -> No  Cons(MInst(g, k, n), rest) -> if g == f && k == key { Yes(n) } else { inst_get(rest, f, key) } }
+}
+// The name a use of `f` at the ground type `t` calls: `f` itself, or the
+// instance at `t`, made (and queued) on first use.
+fn instance(st: MState, f: String, t: Ty) -> MR(String) {
+  match st {
+    MSt(fs, is, jobs, k) -> match find_fn(fs, f) {
+      No -> MR(f, st)
+      Yes(g) -> if !generic(g) { MR(f, st) } else {
+        let key = key_of(t)
+        match inst_get(is, f, key) {
+          Yes(n) -> MR(n, st)
+          No -> {
+            let n = f <> ".mono." <> int.to_string(k)
+            MR(n, MSt(fs, Cons(MInst(f, key, n), is), Cons(MJob(g, n, match_ty(sig(g), t, Nil)), jobs), k + 1))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn at(ss: List(MSub), t: Ty) -> Ty { ground(sub_ty(ss, t)) }
+fn mexprs(st: MState, ss: List(MSub), locals: List(String), xs: List(CExpr)) -> MR(List(CExpr)) {
+  match xs {
+    Nil -> MR(Nil, st)
+    Cons(x, rest) -> match mexpr(st, ss, locals, x) { MR(y, st2) -> match mexprs(st2, ss, locals, rest) { MR(ys, st3) -> MR(Cons(y, ys), st3) } }
+  }
+}
+fn mparams(ss: List(MSub), ps: List(CParam)) -> List(CParam) {
+  match ps { Nil -> Nil  Cons(CParam(n, t), rest) -> Cons(CParam(n, at(ss, t)), mparams(ss, rest)) }
+}
+fn names(ps: List(CParam), acc: List(String)) -> List(String) {
+  match ps { Nil -> acc  Cons(CParam(n, _), rest) -> names(rest, Cons(n, acc)) }
+}
+fn pat_names(p: CPat, acc: List(String)) -> List(String) {
+  match p { QVar(n) -> Cons(n, acc)  QCtor(_, args) -> pats_names(args, acc)  _ -> acc }
+}
+fn pats_names(ps: List(CPat), acc: List(String)) -> List(String) {
+  match ps { Nil -> acc  Cons(p, rest) -> pats_names(rest, pat_names(p, acc)) }
+}
+fn marms(st: MState, ss: List(MSub), locals: List(String), arms: List(CArm)) -> MR(List(CArm)) {
+  match arms {
+    Nil -> MR(Nil, st)
+    Cons(CArm(p, b), rest) -> match mexpr(st, ss, pat_names(p, locals), b) {
+      MR(b2, st2) -> match marms(st2, ss, locals, rest) { MR(more, st3) -> MR(Cons(CArm(p, b2), more), st3) }
+    }
+  }
+}
+fn mexpr(st: MState, ss: List(MSub), locals: List(String), e: CExpr) -> MR(CExpr) {
+  match e {
+    CExpr(a, b, t0, k) -> {
+      let t = at(ss, t0)
+      match k {
+        KVar(n) -> if has(locals, n) { MR(CExpr(a, b, t, k), st) } else { match instance(st, n, t) { MR(m, st2) -> MR(CExpr(a, b, t, KVar(m)), st2) } }
+        KApp(f, args) -> match mexpr(st, ss, locals, f) { MR(f2, st2) -> match mexprs(st2, ss, locals, args) { MR(xs, st3) -> MR(CExpr(a, b, t, KApp(f2, xs)), st3) } }
+        KBuiltin(n, args) -> match mexprs(st, ss, locals, args) { MR(xs, st2) -> MR(CExpr(a, b, t, KBuiltin(n, xs)), st2) }
+        KCtor(n, args) -> match mexprs(st, ss, locals, args) { MR(xs, st2) -> MR(CExpr(a, b, t, KCtor(n, xs)), st2) }
+        KPrim(op, args) -> match mexprs(st, ss, locals, args) { MR(xs, st2) -> MR(CExpr(a, b, t, KPrim(op, xs)), st2) }
+        KLambda(ps, body) -> match mexpr(st, ss, names(ps, locals), body) { MR(b2, st2) -> MR(CExpr(a, b, t, KLambda(mparams(ss, ps), b2)), st2) }
+        // A `let` whose value keeps a type variable may be generalized and
+        // used at several types, which `mono.rs` clones per use; that is
+        // not done here, so the value is marked and the back end refuses it.
+        KLet(n, v, body) -> match mexpr(st, ss, locals, v) {
+          MR(v2, st2) -> match mexpr(st2, ss, Cons(n, locals), body) {
+            MR(b2, st3) -> MR(CExpr(a, b, t, KLet(n, if has_var(sub_ty(ss, expr_ty(v))) { generic_let(v2) } else { v2 }, b2)), st3)
+          }
+        }
+        KIf(c, x, y) -> match mexpr(st, ss, locals, c) {
+          MR(c2, st2) -> match mexpr(st2, ss, locals, x) { MR(x2, st3) -> match mexpr(st3, ss, locals, y) { MR(y2, st4) -> MR(CExpr(a, b, t, KIf(c2, x2, y2)), st4) } }
+        }
+        KMatch(s, arms) -> match mexpr(st, ss, locals, s) { MR(s2, st2) -> match marms(st2, ss, locals, arms) { MR(as2, st3) -> MR(CExpr(a, b, t, KMatch(s2, as2)), st3) } }
+        _ -> MR(CExpr(a, b, t, k), st)
+      }
+    }
+  }
+}
+
+fn expr_ty(e: CExpr) -> Ty { match e { CExpr(_, _, t, _) -> t } }
+fn generic_let(v: CExpr) -> CExpr { match v { CExpr(a, b, t, _) -> CExpr(a, b, t, KBuiltin("$generic", Nil)) } }
+
+fn mfn(st: MState, f: CFn, name: String, ss: List(MSub)) -> MR(CFn) {
+  match f { CFn(_, ps, body) -> match mexpr(st, ss, names(ps, Nil), body) { MR(b2, st2) -> MR(CFn(name, mparams(ss, ps), b2), st2) } }
+}
+fn ground_fns(st: MState, fs: List(CFn), acc: List(CFn)) -> MR(List(CFn)) {
+  match fs {
+    Nil -> MR(acc, st)
+    Cons(f, rest) -> if generic(f) { ground_fns(st, rest, acc) } else {
+      match f { CFn(n, _, _) -> match mfn(st, f, n, Nil) { MR(g, st2) -> ground_fns(st2, rest, Cons(g, acc)) } }
+    }
+  }
+}
+fn drain(st: MState, acc: List(CFn)) -> MR(List(CFn)) {
+  match st {
+    MSt(fs, is, jobs, k) -> match jobs {
+      Nil -> MR(acc, st)
+      Cons(MJob(f, n, ss), rest) -> match mfn(MSt(fs, is, rest, k), f, n, ss) { MR(g, st2) -> drain(st2, Cons(g, acc)) }
+    }
+  }
+}
+
+pub fn mono(m: CModule) -> CModule {
+  match m {
+    CModule(ts, gs, fs) -> match ground_fns(MSt(fs, Nil, Nil, 0), fs, Nil) {
+      MR(done, st) -> match drain(st, Nil) { MR(more, _) -> CModule(ts, gs, rev_onto(done, rev(more))) }
+    }
+  }
+}

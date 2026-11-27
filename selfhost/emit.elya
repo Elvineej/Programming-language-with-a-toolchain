@@ -1,0 +1,1027 @@
+// The back end in Elya, stage B1 (spec
+// docs/superpowers/specs/2026-11-27-elya-backend-in-elya-design.md D6):
+// first-order `Int`, `Bool` and `Unit` programs, written as LLVM IR text
+// that `clang` compiles with the runtime the Rust back end links
+// (crates/codegen/src/runtime.c). Checked by running both programs (D2).
+//
+// Values as the Rust back end lays them out (D4): `Int` and `Unit` an `i64`,
+// `Bool` an `i1`, a `String` a `ptr` the runtime made. Every function is
+// `tailcc` and a call in tail position `musttail` (D5). Anything outside the
+// stage is refused by name before any IR is written.
+import parse / {IO}
+import check / {IO}
+import core / {IO}
+import mono / {IO}
+import resolve / {IO}
+
+fn rev_onto(xs: List(a), acc: List(a)) -> List(a) {
+  match xs { Nil -> acc  Cons(x, rest) -> rev_onto(rest, Cons(x, acc)) }
+}
+fn rev(xs: List(a)) -> List(a) { rev_onto(xs, Nil) }
+
+// ---- Types ------------------------------------------------------------------
+
+type LTy { LI64, LI1, LPtr, LNone }
+fn lt_of(t: Ty) -> LTy {
+  match t {
+    TB(0) -> LI64
+    TB(2) -> LI1
+    TB(4) -> LI64
+    TB(3) -> LPtr
+    TCon(_, _) -> LPtr
+    TFn(_, _, _) -> LPtr
+    _ -> LNone
+  }
+}
+fn lt_text(t: LTy) -> String {
+  match t { LI64 -> "i64"  LI1 -> "i1"  LPtr -> "ptr"  LNone -> "?" }
+}
+
+// ---- Refusal: the stage's fragment -----------------------------------------
+
+type Stage { InStage, Outside(String) }
+fn first(a: Stage, b: Stage) -> Stage { match a { InStage -> b  Outside(w) -> Outside(w) } }
+fn ty_ok(t: Ty) -> Stage { match lt_of(t) { LNone -> Outside("a value of a type outside the stage")  LPtr -> InStage  _ -> InStage } }
+fn builtins() -> List(String) {
+  Cons("io.println", Cons("int.to_string", Cons("string.length", Cons("string.byte_at", Cons("string.slice", Cons("int.wrapping_add", Cons("int.wrapping_sub", Cons("int.wrapping_mul", Cons("int.and", Cons("int.or", Cons("int.xor", Cons("int.shl", Cons("int.shr", Cons("int.ushr", Cons("array.new", Cons("array.push", Cons("array.set", Cons("array.get", Cons("array.length", Cons("buffer.new", Cons("buffer.push", Cons("buffer.finish", Cons("buffer.length", Cons("io.read_file", Cons("io.file_exists", Cons("io.write_file", Cons("io.read_stdin", Cons("io.arg_count", Cons("io.arg", Cons("io.run", Nil))))))))))))))))))))))))))))))
+}
+fn builtin_ok(n: String) -> Stage {
+  if has(builtins(), n) { InStage } else { Outside("builtin " <> n) }
+}
+fn prim_ok(op: String) -> Stage {
+  if op == "Add" || op == "Sub" || op == "Mul" || op == "Div" || op == "Rem" || op == "Eq" || op == "Ne" || op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" || op == "Concat" { InStage } else { Outside("operator " <> op) }
+}
+fn has_fn(fs: List(CFn), n: String) -> Bool {
+  match fs { Nil -> False  Cons(CFn(m, _, _), rest) -> m == n || has_fn(rest, n) }
+}
+fn has(xs: List(String), x: String) -> Bool { match xs { Nil -> False  Cons(y, rest) -> y == x || has(rest, x) } }
+fn param_names(ps: List(CParam), acc: List(String)) -> List(String) {
+  match ps { Nil -> acc  Cons(CParam(n, _), rest) -> param_names(rest, Cons(n, acc)) }
+}
+fn check_all(fs: List(CFn), locals: List(String), xs: List(CExpr)) -> Stage {
+  match xs { Nil -> InStage  Cons(x, rest) -> first(check_expr(fs, locals, x), check_all(fs, locals, rest)) }
+}
+fn eq_operand(op: String, x: CExpr) -> Stage {
+  match x {
+    CExpr(_, _, t, _) -> if (op == "Eq" || op == "Ne") { match lt_of(t) { LNone -> Outside("== on a type outside the stage")  _ -> InStage } } else {
+      if op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" { match t { TB(0) -> InStage  _ -> Outside("an ordering of a type outside the stage") } } else { InStage }
+    }
+  }
+}
+fn check_expr(fs: List(CFn), locals: List(String), e: CExpr) -> Stage {
+  match e {
+    CExpr(_, _, t, k) -> first(ty_ok(t), match k {
+      KLit(LStr(_)) -> InStage
+      KLit(_) -> InStage
+      KVar(n) -> if has(locals, n) || has_fn(fs, n) { InStage } else { Outside("a name outside the stage") }
+      KApp(f, args) -> check_all(fs, locals, Cons(f, args))
+      KBuiltin(n, args) -> first(builtin_ok(n), check_all(fs, locals, args))
+      KPrim(op, args) -> first(prim_ok(op), first(match args { Cons(x, _) -> eq_operand(op, x)  Nil -> InStage }, check_all(fs, locals, args)))
+      KLet(n, v, b) -> first(check_expr(fs, locals, v), check_expr(fs, Cons(n, locals), b))
+      KIf(c, a, b) -> first(check_expr(fs, locals, c), first(check_expr(fs, locals, a), check_expr(fs, locals, b)))
+      KCtor(_, args) -> check_all(fs, locals, args)
+      KLambda(ps, b) -> first(check_params(ps), first(if count_in(free_vars(b, param_names(ps, Nil), Nil), locals, 0) > 61 { Outside("a closure of more than 61 captures") } else { InStage }, check_expr(fs, param_names(ps, locals), b)))
+      KMatch(sc, arms) -> first(check_expr(fs, locals, sc), check_arms(fs, locals, arms))
+      KHandle(_, _, _, _) -> Outside("a handler")
+      KResume(_) -> Outside("a resume")
+      KPerform(_, _, _, _) -> Outside("an effect operation")
+    })
+  }
+}
+fn pat_names(p: CPat, acc: List(String)) -> List(String) {
+  match p { QVar(n) -> Cons(n, acc)  QCtor(_, args) -> pats_names(args, acc)  _ -> acc }
+}
+fn pats_names(ps: List(CPat), acc: List(String)) -> List(String) {
+  match ps { Nil -> acc  Cons(p, rest) -> pats_names(rest, pat_names(p, acc)) }
+}
+fn check_arms(fs: List(CFn), locals: List(String), arms: List(CArm)) -> Stage {
+  match arms { Nil -> InStage  Cons(CArm(p, b), rest) -> first(check_expr(fs, pat_names(p, locals), b), check_arms(fs, locals, rest)) }
+}
+fn check_params(ps: List(CParam)) -> Stage {
+  match ps { Nil -> InStage  Cons(CParam(_, t), rest) -> first(ty_ok(t), check_params(rest)) }
+}
+fn check_fns(all: List(CFn), fs: List(CFn)) -> Stage {
+  match fs {
+    Nil -> match main_type(all) { LI64 -> InStage  LI1 -> InStage  _ -> Outside("`main` of a type outside the stage") }
+    Cons(CFn(_, ps, body), rest) -> first(check_params(ps), first(check_expr(all, param_names(ps, Nil), body), check_fns(all, rest)))
+  }
+}
+fn main_type(fs: List(CFn)) -> LTy {
+  match fs { Nil -> LNone  Cons(CFn(n, _, CExpr(_, _, t, _)), rest) -> if n == "main" { lt_of(t) } else { main_type(rest) } }
+}
+// A row's pointer mask is one word: a constructor's fields from bit 0, a
+// closure's captures from bit 1 (after its code), so 62 fields and 61
+// captures at most; Rust's wider rows (mask words) are not in the stage.
+fn count_in(ns: List(String), locals: List(String), n: Int) -> Int {
+  match ns { Nil -> n  Cons(x, rest) -> count_in(rest, locals, if has(locals, x) { n + 1 } else { n }) }
+}
+fn check_ctors(cs: List(CCtor)) -> Stage {
+  match cs { Nil -> InStage  Cons(CCtor(_, fs), rest) -> if len_tys(fs, 0) > 62 { Outside("a constructor of more than 62 fields") } else { check_ctors(rest) } }
+}
+fn check_types(ts: List(CType)) -> Stage {
+  match ts { Nil -> InStage  Cons(CType(_, cs), rest) -> first(check_ctors(cs), check_types(rest)) }
+}
+fn check_generics(gs: List(CGeneric)) -> Stage {
+  match gs { Nil -> InStage  Cons(CGeneric(_, _, cs), rest) -> first(check_ctors(cs), check_generics(rest)) }
+}
+fn check_module(m: CModule) -> Stage {
+  match m { CModule(ts, gs, fs) -> first(check_types(ts), first(check_generics(gs), check_fns(fs, fs))) }
+}
+
+// ---- Emission state ---------------------------------------------------------
+
+// The function's lines so far (newest first), the next fresh number, the
+// current block's label, and the module's string constants (newest first).
+type SConst { SConst(String, String) }
+// A function written after the one being written: a lambda's code (its
+// number, parameters, body, captures, result) or a top-level function's
+// wrapper as a value (its name).
+type LJob { LamJob(Int, List(CParam), CExpr, List(EBind), LTy), WrapJob(String) }
+// The module's string constants, the jobs still to write, the closure rows
+// so far (arity and pointer mask, newest first), the closures numbered, the
+// functions wrapped (all newest first).
+type Mx { Mx(List(SConst), List(LJob), List(Row2), Int, List(String)) }
+type Row2 { Row2(Int, Int) }
+linear type Emit { Emit(Buffer, Int, String, Mx, Int) }
+type Val { Val(String, LTy) }
+linear type Gotv { Gotv(Val, Emit) }
+type EBind { EBind(String, Val) }
+type ESig { ESig(String, List(LTy), LTy) }
+// A constructor: its name, its tag, its fields' types.
+type CInfo { CInfo(String, String, Int, List(Ty)) }
+// The module's facts: the functions' signatures, the constructors, the
+// string tag (after the constructors, as the descriptor table has it).
+// The closures' tags lie between the constructors' and the string's, as
+// `elya_eq` reads them.
+type ECx { ECx(List(ESig), List(CInfo), Int) }
+fn cx_sigs(cx: ECx) -> List(ESig) { match cx { ECx(ss, _, _) -> ss } }
+fn stag(cx: ECx) -> String { match cx { ECx(_, _, t) -> int.to_string(t) } }
+
+fn line(em: Emit, s: String) -> Emit {
+  match em { Emit(b, n, l, ss, k) -> Emit(buffer.push(b, "  " <> s <> "\n"), n, l, ss, k) }
+}
+fn fresh(em: Emit) -> Fresh1 {
+  match em { Emit(b, n, l, ss, k) -> Fresh1("%t" <> int.to_string(n), Emit(b, n + 1, l, ss, k)) }
+}
+linear type Fresh1 { Fresh1(String, Emit) }
+fn new_label(em: Emit) -> Fresh1 {
+  match em { Emit(b, n, l, ss, k) -> Fresh1("L" <> int.to_string(n), Emit(b, n + 1, l, ss, k)) }
+}
+fn start_block(em: Emit, label: String) -> Emit {
+  match em { Emit(b, n, _, ss, k) -> Emit(buffer.push(b, label <> ":\n"), n, label, ss, k) }
+}
+fn label_of(em: Emit) -> AtLabel {
+  match em { Emit(b, n, l, ss, k) -> AtLabel(l, Emit(b, n, l, ss, k)) }
+}
+linear type AtLabel { AtLabel(String, Emit) }
+
+fn lookup(env: List(EBind), n: String) -> Val {
+  match env { Nil -> Val("undef", LI64)  Cons(EBind(m, v), rest) -> if m == n { v } else { lookup(rest, n) } }
+}
+fn bound(env: List(EBind), n: String) -> Bool {
+  match env { Nil -> False  Cons(EBind(m, _), rest) -> m == n || bound(rest, n) }
+}
+fn is_fn(cx: ECx, n: String) -> Bool { has_sig(cx_sigs(cx), n) }
+fn has_sig(sigs: List(ESig), n: String) -> Bool { match sigs { Nil -> False  Cons(ESig(m, _, _), rest) -> m == n || has_sig(rest, n) } }
+fn sig_of(sigs: List(ESig), n: String) -> ESig {
+  match sigs { Nil -> ESig(n, Nil, LI64)  Cons(ESig(m, ps, r), rest) -> if m == n { ESig(m, ps, r) } else { sig_of(rest, n) } }
+}
+
+// ---- Expressions ------------------------------------------------------------
+
+fn ty_lt(e: CExpr) -> LTy { match e { CExpr(_, _, t, _) -> lt_of(t) } }
+
+fn lit_value(l: CLit) -> String {
+  match l { LInt(n) -> int.to_string(n)  LBool(b) -> if b { "true" } else { "false" }  LUnit -> "0"  _ -> "0" }
+}
+
+// A string literal: a private constant of its bytes, made a runtime string
+// by `elya_str_lit` (the string tag, the bytes, their length).
+fn hex_digit(n: Int) -> String { string.slice("0123456789ABCDEF", n, n + 1) }
+// The text between escapes; empty between two bytes of one character,
+// where a slice would split the character.
+fn between(s: String, from: Int, i: Int) -> String { if from < i { string.slice(s, from, i) } else { "" } }
+fn ir_bytes(s: String, i: Int, from: Int, b: Buffer) -> Buffer {
+  if i >= string.length(s) { buffer.push(b, between(s, from, i)) } else {
+    let c = string.byte_at(s, i)
+    if c < 32 || c > 126 || c == 34 || c == 92 {
+      ir_bytes(s, i + 1, i + 1, buffer.push(buffer.push(b, between(s, from, i)), "\\" <> hex_digit(c / 16) <> hex_digit(c % 16)))
+    } else { ir_bytes(s, i + 1, from, b) }
+  }
+}
+// The heap values live across a call that may collect: every pointer the
+// scope binds, the operands already computed (`pend`) and the call's own
+// arguments are pushed on the runtime's shadow stack before it and popped
+// after (D5). Over-rooting a dead value only keeps it a little longer.
+fn env_roots(env: List(EBind), acc: List(String)) -> List(String) {
+  match env { Nil -> acc  Cons(EBind(_, Val(v, LPtr)), rest) -> env_roots(rest, Cons(v, acc))  Cons(_, rest) -> env_roots(rest, acc) }
+}
+fn val_roots(vs: List(Val), acc: List(String)) -> List(String) {
+  match vs { Nil -> acc  Cons(Val(v, LPtr), rest) -> val_roots(rest, Cons(v, acc))  Cons(_, rest) -> val_roots(rest, acc) }
+}
+fn push_roots(em: Emit, rs: List(String)) -> Emit {
+  match rs { Nil -> em  Cons(r, rest) -> push_roots(line(em, "call void @elya_gc_push(ptr " <> r <> ")"), rest) }
+}
+fn pop_roots(em: Emit, rs: List(String)) -> Emit {
+  match rs { Nil -> em  Cons(_, rest) -> pop_roots(line(em, "call void @elya_gc_pop()"), rest) }
+}
+fn roots(env: List(EBind), pend: List(Val), args: List(Val)) -> List(String) {
+  val_roots(args, val_roots(pend, env_roots(env, Nil)))
+}
+// A call that may allocate, its result `t` (a void call when `LNone`).
+fn rooted(em: Emit, rs: List(String), call: String, t: LTy) -> Gotv {
+  match t {
+    LNone -> Gotv(Val("0", LI64), pop_roots(line(push_roots(em, rs), call), rs))
+    _ -> match fresh(push_roots(em, rs)) { Fresh1(v, em2) -> Gotv(Val(v, t), pop_roots(line(em2, v <> " = " <> call), rs)) }
+  }
+}
+
+fn str_lit(cx: ECx, em: Emit, rs: List(String), v: String) -> Gotv {
+  match em {
+    Emit(b, n, l, ss, k) -> {
+      let name = "@.str." <> int.to_string(k)
+      rooted(Emit(b, n, l, match ss { Mx(cs, js, rws, lk, ws) -> Mx(Cons(SConst(name, v), cs), js, rws, lk, ws) }, k + 1), rs, "call ptr @elya_str_lit(i64 " <> stag(cx) <> ", ptr " <> name <> ", i64 " <> int.to_string(string.length(v)) <> ")", LPtr)
+    }
+  }
+}
+
+linear type Gotvs { Gotvs(List(Val), Emit) }
+// Arguments left to right, each computed with the ones before it rooted.
+fn emit_args(cx: ECx, env: List(EBind), pend: List(Val), xs: List(CExpr), em: Emit, acc: List(Val)) -> Gotvs {
+  match xs {
+    Nil -> Gotvs(rev(acc), em)
+    Cons(x, rest) -> match emit(cx, env, rev_onto(acc, pend), x, em) { Gotv(v, em2) -> emit_args(cx, env, pend, rest, em2, Cons(v, acc)) }
+  }
+}
+fn arg_list(vs: List(Val)) -> String {
+  match vs { Nil -> ""  Cons(Val(s, t), Nil) -> lt_text(t) <> " " <> s  Cons(Val(s, t), rest) -> lt_text(t) <> " " <> s <> ", " <> arg_list(rest) }
+}
+fn nth(vs: List(Val), i: Int) -> Val {
+  match vs { Nil -> Val("undef", LI64)  Cons(v, rest) -> if i == 0 { v } else { nth(rest, i - 1) } }
+}
+fn vtext(v: Val) -> String { match v { Val(s, _) -> s } }
+
+// A check that stops the program through the runtime when `cond` holds.
+fn trap_with(em: Emit, cond: String, fail: String) -> Emit {
+  match new_label(em) {
+    Fresh1(bad, em2) -> match new_label(em2) {
+      Fresh1(ok, em3) -> start_block(line(line(start_block(line(em3, "br i1 " <> cond <> ", label %" <> bad <> ", label %" <> ok), bad), "call void @" <> fail), "unreachable"), ok)
+    }
+  }
+}
+fn trap(em: Emit, cond: String, fail: String) -> Emit { trap_with(em, cond, fail <> "()") }
+fn checked(em: Emit, intr: String, a: String, b: String) -> Gotv {
+  match fresh(em) {
+    Fresh1(pair, em2) -> match fresh(line(em2, pair <> " = call { i64, i1 } @llvm." <> intr <> ".with.overflow.i64(i64 " <> a <> ", i64 " <> b <> ")")) {
+      Fresh1(v, em3) -> match fresh(line(em3, v <> " = extractvalue { i64, i1 } " <> pair <> ", 0")) {
+        Fresh1(o, em4) -> Gotv(Val(v, LI64), trap(line(em4, o <> " = extractvalue { i64, i1 } " <> pair <> ", 1"), o, "elya_int_overflow"))
+      }
+    }
+  }
+}
+fn assign(em: Emit, rhs: String, t: LTy) -> Gotv {
+  match fresh(em) { Fresh1(v, em2) -> Gotv(Val(v, t), line(em2, v <> " = " <> rhs)) }
+}
+// A shift by more than 63 (or less than 0) stops the program by name.
+fn shift(em: Emit, name: String, ins: String, a: String, b: String) -> Gotv {
+  match fresh(em) {
+    Fresh1(bad, em2) -> assign(trap_with(line(em2, bad <> " = icmp ugt i64 " <> b <> ", 63"), bad, "elya_shift_range(ptr @.name." <> name <> ", i64 " <> b <> ")"), ins <> " i64 " <> a <> ", " <> b, LI64)
+  }
+}
+fn prim(cx: ECx, env: List(EBind), pend: List(Val), op: String, is_str: Bool, a: Val, b: Val, em: Emit) -> Gotv {
+  match a {
+    Val(x, at) -> match b {
+      Val(y, _) -> if op == "Add" { checked(em, "sadd", x, y) } else { if op == "Sub" { checked(em, "ssub", x, y) } else { if op == "Mul" { checked(em, "smul", x, y) } else {
+        if op == "Div" {
+          match fresh(em) {
+            Fresh1(z, em2) -> match fresh(trap(line(em2, z <> " = icmp eq i64 " <> y <> ", 0"), z, "elya_div_zero")) {
+              Fresh1(mn, em3) -> match fresh(line(em3, mn <> " = icmp eq i64 " <> x <> ", -9223372036854775808")) {
+                Fresh1(m1, em4) -> match fresh(line(em4, m1 <> " = icmp eq i64 " <> y <> ", -1")) {
+                  Fresh1(ov, em5) -> assign(trap(line(em5, ov <> " = and i1 " <> mn <> ", " <> m1), ov, "elya_int_overflow"), "sdiv i64 " <> x <> ", " <> y, LI64)
+                }
+              }
+            }
+          }
+        } else { if op == "Rem" {
+          match fresh(em) {
+            Fresh1(z, em2) -> match fresh(trap(line(em2, z <> " = icmp eq i64 " <> y <> ", 0"), z, "elya_rem_zero")) {
+              Fresh1(m1, em3) -> match fresh(line(em3, m1 <> " = icmp eq i64 " <> y <> ", -1")) {
+                Fresh1(d, em4) -> assign(line(em4, d <> " = select i1 " <> m1 <> ", i64 1, i64 " <> y), "srem i64 " <> x <> ", " <> d, LI64)
+              }
+            }
+          }
+        } else { if op == "Concat" {
+          rooted(em, roots(env, pend, Cons(a, Cons(b, Nil))), "call ptr @elya_str_concat(i64 " <> stag(cx) <> ", ptr " <> x <> ", ptr " <> y <> ")", LPtr)
+        } else { if at == LPtr {
+          match assign(em, (if is_str { "call i64 @elya_str_eq(ptr " <> x <> ", ptr " <> y <> ")" } else { "call i64 @elya_eq(ptr " <> x <> ", ptr " <> y <> ", i64 " <> stag(cx) <> ", i64 " <> int.to_string(n_ctors(cx)) <> ")" }), LI64) {
+            Gotv(Val(r, _), em2) -> assign(em2, "icmp " <> (if op == "Eq" { "ne" } else { "eq" }) <> " i64 " <> r <> ", 0", LI1)
+          }
+        } else {
+          let cc = if op == "Eq" { "eq" } else { if op == "Ne" { "ne" } else { if op == "Lt" { "slt" } else { if op == "Le" { "sle" } else { if op == "Gt" { "sgt" } else { "sge" } } } } }
+          assign(em, "icmp " <> cc <> " " <> lt_text(at) <> " " <> x <> ", " <> y, LI1)
+        } } } }
+      } } }
+    }
+  }
+}
+
+// An array's words: a traced array (its own tag, after the string's) when
+// its elements are heap values, else the string's tag, traced nowhere.
+fn elem_of(t: Ty) -> Ty { match t { TCon("Array", Cons(e, _)) -> e  _ -> TB(0) } }
+fn array_tag(cx: ECx, t: Ty) -> String { match cx { ECx(_, _, st) -> int.to_string(if lt_of(elem_of(t)) == LPtr { st + 1 } else { st }) } }
+fn builtin(cx: ECx, env: List(EBind), pend: List(Val), n: String, args: List(CExpr), t: Ty, vs: List(Val), em: Emit) -> Gotv {
+  let a = vtext(nth(vs, 0))
+  let b = vtext(nth(vs, 1))
+  let rs = roots(env, pend, vs)
+  if string.slice(n, 0, 3) == "arr" || string.slice(n, 0, 3) == "buf" || string.slice(n, 0, 3) == "io." && n != "io.println" { io_data(cx, rs, n, args, t, vs, em) } else {
+  if n == "int.to_string" { rooted(em, roots(env, pend, vs), "call ptr @elya_int_to_string(i64 " <> stag(cx) <> ", i64 " <> a <> ")", LPtr) } else {
+  if n == "io.println" { rooted(em, roots(env, pend, vs), "call void @elya_println(ptr " <> a <> ")", LNone) } else {
+  if n == "string.length" { assign(em, "call i64 @elya_str_length(ptr " <> a <> ")", LI64) } else {
+  if n == "string.byte_at" { assign(em, "call i64 @elya_str_byte_at(ptr " <> a <> ", i64 " <> b <> ")", LI64) } else {
+  if n == "string.slice" { rooted(em, roots(env, pend, vs), "call ptr @elya_str_slice(i64 " <> stag(cx) <> ", ptr " <> a <> ", i64 " <> b <> ", i64 " <> vtext(nth(vs, 2)) <> ")", LPtr) } else {
+  if n == "int.wrapping_add" { assign(em, "add i64 " <> a <> ", " <> b, LI64) } else {
+  if n == "int.wrapping_sub" { assign(em, "sub i64 " <> a <> ", " <> b, LI64) } else {
+  if n == "int.wrapping_mul" { assign(em, "mul i64 " <> a <> ", " <> b, LI64) } else {
+  if n == "int.and" { assign(em, "and i64 " <> a <> ", " <> b, LI64) } else {
+  if n == "int.or" { assign(em, "or i64 " <> a <> ", " <> b, LI64) } else {
+  if n == "int.xor" { assign(em, "xor i64 " <> a <> ", " <> b, LI64) } else {
+  if n == "int.shl" { shift(em, "shl", "shl", a, b) } else {
+  if n == "int.shr" { shift(em, "shr", "ashr", a, b) } else {
+  if n == "int.ushr" { shift(em, "ushr", "lshr", a, b) } else { unknown(em, n) } } } } } } } } } } } } } } }
+}
+// A builtin the dispatch does not know: text `clang` refuses, so a list and
+// a dispatch that disagree fail the build instead of compiling to undef.
+fn unknown(em: Emit, n: String) -> Gotv { assign(em, "unknown builtin " <> n, LI64) }
+fn arg_ty(args: List(CExpr)) -> Ty { match args { Cons(CExpr(_, _, t, _), _) -> t  Nil -> TB(4) } }
+fn io_data(cx: ECx, rs: List(String), n: String, args: List(CExpr), t: Ty, vs: List(Val), em: Emit) -> Gotv {
+  let a = vtext(nth(vs, 0))
+  let b = vtext(nth(vs, 1))
+  let st = stag(cx)
+  if n == "array.new" { rooted(em, rs, "call ptr @elya_array_new(i64 " <> array_tag(cx, t) <> ")", LPtr) } else {
+  if n == "array.push" { match to_word(em, nth(vs, 1)) { Gotv(Val(w, _), em2) -> rooted(em2, rs, "call ptr @elya_array_push(ptr " <> a <> ", i64 " <> w <> ")", LPtr) } } else {
+  if n == "array.set" { match to_word(em, nth(vs, 2)) { Gotv(Val(w, _), em2) -> rooted(em2, rs, "call ptr @elya_array_set(ptr " <> a <> ", i64 " <> b <> ", i64 " <> w <> ")", LPtr) } } else {
+  if n == "array.get" { match assign(em, "call i64 @elya_array_get(ptr " <> a <> ", i64 " <> b <> ")", LI64) { Gotv(Val(w, _), em2) -> from_word(em2, w, lt_of(t)) } } else {
+  if n == "array.length" || n == "buffer.length" { assign(em, "call i64 @elya_array_length(ptr " <> a <> ")", LI64) } else {
+  if n == "buffer.new" { rooted(em, rs, "call ptr @elya_buffer_new(i64 " <> st <> ")", LPtr) } else {
+  if n == "buffer.push" { rooted(em, rs, "call ptr @elya_buffer_push(i64 " <> st <> ", ptr " <> a <> ", ptr " <> b <> ")", LPtr) } else {
+  if n == "buffer.finish" { rooted(em, rs, "call ptr @elya_buffer_finish(i64 " <> st <> ", ptr " <> a <> ")", LPtr) } else {
+  if n == "io.read_file" { rooted(em, rs, "call ptr @elya_io_read_file(i64 " <> st <> ", ptr " <> a <> ")", LPtr) } else {
+  if n == "io.file_exists" { match assign(em, "call i64 @elya_io_file_exists(ptr " <> a <> ")", LI64) { Gotv(Val(w, _), em2) -> assign(em2, "icmp ne i64 " <> w <> ", 0", LI1) } } else {
+  if n == "io.write_file" { rooted(em, rs, "call void @elya_io_write_file(ptr " <> a <> ", ptr " <> b <> ")", LNone) } else {
+  if n == "io.read_stdin" { rooted(em, rs, "call ptr @elya_io_read_stdin(i64 " <> st <> ")", LPtr) } else {
+  if n == "io.arg_count" { assign(em, "call i64 @elya_io_arg_count()", LI64) } else {
+  if n == "io.run" { rooted(em, rs, "call i64 @elya_io_run(ptr " <> a <> ")", LI64) } else {
+  if n == "io.arg" { rooted(em, rs, "call ptr @elya_io_arg(i64 " <> st <> ", i64 " <> a <> ")", LPtr) } else { unknown(em, n) } } } } } } } } } } } } } } }
+}
+
+fn emit(cx: ECx, env: List(EBind), pend: List(Val), e: CExpr, em: Emit) -> Gotv {
+  match e {
+    CExpr(_, _, t, k) -> match k {
+      KLit(LStr(v)) -> str_lit(cx, em, roots(env, pend, Nil), v)
+      KLit(l) -> Gotv(Val(lit_value(l), lt_of(t)), em)
+      KVar(n) -> if bound(env, n) || !is_fn(cx, n) { Gotv(lookup(env, n), em) } else { fn_value(cx, env, pend, n, em) }
+      KLambda(ps, body) -> lambda(cx, env, pend, ps, body, t, em)
+      KLet(n, v, b) -> match emit(cx, env, pend, v, em) { Gotv(val, em2) -> emit(cx, Cons(EBind(n, val), env), pend, b, em2) }
+      KPrim(op, Cons(a, Cons(b, Nil))) -> match emit(cx, env, pend, a, em) {
+        Gotv(va, em2) -> match emit(cx, env, Cons(va, pend), b, em2) { Gotv(vb, em3) -> prim(cx, env, pend, op, is_string(a), va, vb, em3) }
+      }
+      KCtor(n, Nil) -> match t {
+        // A constructor with fields used as a value: `fn(a1, .., an) { C(a1, .., an) }`.
+        TFn(ps, _, r) -> lambda(cx, env, pend, ctor_params(ps, 0), CExpr(0, 0, r, KCtor(n, ctor_args(ps, 0))), t, em)
+        _ -> construct(cx, env, pend, n, t, Nil, em)
+      }
+      KCtor(n, args) -> match emit_args(cx, env, pend, args, em, Nil) { Gotvs(vs, em2) -> construct(cx, env, pend, n, t, vs, em2) }
+      KMatch(sc, arms) -> match emit(cx, env, pend, sc, em) {
+        Gotv(sv, em2) -> match new_label(em2) {
+          Fresh1(join, em3) -> match emit_arms(cx, env, pend, sv, ty_of(sc), arms, em3, join, Nil, No) {
+            Arms(ins, em4) -> assign(start_block(em4, join), "phi " <> lt_text(lt_of(t)) <> " " <> phi_ins(ins), lt_of(t))
+          }
+        }
+      }
+      KBuiltin(n, args) -> match emit_args(cx, env, pend, args, em, Nil) { Gotvs(vs, em2) -> builtin(cx, env, pend, n, args, t, vs, em2) }
+      KApp(CExpr(_, _, _, KVar(f)), args) -> if bound(env, f) || !is_fn(cx, f) { closure_call(cx, env, pend, e, em, No) } else {
+        match emit_args(cx, env, pend, args, em, Nil) {
+          Gotvs(vs, em2) -> match sig_of(cx_sigs(cx), f) { ESig(_, _, r) -> rooted(em2, roots(env, pend, vs), "call tailcc " <> lt_text(r) <> " @elya." <> f <> "(" <> arg_list(vs) <> ")", r) }
+        }
+      }
+      KApp(_, _) -> closure_call(cx, env, pend, e, em, No)
+      KIf(c, a, b) -> match emit(cx, env, pend, c, em) {
+        Gotv(Val(cv, _), em2) -> match new_label(em2) {
+          Fresh1(lt, em3) -> match new_label(em3) {
+            Fresh1(lf, em4) -> match new_label(em4) {
+              Fresh1(lj, em5) -> match emit(cx, env, pend, a, start_block(line(em5, "br i1 " <> cv <> ", label %" <> lt <> ", label %" <> lf), lt)) {
+                Gotv(Val(av, _), em6) -> match label_of(em6) {
+                  AtLabel(la, em7) -> match emit(cx, env, pend, b, start_block(line(em7, "br label %" <> lj), lf)) {
+                    Gotv(Val(bv, _), em8) -> match label_of(em8) {
+                      AtLabel(lb, em9) -> assign(start_block(line(em9, "br label %" <> lj), lj), "phi " <> lt_text(lt_of(t)) <> " [ " <> av <> ", %" <> la <> " ], [ " <> bv <> ", %" <> lb <> " ]", lt_of(t))
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      _ -> Gotv(Val("undef", LI64), em)
+    }
+  }
+}
+
+// An expression in tail position: its value returned, a call of a function
+// `musttail` (the caller's and the callee's results are one type there;
+// nothing of the caller's is live after it, so nothing is rooted).
+fn emit_tail(cx: ECx, env: List(EBind), e: CExpr, em: Emit, r: LTy) -> Emit {
+  match e {
+    CExpr(_, _, t, k) -> match k {
+      KLet(n, v, b) -> match emit(cx, env, Nil, v, em) { Gotv(val, em2) -> emit_tail(cx, Cons(EBind(n, val), env), b, em2, r) }
+      KIf(c, a, b) -> match emit(cx, env, Nil, c, em) {
+        Gotv(Val(cv, _), em2) -> match new_label(em2) {
+          Fresh1(lt, em3) -> match new_label(em3) {
+            Fresh1(lf, em4) -> emit_tail(cx, env, b, start_block(emit_tail(cx, env, a, start_block(line(em4, "br i1 " <> cv <> ", label %" <> lt <> ", label %" <> lf), lt), r), lf), r)
+          }
+        }
+      }
+      KMatch(sc, arms) -> match emit(cx, env, Nil, sc, em) {
+        Gotv(sv, em2) -> match emit_arms(cx, env, Nil, sv, ty_of(sc), arms, em2, "", Nil, Yes(r)) { Arms(_, em3) -> em3 }
+      }
+      KApp(CExpr(_, _, _, KVar(f)), args) -> if bound(env, f) || !is_fn(cx, f) { match closure_call(cx, env, Nil, e, em, Yes(r)) { Gotv(_, em2) -> em2 } } else {
+        match emit_args(cx, env, Nil, args, em, Nil) {
+          Gotvs(vs, em2) -> match fresh(em2) {
+            Fresh1(v, em3) -> line(line(em3, v <> " = musttail call tailcc " <> lt_text(r) <> " @elya." <> f <> "(" <> arg_list(vs) <> ")"), "ret " <> lt_text(r) <> " " <> v)
+          }
+        }
+      }
+      KApp(_, _) -> match closure_call(cx, env, Nil, e, em, Yes(r)) { Gotv(_, em2) -> em2 }
+      _ -> match emit(cx, env, Nil, e, em) { Gotv(Val(v, _), em2) -> line(em2, "ret " <> lt_text(r) <> " " <> v) }
+    }
+  }
+}
+
+// ---- Closures -----------------------------------------------------------------
+
+// A closure is `[tag][code][captures...]`; its code takes the closure first,
+// then the arguments (the Rust back end's convention).
+fn closure_call(cx: ECx, env: List(EBind), pend: List(Val), e: CExpr, em: Emit, tail: Maybe(LTy)) -> Gotv {
+  match e {
+    CExpr(_, _, t, KApp(callee, args)) -> match emit(cx, env, pend, callee, em) {
+      Gotv(clo, em2) -> match emit_args(cx, env, Cons(clo, pend), args, em2, Nil) {
+        Gotvs(vs, em3) -> match fresh(em3) {
+          Fresh1(cp, em4) -> match fresh(line(em4, cp <> " = getelementptr i64, ptr " <> vtext(clo) <> ", i64 1")) {
+            Fresh1(cw, em5) -> match fresh(line(em5, cw <> " = load i64, ptr " <> cp)) {
+              Fresh1(code, em6) -> {
+                let em7 = line(em6, code <> " = inttoptr i64 " <> cw <> " to ptr")
+                let r = lt_of(t)
+                let call = "tailcc " <> lt_text(r) <> " " <> code <> "(" <> arg_list(Cons(clo, vs)) <> ")"
+                match tail {
+                  Yes(rt) -> match fresh(em7) { Fresh1(v, em8) -> Gotv(Val(v, rt), line(line(em8, v <> " = musttail call " <> call), "ret " <> lt_text(rt) <> " " <> v)) }
+                  No -> rooted(em7, roots(env, pend, Cons(clo, vs)), "call " <> call, r)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    _ -> Gotv(Val("undef", LI64), em)
+  }
+}
+
+// A closure's tag: the next after the constructors', its row recorded.
+linear type Numbered { Numbered(Int, Emit) }
+fn new_closure(em: Emit, arity: Int, mask: Int, job: LJob) -> Numbered {
+  match em {
+    Emit(b, n, l, Mx(cs, js, rws, lk, ws), k) -> Numbered(lk, Emit(b, n, l, Mx(cs, Cons(job, js), Cons(Row2(arity, mask), rws), lk + 1, ws), k))
+  }
+}
+fn cap_mask(caps: List(EBind), bit: Int, acc: Int) -> Int {
+  match caps { Nil -> acc  Cons(EBind(_, Val(_, t)), rest) -> cap_mask(rest, bit * 2, if t == LPtr { acc + bit } else { acc }) }
+}
+fn cap_vals(caps: List(EBind)) -> List(Val) { match caps { Nil -> Nil  Cons(EBind(_, v), rest) -> Cons(v, cap_vals(rest)) } }
+fn alloc_closure(cx: ECx, env: List(EBind), pend: List(Val), tag: Int, code: String, caps: List(Val), em: Emit) -> Gotv {
+  match rooted(em, roots(env, pend, caps), "call ptr @elya_alloc(i64 " <> int.to_string(2 + len_vals(caps, 0)) <> ")", LPtr) {
+    Gotv(Val(obj, _), em2) -> match fresh(line(em2, "store i64 " <> int.to_string(tag) <> ", ptr " <> obj)) {
+      Fresh1(cp, em3) -> Gotv(Val(obj, LPtr), store_fields(line(line(em3, cp <> " = getelementptr i64, ptr " <> obj <> ", i64 1"), "store i64 ptrtoint (ptr " <> code <> " to i64), ptr " <> cp), obj, caps, 2))
+    }
+  }
+}
+fn lambda(cx: ECx, env: List(EBind), pend: List(Val), ps: List(CParam), body: CExpr, t: Ty, em: Emit) -> Gotv {
+  let caps = captures(env, free_vars(body, param_names(ps, Nil), Nil), Nil)
+  let r = match t { TFn(_, _, rt) -> lt_of(rt)  _ -> LI64 }
+  match em {
+    Emit(b, n, l, Mx(cs, js, rws, lk, ws), k) -> match new_closure(Emit(b, n, l, Mx(cs, js, rws, lk, ws), k), 1 + len_binds(caps, 0), cap_mask(caps, 2, 0), LamJob(lk, ps, body, caps, r)) {
+      Numbered(i, em2) -> alloc_closure(cx, env, pend, n_ctors(cx) + i, "@elya$lam." <> int.to_string(i), cap_vals(caps), em2)
+    }
+  }
+}
+fn ctor_params(ps: List(Ty), i: Int) -> List(CParam) {
+  match ps { Nil -> Nil  Cons(p, rest) -> Cons(CParam("$a" <> int.to_string(i), p), ctor_params(rest, i + 1)) }
+}
+fn ctor_args(ps: List(Ty), i: Int) -> List(CExpr) {
+  match ps { Nil -> Nil  Cons(p, rest) -> Cons(CExpr(0, 0, p, KVar("$a" <> int.to_string(i))), ctor_args(rest, i + 1)) }
+}
+fn len_binds(bs: List(EBind), n: Int) -> Int { match bs { Nil -> n  Cons(_, rest) -> len_binds(rest, n + 1) } }
+// A top-level function as a value: a closure with no captures whose code
+// calls it (`anf.rs`'s wrapper), the wrapper written once.
+fn fn_value(cx: ECx, env: List(EBind), pend: List(Val), f: String, em: Emit) -> Gotv {
+  match em {
+    Emit(b, n, l, Mx(cs, js, rws, lk, ws), k) -> {
+      let mx = if has(ws, f) { Mx(cs, js, rws, lk, ws) } else { Mx(cs, Cons(WrapJob(f), js), rws, lk, Cons(f, ws)) }
+      match mx {
+        Mx(cs2, js2, rws2, lk2, ws2) -> alloc_closure(cx, env, pend, n_ctors(cx) + lk2, "@elya$wrap." <> f, Nil, Emit(b, n, l, Mx(cs2, js2, Cons(Row2(1, 0), rws2), lk2 + 1, ws2), k))
+      }
+    }
+  }
+}
+
+// The names a lambda's body reads that it does not bind, in order of
+// first reading, each once; its captures are those the scope binds.
+fn free_list(xs: List(CExpr), bnd: List(String), acc: List(String)) -> List(String) {
+  match xs { Nil -> acc  Cons(x, rest) -> free_list(rest, bnd, free_vars(x, bnd, acc)) }
+}
+fn free_vars(e: CExpr, bnd: List(String), acc: List(String)) -> List(String) {
+  match e {
+    CExpr(_, _, _, k) -> match k {
+      KVar(n) -> if has(bnd, n) || has(acc, n) { acc } else { Cons(n, acc) }
+      KApp(f, args) -> free_list(Cons(f, args), bnd, acc)
+      KBuiltin(_, args) -> free_list(args, bnd, acc)
+      KCtor(_, args) -> free_list(args, bnd, acc)
+      KPrim(_, args) -> free_list(args, bnd, acc)
+      KLambda(ps, b) -> free_vars(b, param_names(ps, bnd), acc)
+      KLet(n, v, b) -> free_vars(b, Cons(n, bnd), free_vars(v, bnd, acc))
+      KIf(c, x, y) -> free_list(Cons(c, Cons(x, Cons(y, Nil))), bnd, acc)
+      KMatch(sc, arms) -> free_arms(arms, bnd, free_vars(sc, bnd, acc))
+      _ -> acc
+    }
+  }
+}
+fn free_arms(arms: List(CArm), bnd: List(String), acc: List(String)) -> List(String) {
+  match arms { Nil -> acc  Cons(CArm(p, b), rest) -> free_arms(rest, bnd, free_vars(b, pat_names(p, bnd), acc)) }
+}
+fn captures(env: List(EBind), names: List(String), acc: List(EBind)) -> List(EBind) {
+  match names { Nil -> acc  Cons(n, rest) -> captures(env, rest, if bound(env, n) { Cons(EBind(n, lookup(env, n)), acc) } else { acc }) }
+}
+
+// ---- Data -------------------------------------------------------------------
+
+fn ty_of(e: CExpr) -> Ty { match e { CExpr(_, _, t, _) -> t } }
+fn is_string(e: CExpr) -> Bool { match ty_of(e) { TB(3) -> True  _ -> False } }
+// A constructor of a ground type is keyed by its name; one of a parametric
+// type's instance by its name and the instance (`Cons` of `List(Int)`).
+fn ctor_info(cs: List(CInfo), n: String, key: String) -> CInfo {
+  match cs { Nil -> CInfo(n, key, 0, Nil)  Cons(CInfo(m, k, tag, fs), rest) -> if m == n && k == key { CInfo(m, k, tag, fs) } else { ctor_info(rest, n, key) } }
+}
+fn type_key(t: Ty) -> String {
+  match t { TCon(_, Nil) -> ""  _ -> mono.key_of(t) }
+}
+fn cx_ctor(cx: ECx, n: String, t: Ty) -> CInfo { match cx { ECx(_, cs, _) -> ctor_info(cs, n, type_key(t)) } }
+fn len_vals(vs: List(Val), n: Int) -> Int { match vs { Nil -> n  Cons(_, rest) -> len_vals(rest, n + 1) } }
+
+// A field's word: an `Int` or `Unit` itself, a `Bool` widened, a pointer as
+// its address.
+fn to_word(em: Emit, v: Val) -> Gotv {
+  match v {
+    Val(x, LI1) -> assign(em, "zext i1 " <> x <> " to i64", LI64)
+    Val(x, LPtr) -> assign(em, "ptrtoint ptr " <> x <> " to i64", LI64)
+    Val(x, t) -> Gotv(Val(x, t), em)
+  }
+}
+fn from_word(em: Emit, w: String, t: LTy) -> Gotv {
+  match t {
+    LI1 -> assign(em, "trunc i64 " <> w <> " to i1", LI1)
+    LPtr -> assign(em, "inttoptr i64 " <> w <> " to ptr", LPtr)
+    _ -> Gotv(Val(w, LI64), em)
+  }
+}
+fn store_fields(em: Emit, obj: String, vs: List(Val), i: Int) -> Emit {
+  match vs {
+    Nil -> em
+    Cons(v, rest) -> match to_word(em, v) {
+      Gotv(Val(w, _), em2) -> match fresh(em2) {
+        Fresh1(fp, em3) -> store_fields(line(line(em3, fp <> " = getelementptr i64, ptr " <> obj <> ", i64 " <> int.to_string(i)), "store i64 " <> w <> ", ptr " <> fp), obj, rest, i + 1)
+      }
+    }
+  }
+}
+// `[tag][fields...]`, the fields rooted across the allocation.
+fn construct(cx: ECx, env: List(EBind), pend: List(Val), n: String, t: Ty, vs: List(Val), em: Emit) -> Gotv {
+  match cx_ctor(cx, n, t) {
+    CInfo(_, _, tag, _) -> match rooted(em, roots(env, pend, vs), "call ptr @elya_alloc(i64 " <> int.to_string(1 + len_vals(vs, 0)) <> ")", LPtr) {
+      Gotv(Val(obj, _), em2) -> Gotv(Val(obj, LPtr), store_fields(line(em2, "store i64 " <> int.to_string(tag) <> ", ptr " <> obj), obj, vs, 1))
+    }
+  }
+}
+
+// One arm's pattern tested against `v` (of type `t`); a failed test goes to
+// `fail`, and the binders are bound as the test passes. `keep` is what a
+// literal's allocation roots besides `v` and the binders: the scrutinee, the
+// objects enclosing `v`, and the pending operands, all read again after it.
+linear type Tested { Tested(List(EBind), Emit) }
+fn load_field(em: Emit, obj: String, i: Int, t: Ty) -> Gotv {
+  match fresh(em) {
+    Fresh1(fp, em2) -> match fresh(line(em2, fp <> " = getelementptr i64, ptr " <> obj <> ", i64 " <> int.to_string(i))) {
+      Fresh1(w, em3) -> from_word(line(em3, w <> " = load i64, ptr " <> fp), w, lt_of(t))
+    }
+  }
+}
+fn branch_on(em: Emit, cond: String, fail: String) -> Emit {
+  match new_label(em) { Fresh1(ok, em2) -> start_block(line(em2, "br i1 " <> cond <> ", label %" <> ok <> ", label %" <> fail), ok) }
+}
+fn test_pat(cx: ECx, v: Val, t: Ty, p: CPat, fail: String, keep: List(String), env: List(EBind), em: Emit) -> Tested {
+  match p {
+    QWild -> Tested(env, em)
+    QVar(n) -> Tested(Cons(EBind(n, v), env), em)
+    QLit(LUnit) -> Tested(env, em)
+    QLit(LStr(s)) -> match str_lit(cx, em, val_roots(Cons(v, Nil), env_roots(env, keep)), s) {
+      Gotv(Val(lit, _), em2) -> match assign(em2, "call i64 @elya_str_eq(ptr " <> vtext(v) <> ", ptr " <> lit <> ")", LI64) {
+        Gotv(Val(r, _), em3) -> match assign(em3, "icmp ne i64 " <> r <> ", 0", LI1) { Gotv(Val(c, _), em4) -> Tested(env, branch_on(em4, c, fail)) }
+      }
+    }
+    QLit(l) -> match v {
+      Val(x, lt) -> match assign(em, "icmp eq " <> lt_text(lt) <> " " <> x <> ", " <> lit_value(l), LI1) { Gotv(Val(c, _), em2) -> Tested(env, branch_on(em2, c, fail)) }
+    }
+    QCtor(n, args) -> match cx_ctor(cx, n, t) {
+      CInfo(_, _, tag, fts) -> match fresh(em) {
+        Fresh1(tg, em2) -> match assign(line(em2, tg <> " = load i64, ptr " <> vtext(v)), "icmp eq i64 " <> tg <> ", " <> int.to_string(tag), LI1) {
+          Gotv(Val(c, _), em3) -> test_fields(cx, vtext(v), fts, args, 1, fail, Cons(vtext(v), keep), env, branch_on(em3, c, fail))
+        }
+      }
+    }
+  }
+}
+fn test_fields(cx: ECx, obj: String, fts: List(Ty), ps: List(CPat), i: Int, fail: String, keep: List(String), env: List(EBind), em: Emit) -> Tested {
+  match ps {
+    Nil -> Tested(env, em)
+    Cons(QWild, rest) -> test_fields(cx, obj, tail_tys(fts), rest, i + 1, fail, keep, env, em)
+    Cons(p, rest) -> match load_field(em, obj, i, head_ty(fts)) {
+      Gotv(fv, em2) -> match test_pat(cx, fv, head_ty(fts), p, fail, keep, env, em2) {
+        Tested(env2, em3) -> test_fields(cx, obj, tail_tys(fts), rest, i + 1, fail, keep, env2, em3)
+      }
+    }
+  }
+}
+fn head_ty(ts: List(Ty)) -> Ty { match ts { Nil -> TB(4)  Cons(t, _) -> t } }
+fn tail_tys(ts: List(Ty)) -> List(Ty) { match ts { Nil -> Nil  Cons(_, rest) -> rest } }
+
+// The arms in order, each tested then run; the value of each that runs and
+// the block it ends in, for the join's phi (none in tail position, where
+// each arm returns). Past the last arm the match fails by name.
+type In { In(String, String) }
+linear type Arms { Arms(List(In), Emit) }
+fn phi_ins(ins: List(In)) -> String {
+  match ins { Nil -> ""  Cons(In(v, l), Nil) -> "[ " <> v <> ", %" <> l <> " ]"  Cons(In(v, l), rest) -> "[ " <> v <> ", %" <> l <> " ], " <> phi_ins(rest) }
+}
+fn emit_arms(cx: ECx, env: List(EBind), pend: List(Val), sv: Val, st: Ty, arms: List(CArm), em: Emit, join: String, ins: List(In), tail: Maybe(LTy)) -> Arms {
+  match arms {
+    Nil -> Arms(rev(ins), line(line(em, "call void @elya_match_fail()"), "unreachable"))
+    Cons(CArm(p, body), rest) -> match new_label(em) {
+      Fresh1(next, em2) -> match test_pat(cx, sv, st, p, next, val_roots(Cons(sv, Nil), val_roots(pend, Nil)), env, em2) {
+        Tested(env2, em3) -> match tail {
+          Yes(r) -> emit_arms(cx, env, pend, sv, st, rest, start_block(emit_tail(cx, env2, body, em3, r), next), join, ins, tail)
+          No -> match emit(cx, env2, pend, body, em3) {
+            Gotv(Val(bv, _), em4) -> match label_of(em4) {
+              AtLabel(lb, em5) -> emit_arms(cx, env, pend, sv, st, rest, start_block(line(em5, "br label %" <> join), next), join, Cons(In(bv, lb), ins), tail)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// ---- Functions and the module ----------------------------------------------
+
+fn param_lts(ps: List(CParam)) -> List(LTy) {
+  match ps { Nil -> Nil  Cons(CParam(_, t), rest) -> Cons(lt_of(t), param_lts(rest)) }
+}
+fn sigs_of(fs: List(CFn)) -> List(ESig) {
+  match fs { Nil -> Nil  Cons(CFn(n, ps, CExpr(_, _, t, _)), rest) -> Cons(ESig(n, param_lts(ps), lt_of(t)), sigs_of(rest)) }
+}
+type Hdr { Hdr(String, List(EBind)) }
+fn header(ps: List(CParam), i: Int, text: String, env: List(EBind)) -> Hdr {
+  match ps {
+    Nil -> Hdr(text, env)
+    Cons(CParam(n, t), rest) -> {
+      let v = "%p" <> int.to_string(i)
+      header(rest, i + 1, if i == 0 { lt_text(lt_of(t)) <> " " <> v } else { text <> ", " <> lt_text(lt_of(t)) <> " " <> v }, Cons(EBind(n, Val(v, lt_of(t))), env))
+    }
+  }
+}
+fn define(cx: ECx, name: String, text: String, r: LTy, env: List(EBind), body: CExpr, pre: List(String), em: Emit) -> Emit {
+  match em {
+    Emit(b, k, _, mx, sk) -> {
+      let em2 = lines(Emit(buffer.push(b, "define tailcc " <> lt_text(r) <> " @" <> name <> "(" <> text <> ") {\nentry:\n"), k, "entry", mx, sk), pre)
+      match emit_tail(cx, env, body, em2, r) {
+        Emit(b2, k2, l2, mx2, sk2) -> Emit(buffer.push(b2, "}\n\n"), k2, l2, mx2, sk2)
+      }
+    }
+  }
+}
+fn lines(em: Emit, ls: List(String)) -> Emit { match ls { Nil -> em  Cons(x, rest) -> lines(line(em, x), rest) } }
+// A lambda's code: the closure, then its parameters; each capture loaded
+// from the closure's words at entry.
+linear type Loaded { Loaded(List(String), List(EBind), Emit) }
+fn load_caps(caps: List(EBind), i: Int, pre: List(String), env: List(EBind), em: Emit) -> Loaded {
+  match caps {
+    Nil -> Loaded(rev(pre), env, em)
+    Cons(EBind(n, Val(_, t)), rest) -> match fresh(em) {
+      Fresh1(fp, em2) -> match fresh(em2) {
+        Fresh1(w, em3) -> {
+          let ld = Cons(w <> " = load i64, ptr " <> fp, Cons(fp <> " = getelementptr i64, ptr %clo, i64 " <> int.to_string(i), pre))
+          match t {
+            LI64 -> load_caps(rest, i + 1, ld, Cons(EBind(n, Val(w, LI64)), env), em3)
+            _ -> match fresh(em3) {
+              Fresh1(v, em4) -> load_caps(rest, i + 1, Cons(v <> (if t == LI1 { " = trunc i64 " <> w <> " to i1" } else { " = inttoptr i64 " <> w <> " to ptr" }), ld), Cons(EBind(n, Val(v, t)), env), em4)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+fn wrapper_params(ps: List(LTy), i: Int, text: String, args: List(Val)) -> Hdr2 {
+  match ps {
+    Nil -> Hdr2(text, rev(args))
+    Cons(t, rest) -> {
+      let v = "%p" <> int.to_string(i)
+      wrapper_params(rest, i + 1, text <> ", " <> lt_text(t) <> " " <> v, Cons(Val(v, t), args))
+    }
+  }
+}
+type Hdr2 { Hdr2(String, List(Val)) }
+fn take_job(em: Emit) -> Job1 {
+  match em {
+    Emit(b, n, l, Mx(cs, js, rws, lk, ws), k) -> match js {
+      Nil -> Job1(No, Emit(b, n, l, Mx(cs, Nil, rws, lk, ws), k))
+      Cons(j, rest) -> Job1(Yes(j), Emit(b, n, l, Mx(cs, rest, rws, lk, ws), k))
+    }
+  }
+}
+linear type Job1 { Job1(Maybe(LJob), Emit) }
+fn drain_jobs(cx: ECx, em: Emit) -> Emit {
+  match take_job(em) {
+    Job1(No, em2) -> em2
+    Job1(Yes(LamJob(i, ps, body, caps, r)), em2) -> match header(ps, 0, "", Nil) {
+      Hdr(text, penv) -> match load_caps(caps, 2, Nil, penv, em2) {
+        Loaded(pre, env, em3) -> drain_jobs(cx, define(cx, "elya$lam." <> int.to_string(i), if text == "" { "ptr %clo" } else { "ptr %clo, " <> text }, r, env, body, pre, em3))
+      }
+    }
+    Job1(Yes(WrapJob(f)), em2) -> match sig_of(cx_sigs(cx), f) {
+      ESig(_, ps, r) -> match wrapper_params(ps, 0, "ptr %clo", Nil) {
+        Hdr2(text, args) -> match em2 {
+          Emit(b, k, l, mx, sk) -> drain_jobs(cx, Emit(buffer.push(b, "define tailcc " <> lt_text(r) <> " @elya$wrap." <> f <> "(" <> text <> ") {\nentry:\n  %r = musttail call tailcc " <> lt_text(r) <> " @elya." <> f <> "(" <> arg_list(args) <> ")\n  ret " <> lt_text(r) <> " %r\n}\n\n"), k, l, mx, sk))
+        }
+      }
+    }
+  }
+}
+fn emit_fns(cx: ECx, fs: List(CFn), em: Emit) -> Emit {
+  match fs {
+    Nil -> em
+    Cons(CFn(n, ps, body), rest) -> match header(ps, 0, "", Nil) {
+      Hdr(text, env) -> emit_fns(cx, rest, drain_jobs(cx, define(cx, "elya." <> n, text, ty_lt(body), env, body, Nil, em)))
+    }
+  }
+}
+fn emit_strs(ss: List(SConst), b: Buffer) -> Buffer {
+  match ss {
+    Nil -> b
+    Cons(SConst(name, v), rest) -> emit_strs(rest, buffer.push(ir_bytes(v, 0, 0, buffer.push(b, name <> " = private unnamed_addr constant [" <> int.to_string(string.length(v)) <> " x i8] c\"")), "\"\n"))
+  }
+}
+fn prelude() -> String {
+  "; The back end in Elya, stage B6.\n" <>
+  "declare ptr @elya_alloc(i64)\n" <>
+  "declare i64 @elya_eq(ptr, ptr, i64, i64)\n" <>
+  "declare void @elya_match_fail()\n" <>
+  "declare ptr @elya_array_new(i64)\n" <>
+  "declare ptr @elya_array_push(ptr, i64)\n" <>
+  "declare ptr @elya_array_set(ptr, i64, i64)\n" <>
+  "declare i64 @elya_array_get(ptr, i64)\n" <>
+  "declare i64 @elya_array_length(ptr)\n" <>
+  "declare ptr @elya_buffer_new(i64)\n" <>
+  "declare ptr @elya_buffer_push(i64, ptr, ptr)\n" <>
+  "declare ptr @elya_buffer_finish(i64, ptr)\n" <>
+  "declare ptr @elya_io_read_file(i64, ptr)\n" <>
+  "declare i64 @elya_io_file_exists(ptr)\n" <>
+  "declare void @elya_io_write_file(ptr, ptr)\n" <>
+  "declare ptr @elya_io_read_stdin(i64)\n" <>
+  "declare i64 @elya_io_arg_count()\n" <>
+  "declare ptr @elya_io_arg(i64, i64)\n" <>
+  "declare i64 @elya_io_run(ptr)\n" <>
+  "declare ptr @elya_str_lit(i64, ptr, i64)\n" <>
+  "declare ptr @elya_int_to_string(i64, i64)\n" <>
+  "declare ptr @elya_str_concat(i64, ptr, ptr)\n" <>
+  "declare i64 @elya_str_eq(ptr, ptr)\n" <>
+  "declare i64 @elya_str_length(ptr)\n" <>
+  "declare i64 @elya_str_byte_at(ptr, i64)\n" <>
+  "declare ptr @elya_str_slice(i64, ptr, i64, i64)\n" <>
+  "declare void @elya_shift_range(ptr, i64)\n" <>
+  "declare void @elya_gc_push(ptr)\n" <>
+  "declare void @elya_gc_pop()\n" <>
+  "@.name.shl = private unnamed_addr constant [4 x i8] c\"shl\\00\"\n" <>
+  "@.name.shr = private unnamed_addr constant [4 x i8] c\"shr\\00\"\n" <>
+  "@.name.ushr = private unnamed_addr constant [5 x i8] c\"ushr\\00\"\n" <>
+  "declare void @elya_println(ptr)\n" <>
+  "declare void @elya_int_overflow()\n" <>
+  "declare void @elya_div_zero()\n" <>
+  "declare void @elya_rem_zero()\n" <>
+  "declare void @elya_gc_init(ptr, i64)\n" <>
+  "declare void @elya_eq_init(ptr, i64)\n" <>
+  "declare void @elya_args_init(i32, ptr)\n" <>
+  "declare i64 @elya_start(ptr)\n" <>
+  "declare void @elya_main_int(i64)\n" <>
+  "declare void @elya_gc_report()\n" <>
+  "declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)\n" <>
+  "declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)\n" <>
+  "declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)\n\n"
+}
+// The entry: `main`'s value printed as the Rust back end prints it, an
+// `Int` (or `Unit`, 0) by `elya_main_int` after the program, a `Bool` by
+// name.
+fn entry(cx: ECx, main_lt: LTy) -> String {
+  "@.true = private unnamed_addr constant [4 x i8] c\"True\"\n@.false = private unnamed_addr constant [5 x i8] c\"False\"\n\n" <>
+  "define i64 @elya_entry() {\nentry:\n  %v = call tailcc " <> lt_text(main_lt) <> " @elya.main()\n" <>
+  (if main_lt == LI1 {
+    "  %t = call ptr @elya_str_lit(i64 " <> stag(cx) <> ", ptr @.true, i64 4)\n  call void @elya_gc_push(ptr %t)\n  %f = call ptr @elya_str_lit(i64 " <> stag(cx) <> ", ptr @.false, i64 5)\n  call void @elya_gc_pop()\n  %s = select i1 %v, ptr %t, ptr %f\n  call void @elya_println(ptr %s)\n  ret i64 0\n}\n\n"
+  } else { "  ret i64 %v\n}\n\n" }) <>
+  "define i32 @main(i32 %0, ptr %1) {\nentry:\n  call void @elya_gc_init(ptr @.gc_desc, i64 " <> int.to_string(rows(cx)) <> ")\n  call void @elya_eq_init(ptr @.eq_float, i64 " <> int.to_string(n_ctors(cx)) <> ")\n" <>
+  "  call void @elya_args_init(i32 %0, ptr %1)\n  %v = call i64 @elya_start(ptr @elya_entry)\n" <>
+  (if main_lt == LI1 { "" } else { "  call void @elya_main_int(i64 %v)\n" }) <>
+  "  call void @elya_gc_report()\n  ret i32 0\n}\n"
+}
+
+// The constructors in declaration order: the index is the tag.
+fn infos(ts: List(CType), tag: Int, acc: List(CInfo)) -> List(CInfo) {
+  match ts {
+    Nil -> rev(acc)
+    Cons(CType(_, Nil), rest) -> infos(rest, tag, acc)
+    Cons(CType(n, Cons(CCtor(c, fs), more)), rest) -> infos(Cons(CType(n, more), rest), tag + 1, Cons(CInfo(c, "", tag, fs), acc))
+  }
+}
+// The instances of the parametric types the ground module uses, each
+// constructor a tag of its own after the ground types' (`instantiate_types`):
+// found from every type the functions mention, and the fields of each
+// instance found, until none is new.
+fn generic_of(gs: List(CGeneric), n: String) -> Maybe(CGeneric) {
+  match gs { Nil -> No  Cons(CGeneric(m, k, cs), rest) -> if m == n { Yes(CGeneric(m, k, cs)) } else { generic_of(rest, n) } }
+}
+fn nth_ty(ts: List(Ty), i: Int) -> Ty { match ts { Nil -> TB(4)  Cons(t, rest) -> if i == 0 { t } else { nth_ty(rest, i - 1) } } }
+fn inst_ty(args: List(Ty), t: Ty) -> Ty {
+  match t {
+    TVar(i) -> nth_ty(args, i)
+    TFn(ps, rw, r) -> TFn(inst_tys(args, ps), rw, inst_ty(args, r))
+    TCon(n, xs) -> TCon(n, inst_tys(args, xs))
+    _ -> t
+  }
+}
+fn inst_tys(args: List(Ty), ts: List(Ty)) -> List(Ty) { match ts { Nil -> Nil  Cons(t, rest) -> Cons(inst_ty(args, t), inst_tys(args, rest)) } }
+fn has_key(cs: List(CInfo), key: String) -> Bool { match cs { Nil -> False  Cons(CInfo(_, k, _, _), rest) -> k == key || has_key(rest, key) } }
+type Insts { Insts(List(CInfo), Int) }
+fn add_ctors(cs: List(CCtor), args: List(Ty), key: String, ins: Insts) -> Insts {
+  match cs {
+    Nil -> ins
+    Cons(CCtor(c, fs), rest) -> match ins { Insts(acc, tag) -> add_ctors(rest, args, key, Insts(Cons(CInfo(c, key, tag, inst_tys(args, fs)), acc), tag + 1)) }
+  }
+}
+fn ctor_fields(cs: List(CCtor), args: List(Ty)) -> List(Ty) {
+  match cs { Nil -> Nil  Cons(CCtor(_, fs), rest) -> rev_onto(inst_tys(args, fs), ctor_fields(rest, args)) }
+}
+fn use_ty(gs: List(CGeneric), t: Ty, ins: Insts) -> Insts {
+  match t {
+    TFn(ps, _, r) -> use_ty(gs, r, use_tys(gs, ps, ins))
+    TCon(n, args) -> {
+      let ins2 = use_tys(gs, args, ins)
+      match args {
+        Nil -> ins2
+        _ -> match generic_of(gs, n) {
+          No -> ins2
+          Yes(CGeneric(_, _, cs)) -> {
+            let key = type_key(t)
+            match ins2 { Insts(acc, tag) -> if has_key(acc, key) { Insts(acc, tag) } else { use_tys(gs, ctor_fields(cs, args), add_ctors(cs, args, key, Insts(acc, tag))) } }
+          }
+        }
+      }
+    }
+    _ -> ins
+  }
+}
+fn use_tys(gs: List(CGeneric), ts: List(Ty), ins: Insts) -> Insts { match ts { Nil -> ins  Cons(t, rest) -> use_tys(gs, rest, use_ty(gs, t, ins)) } }
+fn use_exprs(gs: List(CGeneric), xs: List(CExpr), ins: Insts) -> Insts { match xs { Nil -> ins  Cons(x, rest) -> use_exprs(gs, rest, use_expr(gs, x, ins)) } }
+fn use_expr(gs: List(CGeneric), e: CExpr, ins: Insts) -> Insts {
+  match e {
+    CExpr(_, _, t, k) -> {
+      let ins2 = use_ty(gs, t, ins)
+      match k {
+        KApp(f, args) -> use_exprs(gs, Cons(f, args), ins2)
+        KBuiltin(_, args) -> use_exprs(gs, args, ins2)
+        KCtor(_, args) -> use_exprs(gs, args, ins2)
+        KPrim(_, args) -> use_exprs(gs, args, ins2)
+        KLambda(ps, b) -> use_expr(gs, b, use_tys(gs, param_tys(ps), ins2))
+        KLet(_, v, b) -> use_expr(gs, b, use_expr(gs, v, ins2))
+        KIf(c, x, y) -> use_exprs(gs, Cons(c, Cons(x, Cons(y, Nil))), ins2)
+        KMatch(s, arms) -> use_arms(gs, arms, use_expr(gs, s, ins2))
+        _ -> ins2
+      }
+    }
+  }
+}
+fn use_arms(gs: List(CGeneric), arms: List(CArm), ins: Insts) -> Insts {
+  match arms { Nil -> ins  Cons(CArm(_, b), rest) -> use_arms(gs, rest, use_expr(gs, b, ins)) }
+}
+fn param_tys(ps: List(CParam)) -> List(Ty) { match ps { Nil -> Nil  Cons(CParam(_, t), rest) -> Cons(t, param_tys(rest)) } }
+fn use_fns(gs: List(CGeneric), fs: List(CFn), ins: Insts) -> Insts {
+  match fs { Nil -> ins  Cons(CFn(_, ps, b), rest) -> use_fns(gs, rest, use_expr(gs, b, use_tys(gs, param_tys(ps), ins))) }
+}
+fn ground_fields(cs: List(CInfo), acc: List(Ty)) -> List(Ty) {
+  match cs { Nil -> acc  Cons(CInfo(_, _, _, fs), rest) -> ground_fields(rest, rev_onto(fs, acc)) }
+}
+
+fn n_ctors(cx: ECx) -> Int { match cx { ECx(_, cs, _) -> len_infos(cs, 0) } }
+fn len_infos(cs: List(CInfo), n: Int) -> Int { match cs { Nil -> n  Cons(_, rest) -> len_infos(rest, n + 1) } }
+// The rows: each constructor's, then the string's, then the traced array's.
+fn rows(cx: ECx) -> Int { match cx { ECx(_, _, t) -> t + 2 } }
+fn is_heap(t: Ty) -> Bool { lt_of(t) == LPtr }
+fn mask(fs: List(Ty), bit: Int, acc: Int) -> Int {
+  match fs { Nil -> acc  Cons(f, rest) -> mask(rest, bit * 2, if is_heap(f) { acc + bit } else { acc }) }
+}
+fn len_tys(ts: List(Ty), n: Int) -> Int { match ts { Nil -> n  Cons(_, rest) -> len_tys(rest, n + 1) } }
+fn desc_rows(cs: List(CInfo), b: String) -> String {
+  match cs { Nil -> b  Cons(CInfo(_, _, _, fs), rest) -> desc_rows(rest, b <> "i64 " <> int.to_string(len_tys(fs, 0)) <> ", i64 " <> int.to_string(mask(fs, 1, 0)) <> ", ") }
+}
+// The closures' rows in tag order, then a row for each tag numbered but
+// not used (the count is a bound, D4's tags contiguous).
+fn closure_rows(rws: List(Row2), b: String) -> String {
+  match rws { Nil -> b  Cons(Row2(a, m), rest) -> closure_rows(rest, b <> "i64 " <> int.to_string(a) <> ", i64 " <> int.to_string(m) <> ", ") }
+}
+fn spare_rows(n: Int, b: String) -> String { if n <= 0 { b } else { spare_rows(n - 1, b <> "i64 0, i64 0, ") } }
+fn len_rows(rws: List(Row2), n: Int) -> Int { match rws { Nil -> n  Cons(_, rest) -> len_rows(rest, n + 1) } }
+fn tables(cx: ECx, rws: List(Row2)) -> String {
+  match cx {
+    ECx(_, cs, t) -> "@.gc_desc = private unnamed_addr constant [" <> int.to_string(2 * rows(cx)) <> " x i64] [" <> desc_rows(cs, "") <> closure_rows(rws, "") <> spare_rows(t - n_ctors(cx) - len_rows(rws, 0), "") <> "i64 0, i64 0, i64 -1, i64 0]\n" <>
+      "@.eq_float = private unnamed_addr constant [" <> int.to_string(n_ctors(cx) + 1) <> " x i64] zeroinitializer\n"
+  }
+}
+
+// A bound on the closures the module makes: a lambda each, and each
+// mention of a function's name (a value, or a call).
+fn sites_list(xs: List(CExpr), n: Int) -> Int { match xs { Nil -> n  Cons(x, rest) -> sites_list(rest, sites(x, n)) } }
+fn sites(e: CExpr, n: Int) -> Int {
+  match e {
+    CExpr(_, _, _, k) -> match k {
+      KVar(_) -> n + 1
+      KApp(f, args) -> sites_list(Cons(f, args), n)
+      KBuiltin(_, args) -> sites_list(args, n)
+      KCtor(_, args) -> sites_list(args, n + 1)
+      KPrim(_, args) -> sites_list(args, n)
+      KLambda(_, b) -> sites(b, n + 1)
+      KLet(_, v, b) -> sites(b, sites(v, n))
+      KIf(c, x, y) -> sites_list(Cons(c, Cons(x, Cons(y, Nil))), n)
+      KMatch(sc, arms) -> sites_arms(arms, sites(sc, n))
+      _ -> n
+    }
+  }
+}
+fn sites_arms(arms: List(CArm), n: Int) -> Int { match arms { Nil -> n  Cons(CArm(_, b), rest) -> sites_arms(rest, sites(b, n)) } }
+fn sites_fns(fs: List(CFn), n: Int) -> Int { match fs { Nil -> n  Cons(CFn(_, _, b), rest) -> sites_fns(rest, sites(b, n)) } }
+
+pub fn emit_module(m0: CModule) -> String {
+  match mono.mono(m0) {
+    CModule(ts, gs, fs) -> {
+      let sigs = sigs_of(fs)
+      let ground_cs = infos(ts, 0, Nil)
+      let n = len_infos(ground_cs, 0)
+      let cs = match use_fns(gs, fs, use_tys(gs, ground_fields(ground_cs, Nil), Insts(Nil, n))) { Insts(insts, _) -> rev_onto(rev(ground_cs), rev(insts)) }
+      let cx = ECx(sigs, cs, len_infos(cs, 0) + sites_fns(fs, 0))
+      match emit_fns(cx, fs, Emit(buffer.new(), 0, "entry", Mx(Nil, Nil, Nil, 0, Nil), 0)) {
+        Emit(body, _, _, Mx(ss, _, rws, _, _), _) -> buffer.finish(buffer.push(emit_strs(rev(ss), buffer.push(buffer.new(), prelude() <> tables(cx, rev(rws)))), buffer.finish(body) <> entry(cx, match sig_of(sigs, "main") { ESig(_, _, r) -> r })))
+      }
+    }
+  }
+}
+
+// A resolved program as IR text, or why it is outside the back end's stage.
+type EBuilt { BuiltIr(String), NotBuilt(String) }
+pub fn compile(m: Module, size: Int) -> EBuilt {
+  match core.lower(m, size) {
+    Refused(w) -> NotBuilt(w)
+    Ok(cm) -> match check_module(mono.mono(cm)) {
+      Outside(w) -> NotBuilt(w)
+      InStage -> BuiltIr(emit_module(cm))
+    }
+  }
+}
+
+// io.arg(0) is the program, io.arg(1) the standard modules' directory.
+pub fn main() / {IO} {
+  match resolve.resolved(io.arg(0), if io.arg_count() > 1 { io.arg(1) } else { "src/std" }) {
+    Resolved(m, size, bad, _) -> if bad { io.println("unsupported a program that does not resolve") } else {
+      match core.lower(m, size) {
+        Refused(w) -> io.println("unsupported " <> w)
+        Ok(cm) -> match check_module(mono.mono(cm)) {
+          Outside(w) -> io.println("unsupported " <> w)
+          InStage -> io.println(emit_module(cm))
+        }
+      }
+    }
+  }
+}

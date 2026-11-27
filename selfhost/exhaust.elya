@@ -76,12 +76,12 @@ fn column_cons(m: List(List(XPat)), acc: List(XCon)) -> List(XCon) {
 }
 
 type CA { CA(XCon, Int) }
-type Sig { Finite(List(CA)), Infinite }
+type XSig { Finite(List(CA)), Infinite }
 
 fn sibs_cas(xs: List(Sib)) -> List(CA) {
   match xs { Nil -> Nil  Cons(Sib(n, a), rest) -> Cons(CA(XData(n), a), sibs_cas(rest)) }
 }
-fn signature(heads: List(XCon), sib: List(Sibs)) -> Sig {
+fn signature(heads: List(XCon), sib: List(Sibs)) -> XSig {
   match heads {
     Nil -> Infinite
     Cons(XData(name), _) -> Finite(sibs_cas(sib_lookup(sib, name)))
@@ -315,6 +315,15 @@ fn dump(ds: List(XDiag), b: Buffer) -> Buffer {
     Nil -> b
     Cons(XDiag(err, code, s, e, msg), rest) -> dump(rest, buffer.push(b, (if err { "error " } else { "warning " }) <> code <> " " <> int.to_string(s) <> " " <> int.to_string(e) <> " \"" <> quote_from(msg, 0, 0, "") <> "\"\n"))
   }
+}
+
+// Its diagnostics in the dump form, for the driver, and whether one is an
+// error (E0430; E0431 is a warning).
+type Exhausted { Exhausted(String, Bool) }
+fn any_err(ds: List(XDiag)) -> Bool { match ds { Nil -> False  Cons(XDiag(e, _, _, _, _), rest) -> e || any_err(rest) } }
+pub fn diagnostics(m: Module) -> Exhausted {
+  let ds = check(m)
+  Exhausted(buffer.finish(dump(ds, buffer.new())), any_err(ds))
 }
 
 pub fn main() / {IO} {
