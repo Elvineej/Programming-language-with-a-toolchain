@@ -18,6 +18,17 @@ count, Windows CI, then `main`.
    (the dump has no spans). First run: all 358 corpus programs agreed.
    Natively the pass takes 87 ms on selfhost/lex.elya against Rust's 9 ms
    (the checker dominates, as it does for `check --dump`).
+   Review: three defects. A ground type's function field kept its labels as
+   written, where Rust sorts them and keeps a repeated one's last writing
+   (fixed, Rust's `BTreeMap` order); a literal's characters that Rust's
+   `{:?}` escapes beyond ASCII (combining marks, zero-width and other
+   non-printable ones) were printed raw: such a literal is now refused
+   (`a character Debug escapes`) and not compared, the characters kept
+   being Latin-1 and Latin Extended (but U+00AD), punctuation to U+2027,
+   arrows, box drawing and CJK ideographs; and a comment had Rust's order
+   of lowering a block backwards. 3,116 random programs agreed; of 116
+   mutants, 3 are equivalent and 8 more focused programs kill the 27 that
+   lived (23 focused now).
 2. [x] **B1** (2026-11-27): first-order `Int`/`Bool`/`Unit` programs and
    string literals printed (`selfhost/emit.elya`, importing Core in Elya).
    The harness, crates/codegen/tests/selfhost_backend.rs, builds the back

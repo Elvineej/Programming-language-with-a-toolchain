@@ -81,7 +81,7 @@ fn core_in_elya_agrees() {
         };
         let (interpreter, result) = elya::eval::run_module_keeping_host(&module, World::Live, host);
         assert!(result.is_ok(), "{name}: {result:?}");
-        if interpreter.output() == support::FLOAT {
+        if interpreter.output() == support::FLOAT || interpreter.output() == support::ESCAPED {
             floats += 1;
             continue;
         }

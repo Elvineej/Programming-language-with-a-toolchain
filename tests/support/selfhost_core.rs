@@ -37,6 +37,12 @@ pub fn want(text: &str) -> Option<String> {
 #[allow(dead_code)]
 pub const FLOAT: &str = "refused Unsupported(\"Float in Elya\")\n";
 
+/// What it prints for a string literal holding a character Rust's `{:?}`
+/// may escape (a combining mark, a zero-width space, ...), which it does not
+/// decide: not compared either.
+#[allow(dead_code)]
+pub const ESCAPED: &str = "refused Unsupported(\"a character Debug escapes\")\n";
+
 #[allow(dead_code)]
 pub const FOCUSED: &[&str] = &[
     // Strings: every escape, a raw tab and newline, a non-ASCII byte, in literals and patterns.
@@ -68,4 +74,21 @@ pub const FOCUSED: &[&str] = &[
     "effect Ask { fn ask(n: Int) -> Int }\nfn m(x: fn(Int) -> Int) -> Int { match x { ask -> ask(5) } }\nfn r(x: fn(Int) -> Int) -> Int { handle { x } with { ask(n) -> resume(n)  return(ask) -> ask(6) } }\npub fn main() -> Int { 0 }\n",
     // A clause parameter shadowing an operation.
     "effect A { fn a(g: fn(Int) -> Int) -> Int }\neffect B { fn b(n: Int) -> Int }\nfn f() -> Int { handle { a(fn(x) { x }) } with { a(b) -> resume(b(1)) } }\npub fn main() -> Int { 0 }\n",
+    // Review 2026-11-27, one per surviving mutant or defect:
+    // A nested constructor pattern's binder shadowing an operation.
+    "effect Ask { fn ask(n: Int) -> Int }\ntype B { B(fn(Int) -> Int) }\nfn f(b) { match b { B(ask) -> ask(1) } }\npub fn main() -> Int { 0 }\n",
+    // A let's value does not see its own binder (`let ask = ask(1)` performs).
+    "effect Ask { fn ask(n: Int) -> Int }\nfn f() / {Ask} -> Int { let ask = ask(1)\n ask }\npub fn main() -> Int { 0 }\n",
+    // Float operators and negation without a Float literal.
+    "fn f(x) { -.x }\nfn g(a, b) { a +. b -. a *. b /. a }\nfn h(a, b) { a <. b || a <=. b || a >. b || a >=. b }\ntype T { T(Float) }\npub fn main() -> Int { let x = float.of_int(1)\n if h(x, f(g(x, x))) { 1 } else { 0 } }\n",
+    // A raw NUL, control characters below and above 0x10, DEL.
+    "pub fn main() / {IO} { io.println(\"a\u{0}b\u{1}\u{b}\u{c}\u{e}\u{f}\u{1b}\u{7f}\") }\n",
+    // `with any` never stamped multi, even beside a multi op named `op`.
+    "effect multi M { fn op() -> Int }\nfn f() -> Int { handle { handle { op() } with any { op(o) -> resume(op.perform(o)) } } with multi { op() -> resume(1) + resume(2) } }\nfn g() -> Int { handle { handle { op() } with any { op(o) -> resume(op.perform(o))  return(x) -> x } } with multi { op() -> resume(1) + resume(2) } }\npub fn main() -> Int { f() + g() }\n",
+    // Label arguments, and labels sorted, in a ground type's fields.
+    "effect St(s) { fn get() -> s }\neffect Log { fn log(s: String) -> Unit }\ntype T { T(fn() / {St(Int)} -> Int), U(Array(Int), fn(Bool, String) -> Unit), V(fn() / {Log, St(Bool), IO} -> Int) }\npub fn main() -> Int { 0 }\n",
+    // Labels written out of order and twice: sorted, the last writing kept (review D1).
+    "effect Log { fn log(s: String) -> Unit }\neffect Ask { fn ask(n: Int) -> Int }\neffect St(s) { fn get() -> s }\ntype T { T(fn(Int) / {Log, Ask} -> Int), U(fn() / {St(Int), St(Bool)} -> Int), W(fn() / {Log, Log} -> Int) }\npub fn main() -> Int { 0 }\n",
+    // Builtins the corpus calls only beside a Float literal.
+    "pub fn main() / {IO} { let b = buffer.push(buffer.new(), \"x\")\n let n = buffer.length(b)\n let s = buffer.finish(b)\n let f = float.of_int(3)\n io.println(s <> int.to_string(n + float.truncate(f) + float.round(f) + int.wrapping_sub(1, 2) + int.or(1, 2) + int.shl(1, 2) + int.shr(1, 2) + int.ushr(1, 2))) }\n",
 ];

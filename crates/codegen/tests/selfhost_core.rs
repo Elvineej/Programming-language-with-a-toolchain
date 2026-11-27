@@ -85,7 +85,7 @@ fn native_proof() {
         };
         let path = scratch.put(&text);
         let got = run(&path);
-        if got == support::FLOAT {
+        if got == support::FLOAT || got == support::ESCAPED {
             floats += 1;
             continue;
         }

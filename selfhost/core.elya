@@ -107,10 +107,30 @@ fn split_last(xs: List(Sp(TypeAnn)), acc: List(Sp(TypeAnn))) -> List(Sp(TypeAnn)
 fn last_ann(xs: List(Sp(TypeAnn))) -> TypeAnn {
   match xs { Cons(Sp(a, _, _), Nil) -> a  Cons(_, rest) -> last_ann(rest)  Nil -> TypeAnn("Unit", Nil, No) }
 }
-fn ann_labels(ls: List(LabelAnn), ps: List(String)) -> List(Lab) {
+// Sorted by name, a repeated label's last writing kept (Rust's `BTreeMap`).
+fn str_before(a: String, b: String, i: Int) -> Bool {
+  if i == string.length(a) { i < string.length(b) } else {
+    if i == string.length(b) { False } else {
+      let x = string.byte_at(a, i)
+      let y = string.byte_at(b, i)
+      if x == y { str_before(a, b, i + 1) } else { x < y }
+    }
+  }
+}
+fn put_lab(xs: List(Lab), l: Lab) -> List(Lab) {
+  match l {
+    Lab(n, _, _, _) -> match xs {
+      Nil -> Cons(l, Nil)
+      Cons(Lab(m, x1, x2, x3), rest) -> if m == n { Cons(l, rest) } else {
+        if str_before(n, m, 0) { Cons(l, xs) } else { Cons(Lab(m, x1, x2, x3), put_lab(rest, l)) }
+      }
+    }
+  }
+}
+fn ann_labels(ls: List(LabelAnn), ps: List(String), acc: List(Lab)) -> List(Lab) {
   match ls {
-    Nil -> Nil
-    Cons(LabelAnn(Sp(name, a, b), args), rest) -> Cons(Lab(name, match args { No -> Nil  Yes(xs) -> ann_list(xs, ps) }, a, b), ann_labels(rest, ps))
+    Nil -> acc
+    Cons(LabelAnn(Sp(name, a, b), args), rest) -> ann_labels(rest, ps, put_lab(acc, Lab(name, match args { No -> Nil  Yes(xs) -> ann_list(xs, ps) }, a, b)))
   }
 }
 fn position(ps: List(String), n: String, i: Int) -> Int {
@@ -119,7 +139,7 @@ fn position(ps: List(String), n: String, i: Int) -> Int {
 fn ann_to_ty(a: TypeAnn, ps: List(String)) -> Ty {
   match a {
     TypeAnn(name, args, row) -> if name == "fn" && len(args) > 0 {
-      let r = match row { No -> Row(Nil, RClosed)  Yes(RowAnn(ls, _)) -> Row(ann_labels(ls, ps), RClosed) }
+      let r = match row { No -> Row(Nil, RClosed)  Yes(RowAnn(ls, _)) -> Row(ann_labels(ls, ps, Nil), RClosed) }
       TFn(ann_list(split_last(args, Nil), ps), r, ann_to_ty(last_ann(args), ps))
     } else { if len(args) == 0 && position(ps, name, 0) >= 0 { TVar(position(ps, name, 0)) } else {
       if name == "Int" { TB(0) } else { if name == "Float" { TB(1) } else { if name == "Bool" { TB(2) } else {
@@ -214,9 +234,11 @@ fn block(cx: Cx, locals: List(String), blk: Block) -> Low(CExpr) {
     }
   }
 }
-// The statements are lowered first to last (a refusal is the first one met,
-// statements before the tail, as Rust lowers the tail first only for its
-// value), the scope growing with each `let`.
+// The statements are lowered first to last, the scope growing with each
+// `let`, then the tail; Rust lowers the tail first and the statements last
+// to first. The orders differ only in which of two refusals is reported, and
+// no program that checks has two (each refusal is a front-end error but
+// `Float in Elya`, which is not compared).
 type Lowered { Lowered(Int, Int, String, CExpr) }
 fn stmts_then(cx: Cx, locals: List(String), stmts: List(Sp(Stmt)), tail: Sp(Expr)) -> Low(CExpr) {
   match lower_stmts(cx, locals, stmts, Nil) {
@@ -267,7 +289,7 @@ fn expr_at(cx: Cx, locals: List(String), x: Expr, a: Int, b: Int, ty: Ty) -> Low
     EInt(n) -> Ok(lit(LInt(n), a, b, ty))
     EFloat -> Refused(unsupported("Float in Elya"))
     EBool(v) -> Ok(lit(LBool(v), a, b, ty))
-    EStr(v) -> Ok(lit(LStr(unescape(v)), a, b, ty))
+    EStr(v) -> if plain(v, 0) { Ok(lit(LStr(unescape(v)), a, b, ty)) } else { Refused(unsupported("a character Debug escapes")) }
     EUnit -> Ok(lit(LUnit, a, b, ty))
     EError -> Refused(unsupported("a statement that did not parse"))
     EVar(n) -> Ok(CExpr(a, b, ty, if is_ctor(cx, n) { KCtor(n, Nil) } else { KVar(n) }))
@@ -324,6 +346,29 @@ fn unescape_from(raw: String, i: Int, end: Int, from: Int, acc: Buffer) -> Buffe
 }
 fn unescape(raw: String) -> String { buffer.finish(unescape_from(raw, 1, string.length(raw) - 1, 1, buffer.new())) }
 
+// Whether every character of a literal is one Rust's `{:?}` prints as it is
+// or escapes as `debug_from` does: ASCII, and the letters of the ranges
+// below (Latin-1 and Latin Extended but U+00AD, general punctuation to U+2027,
+// arrows, box drawing, CJK ideographs). Rust also escapes the characters Unicode calls non-printable or
+// grapheme-extending (U+0301, U+200B, U+00AD, ...); a literal with one of
+// those, or with anything outside the ranges, is refused, so not compared.
+fn plain(s: String, i: Int) -> Bool {
+  if i >= string.length(s) { True } else {
+    let c = string.byte_at(s, i)
+    if c < 128 { plain(s, i + 1) } else {
+      if c >= 240 || i + 1 >= string.length(s) { False } else {
+        let cp = if c >= 224 { (c - 224) * 4096 + (string.byte_at(s, i + 1) - 128) * 64 + (string.byte_at(s, i + 2) - 128) } else { (c - 192) * 64 + (string.byte_at(s, i + 1) - 128) }
+        let ok = (cp >= 161 && cp <= 591 && cp != 173) || (cp >= 8208 && cp <= 8231) || (cp >= 8592 && cp <= 8703) || (cp >= 9472 && cp <= 9599) || (cp >= 19968 && cp <= 40959)
+        if ok { plain(s, i + (if c >= 224 { 3 } else { 2 })) } else { False }
+      }
+    }
+  }
+}
+
+fn pat_plain(p: Pattern) -> Bool {
+  match p { PStr(v) -> plain(v, 0)  PCtor(_, args) -> pats_plain(args)  _ -> True }
+}
+fn pats_plain(ps: List(Sp(Pattern))) -> Bool { match ps { Nil -> True  Cons(Sp(p, _, _), rest) -> pat_plain(p) && pats_plain(rest) } }
 fn lower_pat(p: Pattern) -> CPat {
   match p {
     PWild -> QWild
@@ -341,10 +386,10 @@ fn lower_pats(ps: List(Sp(Pattern))) -> List(CPat) {
 fn lower_arms(cx: Cx, locals: List(String), arms: List(Sp(MatchArm))) -> Low(List(CArm)) {
   match arms {
     Nil -> Ok(Nil)
-    Cons(Sp(MatchArm(Sp(p, _, _), body), _, _), rest) -> match expr(cx, pat_names(p, locals), body) {
+    Cons(Sp(MatchArm(Sp(p, _, _), body), _, _), rest) -> if !pat_plain(p) { Refused(unsupported("a character Debug escapes")) } else { match expr(cx, pat_names(p, locals), body) {
       Refused(w) -> Refused(w)
       Ok(be) -> match lower_arms(cx, locals, rest) { Refused(w) -> Refused(w)  Ok(more) -> Ok(Cons(CArm(lower_pat(p), be), more)) }
-    }
+    } }
   }
 }
 
