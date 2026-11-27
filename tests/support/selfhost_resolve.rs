@@ -22,6 +22,14 @@ pub struct Program {
     pub files: Vec<(String, String)>,
 }
 
+/// A path as the resolver in Elya is given it: its separators `/`. The
+/// resolver splits a root's directory at `/` (it cannot ask the platform);
+/// Windows takes either separator, and Rust's oracle reads the same files.
+#[allow(dead_code)]
+pub fn elya_path(p: &std::path::Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
 /// The selfhost files the resolver imports (`parse`, and `lex` through it).
 pub fn reader(name: &str) -> Option<(String, String)> {
     let file = match name {
