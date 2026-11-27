@@ -37,8 +37,8 @@ count, Windows CI, then `main`.
    call's arguments are on the shadow stack across a call that may
    allocate. The harness also runs every Elya-built program collecting at
    every allocation (`ELYA_GC_STRESS=1`), where an unrooted value is freed
-   and poisoned: that run found two rooting faults at once (the entry's
-   `True`/`False`, and a constant split inside a UTF-8 character). 51
+   and poisoned: that run found two faults at once (the entry's `True`/`False`
+   unrooted; a constant split inside a UTF-8 character). 43
    corpus programs and 25 focused ones agree; controls E1-E7 in the
    header, E3 argued (the runtime roots its own arguments).
 4. [ ] **B3**: ground ADTs and `match` (pattern flattening in
