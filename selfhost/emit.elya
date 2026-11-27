@@ -80,7 +80,7 @@ fn check_expr(fs: List(CFn), locals: List(String), e: CExpr) -> Stage {
       KLet(n, v, b) -> first(check_expr(fs, locals, v), check_expr(fs, Cons(n, locals), b))
       KIf(c, a, b) -> first(check_expr(fs, locals, c), first(check_expr(fs, locals, a), check_expr(fs, locals, b)))
       KCtor(_, args) -> check_all(fs, locals, args)
-      KLambda(ps, b) -> first(check_params(ps), check_expr(fs, param_names(ps, locals), b))
+      KLambda(ps, b) -> first(check_params(ps), first(if count_in(free_vars(b, param_names(ps, Nil), Nil), locals, 0) > 61 { Outside("a closure of more than 61 captures") } else { InStage }, check_expr(fs, param_names(ps, locals), b)))
       KMatch(sc, arms) -> first(check_expr(fs, locals, sc), check_arms(fs, locals, arms))
       KHandle(_, _, _, _) -> Outside("a handler")
       KResume(_) -> Outside("a resume")
@@ -109,8 +109,23 @@ fn check_fns(all: List(CFn), fs: List(CFn)) -> Stage {
 fn main_type(fs: List(CFn)) -> LTy {
   match fs { Nil -> LNone  Cons(CFn(n, _, CExpr(_, _, t, _)), rest) -> if n == "main" { lt_of(t) } else { main_type(rest) } }
 }
+// A row's pointer mask is one word: a constructor's fields from bit 0, a
+// closure's captures from bit 1 (after its code), so 62 fields and 61
+// captures at most; Rust's wider rows (mask words) are not in the stage.
+fn count_in(ns: List(String), locals: List(String), n: Int) -> Int {
+  match ns { Nil -> n  Cons(x, rest) -> count_in(rest, locals, if has(locals, x) { n + 1 } else { n }) }
+}
+fn check_ctors(cs: List(CCtor)) -> Stage {
+  match cs { Nil -> InStage  Cons(CCtor(_, fs), rest) -> if len_tys(fs, 0) > 62 { Outside("a constructor of more than 62 fields") } else { check_ctors(rest) } }
+}
+fn check_types(ts: List(CType)) -> Stage {
+  match ts { Nil -> InStage  Cons(CType(_, cs), rest) -> first(check_ctors(cs), check_types(rest)) }
+}
+fn check_generics(gs: List(CGeneric)) -> Stage {
+  match gs { Nil -> InStage  Cons(CGeneric(_, _, cs), rest) -> first(check_ctors(cs), check_generics(rest)) }
+}
 fn check_module(m: CModule) -> Stage {
-  match m { CModule(_, _, fs) -> check_fns(fs, fs) }
+  match m { CModule(ts, gs, fs) -> first(check_types(ts), first(check_generics(gs), check_fns(fs, fs))) }
 }
 
 // ---- Emission state ---------------------------------------------------------
@@ -331,8 +346,12 @@ fn builtin(cx: ECx, env: List(EBind), pend: List(Val), n: String, args: List(CEx
   if n == "int.or" { assign(em, "or i64 " <> a <> ", " <> b, LI64) } else {
   if n == "int.xor" { assign(em, "xor i64 " <> a <> ", " <> b, LI64) } else {
   if n == "int.shl" { shift(em, "shl", "shl", a, b) } else {
-  if n == "int.shr" { shift(em, "shr", "ashr", a, b) } else { shift(em, "ushr", "lshr", a, b) } } } } } } } } } } } } } }
+  if n == "int.shr" { shift(em, "shr", "ashr", a, b) } else {
+  if n == "int.ushr" { shift(em, "ushr", "lshr", a, b) } else { unknown(em, n) } } } } } } } } } } } } } } }
 }
+// A builtin the dispatch does not know: text `clang` refuses, so a list and
+// a dispatch that disagree fail the build instead of compiling to undef.
+fn unknown(em: Emit, n: String) -> Gotv { assign(em, "unknown builtin " <> n, LI64) }
 fn arg_ty(args: List(CExpr)) -> Ty { match args { Cons(CExpr(_, _, t, _), _) -> t  Nil -> TB(4) } }
 fn io_data(cx: ECx, rs: List(String), n: String, args: List(CExpr), t: Ty, vs: List(Val), em: Emit) -> Gotv {
   let a = vtext(nth(vs, 0))
@@ -352,7 +371,7 @@ fn io_data(cx: ECx, rs: List(String), n: String, args: List(CExpr), t: Ty, vs: L
   if n == "io.read_stdin" { rooted(em, rs, "call ptr @elya_io_read_stdin(i64 " <> st <> ")", LPtr) } else {
   if n == "io.arg_count" { assign(em, "call i64 @elya_io_arg_count()", LI64) } else {
   if n == "io.run" { rooted(em, rs, "call i64 @elya_io_run(ptr " <> a <> ")", LI64) } else {
-  rooted(em, rs, "call ptr @elya_io_arg(i64 " <> st <> ", i64 " <> a <> ")", LPtr) } } } } } } } } } } } } } }
+  if n == "io.arg" { rooted(em, rs, "call ptr @elya_io_arg(i64 " <> st <> ", i64 " <> a <> ")", LPtr) } else { unknown(em, n) } } } } } } } } } } } } } } }
 }
 
 fn emit(cx: ECx, env: List(EBind), pend: List(Val), e: CExpr, em: Emit) -> Gotv {
@@ -490,7 +509,7 @@ fn lambda(cx: ECx, env: List(EBind), pend: List(Val), ps: List(CParam), body: CE
   let r = match t { TFn(_, _, rt) -> lt_of(rt)  _ -> LI64 }
   match em {
     Emit(b, n, l, Mx(cs, js, rws, lk, ws), k) -> match new_closure(Emit(b, n, l, Mx(cs, js, rws, lk, ws), k), 1 + len_binds(caps, 0), cap_mask(caps, 2, 0), LamJob(lk, ps, body, caps, r)) {
-      Numbered(i, em2) -> alloc_closure(cx, env, pend, n_ctors(cx) + i, "@elya.lam." <> int.to_string(i), cap_vals(caps), em2)
+      Numbered(i, em2) -> alloc_closure(cx, env, pend, n_ctors(cx) + i, "@elya$lam." <> int.to_string(i), cap_vals(caps), em2)
     }
   }
 }
@@ -508,7 +527,7 @@ fn fn_value(cx: ECx, env: List(EBind), pend: List(Val), f: String, em: Emit) -> 
     Emit(b, n, l, Mx(cs, js, rws, lk, ws), k) -> {
       let mx = if has(ws, f) { Mx(cs, js, rws, lk, ws) } else { Mx(cs, Cons(WrapJob(f), js), rws, lk, Cons(f, ws)) }
       match mx {
-        Mx(cs2, js2, rws2, lk2, ws2) -> alloc_closure(cx, env, pend, n_ctors(cx) + lk2, "@elya.wrap." <> f, Nil, Emit(b, n, l, Mx(cs2, js2, Cons(Row2(1, 0), rws2), lk2 + 1, ws2), k))
+        Mx(cs2, js2, rws2, lk2, ws2) -> alloc_closure(cx, env, pend, n_ctors(cx) + lk2, "@elya$wrap." <> f, Nil, Emit(b, n, l, Mx(cs2, js2, Cons(Row2(1, 0), rws2), lk2 + 1, ws2), k))
       }
     }
   }
@@ -593,7 +612,9 @@ fn construct(cx: ECx, env: List(EBind), pend: List(Val), n: String, t: Ty, vs: L
 }
 
 // One arm's pattern tested against `v` (of type `t`); a failed test goes to
-// `fail`, and the binders are bound as the test passes.
+// `fail`, and the binders are bound as the test passes. `keep` is what a
+// literal's allocation roots besides `v` and the binders: the scrutinee, the
+// objects enclosing `v`, and the pending operands, all read again after it.
 linear type Tested { Tested(List(EBind), Emit) }
 fn load_field(em: Emit, obj: String, i: Int, t: Ty) -> Gotv {
   match fresh(em) {
@@ -605,12 +626,12 @@ fn load_field(em: Emit, obj: String, i: Int, t: Ty) -> Gotv {
 fn branch_on(em: Emit, cond: String, fail: String) -> Emit {
   match new_label(em) { Fresh1(ok, em2) -> start_block(line(em2, "br i1 " <> cond <> ", label %" <> ok <> ", label %" <> fail), ok) }
 }
-fn test_pat(cx: ECx, v: Val, t: Ty, p: CPat, fail: String, env: List(EBind), em: Emit) -> Tested {
+fn test_pat(cx: ECx, v: Val, t: Ty, p: CPat, fail: String, keep: List(String), env: List(EBind), em: Emit) -> Tested {
   match p {
     QWild -> Tested(env, em)
     QVar(n) -> Tested(Cons(EBind(n, v), env), em)
     QLit(LUnit) -> Tested(env, em)
-    QLit(LStr(s)) -> match str_lit(cx, em, val_roots(Cons(v, Nil), env_roots(env, Nil)), s) {
+    QLit(LStr(s)) -> match str_lit(cx, em, val_roots(Cons(v, Nil), env_roots(env, keep)), s) {
       Gotv(Val(lit, _), em2) -> match assign(em2, "call i64 @elya_str_eq(ptr " <> vtext(v) <> ", ptr " <> lit <> ")", LI64) {
         Gotv(Val(r, _), em3) -> match assign(em3, "icmp ne i64 " <> r <> ", 0", LI1) { Gotv(Val(c, _), em4) -> Tested(env, branch_on(em4, c, fail)) }
       }
@@ -621,19 +642,19 @@ fn test_pat(cx: ECx, v: Val, t: Ty, p: CPat, fail: String, env: List(EBind), em:
     QCtor(n, args) -> match cx_ctor(cx, n, t) {
       CInfo(_, _, tag, fts) -> match fresh(em) {
         Fresh1(tg, em2) -> match assign(line(em2, tg <> " = load i64, ptr " <> vtext(v)), "icmp eq i64 " <> tg <> ", " <> int.to_string(tag), LI1) {
-          Gotv(Val(c, _), em3) -> test_fields(cx, vtext(v), fts, args, 1, fail, env, branch_on(em3, c, fail))
+          Gotv(Val(c, _), em3) -> test_fields(cx, vtext(v), fts, args, 1, fail, Cons(vtext(v), keep), env, branch_on(em3, c, fail))
         }
       }
     }
   }
 }
-fn test_fields(cx: ECx, obj: String, fts: List(Ty), ps: List(CPat), i: Int, fail: String, env: List(EBind), em: Emit) -> Tested {
+fn test_fields(cx: ECx, obj: String, fts: List(Ty), ps: List(CPat), i: Int, fail: String, keep: List(String), env: List(EBind), em: Emit) -> Tested {
   match ps {
     Nil -> Tested(env, em)
-    Cons(QWild, rest) -> test_fields(cx, obj, tail_tys(fts), rest, i + 1, fail, env, em)
+    Cons(QWild, rest) -> test_fields(cx, obj, tail_tys(fts), rest, i + 1, fail, keep, env, em)
     Cons(p, rest) -> match load_field(em, obj, i, head_ty(fts)) {
-      Gotv(fv, em2) -> match test_pat(cx, fv, head_ty(fts), p, fail, env, em2) {
-        Tested(env2, em3) -> test_fields(cx, obj, tail_tys(fts), rest, i + 1, fail, env2, em3)
+      Gotv(fv, em2) -> match test_pat(cx, fv, head_ty(fts), p, fail, keep, env, em2) {
+        Tested(env2, em3) -> test_fields(cx, obj, tail_tys(fts), rest, i + 1, fail, keep, env2, em3)
       }
     }
   }
@@ -653,7 +674,7 @@ fn emit_arms(cx: ECx, env: List(EBind), pend: List(Val), sv: Val, st: Ty, arms: 
   match arms {
     Nil -> Arms(rev(ins), line(line(em, "call void @elya_match_fail()"), "unreachable"))
     Cons(CArm(p, body), rest) -> match new_label(em) {
-      Fresh1(next, em2) -> match test_pat(cx, sv, st, p, next, env, em2) {
+      Fresh1(next, em2) -> match test_pat(cx, sv, st, p, next, val_roots(Cons(sv, Nil), val_roots(pend, Nil)), env, em2) {
         Tested(env2, em3) -> match tail {
           Yes(r) -> emit_arms(cx, env, pend, sv, st, rest, start_block(emit_tail(cx, env2, body, em3, r), next), join, ins, tail)
           No -> match emit(cx, env2, pend, body, em3) {
@@ -741,13 +762,13 @@ fn drain_jobs(cx: ECx, em: Emit) -> Emit {
     Job1(No, em2) -> em2
     Job1(Yes(LamJob(i, ps, body, caps, r)), em2) -> match header(ps, 0, "", Nil) {
       Hdr(text, penv) -> match load_caps(caps, 2, Nil, penv, em2) {
-        Loaded(pre, env, em3) -> drain_jobs(cx, define(cx, "elya.lam." <> int.to_string(i), if text == "" { "ptr %clo" } else { "ptr %clo, " <> text }, r, env, body, pre, em3))
+        Loaded(pre, env, em3) -> drain_jobs(cx, define(cx, "elya$lam." <> int.to_string(i), if text == "" { "ptr %clo" } else { "ptr %clo, " <> text }, r, env, body, pre, em3))
       }
     }
     Job1(Yes(WrapJob(f)), em2) -> match sig_of(cx_sigs(cx), f) {
       ESig(_, ps, r) -> match wrapper_params(ps, 0, "ptr %clo", Nil) {
         Hdr2(text, args) -> match em2 {
-          Emit(b, k, l, mx, sk) -> drain_jobs(cx, Emit(buffer.push(b, "define tailcc " <> lt_text(r) <> " @elya.wrap." <> f <> "(" <> text <> ") {\nentry:\n  %r = musttail call tailcc " <> lt_text(r) <> " @elya." <> f <> "(" <> arg_list(args) <> ")\n  ret " <> lt_text(r) <> " %r\n}\n\n"), k, l, mx, sk))
+          Emit(b, k, l, mx, sk) -> drain_jobs(cx, Emit(buffer.push(b, "define tailcc " <> lt_text(r) <> " @elya$wrap." <> f <> "(" <> text <> ") {\nentry:\n  %r = musttail call tailcc " <> lt_text(r) <> " @elya." <> f <> "(" <> arg_list(args) <> ")\n  ret " <> lt_text(r) <> " %r\n}\n\n"), k, l, mx, sk))
         }
       }
     }

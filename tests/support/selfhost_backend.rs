@@ -1,9 +1,45 @@
 //! The back end in Elya's focused programs, stage by stage (spec
 //! docs/superpowers/specs/2026-11-27-elya-backend-in-elya-design.md D6).
 
-/// The corpus programs the current stage must agree on, at least.
+/// The corpus programs the back end must agree on, at least (156 programs
+/// were compared in all, focused included, when it was written).
 #[allow(dead_code)]
-pub const FLOOR: usize = 30;
+pub const FLOOR: usize = 110;
+
+/// The focused programs refused on purpose, by index; every other one must
+/// be built and compared (a refusal is never a pass).
+#[allow(dead_code)]
+pub const REFUSED: &[usize] = &[35, 57, 58, 59];
+
+/// A program of one constructor of `fields` strings, each read back: 62 is
+/// the widest a row's one mask word holds, 63 is refused by name.
+#[allow(dead_code)]
+pub fn wide_ctor(fields: usize) -> String {
+    let tys = vec!["String"; fields].join(", ");
+    let args: Vec<String> = (0..fields).map(|i| format!("\"s{i}\" <> \"\"")).collect();
+    let pats: Vec<String> = (0..fields).map(|i| format!("x{i}")).collect();
+    let last = fields - 1;
+    format!(
+        "type Big {{ Big({tys}) }}\nfn mk() -> Big {{ Big({}) }}\npub fn main() / {{IO}} {{ match mk() {{ Big({}) -> io.println(x0 <> x{last}) }} }}\n",
+        args.join(", "),
+        pats.join(", ")
+    )
+}
+
+/// A program whose lambda captures `caps` strings: 61 is the most a closure's
+/// row holds, 62 is refused by name.
+#[allow(dead_code)]
+pub fn wide_closure(caps: usize) -> String {
+    let ps: Vec<String> = (0..caps).map(|i| format!("a{i}: String")).collect();
+    let uses: Vec<String> = (0..caps).map(|i| format!("a{i}")).collect();
+    let args: Vec<String> = (0..caps).map(|i| format!("\"c{i}\" <> \"\"")).collect();
+    format!(
+        "fn mk({}) -> fn(Int) -> String {{ fn(x) {{ {} }} }}\npub fn main() / {{IO}} {{ io.println(mk({})(0)) }}\n",
+        ps.join(", "),
+        uses.join(" <> "),
+        args.join(", ")
+    )
+}
 
 #[allow(dead_code)]
 pub const FOCUSED: &[&str] = &[
@@ -99,4 +135,32 @@ pub const FOCUSED: &[&str] = &[
     "pub fn main() / {IO} { if io.file_exists(\"/nonexistent/elya\") { io.println(\"odd\") } else { io.println(int.to_string(io.arg_count())) }\n io.println(io.read_file(\"/nonexistent/elya\")) }\n",
     // B6: reading an argument that is not there.
     "pub fn main() / {IO} { io.println(io.arg(0)) }\n",
+    // B3: a string pattern allocated with the computed scrutinee rooted.
+    "type T { B(String, String), C(T, Int) }\nfn mk(s: String) -> T { B(s, s <> \"!\") }\nfn f(n: Int) -> String { match mk(int.to_string(n)) { B(\"x\", _) -> \"no\"  B(_, t) -> t  C(_, _) -> \"c\" } }\npub fn main() / {IO} { io.println(f(12)) }\n",
+    // B3: a string pattern inside a constructor, its enclosing objects rooted.
+    "type T { B(String, String), C(T, Int) }\nfn g(t: T) -> Int { match t { C(B(\"k\", _), n) -> n  C(B(_, s), n) -> string.length(s) + n  _ -> 0 } }\npub fn main() -> Int { g(C(B(\"a\" <> \"b\", \"cd\" <> \"e\"), 4)) }\n",
+    // B3: a string pattern with a pending operand rooted.
+    "fn g(s: String) -> String { int.to_string(string.length(s)) <> match s { \"a\" -> \"A\"  \"b\" -> \"B\"  _ -> \"?\" } }\npub fn main() / {IO} { io.println(g(\"zz\") <> g(\"b\")) }\n",
+    // B5: a computed callee rooted while its arguments allocate.
+    "fn adder(s: String) -> fn(String) -> String { fn(t) { s <> t } }\npub fn main() / {IO} { io.println(adder(\"a\" <> \"b\")(int.to_string(7) <> \"c\")) }\n",
+    // B5: the closure-tag bound counts lambdas.
+    "fn k() -> fn(Int) -> Int { if 1 < 2 { fn(x) { 1 } } else { fn(x) { 2 } } }\npub fn main() -> Int { k()(0) }\n",
+    // B5: the closure-tag bound counts constructors used as values.
+    "type B { B(Int) }\nfn k() -> fn(Int) -> B { if 1 < 2 { B } else { B } }\npub fn main() -> Int { match k()(3) { B(_) -> 7 } }\n",
+    // B5: a parameter shadowing a top-level function, as a value and as a callee.
+    "fn inc(x: Int) -> Int { x + 1 }\nfn ap(f: fn(Int) -> Int, x: Int) -> Int { f(x) }\nfn g(inc: fn(Int) -> Int) -> Int { ap(inc, 10) + inc(1) }\nfn h(inc: fn(Int) -> Int) -> Int { inc(5) }\npub fn main() -> Int { g(fn(x) { x * 3 }) * 100 + h(fn(x) { x - 7 }) }\n",
+    // B4: a local named like a generic function is not instantiated.
+    "type List(a) { Nil, Cons(a, List(a)) }\nfn len(xs: List(a)) -> Int { match xs { Nil -> 0  Cons(_, r) -> 1 + len(r) } }\nfn f(len: Int) -> Int { len + 1 }\npub fn main() -> Int { f(41) + len(Cons(1, Nil)) }\n",
+    // B1: dividing by -1, and dividing MIN, are not overflows.
+    "fn f(a: Int, b: Int) -> Int { a / b }\npub fn main() -> Int { f(7, -1) + f(-9223372036854775807 - 1, 2) }\n",
+    // B3: a non-tail match's binders bound only in their own arm.
+    "type T { A(Int), B(Int, Int) }\nfn f(t: T, x: Int) -> Int { let v = match t { B(x, 0) -> x  A(_) -> x  B(_, y) -> x + y }\n v * 2 }\npub fn main() -> Int { f(B(5, 1), 100) + f(A(2), 10) }\n",
+    // B5: a capture read only as a match's scrutinee.
+    "type T { A, B(Int) }\nfn mk(t: T) -> fn(Int) -> Int { fn(x) { match t { A -> x  B(n) -> n } } }\npub fn main() -> Int { mk(B(7))(1) * 10 + mk(A)(3) }\n",
+    // Refused: a handler in an `else` branch.
+    "effect Ask { fn ask() -> Int }\nfn f(b: Bool) -> Int { if b { 1 } else { handle { ask() + 1 } with { Ask.ask() -> resume(41) } } }\npub fn main() -> Int { f(False) }\n",
+    // Refused: a handler in a match arm.
+    "effect Ask { fn ask() -> Int }\nfn f(n: Int) -> Int { match n { 0 -> 1  _ -> handle { ask() + 1 } with { Ask.ask() -> resume(41) } } }\npub fn main() -> Int { f(5) }\n",
+    // Refused: a handler in a lambda's body.
+    "effect Ask { fn ask() -> Int }\nfn ap(f: fn(Int) -> Int) -> Int { f(1) }\npub fn main() -> Int { ap(fn(x) { handle { ask() + x } with { Ask.ask() -> resume(41) } }) }\n",
 ];

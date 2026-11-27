@@ -45,7 +45,11 @@ fn io_run_natively_answers_statuses_in_order() {
     let dir = temp_dir("statuses");
     let o = run(&build(&statuses(), &dir), &[]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    assert_eq!(String::from_utf8_lossy(&o.stdout), STATUSES_OUT);
+    // The child's own line ends as its platform's do (`\r\n` on Windows).
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n"),
+        STATUSES_OUT
+    );
 }
 
 #[test]

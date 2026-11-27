@@ -55,6 +55,14 @@
 //! I4, `io.file_exists` inverted: tests/files_and_arguments.rs.
 //! I5, an array's element stored unwidened: selfhost/lex.elya (the IR does
 //! not build).
+//! Review controls (the review of 2026-11-27): R1, a string pattern's
+//! literal allocated with only the value it tests rooted: focused #46
+//! (collecting at every allocation). R2, wrappers named `@elya.wrap.f`: two
+//! modules (an invalid redefinition of `elya.wrap.g`). R3, a constructor of
+//! 63 fields not refused: the refused wide constructor (the back end dies
+//! of an integer overflow). R4, a closure of 62 captures not refused: the
+//! refused wide closure (likewise). R5, the stage checker skipping an
+//! `else` branch: focused #57 (compared, not refused).
 //! E3 (a call's own arguments not rooted) cannot be seen: the runtime roots
 //! its arguments before it allocates (`elya_str_concat`, `elya_str_slice`)
 //! and a function roots its parameters as its scope; they stay rooted, as
@@ -162,8 +170,16 @@ fn proof() {
                 .iter()
                 .enumerate()
                 .map(|(i, t)| (format!("focused #{i}"), t.to_string())),
-        );
+        )
+        .chain([
+            ("focused wide constructor".to_string(), support::wide_ctor(62)),
+            ("focused wide closure".to_string(), support::wide_closure(61)),
+            ("refused wide constructor".to_string(), support::wide_ctor(63)),
+            ("refused wide closure".to_string(), support::wide_closure(62)),
+        ]);
     let (mut compared, mut refused) = (0, 0);
+    let mut corpus_compared = 0;
+    let mut focused_refused = Vec::new();
     let rust_exe = scratch
         .path()
         .join(format!("rust{}", std::env::consts::EXE_SUFFIX));
@@ -188,9 +204,29 @@ fn proof() {
             .expect("native runtime appends main's Unit value line");
         if ir.starts_with("unsupported ") {
             refused += 1;
+            if let Some(i) = name.strip_prefix("focused #") {
+                focused_refused.push(i.parse::<usize>().expect("an index"));
+            } else {
+                assert!(
+                    !name.starts_with("focused "),
+                    "{name}: refused, not compared: {ir}"
+                );
+            }
+            assert!(
+                !name.starts_with("refused ") || ir.contains("more than"),
+                "{name}: refused for another reason: {ir}"
+            );
             continue;
         }
+        assert!(
+            !name.starts_with("refused "),
+            "{name}: built, not refused"
+        );
         if rust_build(&text, &rust_exe).is_none() {
+            assert!(
+                !name.starts_with("focused"),
+                "{name}: the Rust back end does not build it"
+            );
             continue;
         }
         let ll = scratch.path().join("program.ll");
@@ -219,13 +255,50 @@ fn proof() {
             "{name}: the Elya-built program collecting often (left) and the Rust-built one (right)"
         );
         compared += 1;
+        if !name.starts_with("focused") {
+            corpus_compared += 1;
+        }
     }
-    println!("compared {compared}, {refused} outside the stage");
+    println!("compared {compared} ({corpus_compared} of the corpus), {refused} outside the stage");
+    assert_eq!(
+        focused_refused,
+        support::REFUSED,
+        "the focused programs refused (all others compared)"
+    );
     assert!(
-        compared >= support::FLOOR + support::FOCUSED.len(),
-        "at least {} corpus programs, and the focused set ({compared})",
+        corpus_compared >= support::FLOOR,
+        "at least {} corpus programs ({corpus_compared})",
         support::FLOOR
     );
+    two_modules(&root, &scratch, &emitter);
+}
+
+/// A module's function named like a function of the program's (`wrap.g`
+/// and `g` as a value): the wrapper's name is one no mangling writes.
+fn two_modules(root: &Path, scratch: &parse_support::Scratch, emitter: &Path) {
+    let dir = scratch.path().join("two");
+    std::fs::create_dir_all(&dir).expect("a directory");
+    std::fs::write(dir.join("wrap.elya"), "pub fn g(x: Int) -> Int { x * 100 }\n").expect("write");
+    std::fs::write(
+        dir.join("main.elya"),
+        "import wrap\nfn g(x: Int) -> Int { x + 1 }\nfn ap(f: fn(Int) -> Int, x: Int) -> Int { f(x) }\npub fn main() -> Int { ap(g, 1) + wrap.g(2) }\n",
+    )
+    .expect("write");
+    let out = Command::new(emitter)
+        .arg(slashed(&dir.join("main.elya")))
+        .arg(slashed(&root.join("src/std")))
+        .output()
+        .expect("run the back end");
+    let ir = String::from_utf8(out.stdout).expect("UTF-8");
+    let ir = ir.strip_suffix("0\n").expect("main's Unit value line");
+    assert!(!ir.starts_with("unsupported "), "two modules: {ir}");
+    let ll = dir.join("program.ll");
+    std::fs::write(&ll, ir).expect("write the IR");
+    let exe = dir.join(format!("two{}", std::env::consts::EXE_SUFFIX));
+    if let Err(e) = elya_codegen::link(&ll, &exe) {
+        panic!("two modules: the IR does not build: {e}");
+    }
+    assert_eq!(shown(&run(&exe, None)).0, "202\n", "two modules");
 }
 
 /// Stage B8 (spec D6): the self-hosted sources themselves, each built twice,

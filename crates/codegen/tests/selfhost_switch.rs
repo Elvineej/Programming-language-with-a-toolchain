@@ -87,6 +87,23 @@ fn switch() {
         ir2 == ir3,
         "stages 2 and 3 write different IR: no fixed point"
     );
+    // A program the front end rejects is not built: the error in the dump
+    // form, nothing written (the back end alone would emit each of these).
+    for (code, bad) in [
+        ("E0400", "pub fn main() -> Int { 1 + \"a\" }\n"),
+        ("E0430", "type T { A, B }\nfn f(t: T) -> Int { match t { A -> 1 } }\npub fn main() -> Int { f(B) }\n"),
+        ("E0428", "pub fn main() -> Int { let a = array.new()\n let b = array.push(a, 1)\n let c = array.push(a, 2)\n array.length(b) + array.length(c) }\n"),
+        ("E0436", "fn g(x: Int) -> Int { x }\npub fn main() -> Bool { g == g }\n"),
+    ] {
+        let src = dir.join(format!("{code}.elya"));
+        std::fs::write(&src, bad).expect("write a rejected program");
+        let out_exe = exe(dir, code);
+        let (built, said) = stage_build(&root, &stage2, &src, &out_exe);
+        assert!(
+            !built && said.contains(&format!("error {code} ")),
+            "stage 2 on a program with {code}: {said}"
+        );
+    }
     // Each stage builds the examples as the Rust compiler does, or refuses one
     // by name.
     let mut examples: Vec<_> = std::fs::read_dir(root.join("examples"))
