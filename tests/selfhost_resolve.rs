@@ -200,9 +200,9 @@ fn evaluator_proof() {
                     .stack_size(1024 * 1024 * 1024)
                     .spawn_scoped(scope, move || {
                         let module = front_end(resolver);
-                        let mut args = vec![std.clone().into_os_string()];
+                        let mut args = vec![support::elya_path(std).into()];
                         for &i in &group {
-                            args.push(cases[i].0.clone().into_os_string());
+                            args.push(support::elya_path(&cases[i].0).into());
                         }
                         let host = Host {
                             args,

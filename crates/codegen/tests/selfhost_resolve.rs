@@ -32,8 +32,8 @@ fn every_program_agrees_natively_and_the_largest_is_measured() {
 fn run(executable: &Path, root: &Path, std: &Path, name: &str, want: &str) -> Duration {
     let start = Instant::now();
     let output = Command::new(executable)
-        .arg(root)
-        .arg(std)
+        .arg(support::elya_path(root))
+        .arg(support::elya_path(std))
         .env_remove("ELYA_RECORD")
         .env_remove("ELYA_REPLAY")
         .output()
