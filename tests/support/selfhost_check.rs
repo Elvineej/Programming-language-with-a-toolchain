@@ -484,7 +484,7 @@ pub const FOCUSED_F5: &[&str] = &[
 
 /// The self-hosted passes' imports: the parser in Elya, its lexer, the affine
 /// pass (its facts, from stage F5), the checker (its types, for Core) and
-/// Core (for the back end).
+/// Core and monomorphization (for the back end).
 pub fn reader(name: &str) -> Option<(String, String)> {
     let file = match name {
         "parse" => "selfhost/parse.elya",
@@ -492,6 +492,7 @@ pub fn reader(name: &str) -> Option<(String, String)> {
         "affine" => "selfhost/affine.elya",
         "check" => "selfhost/check.elya",
         "core" => "selfhost/core.elya",
+        "mono" => "selfhost/mono.elya",
         _ => return None,
     };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

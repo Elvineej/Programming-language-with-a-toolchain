@@ -52,6 +52,19 @@ count, Windows CI, then `main`.
    and the traced array's; `==` on data is `elya_eq`. 53 corpus programs
    and 31 focused ones agree; controls F1-F10 in the header (F4, F6
    dropped: not faults the emitter can make).
-5. [ ] **B4**: monomorphization (`selfhost/mono.elya`).
+5. [x] **B4** (2026-11-27): monomorphization (`selfhost/mono.elya`): a
+   reference to a generic top-level function goes to a clone at the types
+   it is used at (`f.mono.k`, one per instantiated signature), cloned
+   bodies made ground, a variable nothing constrains `Unit`. Core in Elya
+   now carries the parametric declarations (`CGeneric`, fields at
+   `TVar(i)`), and the emitter makes each instance the module uses a type
+   of its own, its constructors tags of their own (keyed by constructor
+   and instance), found from every type the functions mention and the
+   fields of each instance, to a fixpoint. A `let` whose value keeps a
+   type variable is refused (Rust clones such a value per use; not done
+   here). The collection run is now every allocation for the focused
+   programs and every 9,973rd for the corpus, whose largest build lists of
+   a million. 64 corpus programs and 36 focused ones agree; controls G2,
+   G3, G5 and G6 in the header.
 6. [ ] **B5-B8**: closures; arrays, buffers, `io.*`; imports (after part
    4c); the self-hosted sources themselves.

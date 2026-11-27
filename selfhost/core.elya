@@ -34,7 +34,10 @@ type CKind {
 type CCtor { CCtor(String, List(Ty)) }
 type CType { CType(String, List(CCtor)) }
 type CFn { CFn(String, List(CParam), CExpr) }
-type CModule { CModule(List(CType), List(CFn)) }
+// A parametric type: its name, its parameters' count, its constructors,
+// whose fields mention parameter `i` as `TVar(i)` (`CoreGenericType`).
+type CGeneric { CGeneric(String, Int, List(CCtor)) }
+type CModule { CModule(List(CType), List(CGeneric), List(CFn)) }
 
 // A refusal (`LowerError`), as Rust's `Debug` prints it.
 type Low(a) { Ok(a), Refused(String) }
@@ -95,8 +98,8 @@ fn facts(ds: List(Sp(Decl)), ctors: List(String), ops: List(OpEff), mul: List(St
 
 // ---- Declared types (`ann_to_ty`, ground declarations) ----------------------
 
-fn ann_list(xs: List(Sp(TypeAnn))) -> List(Ty) {
-  match xs { Nil -> Nil  Cons(Sp(a, _, _), rest) -> Cons(ann_to_ty(a), ann_list(rest)) }
+fn ann_list(xs: List(Sp(TypeAnn)), ps: List(String)) -> List(Ty) {
+  match xs { Nil -> Nil  Cons(Sp(a, _, _), rest) -> Cons(ann_to_ty(a, ps), ann_list(rest, ps)) }
 }
 fn split_last(xs: List(Sp(TypeAnn)), acc: List(Sp(TypeAnn))) -> List(Sp(TypeAnn)) {
   match xs { Nil -> rev(acc)  Cons(_, Nil) -> rev(acc)  Cons(x, rest) -> split_last(rest, Cons(x, acc)) }
@@ -104,32 +107,43 @@ fn split_last(xs: List(Sp(TypeAnn)), acc: List(Sp(TypeAnn))) -> List(Sp(TypeAnn)
 fn last_ann(xs: List(Sp(TypeAnn))) -> TypeAnn {
   match xs { Cons(Sp(a, _, _), Nil) -> a  Cons(_, rest) -> last_ann(rest)  Nil -> TypeAnn("Unit", Nil, No) }
 }
-fn ann_labels(ls: List(LabelAnn)) -> List(Lab) {
+fn ann_labels(ls: List(LabelAnn), ps: List(String)) -> List(Lab) {
   match ls {
     Nil -> Nil
-    Cons(LabelAnn(Sp(name, a, b), args), rest) -> Cons(Lab(name, match args { No -> Nil  Yes(xs) -> ann_list(xs) }, a, b), ann_labels(rest))
+    Cons(LabelAnn(Sp(name, a, b), args), rest) -> Cons(Lab(name, match args { No -> Nil  Yes(xs) -> ann_list(xs, ps) }, a, b), ann_labels(rest, ps))
   }
 }
-fn ann_to_ty(a: TypeAnn) -> Ty {
+fn position(ps: List(String), n: String, i: Int) -> Int {
+  match ps { Nil -> 0 - 1  Cons(p, rest) -> if p == n { i } else { position(rest, n, i + 1) } }
+}
+fn ann_to_ty(a: TypeAnn, ps: List(String)) -> Ty {
   match a {
     TypeAnn(name, args, row) -> if name == "fn" && len(args) > 0 {
-      let r = match row { No -> Row(Nil, RClosed)  Yes(RowAnn(ls, _)) -> Row(ann_labels(ls), RClosed) }
-      TFn(ann_list(split_last(args, Nil)), r, ann_to_ty(last_ann(args)))
-    } else {
+      let r = match row { No -> Row(Nil, RClosed)  Yes(RowAnn(ls, _)) -> Row(ann_labels(ls, ps), RClosed) }
+      TFn(ann_list(split_last(args, Nil), ps), r, ann_to_ty(last_ann(args), ps))
+    } else { if len(args) == 0 && position(ps, name, 0) >= 0 { TVar(position(ps, name, 0)) } else {
       if name == "Int" { TB(0) } else { if name == "Float" { TB(1) } else { if name == "Bool" { TB(2) } else {
-        if name == "String" { TB(3) } else { if name == "Unit" { TB(4) } else { TCon(name, ann_list(args)) } }
+        if name == "String" { TB(3) } else { if name == "Unit" { TB(4) } else { TCon(name, ann_list(args, ps)) } }
       } } }
-    }
+    } }
   }
 }
-fn ctors_of(vs: List(Sp(VariantDecl))) -> List(CCtor) {
-  match vs { Nil -> Nil  Cons(Sp(VariantDecl(n, fs), _, _), rest) -> Cons(CCtor(n, ann_list(fs)), ctors_of(rest)) }
+fn ctors_of(vs: List(Sp(VariantDecl)), ps: List(String)) -> List(CCtor) {
+  match vs { Nil -> Nil  Cons(Sp(VariantDecl(n, fs), _, _), rest) -> Cons(CCtor(n, ann_list(fs, ps)), ctors_of(rest, ps)) }
 }
 fn ground_types(ds: List(Sp(Decl))) -> List(CType) {
   match ds {
     Nil -> Nil
-    Cons(Sp(DType(name, Nil, _, vs), _, _), rest) -> Cons(CType(name, ctors_of(vs)), ground_types(rest))
+    Cons(Sp(DType(name, Nil, _, vs), _, _), rest) -> Cons(CType(name, ctors_of(vs, Nil)), ground_types(rest))
     Cons(_, rest) -> ground_types(rest)
+  }
+}
+fn generic_types(ds: List(Sp(Decl))) -> List(CGeneric) {
+  match ds {
+    Nil -> Nil
+    Cons(Sp(DType(_, Nil, _, _), _, _), rest) -> generic_types(rest)
+    Cons(Sp(DType(name, ps, _, vs), _, _), rest) -> Cons(CGeneric(name, len(ps), ctors_of(vs, ps)), generic_types(rest))
+    Cons(_, rest) -> generic_types(rest)
   }
 }
 
@@ -452,7 +466,7 @@ pub fn lower(m: Module, size: Int) -> Low(CModule) {
         Typed(recs, _) -> match facts(ds, Nil, Nil, Nil) {
           Facts3(ctors, ops, mul) -> {
             let cx = Cx(match build(recs, len(recs)) { Built(t, _) -> t }, ctors, ops, mul)
-            match lower_fns(cx, ds) { Refused(w) -> Refused(w)  Ok(fns) -> Ok(CModule(ground_types(ds), fns)) }
+            match lower_fns(cx, ds) { Refused(w) -> Refused(w)  Ok(fns) -> Ok(CModule(ground_types(ds), generic_types(ds), fns)) }
           }
         }
       }
@@ -557,7 +571,7 @@ fn pfns(p: P, fs: List(CFn), first: Bool) -> P {
 }
 pub fn pretty(m: CModule) -> String {
   match m {
-    CModule(ts, fs) -> match pfns(ptypes(P(buffer.new(), check.no_names()), ts, True), fs, len(ts) == 0) {
+    CModule(ts, _, fs) -> match pfns(ptypes(P(buffer.new(), check.no_names()), ts, True), fs, len(ts) == 0) {
       P(b, _) -> buffer.finish(b)
     }
   }

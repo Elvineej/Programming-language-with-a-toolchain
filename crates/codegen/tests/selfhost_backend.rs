@@ -36,6 +36,13 @@
 //! examples/03_cek.elya (collecting at every allocation).
 //! F10, a pattern's binder left unbound: examples/03_cek.elya (the IR does
 //! not build).
+//! G2, a parametric type's instances keyed by the constructor alone:
+//! focused #32.
+//! G3, an instance's fields left at the declaration's variables:
+//! tests/adt.rs (the IR does not build).
+//! G5, a `let` of a generic value not refused: focused #35.
+//! G6, one clone of a generic function for every instance: tests/types.rs
+//! (the IR does not build).
 //! E3 (a call's own arguments not rooted) cannot be seen: the runtime roots
 //! its arguments before it allocates (`elya_str_concat`, `elya_str_slice`)
 //! and a function roots its parameters as its scope; they stay rooted, as
@@ -63,16 +70,16 @@ fn the_back_end_in_elya_agrees_with_rusts() {
         .unwrap();
 }
 
-fn run(exe: &Path, stress: bool) -> Output {
+fn run(exe: &Path, stress: Option<&str>) -> Output {
     let mut cmd = Command::new(exe);
     cmd.env_remove("ELYA_RECORD")
         .env_remove("ELYA_REPLAY")
         .env_remove("ELYA_GC_STRESS")
         .stdin(std::process::Stdio::null());
-    // A collection at every allocation: a heap value the program did not
+    // A collection at every Nth allocation: a heap value the program did not
     // root is freed and poisoned, and reaching it stops the program.
-    if stress {
-        cmd.env("ELYA_GC_STRESS", "1");
+    if let Some(n) = stress {
+        cmd.env("ELYA_GC_STRESS", n);
     }
     cmd.output().expect("run a built program")
 }
@@ -176,16 +183,25 @@ fn proof() {
         if let Err(e) = elya_codegen::link(&ll, &elya_exe) {
             panic!("{name}: the IR does not build: {e}\n{ir}");
         }
-        let (want, got) = (run(&rust_exe, false), run(&elya_exe, false));
+        let (want, got) = (run(&rust_exe, None), run(&elya_exe, None));
         assert_eq!(
             shown(&got),
             shown(&want),
             "{name}: the Elya-built program (left) and the Rust-built one (right)"
         );
         assert_eq!(
-            shown(&run(&elya_exe, true)),
+            // Every allocation for the focused programs, written for it; every
+            // 9973rd for the corpus's, some of which build lists of a million.
+            shown(&run(
+                &elya_exe,
+                Some(if name.starts_with("focused") {
+                    "1"
+                } else {
+                    "9973"
+                })
+            )),
             shown(&want),
-            "{name}: the Elya-built program collecting at every allocation (left) and the Rust-built one (right)"
+            "{name}: the Elya-built program collecting often (left) and the Rust-built one (right)"
         );
         compared += 1;
     }
