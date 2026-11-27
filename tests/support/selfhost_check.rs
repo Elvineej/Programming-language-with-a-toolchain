@@ -440,13 +440,14 @@ pub const FOCUSED_F5: &[&str] = &[
     "effect multi Flip { fn flip() -> Bool }\nfn outer(g) {\n  let keep = fn(x) {\n    let w = x(1)\n    let _ = g()\n    x(2)\n  }\n  let a = keep(fn(n) { n })\n  let b = keep(fn(n) { True })\n  0\n}\npub fn main() -> Int { 0 }\n",
 ];
 
-/// The checker's imports: the parser in Elya, its lexer, and the affine pass
-/// (its facts, from stage F5).
+/// The self-hosted passes' imports: the parser in Elya, its lexer, the affine
+/// pass (its facts, from stage F5) and the checker (its types, for Core).
 pub fn reader(name: &str) -> Option<(String, String)> {
     let file = match name {
         "parse" => "selfhost/parse.elya",
         "lex" => "selfhost/lex.elya",
         "affine" => "selfhost/affine.elya",
+        "check" => "selfhost/check.elya",
         _ => return None,
     };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

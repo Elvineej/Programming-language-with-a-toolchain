@@ -94,6 +94,7 @@ fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCo
         Some("check") if args.get(2).map(String::as_str) == Some("--dump") => check_dump_cmd(args),
         Some("check") => cmd(args, None),
         Some("parse") if args.get(2).map(String::as_str) == Some("--dump") => parse_dump_cmd(args),
+        Some("core") if args.get(2).map(String::as_str) == Some("--dump") => core_dump_cmd(args),
         Some("resolve") if args.get(2).map(String::as_str) == Some("--dump") => {
             resolve_dump_cmd(args)
         }
@@ -116,6 +117,7 @@ fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCo
             eprintln!("       elya resolve --dump <file.elya>");
             eprintln!("       elya exhaust --dump <file.elya>");
             eprintln!("       elya affine --dump <file.elya>");
+            eprintln!("       elya core --dump <file.elya>");
             ExitCode::from(2)
         }
     }
@@ -215,6 +217,48 @@ fn pass_dump_cmd(pass: &str, args: &[String]) -> ExitCode {
 
 /// `elya check --dump <file>`: the checker's verdict as text (`elya::check_dump`):
 /// schemes, every node's type, diagnostics. Exit 1 when the program has an error.
+/// `elya core --dump <file>`: the typed Core a program that checks lowers to,
+/// `core::pretty_typed` (spec 2026-11-27-elya-backend-in-elya D3), what Core
+/// in Elya prints. A program that does not check prints its diagnostics and
+/// exits 1; one Core refuses prints the refusal and exits 1.
+fn core_dump_cmd(args: &[String]) -> ExitCode {
+    let Some(path) = args.get(3) else {
+        eprintln!("usage: elya core --dump <file.elya>");
+        return ExitCode::from(2);
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: cannot read {path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let (module, diags, _) = elya::front_end_with(path, &text, &mut files(path));
+    let errors: Vec<_> = diags
+        .iter()
+        .filter(|d| d.severity == elya::diag::Severity::Error)
+        .cloned()
+        .collect();
+    if !errors.is_empty() {
+        print!("{}", elya::ast_dump::dump_diagnostics(&errors));
+        return ExitCode::from(1);
+    }
+    let (_, table) = elya::types::infer_typed_table(&elya::Session::new(), &module);
+    match elya::core::lower_module(&module, &table) {
+        Ok(core) => {
+            println!(
+                "{}",
+                elya::core::pretty_typed(&core, &mut elya::types::TyPrinter::new())
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            println!("refused {e:?}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn check_dump_cmd(args: &[String]) -> ExitCode {
     let Some(path) = args.get(3) else {
         eprintln!("usage: elya check --dump <file.elya>");

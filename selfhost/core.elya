@@ -1,0 +1,575 @@
+// Core in Elya, self-hosting part 5's first piece (spec
+// docs/superpowers/specs/2026-11-27-elya-backend-in-elya-design.md D3).
+// Oracle: src/core.rs, `lower_module` printed by `pretty_typed`, through
+// `elya core --dump`. The types come from the checker in Elya
+// (`check.typed`), one variable one `TVar` across the module, so one shared
+// printer names them as Rust's one `TyPrinter` does.
+import parse / {IO}
+import check / {IO}
+
+fn rev_onto(xs: List(a), acc: List(a)) -> List(a) {
+  match xs { Nil -> acc  Cons(x, rest) -> rev_onto(rest, Cons(x, acc)) }
+}
+fn rev(xs: List(a)) -> List(a) { rev_onto(xs, Nil) }
+fn len_from(xs: List(a), n: Int) -> Int { match xs { Nil -> n  Cons(_, rest) -> len_from(rest, n + 1) } }
+fn len(xs: List(a)) -> Int { len_from(xs, 0) }
+fn has(xs: List(String), x: String) -> Bool { match xs { Nil -> False  Cons(y, rest) -> y == x || has(rest, x) } }
+
+// ---- Core -------------------------------------------------------------------
+
+type CLit { LInt(Int), LBool(Bool), LStr(String), LUnit, LNegZero }
+type CPat { QWild, QVar(String), QCtor(String, List(CPat)), QLit(CLit) }
+type CParam { CParam(String, Ty) }
+type CArm { CArm(CPat, CExpr) }
+type CClause { CClause(String, String, List(CParam), CExpr) }
+type CRet { CRet(String, CExpr) }
+type CExpr { CExpr(Int, Int, Ty, CKind) }
+type CKind {
+  KLit(CLit), KVar(String), KApp(CExpr, List(CExpr)), KBuiltin(String, List(CExpr)),
+  KCtor(String, List(CExpr)), KPrim(String, List(CExpr)), KLambda(List(CParam), CExpr),
+  KLet(String, CExpr, CExpr), KIf(CExpr, CExpr, CExpr), KMatch(CExpr, List(CArm)),
+  KHandle(CExpr, Bool, List(CClause), Maybe(CRet)), KResume(CExpr),
+  KPerform(String, String, Ty, List(CExpr))
+}
+type CCtor { CCtor(String, List(Ty)) }
+type CType { CType(String, List(CCtor)) }
+type CFn { CFn(String, List(CParam), CExpr) }
+type CModule { CModule(List(CType), List(CFn)) }
+
+// A refusal (`LowerError`), as Rust's `Debug` prints it.
+type Low(a) { Ok(a), Refused(String) }
+fn unsupported(what: String) -> String { "Unsupported(\"" <> what <> "\")" }
+fn untyped(a: Int, b: Int) -> String { "Untyped(Span { start: " <> int.to_string(a) <> ", end: " <> int.to_string(b) <> " })" }
+
+// ---- The typed table ---------------------------------------------------------
+
+// A balanced tree over the records, sorted by span.
+type Tab { TLeaf, TNode(Tab, Rec, Tab) }
+type Built { Built(Tab, List(Rec)) }
+fn build(rs: List(Rec), n: Int) -> Built {
+  if n == 0 { Built(TLeaf, rs) } else {
+    let half = n / 2
+    match build(rs, half) {
+      Built(l, rest) -> match rest {
+        Cons(r, rest2) -> match build(rest2, n - half - 1) { Built(rt, rest3) -> Built(TNode(l, r, rt), rest3) }
+        Nil -> Built(l, Nil)
+      }
+    }
+  }
+}
+fn lookup(t: Tab, a: Int, b: Int) -> Maybe(Ty) {
+  match t {
+    TLeaf -> No
+    TNode(l, Rec(s, e, ty), r) -> if a < s || (a == s && b < e) { lookup(l, a, b) } else {
+      if a == s && b == e { Yes(ty) } else { lookup(r, a, b) }
+    }
+  }
+}
+
+// ---- The module's facts (`LowerCx`) ------------------------------------------
+
+type OpEff { OpEff(String, String) }
+type Cx { Cx(Tab, List(String), List(OpEff), List(String)) }
+
+fn op_effect(xs: List(OpEff), op: String) -> Maybe(String) {
+  match xs { Nil -> No  Cons(OpEff(o, e), rest) -> if o == op { Yes(e) } else { op_effect(rest, op) } }
+}
+fn sig_ops(eff: String, ops: List(Sp(OpSig)), acc: List(OpEff)) -> List(OpEff) {
+  match ops { Nil -> acc  Cons(Sp(OpSig(name, _, _, _), _, _), rest) -> sig_ops(eff, rest, Cons(OpEff(name, eff), acc)) }
+}
+fn sig_names(ops: List(Sp(OpSig)), acc: List(String)) -> List(String) {
+  match ops { Nil -> acc  Cons(Sp(OpSig(name, _, _, _), _, _), rest) -> sig_names(rest, Cons(name, acc)) }
+}
+fn variant_names(vs: List(Sp(VariantDecl)), acc: List(String)) -> List(String) {
+  match vs { Nil -> acc  Cons(Sp(VariantDecl(n, _), _, _), rest) -> variant_names(rest, Cons(n, acc)) }
+}
+type Facts3 { Facts3(List(String), List(OpEff), List(String)) }
+fn facts(ds: List(Sp(Decl)), ctors: List(String), ops: List(OpEff), mul: List(String)) -> Facts3 {
+  match ds {
+    Nil -> Facts3(ctors, rev(ops), mul)
+    Cons(Sp(DType(_, _, _, vs), _, _), rest) -> facts(rest, variant_names(vs, ctors), ops, mul)
+    Cons(Sp(DEffect(name, _, is_multi, sigs), _, _), rest) -> facts(rest, ctors, sig_ops(name, sigs, ops), if is_multi { sig_names(sigs, mul) } else { mul })
+    Cons(_, rest) -> facts(rest, ctors, ops, mul)
+  }
+}
+
+// ---- Declared types (`ann_to_ty`, ground declarations) ----------------------
+
+fn ann_list(xs: List(Sp(TypeAnn))) -> List(Ty) {
+  match xs { Nil -> Nil  Cons(Sp(a, _, _), rest) -> Cons(ann_to_ty(a), ann_list(rest)) }
+}
+fn split_last(xs: List(Sp(TypeAnn)), acc: List(Sp(TypeAnn))) -> List(Sp(TypeAnn)) {
+  match xs { Nil -> rev(acc)  Cons(_, Nil) -> rev(acc)  Cons(x, rest) -> split_last(rest, Cons(x, acc)) }
+}
+fn last_ann(xs: List(Sp(TypeAnn))) -> TypeAnn {
+  match xs { Cons(Sp(a, _, _), Nil) -> a  Cons(_, rest) -> last_ann(rest)  Nil -> TypeAnn("Unit", Nil, No) }
+}
+fn ann_labels(ls: List(LabelAnn)) -> List(Lab) {
+  match ls {
+    Nil -> Nil
+    Cons(LabelAnn(Sp(name, a, b), args), rest) -> Cons(Lab(name, match args { No -> Nil  Yes(xs) -> ann_list(xs) }, a, b), ann_labels(rest))
+  }
+}
+fn ann_to_ty(a: TypeAnn) -> Ty {
+  match a {
+    TypeAnn(name, args, row) -> if name == "fn" && len(args) > 0 {
+      let r = match row { No -> Row(Nil, RClosed)  Yes(RowAnn(ls, _)) -> Row(ann_labels(ls), RClosed) }
+      TFn(ann_list(split_last(args, Nil)), r, ann_to_ty(last_ann(args)))
+    } else {
+      if name == "Int" { TB(0) } else { if name == "Float" { TB(1) } else { if name == "Bool" { TB(2) } else {
+        if name == "String" { TB(3) } else { if name == "Unit" { TB(4) } else { TCon(name, ann_list(args)) } }
+      } } }
+    }
+  }
+}
+fn ctors_of(vs: List(Sp(VariantDecl))) -> List(CCtor) {
+  match vs { Nil -> Nil  Cons(Sp(VariantDecl(n, fs), _, _), rest) -> Cons(CCtor(n, ann_list(fs)), ctors_of(rest)) }
+}
+fn ground_types(ds: List(Sp(Decl))) -> List(CType) {
+  match ds {
+    Nil -> Nil
+    Cons(Sp(DType(name, Nil, _, vs), _, _), rest) -> Cons(CType(name, ctors_of(vs)), ground_types(rest))
+    Cons(_, rest) -> ground_types(rest)
+  }
+}
+
+// ---- Lowering ---------------------------------------------------------------
+
+fn is_builtin(n: String) -> Bool {
+  has(Cons("io.println", Cons("io.read_file", Cons("io.file_exists", Cons("io.write_file", Cons("io.read_stdin", Cons("io.arg_count", Cons("io.arg",
+  Cons("buffer.new", Cons("buffer.push", Cons("buffer.finish", Cons("buffer.length",
+  Cons("array.new", Cons("array.push", Cons("array.set", Cons("array.get", Cons("array.length",
+  Cons("int.to_string", Cons("float.to_string", Cons("float.of_int", Cons("float.truncate", Cons("float.round",
+  Cons("string.length", Cons("string.byte_at", Cons("string.slice",
+  Cons("int.wrapping_add", Cons("int.wrapping_sub", Cons("int.wrapping_mul", Cons("int.and", Cons("int.or", Cons("int.xor", Cons("int.shl", Cons("int.shr", Cons("int.ushr",
+  Cons("time.now_ms", Cons("time.sleep_ms",
+  Cons("op.name", Cons("op.show", Cons("op.perform", Cons("op.encode", Cons("op.decode", Nil)))))))))))))))))))))))))))))))))))))))), n)
+}
+// `BinOp`'s `Debug` names, by the operator's symbol.
+fn prim_name(op: String) -> String {
+  match op_effect(Cons(OpEff("+", "Add"), Cons(OpEff("-", "Sub"), Cons(OpEff("*", "Mul"), Cons(OpEff("/", "Div"), Cons(OpEff("%", "Rem"), Cons(OpEff("+.", "AddF"), Cons(OpEff("-.", "SubF"), Cons(OpEff("*.", "MulF"), Cons(OpEff("/.", "DivF"), Cons(OpEff("==", "Eq"), Cons(OpEff("!=", "Ne"), Cons(OpEff("<", "Lt"), Cons(OpEff("<=", "Le"), Cons(OpEff(">", "Gt"), Cons(OpEff(">=", "Ge"), Cons(OpEff("<.", "LtF"), Cons(OpEff("<=.", "LeF"), Cons(OpEff(">.", "GtF"), Cons(OpEff(">=.", "GeF"), Cons(OpEff("<>", "Concat"), Nil)))))))))))))))))))), op) { Yes(n) -> n  No -> "?" }
+}
+
+fn ty_at(cx: Cx, a: Int, b: Int) -> Low(Ty) {
+  match cx { Cx(tab, _, _, _) -> match lookup(tab, a, b) { Yes(t) -> Ok(t)  No -> Refused(untyped(a, b)) } }
+}
+fn is_ctor(cx: Cx, n: String) -> Bool { match cx { Cx(_, cs, _, _) -> has(cs, n) } }
+
+fn params(cx: Cx, ps: List(Sp(Param))) -> Low(List(CParam)) {
+  match ps {
+    Nil -> Ok(Nil)
+    Cons(Sp(Param(n, _, _), a, b), rest) -> match ty_at(cx, a, b) {
+      Refused(w) -> Refused(w)
+      Ok(t) -> match params(cx, rest) { Refused(w) -> Refused(w)  Ok(more) -> Ok(Cons(CParam(n, t), more)) }
+    }
+  }
+}
+fn param_names(ps: List(Sp(Param)), acc: List(String)) -> List(String) {
+  match ps { Nil -> acc  Cons(Sp(Param(n, _, _), _, _), rest) -> param_names(rest, Cons(n, acc)) }
+}
+fn pat_names(p: Pattern, acc: List(String)) -> List(String) {
+  match p {
+    PVar(n) -> Cons(n, acc)
+    PCtor(_, args) -> pats_names(args, acc)
+    _ -> acc
+  }
+}
+fn pats_names(ps: List(Sp(Pattern)), acc: List(String)) -> List(String) {
+  match ps { Nil -> acc  Cons(Sp(p, _, _), rest) -> pats_names(rest, pat_names(p, acc)) }
+}
+
+fn exprs(cx: Cx, locals: List(String), xs: List(Sp(Expr))) -> Low(List(CExpr)) {
+  match xs {
+    Nil -> Ok(Nil)
+    Cons(x, rest) -> match expr(cx, locals, x) {
+      Refused(w) -> Refused(w)
+      Ok(e) -> match exprs(cx, locals, rest) { Refused(w) -> Refused(w)  Ok(more) -> Ok(Cons(e, more)) }
+    }
+  }
+}
+
+fn expr_ty(e: CExpr) -> Ty { match e { CExpr(_, _, t, _) -> t } }
+
+// `lower_block`: the statements as a right-nested `Let` spine, each `Let`
+// at its statement's span and of its body's type.
+fn block(cx: Cx, locals: List(String), blk: Block) -> Low(CExpr) {
+  match blk {
+    Block(stmts, tail) -> match tail {
+      No -> Refused(unsupported("block without tail expression"))
+      Yes(t) -> stmts_then(cx, locals, stmts, t)
+    }
+  }
+}
+// The statements are lowered first to last (a refusal is the first one met,
+// statements before the tail, as Rust lowers the tail first only for its
+// value), the scope growing with each `let`.
+type Lowered { Lowered(Int, Int, String, CExpr) }
+fn stmts_then(cx: Cx, locals: List(String), stmts: List(Sp(Stmt)), tail: Sp(Expr)) -> Low(CExpr) {
+  match lower_stmts(cx, locals, stmts, Nil) {
+    Refused(w) -> Refused(w)
+    Ok(Scoped(done, inner)) -> match expr(cx, inner, tail) {
+      Refused(w) -> Refused(w)
+      Ok(t) -> Ok(spine(done, t))
+    }
+  }
+}
+type Scoped { Scoped(List(Lowered), List(String)) }
+fn lower_stmts(cx: Cx, locals: List(String), stmts: List(Sp(Stmt)), acc: List(Lowered)) -> Low(Scoped) {
+  match stmts {
+    Nil -> Ok(Scoped(acc, locals))
+    Cons(Sp(SLet(name, _, v), a, b), rest) -> match expr(cx, locals, v) {
+      Refused(w) -> Refused(w)
+      Ok(e) -> lower_stmts(cx, Cons(name, locals), rest, Cons(Lowered(a, b, name, e), acc))
+    }
+    Cons(Sp(SExpr(x), a, b), rest) -> match expr(cx, locals, x) {
+      Refused(w) -> Refused(w)
+      Ok(e) -> lower_stmts(cx, locals, rest, Cons(Lowered(a, b, "_", e), acc))
+    }
+  }
+}
+// The lowered statements are newest first: each wraps what follows it.
+fn spine(done: List(Lowered), acc: CExpr) -> CExpr {
+  match done {
+    Nil -> acc
+    Cons(Lowered(a, b, name, v), rest) -> spine(rest, CExpr(a, b, expr_ty(acc), KLet(name, v, acc)))
+  }
+}
+
+fn lit(l: CLit, a: Int, b: Int, t: Ty) -> CExpr { CExpr(a, b, t, KLit(l)) }
+
+fn expr(cx: Cx, locals: List(String), e: Sp(Expr)) -> Low(CExpr) {
+  match e {
+    Sp(x, a, b) -> match ty_at(cx, a, b) {
+      Refused(w) -> Refused(w)
+      Ok(ty) -> expr_at(cx, locals, x, a, b, ty)
+    }
+  }
+}
+fn mk(a: Int, b: Int, ty: Ty, k: Low(CKind)) -> Low(CExpr) {
+  match k { Refused(w) -> Refused(w)  Ok(kind) -> Ok(CExpr(a, b, ty, kind)) }
+}
+fn expr_at(cx: Cx, locals: List(String), x: Expr, a: Int, b: Int, ty: Ty) -> Low(CExpr) {
+  match x {
+    EInt(n) -> Ok(lit(LInt(n), a, b, ty))
+    EFloat -> Refused(unsupported("Float in Elya"))
+    EBool(v) -> Ok(lit(LBool(v), a, b, ty))
+    EStr(v) -> Ok(lit(LStr(unescape(v)), a, b, ty))
+    EUnit -> Ok(lit(LUnit, a, b, ty))
+    EError -> Refused(unsupported("a statement that did not parse"))
+    EVar(n) -> Ok(CExpr(a, b, ty, if is_ctor(cx, n) { KCtor(n, Nil) } else { KVar(n) }))
+    ECall(callee, args) -> call(cx, locals, callee, args, a, b, ty)
+    EBinary(op, l, r) -> match expr(cx, locals, l) {
+      Refused(w) -> Refused(w)
+      Ok(le) -> match expr(cx, locals, r) {
+        Refused(w) -> Refused(w)
+        Ok(re) -> Ok(CExpr(a, b, ty, if op == "&&" { KIf(le, re, lit(LBool(False), a, b, TB(2))) } else {
+          if op == "||" { KIf(le, lit(LBool(True), a, b, TB(2)), re) } else { KPrim(prim_name(op), Cons(le, Cons(re, Nil))) }
+        }))
+      }
+    }
+    EUnary(op, v) -> match expr(cx, locals, v) {
+      Refused(w) -> Refused(w)
+      Ok(ve) -> Ok(CExpr(a, b, ty, if op == "!" { KPrim("Eq", Cons(ve, Cons(lit(LBool(False), a, b, TB(2)), Nil))) } else {
+        if op == "-" { KPrim("Sub", Cons(lit(LInt(0), a, b, TB(0)), Cons(ve, Nil))) } else {
+          KPrim("SubF", Cons(lit(LNegZero, a, b, TB(1)), Cons(ve, Nil)))
+        }
+      }))
+    }
+    EIf(c, Sp(t, _, _), Sp(f, _, _)) -> match expr(cx, locals, c) {
+      Refused(w) -> Refused(w)
+      Ok(ce) -> match block(cx, locals, t) {
+        Refused(w) -> Refused(w)
+        Ok(te) -> match block(cx, locals, f) { Refused(w) -> Refused(w)  Ok(fe) -> Ok(CExpr(a, b, ty, KIf(ce, te, fe))) }
+      }
+    }
+    ELambda(ps, Sp(body, _, _)) -> match params(cx, ps) {
+      Refused(w) -> Refused(w)
+      Ok(cps) -> match block(cx, param_names(ps, locals), body) { Refused(w) -> Refused(w)  Ok(be) -> Ok(CExpr(a, b, ty, KLambda(cps, be))) }
+    }
+    EMatch(s, arms) -> match expr(cx, locals, s) {
+      Refused(w) -> Refused(w)
+      Ok(se) -> match lower_arms(cx, locals, arms) { Refused(w) -> Refused(w)  Ok(las) -> Ok(CExpr(a, b, ty, KMatch(se, las))) }
+    }
+    EBlock(blk) -> block(cx, locals, blk)
+    EHandle(body, h) -> lower_handle(cx, locals, body, h, a, b, ty)
+    EResume(v) -> match expr(cx, locals, v) { Refused(w) -> Refused(w)  Ok(ve) -> Ok(CExpr(a, b, ty, KResume(ve))) }
+    EQualified(_, _) -> Refused(unsupported("Qualified"))
+  }
+}
+
+// A literal's value from its source text, quotes included (the lexer's
+// `unescape`: `\n`, `\t`, `\r`, `\\` and `\"`).
+fn unescape_from(raw: String, i: Int, end: Int, from: Int, acc: Buffer) -> Buffer {
+  if i >= end { buffer.push(acc, string.slice(raw, from, end)) } else {
+    if string.byte_at(raw, i) == 92 {
+      let c = string.byte_at(raw, i + 1)
+      let v = if c == 110 { "\n" } else { if c == 116 { "\t" } else { if c == 114 { "\r" } else { if c == 34 { "\"" } else { "\\" } } } }
+      unescape_from(raw, i + 2, end, i + 2, buffer.push(buffer.push(acc, string.slice(raw, from, i)), v))
+    } else { unescape_from(raw, i + 1, end, from, acc) }
+  }
+}
+fn unescape(raw: String) -> String { buffer.finish(unescape_from(raw, 1, string.length(raw) - 1, 1, buffer.new())) }
+
+fn lower_pat(p: Pattern) -> CPat {
+  match p {
+    PWild -> QWild
+    PVar(n) -> QVar(n)
+    PCtor(n, args) -> QCtor(n, lower_pats(args))
+    PInt(n) -> QLit(LInt(n))
+    PBool(v) -> QLit(LBool(v))
+    PStr(v) -> QLit(LStr(unescape(v)))
+    PUnit -> QLit(LUnit)
+  }
+}
+fn lower_pats(ps: List(Sp(Pattern))) -> List(CPat) {
+  match ps { Nil -> Nil  Cons(Sp(p, _, _), rest) -> Cons(lower_pat(p), lower_pats(rest)) }
+}
+fn lower_arms(cx: Cx, locals: List(String), arms: List(Sp(MatchArm))) -> Low(List(CArm)) {
+  match arms {
+    Nil -> Ok(Nil)
+    Cons(Sp(MatchArm(Sp(p, _, _), body), _, _), rest) -> match expr(cx, pat_names(p, locals), body) {
+      Refused(w) -> Refused(w)
+      Ok(be) -> match lower_arms(cx, locals, rest) { Refused(w) -> Refused(w)  Ok(more) -> Ok(Cons(CArm(lower_pat(p), be), more)) }
+    }
+  }
+}
+
+fn call(cx: Cx, locals: List(String), callee: Sp(Expr), args: List(Sp(Expr)), a: Int, b: Int, ty: Ty) -> Low(CExpr) {
+  match callee {
+    Sp(EQualified(m, n), ca, cb) -> if is_builtin(m <> "." <> n) {
+      match exprs(cx, locals, args) { Refused(w) -> Refused(w)  Ok(xs) -> Ok(CExpr(a, b, ty, KBuiltin(m <> "." <> n, xs))) }
+    } else { plain_call(cx, locals, callee, args, a, b, ty) }
+    Sp(EVar(n), ca, cb) -> if is_ctor(cx, n) {
+      match exprs(cx, locals, args) { Refused(w) -> Refused(w)  Ok(xs) -> Ok(CExpr(a, b, ty, KCtor(n, xs))) }
+    } else {
+      match match cx { Cx(_, _, ops, _) -> if has(locals, n) { No } else { op_effect(ops, n) } } {
+        Yes(eff) -> match ty_at(cx, ca, cb) {
+          Refused(w) -> Refused(w)
+          Ok(op_ty) -> match exprs(cx, locals, args) { Refused(w) -> Refused(w)  Ok(xs) -> Ok(CExpr(a, b, ty, KPerform(eff, n, op_ty, xs))) }
+        }
+        No -> plain_call(cx, locals, callee, args, a, b, ty)
+      }
+    }
+    Sp(EResume(_), ca, cb) -> match expr(cx, locals, callee) {
+      Refused(w) -> Refused(w)
+      Ok(k) -> match exprs(cx, locals, args) {
+        Refused(w) -> Refused(w)
+        Ok(xs) -> Ok(CExpr(ca, cb, ty, KLet("$k", k, CExpr(a, b, ty, KApp(CExpr(ca, cb, expr_ty(k), KVar("$k")), xs)))))
+      }
+    }
+    _ -> plain_call(cx, locals, callee, args, a, b, ty)
+  }
+}
+fn plain_call(cx: Cx, locals: List(String), callee: Sp(Expr), args: List(Sp(Expr)), a: Int, b: Int, ty: Ty) -> Low(CExpr) {
+  match expr(cx, locals, callee) {
+    Refused(w) -> Refused(w)
+    Ok(f) -> match exprs(cx, locals, args) { Refused(w) -> Refused(w)  Ok(xs) -> Ok(CExpr(a, b, ty, KApp(f, xs))) }
+  }
+}
+
+fn clause_effects(cx: Cx, cs: List(Sp(OpClause))) -> Low(List(String)) {
+  match cs {
+    Nil -> Ok(Nil)
+    Cons(Sp(OpClause(eff, op, _, _), _, _), rest) -> match match eff { Yes(e) -> Yes(e)  No -> match cx { Cx(_, _, ops, _) -> op_effect(ops, op) } } {
+      No -> Refused(unsupported("handler clause names no declared operation"))
+      Yes(e) -> match clause_effects(cx, rest) { Refused(w) -> Refused(w)  Ok(more) -> Ok(Cons(e, more)) }
+    }
+  }
+}
+fn any_effects(cs: List(Sp(OpClause))) -> List(String) {
+  match cs { Nil -> Nil  Cons(_, rest) -> Cons("", any_effects(rest)) }
+}
+fn clauses(cx: Cx, locals: List(String), cs: List(Sp(OpClause)), effs: List(String), any: Bool) -> Low(List(CClause)) {
+  match cs {
+    Nil -> Ok(Nil)
+    Cons(Sp(OpClause(_, op, ps, body), _, _), rest) -> match effs {
+      Nil -> Ok(Nil)
+      Cons(eff, effs2) -> match params(cx, ps) {
+        Refused(w) -> Refused(w)
+        Ok(cps) -> match expr(cx, param_names(ps, locals), body) {
+          Refused(w) -> Refused(w)
+          Ok(be) -> match clauses(cx, locals, rest, effs2, any) {
+            Refused(w) -> Refused(w)
+            Ok(more) -> Ok(Cons(CClause(eff, if any { "" } else { op }, cps, be), more))
+          }
+        }
+      }
+    }
+  }
+}
+fn multi_clause(cx: Cx, cs: List(Sp(OpClause))) -> Bool {
+  match cs { Nil -> False  Cons(Sp(OpClause(_, op, _, _), _, _), rest) -> match cx { Cx(_, _, _, ms) -> has(ms, op) } || multi_clause(cx, rest) }
+}
+fn lower_handle(cx: Cx, locals: List(String), body: Sp(Expr), h: Handler, a: Int, b: Int, ty: Ty) -> Low(CExpr) {
+  match h {
+    Handler(_, any, cs, ret) -> {
+      let effs = if any { Ok(any_effects(cs)) } else { clause_effects(cx, cs) }
+      match effs {
+        Refused(w) -> Refused(w)
+        Ok(es) -> match expr(cx, locals, body) {
+          Refused(w) -> Refused(w)
+          Ok(be) -> match clauses(cx, locals, cs, es, any) {
+            Refused(w) -> Refused(w)
+            Ok(ccs) -> match ret {
+              No -> Ok(CExpr(a, b, ty, KHandle(be, !any && multi_clause(cx, cs), ccs, No)))
+              Yes(ReturnClause(binder, rb)) -> match expr(cx, Cons(binder, locals), rb) {
+                Refused(w) -> Refused(w)
+                Ok(rbe) -> Ok(CExpr(a, b, ty, KHandle(be, !any && multi_clause(cx, cs), ccs, Yes(CRet(binder, rbe)))))
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn lower_fns(cx: Cx, ds: List(Sp(Decl))) -> Low(List(CFn)) {
+  match ds {
+    Nil -> Ok(Nil)
+    Cons(Sp(DFn(_, name, ps, _, _, Sp(body, _, _)), da, db), rest) -> match params(cx, ps) {
+      Refused(w) -> Refused(w)
+      Ok(cps) -> match block(cx, param_names(ps, Nil), body) {
+        Refused(w) -> Refused(w)
+        Ok(be) -> match ty_at(cx, da, db) {
+          Refused(w) -> Refused(w)
+          Ok(_) -> match lower_fns(cx, rest) { Refused(w) -> Refused(w)  Ok(more) -> Ok(Cons(CFn(name, cps, be), more)) }
+        }
+      }
+    }
+    Cons(_, rest) -> lower_fns(cx, rest)
+  }
+}
+
+fn effect_io(ds: List(Sp(Decl))) -> Bool {
+  match ds { Nil -> False  Cons(Sp(DEffect(n, _, _, _), _, _), rest) -> n == "IO" || effect_io(rest)  Cons(_, rest) -> effect_io(rest) }
+}
+
+pub fn lower(m: Module, size: Int) -> Low(CModule) {
+  match m {
+    Module(_, ds) -> if effect_io(ds) { Refused(unsupported("effect IO")) } else {
+      match check.typed(m, size) {
+        Typed(recs, _) -> match facts(ds, Nil, Nil, Nil) {
+          Facts3(ctors, ops, mul) -> {
+            let cx = Cx(match build(recs, len(recs)) { Built(t, _) -> t }, ctors, ops, mul)
+            match lower_fns(cx, ds) { Refused(w) -> Refused(w)  Ok(fns) -> Ok(CModule(ground_types(ds), fns)) }
+          }
+        }
+      }
+    }
+  }
+}
+
+// ---- `pretty_typed` ----------------------------------------------------------
+
+fn hex_digit(n: Int) -> String { string.slice("0123456789abcdef", n, n + 1) }
+fn hex(n: Int) -> String { if n < 16 { hex_digit(n) } else { hex(n / 16) <> hex_digit(n % 16) } }
+// Rust's `{:?}` of a string, for the escapes a source literal can hold.
+fn debug_from(s: String, i: Int, from: Int, acc: Buffer) -> Buffer {
+  if i >= string.length(s) { buffer.push(acc, string.slice(s, from, i)) } else {
+    let c = string.byte_at(s, i)
+    let esc = if c == 34 { "\\\"" } else { if c == 92 { "\\\\" } else { if c == 10 { "\\n" } else { if c == 9 { "\\t" } else { if c == 13 { "\\r" } else { if c == 0 { "\\0" } else { if c < 32 || c == 127 { "\\u{" <> hex(c) <> "}" } else { "" } } } } } } }
+    if string.length(esc) == 0 { debug_from(s, i + 1, from, acc) } else {
+      debug_from(s, i + 1, i + 1, buffer.push(buffer.push(acc, string.slice(s, from, i)), esc))
+    }
+  }
+}
+fn push_lit(l: CLit, b: Buffer) -> Buffer {
+  match l {
+    LInt(n) -> buffer.push(b, int.to_string(n))
+    LBool(v) -> buffer.push(b, if v { "True" } else { "False" })
+    LStr(v) -> buffer.push(debug_from(v, 0, 0, buffer.push(b, "\"")), "\"")
+    LUnit -> buffer.push(b, "Unit")
+    LNegZero -> buffer.push(b, "-0.0")
+  }
+}
+type P { P(Buffer, Names) }
+fn push_ty(p: P, t: Ty) -> P {
+  match p { P(b, ns) -> match check.show_ty(t, ns) { Shown(s, ns2) -> P(buffer.push(b, s), ns2) } }
+}
+fn push(p: P, s: String) -> P { match p { P(b, ns) -> P(buffer.push(b, s), ns) } }
+fn push_names(p: P, ps: List(CParam)) -> P {
+  match ps { Nil -> p  Cons(CParam(n, _), Nil) -> push(p, n)  Cons(CParam(n, _), rest) -> push_names(push(push(p, n), " "), rest) }
+}
+fn pexprs(p: P, xs: List(CExpr)) -> P {
+  match xs { Nil -> p  Cons(x, rest) -> pexprs(pexpr(push(p, " "), x), rest) }
+}
+fn ppat(p: P, q: CPat) -> P {
+  match q {
+    QWild -> push(p, "_")
+    QVar(n) -> push(p, n)
+    QCtor(n, Nil) -> push(p, n)
+    QCtor(n, args) -> push(ppats(push(push(p, n), " ("), args), ")")
+    QLit(l) -> match p { P(b, ns) -> P(push_lit(l, b), ns) }
+  }
+}
+fn ppats(p: P, qs: List(CPat)) -> P {
+  match qs { Nil -> p  Cons(q, Nil) -> ppat(p, q)  Cons(q, rest) -> ppats(push(ppat(p, q), " "), rest) }
+}
+fn pexpr(p: P, e: CExpr) -> P {
+  match e {
+    CExpr(_, _, ty, k) -> push(push_ty(push(pkind(p, k), " : "), ty), ")")
+  }
+}
+fn pkind(p: P, k: CKind) -> P {
+  match k {
+    KLit(l) -> match push(p, "(lit ") { P(b, ns) -> P(push_lit(l, b), ns) }
+    KVar(x) -> push(p, "(var " <> x)
+    KApp(f, args) -> pexprs(pexpr(push(p, "(app "), f), args)
+    KBuiltin(n, args) -> pexprs(push(p, "(builtin " <> n), args)
+    KCtor(n, args) -> pexprs(push(p, "(ctor " <> n), args)
+    KPrim(op, args) -> pexprs(push(p, "(prim " <> op), args)
+    KLambda(ps, body) -> pexpr(push(push_names(push(p, "(fn ("), ps), ") "), body)
+    KLet(n, v, body) -> pexpr(push(pexpr(push(p, "(let " <> n <> " "), v), " "), body)
+    KIf(c, t, f) -> pexpr(push(pexpr(push(pexpr(push(p, "(if "), c), " "), t), " "), f)
+    KMatch(s, arms) -> parms(pexpr(push(p, "(match "), s), arms)
+    KHandle(body, mul, cs, ret) -> {
+      let p2 = pexpr(push(p, "(handle "), body)
+      let p3 = pclauses(if mul { push(p2, " multi") } else { p2 }, cs)
+      match ret { No -> p3  Yes(CRet(binder, rb)) -> push(pexpr(push(p3, " (return " <> binder <> " "), rb), ")") }
+    }
+    KResume(v) -> pexpr(push(p, "(resume "), v)
+    KPerform(eff, op, op_ty, args) -> pexprs(push(push_ty(push(p, "(perform (" <> eff <> "." <> op <> " : "), op_ty), ")"), args)
+  }
+}
+fn parms(p: P, arms: List(CArm)) -> P {
+  match arms { Nil -> p  Cons(CArm(q, body), rest) -> parms(push(pexpr(push(ppat(push(p, " ("), q), " "), body), ")"), rest) }
+}
+fn pclauses(p: P, cs: List(CClause)) -> P {
+  match cs {
+    Nil -> p
+    Cons(CClause(eff, op, ps, body), rest) -> pclauses(push(pexpr(push(push_names(push(p, " (" <> eff <> "." <> op <> " ("), ps), ") "), body), ")"), rest)
+  }
+}
+fn ptys(p: P, ts: List(Ty)) -> P { match ts { Nil -> p  Cons(t, rest) -> ptys(push_ty(push(p, " "), t), rest) } }
+fn pctors(p: P, cs: List(CCtor)) -> P {
+  match cs { Nil -> p  Cons(CCtor(n, fs), rest) -> pctors(push(ptys(push(p, " (" <> n), fs), ")"), rest) }
+}
+fn sep(p: P, first: Bool) -> P { if first { p } else { push(p, "\n") } }
+fn ptypes(p: P, ts: List(CType), first: Bool) -> P {
+  match ts { Nil -> p  Cons(CType(n, cs), rest) -> ptypes(push(pctors(push(sep(p, first), "(type " <> n), cs), ")"), rest, False) }
+}
+fn pfns(p: P, fs: List(CFn), first: Bool) -> P {
+  match fs {
+    Nil -> p
+    Cons(CFn(n, ps, body), rest) -> pfns(push(pexpr(push(push_names(push(sep(p, first), "(fn " <> n <> " ("), ps), ") "), body), ")"), rest, False)
+  }
+}
+pub fn pretty(m: CModule) -> String {
+  match m {
+    CModule(ts, fs) -> match pfns(ptypes(P(buffer.new(), check.no_names()), ts, True), fs, len(ts) == 0) {
+      P(b, _) -> buffer.finish(b)
+    }
+  }
+}
+
+pub fn main() / {IO} {
+  let text = io.read_file(io.arg(0))
+  match parse.parse_tree(text) {
+    Parsed(m, _) -> match lower(m, string.length(text)) {
+      Ok(cm) -> io.println(pretty(cm))
+      Refused(w) -> io.println("refused " <> w)
+    }
+    ParseError(_, _, _) -> Unit
+  }
+}
