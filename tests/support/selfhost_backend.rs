@@ -57,4 +57,16 @@ pub const FOCUSED: &[&str] = &[
     "fn spin(n: Int, keep: String) -> String { if n == 0 { keep } else { let junk = int.to_string(n) <> \"junk\"\n spin(n - 1, if n % 1000 == 0 { keep <> string.slice(junk, 0, 1) } else { keep }) } }\npub fn main() / {IO} { io.println(spin(20000, \"k\")) }\n",
     // B2: a slice of a value nothing else holds: its argument rooted.
     "fn f(n: Int) -> String { string.slice(int.to_string(n) <> \"abcdef\", 2, 6) }\npub fn main() / {IO} { io.println(f(12345)) }\n",
+    // B3: a ground list built and folded, its nodes kept across collections.
+    "type L { N, C(Int, L) }\nfn build(n: Int, acc: L) -> L { if n == 0 { acc } else { build(n - 1, C(n, acc)) } }\nfn sum(l: L, acc: Int) -> Int { match l { N -> acc  C(x, rest) -> sum(rest, acc + x) } }\npub fn main() -> Int { sum(build(5000, N), 0) }\n",
+    // B3: nested patterns, first match wins, a match as a value.
+    "type T { A, B(Int, String), C(Bool, T) }\nfn f(t: T) -> Int { let v = match t { A -> 0  B(1, _) -> 10  B(n, \"x\") -> n + 100  B(n, _) -> n  C(True, B(m, _)) -> m + 1  C(False, C(_, A)) -> 7  C(_, rest) -> f(rest) }\n v * 2 }\npub fn main() / {IO} { io.println(int.to_string(f(A)) <> \" \" <> int.to_string(f(B(1, \"y\"))) <> \" \" <> int.to_string(f(B(5, \"x\"))) <> \" \" <> int.to_string(f(B(5, \"z\"))) <> \" \" <> int.to_string(f(C(True, B(3, \"\")))) <> \" \" <> int.to_string(f(C(False, C(True, A)))) <> \" \" <> int.to_string(f(C(True, C(False, B(9, \"q\")))))) }\n",
+    // B3: literal scrutinees: Int, Bool, String, Unit.
+    "fn i(n: Int) -> String { match n { 0 -> \"zero\"  1 -> \"one\"  _ -> \"many\" } }\nfn b(x: Bool) -> Int { match x { True -> 1  False -> 0 } }\nfn s(x: String) -> Int { match x { \"\" -> 0  \"é\" -> 2  _ -> 9 } }\nfn u(x: Unit) -> Int { match x { Unit -> 5 } }\npub fn main() / {IO} { io.println(i(0) <> i(1) <> i(7) <> int.to_string(b(True) + s(\"é\") + s(\"\") + s(\"zz\") + u(Unit))) }\n",
+    // B3: structural equality on data.
+    "type P { P(Int, String), Q(P, Bool) }\nfn same(a: P, b: P) -> Bool { a == b }\npub fn main() / {IO} { let x = Q(P(1, \"a\"), True)\n if same(x, Q(P(1, \"a\"), True)) && x != Q(P(1, \"b\"), True) && !same(P(2, \"c\"), P(3, \"c\")) { io.println(\"ok\") } else { io.println(\"bad\") } }\n",
+    // B3: binders bound only once their arm's test passes.
+    "type T { A(Int), B(Int, Int) }\nfn f(t: T, x: Int) -> Int { match t { B(x, 0) -> x  A(_) -> x  B(_, y) -> x + y } }\npub fn main() -> Int { f(B(5, 1), 100) + f(A(2), 10) }\n",
+    // B3: a tree of strings kept while building another.
+    "type Tr { Leaf, Node(Tr, String, Tr) }\nfn ins(t: Tr, s: String) -> Tr { match t { Leaf -> Node(Leaf, s, Leaf)  Node(l, v, r) -> if string.length(s) < string.length(v) { Node(ins(l, s), v, r) } else { Node(l, v, ins(r, s)) } } }\nfn go(n: Int, t: Tr) -> Tr { if n == 0 { t } else { go(n - 1, ins(t, int.to_string(n * 7919 % 1000))) } }\nfn show(t: Tr) -> String { match t { Leaf -> \".\"  Node(l, v, r) -> \"(\" <> show(l) <> v <> show(r) <> \")\" } }\npub fn main() / {IO} { io.println(show(go(60, Leaf))) }\n",
 ];

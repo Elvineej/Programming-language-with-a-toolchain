@@ -41,8 +41,17 @@ count, Windows CI, then `main`.
    unrooted; a constant split inside a UTF-8 character). 43
    corpus programs and 25 focused ones agree; controls E1-E7 in the
    header, E3 argued (the runtime roots its own arguments).
-4. [ ] **B3**: ground ADTs and `match` (pattern flattening in
-   `selfhost/lower.elya`).
-4. [ ] **B4**: monomorphization (`selfhost/mono.elya`).
-5. [ ] **B5-B8**: closures; arrays, buffers, `io.*`; imports (after part
+4. [x] **B3** (2026-11-27): ground ADTs, `match` and `==` on data, in
+   the emitter itself rather than a separate pass: each arm's pattern is
+   tested in order, a failed test going to the next arm, its binders bound
+   as the test passes (values in SSA, so nothing is bound before its arm
+   is chosen); past the last arm `elya_match_fail` (unreachable in a
+   program that checks: E0430). Constructors are `[tag][fields]` from
+   `elya_alloc`, a `Bool` field widened and an address `ptrtoint`, with a
+   descriptor row per constructor (its pointer mask) before the string's
+   and the traced array's; `==` on data is `elya_eq`. 53 corpus programs
+   and 31 focused ones agree; controls F1-F10 in the header (F4, F6
+   dropped: not faults the emitter can make).
+5. [ ] **B4**: monomorphization (`selfhost/mono.elya`).
+6. [ ] **B5-B8**: closures; arrays, buffers, `io.*`; imports (after part
    4c); the self-hosted sources themselves.

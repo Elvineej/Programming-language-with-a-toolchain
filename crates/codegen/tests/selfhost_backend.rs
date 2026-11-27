@@ -25,6 +25,17 @@
 //! E5, a shift's range unchecked: focused #21.
 //! E6, `int.shr` logical: focused #20.
 //! E7, a binary operator's left operand not rooted: tests/crosscheck.rs.
+//! F1, a constructor's tag compared unequal: examples/03_cek.elya.
+//! F2, fields stored from word 0, over the tag: examples/03_cek.elya.
+//! F3, a heap field left out of its descriptor's mask: examples/03_cek.elya
+//! (collecting at every allocation).
+//! F5, a pattern's fields read one word late: examples/03_cek.elya.
+//! F7, data compared as strings: focused #28.
+//! F8, a string pattern matching anything: focused #26.
+//! F9, a constructor's fields unrooted at its allocation:
+//! examples/03_cek.elya (collecting at every allocation).
+//! F10, a pattern's binder left unbound: examples/03_cek.elya (the IR does
+//! not build).
 //! E3 (a call's own arguments not rooted) cannot be seen: the runtime roots
 //! its arguments before it allocates (`elya_str_concat`, `elya_str_slice`)
 //! and a function roots its parameters as its scope; they stay rooted, as

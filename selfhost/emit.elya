@@ -26,6 +26,8 @@ fn lt_of(t: Ty) -> LTy {
     TB(2) -> LI1
     TB(4) -> LI64
     TB(3) -> LPtr
+    TCon("Buffer", _) -> LNone
+    TCon(_, Nil) -> LPtr
     _ -> LNone
   }
 }
@@ -37,7 +39,7 @@ fn lt_text(t: LTy) -> String {
 
 type Stage { InStage, Outside(String) }
 fn first(a: Stage, b: Stage) -> Stage { match a { InStage -> b  Outside(w) -> Outside(w) } }
-fn ty_ok(t: Ty) -> Stage { match lt_of(t) { LNone -> Outside("a value of a type outside the stage")  LPtr -> match t { TB(3) -> InStage  _ -> Outside("a type outside the stage") }  _ -> InStage } }
+fn ty_ok(t: Ty) -> Stage { match lt_of(t) { LNone -> Outside("a value of a type outside the stage")  LPtr -> InStage  _ -> InStage } }
 fn builtin_ok(n: String) -> Stage {
   if has(Cons("io.println", Cons("int.to_string", Cons("string.length", Cons("string.byte_at", Cons("string.slice",
     Cons("int.wrapping_add", Cons("int.wrapping_sub", Cons("int.wrapping_mul", Cons("int.and", Cons("int.or", Cons("int.xor",
@@ -58,7 +60,7 @@ fn check_all(fs: List(CFn), locals: List(String), xs: List(CExpr)) -> Stage {
 }
 fn eq_operand(op: String, x: CExpr) -> Stage {
   match x {
-    CExpr(_, _, t, _) -> if (op == "Eq" || op == "Ne") { match t { TB(0) -> InStage  TB(2) -> InStage  TB(3) -> InStage  TB(4) -> InStage  _ -> Outside("== on a type outside the stage") } } else {
+    CExpr(_, _, t, _) -> if (op == "Eq" || op == "Ne") { match lt_of(t) { LNone -> Outside("== on a type outside the stage")  _ -> InStage } } else {
       if op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" { match t { TB(0) -> InStage  _ -> Outside("an ordering of a type outside the stage") } } else { InStage }
     }
   }
@@ -75,14 +77,23 @@ fn check_expr(fs: List(CFn), locals: List(String), e: CExpr) -> Stage {
       KPrim(op, args) -> first(prim_ok(op), first(match args { Cons(x, _) -> eq_operand(op, x)  Nil -> InStage }, check_all(fs, locals, args)))
       KLet(n, v, b) -> first(check_expr(fs, locals, v), check_expr(fs, Cons(n, locals), b))
       KIf(c, a, b) -> first(check_expr(fs, locals, c), first(check_expr(fs, locals, a), check_expr(fs, locals, b)))
-      KCtor(_, _) -> Outside("a constructor")
+      KCtor(_, args) -> check_all(fs, locals, args)
       KLambda(_, _) -> Outside("a lambda")
-      KMatch(_, _) -> Outside("a match")
+      KMatch(sc, arms) -> first(check_expr(fs, locals, sc), check_arms(fs, locals, arms))
       KHandle(_, _, _, _) -> Outside("a handler")
       KResume(_) -> Outside("a resume")
       KPerform(_, _, _, _) -> Outside("an effect operation")
     })
   }
+}
+fn pat_names(p: CPat, acc: List(String)) -> List(String) {
+  match p { QVar(n) -> Cons(n, acc)  QCtor(_, args) -> pats_names(args, acc)  _ -> acc }
+}
+fn pats_names(ps: List(CPat), acc: List(String)) -> List(String) {
+  match ps { Nil -> acc  Cons(p, rest) -> pats_names(rest, pat_names(p, acc)) }
+}
+fn check_arms(fs: List(CFn), locals: List(String), arms: List(CArm)) -> Stage {
+  match arms { Nil -> InStage  Cons(CArm(p, b), rest) -> first(check_expr(fs, pat_names(p, locals), b), check_arms(fs, locals, rest)) }
 }
 fn check_params(ps: List(CParam)) -> Stage {
   match ps { Nil -> InStage  Cons(CParam(_, t), rest) -> first(ty_ok(t), check_params(rest)) }
@@ -97,7 +108,7 @@ fn main_type(fs: List(CFn)) -> LTy {
   match fs { Nil -> LNone  Cons(CFn(n, _, CExpr(_, _, t, _)), rest) -> if n == "main" { lt_of(t) } else { main_type(rest) } }
 }
 fn check_module(m: CModule) -> Stage {
-  match m { CModule(ts, fs) -> match ts { Nil -> check_fns(fs, fs)  _ -> Outside("a declared type") } }
+  match m { CModule(_, fs) -> check_fns(fs, fs) }
 }
 
 // ---- Emission state ---------------------------------------------------------
@@ -110,6 +121,13 @@ type Val { Val(String, LTy) }
 linear type Gotv { Gotv(Val, Emit) }
 type EBind { EBind(String, Val) }
 type ESig { ESig(String, List(LTy), LTy) }
+// A constructor: its name, its tag, its fields' types.
+type CInfo { CInfo(String, Int, List(Ty)) }
+// The module's facts: the functions' signatures, the constructors, the
+// string tag (after the constructors, as the descriptor table has it).
+type ECx { ECx(List(ESig), List(CInfo), Int) }
+fn cx_sigs(cx: ECx) -> List(ESig) { match cx { ECx(ss, _, _) -> ss } }
+fn stag(cx: ECx) -> String { match cx { ECx(_, _, t) -> int.to_string(t) } }
 
 fn line(em: Emit, s: String) -> Emit {
   match em { Emit(b, n, l, ss, k) -> Emit(buffer.push(b, "  " <> s <> "\n"), n, l, ss, k) }
@@ -185,21 +203,21 @@ fn rooted(em: Emit, rs: List(String), call: String, t: LTy) -> Gotv {
   }
 }
 
-fn str_lit(em: Emit, rs: List(String), v: String) -> Gotv {
+fn str_lit(cx: ECx, em: Emit, rs: List(String), v: String) -> Gotv {
   match em {
     Emit(b, n, l, ss, k) -> {
       let name = "@.str." <> int.to_string(k)
-      rooted(Emit(b, n, l, Cons(SConst(name, v), ss), k + 1), rs, "call ptr @elya_str_lit(i64 0, ptr " <> name <> ", i64 " <> int.to_string(string.length(v)) <> ")", LPtr)
+      rooted(Emit(b, n, l, Cons(SConst(name, v), ss), k + 1), rs, "call ptr @elya_str_lit(i64 " <> stag(cx) <> ", ptr " <> name <> ", i64 " <> int.to_string(string.length(v)) <> ")", LPtr)
     }
   }
 }
 
 linear type Gotvs { Gotvs(List(Val), Emit) }
 // Arguments left to right, each computed with the ones before it rooted.
-fn emit_args(sigs: List(ESig), env: List(EBind), pend: List(Val), xs: List(CExpr), em: Emit, acc: List(Val)) -> Gotvs {
+fn emit_args(cx: ECx, env: List(EBind), pend: List(Val), xs: List(CExpr), em: Emit, acc: List(Val)) -> Gotvs {
   match xs {
     Nil -> Gotvs(rev(acc), em)
-    Cons(x, rest) -> match emit(sigs, env, rev_onto(acc, pend), x, em) { Gotv(v, em2) -> emit_args(sigs, env, pend, rest, em2, Cons(v, acc)) }
+    Cons(x, rest) -> match emit(cx, env, rev_onto(acc, pend), x, em) { Gotv(v, em2) -> emit_args(cx, env, pend, rest, em2, Cons(v, acc)) }
   }
 }
 fn arg_list(vs: List(Val)) -> String {
@@ -237,7 +255,7 @@ fn shift(em: Emit, name: String, ins: String, a: String, b: String) -> Gotv {
     Fresh1(bad, em2) -> assign(trap_with(line(em2, bad <> " = icmp ugt i64 " <> b <> ", 63"), bad, "elya_shift_range(ptr @.name." <> name <> ", i64 " <> b <> ")"), ins <> " i64 " <> a <> ", " <> b, LI64)
   }
 }
-fn prim(env: List(EBind), pend: List(Val), op: String, a: Val, b: Val, em: Emit) -> Gotv {
+fn prim(cx: ECx, env: List(EBind), pend: List(Val), op: String, is_str: Bool, a: Val, b: Val, em: Emit) -> Gotv {
   match a {
     Val(x, at) -> match b {
       Val(y, _) -> if op == "Add" { checked(em, "sadd", x, y) } else { if op == "Sub" { checked(em, "ssub", x, y) } else { if op == "Mul" { checked(em, "smul", x, y) } else {
@@ -260,9 +278,9 @@ fn prim(env: List(EBind), pend: List(Val), op: String, a: Val, b: Val, em: Emit)
             }
           }
         } else { if op == "Concat" {
-          rooted(em, roots(env, pend, Cons(a, Cons(b, Nil))), "call ptr @elya_str_concat(i64 0, ptr " <> x <> ", ptr " <> y <> ")", LPtr)
+          rooted(em, roots(env, pend, Cons(a, Cons(b, Nil))), "call ptr @elya_str_concat(i64 " <> stag(cx) <> ", ptr " <> x <> ", ptr " <> y <> ")", LPtr)
         } else { if at == LPtr {
-          match assign(em, "call i64 @elya_str_eq(ptr " <> x <> ", ptr " <> y <> ")", LI64) {
+          match assign(em, (if is_str { "call i64 @elya_str_eq(ptr " <> x <> ", ptr " <> y <> ")" } else { "call i64 @elya_eq(ptr " <> x <> ", ptr " <> y <> ", i64 " <> stag(cx) <> ", i64 " <> stag(cx) <> ")" }), LI64) {
             Gotv(Val(r, _), em2) -> assign(em2, "icmp " <> (if op == "Eq" { "ne" } else { "eq" }) <> " i64 " <> r <> ", 0", LI1)
           }
         } else {
@@ -274,14 +292,14 @@ fn prim(env: List(EBind), pend: List(Val), op: String, a: Val, b: Val, em: Emit)
   }
 }
 
-fn builtin(env: List(EBind), pend: List(Val), n: String, vs: List(Val), em: Emit) -> Gotv {
+fn builtin(cx: ECx, env: List(EBind), pend: List(Val), n: String, vs: List(Val), em: Emit) -> Gotv {
   let a = vtext(nth(vs, 0))
   let b = vtext(nth(vs, 1))
-  if n == "int.to_string" { rooted(em, roots(env, pend, vs), "call ptr @elya_int_to_string(i64 0, i64 " <> a <> ")", LPtr) } else {
+  if n == "int.to_string" { rooted(em, roots(env, pend, vs), "call ptr @elya_int_to_string(i64 " <> stag(cx) <> ", i64 " <> a <> ")", LPtr) } else {
   if n == "io.println" { rooted(em, roots(env, pend, vs), "call void @elya_println(ptr " <> a <> ")", LNone) } else {
   if n == "string.length" { assign(em, "call i64 @elya_str_length(ptr " <> a <> ")", LI64) } else {
   if n == "string.byte_at" { assign(em, "call i64 @elya_str_byte_at(ptr " <> a <> ", i64 " <> b <> ")", LI64) } else {
-  if n == "string.slice" { rooted(em, roots(env, pend, vs), "call ptr @elya_str_slice(i64 0, ptr " <> a <> ", i64 " <> b <> ", i64 " <> vtext(nth(vs, 2)) <> ")", LPtr) } else {
+  if n == "string.slice" { rooted(em, roots(env, pend, vs), "call ptr @elya_str_slice(i64 " <> stag(cx) <> ", ptr " <> a <> ", i64 " <> b <> ", i64 " <> vtext(nth(vs, 2)) <> ")", LPtr) } else {
   if n == "int.wrapping_add" { assign(em, "add i64 " <> a <> ", " <> b, LI64) } else {
   if n == "int.wrapping_sub" { assign(em, "sub i64 " <> a <> ", " <> b, LI64) } else {
   if n == "int.wrapping_mul" { assign(em, "mul i64 " <> a <> ", " <> b, LI64) } else {
@@ -292,27 +310,35 @@ fn builtin(env: List(EBind), pend: List(Val), n: String, vs: List(Val), em: Emit
   if n == "int.shr" { shift(em, "shr", "ashr", a, b) } else { shift(em, "ushr", "lshr", a, b) } } } } } } } } } } } } }
 }
 
-fn emit(sigs: List(ESig), env: List(EBind), pend: List(Val), e: CExpr, em: Emit) -> Gotv {
+fn emit(cx: ECx, env: List(EBind), pend: List(Val), e: CExpr, em: Emit) -> Gotv {
   match e {
     CExpr(_, _, t, k) -> match k {
-      KLit(LStr(v)) -> str_lit(em, roots(env, pend, Nil), v)
+      KLit(LStr(v)) -> str_lit(cx, em, roots(env, pend, Nil), v)
       KLit(l) -> Gotv(Val(lit_value(l), lt_of(t)), em)
       KVar(n) -> Gotv(lookup(env, n), em)
-      KLet(n, v, b) -> match emit(sigs, env, pend, v, em) { Gotv(val, em2) -> emit(sigs, Cons(EBind(n, val), env), pend, b, em2) }
-      KPrim(op, Cons(a, Cons(b, Nil))) -> match emit(sigs, env, pend, a, em) {
-        Gotv(va, em2) -> match emit(sigs, env, Cons(va, pend), b, em2) { Gotv(vb, em3) -> prim(env, pend, op, va, vb, em3) }
+      KLet(n, v, b) -> match emit(cx, env, pend, v, em) { Gotv(val, em2) -> emit(cx, Cons(EBind(n, val), env), pend, b, em2) }
+      KPrim(op, Cons(a, Cons(b, Nil))) -> match emit(cx, env, pend, a, em) {
+        Gotv(va, em2) -> match emit(cx, env, Cons(va, pend), b, em2) { Gotv(vb, em3) -> prim(cx, env, pend, op, is_string(a), va, vb, em3) }
       }
-      KBuiltin(n, args) -> match emit_args(sigs, env, pend, args, em, Nil) { Gotvs(vs, em2) -> builtin(env, pend, n, vs, em2) }
-      KApp(CExpr(_, _, _, KVar(f)), args) -> match emit_args(sigs, env, pend, args, em, Nil) {
-        Gotvs(vs, em2) -> match sig_of(sigs, f) { ESig(_, _, r) -> rooted(em2, roots(env, pend, vs), "call tailcc " <> lt_text(r) <> " @elya." <> f <> "(" <> arg_list(vs) <> ")", r) }
+      KCtor(n, args) -> match emit_args(cx, env, pend, args, em, Nil) { Gotvs(vs, em2) -> construct(cx, env, pend, n, vs, em2) }
+      KMatch(sc, arms) -> match emit(cx, env, pend, sc, em) {
+        Gotv(sv, em2) -> match new_label(em2) {
+          Fresh1(join, em3) -> match emit_arms(cx, env, pend, sv, ty_of(sc), arms, em3, join, Nil, No) {
+            Arms(ins, em4) -> assign(start_block(em4, join), "phi " <> lt_text(lt_of(t)) <> " " <> phi_ins(ins), lt_of(t))
+          }
+        }
       }
-      KIf(c, a, b) -> match emit(sigs, env, pend, c, em) {
+      KBuiltin(n, args) -> match emit_args(cx, env, pend, args, em, Nil) { Gotvs(vs, em2) -> builtin(cx, env, pend, n, vs, em2) }
+      KApp(CExpr(_, _, _, KVar(f)), args) -> match emit_args(cx, env, pend, args, em, Nil) {
+        Gotvs(vs, em2) -> match sig_of(cx_sigs(cx), f) { ESig(_, _, r) -> rooted(em2, roots(env, pend, vs), "call tailcc " <> lt_text(r) <> " @elya." <> f <> "(" <> arg_list(vs) <> ")", r) }
+      }
+      KIf(c, a, b) -> match emit(cx, env, pend, c, em) {
         Gotv(Val(cv, _), em2) -> match new_label(em2) {
           Fresh1(lt, em3) -> match new_label(em3) {
             Fresh1(lf, em4) -> match new_label(em4) {
-              Fresh1(lj, em5) -> match emit(sigs, env, pend, a, start_block(line(em5, "br i1 " <> cv <> ", label %" <> lt <> ", label %" <> lf), lt)) {
+              Fresh1(lj, em5) -> match emit(cx, env, pend, a, start_block(line(em5, "br i1 " <> cv <> ", label %" <> lt <> ", label %" <> lf), lt)) {
                 Gotv(Val(av, _), em6) -> match label_of(em6) {
-                  AtLabel(la, em7) -> match emit(sigs, env, pend, b, start_block(line(em7, "br label %" <> lj), lf)) {
+                  AtLabel(la, em7) -> match emit(cx, env, pend, b, start_block(line(em7, "br label %" <> lj), lf)) {
                     Gotv(Val(bv, _), em8) -> match label_of(em8) {
                       AtLabel(lb, em9) -> assign(start_block(line(em9, "br label %" <> lj), lj), "phi " <> lt_text(lt_of(t)) <> " [ " <> av <> ", %" <> la <> " ], [ " <> bv <> ", %" <> lb <> " ]", lt_of(t))
                     }
@@ -331,23 +357,146 @@ fn emit(sigs: List(ESig), env: List(EBind), pend: List(Val), e: CExpr, em: Emit)
 // An expression in tail position: its value returned, a call of a function
 // `musttail` (the caller's and the callee's results are one type there;
 // nothing of the caller's is live after it, so nothing is rooted).
-fn emit_tail(sigs: List(ESig), env: List(EBind), e: CExpr, em: Emit, r: LTy) -> Emit {
+fn emit_tail(cx: ECx, env: List(EBind), e: CExpr, em: Emit, r: LTy) -> Emit {
   match e {
     CExpr(_, _, t, k) -> match k {
-      KLet(n, v, b) -> match emit(sigs, env, Nil, v, em) { Gotv(val, em2) -> emit_tail(sigs, Cons(EBind(n, val), env), b, em2, r) }
-      KIf(c, a, b) -> match emit(sigs, env, Nil, c, em) {
+      KLet(n, v, b) -> match emit(cx, env, Nil, v, em) { Gotv(val, em2) -> emit_tail(cx, Cons(EBind(n, val), env), b, em2, r) }
+      KIf(c, a, b) -> match emit(cx, env, Nil, c, em) {
         Gotv(Val(cv, _), em2) -> match new_label(em2) {
           Fresh1(lt, em3) -> match new_label(em3) {
-            Fresh1(lf, em4) -> emit_tail(sigs, env, b, start_block(emit_tail(sigs, env, a, start_block(line(em4, "br i1 " <> cv <> ", label %" <> lt <> ", label %" <> lf), lt), r), lf), r)
+            Fresh1(lf, em4) -> emit_tail(cx, env, b, start_block(emit_tail(cx, env, a, start_block(line(em4, "br i1 " <> cv <> ", label %" <> lt <> ", label %" <> lf), lt), r), lf), r)
           }
         }
       }
-      KApp(CExpr(_, _, _, KVar(f)), args) -> match emit_args(sigs, env, Nil, args, em, Nil) {
+      KMatch(sc, arms) -> match emit(cx, env, Nil, sc, em) {
+        Gotv(sv, em2) -> match emit_arms(cx, env, Nil, sv, ty_of(sc), arms, em2, "", Nil, Yes(r)) { Arms(_, em3) -> em3 }
+      }
+      KApp(CExpr(_, _, _, KVar(f)), args) -> match emit_args(cx, env, Nil, args, em, Nil) {
         Gotvs(vs, em2) -> match fresh(em2) {
           Fresh1(v, em3) -> line(line(em3, v <> " = musttail call tailcc " <> lt_text(r) <> " @elya." <> f <> "(" <> arg_list(vs) <> ")"), "ret " <> lt_text(r) <> " " <> v)
         }
       }
-      _ -> match emit(sigs, env, Nil, e, em) { Gotv(Val(v, _), em2) -> line(em2, "ret " <> lt_text(r) <> " " <> v) }
+      _ -> match emit(cx, env, Nil, e, em) { Gotv(Val(v, _), em2) -> line(em2, "ret " <> lt_text(r) <> " " <> v) }
+    }
+  }
+}
+
+// ---- Data -------------------------------------------------------------------
+
+fn ty_of(e: CExpr) -> Ty { match e { CExpr(_, _, t, _) -> t } }
+fn is_string(e: CExpr) -> Bool { match ty_of(e) { TB(3) -> True  _ -> False } }
+fn ctor_info(cs: List(CInfo), n: String) -> CInfo {
+  match cs { Nil -> CInfo(n, 0, Nil)  Cons(CInfo(m, tag, fs), rest) -> if m == n { CInfo(m, tag, fs) } else { ctor_info(rest, n) } }
+}
+fn cx_ctor(cx: ECx, n: String) -> CInfo { match cx { ECx(_, cs, _) -> ctor_info(cs, n) } }
+fn len_vals(vs: List(Val), n: Int) -> Int { match vs { Nil -> n  Cons(_, rest) -> len_vals(rest, n + 1) } }
+
+// A field's word: an `Int` or `Unit` itself, a `Bool` widened, a pointer as
+// its address.
+fn to_word(em: Emit, v: Val) -> Gotv {
+  match v {
+    Val(x, LI1) -> assign(em, "zext i1 " <> x <> " to i64", LI64)
+    Val(x, LPtr) -> assign(em, "ptrtoint ptr " <> x <> " to i64", LI64)
+    Val(x, t) -> Gotv(Val(x, t), em)
+  }
+}
+fn from_word(em: Emit, w: String, t: LTy) -> Gotv {
+  match t {
+    LI1 -> assign(em, "trunc i64 " <> w <> " to i1", LI1)
+    LPtr -> assign(em, "inttoptr i64 " <> w <> " to ptr", LPtr)
+    _ -> Gotv(Val(w, LI64), em)
+  }
+}
+fn store_fields(em: Emit, obj: String, vs: List(Val), i: Int) -> Emit {
+  match vs {
+    Nil -> em
+    Cons(v, rest) -> match to_word(em, v) {
+      Gotv(Val(w, _), em2) -> match fresh(em2) {
+        Fresh1(fp, em3) -> store_fields(line(line(em3, fp <> " = getelementptr i64, ptr " <> obj <> ", i64 " <> int.to_string(i)), "store i64 " <> w <> ", ptr " <> fp), obj, rest, i + 1)
+      }
+    }
+  }
+}
+// `[tag][fields...]`, the fields rooted across the allocation.
+fn construct(cx: ECx, env: List(EBind), pend: List(Val), n: String, vs: List(Val), em: Emit) -> Gotv {
+  match cx_ctor(cx, n) {
+    CInfo(_, tag, _) -> match rooted(em, roots(env, pend, vs), "call ptr @elya_alloc(i64 " <> int.to_string(1 + len_vals(vs, 0)) <> ")", LPtr) {
+      Gotv(Val(obj, _), em2) -> Gotv(Val(obj, LPtr), store_fields(line(em2, "store i64 " <> int.to_string(tag) <> ", ptr " <> obj), obj, vs, 1))
+    }
+  }
+}
+
+// One arm's pattern tested against `v` (of type `t`); a failed test goes to
+// `fail`, and the binders are bound as the test passes.
+linear type Tested { Tested(List(EBind), Emit) }
+fn load_field(em: Emit, obj: String, i: Int, t: Ty) -> Gotv {
+  match fresh(em) {
+    Fresh1(fp, em2) -> match fresh(line(em2, fp <> " = getelementptr i64, ptr " <> obj <> ", i64 " <> int.to_string(i))) {
+      Fresh1(w, em3) -> from_word(line(em3, w <> " = load i64, ptr " <> fp), w, lt_of(t))
+    }
+  }
+}
+fn branch_on(em: Emit, cond: String, fail: String) -> Emit {
+  match new_label(em) { Fresh1(ok, em2) -> start_block(line(em2, "br i1 " <> cond <> ", label %" <> ok <> ", label %" <> fail), ok) }
+}
+fn test_pat(cx: ECx, v: Val, t: Ty, p: CPat, fail: String, env: List(EBind), em: Emit) -> Tested {
+  match p {
+    QWild -> Tested(env, em)
+    QVar(n) -> Tested(Cons(EBind(n, v), env), em)
+    QLit(LUnit) -> Tested(env, em)
+    QLit(LStr(s)) -> match str_lit(cx, em, val_roots(Cons(v, Nil), env_roots(env, Nil)), s) {
+      Gotv(Val(lit, _), em2) -> match assign(em2, "call i64 @elya_str_eq(ptr " <> vtext(v) <> ", ptr " <> lit <> ")", LI64) {
+        Gotv(Val(r, _), em3) -> match assign(em3, "icmp ne i64 " <> r <> ", 0", LI1) { Gotv(Val(c, _), em4) -> Tested(env, branch_on(em4, c, fail)) }
+      }
+    }
+    QLit(l) -> match v {
+      Val(x, lt) -> match assign(em, "icmp eq " <> lt_text(lt) <> " " <> x <> ", " <> lit_value(l), LI1) { Gotv(Val(c, _), em2) -> Tested(env, branch_on(em2, c, fail)) }
+    }
+    QCtor(n, args) -> match cx_ctor(cx, n) {
+      CInfo(_, tag, fts) -> match fresh(em) {
+        Fresh1(tg, em2) -> match assign(line(em2, tg <> " = load i64, ptr " <> vtext(v)), "icmp eq i64 " <> tg <> ", " <> int.to_string(tag), LI1) {
+          Gotv(Val(c, _), em3) -> test_fields(cx, vtext(v), fts, args, 1, fail, env, branch_on(em3, c, fail))
+        }
+      }
+    }
+  }
+}
+fn test_fields(cx: ECx, obj: String, fts: List(Ty), ps: List(CPat), i: Int, fail: String, env: List(EBind), em: Emit) -> Tested {
+  match ps {
+    Nil -> Tested(env, em)
+    Cons(QWild, rest) -> test_fields(cx, obj, tail_tys(fts), rest, i + 1, fail, env, em)
+    Cons(p, rest) -> match load_field(em, obj, i, head_ty(fts)) {
+      Gotv(fv, em2) -> match test_pat(cx, fv, head_ty(fts), p, fail, env, em2) {
+        Tested(env2, em3) -> test_fields(cx, obj, tail_tys(fts), rest, i + 1, fail, env2, em3)
+      }
+    }
+  }
+}
+fn head_ty(ts: List(Ty)) -> Ty { match ts { Nil -> TB(4)  Cons(t, _) -> t } }
+fn tail_tys(ts: List(Ty)) -> List(Ty) { match ts { Nil -> Nil  Cons(_, rest) -> rest } }
+
+// The arms in order, each tested then run; the value of each that runs and
+// the block it ends in, for the join's phi (none in tail position, where
+// each arm returns). Past the last arm the match fails by name.
+type In { In(String, String) }
+linear type Arms { Arms(List(In), Emit) }
+fn phi_ins(ins: List(In)) -> String {
+  match ins { Nil -> ""  Cons(In(v, l), Nil) -> "[ " <> v <> ", %" <> l <> " ]"  Cons(In(v, l), rest) -> "[ " <> v <> ", %" <> l <> " ], " <> phi_ins(rest) }
+}
+fn emit_arms(cx: ECx, env: List(EBind), pend: List(Val), sv: Val, st: Ty, arms: List(CArm), em: Emit, join: String, ins: List(In), tail: Maybe(LTy)) -> Arms {
+  match arms {
+    Nil -> Arms(rev(ins), line(line(em, "call void @elya_match_fail()"), "unreachable"))
+    Cons(CArm(p, body), rest) -> match new_label(em) {
+      Fresh1(next, em2) -> match test_pat(cx, sv, st, p, next, env, em2) {
+        Tested(env2, em3) -> match tail {
+          Yes(r) -> emit_arms(cx, env, pend, sv, st, rest, start_block(emit_tail(cx, env2, body, em3, r), next), join, ins, tail)
+          No -> match emit(cx, env2, pend, body, em3) {
+            Gotv(Val(bv, _), em4) -> match label_of(em4) {
+              AtLabel(lb, em5) -> emit_arms(cx, env, pend, sv, st, rest, start_block(line(em5, "br label %" <> join), next), join, Cons(In(bv, lb), ins), tail)
+            }
+          }
+        }
+      }
     }
   }
 }
@@ -370,7 +519,7 @@ fn header(ps: List(CParam), i: Int, text: String, env: List(EBind)) -> Hdr {
     }
   }
 }
-fn emit_fns(sigs: List(ESig), fs: List(CFn), em: Emit) -> Emit {
+fn emit_fns(cx: ECx, fs: List(CFn), em: Emit) -> Emit {
   match fs {
     Nil -> em
     Cons(CFn(n, ps, body), rest) -> match header(ps, 0, "", Nil) {
@@ -379,8 +528,8 @@ fn emit_fns(sigs: List(ESig), fs: List(CFn), em: Emit) -> Emit {
         match em {
           Emit(b, k, _, ss, sk) -> {
             let em2 = Emit(buffer.push(b, "define tailcc " <> lt_text(r) <> " @elya." <> n <> "(" <> text <> ") {\nentry:\n"), k, "entry", ss, sk)
-            match emit_tail(sigs, env, body, em2, r) {
-              Emit(b2, k2, l2, ss2, sk2) -> emit_fns(sigs, rest, Emit(buffer.push(b2, "}\n\n"), k2, l2, ss2, sk2))
+            match emit_tail(cx, env, body, em2, r) {
+              Emit(b2, k2, l2, ss2, sk2) -> emit_fns(cx, rest, Emit(buffer.push(b2, "}\n\n"), k2, l2, ss2, sk2))
             }
           }
         }
@@ -395,9 +544,10 @@ fn emit_strs(ss: List(SConst), b: Buffer) -> Buffer {
   }
 }
 fn prelude() -> String {
-  "; The back end in Elya, stage B2.\n" <>
-  "@.gc_desc = private unnamed_addr constant [4 x i64] [i64 0, i64 0, i64 -1, i64 0]\n" <>
-  "@.eq_float = private unnamed_addr constant [1 x i64] zeroinitializer\n" <>
+  "; The back end in Elya, stage B3.\n" <>
+  "declare ptr @elya_alloc(i64)\n" <>
+  "declare i64 @elya_eq(ptr, ptr, i64, i64)\n" <>
+  "declare void @elya_match_fail()\n" <>
   "declare ptr @elya_str_lit(i64, ptr, i64)\n" <>
   "declare ptr @elya_int_to_string(i64, i64)\n" <>
   "declare ptr @elya_str_concat(i64, ptr, ptr)\n" <>
@@ -428,24 +578,53 @@ fn prelude() -> String {
 // The entry: `main`'s value printed as the Rust back end prints it, an
 // `Int` (or `Unit`, 0) by `elya_main_int` after the program, a `Bool` by
 // name.
-fn entry(main_lt: LTy) -> String {
+fn entry(cx: ECx, main_lt: LTy) -> String {
   "@.true = private unnamed_addr constant [4 x i8] c\"True\"\n@.false = private unnamed_addr constant [5 x i8] c\"False\"\n\n" <>
   "define i64 @elya_entry() {\nentry:\n  %v = call tailcc " <> lt_text(main_lt) <> " @elya.main()\n" <>
   (if main_lt == LI1 {
-    "  %t = call ptr @elya_str_lit(i64 0, ptr @.true, i64 4)\n  call void @elya_gc_push(ptr %t)\n  %f = call ptr @elya_str_lit(i64 0, ptr @.false, i64 5)\n  call void @elya_gc_pop()\n  %s = select i1 %v, ptr %t, ptr %f\n  call void @elya_println(ptr %s)\n  ret i64 0\n}\n\n"
+    "  %t = call ptr @elya_str_lit(i64 " <> stag(cx) <> ", ptr @.true, i64 4)\n  call void @elya_gc_push(ptr %t)\n  %f = call ptr @elya_str_lit(i64 " <> stag(cx) <> ", ptr @.false, i64 5)\n  call void @elya_gc_pop()\n  %s = select i1 %v, ptr %t, ptr %f\n  call void @elya_println(ptr %s)\n  ret i64 0\n}\n\n"
   } else { "  ret i64 %v\n}\n\n" }) <>
-  "define i32 @main(i32 %0, ptr %1) {\nentry:\n  call void @elya_gc_init(ptr @.gc_desc, i64 2)\n  call void @elya_eq_init(ptr @.eq_float, i64 0)\n" <>
+  "define i32 @main(i32 %0, ptr %1) {\nentry:\n  call void @elya_gc_init(ptr @.gc_desc, i64 " <> int.to_string(rows(cx)) <> ")\n  call void @elya_eq_init(ptr @.eq_float, i64 " <> int.to_string(n_ctors(cx)) <> ")\n" <>
   "  call void @elya_args_init(i32 %0, ptr %1)\n  %v = call i64 @elya_start(ptr @elya_entry)\n" <>
   (if main_lt == LI1 { "" } else { "  call void @elya_main_int(i64 %v)\n" }) <>
   "  call void @elya_gc_report()\n  ret i32 0\n}\n"
 }
 
+// The constructors in declaration order: the index is the tag.
+fn infos(ts: List(CType), tag: Int, acc: List(CInfo)) -> List(CInfo) {
+  match ts {
+    Nil -> rev(acc)
+    Cons(CType(_, Nil), rest) -> infos(rest, tag, acc)
+    Cons(CType(n, Cons(CCtor(c, fs), more)), rest) -> infos(Cons(CType(n, more), rest), tag + 1, Cons(CInfo(c, tag, fs), acc))
+  }
+}
+fn n_ctors(cx: ECx) -> Int { match cx { ECx(_, cs, _) -> len_infos(cs, 0) } }
+fn len_infos(cs: List(CInfo), n: Int) -> Int { match cs { Nil -> n  Cons(_, rest) -> len_infos(rest, n + 1) } }
+// The rows: each constructor's, then the string's, then the traced array's.
+fn rows(cx: ECx) -> Int { n_ctors(cx) + 2 }
+fn is_heap(t: Ty) -> Bool { lt_of(t) == LPtr }
+fn mask(fs: List(Ty), bit: Int, acc: Int) -> Int {
+  match fs { Nil -> acc  Cons(f, rest) -> mask(rest, bit * 2, if is_heap(f) { acc + bit } else { acc }) }
+}
+fn len_tys(ts: List(Ty), n: Int) -> Int { match ts { Nil -> n  Cons(_, rest) -> len_tys(rest, n + 1) } }
+fn desc_rows(cs: List(CInfo), b: String) -> String {
+  match cs { Nil -> b  Cons(CInfo(_, _, fs), rest) -> desc_rows(rest, b <> "i64 " <> int.to_string(len_tys(fs, 0)) <> ", i64 " <> int.to_string(mask(fs, 1, 0)) <> ", ") }
+}
+fn tables(cx: ECx) -> String {
+  match cx {
+    ECx(_, cs, _) -> "@.gc_desc = private unnamed_addr constant [" <> int.to_string(2 * rows(cx)) <> " x i64] [" <> desc_rows(cs, "") <> "i64 0, i64 0, i64 -1, i64 0]\n" <>
+      "@.eq_float = private unnamed_addr constant [" <> int.to_string(n_ctors(cx) + 1) <> " x i64] zeroinitializer\n"
+  }
+}
+
 pub fn emit_module(m: CModule) -> String {
   match m {
-    CModule(_, fs) -> {
+    CModule(ts, fs) -> {
       let sigs = sigs_of(fs)
-      match emit_fns(sigs, fs, Emit(buffer.new(), 0, "entry", Nil, 0)) {
-        Emit(body, _, _, ss, _) -> buffer.finish(buffer.push(emit_strs(rev(ss), buffer.push(buffer.new(), prelude())), buffer.finish(body) <> entry(match sig_of(sigs, "main") { ESig(_, _, r) -> r })))
+      let cs = infos(ts, 0, Nil)
+      let cx = ECx(sigs, cs, len_infos(cs, 0))
+      match emit_fns(cx, fs, Emit(buffer.new(), 0, "entry", Nil, 0)) {
+        Emit(body, _, _, ss, _) -> buffer.finish(buffer.push(emit_strs(rev(ss), buffer.push(buffer.new(), prelude() <> tables(cx))), buffer.finish(body) <> entry(cx, match sig_of(sigs, "main") { ESig(_, _, r) -> r })))
       }
     }
   }
