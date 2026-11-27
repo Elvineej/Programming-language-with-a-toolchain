@@ -39,4 +39,22 @@ pub const FOCUSED: &[&str] = &[
     "fn lt(a: Int, b: Int) -> Bool { a < b }\nfn ge(a: Int, b: Int) -> Bool { a >= b }\npub fn main() -> Bool { lt(-1, 1) && ge(1, -1) }\n",
     // B1: multiplication overflows.
     "fn f(a: Int) -> Int { a * 3 }\npub fn main() -> Int { f(4611686018427387904) }\n",
+    // B2: strings built across calls, an operand rooted while the next one allocates.
+    "fn two(a: String, b: String) -> String { a <> \"|\" <> b }\nfn f(x: String) -> String { two(x <> \"a\", int.to_string(42)) }\nfn loop(n: Int, acc: String) -> String { if n == 0 { acc } else { loop(n - 1, two(acc, f(int.to_string(n)))) } }\npub fn main() / {IO} { io.println(loop(30, \"\")) }\n",
+    // B2: equality, length, bytes and slices, UTF-8 included.
+    "fn same(a: String, b: String) -> Bool { a == b }\npub fn main() / {IO} { let s = \"héllo wörld\"\n io.println(int.to_string(string.length(s)) <> \" \" <> int.to_string(string.byte_at(s, 1)) <> \" \" <> string.slice(s, 0, 3) <> string.slice(s, 7, 13))\n if same(s, \"héllo\" <> \" wörld\") && s != \"x\" { io.println(\"eq\") } else { io.println(\"ne\") } }\n",
+    // B2: a byte out of range stops the program by name.
+    "pub fn main() -> Int { string.byte_at(\"abc\", 3) }\n",
+    // B2: a slice splitting a character stops it.
+    "pub fn main() / {IO} { io.println(string.slice(\"é\", 0, 1)) }\n",
+    // B2: shifts, bitwise and wrapping arithmetic.
+    "fn f(a: Int, b: Int) -> Int { int.shl(a, b) + int.shr(-a, b) + int.ushr(-1, 60) + int.and(a, 6) + int.or(a, 8) + int.xor(a, 3) }\npub fn main() / {IO} { io.println(int.to_string(f(5, 2)))\n io.println(int.to_string(int.wrapping_add(9223372036854775807, 1)))\n io.println(int.to_string(int.wrapping_mul(4611686018427387904, 4) + int.wrapping_sub(-9223372036854775807 - 1, 1))) }\n",
+    // B2: a shift out of range stops the program by name.
+    "fn f(n: Int) -> Int { int.ushr(1, n) }\npub fn main() -> Int { f(64) }\n",
+    // B2: a negative shift too.
+    "fn f(n: Int) -> Int { int.shl(1, n) }\npub fn main() -> Int { f(-1) }\n",
+    // B2: many short-lived strings, the live ones kept.
+    "fn spin(n: Int, keep: String) -> String { if n == 0 { keep } else { let junk = int.to_string(n) <> \"junk\"\n spin(n - 1, if n % 1000 == 0 { keep <> string.slice(junk, 0, 1) } else { keep }) } }\npub fn main() / {IO} { io.println(spin(20000, \"k\")) }\n",
+    // B2: a slice of a value nothing else holds: its argument rooted.
+    "fn f(n: Int) -> String { string.slice(int.to_string(n) <> \"abcdef\", 2, 6) }\npub fn main() / {IO} { io.println(f(12345)) }\n",
 ];

@@ -39,10 +39,12 @@ type Stage { InStage, Outside(String) }
 fn first(a: Stage, b: Stage) -> Stage { match a { InStage -> b  Outside(w) -> Outside(w) } }
 fn ty_ok(t: Ty) -> Stage { match lt_of(t) { LNone -> Outside("a value of a type outside the stage")  LPtr -> match t { TB(3) -> InStage  _ -> Outside("a type outside the stage") }  _ -> InStage } }
 fn builtin_ok(n: String) -> Stage {
-  if n == "io.println" || n == "int.to_string" { InStage } else { Outside("builtin " <> n) }
+  if has(Cons("io.println", Cons("int.to_string", Cons("string.length", Cons("string.byte_at", Cons("string.slice",
+    Cons("int.wrapping_add", Cons("int.wrapping_sub", Cons("int.wrapping_mul", Cons("int.and", Cons("int.or", Cons("int.xor",
+    Cons("int.shl", Cons("int.shr", Cons("int.ushr", Nil)))))))))))))), n) { InStage } else { Outside("builtin " <> n) }
 }
 fn prim_ok(op: String) -> Stage {
-  if op == "Add" || op == "Sub" || op == "Mul" || op == "Div" || op == "Rem" || op == "Eq" || op == "Ne" || op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" { InStage } else { Outside("operator " <> op) }
+  if op == "Add" || op == "Sub" || op == "Mul" || op == "Div" || op == "Rem" || op == "Eq" || op == "Ne" || op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" || op == "Concat" { InStage } else { Outside("operator " <> op) }
 }
 fn has_fn(fs: List(CFn), n: String) -> Bool {
   match fs { Nil -> False  Cons(CFn(m, _, _), rest) -> m == n || has_fn(rest, n) }
@@ -56,7 +58,7 @@ fn check_all(fs: List(CFn), locals: List(String), xs: List(CExpr)) -> Stage {
 }
 fn eq_operand(op: String, x: CExpr) -> Stage {
   match x {
-    CExpr(_, _, t, _) -> if (op == "Eq" || op == "Ne") { match t { TB(0) -> InStage  TB(2) -> InStage  TB(4) -> InStage  _ -> Outside("== on a type outside the stage") } } else {
+    CExpr(_, _, t, _) -> if (op == "Eq" || op == "Ne") { match t { TB(0) -> InStage  TB(2) -> InStage  TB(3) -> InStage  TB(4) -> InStage  _ -> Outside("== on a type outside the stage") } } else {
       if op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" { match t { TB(0) -> InStage  _ -> Outside("an ordering of a type outside the stage") } } else { InStage }
     }
   }
@@ -145,44 +147,78 @@ fn lit_value(l: CLit) -> String {
 // A string literal: a private constant of its bytes, made a runtime string
 // by `elya_str_lit` (the string tag, the bytes, their length).
 fn hex_digit(n: Int) -> String { string.slice("0123456789ABCDEF", n, n + 1) }
+// The text between escapes; empty between two bytes of one character,
+// where a slice would split the character.
+fn between(s: String, from: Int, i: Int) -> String { if from < i { string.slice(s, from, i) } else { "" } }
 fn ir_bytes(s: String, i: Int, from: Int, b: Buffer) -> Buffer {
-  if i >= string.length(s) { buffer.push(b, string.slice(s, from, i)) } else {
+  if i >= string.length(s) { buffer.push(b, between(s, from, i)) } else {
     let c = string.byte_at(s, i)
     if c < 32 || c > 126 || c == 34 || c == 92 {
-      ir_bytes(s, i + 1, i + 1, buffer.push(buffer.push(b, string.slice(s, from, i)), "\\" <> hex_digit(c / 16) <> hex_digit(c % 16)))
+      ir_bytes(s, i + 1, i + 1, buffer.push(buffer.push(b, between(s, from, i)), "\\" <> hex_digit(c / 16) <> hex_digit(c % 16)))
     } else { ir_bytes(s, i + 1, from, b) }
   }
 }
-fn str_lit(em: Emit, v: String) -> Gotv {
+// The heap values live across a call that may collect: every pointer the
+// scope binds, the operands already computed (`pend`) and the call's own
+// arguments are pushed on the runtime's shadow stack before it and popped
+// after (D5). Over-rooting a dead value only keeps it a little longer.
+fn env_roots(env: List(EBind), acc: List(String)) -> List(String) {
+  match env { Nil -> acc  Cons(EBind(_, Val(v, LPtr)), rest) -> env_roots(rest, Cons(v, acc))  Cons(_, rest) -> env_roots(rest, acc) }
+}
+fn val_roots(vs: List(Val), acc: List(String)) -> List(String) {
+  match vs { Nil -> acc  Cons(Val(v, LPtr), rest) -> val_roots(rest, Cons(v, acc))  Cons(_, rest) -> val_roots(rest, acc) }
+}
+fn push_roots(em: Emit, rs: List(String)) -> Emit {
+  match rs { Nil -> em  Cons(r, rest) -> push_roots(line(em, "call void @elya_gc_push(ptr " <> r <> ")"), rest) }
+}
+fn pop_roots(em: Emit, rs: List(String)) -> Emit {
+  match rs { Nil -> em  Cons(_, rest) -> pop_roots(line(em, "call void @elya_gc_pop()"), rest) }
+}
+fn roots(env: List(EBind), pend: List(Val), args: List(Val)) -> List(String) {
+  val_roots(args, val_roots(pend, env_roots(env, Nil)))
+}
+// A call that may allocate, its result `t` (a void call when `LNone`).
+fn rooted(em: Emit, rs: List(String), call: String, t: LTy) -> Gotv {
+  match t {
+    LNone -> Gotv(Val("0", LI64), pop_roots(line(push_roots(em, rs), call), rs))
+    _ -> match fresh(push_roots(em, rs)) { Fresh1(v, em2) -> Gotv(Val(v, t), pop_roots(line(em2, v <> " = " <> call), rs)) }
+  }
+}
+
+fn str_lit(em: Emit, rs: List(String), v: String) -> Gotv {
   match em {
     Emit(b, n, l, ss, k) -> {
       let name = "@.str." <> int.to_string(k)
-      match fresh(Emit(b, n, l, Cons(SConst(name, v), ss), k + 1)) {
-        Fresh1(t, em2) -> Gotv(Val(t, LPtr), line(em2, t <> " = call ptr @elya_str_lit(i64 0, ptr " <> name <> ", i64 " <> int.to_string(string.length(v)) <> ")"))
-      }
+      rooted(Emit(b, n, l, Cons(SConst(name, v), ss), k + 1), rs, "call ptr @elya_str_lit(i64 0, ptr " <> name <> ", i64 " <> int.to_string(string.length(v)) <> ")", LPtr)
     }
   }
 }
 
 linear type Gotvs { Gotvs(List(Val), Emit) }
-fn emit_args(sigs: List(ESig), env: List(EBind), xs: List(CExpr), em: Emit, acc: List(Val)) -> Gotvs {
+// Arguments left to right, each computed with the ones before it rooted.
+fn emit_args(sigs: List(ESig), env: List(EBind), pend: List(Val), xs: List(CExpr), em: Emit, acc: List(Val)) -> Gotvs {
   match xs {
     Nil -> Gotvs(rev(acc), em)
-    Cons(x, rest) -> match emit(sigs, env, x, em) { Gotv(v, em2) -> emit_args(sigs, env, rest, em2, Cons(v, acc)) }
+    Cons(x, rest) -> match emit(sigs, env, rev_onto(acc, pend), x, em) { Gotv(v, em2) -> emit_args(sigs, env, pend, rest, em2, Cons(v, acc)) }
   }
 }
 fn arg_list(vs: List(Val)) -> String {
   match vs { Nil -> ""  Cons(Val(s, t), Nil) -> lt_text(t) <> " " <> s  Cons(Val(s, t), rest) -> lt_text(t) <> " " <> s <> ", " <> arg_list(rest) }
 }
+fn nth(vs: List(Val), i: Int) -> Val {
+  match vs { Nil -> Val("undef", LI64)  Cons(v, rest) -> if i == 0 { v } else { nth(rest, i - 1) } }
+}
+fn vtext(v: Val) -> String { match v { Val(s, _) -> s } }
 
 // A check that stops the program through the runtime when `cond` holds.
-fn trap(em: Emit, cond: String, fail: String) -> Emit {
+fn trap_with(em: Emit, cond: String, fail: String) -> Emit {
   match new_label(em) {
     Fresh1(bad, em2) -> match new_label(em2) {
-      Fresh1(ok, em3) -> start_block(line(line(start_block(line(em3, "br i1 " <> cond <> ", label %" <> bad <> ", label %" <> ok), bad), "call void @" <> fail <> "()"), "unreachable"), ok)
+      Fresh1(ok, em3) -> start_block(line(line(start_block(line(em3, "br i1 " <> cond <> ", label %" <> bad <> ", label %" <> ok), bad), "call void @" <> fail), "unreachable"), ok)
     }
   }
 }
+fn trap(em: Emit, cond: String, fail: String) -> Emit { trap_with(em, cond, fail <> "()") }
 fn checked(em: Emit, intr: String, a: String, b: String) -> Gotv {
   match fresh(em) {
     Fresh1(pair, em2) -> match fresh(line(em2, pair <> " = call { i64, i1 } @llvm." <> intr <> ".with.overflow.i64(i64 " <> a <> ", i64 " <> b <> ")")) {
@@ -195,7 +231,13 @@ fn checked(em: Emit, intr: String, a: String, b: String) -> Gotv {
 fn assign(em: Emit, rhs: String, t: LTy) -> Gotv {
   match fresh(em) { Fresh1(v, em2) -> Gotv(Val(v, t), line(em2, v <> " = " <> rhs)) }
 }
-fn prim(op: String, a: Val, b: Val, em: Emit) -> Gotv {
+// A shift by more than 63 (or less than 0) stops the program by name.
+fn shift(em: Emit, name: String, ins: String, a: String, b: String) -> Gotv {
+  match fresh(em) {
+    Fresh1(bad, em2) -> assign(trap_with(line(em2, bad <> " = icmp ugt i64 " <> b <> ", 63"), bad, "elya_shift_range(ptr @.name." <> name <> ", i64 " <> b <> ")"), ins <> " i64 " <> a <> ", " <> b, LI64)
+  }
+}
+fn prim(env: List(EBind), pend: List(Val), op: String, a: Val, b: Val, em: Emit) -> Gotv {
   match a {
     Val(x, at) -> match b {
       Val(y, _) -> if op == "Add" { checked(em, "sadd", x, y) } else { if op == "Sub" { checked(em, "ssub", x, y) } else { if op == "Mul" { checked(em, "smul", x, y) } else {
@@ -217,40 +259,60 @@ fn prim(op: String, a: Val, b: Val, em: Emit) -> Gotv {
               }
             }
           }
+        } else { if op == "Concat" {
+          rooted(em, roots(env, pend, Cons(a, Cons(b, Nil))), "call ptr @elya_str_concat(i64 0, ptr " <> x <> ", ptr " <> y <> ")", LPtr)
+        } else { if at == LPtr {
+          match assign(em, "call i64 @elya_str_eq(ptr " <> x <> ", ptr " <> y <> ")", LI64) {
+            Gotv(Val(r, _), em2) -> assign(em2, "icmp " <> (if op == "Eq" { "ne" } else { "eq" }) <> " i64 " <> r <> ", 0", LI1)
+          }
         } else {
           let cc = if op == "Eq" { "eq" } else { if op == "Ne" { "ne" } else { if op == "Lt" { "slt" } else { if op == "Le" { "sle" } else { if op == "Gt" { "sgt" } else { "sge" } } } } }
           assign(em, "icmp " <> cc <> " " <> lt_text(at) <> " " <> x <> ", " <> y, LI1)
-        } }
+        } } } }
       } } }
     }
   }
 }
 
-fn emit(sigs: List(ESig), env: List(EBind), e: CExpr, em: Emit) -> Gotv {
+fn builtin(env: List(EBind), pend: List(Val), n: String, vs: List(Val), em: Emit) -> Gotv {
+  let a = vtext(nth(vs, 0))
+  let b = vtext(nth(vs, 1))
+  if n == "int.to_string" { rooted(em, roots(env, pend, vs), "call ptr @elya_int_to_string(i64 0, i64 " <> a <> ")", LPtr) } else {
+  if n == "io.println" { rooted(em, roots(env, pend, vs), "call void @elya_println(ptr " <> a <> ")", LNone) } else {
+  if n == "string.length" { assign(em, "call i64 @elya_str_length(ptr " <> a <> ")", LI64) } else {
+  if n == "string.byte_at" { assign(em, "call i64 @elya_str_byte_at(ptr " <> a <> ", i64 " <> b <> ")", LI64) } else {
+  if n == "string.slice" { rooted(em, roots(env, pend, vs), "call ptr @elya_str_slice(i64 0, ptr " <> a <> ", i64 " <> b <> ", i64 " <> vtext(nth(vs, 2)) <> ")", LPtr) } else {
+  if n == "int.wrapping_add" { assign(em, "add i64 " <> a <> ", " <> b, LI64) } else {
+  if n == "int.wrapping_sub" { assign(em, "sub i64 " <> a <> ", " <> b, LI64) } else {
+  if n == "int.wrapping_mul" { assign(em, "mul i64 " <> a <> ", " <> b, LI64) } else {
+  if n == "int.and" { assign(em, "and i64 " <> a <> ", " <> b, LI64) } else {
+  if n == "int.or" { assign(em, "or i64 " <> a <> ", " <> b, LI64) } else {
+  if n == "int.xor" { assign(em, "xor i64 " <> a <> ", " <> b, LI64) } else {
+  if n == "int.shl" { shift(em, "shl", "shl", a, b) } else {
+  if n == "int.shr" { shift(em, "shr", "ashr", a, b) } else { shift(em, "ushr", "lshr", a, b) } } } } } } } } } } } } }
+}
+
+fn emit(sigs: List(ESig), env: List(EBind), pend: List(Val), e: CExpr, em: Emit) -> Gotv {
   match e {
     CExpr(_, _, t, k) -> match k {
-      KLit(LStr(v)) -> str_lit(em, v)
+      KLit(LStr(v)) -> str_lit(em, roots(env, pend, Nil), v)
       KLit(l) -> Gotv(Val(lit_value(l), lt_of(t)), em)
       KVar(n) -> Gotv(lookup(env, n), em)
-      KLet(n, v, b) -> match emit(sigs, env, v, em) { Gotv(val, em2) -> emit(sigs, Cons(EBind(n, val), env), b, em2) }
-      KPrim(op, Cons(a, Cons(b, Nil))) -> match emit(sigs, env, a, em) {
-        Gotv(va, em2) -> match emit(sigs, env, b, em2) { Gotv(vb, em3) -> prim(op, va, vb, em3) }
+      KLet(n, v, b) -> match emit(sigs, env, pend, v, em) { Gotv(val, em2) -> emit(sigs, Cons(EBind(n, val), env), pend, b, em2) }
+      KPrim(op, Cons(a, Cons(b, Nil))) -> match emit(sigs, env, pend, a, em) {
+        Gotv(va, em2) -> match emit(sigs, env, Cons(va, pend), b, em2) { Gotv(vb, em3) -> prim(env, pend, op, va, vb, em3) }
       }
-      KBuiltin(n, args) -> match emit_args(sigs, env, args, em, Nil) {
-        Gotvs(vs, em2) -> if n == "int.to_string" { assign(em2, "call ptr @elya_int_to_string(i64 0, " <> arg_list(vs) <> ")", LPtr) } else {
-          Gotv(Val("0", LI64), line(em2, "call void @elya_println(" <> arg_list(vs) <> ")"))
-        }
+      KBuiltin(n, args) -> match emit_args(sigs, env, pend, args, em, Nil) { Gotvs(vs, em2) -> builtin(env, pend, n, vs, em2) }
+      KApp(CExpr(_, _, _, KVar(f)), args) -> match emit_args(sigs, env, pend, args, em, Nil) {
+        Gotvs(vs, em2) -> match sig_of(sigs, f) { ESig(_, _, r) -> rooted(em2, roots(env, pend, vs), "call tailcc " <> lt_text(r) <> " @elya." <> f <> "(" <> arg_list(vs) <> ")", r) }
       }
-      KApp(CExpr(_, _, _, KVar(f)), args) -> match emit_args(sigs, env, args, em, Nil) {
-        Gotvs(vs, em2) -> match sig_of(sigs, f) { ESig(_, _, r) -> assign(em2, "call tailcc " <> lt_text(r) <> " @elya." <> f <> "(" <> arg_list(vs) <> ")", r) }
-      }
-      KIf(c, a, b) -> match emit(sigs, env, c, em) {
+      KIf(c, a, b) -> match emit(sigs, env, pend, c, em) {
         Gotv(Val(cv, _), em2) -> match new_label(em2) {
           Fresh1(lt, em3) -> match new_label(em3) {
             Fresh1(lf, em4) -> match new_label(em4) {
-              Fresh1(lj, em5) -> match emit(sigs, env, a, start_block(line(em5, "br i1 " <> cv <> ", label %" <> lt <> ", label %" <> lf), lt)) {
+              Fresh1(lj, em5) -> match emit(sigs, env, pend, a, start_block(line(em5, "br i1 " <> cv <> ", label %" <> lt <> ", label %" <> lf), lt)) {
                 Gotv(Val(av, _), em6) -> match label_of(em6) {
-                  AtLabel(la, em7) -> match emit(sigs, env, b, start_block(line(em7, "br label %" <> lj), lf)) {
+                  AtLabel(la, em7) -> match emit(sigs, env, pend, b, start_block(line(em7, "br label %" <> lj), lf)) {
                     Gotv(Val(bv, _), em8) -> match label_of(em8) {
                       AtLabel(lb, em9) -> assign(start_block(line(em9, "br label %" <> lj), lj), "phi " <> lt_text(lt_of(t)) <> " [ " <> av <> ", %" <> la <> " ], [ " <> bv <> ", %" <> lb <> " ]", lt_of(t))
                     }
@@ -267,24 +329,25 @@ fn emit(sigs: List(ESig), env: List(EBind), e: CExpr, em: Emit) -> Gotv {
 }
 
 // An expression in tail position: its value returned, a call of a function
-// `musttail` (the caller's and the callee's results are one type there).
+// `musttail` (the caller's and the callee's results are one type there;
+// nothing of the caller's is live after it, so nothing is rooted).
 fn emit_tail(sigs: List(ESig), env: List(EBind), e: CExpr, em: Emit, r: LTy) -> Emit {
   match e {
     CExpr(_, _, t, k) -> match k {
-      KLet(n, v, b) -> match emit(sigs, env, v, em) { Gotv(val, em2) -> emit_tail(sigs, Cons(EBind(n, val), env), b, em2, r) }
-      KIf(c, a, b) -> match emit(sigs, env, c, em) {
+      KLet(n, v, b) -> match emit(sigs, env, Nil, v, em) { Gotv(val, em2) -> emit_tail(sigs, Cons(EBind(n, val), env), b, em2, r) }
+      KIf(c, a, b) -> match emit(sigs, env, Nil, c, em) {
         Gotv(Val(cv, _), em2) -> match new_label(em2) {
           Fresh1(lt, em3) -> match new_label(em3) {
             Fresh1(lf, em4) -> emit_tail(sigs, env, b, start_block(emit_tail(sigs, env, a, start_block(line(em4, "br i1 " <> cv <> ", label %" <> lt <> ", label %" <> lf), lt), r), lf), r)
           }
         }
       }
-      KApp(CExpr(_, _, _, KVar(f)), args) -> match emit_args(sigs, env, args, em, Nil) {
+      KApp(CExpr(_, _, _, KVar(f)), args) -> match emit_args(sigs, env, Nil, args, em, Nil) {
         Gotvs(vs, em2) -> match fresh(em2) {
           Fresh1(v, em3) -> line(line(em3, v <> " = musttail call tailcc " <> lt_text(r) <> " @elya." <> f <> "(" <> arg_list(vs) <> ")"), "ret " <> lt_text(r) <> " " <> v)
         }
       }
-      _ -> match emit(sigs, env, e, em) { Gotv(Val(v, _), em2) -> line(em2, "ret " <> lt_text(r) <> " " <> v) }
+      _ -> match emit(sigs, env, Nil, e, em) { Gotv(Val(v, _), em2) -> line(em2, "ret " <> lt_text(r) <> " " <> v) }
     }
   }
 }
@@ -332,11 +395,22 @@ fn emit_strs(ss: List(SConst), b: Buffer) -> Buffer {
   }
 }
 fn prelude() -> String {
-  "; The back end in Elya, stage B1.\n" <>
+  "; The back end in Elya, stage B2.\n" <>
   "@.gc_desc = private unnamed_addr constant [4 x i64] [i64 0, i64 0, i64 -1, i64 0]\n" <>
   "@.eq_float = private unnamed_addr constant [1 x i64] zeroinitializer\n" <>
   "declare ptr @elya_str_lit(i64, ptr, i64)\n" <>
   "declare ptr @elya_int_to_string(i64, i64)\n" <>
+  "declare ptr @elya_str_concat(i64, ptr, ptr)\n" <>
+  "declare i64 @elya_str_eq(ptr, ptr)\n" <>
+  "declare i64 @elya_str_length(ptr)\n" <>
+  "declare i64 @elya_str_byte_at(ptr, i64)\n" <>
+  "declare ptr @elya_str_slice(i64, ptr, i64, i64)\n" <>
+  "declare void @elya_shift_range(ptr, i64)\n" <>
+  "declare void @elya_gc_push(ptr)\n" <>
+  "declare void @elya_gc_pop()\n" <>
+  "@.name.shl = private unnamed_addr constant [4 x i8] c\"shl\\00\"\n" <>
+  "@.name.shr = private unnamed_addr constant [4 x i8] c\"shr\\00\"\n" <>
+  "@.name.ushr = private unnamed_addr constant [5 x i8] c\"ushr\\00\"\n" <>
   "declare void @elya_println(ptr)\n" <>
   "declare void @elya_int_overflow()\n" <>
   "declare void @elya_div_zero()\n" <>
@@ -358,7 +432,7 @@ fn entry(main_lt: LTy) -> String {
   "@.true = private unnamed_addr constant [4 x i8] c\"True\"\n@.false = private unnamed_addr constant [5 x i8] c\"False\"\n\n" <>
   "define i64 @elya_entry() {\nentry:\n  %v = call tailcc " <> lt_text(main_lt) <> " @elya.main()\n" <>
   (if main_lt == LI1 {
-    "  %t = call ptr @elya_str_lit(i64 0, ptr @.true, i64 4)\n  %f = call ptr @elya_str_lit(i64 0, ptr @.false, i64 5)\n  %s = select i1 %v, ptr %t, ptr %f\n  call void @elya_println(ptr %s)\n  ret i64 0\n}\n\n"
+    "  %t = call ptr @elya_str_lit(i64 0, ptr @.true, i64 4)\n  call void @elya_gc_push(ptr %t)\n  %f = call ptr @elya_str_lit(i64 0, ptr @.false, i64 5)\n  call void @elya_gc_pop()\n  %s = select i1 %v, ptr %t, ptr %f\n  call void @elya_println(ptr %s)\n  ret i64 0\n}\n\n"
   } else { "  ret i64 %v\n}\n\n" }) <>
   "define i32 @main(i32 %0, ptr %1) {\nentry:\n  call void @elya_gc_init(ptr @.gc_desc, i64 2)\n  call void @elya_eq_init(ptr @.eq_float, i64 0)\n" <>
   "  call void @elya_args_init(i32 %0, ptr %1)\n  %v = call i64 @elya_start(ptr @elya_entry)\n" <>

@@ -31,8 +31,18 @@ count, Windows CI, then `main`.
    after focused programs were added for them). `main`'s value is printed
    as the Rust back end prints it: an `Int` or `Unit` by `elya_main_int`, a
    `Bool` by name.
-3. [ ] **B2-B3**: strings and builtins; ground ADTs and `match` (pattern
-   flattening in `selfhost/lower.elya`).
+3. [x] **B2** (2026-11-27): `String` (literals, `<>`, `==`, `string.*`),
+   `int.*` (wrapping, bitwise, shifts with their range stop), and rooting:
+   every heap value of the scope, the operands already computed and a
+   call's arguments are on the shadow stack across a call that may
+   allocate. The harness also runs every Elya-built program collecting at
+   every allocation (`ELYA_GC_STRESS=1`), where an unrooted value is freed
+   and poisoned: that run found two rooting faults at once (the entry's
+   `True`/`False`, and a constant split inside a UTF-8 character). 51
+   corpus programs and 25 focused ones agree; controls E1-E7 in the
+   header, E3 argued (the runtime roots its own arguments).
+4. [ ] **B3**: ground ADTs and `match` (pattern flattening in
+   `selfhost/lower.elya`).
 4. [ ] **B4**: monomorphization (`selfhost/mono.elya`).
 5. [ ] **B5-B8**: closures; arrays, buffers, `io.*`; imports (after part
    4c); the self-hosted sources themselves.

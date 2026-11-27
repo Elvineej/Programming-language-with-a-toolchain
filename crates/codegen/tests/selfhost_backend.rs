@@ -18,6 +18,17 @@
 //! D8, a quote in a string constant unescaped: focused #10 (the IR does
 //! not build).
 //! D9, `MIN / -1` unchecked: focused #6.
+//! E1, the arguments computed before a call's next one not rooted:
+//! focused #16 (collecting at every allocation).
+//! E2, the scope's heap values not rooted: tests/string_bytes.rs.
+//! E4, `==` on strings inverted: focused #17.
+//! E5, a shift's range unchecked: focused #21.
+//! E6, `int.shr` logical: focused #20.
+//! E7, a binary operator's left operand not rooted: tests/crosscheck.rs.
+//! E3 (a call's own arguments not rooted) cannot be seen: the runtime roots
+//! its arguments before it allocates (`elya_str_concat`, `elya_str_slice`)
+//! and a function roots its parameters as its scope; they stay rooted, as
+//! the Rust back end roots them.
 
 // Only the module reader is used here.
 #[allow(dead_code)]
@@ -41,14 +52,26 @@ fn the_back_end_in_elya_agrees_with_rusts() {
         .unwrap();
 }
 
-fn run(exe: &Path) -> Output {
-    Command::new(exe)
-        .env_remove("ELYA_RECORD")
+fn run(exe: &Path, stress: bool) -> Output {
+    let mut cmd = Command::new(exe);
+    cmd.env_remove("ELYA_RECORD")
         .env_remove("ELYA_REPLAY")
         .env_remove("ELYA_GC_STRESS")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .expect("run a built program")
+        .stdin(std::process::Stdio::null());
+    // A collection at every allocation: a heap value the program did not
+    // root is freed and poisoned, and reaching it stops the program.
+    if stress {
+        cmd.env("ELYA_GC_STRESS", "1");
+    }
+    cmd.output().expect("run a built program")
+}
+
+fn shown(o: &Output) -> (String, String, Option<i32>) {
+    (
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+        o.status.code(),
+    )
 }
 
 /// The Rust back end's program for `text`, or `None` when it does not build
@@ -142,19 +165,16 @@ fn proof() {
         if let Err(e) = elya_codegen::link(&ll, &elya_exe) {
             panic!("{name}: the IR does not build: {e}\n{ir}");
         }
-        let (want, got) = (run(&rust_exe), run(&elya_exe));
+        let (want, got) = (run(&rust_exe, false), run(&elya_exe, false));
         assert_eq!(
-            (
-                String::from_utf8_lossy(&got.stdout),
-                String::from_utf8_lossy(&got.stderr),
-                got.status.code()
-            ),
-            (
-                String::from_utf8_lossy(&want.stdout),
-                String::from_utf8_lossy(&want.stderr),
-                want.status.code()
-            ),
+            shown(&got),
+            shown(&want),
             "{name}: the Elya-built program (left) and the Rust-built one (right)"
+        );
+        assert_eq!(
+            shown(&run(&elya_exe, true)),
+            shown(&want),
+            "{name}: the Elya-built program collecting at every allocation (left) and the Rust-built one (right)"
         );
         compared += 1;
     }
