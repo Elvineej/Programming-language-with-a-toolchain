@@ -2562,7 +2562,7 @@ fn host_signature(m: String, n: String) -> Sig {
         if n == "file_exists" { Sig(Cons(TB(3), Nil), TB(2)) } else {
           if n == "write_file" { Sig(Cons(TB(3), Cons(TB(3), Nil)), TB(4)) } else {
             if n == "read_stdin" { Sig(Nil, TB(3)) } else {
-              if n == "arg_count" { Sig(Nil, TB(0)) } else { if n == "arg" { Sig(Cons(TB(0), Nil), TB(3)) } else { NoSig } }
+              if n == "arg_count" { Sig(Nil, TB(0)) } else { if n == "arg" { Sig(Cons(TB(0), Nil), TB(3)) } else { if n == "run" { Sig(Cons(TB(3), Nil), TB(0)) } else { NoSig } } }
             }
           }
         }
@@ -4390,7 +4390,9 @@ fn note_pats(s: St, ps: List(Sp(Pattern)), env: List(Entry)) -> St {
   match ps { Nil -> s  Cons(p, rest) -> note_pats(note_pat(s, p, env), rest, env) }
 }
 
-pub fn check_dump(m: Module, size: Int) -> String {
+type Ran { Ran(List(SchemeLine), St) }
+// Inference over the whole module: the scheme lines and the final state.
+fn infer_module(m: Module, size: Int) -> Ran {
   match m {
     Module(_, decls) -> {
       let af0 = Af(affine.facts(m, size), Nil, Nil, Nil, Nil, Nil, Cons("Buffer", Cons("Array", linear_names(decls, Nil))))
@@ -4401,22 +4403,72 @@ pub fn check_dump(m: Module, size: Int) -> String {
       let st1 = set_hx(st0, Hx(Nil, Nil, 0, Nil, effect_names(decls, Nil), Nil, multi_names(decls, Nil), Gn(0, Nil, Nil), af0))
       let declared = match type_decls(st1, decls, Nil) { R(env0, s0) -> R(env0, effect_decls(s0, decls)) }
       match match declared { R(env0, s0) -> groups(s0, fns, order, env0, Nil) } {
-        R(lines, s) -> match s {
-          St(sub, lv, cur, ds0, rs, cx, rw, gx, eq, hx) -> {
-            // D7: the affine diagnostics after the others, and only when
-            // there is no other error (`with_affine`).
-            let ds = match hx { Hx(_, _, _, _, _, _, _, _, Af(_, _, _, _, _, ad, _)) -> if any_error(ds0) { ds0 } else { append(ad, ds0) } }
-            let b1 = dump_schemes(sort_by(rev(lines), line_le), buffer.new())
-            let recs = last_per_span(sort_by(rs, rec_le), 0 - 1, 0 - 1, Nil)
-            match dump_types(St(sub, lv, cur, Nil, Nil, cx, rw, gx, eq, hx), recs, b1) {
-              R(b2, _) -> buffer.finish(dump_diags(rev(ds), b2))
-            }
-          }
+        R(lines, s) -> Ran(lines, s)
+      }
+    }
+  }
+}
+// The diagnostics in order, the affine ones after the others and only when
+// there is no other error (D7, `with_affine`).
+fn all_diags(ds0: List(Diag), hx: Hx) -> List(Diag) {
+  match hx {
+    Hx(_, _, _, _, _, _, _, _, Af(_, _, _, _, _, ad, _)) -> rev(if any_error(ds0) { ds0 } else { append(ad, ds0) })
+  }
+}
+
+pub fn check_dump(m: Module, size: Int) -> String {
+  match infer_module(m, size) {
+    Ran(lines, s) -> match s {
+      St(sub, lv, cur, ds0, rs, cx, rw, gx, eq, hx) -> {
+        let ds = all_diags(ds0, hx)
+        let b1 = dump_schemes(sort_by(rev(lines), line_le), buffer.new())
+        let recs = last_per_span(sort_by(rs, rec_le), 0 - 1, 0 - 1, Nil)
+        match dump_types(St(sub, lv, cur, Nil, Nil, cx, rw, gx, eq, hx), recs, b1) {
+          R(b2, _) -> buffer.finish(dump_diags(ds, b2))
         }
       }
     }
   }
 }
+
+// What Core reads (self-hosting part 5, spec 2026-11-27-elya-backend-in-elya
+// D3): every node's type by span, sorted, each resolved through the final
+// substitution, so one variable is one `TVar` across the whole module; and
+// whether the program has an error.
+type Typed { Typed(List(Rec), Bool) }
+fn resolve_recs(s: St, rs: List(Rec), acc: List(Rec)) -> List(Rec) {
+  match rs {
+    Nil -> rev(acc)
+    Cons(Rec(a, b, t), rest) -> match resolve(s, t) { R(rt, s2) -> resolve_recs(s2, rest, Cons(Rec(a, b, rt), acc)) }
+  }
+}
+pub fn typed(m: Module, size: Int) -> Typed {
+  match infer_module(m, size) {
+    Ran(_, s) -> match s {
+      St(sub, lv, cur, ds0, rs, cx, rw, gx, eq, hx) -> {
+        let err = any_error(all_diags(ds0, hx))
+        let recs = last_per_span(sort_by(rs, rec_le), 0 - 1, 0 - 1, Nil)
+        Typed(resolve_recs(St(sub, lv, cur, Nil, Nil, cx, rw, gx, eq, hx), recs, Nil), err)
+      }
+    }
+  }
+}
+pub fn show_ty(t: Ty, names: Names) -> Shown { show(t, names) }
+
+// The checker's diagnostics in the dump form, for the driver (spec
+// 2026-11-27-elya-the-switch D2), and whether one is an error.
+type Checked { Checked(String, Bool) }
+pub fn diagnostics(m: Module, size: Int) -> Checked {
+  match infer_module(m, size) {
+    Ran(_, s) -> match s {
+      St(_, _, _, ds0, _, _, _, _, _, hx) -> {
+        let ds = all_diags(ds0, hx)
+        Checked(buffer.finish(dump_diags(ds, buffer.new())), any_error(ds))
+      }
+    }
+  }
+}
+pub fn no_names() -> Names { Names(Nil, 0) }
 
 pub fn main() / {IO} {
   let text = io.read_file(io.arg(0))

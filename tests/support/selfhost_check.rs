@@ -482,13 +482,20 @@ pub const FOCUSED_F5: &[&str] = &[
     "linear type Tok { Tok(Int) }\neffect Put { fn put(t: Tok) -> Int }\nfn h(body) { handle { body() } with any { op(o) -> resume(op.perform(o)) } }\nfn h2(body) { h(body) }\nfn f() { h2(fn() { put(Tok(1)) }) + h2(fn() { put(Tok(2)) }) }\npub fn main() -> Int { 0 }\n",
 ];
 
-/// The checker's imports: the parser in Elya, its lexer, and the affine pass
-/// (its facts, from stage F5).
+/// The self-hosted passes' imports: the parser in Elya, its lexer, the affine
+/// pass (its facts, from stage F5), the checker (its types, for Core) and
+/// Core and monomorphization (for the back end).
 pub fn reader(name: &str) -> Option<(String, String)> {
     let file = match name {
         "parse" => "selfhost/parse.elya",
         "lex" => "selfhost/lex.elya",
         "affine" => "selfhost/affine.elya",
+        "check" => "selfhost/check.elya",
+        "core" => "selfhost/core.elya",
+        "mono" => "selfhost/mono.elya",
+        "resolve" => "selfhost/resolve.elya",
+        "exhaust" => "selfhost/exhaust.elya",
+        "emit" => "selfhost/emit.elya",
         _ => return None,
     };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
