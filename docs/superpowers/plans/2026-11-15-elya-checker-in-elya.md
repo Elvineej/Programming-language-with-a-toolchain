@@ -13,7 +13,21 @@ Spec: `docs/superpowers/specs/2026-11-15-elya-checker-in-elya-design.md`.
    pinned output. Its notes, now in the spec: the exhaust dump runs on
    ill-typed programs on purpose; `resumes` keeps the walk's order; inference
    analyzes the same module. Docs only after the gate.
-2. [ ] 4d, `selfhost/exhaust.elya`: Codex, after 4c.
+2. [x] 4d, `selfhost/exhaust.elya` (**built** 2026-11-24 by Claude, since
+   Codex was out of reach): Maranget's usefulness, as in src/exhaust.rs,
+   keeping Rust's behaviour on ragged rows (an ill-typed constructor
+   pattern) and the walk's order of diagnostics. Tests:
+   tests/selfhost_exhaust.rs and crates/codegen/tests/selfhost_exhaust.rs
+   compare `elya exhaust --dump` on every corpus program that resolves
+   without an error, ill-typed ones included (503), and 20 focused
+   programs, in the evaluator and natively. Controls E1-E18 in the test's
+   header, all caught. Review: no defect; 7,948 random programs that
+   resolve (5,334 with diagnostics) agree natively. Of 102 mutants, 10 are
+   equivalent (a witness never holds an Int or String literal, those
+   columns being infinite, so `debug_str` is kept only as Rust's twin; a
+   constructor is never declared twice, E0209; a message never needs
+   quoting), and 14 lived through the tests: ten more focused programs
+   kill them.
 3. [x] 4e, `selfhost/affine.elya` (**built** 2026-11-24 by Claude, since
    the checker's F5 stage needed its facts first; `pub fn facts` is the
    entry F5 calls, and `Frame`/`Why` became `CFrame`/`AWhy` so the names do

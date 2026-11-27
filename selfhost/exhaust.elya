@@ -1,0 +1,329 @@
+// Exhaustiveness in Elya, self-hosting part 4d (spec
+// docs/superpowers/specs/2026-11-15-elya-checker-in-elya-design.md D2).
+// Oracle: src/exhaust.rs (`exhaust::check`) through `elya exhaust --dump`.
+// Maranget's usefulness: a `match` is exhaustive when a wildcard is not
+// useful against its arms (else E0430 with a witness), and an arm is
+// unreachable when it is not useful against the arms before it (E0431, a
+// warning). No types are read: a column's constructors come from the
+// `type` declarations, or from the literals themselves.
+//
+// The pass runs on programs with type errors too, so rows may be ragged (a
+// pattern given more or fewer arguments than its constructor has): every
+// step keeps Rust's behaviour on them, a row with no head matching nothing.
+import parse / {IO}
+
+fn rev_onto(xs: List(a), acc: List(a)) -> List(a) {
+  match xs { Nil -> acc  Cons(x, rest) -> rev_onto(rest, Cons(x, acc)) }
+}
+fn rev(xs: List(a)) -> List(a) { rev_onto(xs, Nil) }
+fn append(xs: List(a), ys: List(a)) -> List(a) { rev_onto(rev(xs), ys) }
+fn len_from(xs: List(a), n: Int) -> Int { match xs { Nil -> n  Cons(_, rest) -> len_from(rest, n + 1) } }
+fn len(xs: List(a)) -> Int { len_from(xs, 0) }
+
+// ---- Patterns ---------------------------------------------------------------
+
+type XCon { XData(String), XBool(Bool), XInt(Int), XStr(String), XUnit }
+type XPat { XWild, XApp(XCon, List(XPat)) }
+type Sib { Sib(String, Int) }
+type Sibs { Sibs(String, List(Sib)) }
+type Use { Useless, Witness(List(XPat)) }
+
+fn con_eq(a: XCon, b: XCon) -> Bool {
+  match a {
+    XData(x) -> match b { XData(y) -> x == y  _ -> False }
+    XBool(x) -> match b { XBool(y) -> x == y  _ -> False }
+    XInt(x) -> match b { XInt(y) -> x == y  _ -> False }
+    XStr(x) -> match b { XStr(y) -> x == y  _ -> False }
+    XUnit -> match b { XUnit -> True  _ -> False }
+  }
+}
+fn has_con(xs: List(XCon), c: XCon) -> Bool {
+  match xs { Nil -> False  Cons(x, rest) -> con_eq(x, c) || has_con(rest, c) }
+}
+
+fn lower(p: Pattern) -> XPat {
+  match p {
+    PWild -> XWild
+    PVar(_) -> XWild
+    PCtor(name, args) -> XApp(XData(name), lower_args(args))
+    PInt(n) -> XApp(XInt(n), Nil)
+    PBool(b) -> XApp(XBool(b), Nil)
+    PStr(s) -> XApp(XStr(s), Nil)
+    PUnit -> XApp(XUnit, Nil)
+  }
+}
+fn lower_args(xs: List(Sp(Pattern))) -> List(XPat) {
+  match xs { Nil -> Nil  Cons(Sp(p, _, _), rest) -> Cons(lower(p), lower_args(rest)) }
+}
+
+fn wilds(n: Int, tail: List(XPat)) -> List(XPat) {
+  if n <= 0 { tail } else { wilds(n - 1, Cons(XWild, tail)) }
+}
+
+// ---- Constructor sets ------------------------------------------------------
+
+fn sib_lookup(sib: List(Sibs), name: String) -> List(Sib) {
+  match sib { Nil -> Nil  Cons(Sibs(n, all), rest) -> if n == name { all } else { sib_lookup(rest, name) } }
+}
+
+// The distinct head constructors of the first column, in row order.
+fn column_cons(m: List(List(XPat)), acc: List(XCon)) -> List(XCon) {
+  match m {
+    Nil -> rev(acc)
+    Cons(Cons(XApp(c, _), _), rest) -> column_cons(rest, if has_con(acc, c) { acc } else { Cons(c, acc) })
+    Cons(_, rest) -> column_cons(rest, acc)
+  }
+}
+
+type CA { CA(XCon, Int) }
+type Sig { Finite(List(CA)), Infinite }
+
+fn sibs_cas(xs: List(Sib)) -> List(CA) {
+  match xs { Nil -> Nil  Cons(Sib(n, a), rest) -> Cons(CA(XData(n), a), sibs_cas(rest)) }
+}
+fn signature(heads: List(XCon), sib: List(Sibs)) -> Sig {
+  match heads {
+    Nil -> Infinite
+    Cons(XData(name), _) -> Finite(sibs_cas(sib_lookup(sib, name)))
+    Cons(XBool(_), _) -> Finite(Cons(CA(XBool(True), 0), Cons(CA(XBool(False), 0), Nil)))
+    Cons(XUnit, _) -> Finite(Cons(CA(XUnit, 0), Nil))
+    Cons(_, _) -> Infinite
+  }
+}
+
+fn all_present(all: List(CA), heads: List(XCon)) -> Bool {
+  match all { Nil -> True  Cons(CA(c, _), rest) -> has_con(heads, c) && all_present(rest, heads) }
+}
+fn first_missing(all: List(CA), heads: List(XCon)) -> CA {
+  match all { Nil -> CA(XUnit, 0)  Cons(CA(c, a), rest) -> if has_con(heads, c) { first_missing(rest, heads) } else { CA(c, a) } }
+}
+
+// ---- The matrix ------------------------------------------------------------
+
+fn specialize(m: List(List(XPat)), c: XCon, arity: Int) -> List(List(XPat)) {
+  match m {
+    Nil -> Nil
+    Cons(row, rest) -> match row {
+      Cons(XApp(rc, rargs), tail) -> if con_eq(rc, c) { Cons(append(rargs, tail), specialize(rest, c, arity)) } else { specialize(rest, c, arity) }
+      Cons(XWild, tail) -> Cons(wilds(arity, tail), specialize(rest, c, arity))
+      Nil -> specialize(rest, c, arity)
+    }
+  }
+}
+fn default_matrix(m: List(List(XPat))) -> List(List(XPat)) {
+  match m {
+    Nil -> Nil
+    Cons(Cons(XWild, tail), rest) -> Cons(tail, default_matrix(rest))
+    Cons(_, rest) -> default_matrix(rest)
+  }
+}
+
+fn take(xs: List(XPat), n: Int) -> List(XPat) {
+  if n <= 0 { Nil } else { match xs { Nil -> Nil  Cons(x, rest) -> Cons(x, take(rest, n - 1)) } }
+}
+fn drop(xs: List(XPat), n: Int) -> List(XPat) {
+  if n <= 0 { xs } else { match xs { Nil -> Nil  Cons(_, rest) -> drop(rest, n - 1) } }
+}
+fn rebuild(c: XCon, arity: Int, w: List(XPat)) -> List(XPat) {
+  Cons(XApp(c, take(w, arity)), drop(w, arity))
+}
+
+fn useful(m: List(List(XPat)), q: List(XPat), sib: List(Sibs)) -> Use {
+  match q {
+    Nil -> match m { Nil -> Witness(Nil)  _ -> Useless }
+    Cons(XApp(c, cargs), qrest) -> {
+      let arity = len(cargs)
+      match useful(specialize(m, c, arity), append(cargs, qrest), sib) {
+        Useless -> Useless
+        Witness(w) -> Witness(rebuild(c, arity, w))
+      }
+    }
+    Cons(XWild, qrest) -> {
+      let heads = column_cons(m, Nil)
+      match signature(heads, sib) {
+        Finite(all) -> if all_present(all, heads) { each_con(m, all, qrest, sib) } else {
+          match useful(default_matrix(m), qrest, sib) {
+            Useless -> Useless
+            Witness(w) -> match first_missing(all, heads) { CA(mc, ma) -> Witness(Cons(XApp(mc, wilds(ma, Nil)), w)) }
+          }
+        }
+        Infinite -> match useful(default_matrix(m), qrest, sib) {
+          Useless -> Useless
+          Witness(w) -> Witness(Cons(XWild, w))
+        }
+      }
+    }
+  }
+}
+fn each_con(m: List(List(XPat)), all: List(CA), qrest: List(XPat), sib: List(Sibs)) -> Use {
+  match all {
+    Nil -> Useless
+    Cons(CA(c, arity), rest) -> match useful(specialize(m, c, arity), wilds(arity, qrest), sib) {
+      Witness(w) -> Witness(rebuild(c, arity, w))
+      Useless -> each_con(m, rest, qrest, sib)
+    }
+  }
+}
+
+// ---- Rendering -------------------------------------------------------------
+
+fn hex_digit(n: Int) -> String { string.slice("0123456789abcdef", n, n + 1) }
+fn hex(n: Int) -> String { if n < 16 { hex_digit(n) } else { hex(n / 16) <> hex_digit(n - (n / 16) * 16) } }
+
+// Rust's `{:?}` of a string, for the escapes a source literal can hold.
+fn debug_from(s: String, i: Int, from: Int, acc: String) -> String {
+  if i >= string.length(s) { acc <> string.slice(s, from, i) } else {
+    let b = string.byte_at(s, i)
+    let esc = if b == 34 { "\\\"" } else { if b == 92 { "\\\\" } else { if b == 10 { "\\n" } else { if b == 9 { "\\t" } else { if b == 13 { "\\r" } else { if b == 0 { "\\0" } else { if b < 32 || b == 127 { "\\u{" <> hex(b) <> "}" } else { "" } } } } } } }
+    if string.length(esc) == 0 { debug_from(s, i + 1, from, acc) } else {
+      debug_from(s, i + 1, i + 1, acc <> string.slice(s, from, i) <> esc)
+    }
+  }
+}
+fn debug_str(s: String) -> String { "\"" <> debug_from(s, 0, 0, "") <> "\"" }
+
+fn render(p: XPat) -> String {
+  match p {
+    XWild -> "_"
+    XApp(XData(name), args) -> match args { Nil -> name  _ -> name <> "(" <> render_args(args) <> ")" }
+    XApp(XBool(b), _) -> if b { "True" } else { "False" }
+    XApp(XInt(n), _) -> int.to_string(n)
+    XApp(XStr(s), _) -> debug_str(s)
+    XApp(XUnit, _) -> "Unit"
+  }
+}
+fn render_args(xs: List(XPat)) -> String {
+  match xs { Nil -> ""  Cons(x, Nil) -> render(x)  Cons(x, rest) -> render(x) <> ", " <> render_args(rest) }
+}
+
+// ---- Diagnostics -----------------------------------------------------------
+
+type XDiag { XDiag(Bool, String, Int, Int, String) }
+
+fn arm_rows(arms: List(Sp(MatchArm))) -> List(List(XPat)) {
+  match arms { Nil -> Nil  Cons(Sp(MatchArm(Sp(p, _, _), _), _, _), rest) -> Cons(Cons(lower(p), Nil), arm_rows(rest)) }
+}
+fn useless_arms(arms: List(Sp(MatchArm)), before: List(List(XPat)), sib: List(Sibs), out: List(XDiag)) -> List(XDiag) {
+  match arms {
+    Nil -> out
+    Cons(Sp(MatchArm(Sp(p, a, b), _), _, _), rest) -> {
+      let row = Cons(lower(p), Nil)
+      let out2 = match useful(rev(before), row, sib) {
+        Useless -> Cons(XDiag(False, "E0431", a, b, "unreachable match arm"), out)
+        Witness(_) -> out
+      }
+      useless_arms(rest, Cons(row, before), sib, out2)
+    }
+  }
+}
+fn check_match(arms: List(Sp(MatchArm)), a: Int, b: Int, sib: List(Sibs), out: List(XDiag)) -> List(XDiag) {
+  let out2 = useless_arms(arms, Nil, sib, out)
+  match useful(arm_rows(arms), Cons(XWild, Nil), sib) {
+    Useless -> out2
+    Witness(w) -> {
+      let shown = match w { Nil -> "_"  Cons(x, _) -> render(x) }
+      Cons(XDiag(True, "E0430", a, b, "non-exhaustive match: `" <> shown <> "` is not covered"), out2)
+    }
+  }
+}
+
+// Diagnostics are gathered in reverse.
+fn walk(e: Sp(Expr), sib: List(Sibs), out: List(XDiag)) -> List(XDiag) {
+  match e {
+    Sp(EMatch(scrut, arms), a, b) -> {
+      let out2 = walk_arms(arms, sib, walk(scrut, sib, out))
+      match arms { Nil -> out2  _ -> check_match(arms, a, b, sib, out2) }
+    }
+    Sp(ECall(callee, args), _, _) -> walk_list(args, sib, walk(callee, sib, out))
+    Sp(EUnary(_, x), _, _) -> walk(x, sib, out)
+    Sp(EBinary(_, l, r), _, _) -> walk(r, sib, walk(l, sib, out))
+    Sp(EIf(c, Sp(t, _, _), Sp(f, _, _)), _, _) -> walk_block(f, sib, walk_block(t, sib, walk(c, sib, out)))
+    Sp(EBlock(blk), _, _) -> walk_block(blk, sib, out)
+    Sp(EHandle(body, Handler(_, _, clauses, ret)), _, _) -> {
+      let out2 = walk_clauses(clauses, sib, walk(body, sib, out))
+      match ret { No -> out2  Yes(ReturnClause(_, r)) -> walk(r, sib, out2) }
+    }
+    Sp(EResume(x), _, _) -> walk(x, sib, out)
+    Sp(ELambda(_, Sp(blk, _, _)), _, _) -> walk_block(blk, sib, out)
+    _ -> out
+  }
+}
+fn walk_list(xs: List(Sp(Expr)), sib: List(Sibs), out: List(XDiag)) -> List(XDiag) {
+  match xs { Nil -> out  Cons(x, rest) -> walk_list(rest, sib, walk(x, sib, out)) }
+}
+fn walk_arms(xs: List(Sp(MatchArm)), sib: List(Sibs), out: List(XDiag)) -> List(XDiag) {
+  match xs { Nil -> out  Cons(Sp(MatchArm(_, body), _, _), rest) -> walk_arms(rest, sib, walk(body, sib, out)) }
+}
+fn walk_clauses(xs: List(Sp(OpClause)), sib: List(Sibs), out: List(XDiag)) -> List(XDiag) {
+  match xs { Nil -> out  Cons(Sp(OpClause(_, _, _, body), _, _), rest) -> walk_clauses(rest, sib, walk(body, sib, out)) }
+}
+fn walk_block(blk: Block, sib: List(Sibs), out: List(XDiag)) -> List(XDiag) {
+  match blk {
+    Block(stmts, tail) -> {
+      let out2 = walk_stmts(stmts, sib, out)
+      match tail { No -> out2  Yes(t) -> walk(t, sib, out2) }
+    }
+  }
+}
+fn walk_stmts(xs: List(Sp(Stmt)), sib: List(Sibs), out: List(XDiag)) -> List(XDiag) {
+  match xs {
+    Nil -> out
+    Cons(Sp(SLet(_, _, v), _, _), rest) -> walk_stmts(rest, sib, walk(v, sib, out))
+    Cons(Sp(SExpr(x), _, _), rest) -> walk_stmts(rest, sib, walk(x, sib, out))
+  }
+}
+
+// Constructor name to its type's constructors: a later type's entry wins in
+// Rust's map, so the list is searched newest first.
+fn variant_sibs(vs: List(Sp(VariantDecl))) -> List(Sib) {
+  match vs { Nil -> Nil  Cons(Sp(VariantDecl(n, fields), _, _), rest) -> Cons(Sib(n, len(fields)), variant_sibs(rest)) }
+}
+fn add_sibs(vs: List(Sp(VariantDecl)), all: List(Sib), acc: List(Sibs)) -> List(Sibs) {
+  match vs { Nil -> acc  Cons(Sp(VariantDecl(n, _), _, _), rest) -> add_sibs(rest, all, Cons(Sibs(n, all), acc)) }
+}
+fn siblings(ds: List(Sp(Decl)), acc: List(Sibs)) -> List(Sibs) {
+  match ds {
+    Nil -> acc
+    Cons(Sp(DType(_, _, _, vs), _, _), rest) -> siblings(rest, add_sibs(vs, variant_sibs(vs), acc))
+    Cons(_, rest) -> siblings(rest, acc)
+  }
+}
+fn walk_fns(ds: List(Sp(Decl)), sib: List(Sibs), out: List(XDiag)) -> List(XDiag) {
+  match ds {
+    Nil -> out
+    Cons(Sp(DFn(_, _, _, _, _, Sp(blk, _, _)), _, _), rest) -> walk_fns(rest, sib, walk_block(blk, sib, out))
+    Cons(_, rest) -> walk_fns(rest, sib, out)
+  }
+}
+
+pub fn check(m: Module) -> List(XDiag) {
+  match m { Module(_, ds) -> rev(walk_fns(ds, siblings(ds, Nil), Nil)) }
+}
+
+// `dump_diagnostics`'s quoting.
+fn quote_from(s: String, i: Int, from: Int, acc: String) -> String {
+  if i >= string.length(s) { acc <> string.slice(s, from, i) } else {
+    let b = string.byte_at(s, i)
+    let esc = if b == 10 { "\\n" } else { if b == 9 { "\\t" } else { if b == 13 { "\\r" } else { if b == 92 { "\\\\" } else { if b == 34 { "\\\"" } else { "" } } } } }
+    if string.length(esc) == 0 { quote_from(s, i + 1, from, acc) } else {
+      quote_from(s, i + 1, i + 1, acc <> string.slice(s, from, i) <> esc)
+    }
+  }
+}
+fn dump(ds: List(XDiag), b: Buffer) -> Buffer {
+  match ds {
+    Nil -> b
+    Cons(XDiag(err, code, s, e, msg), rest) -> dump(rest, buffer.push(b, (if err { "error " } else { "warning " }) <> code <> " " <> int.to_string(s) <> " " <> int.to_string(e) <> " \"" <> quote_from(msg, 0, 0, "") <> "\"\n"))
+  }
+}
+
+pub fn main() / {IO} {
+  let text = io.read_file(io.arg(0))
+  match parse.parse_tree(text) {
+    Parsed(m, _) -> {
+      let out = buffer.finish(dump(check(m), buffer.new()))
+      if string.length(out) == 0 { Unit } else { io.println(string.slice(out, 0, string.length(out) - 1)) }
+    }
+    ParseError(_, _, _) -> Unit
+  }
+}
