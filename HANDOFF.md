@@ -30,7 +30,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1672 passed, 202 suites (2026-11-27), and configuration C
+- Linux gate at the tip of `main`: 1690 passed, 213 suites (2026-11-27), and configuration C
   (the boards on QEMU; `check.sh` fails without its tools unless
   `ELYA_BOARDS=skip`) 8 passed, 2 suites. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
@@ -74,7 +74,10 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   both board toolchains, so Codex jobs build and run everything (GPT-6.1 Sol,
   effort Ultra, the most offered). Its work goes on `codex/*` branches as pull
   requests; Claude checks and lands it. The chat (GitHub connector) can read
-  and review but not run.
+  and review but not run. On 2026-11-27 the desktop Codex app could not start
+  its app-server ("Permission mode is unavailable"); jobs go through
+  chatgpt.com/codex in the maintainer's Chrome (the Claude extension), the
+  cloud environment above, effort Ultra (GPT-6.2 Sol).
   `elya_eq` takes a fourth argument (the first closure tag) since 2026-10-23.
 - Interactive sessions use the same `AUTO_RUN_LOG.md` lock: an IN PROGRESS entry
   under 3 hours old makes a scheduled run exit.
@@ -841,18 +844,28 @@ programs agreed, 44 programs from its mutation run pinned), **4d** (c523903:
 exhaustiveness, `selfhost/exhaust.elya`; 7,948 random programs agreed, 10
 pinned) and **F5** (duplicability, reading 4e's facts; its review found one
 defect, a pattern's binders noted too early, fixed, and 21 programs pinned)
-are on `main`. Next: **4c**, modules and resolution (`selfhost/resolve.elya`,
-a subagent's job, under way on branch `resolve4c`), then **F6** (imports,
-E0606). **Part 5 is begun** (spec `2026-11-27-elya-backend-in-elya-design.md`,
-plan beside it, both on the working branch `f5` until they land): Core in
-Elya (`selfhost/core.elya`, compared byte for byte with the new `elya core
---dump` on every corpus program without imports that checks), then a back
-end in Elya writing LLVM IR text for *Elya-S*, the language the compiler's
-own sources use (no handlers, no `Float`), checked by running both programs:
-stages B1-B6 built (first order, strings and rooting, data and `match`,
-monomorphization, closures, arrays, buffers and `io.*`; 101 corpus programs
-and 46 focused ones agree, every Elya-built program also run collecting at
-every allocation). B7 (imports) waits for 4c; B8 is the self-hosted sources.
+are on `main`, and so is **4c** (c28986e: modules and resolution,
+`selfhost/resolve.elya`). **F6** (imports, E0606) is Codex's job, sent
+2026-11-27 (branch `codex/check-f6`, a pull request to check and land).
+**Part 5 is done** (spec `2026-11-27-elya-backend-in-elya-design.md`, plan
+beside it): Core in Elya (`selfhost/core.elya`, byte for byte with `elya core
+--dump`), monomorphization (`selfhost/mono.elya`) and a back end in Elya
+(`selfhost/emit.elya`) writing LLVM IR text for *Elya-S*, the language the
+compiler's own sources use (no handlers, no `Float`), checked by running both
+programs: every corpus program in the stage (at least 110) and 60 focused ones
+agree, also collecting at every allocation; the self-hosted sources built by
+it agree on 327 runs (B8). Its review found four defects (a string pattern's
+literal allocated unrooted, a wrapper's name colliding with an import's, wide
+rows crashing the emitter, a test that passed on refusals), all fixed and
+pinned (controls R1-R5). **Part 6, the switch, is done** (spec
+`2026-11-27-elya-the-switch-design.md`): `io.run`, the driver
+`selfhost/elya.elya` (`elya build` in Elya), and **the fixed point**: the
+driver built by Rust builds itself, that build builds it again, and the two
+write the same IR byte for byte (`selfhost_switch.rs`, Unix). Left before Rust
+can retire (spec D4): F6; handlers and `Float` in the back end in Elya; a
+diagnostic renderer in Elya; the driver's platform flags and an exit status of
+its own; and the evaluator (`elya run`), or a decision that native `build` is
+the only way to run.
 The checker's verdict has its print form too, `elya
 check --dump` (spec D6). The roadmap's "continuation-aware ownership" line takes
 the review's longer proposals (loans through continuations, once-callable

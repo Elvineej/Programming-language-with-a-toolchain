@@ -4,6 +4,18 @@ Runs working on `main` (on branch `auto/elya` until 2026-10-30) record their sta
 newest entry first.
 A run whose top entry says IN PROGRESS and started less than 3 hours ago is still active.
 
+## 2026-11-27 21:30 UTC — IN PROGRESS
+
+- **Landed:** 4c (c28986e: the resolver in Elya, its review's pins), then
+  self-hosting parts 5 and 6: Core in Elya, monomorphization and the back
+  end in Elya (B1-B8), `io.run`, the driver in Elya and the fixed point
+  (stages 2 and 3 write the same IR). Gates 1677 / 205 and 1690 / 213 as
+  predicted; Windows green before `main` moved.
+- The back end's review: four defects fixed with controls R1-R5 (all
+  killed); 93 mutants run, the survivors pinned or argued equivalent.
+- The PC is linked again: Codex's desktop app could not start its
+  app-server, so F6 went to Codex through chatgpt.com/codex in Chrome.
+
 ## 2026-11-27 02:45 UTC — IN PROGRESS
 
 - **Landed:** 4e (e8731cd: the affine pass in Elya), 4d (c523903:
