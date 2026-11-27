@@ -126,3 +126,15 @@ a module is E0600 but its name is not marked failed, so R3 does not refuse a
 qualified use of it: `import elya/nope\npub fn main() -> Int { nope.f() }`
 prints E0600 and then E0201 ``unknown builtin `nope.f` `` (a user module's
 `import nope` prints E0600 alone).
+
+**Review (2026-11-27).** No defect in the resolver: 30,000 generated
+multi-file programs (diamonds, cycles, missing and standard modules,
+aliases, every binder shadowing) agree, natively. Of 682 mutants, 330 were
+killed, 298 did not compile, 54 lived: 14 more focused programs kill 17, 29
+are argued equivalent (a name is never empty, a constructor's mask is always
+4, a message holds nothing to quote), and 8 differ only for a root whose
+path the test cannot name (in the file system's root, or not ending in
+`.elya`). One limit of the runtime, not the resolver: an imported file that
+is not UTF-8 is E0600 in Rust (`read_to_string` fails) and stops the Elya
+pass by name (`io.read_file`'s `is not UTF-8`). The evaluator test was
+trimmed to the programs with something to resolve (see its header).

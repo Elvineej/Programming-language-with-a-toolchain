@@ -10,15 +10,22 @@
 //! one (crates/codegen/tests/selfhost_resolve.rs), first on the program named
 //! (the evaluator's workers take the largest programs first):
 //! K1, a shadowed reference renamed anyway (`rw_var` asking the unit's
-//! functions before the scopes): here delete-token-380-from-
-//! examples/08_timers.elya, natively examples/06_structured.elya (`step`, a
-//! parameter of `elya/async`, renamed `elya.async.step`).
+//! functions before the scopes): here and natively
+//! examples/06_structured.elya (`step`, a parameter of `elya/async`, renamed
+//! `elya.async.step`).
 //! K2, the R3 filter dropped (`r3` keeping every diagnostic): here
-//! delete-token-23988-from-selfhost/check.elya, natively selfhost/check.elya
+//! delete-token-12332-from-selfhost/parse.elya, natively selfhost/check.elya
 //! (E0201 for `parse.parse_tree` after E0600 for `import parse`).
 //! K3, the two passes' diagnostics in the other order: the same two
 //! programs (resolution's E0200 printed before the parse and module
 //! diagnostics).
+//! (Rerun 2026-11-27 on the evaluator's subset, below: all three caught.)
+//!
+//! The evaluator runs on every multi-file and focused program and on the
+//! corpus programs with something to resolve (an import, a module or
+//! resolution error), none over 100 KB; the native twin on everything. The
+//! review measured the subset keeping all 330 mutants it killed, at half the
+//! bytes (1,123 s in the gate's configuration A before).
 //! The focused set has a program for each besides (shadowing by every kind
 //! of binder; a refused name; both passes in one program).
 
@@ -143,14 +150,31 @@ fn evaluator_proof() {
     let std = root.join("src/std");
     let mut cases = Vec::new();
     let mut codes = Vec::new();
+    let mut kept = Vec::new();
     for (i, p) in programs.iter().enumerate() {
         let path = support::materialise(scratch.path(), i, p);
         let (want, cs) = support::oracle(&path);
+        // The evaluator runs on every multi-file and focused program, and on
+        // the corpus programs with something to resolve: a module or
+        // resolution error, or an import; and none over 100 KB (the
+        // self-hosted sources and their variants). The native twin runs the
+        // pass on everything (the review's measure: the subset keeps every
+        // mutant killed, at half the bytes).
+        let resolving =
+            cs.iter().any(|c| support::CODES.contains(&c.as_str())) || want.contains("Import");
+        if i >= corpus.len() || (p.root.len() <= 100_000 && resolving) {
+            kept.push(i);
+        }
         codes.push(cs);
         cases.push((path, want));
     }
+    let programs: Vec<_> = kept.iter().map(|&i| programs[i].clone()).collect();
+    let corpus_kept = kept.iter().filter(|&&i| i < corpus.len()).count();
+    let all_codes = codes.clone();
+    let codes: Vec<_> = kept.iter().map(|&i| codes[i].clone()).collect();
+    let cases: Vec<_> = kept.iter().map(|&i| cases[i].clone()).collect();
     println!("RESOLVE oracles in {:?}", start.elapsed());
-    let focused_codes = support::count_codes(&codes[corpus.len() + multi.len()..]);
+    let focused_codes = support::count_codes(&codes[corpus_kept + multi.len()..]);
     for (code, n) in &focused_codes {
         assert!(*n > 0, "the focused set misses {code}");
     }
@@ -223,13 +247,13 @@ fn evaluator_proof() {
             .sum::<usize>()
     });
     assert_eq!(compared, cases.len(), "every program is compared once");
-    let errors = support::count_codes(&codes);
-    let with_error = codes
+    let errors = support::count_codes(&all_codes);
+    let with_error = all_codes
         .iter()
         .filter(|cs| cs.iter().any(|c| support::CODES.contains(&c.as_str())))
         .count();
     println!(
-        "RESOLVE corpus={} multi-file={} focused={} total={compared}; programs with a module or resolution error={with_error}; by code (programs): {errors:?}; focused by code: {focused_codes:?}; elapsed={:?}",
+        "RESOLVE corpus={} (the evaluator on {corpus_kept}) multi-file={} focused={} total={compared}; programs with a module or resolution error={with_error}; by code (programs): {errors:?}; focused by code: {focused_codes:?}; elapsed={:?}",
         corpus.len(),
         multi.len(),
         focused.len(),
