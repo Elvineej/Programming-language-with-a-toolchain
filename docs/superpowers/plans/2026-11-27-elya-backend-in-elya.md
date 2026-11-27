@@ -98,6 +98,19 @@ count, Windows CI, then `main`.
    (files, standard input, arguments), each call that may allocate rooted.
    101 corpus programs (selfhost/lex.elya among them) and 46 focused ones
    agree; controls I1 and I3-I5 in the header.
-8. [ ] **B7-B8**: imports (the merged module; after part 4c), then the
-   self-hosted sources built by the back end in Elya agreeing with their
-   Rust-built twins on their whole corpus.
+8. [x] **B7** (2026-11-27): imports. The resolver in Elya (part 4c) gains
+   `resolved` (the merged module, its text's length, whether loading or
+   resolving found an error), and the back end reads its program through
+   it; two of its types were renamed (`RvLS`, `RvRS`) since type names are
+   one namespace across a program. The harness no longer skips programs
+   with imports: 110 corpus programs and 46 focused ones agree.
+9. [x] **B8** (2026-11-27): the self-hosted sources. Each of `lex`,
+   `parse`, `exhaust`, `affine`, `check`, `core`, `resolve` and `emit` is
+   built by the Rust back end and by the back end in Elya, and the two run
+   on the repository's Elya files (the examples, the self-hosted sources,
+   the standard modules, tests/ui): 327 runs agree. The back end is among
+   them: built by itself it writes the same IR as built by Rust, on its own
+   source too, so the back end has reached its fixed point at the IR text.
+   Elya-built tools run about as fast as Rust-built ones (`check` on
+   check.elya: 1.52 s against 1.73 s; `emit` on check.elya: 10.3 s against
+   13.4 s; both through clang).

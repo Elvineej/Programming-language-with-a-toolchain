@@ -69,7 +69,7 @@ mod parse_support;
 #[path = "../../../tests/support/selfhost_backend.rs"]
 mod support;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 #[test]
@@ -84,6 +84,10 @@ fn the_back_end_in_elya_agrees_with_rusts() {
 
 fn run(exe: &Path, stress: Option<&str>) -> Output {
     let mut cmd = Command::new(exe);
+    // In the scratch directory: a program that writes a file writes it there.
+    if let Some(dir) = exe.parent() {
+        cmd.current_dir(dir);
+    }
     cmd.env_remove("ELYA_RECORD")
         .env_remove("ELYA_REPLAY")
         .env_remove("ELYA_GC_STRESS")
@@ -161,17 +165,10 @@ fn proof() {
         .path()
         .join(format!("elya{}", std::env::consts::EXE_SUFFIX));
     for (name, text) in texts {
-        // A program importing modules is merged with them: part 4c's.
-        if !elya::parse::parse_module(&elya::Session::new(), &text)
-            .0
-            .imports
-            .is_empty()
-        {
-            continue;
-        }
         let path = scratch.put(&text);
         let out = Command::new(&emitter)
             .arg(&path)
+            .arg(root.join("src/std"))
             .output()
             .expect("run the back end");
         assert!(
@@ -223,4 +220,127 @@ fn proof() {
         "at least {} corpus programs, and the focused set ({compared})",
         support::FLOOR
     );
+}
+
+/// Stage B8 (spec D6): the self-hosted sources themselves, each built twice,
+/// by the Rust back end and by the back end in Elya, run on the repository's
+/// Elya files: the two builds print the same and exit the same. The back end
+/// in Elya is among them, so its Elya-built twin must write the same IR as
+/// its Rust-built self, its own source included (the back end's fixed point).
+#[test]
+fn the_self_hosted_sources_built_by_the_back_end_in_elya_agree() {
+    std::thread::Builder::new()
+        .stack_size(1024 * 1024 * 1024)
+        .spawn(self_hosted)
+        .expect("back end test thread")
+        .join()
+        .unwrap();
+}
+
+fn build_both(root: &Path, emitter: &Path, scratch: &Path, tool: &str) -> (PathBuf, PathBuf) {
+    let source = root.join("selfhost").join(format!("{tool}.elya"));
+    let text = std::fs::read_to_string(&source).expect("a self-hosted source");
+    let (module, diagnostics, sources) = elya::front_end_with(
+        &format!("selfhost/{tool}.elya"),
+        &text,
+        &mut check_support::reader,
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "{tool}: {}",
+        elya::diag::render(&diagnostics, &sources)
+    );
+    let (_, table) = elya::types::infer_typed_table(&elya::Session::new(), &module);
+    let core = elya::core::lower_module(&module, &table).expect("lowers");
+    let rust = scratch.join(format!("{tool}-rust{}", std::env::consts::EXE_SUFFIX));
+    let object = scratch.join(format!("{tool}-rust.o"));
+    elya_codegen::compile_module(&core, &object).expect("compiles");
+    elya_codegen::link(&object, &rust).expect("links");
+    let out = Command::new(emitter)
+        .arg(&source)
+        .arg(root.join("src/std"))
+        .output()
+        .expect("run the back end");
+    let ir = String::from_utf8(out.stdout).expect("UTF-8");
+    let ir = ir.strip_suffix("0\n").expect("main's Unit line");
+    assert!(
+        !ir.starts_with("unsupported "),
+        "{tool}: the back end in Elya refuses it: {ir}"
+    );
+    let ll = scratch.join(format!("{tool}.ll"));
+    std::fs::write(&ll, ir).expect("write the IR");
+    let elya = scratch.join(format!("{tool}-elya{}", std::env::consts::EXE_SUFFIX));
+    elya_codegen::link(&ll, &elya).unwrap_or_else(|e| panic!("{tool}: the IR does not build: {e}"));
+    (rust, elya)
+}
+
+fn self_hosted() {
+    let root = parse_support::root();
+    let scratch = parse_support::Scratch::new("native-self-hosted");
+    let pass = std::fs::read_to_string(root.join("selfhost/emit.elya")).expect("the back end");
+    let (module, _, _) =
+        elya::front_end_with("selfhost/emit.elya", &pass, &mut check_support::reader);
+    let (_, table) = elya::types::infer_typed_table(&elya::Session::new(), &module);
+    let core = elya::core::lower_module(&module, &table).expect("lowers");
+    let object = scratch.path().join("emitter.o");
+    let emitter = scratch
+        .path()
+        .join(format!("emitter{}", std::env::consts::EXE_SUFFIX));
+    elya_codegen::compile_module(&core, &object).expect("the back end compiles");
+    elya_codegen::link(&object, &emitter).expect("the back end links");
+    let mut inputs = Vec::new();
+    for dir in ["examples", "selfhost", "src/std", "tests/ui"] {
+        let mut names: Vec<_> = std::fs::read_dir(root.join(dir))
+            .expect("a source directory")
+            .map(|e| e.expect("an entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "elya"))
+            .collect();
+        names.sort();
+        inputs.extend(names);
+    }
+    let tools = [
+        "lex", "parse", "exhaust", "affine", "check", "core", "resolve", "emit",
+    ];
+    let mut compared = 0;
+    for tool in tools {
+        let (rust, elya) = build_both(&root, &emitter, scratch.path(), tool);
+        // The back end itself on the programs it compiles in a few seconds:
+        // the examples and the self-hosted sources it compiles, its own last.
+        let these: Vec<&PathBuf> = if tool == "emit" {
+            inputs
+                .iter()
+                .filter(|p| {
+                    p.starts_with(root.join("examples"))
+                        || p.ends_with("lex.elya")
+                        || p.ends_with("emit.elya")
+                })
+                .collect()
+        } else {
+            inputs.iter().collect()
+        };
+        for input in these {
+            let run = |exe: &Path| {
+                Command::new(exe)
+                    .arg(input)
+                    .arg(root.join("src/std"))
+                    .current_dir(scratch.path())
+                    .env_remove("ELYA_RECORD")
+                    .env_remove("ELYA_REPLAY")
+                    .output()
+                    .expect("run a build")
+            };
+            assert_eq!(
+                shown(&run(&elya)),
+                shown(&run(&rust)),
+                "{tool} on {}: built by the back end in Elya (left), by Rust's (right)",
+                input.display()
+            );
+            compared += 1;
+        }
+    }
+    println!(
+        "{compared} runs of the {} self-hosted tools agree",
+        tools.len()
+    );
+    assert!(compared >= 200, "the inputs ({compared})");
 }

@@ -12,6 +12,7 @@ import parse / {IO}
 import check / {IO}
 import core / {IO}
 import mono / {IO}
+import resolve / {IO}
 
 fn rev_onto(xs: List(a), acc: List(a)) -> List(a) {
   match xs { Nil -> acc  Cons(x, rest) -> rev_onto(rest, Cons(x, acc)) }
@@ -975,16 +976,17 @@ pub fn emit_module(m0: CModule) -> String {
   }
 }
 
+// io.arg(0) is the program, io.arg(1) the standard modules' directory.
 pub fn main() / {IO} {
-  let text = io.read_file(io.arg(0))
-  match parse.parse_tree(text) {
-    Parsed(m, _) -> match core.lower(m, string.length(text)) {
-      Refused(w) -> io.println("unsupported " <> w)
-      Ok(cm) -> match check_module(mono.mono(cm)) {
-        Outside(w) -> io.println("unsupported " <> w)
-        InStage -> io.println(emit_module(cm))
+  match resolve.resolved(io.arg(0), if io.arg_count() > 1 { io.arg(1) } else { "src/std" }) {
+    Resolved(m, size, bad) -> if bad { io.println("unsupported a program that does not resolve") } else {
+      match core.lower(m, size) {
+        Refused(w) -> io.println("unsupported " <> w)
+        Ok(cm) -> match check_module(mono.mono(cm)) {
+          Outside(w) -> io.println("unsupported " <> w)
+          InStage -> io.println(emit_module(cm))
+        }
       }
     }
-    ParseError(_, _, _) -> Unit
   }
 }

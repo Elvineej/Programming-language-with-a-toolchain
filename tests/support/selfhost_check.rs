@@ -493,6 +493,7 @@ pub fn reader(name: &str) -> Option<(String, String)> {
         "check" => "selfhost/check.elya",
         "core" => "selfhost/core.elya",
         "mono" => "selfhost/mono.elya",
+        "resolve" => "selfhost/resolve.elya",
         _ => return None,
     };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -290,25 +290,25 @@ type RUnit { RUnit(String, Module, List(RBind), List(String), List(String)) }
 // The files' texts (newest first), the next file's base, the units (newest
 // first), the loaded paths, the paths being loaded (innermost first), the
 // diagnostics (newest first), the root's directory, the standard modules'.
-type LS { LS(List(String), Int, List(RUnit), List(String), List(String), List(ParseDiag), String, String) }
-type LI { LI(LS, List(RBind), List(String), List(String)) }
+type RvLS { RvLS(List(String), Int, List(RUnit), List(String), List(String), List(ParseDiag), String, String) }
+type LI { LI(RvLS, List(RBind), List(String), List(String)) }
 
 fn bind_get(xs: List(RBind), k: String) -> Maybe(String) {
   match xs { Nil -> No Cons(RBind(n, p), rest) -> if n == k { Yes(p) } else { bind_get(rest, k) } }
 }
 fn bind_has(xs: List(RBind), k: String) -> Bool { match bind_get(xs, k) { No -> False Yes(_) -> True } }
-fn ls_diag(ls: LS, d: ParseDiag) -> LS {
-  match ls { LS(t, nb, us, ld, st, ds, dir, std) -> LS(t, nb, us, ld, st, Cons(d, ds), dir, std) }
+fn ls_diag(ls: RvLS, d: ParseDiag) -> RvLS {
+  match ls { RvLS(t, nb, us, ld, st, ds, dir, std) -> RvLS(t, nb, us, ld, st, Cons(d, ds), dir, std) }
 }
-fn ls_stack(ls: LS) -> List(String) { match ls { LS(_, _, _, _, st, _, _, _) -> st } }
-fn ls_loaded(ls: LS) -> List(String) { match ls { LS(_, _, _, ld, _, _, _, _) -> ld } }
+fn ls_stack(ls: RvLS) -> List(String) { match ls { RvLS(_, _, _, _, st, _, _, _) -> st } }
+fn ls_loaded(ls: RvLS) -> List(String) { match ls { RvLS(_, _, _, ld, _, _, _, _) -> ld } }
 fn first_seg(xs: List(String)) -> String { match xs { Nil -> "" Cons(x, _) -> x } }
 
 // The module's text: a standard module from its directory, a user module
 // next to the root, or none.
-fn read_module(ls: LS, target: String) -> Maybe(String) {
+fn read_module(ls: RvLS, target: String) -> Maybe(String) {
   match ls {
-    LS(_, _, _, _, _, _, dir, std) -> {
+    RvLS(_, _, _, _, _, _, dir, std) -> {
       let file = if has_str(std_modules(), target) {
         in_dir(std, string.slice(target, 5, string.length(target)) <> ".elya")
       } else { in_dir(dir, target <> ".elya") }
@@ -317,19 +317,19 @@ fn read_module(ls: LS, target: String) -> Maybe(String) {
   }
 }
 
-fn load_unit(ls: LS, path: String, m: Module) -> LS {
-  let ls = match ls { LS(t, nb, us, ld, st, ds, dir, std) -> LS(t, nb, us, ld, Cons(path, st), ds, dir, std) }
+fn load_unit(ls: RvLS, path: String, m: Module) -> RvLS {
+  let ls = match ls { RvLS(t, nb, us, ld, st, ds, dir, std) -> RvLS(t, nb, us, ld, Cons(path, st), ds, dir, std) }
   match m {
     Module(imps, _) -> match load_imports(ls, imps, Nil, Nil, Nil) {
-      LI(LS(t, nb, us, ld, st, ds, dir, std), binds, imports, failed) -> {
+      LI(RvLS(t, nb, us, ld, st, ds, dir, std), binds, imports, failed) -> {
         let st = match st { Nil -> Nil Cons(_, rest) -> rest }
-        LS(t, nb, Cons(RUnit(path, m, binds, imports, failed), us), ld, st, ds, dir, std)
+        RvLS(t, nb, Cons(RUnit(path, m, binds, imports, failed), us), ld, st, ds, dir, std)
       }
     }
   }
 }
 
-fn load_imports(ls: LS, imps: List(Sp(Import)), binds: List(RBind), imports: List(String), failed: List(String)) -> LI {
+fn load_imports(ls: RvLS, imps: List(Sp(Import)), binds: List(RBind), imports: List(String), failed: List(String)) -> LI {
   match imps {
     Nil -> LI(ls, binds, imports, failed)
     Cons(Sp(Import(path, alias, effs), a, b), rest) -> {
@@ -370,12 +370,12 @@ fn load_imports(ls: LS, imps: List(Sp(Import)), binds: List(RBind), imports: Lis
                   load_imports(ls_diag(ls, d), rest, binds, imports, Cons(name, failed))
                 }
                 Yes(text) -> match ls {
-                  LS(t, base, us, ld, st, ds, dir, std) -> match parse.parse_full(text) {
+                  RvLS(t, base, us, ld, st, ds, dir, std) -> match parse.parse_full(text) {
                     ParsedSource(m, pds, _) -> {
                       let ds = reverse_into(sh_diags(pds, base), ds)
-                      let ls = LS(Cons(text, t), base + string.length(text) + 1, us, ld, st, ds, dir, std)
+                      let ls = RvLS(Cons(text, t), base + string.length(text) + 1, us, ld, st, ds, dir, std)
                       let ls = load_unit(ls, target, sh_module(m, base))
-                      let ls = match ls { LS(t, nb, us, ld, st, ds, dir, std) -> LS(t, nb, us, Cons(target, ld), st, ds, dir, std) }
+                      let ls = match ls { RvLS(t, nb, us, ld, st, ds, dir, std) -> RvLS(t, nb, us, Cons(target, ld), st, ds, dir, std) }
                       load_imports(ls, rest, Cons(RBind(name, target), binds), Cons(target, imports), failed)
                     }
                   }
@@ -450,7 +450,7 @@ fn grants(all: List(RUnit), us: List(RUnit), me: Int, ds: List(ParseDiag)) -> Li
 // ---- Merging (modules::merge) -------------------------------------------
 
 // A table's value: a flag or index, a name, a list of names.
-type RV { RI(Int), RS(String), RL(List(String)) }
+type RV { RI(Int), RvRS(String), RL(List(String)) }
 
 fn put_new(m: Array(MapSlot(RV)), k: String, v: RV) -> Array(MapSlot(RV)) {
   if map.has(m, k) { m } else { map.put(m, k, v) }
@@ -472,7 +472,7 @@ fn tab_ops(m: Array(MapSlot(RV)), i: String, ops: List(Sp(OpSig)), u: RV, eff: S
     Nil -> m
     Cons(Sp(OpSig(n, _, _, _), _, _), rest) -> {
       let m = map.put(put_new(m, "oO" <> n, u), "d" <> i <> ":O" <> n, RI(1))
-      tab_ops(put_new(m, "x" <> n, RS(eff)), i, rest, u, eff)
+      tab_ops(put_new(m, "x" <> n, RvRS(eff)), i, rest, u, eff)
     }
   }
 }
@@ -499,7 +499,7 @@ fn op_named_fns(borrow m: Array(MapSlot(RV)), ds: List(Sp(Decl)), out: List(Pars
     Nil -> out
     Cons(Sp(DFn(_, n, _, _, _, _), a, b), rest) -> {
       let out = match map.get(m, "x" <> n) {
-        MapFound(RS(eff)) -> Cons(ParseDiag("E0205", a, b, "function `" <> n <> "` has the name of an operation of `" <> eff <> "`"), out)
+        MapFound(RvRS(eff)) -> Cons(ParseDiag("E0205", a, b, "function `" <> n <> "` has the name of an operation of `" <> eff <> "`"), out)
         _ -> out
       }
       op_named_fns(m, rest, out)
@@ -856,7 +856,7 @@ fn rt_ops(t: RTab, eff: String, ops: List(Sp(OpSig))) -> RTab {
           let m = map.put(m, "D" <> n, RI(1))
           RTab(m, Cons(ParseDiag("E0202", a, b, "operation `" <> n <> "` is declared more than once"), ds))
         } else {
-          let m = map.put(map.put(m, "X" <> n, RS(eff)), "A" <> n, RI(count(tys)))
+          let m = map.put(map.put(m, "X" <> n, RvRS(eff)), "A" <> n, RI(count(tys)))
           let known = match map.get(m, "L" <> eff) { MapFound(RL(xs)) -> xs _ -> Nil }
           RTab(map.put(m, "L" <> eff, RL(Cons(n, known))), ds)
         }
@@ -900,7 +900,7 @@ fn op_fns(borrow m: Array(MapSlot(RV)), ds: List(Sp(Decl)), out: List(ParseDiag)
     Nil -> out
     Cons(Sp(DFn(_, n, _, _, _, _), a, b), rest) -> {
       let out = match map.get(m, "X" <> n) {
-        MapFound(RS(eff)) -> Cons(ParseDiag("E0205", a, b, "function `" <> n <> "` has the name of an operation of `" <> eff <> "`"), out)
+        MapFound(RvRS(eff)) -> Cons(ParseDiag("E0205", a, b, "function `" <> n <> "` has the name of an operation of `" <> eff <> "`"), out)
         _ -> out
       }
       op_fns(m, rest, out)
@@ -1005,7 +1005,7 @@ fn check_expr(borrow r: Array(MapSlot(RV)), e: Sp(Expr), sc: List(List(String)),
 fn clause_bad(borrow r: Array(MapSlot(RV)), q: Maybe(String), op: String, n: Int) -> Bool {
   if map.has(r, "D" <> op) { False } else {
     match map.get(r, "X" <> op) {
-      MapFound(RS(owner)) -> {
+      MapFound(RvRS(owner)) -> {
         let wrong = match q { No -> False Yes(q) -> !map.has(r, "E" <> q) || owner != q }
         wrong || get_int(r, "A" <> op) != n
       }
@@ -1041,7 +1041,7 @@ fn clause_effects(borrow r: Array(MapSlot(RV)), ops: List(String), acc: List(Str
     Nil -> acc
     Cons(op, rest) -> {
       let acc = if map.has(r, "D" <> op) { acc } else {
-        match map.get(r, "X" <> op) { MapFound(RS(eff)) -> if has_str(acc, eff) { acc } else { Cons(eff, acc) } _ -> acc }
+        match map.get(r, "X" <> op) { MapFound(RvRS(eff)) -> if has_str(acc, eff) { acc } else { Cons(eff, acc) } _ -> acc }
       }
       clause_effects(r, rest, acc)
     }
@@ -1133,9 +1133,9 @@ pub fn resolve_dump(file: String, std: String) -> String {
   let text = io.read_file(file)
   match parse.parse_full(text) {
     ParsedSource(root, pds, _) -> {
-      let ls = LS(Cons(text, Nil), string.length(text) + 1, Nil, Nil, Nil, rev(pds), root_dir(file), std)
+      let ls = RvLS(Cons(text, Nil), string.length(text) + 1, Nil, Nil, Nil, rev(pds), root_dir(file), std)
       match load_unit(ls, root_path(file), root) {
-        LS(texts, _, us, _, _, ds, _, _) -> {
+        RvLS(texts, _, us, _, _, ds, _, _) -> {
           let us = rev(us)
           let ds = grants(us, us, 0, ds)
           match merge(us, ds) {
@@ -1145,6 +1145,33 @@ pub fn resolve_dump(file: String, std: String) -> String {
               let out = buffer.push(buffer.new(), tree)
               let out = diag_lines(rev(ds), out)
               buffer.finish(diag_lines(r3(resolve_check(m), rf), out))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// The merged program itself, for the passes after resolution (the back end
+// in Elya, self-hosting part 5's stage B7): its tree, its text's length
+// (spans index the merged text) and whether loading or resolving it found
+// an error.
+type Resolved { Resolved(Module, Int, Bool) }
+pub fn resolved(file: String, std: String) -> Resolved {
+  let text = io.read_file(file)
+  match parse.parse_full(text) {
+    ParsedSource(root, pds, _) -> {
+      let ls = RvLS(Cons(text, Nil), string.length(text) + 1, Nil, Nil, Nil, rev(pds), root_dir(file), std)
+      match load_unit(ls, root_path(file), root) {
+        RvLS(texts, _, us, _, _, ds, _, _) -> {
+          let us = rev(us)
+          let ds = grants(us, us, 0, ds)
+          match merge(us, ds) {
+            Merged(m, ds, rf) -> {
+              let merged = buffer.finish(texts_joined(rev(texts), buffer.new(), True))
+              let bad = match ds { Nil -> match r3(resolve_check(m), rf) { Nil -> False  _ -> True }  _ -> True }
+              Resolved(m, string.length(merged), bad)
             }
           }
         }
