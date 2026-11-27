@@ -85,7 +85,20 @@ type MJob { MJob(CFn, String, List(MSub)) }
 type MState { MSt(List(CFn), List(MInst), List(MJob), Int) }
 type MR(a) { MR(a, MState) }
 
-fn key_of(t: Ty) -> String { match check.show_ty(t, check.no_names()) { Shown(s, _) -> s } }
+// A ground type's text without its effect rows, which do not change how a
+// value is laid out: the key of an instance, of a type or of a function.
+pub fn key_of(t: Ty) -> String {
+  match t {
+    TB(c) -> if c == 0 { "Int" } else { if c == 1 { "Float" } else { if c == 2 { "Bool" } else { if c == 3 { "String" } else { "Unit" } } } }
+    TFn(ps, _, r) -> "fn(" <> keys(ps) <> ") -> " <> key_of(r)
+    TCon(n, Nil) -> n
+    TCon(n, args) -> n <> "(" <> keys(args) <> ")"
+    _ -> "?"
+  }
+}
+fn keys(ts: List(Ty)) -> String {
+  match ts { Nil -> ""  Cons(t, Nil) -> key_of(t)  Cons(t, rest) -> key_of(t) <> ", " <> keys(rest) }
+}
 fn inst_get(is: List(MInst), f: String, key: String) -> Maybe(String) {
   match is { Nil -> No  Cons(MInst(g, k, n), rest) -> if g == f && k == key { Yes(n) } else { inst_get(rest, f, key) } }
 }

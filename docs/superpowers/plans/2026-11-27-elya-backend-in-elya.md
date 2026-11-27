@@ -66,5 +66,20 @@ count, Windows CI, then `main`.
    programs and every 9,973rd for the corpus, whose largest build lists of
    a million. 64 corpus programs and 36 focused ones agree; controls G2,
    G3, G5 and G6 in the header.
-6. [ ] **B5-B8**: closures; arrays, buffers, `io.*`; imports (after part
-   4c); the self-hosted sources themselves.
+6. [x] **B5** (2026-11-27): closures as the Rust back end lays them out,
+   `[tag][code][captures...]`, the code taking the closure first. A
+   lambda's captures are the names its body reads that the scope binds, in
+   order of first reading; its code is written after the function it is in
+   (`@elya.lam.k`), loading them at entry. A top-level function used as a
+   value is a capture-less closure over a wrapper written once
+   (`@elya.wrap.f`), a constructor with fields used as a value a lambda
+   building it. A call of anything but a top-level function by name loads
+   the code and calls it, `musttail` in tail position. The closures' tags
+   lie between the constructors' and the string's, as `elya_eq` reads
+   them; their count is bounded before writing (each lambda, each mention
+   of a function's name, each constructor), the unused rows empty. Keys of
+   instances drop effect rows, which do not change a value's layout (a
+   generic function's row variable left one in). 82 corpus programs and
+   40 focused ones agree; controls H2-H4 and H6 in the header.
+7. [ ] **B6-B8**: arrays, buffers, `io.*`; imports (after part 4c); the
+   self-hosted sources themselves.

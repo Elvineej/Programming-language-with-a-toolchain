@@ -43,6 +43,13 @@
 //! G5, a `let` of a generic value not refused: focused #35.
 //! G6, one clone of a generic function for every instance: tests/types.rs
 //! (the IR does not build).
+//! H2, a closure's heap captures left out of its row's mask: focused #36
+//! (collecting at every allocation).
+//! H3, a closure called without itself as the first argument: tests/adt.rs.
+//! H4, a call through a closure in tail position not `musttail`: focused
+//! #38 (a hundred million deep).
+//! H6, an instance keyed with its effect rows: focused #37 (a generic
+//! function's row variable left in a key).
 //! E3 (a call's own arguments not rooted) cannot be seen: the runtime roots
 //! its arguments before it allocates (`elya_str_concat`, `elya_str_slice`)
 //! and a function roots its parameters as its scope; they stay rooted, as

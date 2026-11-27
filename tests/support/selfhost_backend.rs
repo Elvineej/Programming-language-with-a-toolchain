@@ -79,4 +79,12 @@ pub const FOCUSED: &[&str] = &[
     "type List(a) { Nil, Cons(a, List(a)) }\nfn range(n: Int, acc: List(Int)) -> List(Int) { if n == 0 { acc } else { range(n - 1, Cons(n, acc)) } }\nfn fold(xs: List(a), acc: Int, f: Int) -> Int { match xs { Nil -> acc  Cons(_, r) -> fold(r, acc + f, f) } }\npub fn main() -> Int { fold(range(3000, Nil), 0, 3) }\n",
     // B4: a generic `let` used at two types is refused, not miscompiled.
     "type List(a) { Nil, Cons(a, List(a)) }\nfn len(xs: List(a)) -> Int { match xs { Nil -> 0  Cons(_, r) -> 1 + len(r) } }\npub fn main() -> Int { let n = Nil\n let a = Cons(1, n)\n let b = Cons(\"s\", Cons(\"t\", n))\n len(a) * 10 + len(b) }\n",
+    // B5: closures capturing an Int, a String and a Bool, nested captures.
+    "fn mk(n: Int, s: String, b: Bool) -> fn(Int) -> String { fn(x) { let inner = fn(y) { if b { s <> int.to_string(n + y) } else { s } }\n inner(x * 2) } }\npub fn main() / {IO} { let f = mk(10, \"v\", True)\n let g = mk(0, \"w\", False)\n io.println(f(1) <> g(5) <> f(2)) }\n",
+    // B5: functions in data, a computed callee, a constructor as a value.
+    "type List(a) { Nil, Cons(a, List(a)) }\ntype Box { Box(Int) }\nfn inc(x: Int) -> Int { x + 1 }\nfn dbl(x: Int) -> Int { x * 2 }\nfn apply_all(fs: List(fn(Int) -> Int), x: Int) -> Int { match fs { Nil -> x  Cons(f, r) -> apply_all(r, f(x)) } }\nfn map(xs: List(Int), f: fn(Int) -> Box) -> List(Box) { match xs { Nil -> Nil  Cons(h, t) -> Cons(f(h), map(t, f)) } }\nfn sum(xs: List(Box)) -> Int { match xs { Nil -> 0  Cons(Box(n), t) -> n + sum(t) } }\npub fn main() / {IO} { let c = True\n io.println(int.to_string(apply_all(Cons(inc, Cons(dbl, Cons(fn(x) { x - 3 }, Nil))), 5) + (if c { inc } else { dbl })(100) + sum(map(Cons(1, Cons(2, Nil)), Box)))) }\n",
+    // B5: a loop through a closure in tail position, a hundred million deep.
+    "type K { K(fn(K, Int, Int) -> Int) }\nfn go(k: K, n: Int, acc: Int) -> Int { if n == 0 { acc } else { match k { K(f) -> f(k, n - 1, acc + 1) } } }\npub fn main() -> Int { go(K(go), 100000000, 0) }\n",
+    // B5: captured strings kept across collections.
+    "fn adder(s: String) -> fn(String) -> String { fn(t) { s <> t <> s } }\nfn loop(n: Int, f: fn(String) -> String, acc: String) -> String { if n == 0 { acc } else { loop(n - 1, adder(int.to_string(n)), f(string.slice(acc, 0, 1))) } }\npub fn main() / {IO} { io.println(loop(300, adder(\"x\"), \"start\")) }\n",
 ];
