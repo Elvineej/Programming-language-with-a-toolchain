@@ -13,7 +13,7 @@ import elya/map
 // `resolve::builtins()`.
 fn builtin_names() -> List(String) {
   Cons("io.println", Cons("io.read_file", Cons("io.file_exists", Cons("io.write_file",
-  Cons("io.read_stdin", Cons("io.arg_count", Cons("io.arg",
+  Cons("io.read_stdin", Cons("io.arg_count", Cons("io.arg", Cons("io.run",
   Cons("buffer.new", Cons("buffer.push", Cons("buffer.finish", Cons("buffer.length",
   Cons("array.new", Cons("array.push", Cons("array.set", Cons("array.get", Cons("array.length",
   Cons("int.to_string", Cons("float.to_string", Cons("float.of_int", Cons("float.truncate", Cons("float.round",
@@ -22,7 +22,7 @@ fn builtin_names() -> List(String) {
   Cons("int.and", Cons("int.or", Cons("int.xor", Cons("int.shl", Cons("int.shr", Cons("int.ushr",
   Cons("time.now_ms", Cons("time.sleep_ms",
   Cons("op.name", Cons("op.show", Cons("op.perform", Cons("op.encode", Cons("op.decode",
-  Nil))))))))))))))))))))))))))))))))))))))))
+  Nil)))))))))))))))))))))))))))))))))))))))))
 }
 // `resolve::INT_BINARY_BUILTINS`.
 fn int_binary_builtins() -> List(String) {
@@ -39,7 +39,7 @@ fn buffer_builtins() -> List(String) { Cons("new", Cons("push", Cons("finish", C
 fn array_builtins() -> List(String) { Cons("new", Cons("push", Cons("set", Cons("get", Cons("length", Nil))))) }
 // `resolve::IO_BUILTINS`.
 fn io_builtins() -> List(String) {
-  Cons("read_file", Cons("file_exists", Cons("write_file", Cons("read_stdin", Cons("arg_count", Cons("arg", Nil))))))
+  Cons("read_file", Cons("file_exists", Cons("write_file", Cons("read_stdin", Cons("arg_count", Cons("arg", Cons("run", Nil)))))))
 }
 // `modules::BUILTIN_MODULES`.
 fn builtin_modules() -> List(String) {
@@ -1156,8 +1156,8 @@ pub fn resolve_dump(file: String, std: String) -> String {
 // The merged program itself, for the passes after resolution (the back end
 // in Elya, self-hosting part 5's stage B7): its tree, its text's length
 // (spans index the merged text) and whether loading or resolving it found
-// an error.
-type Resolved { Resolved(Module, Int, Bool) }
+// an error, and its diagnostics in the dump form.
+type Resolved { Resolved(Module, Int, Bool, String) }
 pub fn resolved(file: String, std: String) -> Resolved {
   let text = io.read_file(file)
   match parse.parse_full(text) {
@@ -1170,8 +1170,9 @@ pub fn resolved(file: String, std: String) -> Resolved {
           match merge(us, ds) {
             Merged(m, ds, rf) -> {
               let merged = buffer.finish(texts_joined(rev(texts), buffer.new(), True))
-              let bad = match ds { Nil -> match r3(resolve_check(m), rf) { Nil -> False  _ -> True }  _ -> True }
-              Resolved(m, string.length(merged), bad)
+              let rds = r3(resolve_check(m), rf)
+              let bad = match ds { Nil -> match rds { Nil -> False  _ -> True }  _ -> True }
+              Resolved(m, string.length(merged), bad, buffer.finish(diag_lines(rds, diag_lines(rev(ds), buffer.new()))))
             }
           }
         }

@@ -170,14 +170,14 @@ fn generic_types(ds: List(Sp(Decl))) -> List(CGeneric) {
 // ---- Lowering ---------------------------------------------------------------
 
 fn is_builtin(n: String) -> Bool {
-  has(Cons("io.println", Cons("io.read_file", Cons("io.file_exists", Cons("io.write_file", Cons("io.read_stdin", Cons("io.arg_count", Cons("io.arg",
+  has(Cons("io.println", Cons("io.read_file", Cons("io.file_exists", Cons("io.write_file", Cons("io.read_stdin", Cons("io.arg_count", Cons("io.arg", Cons("io.run",
   Cons("buffer.new", Cons("buffer.push", Cons("buffer.finish", Cons("buffer.length",
   Cons("array.new", Cons("array.push", Cons("array.set", Cons("array.get", Cons("array.length",
   Cons("int.to_string", Cons("float.to_string", Cons("float.of_int", Cons("float.truncate", Cons("float.round",
   Cons("string.length", Cons("string.byte_at", Cons("string.slice",
   Cons("int.wrapping_add", Cons("int.wrapping_sub", Cons("int.wrapping_mul", Cons("int.and", Cons("int.or", Cons("int.xor", Cons("int.shl", Cons("int.shr", Cons("int.ushr",
   Cons("time.now_ms", Cons("time.sleep_ms",
-  Cons("op.name", Cons("op.show", Cons("op.perform", Cons("op.encode", Cons("op.decode", Nil)))))))))))))))))))))))))))))))))))))))), n)
+  Cons("op.name", Cons("op.show", Cons("op.perform", Cons("op.encode", Cons("op.decode", Nil))))))))))))))))))))))))))))))))))))))))), n)
 }
 // `BinOp`'s `Debug` names, by the operator's symbol.
 fn prim_name(op: String) -> String {

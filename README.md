@@ -31,7 +31,9 @@ A program reads and writes files, reads standard input and its command line:
 `io.read_file(path)`, `io.file_exists(path)`, `io.write_file(path, text)`,
 `io.read_stdin()`, `io.arg_count()` and `io.arg(i)` perform `IO`, and a failure
 stops the run by name (`elya: cannot read `a.txt`: no such file or directory`),
-the same words natively. A compiled binary takes its own arguments and input. A
+the same words natively. A compiled binary takes its own arguments and input.
+`io.run(command)` runs a program (the command's lines are the program and its
+arguments) and answers its exit status. A
 dependency is written against `elya/files` (a `Files` effect) and granted that,
 never `IO`; `elya/host`'s `files` gives it the host's files, and `elya/files`
 has handlers in memory, read-only and under a directory.

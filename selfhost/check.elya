@@ -2562,7 +2562,7 @@ fn host_signature(m: String, n: String) -> Sig {
         if n == "file_exists" { Sig(Cons(TB(3), Nil), TB(2)) } else {
           if n == "write_file" { Sig(Cons(TB(3), Cons(TB(3), Nil)), TB(4)) } else {
             if n == "read_stdin" { Sig(Nil, TB(3)) } else {
-              if n == "arg_count" { Sig(Nil, TB(0)) } else { if n == "arg" { Sig(Cons(TB(0), Nil), TB(3)) } else { NoSig } }
+              if n == "arg_count" { Sig(Nil, TB(0)) } else { if n == "arg" { Sig(Cons(TB(0), Nil), TB(3)) } else { if n == "run" { Sig(Cons(TB(3), Nil), TB(0)) } else { NoSig } } }
             }
           }
         }
@@ -4454,6 +4454,20 @@ pub fn typed(m: Module, size: Int) -> Typed {
   }
 }
 pub fn show_ty(t: Ty, names: Names) -> Shown { show(t, names) }
+
+// The checker's diagnostics in the dump form, for the driver (spec
+// 2026-11-27-elya-the-switch D2), and whether one is an error.
+type Checked { Checked(String, Bool) }
+pub fn diagnostics(m: Module, size: Int) -> Checked {
+  match infer_module(m, size) {
+    Ran(_, s) -> match s {
+      St(_, _, _, ds0, _, _, _, _, _, hx) -> {
+        let ds = all_diags(ds0, hx)
+        Checked(buffer.finish(dump_diags(ds, buffer.new())), any_error(ds))
+      }
+    }
+  }
+}
 pub fn no_names() -> Names { Names(Nil, 0) }
 
 pub fn main() / {IO} {

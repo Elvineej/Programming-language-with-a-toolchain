@@ -1,0 +1,73 @@
+// The driver, self-hosting part 6 (spec
+// docs/superpowers/specs/2026-11-27-elya-the-switch-design.md D2):
+//   elya build <file> [-o <out>] [--runtime <dir>] [--std <dir>]
+// The resolver in Elya, the checker (with the affine facts) and
+// exhaustiveness, any error printed in the dump form; else Core,
+// monomorphization and the back end in Elya, the IR written beside the
+// output, and `clang` run on it with the runtime (`<dir>/runtime.c`, the
+// Rust back end's flags). `main`'s value is the status: 0 built, 1 not.
+import parse / {IO}
+import check / {IO}
+import exhaust / {IO}
+import resolve / {IO}
+import emit / {IO}
+
+type Opts { Opts(String, String, String, String) }
+
+// The value after `flag`, or `dflt`.
+fn flag_value(i: Int, flag: String, dflt: String) -> String {
+  if i + 1 >= io.arg_count() { dflt } else {
+    if io.arg(i) == flag { io.arg(i + 1) } else { flag_value(i + 1, flag, dflt) }
+  }
+}
+// `foo.elya` -> `foo`.
+fn stem(p: String) -> String {
+  let n = string.length(p)
+  if n > 5 && string.slice(p, n - 5, n) == ".elya" { string.slice(p, 0, n - 5) } else { p <> ".out" }
+}
+fn say(s: String) -> Unit { if string.length(s) == 0 { Unit } else { io.println(string.slice(s, 0, string.length(s) - 1)) } }
+
+fn build(o: Opts) -> Int {
+  match o {
+    Opts(file, out, runtime, std) -> match resolve.resolved(file, std) {
+      Resolved(m, size, bad, rtext) -> if bad { say(rtext)
+        1 } else {
+        match check.diagnostics(m, size) {
+          Checked(ctext, cbad) -> if cbad { say(ctext)
+            1 } else {
+            match exhaust.diagnostics(m) {
+              Exhausted(etext, ebad) -> {
+                say(ctext)
+                say(etext)
+                if ebad { 1 } else {
+                  match emit.compile(m, size) {
+                    NotBuilt(w) -> { io.println("elya: build: unsupported " <> w)
+                      1 }
+                    BuiltIr(ir) -> {
+                      let ll = out <> ".ll"
+                      io.write_file(ll, ir)
+                      let status = io.run("clang\n-w\n-O2\n" <> ll <> "\n" <> runtime <> "/runtime.c\n-o\n" <> out <> "\n-no-pie\n-pthread")
+                      if status == 0 { io.println("built " <> out)
+                        0 } else { io.println("elya: build: clang exited " <> int.to_string(status))
+                        1 }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+pub fn main() / {IO} -> Int {
+  if io.arg_count() < 2 || io.arg(0) != "build" {
+    io.println("usage: elya build <file.elya> [-o <out>] [--runtime <dir>] [--std <dir>]")
+    2
+  } else {
+    let file = io.arg(1)
+    build(Opts(file, flag_value(2, "-o", stem(file)), flag_value(2, "--runtime", "crates/codegen/src"), flag_value(2, "--std", "src/std")))
+  }
+}
