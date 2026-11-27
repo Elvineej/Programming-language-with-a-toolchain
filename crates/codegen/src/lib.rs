@@ -784,6 +784,7 @@ pub(crate) fn io_builtin<'ctx>(
         ("io.read_stdin", []) => value(call(lc.io_read_stdin, &[tag.into()])?),
         ("io.arg_count", []) => value(call(lc.io_arg_count, &[])?),
         ("io.arg", [i]) => value(call(lc.io_arg, &[tag.into(), (*i).into()])?),
+        ("io.run", [c]) => value(call(lc.io_run, &[(*c).into()])?),
         _ => Err(CodegenError::UnsupportedBuiltin(name.to_string())),
     }
 }
@@ -1015,6 +1016,7 @@ pub(crate) fn is_native_builtin(name: &str) -> bool {
             | "io.read_stdin"
             | "io.arg_count"
             | "io.arg"
+            | "io.run"
             | "buffer.new"
             | "buffer.push"
             | "buffer.finish"
@@ -2833,6 +2835,7 @@ struct LowerCtx<'a, 'ctx> {
     io_read_stdin: FunctionValue<'ctx>,
     io_arg_count: FunctionValue<'ctx>,
     io_arg: FunctionValue<'ctx>,
+    io_run: FunctionValue<'ctx>,
     /// `elya_buffer_*` (spec 2026-11-14-elya-buffer).
     buffer_new: FunctionValue<'ctx>,
     buffer_push: FunctionValue<'ctx>,
@@ -3081,6 +3084,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         None,
     );
     let io_arg_count = module.add_function("elya_io_arg_count", i64t.fn_type(&[], false), None);
+    let io_run = module.add_function("elya_io_run", i64t.fn_type(&[ptrt.into()], false), None);
     let io_arg = module.add_function(
         "elya_io_arg",
         ptrt.fn_type(&[i64t.into(), i64t.into()], false),
@@ -3278,6 +3282,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         io_read_stdin,
         io_arg_count,
         io_arg,
+        io_run,
         buffer_new,
         buffer_push,
         buffer_finish,

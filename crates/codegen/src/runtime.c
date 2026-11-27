@@ -51,6 +51,12 @@ const char *elya_platform_error(void);
 void *elya_platform_path_open(const char *path);
 int elya_platform_path_exists(const char *path);
 int elya_platform_path_write(const char *path, const char *bytes, int64_t n);
+/* Run `argv` (NULL-terminated, UTF-8), inheriting the standard streams: its
+ * exit status (128 plus the signal for one a signal stopped), or -1 when it
+ * could not start, `elya_platform_run_error` then saying why (spec
+ * 2026-11-27-elya-the-switch D1). */
+int64_t elya_platform_run(char *const *argv);
+const char *elya_platform_run_error(void);
 const char *elya_platform_path_error(const char *path);
 int64_t elya_platform_stdin_read(char *into, int64_t n);
 char **elya_platform_args(int argc, char **argv, int *count);
@@ -1912,6 +1918,91 @@ void elya_io_write_file(void *path, void *text) {
     elya_gc_pop();
 }
 
+/* `io.run(command)` (spec 2026-11-27-elya-the-switch D1): the command's lines
+ * are the program and its arguments; the answer its exit status. Output
+ * written before is flushed first, as the program shares the streams. */
+static void io_fail_run(const int64_t *cmd, const char *reason) {
+    AnyBuf m = {0};
+    const char *c = (const char *)&cmd[2];
+    int64_t n = 0;
+    while (n < cmd[1] && c[n] != '\n') {
+        n++;
+    }
+    any_puts(&m, "elya: cannot run `");
+    any_put(&m, c, n);
+    any_puts(&m, "`: ");
+    any_puts(&m, reason);
+    io_fail(&m);
+}
+
+int64_t elya_io_run(void *command) {
+    int64_t *c = (int64_t *)command;
+    elya_gc_push(command);
+    AnyBuf q = {0};
+    io_question(&q, "io.run", c);
+    any_puts(&q, ")");
+    int64_t r;
+    if (elya_trace_mode == TRACE_REPLAY) {
+        TraceStr a = trace_answer_n(q.p, q.len);
+        if (!trace_int(a, &r)) {
+            trace_wrong_type(a, "Int");
+        }
+    } else {
+        const char *bytes = (const char *)&c[2];
+        if (rt_memchr(bytes, 0, (size_t)c[1])) {
+            io_fail_run(c, "a command cannot hold a NUL byte");
+        }
+        if (c[1] == 0 || bytes[0] == '\n') {
+            io_fail_run(c, "an empty command");
+        }
+        /* The words, each ended by a NUL where its newline was. */
+        AnyBuf words = {0};
+        any_put(&words, bytes, c[1]);
+        any_put(&words, "", 1);
+        int64_t n = 1;
+        for (int64_t i = 0; i < c[1]; i++) {
+            if (words.p[i] == '\n') {
+                words.p[i] = 0;
+                n++;
+            }
+        }
+        int64_t cap = 0;
+        char **argv = (char **)any_grow(NULL, &cap, n + 1, sizeof(char *));
+        int64_t k = 0;
+        argv[k++] = words.p;
+        for (int64_t i = 0; i < c[1]; i++) {
+            if (words.p[i] == 0) {
+                argv[k++] = words.p + i + 1;
+            }
+        }
+        argv[k] = NULL;
+        elya_platform_flush();
+        r = elya_platform_run(argv);
+        if (r < 0) {
+            io_fail_run(c, elya_platform_run_error());
+        }
+        elya_platform_scratch(argv, 0);
+        elya_platform_scratch(words.p, 0);
+        if (elya_trace_mode == TRACE_RECORD) {
+            char digits[24];
+            int64_t len = 0;
+            int64_t v = r;
+            char rev[24];
+            do {
+                rev[len++] = (char)('0' + v % 10);
+                v /= 10;
+            } while (v > 0);
+            for (int64_t i = 0; i < len; i++) {
+                digits[i] = rev[len - 1 - i];
+            }
+            io_record(&q, digits, len, 0);
+        }
+    }
+    elya_platform_scratch(q.p, 0);
+    elya_gc_pop();
+    return r;
+}
+
 void *elya_io_read_stdin(int64_t tag) {
     static const char q[] = "io.read_stdin()";
     if (elya_trace_mode == TRACE_REPLAY) {
@@ -2273,6 +2364,11 @@ ELYA_WEAK const char *elya_platform_path_error(const char *path) {
     (void)path;
     return "this platform has no files";
 }
+ELYA_WEAK int64_t elya_platform_run(char *const *argv) {
+    (void)argv;
+    return -1;
+}
+ELYA_WEAK const char *elya_platform_run_error(void) { return "this platform cannot run programs"; }
 /* No input: at its end at once. */
 ELYA_WEAK int64_t elya_platform_stdin_read(char *into, int64_t n) {
     (void)into;

@@ -45,7 +45,8 @@ pub const ARRAY_BUILTINS: &[&str] = &["new", "push", "set", "get", "length"];
 /// 2026-11-14-elya-files-and-arguments D1), each performing `IO`:
 /// `read_file : fn(String) -> String`, `file_exists : fn(String) -> Bool`,
 /// `write_file : fn(String, String) -> Unit`, `read_stdin : fn() -> String`,
-/// `arg_count : fn() -> Int`, `arg : fn(Int) -> String`.
+/// `arg_count : fn() -> Int`, `arg : fn(Int) -> String`; and `run :
+/// fn(String) -> Int` (spec 2026-11-27-elya-the-switch D1).
 pub const IO_BUILTINS: &[&str] = &[
     "read_file",
     "file_exists",
@@ -53,6 +54,7 @@ pub const IO_BUILTINS: &[&str] = &[
     "read_stdin",
     "arg_count",
     "arg",
+    "run",
 ];
 
 /// How many arguments a builtin takes (every name in [`builtins`]).
@@ -83,6 +85,8 @@ pub fn builtins() -> &'static [&'static str] {
         "io.read_stdin",
         "io.arg_count",
         "io.arg",
+        // Running a program (2026-11-27, spec 2026-11-27-elya-the-switch D1).
+        "io.run",
         // A linear text buffer (spec 2026-11-14-elya-buffer D2).
         "buffer.new",
         "buffer.push",

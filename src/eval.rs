@@ -284,6 +284,7 @@ const IO_HOST: &[&str] = &[
     "io.read_stdin",
     "io.arg_count",
     "io.arg",
+    "io.run",
 ];
 
 /// The qualified name of the host's `io.<name>`, if it is one.
@@ -2214,7 +2215,9 @@ fn host_builtin(
             // a value of another type.
             let a = answer.trim();
             let (ty, v) = match name {
-                "time.now_ms" | "io.arg_count" => ("Int", a.parse::<i64>().ok().map(Value::Int)),
+                "time.now_ms" | "io.arg_count" | "io.run" => {
+                    ("Int", a.parse::<i64>().ok().map(Value::Int))
+                }
                 "io.file_exists" => (
                     "Bool",
                     match a {
@@ -2326,8 +2329,44 @@ fn io_builtin(
                 .map(|a| Value::Str(a.into()))
                 .ok_or_else(|| rt(span, format!("argument {i} is not UTF-8")))
         }
+        ("io.run", [Value::Str(command)]) => run_program(command, span),
         _ => Err(rt(span, format!("{name}: wrong arguments"))),
     }
+}
+
+/// `io.run(command)` (spec 2026-11-27-elya-the-switch D1): the command's
+/// lines are the program and its arguments; the answer is its exit status
+/// (128 plus the signal for one a signal stopped). It inherits the standard
+/// streams, so what the program wrote before is flushed first. The native
+/// runtime fails in the same words (`elya_io_run`).
+fn run_program(command: &str, span: Span) -> Result<Value, RuntimeError> {
+    let mut words = command.split('\n');
+    let program = words.next().unwrap_or("");
+    let fail = |why: &str| Err(rt(span, format!("cannot run `{program}`: {why}")));
+    if command.contains('\0') {
+        return fail("a command cannot hold a NUL byte");
+    }
+    if program.is_empty() {
+        return fail("an empty command");
+    }
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let status = match std::process::Command::new(program).args(words).status() {
+        Ok(s) => s,
+        Err(e) => {
+            let why = match e.kind() {
+                std::io::ErrorKind::NotFound => "no such file or directory".to_string(),
+                std::io::ErrorKind::PermissionDenied => "permission denied".to_string(),
+                _ => os_words(&e),
+            };
+            return fail(&why);
+        }
+    };
+    #[cfg(unix)]
+    if let Some(sig) = std::os::unix::process::ExitStatusExt::signal(&status) {
+        return Ok(Value::Int(128 + i64::from(sig)));
+    }
+    Ok(Value::Int(i64::from(status.code().unwrap_or(1))))
 }
 
 /// Why a file operation on `path` failed (spec D2): the same words natively.

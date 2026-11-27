@@ -14,6 +14,7 @@
 #include <wchar.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <process.h>
 #include <shellapi.h>
 /* `CommandLineToArgvW`, for the arguments as UTF-8 (MSVC's linker reads the
  * request; MinGW links shell32 by default). */
@@ -22,6 +23,8 @@
 #endif
 #else
 #include <pthread.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -250,6 +253,116 @@ static FILE *elya_path_create(const char *path) { return fopen(path, "wb"); }
 char **elya_platform_args(int argc, char **argv, int *count) {
     *count = argc;
     return argv;
+}
+#endif
+
+/* `io.run` (spec 2026-11-27-elya-the-switch D1). */
+static int elya_run_errno = 0;
+const char *elya_platform_run_error(void) {
+    int e = elya_run_errno;
+    return e == ENOENT ? "no such file or directory"
+           : (e == EACCES || e == EPERM) ? "permission denied"
+                                         : strerror(e);
+}
+#ifdef _WIN32
+/* One argument as `CommandLineToArgvW` reads it back: quoted when it holds a
+ * space, a tab or a quote (or is empty), its backslashes doubled before a
+ * quote. */
+static wchar_t *elya_quote_arg(const wchar_t *a) {
+    size_t n = wcslen(a);
+    int plain = n > 0 && !wcspbrk(a, L" \t\"");
+    wchar_t *q = (wchar_t *)malloc((2 * n + 3) * sizeof(wchar_t));
+    if (!q) {
+        return NULL;
+    }
+    if (plain) {
+        wcscpy(q, a);
+        return q;
+    }
+    size_t k = 0;
+    q[k++] = L'"';
+    for (size_t i = 0;; i++) {
+        size_t bs = 0;
+        while (i < n && a[i] == L'\\') {
+            bs++;
+            i++;
+        }
+        if (i == n) {
+            for (size_t j = 0; j < 2 * bs; j++) {
+                q[k++] = L'\\';
+            }
+            break;
+        }
+        if (a[i] == L'"') {
+            for (size_t j = 0; j < 2 * bs + 1; j++) {
+                q[k++] = L'\\';
+            }
+        } else {
+            for (size_t j = 0; j < bs; j++) {
+                q[k++] = L'\\';
+            }
+        }
+        q[k++] = a[i];
+    }
+    q[k++] = L'"';
+    q[k] = 0;
+    return q;
+}
+int64_t elya_platform_run(char *const *argv) {
+    size_t n = 0;
+    while (argv[n]) {
+        n++;
+    }
+    wchar_t **wide = (wchar_t **)calloc(n + 1, sizeof(*wide));
+    if (!wide) {
+        elya_run_errno = ENOMEM;
+        return -1;
+    }
+    int ok = 1;
+    for (size_t i = 0; i < n && ok; i++) {
+        wchar_t *w = elya_wide_path(argv[i]);
+        wide[i] = w ? (i == 0 ? w : elya_quote_arg(w)) : NULL;
+        if (w && i > 0) {
+            free(w);
+        }
+        ok = wide[i] != NULL;
+    }
+    intptr_t status = -1;
+    if (ok) {
+        fflush(NULL);
+        errno = 0;
+        status = _wspawnvp(_P_WAIT, wide[0], (const wchar_t *const *)wide);
+        elya_run_errno = errno;
+    } else {
+        elya_run_errno = EINVAL;
+    }
+    for (size_t i = 0; i < n; i++) {
+        free(wide[i]);
+    }
+    free(wide);
+    return status < 0 ? -1 : (int64_t)status;
+}
+#else
+extern char **environ;
+int64_t elya_platform_run(char *const *argv) {
+    fflush(NULL);
+    pid_t pid;
+    int e = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
+    if (e != 0) {
+        elya_run_errno = e;
+        return -1;
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            elya_run_errno = errno;
+            return -1;
+        }
+    }
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 #endif
 
