@@ -204,9 +204,29 @@ Spec: `docs/superpowers/specs/2026-11-15-elya-checker-in-elya-design.md`.
        the next settling (Rust compresses the chain; ported). Its 34 mutants
        left 13 unpinned behaviours, now pinned; the `cur_span` claim and
        the omitted `hold_*` bookkeeping (stage 8's) confirmed.
-   - F5: duplicability (the marks on type variables, E0428, E0429, E0437),
-     `linear` types, `Buffer` and `Array`, and the borrow facts (E0438,
-     E0439). These read 4e's facts, so F5 waits for 4e.
+   - F5 (**built** 2026-11-24; the classifier's stage 8): duplicability
+     (spec 2026-11-06-elya-affine-across-functions), reading the affine
+     pass in Elya's facts (`affine.facts`, part 4e, Claude's). The marks on
+     type variables (`dup_vars`, checked at each binding and copied, the
+     instantiation named, at each instantiation), the holds riding on row
+     variables (moved when a row is bound, copied when a scheme is
+     instantiated, kept from a `let`'s quantifying), each local binding by
+     its binder; E0428, E0429, E0437, E0438, E0439, reported after the
+     others and only when there is no other error; `linear` types, `Buffer`
+     (written as a base type) and `Array` with their builtins. 62 corpus
+     programs and 36 focused ones agree, in the evaluator and natively (the
+     62 at the first run); controls K84-K102 in the test's header (five
+     survived the corpus and got focused programs). Review (2026-11-27):
+     one defect, fixed: a pattern's binders were noted as each `PVar` was
+     checked, while its type could still be a variable a later sub-pattern
+     binds, so the first binder's mark claimed it and a later E0428 was
+     lost; they are noted once the whole pattern is checked
+     (`bind_arm_pattern`'s order, `note_pat`), with the two programs that
+     showed it pinned (reverting the fix fails focused F5 #36). 4,800
+     random programs and 148 handwritten ones agree otherwise. Of 46
+     mutants, 11 are argued equivalent (help text the dump does not print,
+     one dedupe key per handle, `$Op` known duplicable) and 19 programs,
+     one per surviving mutant and named, pin the other 23.
    - F6: the grants of modules part 2 (E0606) on multi-file programs, and
      the whole corpus.
    Each stage gets negative controls in the Elya code (a row printed
