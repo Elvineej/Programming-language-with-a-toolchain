@@ -5,6 +5,10 @@
 //! and 3 write the same IR, byte for byte, the compiler's fixed point. Each
 //! stage also builds the examples it can, to programs that behave as the
 //! Rust-built ones do, and refuses the others by name.
+//!
+//! On Unix only: the driver runs `clang` with the Rust back end's Unix flags
+//! (`-no-pie`, `-pthread`; spec D2) until it knows the platform.
+#![cfg(unix)]
 
 #[allow(dead_code)]
 #[path = "../../../tests/support/selfhost_check.rs"]
@@ -15,9 +19,6 @@ mod parse_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// The driver runs `clang` with the Rust back end's Unix flags (`-no-pie`,
-// `-pthread`; spec D2): on Unix only until it knows the platform.
-#[cfg(unix)]
 #[test]
 fn elya_builds_itself_to_a_fixed_point() {
     std::thread::Builder::new()
