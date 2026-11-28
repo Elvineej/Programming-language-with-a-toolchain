@@ -227,8 +227,47 @@ Spec: `docs/superpowers/specs/2026-11-15-elya-checker-in-elya-design.md`.
      mutants, 11 are argued equivalent (help text the dump does not print,
      one dedupe key per handle, `$Op` known duplicable) and 19 programs,
      one per surviving mutant and named, pin the other 23.
-   - F6: the grants of modules part 2 (E0606) on multi-file programs, and
-     the whole corpus.
+   - F6 (blocked, 2026-11-27): the grants of modules part 2 (E0606) on
+     multi-file programs, and the whole corpus. On `c28986e`, Rust's
+     `Interface::ann` visits the type arguments of an annotated effect
+     label at one polarity. The modules part 2 spec (§3, which amends D1)
+     requires both polarities for a label's arguments. Rust already does
+     this for inferred types in `Interface::ty`.
+
+     `main.elya`
+
+     ```elya
+     import m
+     ```
+
+     `m.elya`
+
+     ```elya
+     effect E(a) { fn e() -> a }
+     type T { T(fn() / {E(fn() / {IO} -> Unit)} -> Unit) }
+     pub fn f(x: T) { Unit }
+     ```
+
+     `elya check --dump main.elya` exits 0 and prints
+     `scheme m.f fn(T) -> Unit` and three type lines. The parameter puts
+     `T`'s field at a negative position. The label `E` stays negative, but
+     visiting its type argument at both polarities exposes `IO` at a
+     positive position. The expected diagnostic is:
+
+     ```text
+     error E0606 0 8 "module `m` can perform `IO`, which this import does not grant"
+     ```
+
+     Replace the last two lines of `m.elya` with the signature below.
+     Rust exits 1 and prints that diagnostic, because the effect label is
+     now reached through the inferred function type.
+
+     ```elya
+     pub fn f(x: fn() / {E(fn() / {IO} -> Unit)} -> Unit) { Unit }
+     ```
+
+     F6 implementation, parity tests, negative controls, and the native
+     timing are pending the Rust/spec decision.
    Each stage gets negative controls in the Elya code (a row printed
    unsorted, a scheme generalized one level too deep, and so on), and a native run of the largest program in its fragment, timed
    against Rust.
