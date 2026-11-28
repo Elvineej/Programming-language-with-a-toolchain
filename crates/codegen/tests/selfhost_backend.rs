@@ -72,6 +72,22 @@
 //! IR does not build). S3, a constructor of five fields as a value not
 //! spilled: focused #62. S4, a parametric type's wide field not refused:
 //! the focused refusals (#65 built).
+//! Effects' controls (spec 2026-11-28-elya-backend-effects E2): X1, a tail
+//! resume a nested call: flat stack #0 (one MiB). X2, a frame's saved heap
+//! values untraced: focused #75 (collecting at every allocation). X3,
+//! one-shot not enforced: tests/effects_run.rs. X5, a frame's saved values
+//! read one word late: tests/affine.rs. X6, a return clause's binder unbound:
+//! tests/annotations.rs. X7, the operands before a site not bound first:
+//! tests/clause_resolution.rs (the IR does not build). X8, the continuation
+//! object untraced: focused #75 (collecting often). X10, a leaking handle not
+//! refused: the focused refusals. X11, the callee not hoisted first: focused
+//! #92. X12, a site frame of 61 saved values not refused: focused #97 (the
+//! back end dies of an integer overflow). Two cannot be seen in E2: X4, the
+//! outer handler not made current again after a handle (every way out of a
+//! direct handle, its return clause or a clause, makes its parent current
+//! first; Rust keeps the store too), and X9, a handler frame's saved values
+//! untraced (a direct handle's caller roots them across the body's call; a
+//! CPS handle, E3, has no such caller).
 //! E3 (a call's own arguments not rooted) cannot be seen: the runtime roots
 //! its arguments before it allocates (`elya_str_concat`, `elya_str_slice`)
 //! and a function roots its parameters as its scope; they stay rooted, as
@@ -106,7 +122,15 @@ fn slashed(p: &Path) -> String {
 }
 
 fn run(exe: &Path, stress: Option<&str>) -> Output {
+    run_with(exe, stress, None)
+}
+
+/// `stack`: the program's stack in MiB (`ELYA_STACK_MIB`), its default else.
+fn run_with(exe: &Path, stress: Option<&str>, stack: Option<&str>) -> Output {
     let mut cmd = Command::new(exe);
+    if let Some(m) = stack {
+        cmd.env("ELYA_STACK_MIB", m);
+    }
     // In the scratch directory: a program that writes a file writes it there.
     if let Some(dir) = exe.parent() {
         cmd.current_dir(dir);
@@ -314,6 +338,52 @@ fn proof() {
         support::FLOOR
     );
     two_modules(&root, &scratch, &emitter);
+    flat_stack(&root, &scratch, &emitter);
+}
+
+/// Effects (spec 2026-11-28-elya-backend-effects E2): a million performs
+/// resumed in tail position, and a million effectful calls deep, each on a
+/// stack of one MiB: a resume in tail position is a jump, a site's rest is a
+/// frame on the heap, so neither grows the native stack (Rust's D14). Not
+/// under the collector's stress (a million collections).
+fn flat_stack(root: &Path, scratch: &parse_support::Scratch, emitter: &Path) {
+    let programs = [
+        "effect Tick { fn tick(n: Int) -> Int }\nfn loop(i: Int, acc: Int) / {Tick} -> Int { if i == 0 { acc } else { loop(i - 1, acc + tick(i)) } }\npub fn main() -> Int { handle { loop(1000000, 0) } with { Tick.tick(n) -> resume(n % 7) } }\n",
+        "effect Pick { fn pick(a: Int, b: Int) -> Int }\nfn deep(n: Int) / {Pick} -> Int { if n == 0 { 0 } else { pick(n, 1) + deep(n - 1) } }\npub fn main() -> Int { handle { deep(1000000) } with { Pick.pick(a, b) -> resume(a % 3 + b) return(v) -> v + 1 } }\n",
+    ];
+    let dir = scratch.path().join("flat");
+    std::fs::create_dir_all(&dir).expect("a directory");
+    for (i, text) in programs.iter().enumerate() {
+        let src = dir.join(format!("p{i}.elya"));
+        std::fs::write(&src, text).expect("write");
+        let out = Command::new(emitter)
+            .arg(slashed(&src))
+            .arg(slashed(&root.join("src/std")))
+            .output()
+            .expect("run the back end");
+        let ir = String::from_utf8(out.stdout).expect("UTF-8");
+        let ir = ir.strip_suffix("0\n").expect("main's Unit value line");
+        assert!(!ir.starts_with("unsupported "), "flat stack #{i}: {ir}");
+        let ll = dir.join(format!("p{i}.ll"));
+        std::fs::write(&ll, ir).expect("write the IR");
+        let exe = dir.join(format!("p{i}{}", std::env::consts::EXE_SUFFIX));
+        if let Err(e) = elya_codegen::link(&ll, &exe) {
+            panic!("flat stack #{i}: the IR does not build: {e}");
+        }
+        let rust = dir.join(format!("r{i}{}", std::env::consts::EXE_SUFFIX));
+        rust_build(text, &rust).expect("the Rust back end builds it");
+        let want = shown(&run_with(&rust, None, Some("1")));
+        assert_eq!(
+            want.2,
+            Some(0),
+            "flat stack #{i}: the Rust-built program on one MiB"
+        );
+        assert_eq!(
+            shown(&run_with(&exe, None, Some("1"))),
+            want,
+            "flat stack #{i}: the Elya-built program (left) and the Rust-built one (right)"
+        );
+    }
 }
 
 /// No function of the IR takes more than four parameters (three and a

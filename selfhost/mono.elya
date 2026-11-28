@@ -174,8 +174,26 @@ fn mexpr(st: MState, ss: List(MSub), locals: List(String), e: CExpr) -> MR(CExpr
           MR(c2, st2) -> match mexpr(st2, ss, locals, x) { MR(x2, st3) -> match mexpr(st3, ss, locals, y) { MR(y2, st4) -> MR(CExpr(a, b, t, KIf(c2, x2, y2)), st4) } }
         }
         KMatch(s, arms) -> match mexpr(st, ss, locals, s) { MR(s2, st2) -> match marms(st2, ss, locals, arms) { MR(as2, st3) -> MR(CExpr(a, b, t, KMatch(s2, as2)), st3) } }
+        KHandle(body, mul, cs, ret) -> match mexpr(st, ss, locals, body) {
+          MR(b2, st2) -> match mclauses(st2, ss, locals, cs) {
+            MR(cs2, st3) -> match ret {
+              No -> MR(CExpr(a, b, t, KHandle(b2, mul, cs2, No)), st3)
+              Yes(CRet(n, rb)) -> match mexpr(st3, ss, Cons(n, locals), rb) { MR(rb2, st4) -> MR(CExpr(a, b, t, KHandle(b2, mul, cs2, Yes(CRet(n, rb2)))), st4) }
+            }
+          }
+        }
+        KResume(v) -> match mexpr(st, ss, locals, v) { MR(v2, st2) -> MR(CExpr(a, b, t, KResume(v2)), st2) }
+        KPerform(eff, op, ot, args) -> match mexprs(st, ss, locals, args) { MR(xs, st2) -> MR(CExpr(a, b, t, KPerform(eff, op, at(ss, ot), xs)), st2) }
         _ -> MR(CExpr(a, b, t, k), st)
       }
+    }
+  }
+}
+fn mclauses(st: MState, ss: List(MSub), locals: List(String), cs: List(CClause)) -> MR(List(CClause)) {
+  match cs {
+    Nil -> MR(Nil, st)
+    Cons(CClause(eff, op, ps, body), rest) -> match mexpr(st, ss, names(ps, locals), body) {
+      MR(b2, st2) -> match mclauses(st2, ss, locals, rest) { MR(more, st3) -> MR(Cons(CClause(eff, op, mparams(ss, ps), b2), more), st3) }
     }
   }
 }

@@ -86,9 +86,9 @@ fn check_expr(fs: List(CFn), locals: List(String), e: CExpr) -> Stage {
       KCtor(_, args) -> check_all(fs, locals, args)
       KLambda(ps, b) -> first(check_params(ps), first(if count_in(free_vars(b, param_names(ps, Nil), Nil), locals, 0) > 61 { Outside("a closure of more than 61 captures") } else { InStage }, check_expr(fs, param_names(ps, locals), b)))
       KMatch(sc, arms) -> first(check_expr(fs, locals, sc), check_arms(fs, locals, arms))
-      KHandle(_, _, _, _) -> Outside("a handler")
-      KResume(_) -> Outside("a resume")
-      KPerform(_, _, _, _) -> Outside("an effect operation")
+      KHandle(body, _, cs, ret) -> first(check_expr(fs, locals, body), first(check_clauses(fs, locals, cs), match ret { No -> InStage  Yes(CRet(n, rb)) -> check_expr(fs, Cons(n, locals), rb) }))
+      KResume(v) -> check_expr(fs, locals, v)
+      KPerform(_, _, _, args) -> check_all(fs, locals, args)
     })
   }
 }
@@ -100,6 +100,9 @@ fn pats_names(ps: List(CPat), acc: List(String)) -> List(String) {
 }
 fn check_arms(fs: List(CFn), locals: List(String), arms: List(CArm)) -> Stage {
   match arms { Nil -> InStage  Cons(CArm(p, b), rest) -> first(check_expr(fs, pat_names(p, locals), b), check_arms(fs, locals, rest)) }
+}
+fn check_clauses(fs: List(CFn), locals: List(String), cs: List(CClause)) -> Stage {
+  match cs { Nil -> InStage  Cons(CClause(_, _, ps, b), rest) -> first(check_params(ps), first(check_expr(fs, param_names(ps, locals), b), check_clauses(fs, locals, rest))) }
 }
 fn check_params(ps: List(CParam)) -> Stage {
   match ps { Nil -> InStage  Cons(CParam(_, t), rest) -> first(ty_ok(t), check_params(rest)) }
@@ -135,7 +138,7 @@ fn wide_fn(t: Ty) -> Bool {
 fn wide_fns(ts: List(Ty)) -> Bool { match ts { Nil -> False  Cons(t, rest) -> wide_fn(t) || wide_fns(rest) } }
 fn wide_fields(cs: List(CCtor)) -> Bool { match cs { Nil -> False  Cons(CCtor(_, fs), rest) -> wide_fns(fs) || wide_fields(rest) } }
 fn check_module(m: CModule) -> Stage {
-  match m { CModule(ts, gs, fs) -> first(check_types(ts), first(check_generics(gs), check_fns(fs, fs))) }
+  match m { CModule(ts, gs, fs) -> first(check_types(ts), first(check_generics(gs), first(check_fns(fs, fs), check_effects(fs)))) }
 }
 
 // ---- Emission state ---------------------------------------------------------
@@ -146,11 +149,22 @@ type SConst { SConst(String, String) }
 // A function written after the one being written: a lambda's code (its
 // number, parameters, body, captures, result) or a top-level function's
 // wrapper as a value (its name).
-type LJob { LamJob(Int, List(CParam), CExpr, List(EBind), LTy), WrapJob(String) }
+// A site's resumption (its number, the hole's name and type, what it saves,
+// the rest of its region) and a handle's functions (its number, body,
+// clauses, return clause, what its frame saves, the body's type).
+type LJob {
+  LamJob(Int, List(CParam), CExpr, List(EBind), LTy), WrapJob(String),
+  SiteJob(Int, String, Ty, List(EBind), CExpr),
+  HandJob(Int, CExpr, List(CClause), Maybe(CRet), List(EBind), Ty)
+}
 // The module's string constants, the jobs still to write, the closure rows
 // so far (arity and pointer mask, newest first), the closures numbered, the
 // functions wrapped (all newest first).
-type Mx { Mx(List(SConst), List(LJob), List(Row2), Int, List(String)) }
+// The effects' rows so far: the site frames' and the handler frames' (both
+// newest first; a tag is its base plus its index), and the resumptions
+// numbered.
+type FRows { FRows(List(Row2), List(Row2), Int) }
+type Mx { Mx(List(SConst), List(LJob), List(Row2), Int, List(String), FRows) }
 type Row2 { Row2(Int, Int) }
 linear type Emit { Emit(Buffer, Int, String, Mx, Int) }
 type Val { Val(String, LTy) }
@@ -163,9 +177,14 @@ type CInfo { CInfo(String, String, Int, List(Ty)) }
 // string tag (after the constructors, as the descriptor table has it).
 // The closures' tags lie between the constructors' and the string's, as
 // `elya_eq` reads them.
-type ECx { ECx(List(ESig), List(CInfo), Int) }
-fn cx_sigs(cx: ECx) -> List(ESig) { match cx { ECx(ss, _, _) -> ss } }
-fn stag(cx: ECx) -> String { match cx { ECx(_, _, t) -> int.to_string(t) } }
+// Effects (spec 2026-11-28-elya-backend-effects): the CPS functions, every
+// (effect, operation) of the module numbered, and the bounds on the site
+// frames and handler frames, whose rows follow the array's.
+type EffOp { EffOp(String, String) }
+type EffCx { EffCx(List(String), List(EffOp), Int, Int) }
+type ECx { ECx(List(ESig), List(CInfo), Int, EffCx) }
+fn cx_sigs(cx: ECx) -> List(ESig) { match cx { ECx(ss, _, _, _) -> ss } }
+fn stag(cx: ECx) -> String { match cx { ECx(_, _, t, _) -> int.to_string(t) } }
 
 fn line(em: Emit, s: String) -> Emit {
   match em { Emit(b, n, l, ss, k) -> Emit(buffer.push(b, "  " <> s <> "\n"), n, l, ss, k) }
@@ -250,7 +269,7 @@ fn str_lit(cx: ECx, em: Emit, rs: List(String), v: String) -> Gotv {
   match em {
     Emit(b, n, l, ss, k) -> {
       let name = "@.str." <> int.to_string(k)
-      rooted(Emit(b, n, l, match ss { Mx(cs, js, rws, lk, ws) -> Mx(Cons(SConst(name, v), cs), js, rws, lk, ws) }, k + 1), rs, "call ptr @elya_str_lit(i64 " <> stag(cx) <> ", ptr " <> name <> ", i64 " <> int.to_string(string.length(v)) <> ")", LPtr)
+      rooted(Emit(b, n, l, match ss { Mx(cs, js, rws, lk, ws, fr) -> Mx(Cons(SConst(name, v), cs), js, rws, lk, ws, fr) }, k + 1), rs, "call ptr @elya_str_lit(i64 " <> stag(cx) <> ", ptr " <> name <> ", i64 " <> int.to_string(string.length(v)) <> ")", LPtr)
     }
   }
 }
@@ -362,7 +381,7 @@ fn prim(cx: ECx, env: List(EBind), pend: List(Val), op: String, is_str: Bool, is
 // An array's words: a traced array (its own tag, after the string's) when
 // its elements are heap values, else the string's tag, traced nowhere.
 fn elem_of(t: Ty) -> Ty { match t { TCon("Array", Cons(e, _)) -> e  _ -> TB(0) } }
-fn array_tag(cx: ECx, t: Ty) -> String { match cx { ECx(_, _, st) -> int.to_string(if lt_of(elem_of(t)) == LPtr { st + 1 } else { st }) } }
+fn array_tag(cx: ECx, t: Ty) -> String { match cx { ECx(_, _, st, _) -> int.to_string(if lt_of(elem_of(t)) == LPtr { st + 1 } else { st }) } }
 fn builtin(cx: ECx, env: List(EBind), pend: List(Val), n: String, args: List(CExpr), t: Ty, vs: List(Val), em: Emit) -> Gotv {
   let a = vtext(nth(vs, 0))
   let b = vtext(nth(vs, 1))
@@ -441,7 +460,7 @@ fn emit(cx: ECx, env: List(EBind), pend: List(Val), e: CExpr, em: Emit) -> Gotv 
       KCtor(n, args) -> match emit_args(cx, env, pend, args, em, Nil) { Gotvs(vs, em2) -> construct(cx, env, pend, n, t, vs, em2) }
       KMatch(sc, arms) -> match emit(cx, env, pend, sc, em) {
         Gotv(sv, em2) -> match new_label(em2) {
-          Fresh1(join, em3) -> match emit_arms(cx, env, pend, sv, ty_of(sc), arms, em3, join, Nil, No) {
+          Fresh1(join, em3) -> match emit_arms(cx, env, pend, sv, ty_of(sc), arms, em3, join, Nil, TNo) {
             Arms(ins, em4) -> assign(start_block(em4, join), "phi " <> lt_text(lt_of(t)) <> " " <> phi_ins(ins), lt_of(t))
           }
         }
@@ -470,7 +489,17 @@ fn emit(cx: ECx, env: List(EBind), pend: List(Val), e: CExpr, em: Emit) -> Gotv 
           }
         }
       }
-      _ -> Gotv(Val("undef", LI64), em)
+      KHandle(body, _, cs, ret) -> emit_handle(cx, env, pend, body, cs, ret, t, em)
+      KResume(v) -> match emit(cx, env, pend, v, em) {
+        Gotv(val, em2) -> match resume_start(env, val, em2) {
+          Resumed(w, rk, rc, rp, em3) -> match rooted(em3, roots(env, pend, Nil), "call tailcc i64 " <> rc <> "(i64 " <> w <> ", ptr " <> rk <> ")", LI64) {
+            Gotv(Val(r, _), em4) -> from_word(line(em4, "store ptr " <> rp <> ", ptr @elya_current_handler"), r, lt_of(t))
+          }
+        }
+      }
+      // A site never reaches direct code (the pre-pass names every one); if
+      // one did, the IR fails to build rather than compute `undef`.
+      _ -> unknown(em, "a site in direct code")
     }
   }
 }
@@ -490,7 +519,7 @@ fn emit_tail(cx: ECx, env: List(EBind), e: CExpr, em: Emit, r: LTy) -> Emit {
         }
       }
       KMatch(sc, arms) -> match emit(cx, env, Nil, sc, em) {
-        Gotv(sv, em2) -> match emit_arms(cx, env, Nil, sv, ty_of(sc), arms, em2, "", Nil, Yes(r)) { Arms(_, em3) -> em3 }
+        Gotv(sv, em2) -> match emit_arms(cx, env, Nil, sv, ty_of(sc), arms, em2, "", Nil, TDir(r)) { Arms(_, em3) -> em3 }
       }
       KApp(CExpr(_, _, _, KVar(f)), args) -> if bound(env, f) || !is_fn(cx, f) { match closure_call(cx, env, Nil, e, em, Yes(r)) { Gotv(_, em2) -> em2 } } else {
         match emit_args(cx, env, Nil, args, em, Nil) {
@@ -538,7 +567,7 @@ fn closure_call(cx: ECx, env: List(EBind), pend: List(Val), e: CExpr, em: Emit, 
 linear type Numbered { Numbered(Int, Emit) }
 fn new_closure(em: Emit, arity: Int, mask: Int, job: LJob) -> Numbered {
   match em {
-    Emit(b, n, l, Mx(cs, js, rws, lk, ws), k) -> Numbered(lk, Emit(b, n, l, Mx(cs, Cons(job, js), Cons(Row2(arity, mask), rws), lk + 1, ws), k))
+    Emit(b, n, l, Mx(cs, js, rws, lk, ws, fr), k) -> Numbered(lk, Emit(b, n, l, Mx(cs, Cons(job, js), Cons(Row2(arity, mask), rws), lk + 1, ws, fr), k))
   }
 }
 fn cap_mask(caps: List(EBind), bit: Int, acc: Int) -> Int {
@@ -556,7 +585,7 @@ fn lambda(cx: ECx, env: List(EBind), pend: List(Val), ps: List(CParam), body: CE
   let caps = captures(env, free_vars(body, param_names(ps, Nil), Nil), Nil)
   let r = match t { TFn(_, _, rt) -> lt_of(rt)  _ -> LI64 }
   match em {
-    Emit(b, n, l, Mx(cs, js, rws, lk, ws), k) -> match new_closure(Emit(b, n, l, Mx(cs, js, rws, lk, ws), k), 1 + len_binds(caps, 0), cap_mask(caps, 2, 0), LamJob(lk, ps, body, caps, r)) {
+    Emit(b, n, l, Mx(cs, js, rws, lk, ws, fr), k) -> match new_closure(Emit(b, n, l, Mx(cs, js, rws, lk, ws, fr), k), 1 + len_binds(caps, 0), cap_mask(caps, 2, 0), LamJob(lk, ps, body, caps, r)) {
       Numbered(i, em2) -> alloc_closure(cx, env, pend, n_ctors(cx) + i, "@elya$lam." <> int.to_string(i), cap_vals(caps), em2)
     }
   }
@@ -572,10 +601,10 @@ fn len_binds(bs: List(EBind), n: Int) -> Int { match bs { Nil -> n  Cons(_, rest
 // calls it (`anf.rs`'s wrapper), the wrapper written once.
 fn fn_value(cx: ECx, env: List(EBind), pend: List(Val), f: String, em: Emit) -> Gotv {
   match em {
-    Emit(b, n, l, Mx(cs, js, rws, lk, ws), k) -> {
-      let mx = if has(ws, f) { Mx(cs, js, rws, lk, ws) } else { Mx(cs, Cons(WrapJob(f), js), rws, lk, Cons(f, ws)) }
+    Emit(b, n, l, Mx(cs, js, rws, lk, ws, fr), k) -> {
+      let mx = if has(ws, f) { Mx(cs, js, rws, lk, ws, fr) } else { Mx(cs, Cons(WrapJob(f), js), rws, lk, Cons(f, ws), fr) }
       match mx {
-        Mx(cs2, js2, rws2, lk2, ws2) -> alloc_closure(cx, env, pend, n_ctors(cx) + lk2, "@elya$wrap." <> f, Nil, Emit(b, n, l, Mx(cs2, js2, Cons(Row2(1, 0), rws2), lk2 + 1, ws2), k))
+        Mx(cs2, js2, rws2, lk2, ws2, fr2) -> alloc_closure(cx, env, pend, n_ctors(cx) + lk2, "@elya$wrap." <> f, Nil, Emit(b, n, l, Mx(cs2, js2, Cons(Row2(1, 0), rws2), lk2 + 1, ws2, fr2), k))
       }
     }
   }
@@ -598,9 +627,20 @@ fn free_vars(e: CExpr, bnd: List(String), acc: List(String)) -> List(String) {
       KLet(n, v, b) -> free_vars(b, Cons(n, bnd), free_vars(v, bnd, acc))
       KIf(c, x, y) -> free_list(Cons(c, Cons(x, Cons(y, Nil))), bnd, acc)
       KMatch(sc, arms) -> free_arms(arms, bnd, free_vars(sc, bnd, acc))
+      KPerform(_, _, _, args) -> free_list(args, bnd, acc)
+      // A resume reads its clause's continuation.
+      KResume(v) -> free_vars(v, bnd, if has(bnd, "$cont") || has(acc, "$cont") { acc } else { Cons("$cont", acc) })
+      KHandle(body, _, cs, ret) -> handle_free(body, cs, ret, bnd, acc)
       _ -> acc
     }
   }
+}
+fn handle_free(body: CExpr, cs: List(CClause), ret: Maybe(CRet), bnd: List(String), acc: List(String)) -> List(String) {
+  let a2 = free_clauses(cs, bnd, free_vars(body, bnd, acc))
+  match ret { No -> a2  Yes(CRet(n, rb)) -> free_vars(rb, Cons(n, bnd), a2) }
+}
+fn free_clauses(cs: List(CClause), bnd: List(String), acc: List(String)) -> List(String) {
+  match cs { Nil -> acc  Cons(CClause(_, _, ps, b), rest) -> free_clauses(rest, bnd, free_vars(b, Cons("$cont", param_names(ps, bnd)), acc)) }
 }
 fn free_arms(arms: List(CArm), bnd: List(String), acc: List(String)) -> List(String) {
   match arms { Nil -> acc  Cons(CArm(p, b), rest) -> free_arms(rest, bnd, free_vars(b, pat_names(p, bnd), acc)) }
@@ -622,7 +662,7 @@ fn ctor_info(cs: List(CInfo), n: String, key: String) -> CInfo {
 fn type_key(t: Ty) -> String {
   match t { TCon(_, Nil) -> ""  _ -> mono.key_of(t) }
 }
-fn cx_ctor(cx: ECx, n: String, t: Ty) -> CInfo { match cx { ECx(_, cs, _) -> ctor_info(cs, n, type_key(t)) } }
+fn cx_ctor(cx: ECx, n: String, t: Ty) -> CInfo { match cx { ECx(_, cs, _, _) -> ctor_info(cs, n, type_key(t)) } }
 fn len_vals(vs: List(Val), n: Int) -> Int { match vs { Nil -> n  Cons(_, rest) -> len_vals(rest, n + 1) } }
 
 // A field's word: an `Int` or `Unit` itself, a `Bool` widened, a pointer as
@@ -719,18 +759,24 @@ linear type Arms { Arms(List(In), Emit) }
 fn phi_ins(ins: List(In)) -> String {
   match ins { Nil -> ""  Cons(In(v, l), Nil) -> "[ " <> v <> ", %" <> l <> " ]"  Cons(In(v, l), rest) -> "[ " <> v <> ", %" <> l <> " ], " <> phi_ins(rest) }
 }
-fn emit_arms(cx: ECx, env: List(EBind), pend: List(Val), sv: Val, st: Ty, arms: List(CArm), em: Emit, join: String, ins: List(In), tail: Maybe(LTy)) -> Arms {
+// How an arm ends: joined (`TNo`), or in tail position of a direct function
+// (its result type), of a CPS region, or of a handler's clause.
+type TMode { TNo, TDir(LTy), TCps, TCl }
+fn tail_by(cx: ECx, env: List(EBind), e: CExpr, em: Emit, mode: TMode) -> Emit {
+  match mode { TDir(r) -> emit_tail(cx, env, e, em, r)  TCps -> cps_tail(cx, env, e, em)  TCl -> clause_tail(cx, env, e, em)  TNo -> emit_tail(cx, env, e, em, LI64) }
+}
+fn emit_arms(cx: ECx, env: List(EBind), pend: List(Val), sv: Val, st: Ty, arms: List(CArm), em: Emit, join: String, ins: List(In), tail: TMode) -> Arms {
   match arms {
     Nil -> Arms(rev(ins), line(line(em, "call void @elya_match_fail()"), "unreachable"))
     Cons(CArm(p, body), rest) -> match new_label(em) {
       Fresh1(next, em2) -> match test_pat(cx, sv, st, p, next, val_roots(Cons(sv, Nil), val_roots(pend, Nil)), env, em2) {
         Tested(env2, em3) -> match tail {
-          Yes(r) -> emit_arms(cx, env, pend, sv, st, rest, start_block(emit_tail(cx, env2, body, em3, r), next), join, ins, tail)
-          No -> match emit(cx, env2, pend, body, em3) {
+          TNo -> match emit(cx, env2, pend, body, em3) {
             Gotv(Val(bv, _), em4) -> match label_of(em4) {
               AtLabel(lb, em5) -> emit_arms(cx, env, pend, sv, st, rest, start_block(line(em5, "br label %" <> join), next), join, Cons(In(bv, lb), ins), tail)
             }
           }
+          _ -> emit_arms(cx, env, pend, sv, st, rest, start_block(tail_by(cx, env2, body, em3, tail), next), join, ins, tail)
         }
       }
     }
@@ -765,21 +811,32 @@ fn define(cx: ECx, name: String, text: String, r: LTy, env: List(EBind), body: C
     }
   }
 }
+fn define_mode(cx: ECx, name: String, text: String, r: LTy, env: List(EBind), body: CExpr, pre: List(String), em: Emit, mode: TMode) -> Emit {
+  match em {
+    Emit(b, k, _, mx, sk) -> {
+      let em2 = lines(Emit(buffer.push(b, "define tailcc " <> lt_text(r) <> " @" <> name <> "(" <> text <> ") {\nentry:\n"), k, "entry", mx, sk), pre)
+      match tail_by(cx, env, body, em2, mode) {
+        Emit(b2, k2, l2, mx2, sk2) -> Emit(buffer.push(b2, "}\n\n"), k2, l2, mx2, sk2)
+      }
+    }
+  }
+}
 fn lines(em: Emit, ls: List(String)) -> Emit { match ls { Nil -> em  Cons(x, rest) -> lines(line(em, x), rest) } }
 // A lambda's code: the closure, then its parameters; each capture loaded
 // from the closure's words at entry.
 linear type Loaded { Loaded(List(String), List(EBind), Emit) }
-fn load_caps(caps: List(EBind), i: Int, pre: List(String), env: List(EBind), em: Emit) -> Loaded {
+fn load_caps(caps: List(EBind), i: Int, pre: List(String), env: List(EBind), em: Emit) -> Loaded { load_from(caps, "%clo", i, pre, env, em) }
+fn load_from(caps: List(EBind), base: String, i: Int, pre: List(String), env: List(EBind), em: Emit) -> Loaded {
   match caps {
     Nil -> Loaded(rev(pre), env, em)
     Cons(EBind(n, Val(_, t)), rest) -> match fresh(em) {
       Fresh1(fp, em2) -> match fresh(em2) {
         Fresh1(w, em3) -> {
-          let ld = Cons(w <> " = load i64, ptr " <> fp, Cons(fp <> " = getelementptr i64, ptr %clo, i64 " <> int.to_string(i), pre))
+          let ld = Cons(w <> " = load i64, ptr " <> fp, Cons(fp <> " = getelementptr i64, ptr " <> base <> ", i64 " <> int.to_string(i), pre))
           match t {
-            LI64 -> load_caps(rest, i + 1, ld, Cons(EBind(n, Val(w, LI64)), env), em3)
+            LI64 -> load_from(rest, base, i + 1, ld, Cons(EBind(n, Val(w, LI64)), env), em3)
             _ -> match fresh(em3) {
-              Fresh1(v, em4) -> load_caps(rest, i + 1, Cons(v <> (if t == LI1 { " = trunc i64 " <> w <> " to i1" } else { " = inttoptr i64 " <> w <> " to ptr" }), ld), Cons(EBind(n, Val(v, t)), env), em4)
+              Fresh1(v, em4) -> load_from(rest, base, i + 1, Cons(v <> (if t == LI1 { " = trunc i64 " <> w <> " to i1" } else { " = inttoptr i64 " <> w <> " to ptr" }), ld), Cons(EBind(n, Val(v, t)), env), em4)
             }
           }
         }
@@ -799,9 +856,9 @@ fn wrapper_params(ps: List(LTy), i: Int, text: String, args: List(Val)) -> Hdr2 
 type Hdr2 { Hdr2(String, List(Val)) }
 fn take_job(em: Emit) -> Job1 {
   match em {
-    Emit(b, n, l, Mx(cs, js, rws, lk, ws), k) -> match js {
-      Nil -> Job1(No, Emit(b, n, l, Mx(cs, Nil, rws, lk, ws), k))
-      Cons(j, rest) -> Job1(Yes(j), Emit(b, n, l, Mx(cs, rest, rws, lk, ws), k))
+    Emit(b, n, l, Mx(cs, js, rws, lk, ws, fr), k) -> match js {
+      Nil -> Job1(No, Emit(b, n, l, Mx(cs, Nil, rws, lk, ws, fr), k))
+      Cons(j, rest) -> Job1(Yes(j), Emit(b, n, l, Mx(cs, rest, rws, lk, ws, fr), k))
     }
   }
 }
@@ -814,6 +871,15 @@ fn drain_jobs(cx: ECx, em: Emit) -> Emit {
         Loaded(pre, env, em3) -> drain_jobs(cx, define(cx, "elya$lam." <> int.to_string(i), if text == "" { "ptr %clo" } else { "ptr %clo, " <> text }, r, env, body, pre, em3))
       }
     }
+    // A site's resumption: the hole's value and the frame; the frame's next
+    // is the region's continuation, its saved values the rest's scope.
+    Job1(Yes(SiteJob(i, x, xt, saved, rest)), em2) -> match load_from(saved, "%f", 3, Nil, Nil, em2) {
+      Loaded(pre, env, em3) -> match bind_word(x, xt, "%v") {
+        Bound(bl, xb) -> drain_jobs(cx, define_mode(cx, "elya$k." <> int.to_string(i), "i64 %v, ptr %f", LI64, Cons(xb, Cons(EBind("$k", Val("%next", LPtr)), env)), rest,
+          rev_onto(rev(Cons("%next.p = getelementptr i64, ptr %f, i64 2", Cons("%next.w = load i64, ptr %next.p", Cons("%next = inttoptr i64 %next.w to ptr", Nil)))), rev_onto(rev(pre), bl)), em3, TCps))
+      }
+    }
+    Job1(Yes(HandJob(i, body, cs, ret, saved, bt)), em2) -> drain_jobs(cx, handler_fns(cx, i, body, cs, ret, saved, bt, em2))
     Job1(Yes(WrapJob(f)), em2) -> match sig_of(cx_sigs(cx), f) {
       ESig(_, ps, r) -> match wrapper_params(ps, 0, "ptr %clo", Nil) {
         Hdr2(text, args) -> match em2 {
@@ -827,7 +893,10 @@ fn emit_fns(cx: ECx, fs: List(CFn), em: Emit) -> Emit {
   match fs {
     Nil -> em
     Cons(CFn(n, ps, body), rest) -> match header(ps, 0, "", Nil) {
-      Hdr(text, env) -> emit_fns(cx, rest, drain_jobs(cx, define(cx, "elya." <> n, text, ty_lt(body), env, body, Nil, em)))
+      Hdr(text, env) -> emit_fns(cx, rest, drain_jobs(cx, if is_cps(cx, n) {
+        // A CPS function: its continuation one more parameter (D14).
+        define_mode(cx, "elya." <> n, if text == "" { "ptr %k" } else { text <> ", ptr %k" }, LI64, Cons(EBind("$k", Val("%k", LPtr)), env), body, Nil, em, TCps)
+      } else { define(cx, "elya." <> n, text, ty_lt(body), env, body, Nil, em) }))
     }
   }
 }
@@ -868,6 +937,14 @@ fn prelude() -> String {
   "declare ptr @elya_str_slice(i64, ptr, i64, i64)\n" <>
   "declare void @elya_shift_range(ptr, i64)\n" <>
   "declare void @elya_gc_push(ptr)\n" <>
+  "@elya_current_handler = external global ptr\n" <>
+  "@elya_handle_end = external global ptr\n" <>
+  "declare void @elya_resume_twice()\n" <>
+  "declare void @elya_unhandled_effect()\n" <>
+  "declare void @elya_handle_end_init(ptr)\n" <>
+  // The end frame's code: the current handler's (spec
+  // 2026-10-22-elya-multi-shot-sharing D1); C cannot `musttail` a `tailcc`.
+  "define internal tailcc i64 @elya_rt_handle_end(i64 %v, ptr %f) {\nentry:\n  %h = load ptr, ptr @elya_current_handler\n  %cw = getelementptr i64, ptr %h, i64 1\n  %c = load i64, ptr %cw\n  %code = inttoptr i64 %c to ptr\n  %r = musttail call tailcc i64 %code(i64 %v, ptr %h)\n  ret i64 %r\n}\n" <>
   "declare void @elya_gc_pop()\n" <>
   "@.name.shl = private unnamed_addr constant [4 x i8] c\"shl\\00\"\n" <>
   "@.name.shr = private unnamed_addr constant [4 x i8] c\"shr\\00\"\n" <>
@@ -907,7 +984,7 @@ fn entry(cx: ECx, main_lt: LTy, fl: Bool) -> String {
   } else { if fl {
     "  %s = call ptr @elya_float_to_string(i64 " <> stag(cx) <> ", i64 %v)\n  call void @elya_println(ptr %s)\n  ret i64 0\n}\n\n"
   } else { "  ret i64 %v\n}\n\n" } }) <>
-  "define i32 @main(i32 %0, ptr %1) {\nentry:\n  call void @elya_gc_init(ptr @.gc_desc, i64 " <> int.to_string(rows(cx)) <> ")\n  call void @elya_eq_init(ptr @.eq_float, i64 " <> int.to_string(n_ctors(cx)) <> ")\n" <>
+  "define i32 @main(i32 %0, ptr %1) {\nentry:\n  call void @elya_gc_init(ptr @.gc_desc, i64 " <> int.to_string(rows(cx)) <> ")\n  call void @elya_eq_init(ptr @.eq_float, i64 " <> int.to_string(n_ctors(cx)) <> ")\n  call void @elya_handle_end_init(ptr @elya_rt_handle_end)\n" <>
   "  call void @elya_args_init(i32 %0, ptr %1)\n  %v = call i64 @elya_start(ptr @elya_entry)\n" <>
   (if main_lt == LI1 || fl { "" } else { "  call void @elya_main_int(i64 %v)\n" }) <>
   "  call void @elya_gc_report()\n  ret i32 0\n}\n"
@@ -983,10 +1060,16 @@ fn use_expr(gs: List(CGeneric), e: CExpr, ins: Insts) -> Insts {
         KLet(_, v, b) -> use_expr(gs, b, use_expr(gs, v, ins2))
         KIf(c, x, y) -> use_exprs(gs, Cons(c, Cons(x, Cons(y, Nil))), ins2)
         KMatch(s, arms) -> use_arms(gs, arms, use_expr(gs, s, ins2))
+        KPerform(_, _, ot, args) -> use_exprs(gs, args, use_ty(gs, ot, ins2))
+        KResume(v) -> use_expr(gs, v, ins2)
+        KHandle(body, _, cs, ret) -> use_clauses(gs, cs, match ret { No -> use_expr(gs, body, ins2)  Yes(CRet(_, rb)) -> use_expr(gs, rb, use_expr(gs, body, ins2)) })
         _ -> ins2
       }
     }
   }
+}
+fn use_clauses(gs: List(CGeneric), cs: List(CClause), ins: Insts) -> Insts {
+  match cs { Nil -> ins  Cons(CClause(_, _, ps, b), rest) -> use_clauses(gs, rest, use_expr(gs, b, use_tys(gs, param_tys(ps), ins))) }
 }
 fn use_arms(gs: List(CGeneric), arms: List(CArm), ins: Insts) -> Insts {
   match arms { Nil -> ins  Cons(CArm(_, b), rest) -> use_arms(gs, rest, use_expr(gs, b, ins)) }
@@ -999,10 +1082,17 @@ fn ground_fields(cs: List(CInfo), acc: List(Ty)) -> List(Ty) {
   match cs { Nil -> acc  Cons(CInfo(_, _, _, fs), rest) -> ground_fields(rest, rev_onto(fs, acc)) }
 }
 
-fn n_ctors(cx: ECx) -> Int { match cx { ECx(_, cs, _) -> len_infos(cs, 0) } }
+fn n_ctors(cx: ECx) -> Int { match cx { ECx(_, cs, _, _) -> len_infos(cs, 0) } }
 fn len_infos(cs: List(CInfo), n: Int) -> Int { match cs { Nil -> n  Cons(_, rest) -> len_infos(rest, n + 1) } }
 // The rows: each constructor's, then the string's, then the traced array's.
-fn rows(cx: ECx) -> Int { match cx { ECx(_, _, t) -> t + 2 } }
+// The rows: each constructor's and closure's, the string's, the traced
+// array's, then the effects' (spec 2026-11-28-elya-backend-effects): the
+// empty frame's, the site frames', the handler frames', the continuation's.
+fn frame_tag(cx: ECx) -> Int { match cx { ECx(_, _, t, _) -> t + 2 } }
+fn site_base(cx: ECx) -> Int { frame_tag(cx) + 1 }
+fn handler_base(cx: ECx) -> Int { match cx { ECx(_, _, _, EffCx(_, _, ns, _)) -> site_base(cx) + ns } }
+fn cont_tag(cx: ECx) -> Int { match cx { ECx(_, _, _, EffCx(_, _, _, nh)) -> handler_base(cx) + nh } }
+fn rows(cx: ECx) -> Int { cont_tag(cx) + 1 }
 fn is_heap(t: Ty) -> Bool { lt_of(t) == LPtr }
 fn mask(fs: List(Ty), bit: Int, acc: Int) -> Int {
   match fs { Nil -> acc  Cons(f, rest) -> mask(rest, bit * 2, if is_heap(f) { acc + bit } else { acc }) }
@@ -1026,9 +1116,9 @@ fn closure_rows(rws: List(Row2), b: String) -> String {
 }
 fn spare_rows(n: Int, b: String) -> String { if n <= 0 { b } else { spare_rows(n - 1, b <> "i64 0, i64 0, ") } }
 fn len_rows(rws: List(Row2), n: Int) -> Int { match rws { Nil -> n  Cons(_, rest) -> len_rows(rest, n + 1) } }
-fn tables(cx: ECx, rws: List(Row2)) -> String {
+fn tables(cx: ECx, rws: List(Row2), fr: FRows) -> String {
   match cx {
-    ECx(_, cs, t) -> "@.gc_desc = private unnamed_addr constant [" <> int.to_string(2 * rows(cx)) <> " x i64] [" <> desc_rows(cs, "") <> closure_rows(rws, "") <> spare_rows(t - n_ctors(cx) - len_rows(rws, 0), "") <> "i64 0, i64 0, i64 -1, i64 0]\n" <>
+    ECx(_, cs, t, EffCx(_, _, ns, nh)) -> "@.gc_desc = private unnamed_addr constant [" <> int.to_string(2 * rows(cx)) <> " x i64] [" <> desc_rows(cs, "") <> closure_rows(rws, "") <> spare_rows(t - n_ctors(cx) - len_rows(rws, 0), "") <> "i64 0, i64 0, i64 -1, i64 0, " <> effect_rows(fr, ns, nh) <> "]\n" <>
       "@.eq_float = private unnamed_addr constant [" <> int.to_string(n_ctors(cx) + 1) <> " x i64] [" <> float_rows(cs, "") <> "i64 0]\n"
   }
 }
@@ -1048,12 +1138,519 @@ fn sites(e: CExpr, n: Int) -> Int {
       KLet(_, v, b) -> sites(b, sites(v, n))
       KIf(c, x, y) -> sites_list(Cons(c, Cons(x, Cons(y, Nil))), n)
       KMatch(sc, arms) -> sites_arms(arms, sites(sc, n))
+      KPerform(_, _, _, args) -> sites_list(args, n)
+      KResume(v) -> sites(v, n)
+      KHandle(body, _, cs, ret) -> sites_clauses(cs, match ret { No -> sites(body, n)  Yes(CRet(_, rb)) -> sites(rb, sites(body, n)) })
       _ -> n
     }
   }
 }
+fn sites_clauses(cs: List(CClause), n: Int) -> Int { match cs { Nil -> n  Cons(CClause(_, _, _, b), rest) -> sites_clauses(rest, sites(b, n)) } }
 fn sites_arms(arms: List(CArm), n: Int) -> Int { match arms { Nil -> n  Cons(CArm(_, b), rest) -> sites_arms(rest, sites(b, n)) } }
 fn sites_fns(fs: List(CFn), n: Int) -> Int { match fs { Nil -> n  Cons(CFn(_, _, b), rest) -> sites_fns(rest, sites(b, n)) } }
+
+// ---- Effects (spec 2026-11-28-elya-backend-effects E1, E2) -----------------
+// The Rust back end's selective CPS, its runtime protocol word for word
+// (crates/codegen/src/cps.rs, cps_emit.rs): a function whose region performs
+// or makes an effectful call takes its continuation as one more parameter and
+// answers an `i64` word through it; a non-tail site saves the rest of its
+// region in a frame `[tag][code][next][saved..]`; a `handle` is a handler
+// frame `[tag][ret][next][table][parent][saved..]` made current around its
+// body; a perform walks the handlers from `elya_current_handler` to the first
+// whose clause table has the operation and jumps to the clause with a
+// continuation object `[tag][k][handler][innermost]`; `resume` runs it once.
+
+fn eff_of(cx: ECx) -> EffCx { match cx { ECx(_, _, _, e) -> e } }
+fn is_cps(cx: ECx, n: String) -> Bool { match eff_of(cx) { EffCx(ns, _, _, _) -> has(ns, n) } }
+
+// D16: a row with a label but `IO`, or the poisoned tail, needs the
+// continuation; an open tail alone does not.
+fn labs_cps(ls: List(Lab)) -> Bool { match ls { Nil -> False  Cons(Lab(n, _, _, _), rest) -> n != "IO" || labs_cps(rest) } }
+fn tail_err(t: Tail) -> Bool { match t { RError -> True  _ -> False } }
+fn needs_cps(t: Ty) -> Bool { match t { TFn(_, Row(ls, tl), _) -> labs_cps(ls) || tail_err(tl)  _ -> False } }
+fn is_site(e: CExpr) -> Bool {
+  match e { CExpr(_, _, _, k) -> match k { KPerform(_, _, _, _) -> True  KApp(f, _) -> needs_cps(ty_of(f))  _ -> False } }
+}
+// Every child expression, a lambda's body and a handle's parts included.
+fn arm_bodies(arms: List(CArm), acc: List(CExpr)) -> List(CExpr) { match arms { Nil -> rev(acc)  Cons(CArm(_, b), rest) -> arm_bodies(rest, Cons(b, acc)) } }
+fn clause_bodies(cs: List(CClause), acc: List(CExpr)) -> List(CExpr) { match cs { Nil -> rev(acc)  Cons(CClause(_, _, _, b), rest) -> clause_bodies(rest, Cons(b, acc)) } }
+fn children(e: CExpr) -> List(CExpr) {
+  match e {
+    CExpr(_, _, _, k) -> match k {
+      KApp(f, xs) -> Cons(f, xs)
+      KBuiltin(_, xs) -> xs
+      KCtor(_, xs) -> xs
+      KPrim(_, xs) -> xs
+      KPerform(_, _, _, xs) -> xs
+      KLambda(_, b) -> Cons(b, Nil)
+      KLet(_, v, b) -> Cons(v, Cons(b, Nil))
+      KIf(c, x, y) -> Cons(c, Cons(x, Cons(y, Nil)))
+      KMatch(sc, arms) -> Cons(sc, arm_bodies(arms, Nil))
+      KResume(v) -> Cons(v, Nil)
+      KHandle(b, _, cs, ret) -> Cons(b, rev_onto(rev(clause_bodies(cs, Nil)), match ret { No -> Nil  Yes(CRet(_, rb)) -> Cons(rb, Nil) }))
+      _ -> Nil
+    }
+  }
+}
+// `contains_effect`: a site anywhere in the region, which a lambda's body
+// and a (direct) handle's parts are not.
+fn has_site(e: CExpr) -> Bool {
+  if is_site(e) { True } else {
+    match e { CExpr(_, _, _, k) -> match k { KLambda(_, _) -> False  KHandle(_, _, _, _) -> False  _ -> any_site(children(e)) } }
+  }
+}
+fn any_site(xs: List(CExpr)) -> Bool { match xs { Nil -> False  Cons(x, rest) -> has_site(x) || any_site(rest) } }
+fn has_handle(e: CExpr) -> Bool { match e { CExpr(_, _, _, KHandle(_, _, _, _)) -> True  _ -> any_handle(children(e)) } }
+fn any_handle(xs: List(CExpr)) -> Bool { match xs { Nil -> False  Cons(x, rest) -> has_handle(x) || any_handle(rest) } }
+fn has_resume(e: CExpr) -> Bool {
+  match e {
+    CExpr(_, _, _, KResume(_)) -> True
+    // An inner handle's clauses resume their own continuations.
+    CExpr(_, _, _, KHandle(b, _, _, ret)) -> has_resume(b) || match ret { No -> False  Yes(CRet(_, rb)) -> has_resume(rb) }
+    _ -> any_resume(children(e))
+  }
+}
+fn any_resume(xs: List(CExpr)) -> Bool { match xs { Nil -> False  Cons(x, rest) -> has_resume(x) || any_resume(rest) } }
+fn cps_names(fs: List(CFn), acc: List(String)) -> List(String) {
+  match fs { Nil -> acc  Cons(CFn(n, _, b), rest) -> cps_names(rest, if has_site(b) { Cons(n, acc) } else { acc }) }
+}
+
+// Every (effect, operation) the module performs, and those it handles too:
+// the index into every handle's clause table.
+fn has_op(xs: List(EffOp), eff: String, op: String) -> Bool { match xs { Nil -> False  Cons(EffOp(e, o), rest) -> e == eff && o == op || has_op(rest, eff, op) } }
+fn add_op(acc: List(EffOp), eff: String, op: String) -> List(EffOp) { if has_op(acc, eff, op) { acc } else { Cons(EffOp(eff, op), acc) } }
+fn clause_ops(cs: List(CClause), acc: List(EffOp)) -> List(EffOp) { match cs { Nil -> acc  Cons(CClause(e, o, _, _), rest) -> clause_ops(rest, add_op(acc, e, o)) } }
+fn ops_expr(e: CExpr, clauses: Bool, acc: List(EffOp)) -> List(EffOp) {
+  let acc2 = match e {
+    CExpr(_, _, _, KPerform(eff, op, _, _)) -> add_op(acc, eff, op)
+    CExpr(_, _, _, KHandle(_, _, cs, _)) -> if clauses { clause_ops(cs, acc) } else { acc }
+    _ -> acc
+  }
+  ops_list(children(e), clauses, acc2)
+}
+fn ops_list(xs: List(CExpr), clauses: Bool, acc: List(EffOp)) -> List(EffOp) { match xs { Nil -> acc  Cons(x, rest) -> ops_list(rest, clauses, ops_expr(x, clauses, acc)) } }
+fn ops_fns(fs: List(CFn), clauses: Bool, acc: List(EffOp)) -> List(EffOp) { match fs { Nil -> acc  Cons(CFn(_, _, b), rest) -> ops_fns(rest, clauses, ops_expr(b, clauses, acc)) } }
+fn op_index(xs: List(EffOp), eff: String, op: String, i: Int) -> Int { match xs { Nil -> 0 - 1  Cons(EffOp(e, o), rest) -> if e == eff && o == op { i } else { op_index(rest, eff, op, i + 1) } } }
+fn op_id(cx: ECx, eff: String, op: String) -> Int { match eff_of(cx) { EffCx(_, ops, _, _) -> op_index(ops, eff, op, 0) } }
+fn len_ops(xs: List(EffOp), n: Int) -> Int { match xs { Nil -> n  Cons(_, rest) -> len_ops(rest, n + 1) } }
+// Bounds on the frames' and handler frames' tags: a `let` each (only one
+// whose value holds a site makes a frame), a handle each.
+fn count_lets(e: CExpr, n: Int) -> Int { count_list(children(e), match e { CExpr(_, _, _, KLet(_, _, _)) -> n + 1  _ -> n }, False) }
+fn count_handles(e: CExpr, n: Int) -> Int { count_list(children(e), match e { CExpr(_, _, _, KHandle(_, _, _, _)) -> n + 1  _ -> n }, True) }
+fn count_list(xs: List(CExpr), n: Int, hs: Bool) -> Int { match xs { Nil -> n  Cons(x, rest) -> count_list(rest, if hs { count_handles(x, n) } else { count_lets(x, n) }, hs) } }
+fn count_fns(fs: List(CFn), n: Int, hs: Bool) -> Int { match fs { Nil -> n  Cons(CFn(_, _, b), rest) -> count_fns(rest, if hs { count_handles(b, n) } else { count_lets(b, n) }, hs) } }
+fn eff_cx(fs: List(CFn)) -> EffCx {
+  let cps = cps_names(fs, Nil)
+  let nh = count_fns(fs, 0, True)
+  EffCx(cps, rev(ops_fns(fs, True, Nil)), match cps { Nil -> if nh == 0 { 0 } else { count_fns(fs, 0, False) }  _ -> count_fns(fs, 0, False) }, nh)
+}
+fn effect_rows(fr: FRows, ns: Int, nh: Int) -> String {
+  match fr { FRows(sr, hr, _) -> "i64 2, i64 2, " <> closure_rows(rev(sr), "") <> spare_rows(ns - len_rows(sr, 0), "") <> closure_rows(rev(hr), "") <> spare_rows(nh - len_rows(hr, 0), "") <> "i64 3, i64 5" }
+}
+
+// ---- The stage's effects (E2): one-shot, direct handles ------------------------
+
+fn add_eff(acc: List(String), eff: String) -> List(String) { if eff == "IO" || has(acc, eff) { acc } else { Cons(eff, acc) } }
+fn labs_effs(ls: List(Lab), acc: List(String)) -> List(String) { match ls { Nil -> acc  Cons(Lab(n, _, _, _), rest) -> labs_effs(rest, add_eff(acc, n)) } }
+fn row_effs(t: Ty, acc: List(String)) -> List(String) { match t { TFn(_, Row(ls, _), _) -> labs_effs(ls, acc)  _ -> acc } }
+// `region_effects`: what a region performs that nothing in it handles.
+fn reff(perf: List(EffOp), e: CExpr, acc: List(String)) -> List(String) {
+  match e {
+    CExpr(_, _, _, k) -> match k {
+      KPerform(eff, _, _, xs) -> reffs(perf, xs, add_eff(acc, eff))
+      KApp(f, xs) -> reffs(perf, Cons(f, xs), row_effs(ty_of(f), acc))
+      KLambda(_, _) -> acc
+      KHandle(b, _, cs, ret) -> union(handle_effs(perf, b, cs, ret), acc)
+      _ -> reffs(perf, children(e), acc)
+    }
+  }
+}
+fn reffs(perf: List(EffOp), xs: List(CExpr), acc: List(String)) -> List(String) { match xs { Nil -> acc  Cons(x, rest) -> reffs(perf, rest, reff(perf, x, acc)) } }
+fn union(xs: List(String), acc: List(String)) -> List(String) { match xs { Nil -> acc  Cons(x, rest) -> union(rest, add_eff(acc, x)) } }
+fn remove(xs: List(String), x: String) -> List(String) { match xs { Nil -> Nil  Cons(y, rest) -> if y == x { remove(rest, x) } else { Cons(y, remove(rest, x)) } } }
+fn clause_eff(cs: List(CClause)) -> String { match cs { Nil -> ""  Cons(CClause(e, _, _, _), _) -> e } }
+fn has_clause(cs: List(CClause), eff: String, op: String) -> Bool { match cs { Nil -> False  Cons(CClause(e, o, _, _), rest) -> e == eff && o == op || has_clause(rest, eff, op) } }
+// A handle handles its effect only with a clause for every operation of it
+// the module performs.
+fn covers(perf: List(EffOp), eff: String, cs: List(CClause)) -> Bool {
+  match perf { Nil -> True  Cons(EffOp(e, o), rest) -> (e != eff || has_clause(cs, e, o)) && covers(rest, eff, cs) }
+}
+fn handle_effs(perf: List(EffOp), b: CExpr, cs: List(CClause), ret: Maybe(CRet)) -> List(String) {
+  let he = clause_eff(cs)
+  let body = reff(perf, b, Nil)
+  let inner = if he != "" && covers(perf, he, cs) { remove(body, he) } else { body }
+  let c2 = reffs(perf, clause_bodies(cs, Nil), inner)
+  match ret { No -> c2  Yes(CRet(_, rb)) -> reff(perf, rb, c2) }
+}
+fn len_exprs(xs: List(CExpr), n: Int) -> Int { match xs { Nil -> n  Cons(_, rest) -> len_exprs(rest, n + 1) } }
+fn len_params(ps: List(CParam), n: Int) -> Int { match ps { Nil -> n  Cons(_, rest) -> len_params(rest, n + 1) } }
+fn any_op_clause(cs: List(CClause)) -> Bool { match cs { Nil -> False  Cons(CClause(_, o, _, _), rest) -> o == "" || any_op_clause(rest) } }
+fn wide_clause(cs: List(CClause)) -> Bool { match cs { Nil -> False  Cons(CClause(_, _, ps, _), rest) -> len_params(ps, 0) > 2 || wide_clause(rest) } }
+fn convention(cps: List(String), n: String, t: Ty) -> Stage {
+  if needs_cps(t) == has(cps, n) { InStage } else { Outside("a calling convention that disagrees with the callee") }
+}
+type EffEnv { EffEnv(List(CFn), List(String), List(EffOp)) }
+fn check_effects(fs: List(CFn)) -> Stage {
+  let cps = cps_names(fs, Nil)
+  first(if has(cps, "main") { Outside("`main` performing an effect") } else { InStage }, first(eff_fns(EffEnv(fs, cps, ops_fns(fs, False, Nil)), fs), wide_fns_frames(anf_fns(fs))))
+}
+// A frame's pointer mask is one word: a site frame saves 60 values at most
+// (bits 2 to 61), a handler frame 58 (bits 4 to 61), counted after the
+// pre-pass names its operands.
+fn wide_fns_frames(fs: List(CFn)) -> Stage {
+  match fs { Nil -> InStage  Cons(CFn(_, ps, b), rest) -> first(wide_frames(param_names(ps, Nil), b), wide_fns_frames(rest)) }
+}
+fn wide_all(locals: List(String), xs: List(CExpr)) -> Stage { match xs { Nil -> InStage  Cons(x, rest) -> first(wide_frames(locals, x), wide_all(locals, rest)) } }
+fn wide_arms(locals: List(String), arms: List(CArm)) -> Stage { match arms { Nil -> InStage  Cons(CArm(p, b), rest) -> first(wide_frames(pat_names(p, locals), b), wide_arms(locals, rest)) } }
+fn wide_clauses(locals: List(String), cs: List(CClause)) -> Stage { match cs { Nil -> InStage  Cons(CClause(_, _, ps, b), rest) -> first(wide_frames(Cons("$cont", param_names(ps, locals)), b), wide_clauses(locals, rest)) } }
+fn wide_frames(locals: List(String), e: CExpr) -> Stage {
+  match e {
+    CExpr(_, _, _, k) -> match k {
+      KLet(n, v, b) -> first(if has_site(v) && count_in(free_vars(b, Cons(n, Nil), Nil), locals, 0) > 60 { Outside("a frame of more than 60 saved values") } else { InStage }, first(wide_frames(locals, v), wide_frames(Cons(n, locals), b)))
+      KLambda(ps, b) -> wide_frames(param_names(ps, locals), b)
+      KMatch(sc, arms) -> first(wide_frames(locals, sc), wide_arms(locals, arms))
+      KHandle(b, _, cs, ret) -> first(if count_in(handle_free(b, cs, ret, Nil, Nil), locals, 0) > 58 { Outside("a handler frame of more than 58 saved values") } else { InStage }, first(wide_frames(locals, b), first(wide_clauses(locals, cs), match ret { No -> InStage  Yes(CRet(n, rb)) -> wide_frames(Cons(n, locals), rb) })))
+      _ -> wide_all(locals, children(e))
+    }
+  }
+}
+fn eff_fns(x: EffEnv, fs: List(CFn)) -> Stage {
+  match fs { Nil -> InStage  Cons(CFn(_, ps, b), rest) -> first(check_eff(x, param_names(ps, Nil), b), eff_fns(x, rest)) }
+}
+fn eff_all(x: EffEnv, locals: List(String), xs: List(CExpr)) -> Stage { match xs { Nil -> InStage  Cons(e, rest) -> first(check_eff(x, locals, e), eff_all(x, locals, rest)) } }
+fn eff_arms(x: EffEnv, locals: List(String), arms: List(CArm)) -> Stage { match arms { Nil -> InStage  Cons(CArm(p, b), rest) -> first(check_eff(x, pat_names(p, locals), b), eff_arms(x, locals, rest)) } }
+fn eff_clauses(x: EffEnv, locals: List(String), cs: List(CClause)) -> Stage { match cs { Nil -> InStage  Cons(CClause(_, _, ps, b), rest) -> first(check_eff(x, param_names(ps, locals), b), eff_clauses(x, locals, rest)) } }
+fn is_top(x: EffEnv, locals: List(String), n: String) -> Bool { match x { EffEnv(all, _, _) -> !has(locals, n) && has_fn(all, n) } }
+fn x_cps(x: EffEnv) -> List(String) { match x { EffEnv(_, c, _) -> c } }
+fn check_eff(x: EffEnv, locals: List(String), e: CExpr) -> Stage {
+  match e {
+    CExpr(_, _, t, k) -> match k {
+      KVar(n) -> if is_top(x, locals, n) { if has(x_cps(x), n) { Outside("an effectful function as a value") } else { convention(x_cps(x), n, t) } } else { InStage }
+      KApp(CExpr(_, _, ft, KVar(f)), args) -> first(if is_top(x, locals, f) { convention(x_cps(x), f, ft) } else { if needs_cps(ft) { Outside("an effectful call of a closure") } else { InStage } }, eff_all(x, locals, args))
+      KApp(f, args) -> first(if needs_cps(ty_of(f)) { Outside("an effectful call of a closure") } else { InStage }, eff_all(x, locals, Cons(f, args)))
+      KLambda(ps, b) -> if has_site(b) { Outside("an effectful lambda") } else { if has_resume(b) { Outside("a resume inside a lambda") } else { check_eff(x, param_names(ps, locals), b) } }
+      KLet(n, v, b) -> first(check_eff(x, locals, v), check_eff(x, Cons(n, locals), b))
+      KMatch(sc, arms) -> first(check_eff(x, locals, sc), eff_arms(x, locals, arms))
+      KPerform(_, _, _, args) -> if len_exprs(args, 0) > 2 { Outside("an operation of more than two parameters") } else { eff_all(x, locals, args) }
+      KHandle(b, m, cs, ret) -> first(handle_ok(x, b, m, cs, ret), first(check_eff(x, locals, b), first(eff_clauses(x, locals, cs), match ret { No -> InStage  Yes(CRet(n, rb)) -> check_eff(x, Cons(n, locals), rb) })))
+      _ -> eff_all(x, locals, children(e))
+    }
+  }
+}
+fn handle_ok(x: EffEnv, b: CExpr, m: Bool, cs: List(CClause), ret: Maybe(CRet)) -> Stage {
+  if m { Outside("a multi-shot handler") } else {
+    if any_op_clause(cs) { Outside("a `with any` handler") } else {
+      if wide_clause(cs) { Outside("an operation of more than two parameters") } else {
+        match x { EffEnv(_, _, perf) -> match handle_effs(perf, b, cs, ret) { Nil -> InStage  _ -> Outside("a handler that leaks an effect") } }
+      }
+    }
+  }
+}
+
+// ---- Naming what a continuation saves -----------------------------------------
+// In a CPS region an operand that holds a site, and every operand computed
+// before it, is bound by a `let` first (`$o<i>`; a condition or scrutinee
+// `$c`/`$s`), so a site's continuation is always the rest of a `let`, and
+// what its frame saves is the free names of that rest.
+type HB { HB(String, CExpr) }
+linear type Hoisted { Hoisted(List(HB), List(CExpr)) }
+fn atomic(e: CExpr) -> Bool { match e { CExpr(_, _, _, KLit(_)) -> True  CExpr(_, _, _, KVar(_)) -> True  _ -> False } }
+fn last_site(xs: List(CExpr), i: Int, last: Int) -> Int { match xs { Nil -> last  Cons(x, rest) -> last_site(rest, i + 1, if has_site(x) { i } else { last }) } }
+fn hoist(xs: List(CExpr), i: Int, last: Int, bs: List(HB), out: List(CExpr)) -> Hoisted {
+  match xs {
+    Nil -> Hoisted(rev(bs), rev(out))
+    Cons(x, rest) -> {
+      let x2 = anf(x)
+      if i <= last && !atomic(x2) {
+        let n = "$o" <> int.to_string(i)
+        match x2 { CExpr(a, b, t, _) -> hoist(rest, i + 1, last, Cons(HB(n, x2), bs), Cons(CExpr(a, b, t, KVar(n)), out)) }
+      } else { hoist(rest, i + 1, last, bs, Cons(x2, out)) }
+    }
+  }
+}
+fn hoist_all(xs: List(CExpr)) -> Hoisted { hoist(xs, 0, last_site(xs, 0, 0 - 1), Nil, Nil) }
+fn wrap_lets(bs: List(HB), body: CExpr) -> CExpr {
+  match bs { Nil -> body  Cons(HB(n, v), rest) -> match body { CExpr(a, b, t, _) -> CExpr(a, b, t, KLet(n, v, wrap_lets(rest, body))) } }
+}
+fn anf_bind(n: String, v: CExpr, mk: CExpr) -> CExpr { match mk { CExpr(a, b, t, _) -> CExpr(a, b, t, KLet(n, v, mk)) } }
+fn anf(e: CExpr) -> CExpr {
+  match e {
+    CExpr(a, b, t, k) -> match k {
+      // The callee is operand 0: evaluated first, hoisted like the others.
+      KApp(f, xs) -> match hoist_all(Cons(f, xs)) { Hoisted(bs, ys) -> match ys { Cons(g, zs) -> wrap_lets(bs, CExpr(a, b, t, KApp(g, zs)))  Nil -> e } }
+      KBuiltin(n, xs) -> match hoist_all(xs) { Hoisted(bs, ys) -> wrap_lets(bs, CExpr(a, b, t, KBuiltin(n, ys))) }
+      KCtor(n, xs) -> match hoist_all(xs) { Hoisted(bs, ys) -> wrap_lets(bs, CExpr(a, b, t, KCtor(n, ys))) }
+      KPrim(op, xs) -> match hoist_all(xs) { Hoisted(bs, ys) -> wrap_lets(bs, CExpr(a, b, t, KPrim(op, ys))) }
+      KPerform(eff, op, ot, xs) -> match hoist_all(xs) { Hoisted(bs, ys) -> wrap_lets(bs, CExpr(a, b, t, KPerform(eff, op, ot, ys))) }
+      KLambda(ps, body) -> CExpr(a, b, t, KLambda(ps, anf(body)))
+      KLet(n, v, body) -> CExpr(a, b, t, KLet(n, anf(v), anf(body)))
+      KIf(c, x, y) -> {
+        let c2 = anf(c)
+        if has_site(c2) { anf_bind("$c", c2, CExpr(a, b, t, KIf(CExpr(a, b, ty_of(c2), KVar("$c")), anf(x), anf(y)))) } else { CExpr(a, b, t, KIf(c2, anf(x), anf(y))) }
+      }
+      KMatch(sc, arms) -> {
+        let s2 = anf(sc)
+        if has_site(s2) { anf_bind("$s", s2, CExpr(a, b, t, KMatch(CExpr(a, b, ty_of(s2), KVar("$s")), anf_arms(arms)))) } else { CExpr(a, b, t, KMatch(s2, anf_arms(arms))) }
+      }
+      KResume(v) -> {
+        let v2 = anf(v)
+        if has_site(v2) { anf_bind("$r", v2, CExpr(a, b, t, KResume(CExpr(a, b, ty_of(v2), KVar("$r"))))) } else { CExpr(a, b, t, KResume(v2)) }
+      }
+      KHandle(body, m, cs, ret) -> CExpr(a, b, t, KHandle(anf(body), m, anf_clauses(cs), match ret { No -> No  Yes(CRet(n, rb)) -> Yes(CRet(n, anf(rb))) }))
+      _ -> e
+    }
+  }
+}
+fn anf_arms(arms: List(CArm)) -> List(CArm) { match arms { Nil -> Nil  Cons(CArm(p, b), rest) -> Cons(CArm(p, anf(b)), anf_arms(rest)) } }
+fn anf_clauses(cs: List(CClause)) -> List(CClause) { match cs { Nil -> Nil  Cons(CClause(e, o, ps, b), rest) -> Cons(CClause(e, o, ps, anf(b)), anf_clauses(rest)) } }
+// Only a function with a region of its own: the others are unchanged.
+fn anf_fns(fs: List(CFn)) -> List(CFn) {
+  match fs { Nil -> Nil  Cons(CFn(n, ps, b), rest) -> Cons(CFn(n, ps, if has_site(b) || has_handle(b) { anf(b) } else { b }), anf_fns(rest)) }
+}
+
+// ---- CPS emission ---------------------------------------------------------------
+
+fn raw(em: Emit, s: String) -> Emit { match em { Emit(b, n, l, ss, k) -> Emit(buffer.push(b, s), n, l, ss, k) } }
+// A value given to a continuation: `code = k[1]; musttail code(word, k)`.
+fn return_to(em: Emit, k: Val, v: Val) -> Emit {
+  match to_word(em, v) {
+    Gotv(Val(w, _), em2) -> match load_field(em2, vtext(k), 1, TB(3)) {
+      Gotv(Val(code, _), em3) -> match fresh(em3) {
+        Fresh1(r, em4) -> line(line(em4, r <> " = musttail call tailcc i64 " <> code <> "(i64 " <> w <> ", ptr " <> vtext(k) <> ")"), "ret i64 " <> r)
+      }
+    }
+  }
+}
+fn ret_value(cx: ECx, env: List(EBind), e: CExpr, em: Emit) -> Emit {
+  match emit(cx, env, Nil, e, em) { Gotv(v, em2) -> return_to(em2, lookup(env, "$k"), v) }
+}
+fn if_tail(cx: ECx, env: List(EBind), c: CExpr, a: CExpr, b: CExpr, em: Emit, mode: TMode) -> Emit {
+  match emit(cx, env, Nil, c, em) {
+    Gotv(Val(cv, _), em2) -> match new_label(em2) {
+      Fresh1(lt, em3) -> match new_label(em3) {
+        Fresh1(lf, em4) -> tail_by(cx, env, b, start_block(tail_by(cx, env, a, start_block(line(em4, "br i1 " <> cv <> ", label %" <> lt <> ", label %" <> lf), lt), mode), lf), mode)
+      }
+    }
+  }
+}
+// The region's continuation is `$k` in the scope, so every allocation roots it.
+fn cps_tail(cx: ECx, env: List(EBind), e: CExpr, em: Emit) -> Emit {
+  match e {
+    CExpr(_, _, _, k) -> match k {
+      KLet(n, v, b) -> if has_site(v) {
+        match site_frame(cx, env, n, ty_of(v), b, em) { Gotv(f, em2) -> cps_tail(cx, Cons(EBind("$k", f), env), v, em2) }
+      } else {
+        match emit(cx, env, Nil, v, em) { Gotv(val, em2) -> cps_tail(cx, Cons(EBind(n, val), env), b, em2) }
+      }
+      KIf(c, a, b) -> if_tail(cx, env, c, a, b, em, TCps)
+      KMatch(sc, arms) -> match emit(cx, env, Nil, sc, em) {
+        Gotv(sv, em2) -> match emit_arms(cx, env, Nil, sv, ty_of(sc), arms, em2, "", Nil, TCps) { Arms(_, em3) -> em3 }
+      }
+      KApp(CExpr(_, _, ft, KVar(f)), args) -> if needs_cps(ft) && !bound(env, f) && is_fn(cx, f) {
+        match emit_args(cx, env, Nil, args, em, Nil) {
+          Gotvs(vs, em2) -> match fresh(em2) {
+            Fresh1(r, em3) -> line(line(em3, r <> " = musttail call tailcc i64 @elya." <> f <> "(" <> arg_list(rev_onto(rev(vs), Cons(lookup(env, "$k"), Nil))) <> ")"), "ret i64 " <> r)
+          }
+        }
+      } else { ret_value(cx, env, e, em) }
+      KPerform(eff, op, _, args) -> match emit_args(cx, env, Nil, args, em, Nil) { Gotvs(vs, em2) -> perform(cx, env, eff, op, vs, em2) }
+      _ -> ret_value(cx, env, e, em)
+    }
+  }
+}
+// A non-tail site's frame: the rest of the `let` is its resumption.
+fn site_frame(cx: ECx, env: List(EBind), x: String, xt: Ty, rest: CExpr, em: Emit) -> Gotv {
+  let saved = captures(env, free_vars(rest, Cons(x, Nil), Nil), Nil)
+  let n = len_binds(saved, 0)
+  match em {
+    Emit(b, c, l, Mx(scs, js, rws, lk, ws, FRows(sr, hr, nk)), sk) -> {
+      let tag = if n == 0 { frame_tag(cx) } else { site_base(cx) + len_rows(sr, 0) }
+      let sr2 = if n == 0 { sr } else { Cons(Row2(2 + n, cap_mask(saved, 4, 2)), sr) }
+      let em2 = Emit(b, c, l, Mx(scs, Cons(SiteJob(nk, x, xt, saved, rest), js), rws, lk, ws, FRows(sr2, hr, nk + 1)), sk)
+      match rooted(em2, roots(env, Nil, Nil), "call ptr @elya_alloc(i64 " <> int.to_string(3 + n) <> ")", LPtr) {
+        Gotv(Val(fr, _), em3) -> Gotv(Val(fr, LPtr), store_fields(line(em3, "store i64 " <> int.to_string(tag) <> ", ptr " <> fr), fr, Cons(Val("ptrtoint (ptr @elya$k." <> int.to_string(nk) <> " to i64)", LI64), Cons(lookup(env, "$k"), cap_vals(saved))), 1))
+      }
+    }
+  }
+}
+fn load_as(em: Emit, obj: String, i: Int, name: String) -> Emit {
+  match fresh(em) {
+    Fresh1(fp, em2) -> match fresh(line(em2, fp <> " = getelementptr i64, ptr " <> obj <> ", i64 " <> int.to_string(i))) {
+      Fresh1(w, em3) -> line(line(em3, w <> " = load i64, ptr " <> fp), name <> " = inttoptr i64 " <> w <> " to ptr")
+    }
+  }
+}
+// A perform: the continuation object, then the handlers walked from the
+// current one by their parents to the first whose table has the operation.
+fn perform(cx: ECx, env: List(EBind), eff: String, op: String, vs: List(Val), em: Emit) -> Emit {
+  match rooted(em, roots(env, Nil, vs), "call ptr @elya_alloc(i64 4)", LPtr) {
+    Gotv(Val(c, _), em2) -> match fresh(store_fields(line(em2, "store i64 " <> int.to_string(cont_tag(cx)) <> ", ptr " <> c), c, Cons(lookup(env, "$k"), Nil), 1)) {
+      Fresh1(h, em3) -> match label_of(line(em3, h <> " = load ptr, ptr @elya_current_handler")) {
+        AtLabel(l0, em4) -> match new_label(em4) {
+          Fresh1(find, em5) -> match new_label(em5) {
+            Fresh1(none, em6) -> match new_label(em6) {
+              Fresh1(hl, em7) -> match new_label(em7) {
+                Fresh1(outer, em8) -> match new_label(em8) {
+                  Fresh1(disp, em9) -> match fresh(em9) {
+                    Fresh1(hw, em10) -> match fresh(em10) {
+                      Fresh1(ph, em11) -> match fresh(em11) {
+                        Fresh1(noh, em12) -> {
+                          let em13 = line(start_block(line(em12, "br label %" <> find), find), hw <> " = phi ptr [ " <> h <> ", %" <> l0 <> " ], [ " <> ph <> ", %" <> outer <> " ]")
+                          let em14 = start_block(line(line(start_block(line(line(em13, noh <> " = icmp eq ptr " <> hw <> ", null"), "br i1 " <> noh <> ", label %" <> none <> ", label %" <> hl), none), "call void @elya_unhandled_effect()"), "unreachable"), hl)
+                          match load_field(em14, hw, 3, TB(3)) {
+                            Gotv(Val(tab, _), em15) -> match fresh(em15) {
+                              Fresh1(cs, em16) -> match fresh(line(em16, cs <> " = getelementptr ptr, ptr " <> tab <> ", i64 " <> int.to_string(op_id(cx, eff, op)))) {
+                                Fresh1(ce, em17) -> match fresh(line(em17, ce <> " = load ptr, ptr " <> cs)) {
+                                  Fresh1(nc, em18) -> {
+                                    let em19 = start_block(line(line(em18, nc <> " = icmp eq ptr " <> ce <> ", null"), "br i1 " <> nc <> ", label %" <> outer <> ", label %" <> disp), outer)
+                                    let em20 = start_block(line(load_as(em19, hw, 4, ph), "br label %" <> find), disp)
+                                    match fresh(store_fields(em20, c, Cons(Val(hw, LPtr), Cons(Val(h, LPtr), Nil)), 2)) {
+                                      Fresh1(r, em21) -> line(line(em21, r <> " = musttail call tailcc i64 " <> ce <> "(" <> arg_list(rev_onto(rev(vs), Cons(Val(c, LPtr), Cons(Val(hw, LPtr), Nil)))) <> ")"), "ret i64 " <> r)
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+// A direct handle: its frame made current around a nested call of its body.
+fn emit_handle(cx: ECx, env: List(EBind), pend: List(Val), body: CExpr, cs: List(CClause), ret: Maybe(CRet), t: Ty, em: Emit) -> Gotv {
+  let saved = captures(env, handle_free(body, cs, ret, Nil, Nil), Nil)
+  let n = len_binds(saved, 0)
+  match em {
+    Emit(b, c, l, Mx(scs, js, rws, lk, ws, FRows(sr, hr, nk)), sk) -> {
+      let i = len_rows(hr, 0)
+      let hn = "@elya$h." <> int.to_string(i)
+      let em2 = Emit(b, c, l, Mx(scs, Cons(HandJob(i, body, cs, ret, saved, ty_of(body)), js), rws, lk, ws, FRows(sr, Cons(Row2(4 + n, cap_mask(saved, 16, 10)), hr), nk)), sk)
+      match rooted(em2, roots(env, pend, Nil), "call ptr @elya_alloc(i64 " <> int.to_string(5 + n) <> ")", LPtr) {
+        Gotv(Val(fr, _), em3) -> match fresh(line(em3, "store i64 " <> int.to_string(handler_base(cx) + i) <> ", ptr " <> fr)) {
+          Fresh1(oh, em4) -> {
+            let em5 = store_fields(line(em4, oh <> " = load ptr, ptr @elya_current_handler"), fr, Cons(Val("ptrtoint (ptr " <> hn <> ".ret to i64)", LI64), Cons(Val("0", LI64), Cons(Val("ptrtoint (ptr " <> hn <> ".tab to i64)", LI64), Cons(Val(oh, LPtr), cap_vals(saved))))), 1)
+            match rooted(line(em5, "store ptr " <> fr <> ", ptr @elya_current_handler"), roots(env, pend, Nil), "call tailcc i64 " <> hn <> ".body(ptr " <> fr <> ")", LI64) {
+              Gotv(Val(hb, _), em6) -> from_word(line(em6, "store ptr " <> oh <> ", ptr @elya_current_handler"), hb, lt_of(t))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+// A word as a binding of `t`'s layout, the lines that convert it.
+linear type Bound { Bound(List(String), EBind) }
+fn bind_word(x: String, t: Ty, w: String) -> Bound {
+  match lt_of(t) {
+    LI1 -> Bound(Cons(w <> ".b = trunc i64 " <> w <> " to i1", Nil), EBind(x, Val(w <> ".b", LI1)))
+    LPtr -> Bound(Cons(w <> ".p = inttoptr i64 " <> w <> " to ptr", Nil), EBind(x, Val(w <> ".p", LPtr)))
+    _ -> Bound(Nil, EBind(x, Val(w, LI64)))
+  }
+}
+fn table_entries(ops: List(EffOp), cs: List(CClause), hn: String) -> String {
+  match ops {
+    Nil -> ""
+    Cons(EffOp(e, o), rest) -> {
+      let j = clause_index(cs, e, o, 0)
+      (if j < 0 { "ptr null" } else { "ptr @" <> hn <> ".c." <> int.to_string(j) }) <> (match rest { Nil -> ""  _ -> ", " }) <> table_entries(rest, cs, hn)
+    }
+  }
+}
+fn clause_index(cs: List(CClause), eff: String, op: String, j: Int) -> Int {
+  match cs { Nil -> 0 - 1  Cons(CClause(e, o, _, _), rest) -> if e == eff && o == op { j } else { clause_index(rest, eff, op, j + 1) } }
+}
+fn par_lines() -> List(String) {
+  Cons("%par.p = getelementptr i64, ptr %hf, i64 4", Cons("%par.w = load i64, ptr %par.p", Cons("%par = inttoptr i64 %par.w to ptr", Cons("store ptr %par, ptr @elya_current_handler", Nil))))
+}
+fn concat_lines(ls: List(String), acc: String) -> String { match ls { Nil -> acc  Cons(x, rest) -> concat_lines(rest, acc <> "  " <> x <> "\n") } }
+// A handle's functions: its clause table, its body (a region ending at the
+// end frame), its return clause and its clauses, each run with the frame's
+// parent current.
+fn handler_fns(cx: ECx, i: Int, body: CExpr, cs: List(CClause), ret: Maybe(CRet), saved: List(EBind), bt: Ty, em: Emit) -> Emit {
+  let hn = "elya$h." <> int.to_string(i)
+  let ops = match eff_of(cx) { EffCx(_, o, _, _) -> o }
+  let em1 = raw(em, "@" <> hn <> ".tab = private constant [" <> int.to_string(len_ops(ops, 0)) <> " x ptr] " <> (match ops { Nil -> "zeroinitializer"  _ -> "[" <> table_entries(ops, cs, hn) <> "]" }) <> "\n\n")
+  match load_from(saved, "%hf", 5, Nil, Nil, em1) {
+    Loaded(pre, env, em2) -> {
+      let em3 = define_mode(cx, hn <> ".body", "ptr %hf", LI64, Cons(EBind("$k", Val("%end", LPtr)), env), body, rev_onto(rev(pre), Cons("%end = load ptr, ptr @elya_handle_end", Nil)), em2, TCps)
+      let em4 = match ret {
+        No -> raw(em3, "define tailcc i64 @" <> hn <> ".ret(i64 %v, ptr %hf) {\nentry:\n" <> concat_lines(par_lines(), "") <> "  ret i64 %v\n}\n\n")
+        Yes(CRet(x, rb)) -> match load_from(saved, "%hf", 5, Nil, Nil, em3) {
+          Loaded(pre2, env2, em3b) -> match bind_word(x, bt, "%v") {
+            Bound(bl, xb) -> define_mode(cx, hn <> ".ret", "i64 %v, ptr %hf", LI64, Cons(xb, env2), rb, rev_onto(rev(par_lines()), rev_onto(rev(pre2), bl)), em3b, TCl)
+          }
+        }
+      }
+      clause_fns(cx, hn, cs, 0, saved, em4)
+    }
+  }
+}
+fn clause_fns(cx: ECx, hn: String, cs: List(CClause), j: Int, saved: List(EBind), em: Emit) -> Emit {
+  match cs {
+    Nil -> em
+    Cons(CClause(_, _, ps, b), rest) -> match header(ps, 0, "", Nil) {
+      Hdr(text, penv) -> match load_from(saved, "%hf", 5, Nil, Nil, em) {
+        // The parameters shadow what the frame saves.
+        Loaded(pre, env, em2) -> clause_fns(cx, hn, rest, j + 1, saved, define_mode(cx, hn <> ".c." <> int.to_string(j), (if text == "" { "" } else { text <> ", " }) <> "ptr %cont, ptr %hf", LI64, Cons(EBind("$cont", Val("%cont", LPtr)), rev_onto(rev(penv), env)), b, rev_onto(rev(par_lines()), pre), em2, TCl))
+      }
+    }
+  }
+}
+// One-shot resume (D13): the continuation's handler word is cleared, the
+// handler frame reparented to the current one, the innermost handler made
+// current, then its code is called (or jumped to, in tail position).
+linear type Resumed { Resumed(String, String, String, String, Emit) }
+fn resume_start(env: List(EBind), val: Val, em: Emit) -> Resumed {
+  let cont = vtext(lookup(env, "$cont"))
+  match to_word(em, val) {
+    Gotv(Val(w, _), em1) -> match load_field(em1, cont, 2, TB(0)) {
+      Gotv(Val(used, _), em2) -> match fresh(em2) {
+        Fresh1(z, em3) -> match fresh(trap(line(em3, z <> " = icmp eq i64 " <> used <> ", 0"), z, "elya_resume_twice")) {
+          Fresh1(zp, em4) -> match assign(line(line(em4, zp <> " = getelementptr i64, ptr " <> cont <> ", i64 2"), "store i64 0, ptr " <> zp), "inttoptr i64 " <> used <> " to ptr", LPtr) {
+            Gotv(Val(rhf, _), em5) -> match load_field(em5, cont, 1, TB(3)) {
+              Gotv(Val(rk, _), em6) -> match load_field(em6, rk, 1, TB(3)) {
+                Gotv(Val(rc, _), em7) -> match load_field(em7, cont, 3, TB(3)) {
+                  Gotv(Val(rh, _), em8) -> match fresh(em8) {
+                    Fresh1(rp, em9) -> Resumed(w, rk, rc, rp, line(store_fields(line(em9, rp <> " = load ptr, ptr @elya_current_handler"), rhf, Cons(Val(rp, LPtr), Nil), 4), "store ptr " <> rh <> ", ptr @elya_current_handler"))
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+// A clause's (or return clause's) tail: a resume there jumps.
+fn clause_tail(cx: ECx, env: List(EBind), e: CExpr, em: Emit) -> Emit {
+  match e {
+    CExpr(_, _, _, k) -> match k {
+      KLet(n, v, b) -> match emit(cx, env, Nil, v, em) { Gotv(val, em2) -> clause_tail(cx, Cons(EBind(n, val), env), b, em2) }
+      KIf(c, a, b) -> if_tail(cx, env, c, a, b, em, TCl)
+      KMatch(sc, arms) -> match emit(cx, env, Nil, sc, em) {
+        Gotv(sv, em2) -> match emit_arms(cx, env, Nil, sv, ty_of(sc), arms, em2, "", Nil, TCl) { Arms(_, em3) -> em3 }
+      }
+      KResume(v) -> match emit(cx, env, Nil, v, em) {
+        Gotv(val, em2) -> match resume_start(env, val, em2) {
+          Resumed(w, rk, rc, _, em3) -> match fresh(em3) {
+            Fresh1(r, em4) -> line(line(em4, r <> " = musttail call tailcc i64 " <> rc <> "(i64 " <> w <> ", ptr " <> rk <> ")"), "ret i64 " <> r)
+          }
+        }
+      }
+      _ -> match emit(cx, env, Nil, e, em) { Gotv(v, em2) -> match to_word(em2, v) { Gotv(Val(w, _), em3) -> line(em3, "ret i64 " <> w) } }
+    }
+  }
+}
 
 // ---- Argument records -------------------------------------------------------
 // As the Rust back end's `spill.rs` (spec 2026-10-16-elya-argument-records):
@@ -1119,12 +1716,16 @@ fn recs_expr(e: CExpr, acc: List(SRec)) -> List(SRec) {
         KLet(_, v, b) -> recs_expr(b, recs_expr(v, acc2))
         KIf(c, x, y) -> recs_exprs(Cons(c, Cons(x, Cons(y, Nil))), acc2)
         KMatch(sc, arms) -> recs_arms(arms, recs_expr(sc, acc2))
+        KPerform(_, _, ot, xs) -> recs_exprs(xs, recs_ty(ot, acc2))
+        KResume(v) -> recs_expr(v, acc2)
+        KHandle(body, _, cs, ret) -> recs_clauses(cs, match ret { No -> recs_expr(body, acc2)  Yes(CRet(_, rb)) -> recs_expr(rb, recs_expr(body, acc2)) })
         _ -> acc2
       }
     }
   }
 }
 fn recs_exprs(xs: List(CExpr), acc: List(SRec)) -> List(SRec) { match xs { Nil -> acc  Cons(x, rest) -> recs_exprs(rest, recs_expr(x, acc)) } }
+fn recs_clauses(cs: List(CClause), acc: List(SRec)) -> List(SRec) { match cs { Nil -> acc  Cons(CClause(_, _, ps, b), rest) -> recs_clauses(rest, recs_expr(b, recs_params(ps, acc))) } }
 fn recs_arms(arms: List(CArm), acc: List(SRec)) -> List(SRec) { match arms { Nil -> acc  Cons(CArm(_, b), rest) -> recs_arms(rest, recs_expr(b, acc)) } }
 fn recs_ctors(cs: List(CCtor), acc: List(SRec)) -> List(SRec) { match cs { Nil -> acc  Cons(CCtor(_, fs), rest) -> recs_ctors(rest, recs_tys(fs, acc)) } }
 fn recs_types(ts: List(CType), acc: List(SRec)) -> List(SRec) { match ts { Nil -> acc  Cons(CType(_, cs), rest) -> recs_types(rest, recs_ctors(cs, acc)) } }
@@ -1167,6 +1768,7 @@ fn spill_args(f: CExpr, xs: List(CExpr)) -> List(CExpr) {
   }
 }
 fn spill_list(xs: List(CExpr)) -> List(CExpr) { match xs { Nil -> Nil  Cons(x, rest) -> Cons(spill_expr(x), spill_list(rest)) } }
+fn spill_clauses(cs: List(CClause)) -> List(CClause) { match cs { Nil -> Nil  Cons(CClause(e, o, ps, b), rest) -> Cons(CClause(e, o, spill_cparams(ps), spill_expr(b)), spill_clauses(rest)) } }
 fn spill_arms(arms: List(CArm)) -> List(CArm) { match arms { Nil -> Nil  Cons(CArm(p, b), rest) -> Cons(CArm(p, spill_expr(b)), spill_arms(rest)) } }
 fn spill_expr(e: CExpr) -> CExpr {
   match e {
@@ -1187,6 +1789,9 @@ fn spill_expr(e: CExpr) -> CExpr {
         KLet(n, v, body) -> CExpr(a, b, t2, KLet(n, spill_expr(v), spill_expr(body)))
         KIf(c, x, y) -> CExpr(a, b, t2, KIf(spill_expr(c), spill_expr(x), spill_expr(y)))
         KMatch(sc, arms) -> CExpr(a, b, t2, KMatch(spill_expr(sc), spill_arms(arms)))
+        KPerform(eff, op, ot, xs) -> CExpr(a, b, t2, KPerform(eff, op, spill_ty(ot), spill_list(xs)))
+        KResume(v) -> CExpr(a, b, t2, KResume(spill_expr(v)))
+        KHandle(body, m, cs, ret) -> CExpr(a, b, t2, KHandle(spill_expr(body), m, spill_clauses(cs), match ret { No -> No  Yes(CRet(n, rb)) -> Yes(CRet(n, spill_expr(rb))) }))
         _ -> CExpr(a, b, t2, k)
       }
     }
@@ -1212,14 +1817,15 @@ pub fn spill(m: CModule) -> CModule {
 
 pub fn emit_module(m0: CModule) -> String {
   match spill(mono.mono(m0)) {
-    CModule(ts, gs, fs) -> {
+    CModule(ts, gs, fs0) -> {
+      let fs = anf_fns(fs0)
       let sigs = sigs_of(fs)
       let ground_cs = infos(ts, 0, Nil)
       let n = len_infos(ground_cs, 0)
       let cs = match use_fns(gs, fs, use_tys(gs, ground_fields(ground_cs, Nil), Insts(Nil, n))) { Insts(insts, _) -> rev_onto(rev(ground_cs), rev(insts)) }
-      let cx = ECx(sigs, cs, len_infos(cs, 0) + sites_fns(fs, 0))
-      match emit_fns(cx, fs, Emit(buffer.new(), 0, "entry", Mx(Nil, Nil, Nil, 0, Nil), 0)) {
-        Emit(body, _, _, Mx(ss, _, rws, _, _), _) -> buffer.finish(buffer.push(emit_strs(rev(ss), buffer.push(buffer.new(), prelude() <> tables(cx, rev(rws)))), buffer.finish(body) <> entry(cx, match sig_of(sigs, "main") { ESig(_, _, r) -> r }, main_float(fs))))
+      let cx = ECx(sigs, cs, len_infos(cs, 0) + sites_fns(fs, 0), eff_cx(fs))
+      match emit_fns(cx, fs, Emit(buffer.new(), 0, "entry", Mx(Nil, Nil, Nil, 0, Nil, FRows(Nil, Nil, 0)), 0)) {
+        Emit(body, _, _, Mx(ss, _, rws, _, _, fr), _) -> buffer.finish(buffer.push(emit_strs(rev(ss), buffer.push(buffer.new(), prelude() <> tables(cx, rev(rws), fr))), buffer.finish(body) <> entry(cx, match sig_of(sigs, "main") { ESig(_, _, r) -> r }, main_float(fs))))
       }
     }
   }

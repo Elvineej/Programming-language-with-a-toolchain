@@ -61,3 +61,36 @@ its predicted count, Windows green, then `main`.
 Whether the Elya port keeps `anf.rs` as a separate pass or names saved values
 while emitting (the Rust split exists for inkwell's sake); decided in E2's
 plan, measured on the corpus's largest handler programs.
+
+## 3. E1 and E2 as built (2026-11-28)
+
+**E1 is checked by behaviour, with E2** (no `elya cps --dump`): the two
+partitions' names and passes differ (Rust keys sites by node address, after
+`anf`/`specialize`), so a dump would compare conventions of naming, not the
+partition. A partition that disagreed with Rust's shows as a program that
+does not build, or behaves differently, or is refused where Rust builds it.
+
+**Naming what a continuation saves: a small pre-pass, not `anf.rs`.** In a
+function with a region of its own (a site, or a handle), an operand that holds
+a site, and every operand evaluated before it, is bound by a `let` first
+(`$o<i>`; a condition `$c`, a scrutinee `$s`); evaluation order is kept. A
+site is then always the value of a `let` or in tail position, and the frame
+of `let x = V in rest` saves the free names of `rest` and resumes into it
+(`@elya$k.N`). A `let` whose value is an `if` or `match` holding sites needs
+no join point: the frame is made before the value, and each branch ends at it
+(a site's continuation, or a value returned to it).
+
+**E2's fragment**, refused by name past it: a multi-shot handler, `with any`,
+a handle that leaks an effect (its body performs one it does not handle for
+every operation the module performs, or a clause or the return clause
+performs one), an effectful lambda, an effectful call of a closure, an
+effectful function as a value, a calling convention that disagrees with the
+callee (Rust's own refusal), a resume inside a lambda, an operation of more
+than two parameters (a clause's code takes the continuation and the frame
+too, and win64's tail calls stop at five), a frame whose pointer mask needs a
+second word (a site frame of more than 60 saved values, a handler frame of
+more than 58), and `main` performing an effect.
+
+Evidence: 24 new focused programs (17 compared, 7 refusals pinned at the
+stage's edges) and three former refusals now compared, the corpus again, and two programs on a one-MiB stack (a
+million tail resumes; a million effectful calls deep).
