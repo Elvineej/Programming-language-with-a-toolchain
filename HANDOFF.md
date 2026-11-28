@@ -1024,6 +1024,35 @@ design in the spec.
 
 ## Also open, unscheduled
 
+**Numerics and systems, the maintainer's list (2026-11-28: "add at some point
+... or create one your own more efficient and adaptable with the language if
+the current ones don't make any better").** Each gets a spec, measured first,
+after the self-hosting road (spec 2026-11-28-elya-retiring-rust), in roughly
+this dependency order:
+- **binary file I/O** (bytes, not UTF-8 text: a `Bytes` value, reading and
+  writing a file's bytes, both back ends and the boards);
+- **aligned memory allocation** (the collector's pages already align; a
+  request for N-byte alignment, and pinned blocks for the FFI and the GPU);
+- **a C foreign function interface** (declaring a C function, the data that
+  crosses, who owns it, and how an effect row says a call may do anything);
+- **FP32, FP16 and BF16** beside today's 64-bit `Float` (literals,
+  conversions, the rounding rules, where a board has no FPU);
+- **a mathematical standard library** (`elya/math`: elementary functions,
+  correctly rounded where it is cheap, the same answers natively and in the
+  evaluator);
+- **dense numerical tensors** (shape, strides and element type; built on
+  arrays, linear so updates happen in place, the affine guarantee doing the
+  work a borrow checker would);
+- **SIMD vectorisation** (LLVM's vectoriser on tensor loops first; explicit
+  vector types only if measurement says so);
+- **native multithreading** (Elya's effects as the way in: a spawn the type
+  system sees, linear values moved between threads, the collector made
+  thread-aware);
+- **GPU memory management** (device buffers as linear values, transfers as
+  effects; an existing API such as Vulkan compute or CUDA where it serves,
+  or Elya's own design where those would constrain it).
+
+
 `examples/08_timers.elya`'s real-clock part can reorder `a` and `c` under heavy
 load (its snapshot then fails): the three deadlines are 10 ms apart and counted
 from each task's own spawn (seen 2026-10-30 with a debugger running beside the
