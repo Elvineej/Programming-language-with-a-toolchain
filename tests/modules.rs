@@ -539,6 +539,31 @@ fn closures_through_operations_are_the_module_s() {
     has(&errors(root, &files), "E0606", "can perform `IO`");
 }
 
+/// A label's type argument in a declared field is walked both ways, as one in
+/// a signature is (spec 2026-10-24 D1 as amended; found by Codex's F6 job,
+/// 2026-11-28: the field's polarity alone hid `IO`).
+#[test]
+fn a_label_s_argument_in_a_declared_field_flows_both_ways() {
+    let files = [(
+        "m",
+        "effect E(a) { fn e() -> a }
+         type T { T(fn() / {E(fn() / {IO} -> Unit)} -> Unit) }
+         pub fn f(x: T) { Unit }
+",
+    )];
+    has(&errors("import m
+", &files), "E0606", "can perform `IO`");
+    // The same label in the signature itself, as before.
+    let files = [(
+        "m",
+        "effect E(a) { fn e() -> a }
+         pub fn f(x: fn() / {E(fn() / {IO} -> Unit)} -> Unit) { Unit }
+",
+    )];
+    has(&errors("import m
+", &files), "E0606", "can perform `IO`");
+}
+
 /// The review's quality finding: the help names the function as the importing
 /// file writes it (through its alias).
 #[test]

@@ -541,12 +541,17 @@ impl Interface<'_> {
     fn ann(&mut self, a: &TypeAnn, positive: bool) {
         if a.name == "fn" {
             // Effects only: a row's variable (its tail) is not one. A label's
-            // arguments are walked at the label's polarity (a row argument is
-            // a phantom function type, spec 2026-10-30-elya-row-variables D7).
+            // arguments are walked at both polarities, as `ty` walks them (spec
+            // 2026-10-24 D1 as amended: an effect's arguments flow both ways;
+            // a row argument is a phantom function type, spec
+            // 2026-10-30-elya-row-variables D7). Walked at the label's own
+            // polarity only, a declared field's `E(fn() / {IO} -> Unit)` hid
+            // `IO` (found by Codex's F6 job, 2026-11-28).
             for l in a.row.iter().flat_map(|r| r.labels.iter()) {
                 self.label(&l.name.node, positive);
                 for x in l.args.iter().flatten() {
-                    self.ann(&x.node, positive);
+                    self.ann(&x.node, true);
+                    self.ann(&x.node, false);
                 }
             }
             let n = a.args.len();
