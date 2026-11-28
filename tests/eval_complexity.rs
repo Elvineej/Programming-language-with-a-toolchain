@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The evaluator's cost is linear in the work a program does, not in its depth.
 //!
 //! Spec: `docs/superpowers/specs/2026-10-10-elya-eval-linear-continuations-design.md`.

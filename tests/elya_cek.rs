@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! A CEK machine written in Elya (`examples/03_cek.elya`), run at depth by the
 //! reference evaluator. The example's own `main` stays small because the
 //! tree-walker cross-check (`tests/crosscheck.rs`) recurses on the host stack;

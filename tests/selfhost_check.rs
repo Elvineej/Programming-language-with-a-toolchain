@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The checker in Elya (plan docs/superpowers/plans/2026-11-15-elya-checker-in-elya.md,
 //! step 4): `selfhost/check.elya` prints exactly `elya check --dump` on every
 //! corpus program inside the stages built so far: F1 (first-order programs)

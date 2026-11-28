@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Elya programs compiled for two boards and run on QEMU (specs
 //! 2026-11-13-elya-boards, 2026-11-14-elya-riscv-board): a Cortex-M3
 //! (`mps2-an385`) and a 32-bit RISC-V (`virt`). The program, the runtime built

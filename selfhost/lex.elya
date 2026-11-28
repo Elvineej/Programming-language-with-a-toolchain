@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // Elya's byte lexer, matching src/lex.rs (logos 0.14), except E0002:
 // (Codex wrote the first version, b004e29; ChatGPT rewrote it to answer its
 // tokens as an array, 2026-11-15, self-hosting part 4's plan step 2; both

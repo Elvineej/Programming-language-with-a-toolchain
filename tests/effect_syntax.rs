@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 3b: well-formed effect programs parse, resolve, AND type-check cleanly
 //! — effects are now typed with row inference and handler discharge. Evaluation
 //! is still deferred to 3c, so `run_source` reports the "not evaluated yet"

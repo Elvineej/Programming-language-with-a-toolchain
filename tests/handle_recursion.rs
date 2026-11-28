@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Recursion through a handle body (spec
 //! `docs/superpowers/specs/2026-10-15-elya-handle-recursion-design.md`, PARKED
 //! since slice 5b-10). A recursive call made directly in a handle's body used

@@ -1,4 +1,6 @@
 #!/usr/bin/env sh
+# Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+# SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 set -e
 cargo fmt --all -- --check
 # Configuration A — LLVM-free: the front end and the shipped CLI must build and

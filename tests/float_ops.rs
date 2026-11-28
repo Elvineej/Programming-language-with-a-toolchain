@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! `Float`, part 2: comparisons, negation and conversions (2026-10-24, spec
 //! `docs/superpowers/specs/2026-10-24-elya-float-part-2-design.md`), in the
 //! evaluator. `crates/codegen/tests/native_float.rs` holds the differential

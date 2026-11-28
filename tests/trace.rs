@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Record and replay from the command line (spec
 //! `docs/superpowers/specs/2026-10-16-elya-cli-record-replay-design.md`): the
 //! trace is the host's answers, and replaying them reproduces the run.

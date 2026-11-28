@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! `elya build --target <board>` (spec 2026-11-14-elya-build-target): the real
 //! CLI builds an ELF for each board, which QEMU runs, writing what the program
 //! means; and a board whose tools are missing is a failure by name, with no

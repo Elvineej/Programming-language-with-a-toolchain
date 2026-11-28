@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Time as a builtin source (2026-10-15, spec `2026-10-15-elya-async-step2-timers-design.md`
 //! D3). `time.now_ms() -> Int` is monotonic milliseconds since an arbitrary start, and
 //! `time.sleep_ms(ms: Int) -> Unit` blocks for at least `ms`. Both perform `IO`. A

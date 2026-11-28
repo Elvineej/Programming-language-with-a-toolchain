@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The switch (self-hosting part 6, spec
 //! docs/superpowers/specs/2026-11-27-elya-the-switch-design.md D3): the driver
 //! in Elya, `selfhost/elya.elya`, built by the Rust compiler (stage 1),

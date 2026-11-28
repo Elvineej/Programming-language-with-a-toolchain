@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Diagnostics at the edges (2026-10-24, spec
 //! `docs/superpowers/specs/2026-10-24-elya-diagnostics-at-the-edges-design.md`):
 //! byte offsets in the renderer (D1), both declarations of a duplicate (D2), one

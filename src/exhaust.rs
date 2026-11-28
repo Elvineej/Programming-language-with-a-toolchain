@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Exhaustiveness & useless-arm checking for `match` (Maranget's usefulness
 //! algorithm — "Warnings for pattern matching"). A pattern vector `q` is
 //! *useful* w.r.t. a matrix `P` if some value matches `q` but no row of `P`.

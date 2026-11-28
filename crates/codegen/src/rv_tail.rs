@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Guaranteed tail calls on 32-bit RISC-V, where LLVM 18 has no `tailcc`
 //! (spec 2026-11-14-elya-riscv-board D1).
 //!

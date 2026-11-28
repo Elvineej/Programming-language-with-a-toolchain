@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! `with any` natively: operation-generic handlers by expansion (spec
 //! `docs/superpowers/specs/2026-10-17-elya-native-any-handlers-design.md`).
 //!

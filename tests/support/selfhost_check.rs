@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The fragments of the checker in Elya's stages (plan
 //! docs/superpowers/plans/2026-11-15-elya-checker-in-elya.md, step 4): the
 //! smallest stage whose fragment holds a program, read off its syntax.

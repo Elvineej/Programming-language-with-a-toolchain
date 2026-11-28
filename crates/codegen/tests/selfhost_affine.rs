@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The affine pass in Elya, natively (self-hosting part 4e): every program
 //! of tests/selfhost_affine.rs agrees with `elya affine --dump`, and the
 //! largest is timed against Rust. Native entry points append main's value

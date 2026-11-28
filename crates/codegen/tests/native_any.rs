@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! `with any` natively (2026-10-17, spec
 //! `docs/superpowers/specs/2026-10-17-elya-native-any-handlers-design.md`). Every
 //! program here is compiled, linked and RUN, and its output compared with the

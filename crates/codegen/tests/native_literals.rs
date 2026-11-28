@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Literals at the edges, and a layout rule, natively (2026-10-23, spec
 //! `docs/superpowers/specs/2026-10-23-elya-literals-and-layout-design.md`).
 //! Every program is compiled, linked and RUN, and its outcome compared with the

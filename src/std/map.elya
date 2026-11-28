@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // elya/map: a String-keyed hash map over builtin linear arrays.
 // Spec: docs/superpowers/specs/2026-11-14-elya-arrays-and-borrowing-design.md D7.
 // Written by ChatGPT (OpenAI) to Claude's brief; checked here, its functions

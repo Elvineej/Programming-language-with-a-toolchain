@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // elya/clock: the time as an effect, and handlers that give a dependency a
 // clock it cannot use to observe the host (spec
 // docs/superpowers/specs/2026-10-24-elya-capabilities-part-3-design.md).

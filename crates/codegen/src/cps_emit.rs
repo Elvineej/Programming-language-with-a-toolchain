@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! 5b-8 Task 7b-3 — the EMISSION half of selective CPS (D10, D14, D16-D18).
 //!
 //! `cps.rs` decides (LLVM-free) which calls are continuation sites and what each

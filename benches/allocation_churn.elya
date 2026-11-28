@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // Lists and full binary trees die after every round; neither is shared.
 // checksum: 961529344
 // Each round: list = 32896 + 256*s, tree = 3072 + 256*s; s = round % 17.

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! `&&` and `||` short-circuit natively (spec 2026-11-15-elya-short-circuit):
 //! the evaluator's answers on the same programs (tests/short_circuit.rs).
 

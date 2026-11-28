@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! A `let` generalized by levels quantifies what asking the environment did
 //! (2026-11-05, spec `docs/superpowers/specs/2026-10-31-elya-scalability-design.md`
 //! D14). Every program here is checked under `elya::types::check_levels`,

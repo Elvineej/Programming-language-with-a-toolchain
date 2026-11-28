@@ -1,4 +1,6 @@
 #!/usr/bin/env sh
+# Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+# SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 # Block commits that aren't rustfmt-clean. Cargo isn't on the default PATH here,
 # so prepend the user cargo bin (see project memory: cargo-on-windows-path).
 export PATH="$HOME/.cargo/bin:$PATH"

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Running a program (2026-11-27, spec
 //! `docs/superpowers/specs/2026-11-27-elya-the-switch-design.md` D1) in the
 //! evaluator: `io.run` answers the exit status and fails by name in the

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 5a-1 Task 3 — the bug-surface corpus (spec §5). Each surface is pinned
 //! by a snapshot (human-auditable) AND targeted assertions (machine teeth) that
 //! fail loudly on lingering vars, wrong generalization, or unresolved rows.

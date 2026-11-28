@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 /* The platform layer, hosted (spec 2026-11-13-elya-platform-layer D2): the
  * hooks runtime.c and gc.c declare, over the C library and the operating
  * system (Linux, macOS, Windows), and the program's own stack. Included at the

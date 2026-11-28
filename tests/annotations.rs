@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Type annotations are checked (2026-10-09; Claude's decision under the
 //! maintainer's delegation, HANDOFF rule 2). The parser used to DISCARD every
 //! parameter, return and `let` type (`skip_type_annotation`, "Slice 1 has no

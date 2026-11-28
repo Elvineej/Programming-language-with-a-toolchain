@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 5a-1 Task 1 — the hard prerequisite gate (spec §2). The typed table is
 //! Shape A: keyed on `Span`. That is only sound if no two distinct expression
 //! nodes share a span and none is `Span::EMPTY`. This audit proves it over the

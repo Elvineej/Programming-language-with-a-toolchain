@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 5a-2 Task 1 — the raw `Span → Ty` accessor. Proves it feeds the same
 //! zonked types `infer_with_types` renders, but structured (not stringified), and
 //! that a polymorphic node's `Ty::Var` rides through unmonomorphized.

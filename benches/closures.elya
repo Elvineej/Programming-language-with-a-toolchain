@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // Each round allocates captured closures, maps by an indirect call,
 // composes two captured functions, and folds the resulting list through a HOF.
 // checksum: 2283500800

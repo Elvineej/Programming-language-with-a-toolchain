@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // One recorder and one replayer, for any effect, written in Elya.
 //
 // `examples/05_replay.elya` records ONE effect: its `record` and `replay` name

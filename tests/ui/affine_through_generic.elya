@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 linear type File { File(Int) }
 fn read(f: File) -> Int { match f { File(n) -> n } }
 fn twice(g, x) { g(x) + g(x) }

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 /* A Cortex-M3 board's platform (spec 2026-11-13-elya-boards D3): bytes out and
  * stop by Arm semihosting (QEMU passes them to its own stdout, stderr and exit
  * status), a clock, a guard below the stack, the collector's region after the

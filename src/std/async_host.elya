@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // elya/async_host: `elya/async`'s scheduler on the machine's clock (spec
 // docs/superpowers/specs/2026-10-31-elya-async-module-design.md, D3). Its
 // interface performs `IO`, so an import of it needs `/ {IO}` (capabilities part 3

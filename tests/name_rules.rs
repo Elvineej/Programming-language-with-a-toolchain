@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 5c-2: name rules. A second clause for one op is E0204; a top-level
 //! function named like an op is E0205; a LOCAL binding shadows an op,
 //! lexically, in inference, the evaluator and Core lowering alike. Programs

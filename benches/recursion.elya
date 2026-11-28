@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // checksum: 30002934520
 // 768 live non-tail calls: each frame carries its seed across the recursive
 // call, then mixes the answer while unwinding. The outer loop varies the seed.

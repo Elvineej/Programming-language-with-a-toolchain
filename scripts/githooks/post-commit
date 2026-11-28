@@ -1,4 +1,6 @@
 #!/bin/sh
+# Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+# SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 # graphify-hook-start
 # Auto-rebuilds the knowledge graph after each commit (code files only, no LLM needed).
 # Installed by: graphify hook install

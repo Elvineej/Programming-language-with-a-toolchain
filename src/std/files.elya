@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // elya/files: a program's files as an effect, and handlers that give a
 // dependency less than the host's `IO` (spec
 // docs/superpowers/specs/2026-11-14-elya-files-and-arguments-design.md D6).

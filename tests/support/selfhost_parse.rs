@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Shared corpus and comparison for the evaluator and native self-hosted parser.
 
 #![allow(dead_code)] // Each back end uses only the helpers it needs.

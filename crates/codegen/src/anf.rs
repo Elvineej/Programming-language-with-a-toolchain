@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Computed callees and functions as values (spec
 //! `docs/superpowers/specs/2026-10-16-elya-callees-and-function-values-design.md`).
 //!

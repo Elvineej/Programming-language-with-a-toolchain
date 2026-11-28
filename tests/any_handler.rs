@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Operation-generic handlers, `with any` (2026-10-16, spec
 //! `docs/superpowers/specs/2026-10-16-elya-any-handlers-design.md`). A handler that
 //! handles every operation its body performs (but `IO`), whatever the effect, with the

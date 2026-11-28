@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Record and replay natively (2026-10-17, spec
 //! `docs/superpowers/specs/2026-10-17-elya-native-record-replay-design.md`): a
 //! native binary writes the trace `ELYA_RECORD` names and answers from the one

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 /* memcpy, memset, memcmp and memmove for a board with no C library (spec
  * 2026-11-13-elya-boards D3): a word at a time where both pointers are equally
  * aligned, a byte at a time otherwise; weak, so a board's own replace them.

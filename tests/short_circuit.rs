@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! `&&` and `||` short-circuit (spec 2026-11-15-elya-short-circuit): `a && b`
 //! is `if a { b } else { False }` and `a || b` is `if a { True } else { b }`,
 //! in both evaluators, natively (crates/codegen/tests/native_short_circuit.rs)

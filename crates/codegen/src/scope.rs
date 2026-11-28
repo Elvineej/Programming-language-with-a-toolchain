@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! A stack of named bindings that finds a name's innermost binding without
 //! searching the stack (spec 2026-10-31-elya-scalability D12).
 //!

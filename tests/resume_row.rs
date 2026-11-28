@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! HANDOFF step "`resume` carries its handle's row" (found by slice 5b-10, PARKED).
 //!
 //! Under deep handlers `resume(v)` runs the rest of the handled body, which may

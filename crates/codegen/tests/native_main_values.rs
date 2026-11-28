@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! What `main` is worth, natively (2026-10-30, spec
 //! `docs/superpowers/specs/2026-10-30-elya-main-values-design.md`): a native
 //! binary's last line is `main`'s value as `elya run --value` writes it, for

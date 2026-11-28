@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Values of more than 64 words. A descriptor row's pointer mask was one word:
 //! a constructor's 65th field, a closure's 64th capture or the 63rd value live
 //! across a call shifted a bit out of range, here (a panic in a debug build of

@@ -1,3 +1,5 @@
+# Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+# SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 # Core -> LLVM -> object -> native binary. This is the ONLY crate that links
 # `llvm_sys`; the vcpkg static LLVM 18 is bundled into a 3.73 GiB rlib, so
 # keeping it out of the front end keeps `cargo test` off the link marathon.

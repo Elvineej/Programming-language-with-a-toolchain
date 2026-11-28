@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Data literals: how a `with any` handler shows, encodes and decodes the operations
 //! it handles (2026-10-16, spec `2026-10-16-elya-any-handlers-design.md` D7).
 //!

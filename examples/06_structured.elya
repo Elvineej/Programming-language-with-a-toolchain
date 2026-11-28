@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // Structured concurrency, on the standard scheduler `elya/async`.
 //
 // `async_spawn(f)` starts a task and answers its id; `async_await(id)` waits for

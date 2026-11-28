@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Files, standard input and arguments natively (2026-11-14, spec
 //! `docs/superpowers/specs/2026-11-14-elya-files-and-arguments-design.md`): a
 //! binary does what the evaluator does with the same world, fails with its

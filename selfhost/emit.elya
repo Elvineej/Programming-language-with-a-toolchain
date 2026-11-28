@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // The back end in Elya, stage B1 (spec
 // docs/superpowers/specs/2026-11-27-elya-backend-in-elya-design.md D6):
 // first-order `Int`, `Bool` and `Unit` programs, written as LLVM IR text

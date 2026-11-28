@@ -1,4 +1,6 @@
 #!/bin/sh
+# Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+# SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 # Release benchmarks. Requires the existing Rust/LLVM toolchain and POSIX utilities.
 set -eu
 LC_ALL=C

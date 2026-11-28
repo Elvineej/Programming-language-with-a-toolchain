@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 5b-1 — the execution proof. Every test here produces a native binary,
 //! RUNS it, and asserts on exit status, stdout, and stderr. Proof is execution,
 //! never IR inspection: no insta snapshot of LLVM IR exists anywhere in this

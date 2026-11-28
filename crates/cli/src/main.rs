@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 use std::process::ExitCode;
 
 /// Reads the program's imports from disk: module `a/b` is the file `a/b.elya` in
@@ -72,6 +74,14 @@ fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCo
         stdin: None,
     };
     match args.get(1).map(String::as_str) {
+        // The watermark (runtime.c's `elya_watermark` is the built program's).
+        Some("--version") if args.len() == 2 => {
+            println!(
+                "elya {}\nCopyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).\nLicensed under the PolyForm Strict License 1.0.0.",
+                env!("CARGO_PKG_VERSION")
+            );
+            ExitCode::SUCCESS
+        }
         Some("run")
             if matches!(
                 args.get(2).map(String::as_str),

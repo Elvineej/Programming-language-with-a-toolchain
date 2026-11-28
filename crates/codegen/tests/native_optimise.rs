@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Optimised code (spec 2026-11-13-elya-optimised-code): `compile_module` runs
 //! LLVM's `default<O2>`; `Optimise::None` is the IR as written. Both write what
 //! the program means, plainly and under `ELYA_GC_STRESS=1`; the optimised

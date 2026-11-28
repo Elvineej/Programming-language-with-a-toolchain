@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // Elya lexer over the whole async module, including its comments, 60 times.
 // checksum: 29819953033
 import support/lex / {IO}

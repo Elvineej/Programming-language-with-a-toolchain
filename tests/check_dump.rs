@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The checker's verdict as text (`elya::check_dump`, `elya check --dump`):
 //! the form a checker written in Elya will be compared against byte for byte
 //! (self-hosting, part 4's checker half). Pinned on a program with generic,

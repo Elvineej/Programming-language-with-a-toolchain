@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! A name clash is reported once, where it was made (2026-10-30, spec
 //! `docs/superpowers/specs/2026-10-30-elya-name-clashes-design.md`). Each program
 //! is checked against the standard modules and two user modules, and every

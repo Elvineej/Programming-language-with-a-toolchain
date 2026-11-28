@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! TCE is a measured guarantee: deep tail recursion runs in bounded Kont depth.
 //! `K_MAX` was pinned from the first measurement (both loops peak at 3). A
 //! per-iteration frame leak would drive the peak toward the iteration count;

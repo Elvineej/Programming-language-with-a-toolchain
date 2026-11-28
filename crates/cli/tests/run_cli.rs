@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! `elya run --record` / `--replay` (spec 2026-10-16-elya-cli-record-replay):
 //! the user-facing entry point, through the real binary.
 
@@ -637,4 +639,19 @@ fn exhaust_and_affine_dumps() {
         "{text}"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The watermark: `elya --version` names the author.
+#[test]
+fn elya_version_names_the_author() {
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .arg("--version")
+        .output()
+        .expect("spawn elya --version");
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej)."),
+        "{text}"
+    );
 }

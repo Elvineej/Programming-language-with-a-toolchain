@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Unary operators in Core, and explicit wrapping and bit arithmetic (2026-10-17,
 //! spec `docs/superpowers/specs/2026-10-17-elya-unary-and-wrapping-design.md`).
 

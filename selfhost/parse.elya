@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // Elya parser, self-hosting parts 4a and 4b. Oracle: src/parse.rs.
 // Keep every recovered node, span, flag and diagnostic in oracle order.
 import lex / {IO}

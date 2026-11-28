@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Failure as an effect: an empty type and an empty match (spec
 //! `docs/superpowers/specs/2026-10-16-elya-failure-and-cancellation-design.md`).
 

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Row variables you can write (2026-10-30, spec
 //! `docs/superpowers/specs/2026-10-30-elya-row-variables-design.md`, part 1): a
 //! row may end in a named row variable, `/ {e}` or `/ {Log | e}`, shared across

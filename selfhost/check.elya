@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // The checker in Elya, self-hosting part 4f (plan
 // docs/superpowers/plans/2026-11-15-elya-checker-in-elya.md, step 4).
 // Oracle: src/types.rs through `elya check --dump` (src/check_dump.rs).

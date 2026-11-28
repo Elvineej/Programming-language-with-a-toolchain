@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Capabilities, part 3: attenuation in the standard library (2026-10-24, spec
 //! `docs/superpowers/specs/2026-10-24-elya-capabilities-part-3-design.md`).
 //! `elya/console` (`Console`) and `elya/clock` (`WallClock`) are a vocabulary a

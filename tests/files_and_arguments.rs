@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Self-hosting, part 1 (2026-11-14, spec
 //! `docs/superpowers/specs/2026-11-14-elya-files-and-arguments-design.md`): a
 //! program reads and writes files, reads standard input and its arguments,

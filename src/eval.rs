@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice-2 evaluators: a shared value/env layer, the tree-walker oracle (`tree`),
 //! and the CEK machine (`cek`, added in Task 8).
 

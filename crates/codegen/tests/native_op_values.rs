@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Operation values as values natively (2026-10-23, spec
 //! `docs/superpowers/specs/2026-10-23-elya-operation-values-natively-design.md`).
 //! A `with any` clause's operation `o` given to helpers, stored, captured,

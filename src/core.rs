@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Core IR (Slice 5a-2): a minimal, corpus-derived intermediate representation
 //! with each node's zonked type carried inline (Shape C). Built by a type-directed
 //! fold over the typed AST that clones types out of the frozen `Span → Ty` table —

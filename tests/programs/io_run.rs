@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The programs of `tests/io_run.rs`, shared with
 //! `crates/codegen/tests/native_io_run.rs` (no tests here): `io.run` (spec
 //! `docs/superpowers/specs/2026-11-27-elya-the-switch-design.md` D1). A

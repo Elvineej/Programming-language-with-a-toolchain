@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Byte-for-byte parser parity on clean, malformed and token-deleted inputs.
 //! The oracle is the recovered tree followed by lexing and parsing diagnostics.
 

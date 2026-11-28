@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Row parameters on declarations (2026-10-30, spec
 //! `docs/superpowers/specs/2026-10-30-elya-row-variables-design.md`, part 2): a
 //! type or an effect can take a row, so a task type names "whatever else the

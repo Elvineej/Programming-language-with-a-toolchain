@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! `elya/map` natively (2026-11-15, spec
 //! `docs/superpowers/specs/2026-11-14-elya-arrays-and-borrowing-design.md`
 //! D7): the evaluator's output, with a collection at every allocation, and a

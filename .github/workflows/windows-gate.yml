@@ -1,3 +1,5 @@
+# Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+# SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 # The Windows gate PARKED.md requires before `main` takes a branch: the
 # unmodified scripts/check.ps1 on x86_64-pc-windows-msvc. LLVM 18 comes from
 # the official 18.1.8 release archive (static libs + llvm-config), not vcpkg,

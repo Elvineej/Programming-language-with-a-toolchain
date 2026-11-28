@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 /* The Elya collector (spec 2026-11-12-elya-paged-collector): one collector from
  * bare metal to large programs. Stop-the-world, non-moving, precise mark-sweep
  * over PAGES of one size class each, swept lazily, marking with a fixed

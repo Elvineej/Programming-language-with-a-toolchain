@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 4c-2: generic (parametric) effects — `effect State(s)` usable at any
 //! state type. CEK-only + output-verified for runs; `E0423` for a conflicting
 //! instantiation. There is no cek==tree oracle behind effect evaluation, so every

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 5a-2 Task 3 — the typed-Core snapshot corpus (spec §5), the deliverable.
 //! Reuses the 5a-1 programs (tests/typed_inference.rs), lowers each to Core, and
 //! pins the result with an insta snapshot PLUS per-surface teeth and two origin

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // Keep a 65,535-node tree alive while lists and small trees become garbage.
 // Revisit the retained tree during churn and checksum every leaf afterward.
 // checksum: 4288928266

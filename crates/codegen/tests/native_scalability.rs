@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The native passes scale with the program (2026-10-31, spec
 //! `docs/superpowers/specs/2026-10-31-elya-scalability-design.md` D12, D13): a
 //! name bound above a long block is found without searching the block, a lambda

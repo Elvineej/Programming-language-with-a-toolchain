@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The runtime behind its platform layer (spec 2026-11-13-elya-platform-layer):
 //! `runtime.c` built freestanding for bare-metal targets, and Elya programs
 //! linked with a board's platform and NO C library, writing what the hosted

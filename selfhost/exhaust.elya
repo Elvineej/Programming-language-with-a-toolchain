@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // Exhaustiveness in Elya, self-hosting part 4d (spec
 // docs/superpowers/specs/2026-11-15-elya-checker-in-elya-design.md D2).
 // Oracle: src/exhaust.rs (`exhaust::check`) through `elya exhaust --dump`.

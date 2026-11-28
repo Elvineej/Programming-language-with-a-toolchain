@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! A block's length is not a stack bound (2026-10-30, spec
 //! `docs/superpowers/specs/2026-10-30-elya-long-blocks-design.md` D2): a long
 //! `main` is checked, lowered to Core, dropped and run on a small thread.

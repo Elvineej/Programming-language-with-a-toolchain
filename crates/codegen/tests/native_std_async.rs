@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! `elya/async`, natively (2026-10-31, spec
 //! `docs/superpowers/specs/2026-10-31-elya-async-module-design.md`): a native
 //! binary prints what the evaluator prints for the standard scheduler.

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The programs of `tests/files_and_arguments.rs`, shared with
 //! `crates/codegen/tests/native_files.rs` (no tests here). `@D@` stands for a
 //! directory the test made; `at` puts it in.

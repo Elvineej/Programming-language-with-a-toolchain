@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 5b-1 Task 5 — the CLI-driven proof. Everything above this file proves
 //! the *library* path (Core → LLVM → object → link → run); this proves the
 //! user-facing entry point: a real `elya build prog.elya` producing a native

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Native parser parity and timings. Only the native runtime's final Unit value
 //! line is removed; every byte printed by the Elya parser itself is compared.
 

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! `Int` arithmetic is exact or fails by name (spec
 //! `docs/superpowers/specs/2026-10-10-elya-checked-integer-arithmetic-design.md`, D1/D2).
 //! Both evaluators share `apply_binop`/`apply_unop`; each test runs both.

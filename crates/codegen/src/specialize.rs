@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! N7 part 1 — convention specialization and the upcast adapter (spec
 //! `docs/superpowers/specs/2026-10-09-elya-n7a-convention-specialization-design.md`).
 //!

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -16,6 +18,12 @@
  * gives `write` and `exit` and may give the rest (weak defaults at the end). */
 
 int memcmp(const void *, const void *, size_t);
+
+/* The watermark: every program Elya builds, by either back end and on every
+ * board, carries its author's name in its read-only data. `used` keeps it
+ * through the optimizer and, on COFF, through the linker's /OPT:REF. */
+__attribute__((used)) const char elya_watermark[] =
+    "Built with Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).";
 
 /* ---- the platform layer (D1) ---- */
 

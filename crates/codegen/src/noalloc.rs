@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The functions that never allocate (2026-11-15): a caller need not root
 //! what it holds across a call to one, since nothing can collect during it.
 //!

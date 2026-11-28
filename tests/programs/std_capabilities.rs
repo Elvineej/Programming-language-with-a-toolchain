@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The programs of `tests/std_capabilities.rs`, shared with
 //! `crates/codegen/tests/native_std_capabilities.rs` (no tests here).
 

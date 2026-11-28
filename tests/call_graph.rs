@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Inference's call graph must see every call. `collect_refs_expr` ended in
 //! `_ => {}`, so a call inside a `match` arm, a lambda or a handler was no edge:
 //! the caller could be generalised BEFORE its callee was typed, giving it a

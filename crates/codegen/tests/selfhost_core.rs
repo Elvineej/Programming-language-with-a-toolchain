@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Core in Elya, natively (self-hosting part 5's first piece): the native
 //! twin of tests/selfhost_core.rs, which agrees with `elya core --dump` in the
 //! evaluator, and the pass's speed against Rust's front end and lowering.

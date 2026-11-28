@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! A `tailcc` call's stacked arguments on 32-bit ARM, made a size LLVM 18's
 //! ARM back end agrees with itself about (spec 2026-11-13-elya-boards D4).
 //!

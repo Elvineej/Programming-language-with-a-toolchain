@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! TCE through `match` is a measured guarantee (spec §3.3): a tail-position
 //! match preserves tail-call elimination (the `MatchK` frame is transient, so it
 //! adds no net depth). `K_MAX_MATCH` is pinned from the first measurement — a

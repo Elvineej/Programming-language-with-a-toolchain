@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! `int.to_string` (2026-10-15, spec `2026-10-15-elya-native-strings-design.md` D1): the
 //! one way to turn a number into text. A pure, module-qualified builtin like
 //! `io.println`; decimal, with a leading `-` for a negative number, `i64::MIN`

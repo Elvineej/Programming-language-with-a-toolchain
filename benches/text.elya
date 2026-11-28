@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // The deliberately quadratic immutable <> baseline for a future Buffer.
 // Build only 4 KiB at a time; scan every byte with a position-weighted sum.
 // checksum: 818089984000

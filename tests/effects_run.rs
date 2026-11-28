@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slices 3c/3d: output-verified execution of effect programs on the CEK machine.
 //!
 //! The tree-walker recurses on the host stack and CANNOT capture continuations,

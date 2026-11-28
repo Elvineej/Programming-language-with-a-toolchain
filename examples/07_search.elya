@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // One search, three meanings: backtracking with a multi-shot effect.
 //
 // `queens` is an ordinary function. It asks `choose(n)` for a column and calls

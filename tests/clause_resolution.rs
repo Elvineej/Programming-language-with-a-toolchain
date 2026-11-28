@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 5c-1: handler clause resolution. Op names are unique per module
 //! (E0202), a clause must name a declared operation of the effect it names
 //! (E0203), and an unqualified clause means its op's effect. Programs m1-m7 are

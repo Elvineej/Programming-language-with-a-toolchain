@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The selective-CPS partition (spec §8.1-8.2).
 //!
 //! Deliberately LLVM-free: this is a pure question about a `Ty`, so it needs no

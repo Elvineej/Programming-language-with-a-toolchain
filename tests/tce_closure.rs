@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! TCE through a *closure* call is a measured guarantee (spec §3.3). The
 //! closure-call path reuses the continuation, so a tail call to a closure adds no
 //! net depth. We drive a million alternating tail calls between a top-level `drive`

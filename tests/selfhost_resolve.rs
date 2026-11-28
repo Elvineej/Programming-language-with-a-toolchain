@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Modules and name resolution in Elya (self-hosting part 4c, spec
 //! docs/superpowers/specs/2026-11-15-elya-resolution-in-elya-design.md D2-D4):
 //! `selfhost/resolve.elya`, run in the evaluator, prints exactly `elya

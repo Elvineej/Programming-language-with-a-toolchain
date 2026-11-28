@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! `float.to_string` (2026-10-23, spec
 //! `docs/superpowers/specs/2026-10-23-elya-float-natively-design.md` D5): a
 //! float's text is its literal text, the one `op.show` writes.

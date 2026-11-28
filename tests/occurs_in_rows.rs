@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The occurs checks look inside effect rows (2026-10-30, spec
 //! `docs/superpowers/specs/2026-10-30-elya-occurs-in-rows-design.md`). A type
 //! that would contain itself through an effect's argument is a named error, not

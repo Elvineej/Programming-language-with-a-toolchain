@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The parser's, the resolver's and the checker's recursive paths are a few
 //! small frames per nesting level: deep nests of calls, lambdas, matches and
 //! handlers parse and check on a thread of 1.25 MiB in a debug build. After

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The checker in Elya, natively (plan
 //! docs/superpowers/plans/2026-11-15-elya-checker-in-elya.md, step 4): every
 //! program of the built stages agrees with `elya check --dump`, and the

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 /* A 32-bit RISC-V board's platform (spec 2026-11-14-elya-riscv-board D2): bytes
  * out and stop by RISC-V semihosting (QEMU passes them to its own stdout,
  * stderr and exit status), a clock, a locked PMP guard below the stack, traps

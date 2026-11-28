@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Exact replay and handler-based testing (ROADMAP priority 3; spec
 //! `docs/superpowers/specs/2026-10-10-elya-replay-design.md`). Every test runs the
 //! declarations of `examples/05_replay.elya` -- the program, `record`, `replay`,

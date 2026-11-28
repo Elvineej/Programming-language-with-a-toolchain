@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 4b-3: the closure-arc row capstone. Proves the value restriction keeps a
 //! non-value's EFFECT ROW monomorphic (two-sided teeth), and that row polymorphism
 //! composes through recursive combinators. CEK-only + output-verified: every case

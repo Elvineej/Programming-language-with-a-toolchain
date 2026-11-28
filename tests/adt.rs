@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 4a: ADT programs type-check and run — on BOTH the CEK machine and the
 //! tree-walker, asserting `cek == tree` (the effect-free ADT differential oracle
 //! is a hard gate from Task 2 onward, spec §3.4).

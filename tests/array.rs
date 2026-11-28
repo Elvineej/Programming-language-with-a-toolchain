@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Self-hosting, part 2b (2026-11-14, spec
 //! `docs/superpowers/specs/2026-11-14-elya-arrays-and-borrowing-design.md`): a
 //! linear `Array(a)` written in place and read by borrowing; a borrow counts

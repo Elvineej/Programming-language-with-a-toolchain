@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // Failure as an effect, and a scope that cancels its children.
 //
 // `fail` answers `Never`, a type with no values: no handler can resume it,

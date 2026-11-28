@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // elya/host: the standard effects given their meaning by the host (spec
 // docs/superpowers/specs/2026-10-24-elya-capabilities-part-3-design.md; the
 // files, spec 2026-11-14-elya-files-and-arguments D6). Its handlers perform

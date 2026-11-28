@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Record and replay as an Elya library (2026-10-24, spec
 //! `docs/superpowers/specs/2026-10-24-elya-std-replay-design.md`): `import
 //! elya/replay` is a standard module written in Elya, shipped in the compiler.

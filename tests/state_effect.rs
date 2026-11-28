@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 4c-1: parameter-passing State. `State` is an ordinary user handler over
 //! the effect mechanism (the manifesto's "state is the State effect", no language
 //! primitive), interpreted state-passing style — each clause returns a function of

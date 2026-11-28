@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The affine pass (spec 2026-11-06-elya-affine-across-functions D2, D3, D7):
 //! what inference needs to know about uses, read off the syntax before it runs.
 //!

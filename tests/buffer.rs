@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Self-hosting, part 2a (2026-11-14, spec
 //! `docs/superpowers/specs/2026-11-14-elya-buffer-design.md`): a linear
 //! `Buffer` builds text in linear time, in place, because the affine guarantee

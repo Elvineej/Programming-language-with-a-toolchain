@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The affine pass in Elya (self-hosting part 4e, spec
 //! docs/superpowers/specs/2026-11-15-elya-checker-in-elya-design.md D2):
 //! `selfhost/affine.elya` prints exactly `elya affine --dump` on every corpus

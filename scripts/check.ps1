@@ -1,3 +1,5 @@
+# Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+# SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 $ErrorActionPreference = "Stop"
 cargo fmt --all -- --check
 if ($LASTEXITCODE -ne 0) { exit 1 }

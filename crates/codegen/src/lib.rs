@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Native codegen: Core → LLVM via inkwell. Slice 5b-1 covered the arithmetic
 //! subset (Int literals, Var, Prim(Add/Sub/Mul), Let); Slice 5b-2 adds control
 //! flow — `If` as a three-block diamond joined by `phi`, `Bool` as i1, the six

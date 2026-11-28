@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! A linear buffer natively (2026-11-14, spec
 //! `docs/superpowers/specs/2026-11-14-elya-buffer-design.md`): the evaluator's
 //! text, in place, in linear time, with a collection at every allocation.

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The accessor that makes the native back end's differential check possible
 //! (5b-2 §5): `elya run` observes only `io.println` output, so nothing public
 //! could say what `main` evaluated to. `run_module_value` says it — and

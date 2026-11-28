@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 3b: inferred effect rows in top-level function schemes. Pins the
 //! printed form of ambient-row inference — concrete-effect functions get a
 //! closed row, a pure relay is row-polymorphic, pure functions show no row.

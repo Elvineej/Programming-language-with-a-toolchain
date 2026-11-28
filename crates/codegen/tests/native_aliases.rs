@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Aliases that rebind their target (2026-10-24, spec
 //! `docs/superpowers/specs/2026-10-24-elya-alias-renaming-design.md`): `anf`
 //! substitutes an alias of a row-polymorphic local by renaming the body's own

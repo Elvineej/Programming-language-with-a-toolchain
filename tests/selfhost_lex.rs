@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Differential proof for selfhost/lex.elya. E0002 is deliberately excluded:
 //! the port preserves numeric spelling and does not parse float magnitudes.
 

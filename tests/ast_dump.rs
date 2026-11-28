@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The parser's output as text (self-hosting part 4, spec
 //! `docs/superpowers/specs/2026-11-15-elya-parser-in-elya-design.md` D2):
 //! the form the parser in Elya must print byte for byte. Pinned on a program

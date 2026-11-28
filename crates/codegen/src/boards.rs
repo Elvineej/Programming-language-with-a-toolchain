@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! A board's link (spec 2026-11-14-elya-build-target D2): an object compiled
 //! for a board's processor (`compile_module_for`), the runtime and the board's
 //! files built for the same processor, `ld.lld` with the board's linker script,

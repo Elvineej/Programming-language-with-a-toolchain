@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Strings indexed by byte, natively (2026-10-30, spec
 //! `docs/superpowers/specs/2026-10-24-elya-trace-text-design.md` D1-D3). Every
 //! program is compiled, linked and RUN, and its outcome compared with the

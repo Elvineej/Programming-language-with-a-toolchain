@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 4b-2: effect-carrying closures relayed through higher-order functions.
 //! CEK-only (the tree-walker does not evaluate effects), so every case is
 //! output-verified — a concrete program output or diagnostic — because there is

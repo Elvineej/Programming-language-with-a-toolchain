@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Slice 4d-2: the affine-resource guarantee, two-sided. A `linear type`'s
 //! values are affine (use at most once — E0428; never live across a `multi`-
 //! perform — E0429). Each rule is checked BOTH ways: the violation fires and the

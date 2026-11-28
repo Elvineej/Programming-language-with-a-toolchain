@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! What the emitter roots (2026-11-15): a value is put on the shadow stack
 //! only where something may collect before its last use. Rooting around reads
 //! that allocate nothing (`string.length`, `string.byte_at`, `array.get`, ...)

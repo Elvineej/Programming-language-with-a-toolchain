@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The affine pass in Elya's focused programs (self-hosting part 4e): each
 //! kind of fact, and each rule of the walks that make them: counts in
 //! sequence and across arms, `let`-bound lambdas counted where called, a

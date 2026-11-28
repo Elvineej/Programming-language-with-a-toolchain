@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Rooting is complete under a collection at every allocation (2026-11-05,
 //! spec `docs/superpowers/specs/2026-10-31-elya-scalability-design.md` D13).
 //! Each program runs natively with `ELYA_GC_STRESS=1`, which collects at every

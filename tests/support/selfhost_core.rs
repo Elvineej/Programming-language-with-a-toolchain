@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Core in Elya (self-hosting part 5's first piece, spec
 //! docs/superpowers/specs/2026-11-27-elya-backend-in-elya-design.md D3): what
 //! `elya core --dump` prints, and the focused programs.

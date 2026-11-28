@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The collector on its own, as a board runs it (spec
 //! 2026-11-12-elya-paged-collector): `gc.c` with a platform that gives no
 //! memory but one fixed region (`elya_heap_init`), and `gc.c` built

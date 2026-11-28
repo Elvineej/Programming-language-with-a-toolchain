@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // The round-robin scheduler of `examples/04_async.elya`, written once for any
 // other effects: `Task(e)` and `Queue(e)` take the row the tasks perform
 // besides `Async(e)` (tests/row_parameters.rs).

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The programs `selfhost/resolve.elya` is compared on (spec
 //! 2026-11-15-elya-resolution-in-elya D4), and its oracle: what `elya
 //! resolve --dump` prints (crates/cli/src/main.rs, `resolve_dump_cmd`).

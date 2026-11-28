@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! The programs of `tests/std_map.rs`, shared with
 //! `crates/codegen/tests/native_std_map.rs` (no tests here). ChatGPT wrote
 //! them with the module (spec 2026-11-14-elya-arrays-and-borrowing D7).

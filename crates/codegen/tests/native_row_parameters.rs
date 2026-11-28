@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Row parameters on declarations, natively (2026-10-30, spec
 //! `docs/superpowers/specs/2026-10-30-elya-row-variables-design.md`, part 2,
 //! D6): a native binary prints what the evaluator prints, for a type and an

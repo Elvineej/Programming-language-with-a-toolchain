@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Effect-TCE is a measured guarantee (spec §6): tail-resumptive handlers and
 //! tail calls in handler clauses run in bounded continuation depth. `K_MAX_EFF`
 //! is pinned from the first measurement (both tail-resumptive loops peak at 4 —

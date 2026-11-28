@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 // checksum: 222000
 // Three independently allocated 8192-cell lists. The unequal list differs only
 // in its last element, forcing both equality and inequality to walk the data.

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! HANDOFF step "the soundness sweep the resume-row review found".
 //!
 //! An effect added to an ambient whose row was ALREADY closed used to vanish:

@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! N7 part 2 — type monomorphization (spec
 //! `docs/superpowers/specs/2026-10-15-elya-n7b-type-monomorphization-design.md`).
 //!

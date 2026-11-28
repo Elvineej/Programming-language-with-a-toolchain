@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Structural equality (spec
 //! `docs/superpowers/specs/2026-10-16-elya-structural-equality-design.md`): `==`
 //! and `!=` compare data, structurally; comparing anything that is not data is

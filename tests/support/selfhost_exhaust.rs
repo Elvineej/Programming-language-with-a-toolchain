@@ -1,3 +1,5 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
 //! Exhaustiveness in Elya's focused programs (self-hosting part 4d): nested
 //! witnesses, unreachable arms, `Bool` and `Unit` finite and `Int` and
 //! `String` infinite, the first missing constructor in declaration order with
