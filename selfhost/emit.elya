@@ -1172,8 +1172,14 @@ fn is_site(e: CExpr) -> Bool {
   match e { CExpr(_, _, _, k) -> match k { KPerform(_, _, _, _) -> True  KApp(f, _) -> needs_cps(ty_of(f))  _ -> False } }
 }
 // Every child expression, a lambda's body and a handle's parts included.
-fn arm_bodies(arms: List(CArm), acc: List(CExpr)) -> List(CExpr) { match arms { Nil -> rev(acc)  Cons(CArm(_, b), rest) -> arm_bodies(rest, Cons(b, acc)) } }
-fn clause_bodies(cs: List(CClause), acc: List(CExpr)) -> List(CExpr) { match cs { Nil -> rev(acc)  Cons(CClause(_, _, _, b), rest) -> clause_bodies(rest, Cons(b, acc)) } }
+// Monomorphic, not `rev`: each instance of a generic function is a clone the
+// Rust back end counts (mono.rs's MAX_TYPE_CLONES), and the driver is near it.
+fn rev_es(xs: List(CExpr), acc: List(CExpr)) -> List(CExpr) { match xs { Nil -> acc  Cons(x, rest) -> rev_es(rest, Cons(x, acc)) } }
+fn rev_hbs(xs: List(HB), acc: List(HB)) -> List(HB) { match xs { Nil -> acc  Cons(x, rest) -> rev_hbs(rest, Cons(x, acc)) } }
+fn rev_ops(xs: List(EffOp), acc: List(EffOp)) -> List(EffOp) { match xs { Nil -> acc  Cons(x, rest) -> rev_ops(rest, Cons(x, acc)) } }
+fn rev_binds(xs: List(EBind), acc: List(EBind)) -> List(EBind) { match xs { Nil -> acc  Cons(x, rest) -> rev_binds(rest, Cons(x, acc)) } }
+fn arm_bodies(arms: List(CArm), acc: List(CExpr)) -> List(CExpr) { match arms { Nil -> rev_es(acc, Nil)  Cons(CArm(_, b), rest) -> arm_bodies(rest, Cons(b, acc)) } }
+fn clause_bodies(cs: List(CClause), acc: List(CExpr)) -> List(CExpr) { match cs { Nil -> rev_es(acc, Nil)  Cons(CClause(_, _, _, b), rest) -> clause_bodies(rest, Cons(b, acc)) } }
 fn children(e: CExpr) -> List(CExpr) {
   match e {
     CExpr(_, _, _, k) -> match k {
@@ -1187,7 +1193,7 @@ fn children(e: CExpr) -> List(CExpr) {
       KIf(c, x, y) -> Cons(c, Cons(x, Cons(y, Nil)))
       KMatch(sc, arms) -> Cons(sc, arm_bodies(arms, Nil))
       KResume(v) -> Cons(v, Nil)
-      KHandle(b, _, cs, ret) -> Cons(b, rev_onto(rev(clause_bodies(cs, Nil)), match ret { No -> Nil  Yes(CRet(_, rb)) -> Cons(rb, Nil) }))
+      KHandle(b, _, cs, ret) -> Cons(b, rev_es(rev_es(clause_bodies(cs, Nil), Nil), match ret { No -> Nil  Yes(CRet(_, rb)) -> Cons(rb, Nil) }))
       _ -> Nil
     }
   }
@@ -1242,7 +1248,7 @@ fn count_fns(fs: List(CFn), n: Int, hs: Bool) -> Int { match fs { Nil -> n  Cons
 fn eff_cx(fs: List(CFn)) -> EffCx {
   let cps = cps_names(fs, Nil)
   let nh = count_fns(fs, 0, True)
-  EffCx(cps, rev(ops_fns(fs, True, Nil)), match cps { Nil -> if nh == 0 { 0 } else { count_fns(fs, 0, False) }  _ -> count_fns(fs, 0, False) }, nh)
+  EffCx(cps, rev_ops(ops_fns(fs, True, Nil), Nil), match cps { Nil -> if nh == 0 { 0 } else { count_fns(fs, 0, False) }  _ -> count_fns(fs, 0, False) }, nh)
 }
 fn effect_rows(fr: FRows, ns: Int, nh: Int) -> String {
   match fr { FRows(sr, hr, _) -> "i64 2, i64 2, " <> closure_rows(rev(sr), "") <> spare_rows(ns - len_rows(sr, 0), "") <> closure_rows(rev(hr), "") <> spare_rows(nh - len_rows(hr, 0), "") <> "i64 3, i64 5" }
@@ -1358,7 +1364,7 @@ fn atomic(e: CExpr) -> Bool { match e { CExpr(_, _, _, KLit(_)) -> True  CExpr(_
 fn last_site(xs: List(CExpr), i: Int, last: Int) -> Int { match xs { Nil -> last  Cons(x, rest) -> last_site(rest, i + 1, if has_site(x) { i } else { last }) } }
 fn hoist(xs: List(CExpr), i: Int, last: Int, bs: List(HB), out: List(CExpr)) -> Hoisted {
   match xs {
-    Nil -> Hoisted(rev(bs), rev(out))
+    Nil -> Hoisted(rev_hbs(bs, Nil), rev_es(out, Nil))
     Cons(x, rest) -> {
       let x2 = anf(x)
       if i <= last && !atomic(x2) {
@@ -1600,7 +1606,7 @@ fn clause_fns(cx: ECx, hn: String, cs: List(CClause), j: Int, saved: List(EBind)
     Cons(CClause(_, _, ps, b), rest) -> match header(ps, 0, "", Nil) {
       Hdr(text, penv) -> match load_from(saved, "%hf", 5, Nil, Nil, em) {
         // The parameters shadow what the frame saves.
-        Loaded(pre, env, em2) -> clause_fns(cx, hn, rest, j + 1, saved, define_mode(cx, hn <> ".c." <> int.to_string(j), (if text == "" { "" } else { text <> ", " }) <> "ptr %cont, ptr %hf", LI64, Cons(EBind("$cont", Val("%cont", LPtr)), rev_onto(rev(penv), env)), b, rev_onto(rev(par_lines()), pre), em2, TCl))
+        Loaded(pre, env, em2) -> clause_fns(cx, hn, rest, j + 1, saved, define_mode(cx, hn <> ".c." <> int.to_string(j), (if text == "" { "" } else { text <> ", " }) <> "ptr %cont, ptr %hf", LI64, Cons(EBind("$cont", Val("%cont", LPtr)), rev_binds(rev_binds(penv, Nil), env)), b, rev_onto(rev(par_lines()), pre), em2, TCl))
       }
     }
   }
