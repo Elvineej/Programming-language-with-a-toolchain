@@ -6,6 +6,70 @@
 use std::process::Command;
 
 #[test]
+fn elya_help_prints_usage_to_stdout() {
+    for command in ["help", "--help"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+            .arg(command)
+            .output()
+            .expect("spawn elya help");
+        assert_eq!(out.status.code(), Some(0), "{command}: {out:?}");
+        assert!(out.stderr.is_empty(), "{command}: {out:?}");
+        assert!(
+            out.stdout.starts_with(b"usage: elya "),
+            "{command}: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn elya_unknown_command_prints_usage_to_stderr() {
+    let help = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .arg("help")
+        .output()
+        .expect("spawn elya help");
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .arg("unknown-command")
+        .output()
+        .expect("spawn elya with an unknown command");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(out.stderr, help.stdout);
+}
+
+#[test]
+fn elya_help_lists_dispatcher_commands_and_options() {
+    let out = Command::new(env!("CARGO_BIN_EXE_elya"))
+        .arg("--help")
+        .output()
+        .expect("spawn elya --help");
+    let help = String::from_utf8(out.stdout).expect("UTF-8 help");
+    // Cover every top-level dispatcher arm, including feature-gated build.
+    for synopsis in [
+        "help | --help",
+        "--version",
+        "check <file.elya>",
+        "run <file.elya> [-- <args>...]",
+        "run --value",
+        "run --record",
+        "run --replay",
+        "build <file.elya> [-o <out>] [--target <machine>]",
+        "parse --dump",
+        "check --dump",
+        "resolve --dump",
+        "exhaust --dump",
+        "affine --dump",
+        "core --dump",
+    ] {
+        assert!(
+            help.lines()
+                .filter_map(|line| line.strip_prefix("  elya "))
+                .any(|line| line.starts_with(synopsis)),
+            "help is missing {synopsis}"
+        );
+    }
+}
+
+#[test]
 fn elya_run_records_and_replays_a_trace() {
     let dir = std::env::temp_dir().join(format!("elya-run-cli-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

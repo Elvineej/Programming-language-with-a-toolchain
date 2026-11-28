@@ -67,6 +67,28 @@ fn main() -> ExitCode {
     }
 }
 
+fn usage() -> &'static str {
+    "\
+usage: elya <command> [options]
+  elya help | --help                                      Show this help.
+  elya --version                                          Show version and license information.
+  elya run <file.elya> [-- <args>...]                     Run a program and pass it arguments after --.
+  elya run --value <file.elya> [-- <args>...]             Run a program and print the return value of main.
+  elya run --record <trace> <file.elya> [-- <args>...]    Run a program and record a trace.
+  elya run --replay <trace> <file.elya>                   Replay a program using a recorded trace.
+  elya check <file.elya>                                  Check a program for errors.
+  elya build <file.elya> [-o <out>] [--target <machine>]  Compile a program (requires codegen).
+    -o <out>                                              Set the output path.
+    --target host|cortex-m3|riscv32                       Select the target (default: host; other targets require boards).
+  elya parse --dump <file.elya>                           Print the syntax tree and parser diagnostics.
+  elya check --dump <file.elya>                           Print inferred types and checker diagnostics.
+  elya resolve --dump <file.elya>                         Print the resolved program and diagnostics.
+  elya exhaust --dump <file.elya>                         Print exhaustiveness diagnostics.
+  elya affine --dump <file.elya>                          Print affine analysis facts.
+  elya core --dump <file.elya>                            Print the typed Core representation.
+"
+}
+
 /// `args` are `elya`'s own; `program`, what followed `--` after `run`.
 fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCode {
     let host = elya::eval::Host {
@@ -74,6 +96,10 @@ fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCo
         stdin: None,
     };
     match args.get(1).map(String::as_str) {
+        Some("help" | "--help") if args.len() == 2 => {
+            print!("{}", usage());
+            ExitCode::SUCCESS
+        }
         // The watermark (runtime.c's `elya_watermark` is the built program's).
         Some("--version") if args.len() == 2 => {
             println!(
@@ -116,18 +142,7 @@ fn dispatch(args: &[String], program: Option<Vec<std::ffi::OsString>>) -> ExitCo
         #[cfg(feature = "codegen")]
         Some("build") => build_cmd(args),
         _ => {
-            eprintln!("usage: elya <run|check|build> <file.elya>");
-            eprintln!("       elya run <file.elya> [-- <args>...]");
-            eprintln!("       elya build <file.elya> [-o <out>] [--target host|cortex-m3|riscv32]");
-            eprintln!("       elya run --value <file.elya> [-- <args>...]");
-            eprintln!("       elya run --record <trace> <file.elya> [-- <args>...]");
-            eprintln!("       elya run --replay <trace> <file.elya>");
-            eprintln!("       elya parse --dump <file.elya>");
-            eprintln!("       elya check --dump <file.elya>");
-            eprintln!("       elya resolve --dump <file.elya>");
-            eprintln!("       elya exhaust --dump <file.elya>");
-            eprintln!("       elya affine --dump <file.elya>");
-            eprintln!("       elya core --dump <file.elya>");
+            eprint!("{}", usage());
             ExitCode::from(2)
         }
     }
