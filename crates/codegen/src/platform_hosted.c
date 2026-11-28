@@ -582,3 +582,16 @@ int64_t elya_start(elya_entry_fn entry) {
     return elya_entry_result;
 }
 #endif
+
+/* `io.os` (spec 2026-11-28-elya-io-os D3). */
+const char *elya_platform_os(void) {
+#if defined(_WIN32)
+    return "windows";
+#elif defined(__APPLE__)
+    return "macos";
+#elif defined(__linux__)
+    return "linux";
+#else
+    return "unix";
+#endif
+}

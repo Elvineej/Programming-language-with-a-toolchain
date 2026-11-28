@@ -45,7 +45,7 @@ type Stage { InStage, Outside(String) }
 fn first(a: Stage, b: Stage) -> Stage { match a { InStage -> b  Outside(w) -> Outside(w) } }
 fn ty_ok(t: Ty) -> Stage { match lt_of(t) { LNone -> Outside("a value of a type outside the stage")  LPtr -> InStage  _ -> InStage } }
 fn builtins() -> List(String) {
-  Cons("io.println", Cons("int.to_string", Cons("string.length", Cons("string.byte_at", Cons("string.slice", Cons("int.wrapping_add", Cons("int.wrapping_sub", Cons("int.wrapping_mul", Cons("int.and", Cons("int.or", Cons("int.xor", Cons("int.shl", Cons("int.shr", Cons("int.ushr", Cons("array.new", Cons("array.push", Cons("array.set", Cons("array.get", Cons("array.length", Cons("buffer.new", Cons("buffer.push", Cons("buffer.finish", Cons("buffer.length", Cons("io.read_file", Cons("io.file_exists", Cons("io.write_file", Cons("io.read_stdin", Cons("io.arg_count", Cons("io.arg", Cons("io.run", Cons("io.exit", Nil)))))))))))))))))))))))))))))))
+  Cons("io.println", Cons("int.to_string", Cons("string.length", Cons("string.byte_at", Cons("string.slice", Cons("int.wrapping_add", Cons("int.wrapping_sub", Cons("int.wrapping_mul", Cons("int.and", Cons("int.or", Cons("int.xor", Cons("int.shl", Cons("int.shr", Cons("int.ushr", Cons("array.new", Cons("array.push", Cons("array.set", Cons("array.get", Cons("array.length", Cons("buffer.new", Cons("buffer.push", Cons("buffer.finish", Cons("buffer.length", Cons("io.read_file", Cons("io.file_exists", Cons("io.write_file", Cons("io.read_stdin", Cons("io.arg_count", Cons("io.arg", Cons("io.run", Cons("io.exit", Cons("io.os", Nil))))))))))))))))))))))))))))))))
 }
 fn builtin_ok(n: String) -> Stage {
   if has(builtins(), n) { InStage } else { Outside("builtin " <> n) }
@@ -380,7 +380,8 @@ fn io_data(cx: ECx, rs: List(String), n: String, args: List(CExpr), t: Ty, vs: L
   if n == "io.arg_count" { assign(em, "call i64 @elya_io_arg_count()", LI64) } else {
   if n == "io.run" { rooted(em, rs, "call i64 @elya_io_run(ptr " <> a <> ")", LI64) } else {
   if n == "io.exit" { rooted(em, rs, "call void @elya_io_exit(i64 " <> a <> ")", LNone) } else {
-  if n == "io.arg" { rooted(em, rs, "call ptr @elya_io_arg(i64 " <> st <> ", i64 " <> a <> ")", LPtr) } else { unknown(em, n) } } } } } } } } } } } } } } } }
+  if n == "io.os" { rooted(em, rs, "call ptr @elya_io_os(i64 " <> st <> ")", LPtr) } else {
+  if n == "io.arg" { rooted(em, rs, "call ptr @elya_io_arg(i64 " <> st <> ", i64 " <> a <> ")", LPtr) } else { unknown(em, n) } } } } } } } } } } } } } } } } }
 }
 
 fn emit(cx: ECx, env: List(EBind), pend: List(Val), e: CExpr, em: Emit) -> Gotv {
@@ -818,6 +819,7 @@ fn prelude() -> String {
   "declare ptr @elya_io_arg(i64, i64)\n" <>
   "declare i64 @elya_io_run(ptr)\n" <>
   "declare void @elya_io_exit(i64)\n" <>
+  "declare ptr @elya_io_os(i64)\n" <>
   "declare ptr @elya_str_lit(i64, ptr, i64)\n" <>
   "declare ptr @elya_int_to_string(i64, i64)\n" <>
   "declare ptr @elya_str_concat(i64, ptr, ptr)\n" <>

@@ -3392,6 +3392,7 @@ impl Infer {
             ("io", "write_file") => (vec![Ty::str(), Ty::str()], Ty::unit()),
             ("io", "run") => (vec![Ty::str()], Ty::int()),
             ("io", "exit") => (vec![Ty::int()], Ty::unit()),
+            ("io", "os") => (Vec::new(), Ty::str()),
             ("io", "read_stdin") => (Vec::new(), Ty::str()),
             ("io", "arg_count") => (Vec::new(), Ty::int()),
             ("io", "arg") => (vec![Ty::int()], Ty::str()),

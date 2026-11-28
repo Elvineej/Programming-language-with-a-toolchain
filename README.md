@@ -34,7 +34,8 @@ stops the run by name (`elya: cannot read `a.txt`: no such file or directory`),
 the same words natively. A compiled binary takes its own arguments and input.
 `io.run(command)` runs a program (the command's lines are the program and its
 arguments) and answers its exit status; `io.exit(status)` ends the program
-with a status of its own, 0 to 255. A
+with a status of its own, 0 to 255; `io.os()` names the platform (`linux`,
+`macos`, `windows`, `unix`). A
 dependency is written against `elya/files` (a `Files` effect) and granted that,
 never `IO`; `elya/host`'s `files` gives it the host's files, and `elya/files`
 has handlers in memory, read-only and under a directory.

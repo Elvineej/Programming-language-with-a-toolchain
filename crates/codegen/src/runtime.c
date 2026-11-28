@@ -64,6 +64,9 @@ int elya_platform_path_write(const char *path, const char *bytes, int64_t n);
  * could not start, `elya_platform_run_error` then saying why (spec
  * 2026-11-27-elya-the-switch D1). */
 int64_t elya_platform_run(char *const *argv);
+/* The platform's name: "linux", "macos", "windows", "unix" or "none" (spec
+ * 2026-11-28-elya-io-os D3). */
+const char *elya_platform_os(void);
 const char *elya_platform_run_error(void);
 const char *elya_platform_path_error(const char *path);
 int64_t elya_platform_stdin_read(char *into, int64_t n);
@@ -2122,6 +2125,27 @@ void *elya_io_arg(int64_t tag, int64_t i) {
     return r;
 }
 
+/* `io.os()` (spec 2026-11-28-elya-io-os D1-D3): the platform's name,
+ * recorded and replayed as `io.arg`'s answer is. */
+void *elya_io_os(int64_t tag) {
+    const char *q = "io.os()";
+    if (elya_trace_mode == TRACE_REPLAY) {
+        return trace_string(tag, trace_answer(q));
+    }
+    const char *a = elya_platform_os();
+    int64_t n = (int64_t)rt_strlen(a);
+    void *r = elya_str_lit(tag, a, n);
+    if (elya_trace_mode == TRACE_RECORD) {
+        AnyBuf line = {0};
+        elya_gc_push(r);
+        any_puts(&line, q);
+        io_record(&line, a, n, 1);
+        elya_gc_pop();
+        elya_platform_scratch(line.p, 0);
+    }
+    return r;
+}
+
 /* The deterministic failed-match trap. Spec 5b-4 §5: never `unreachable`. */
 void elya_match_fail(void) {
     rt_puts(2, "elya: match failed (no arm matched)\n");
@@ -2404,6 +2428,7 @@ ELYA_WEAK int64_t elya_platform_run(char *const *argv) {
     return -1;
 }
 ELYA_WEAK const char *elya_platform_run_error(void) { return "this platform cannot run programs"; }
+ELYA_WEAK const char *elya_platform_os(void) { return "none"; }
 /* No input: at its end at once. */
 ELYA_WEAK int64_t elya_platform_stdin_read(char *into, int64_t n) {
     (void)into;

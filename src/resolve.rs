@@ -58,12 +58,15 @@ pub const IO_BUILTINS: &[&str] = &[
     "arg",
     "run",
     "exit",
+    "os",
 ];
 
 /// How many arguments a builtin takes (every name in [`builtins`]).
 pub fn builtin_arity(full: &str) -> usize {
     match full {
-        "time.now_ms" | "io.read_stdin" | "io.arg_count" | "buffer.new" | "array.new" => 0,
+        "time.now_ms" | "io.read_stdin" | "io.arg_count" | "io.os" | "buffer.new" | "array.new" => {
+            0
+        }
         "op.encode" | "op.decode" | "string.byte_at" | "io.write_file" | "buffer.push"
         | "array.push" | "array.get" => 2,
         "string.slice" | "array.set" => 3,
@@ -92,6 +95,8 @@ pub fn builtins() -> &'static [&'static str] {
         "io.run",
         // Ending with a status (2026-11-28, spec 2026-11-28-elya-io-exit D1).
         "io.exit",
+        // The platform (2026-11-28, spec 2026-11-28-elya-io-os D1).
+        "io.os",
         // A linear text buffer (spec 2026-11-14-elya-buffer D2).
         "buffer.new",
         "buffer.push",

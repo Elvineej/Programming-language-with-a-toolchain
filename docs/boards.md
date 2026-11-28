@@ -56,7 +56,7 @@ fails (the program stops with status 70).
   `elya: cannot read `<path>`: this platform has no files`, status 1.
   `io.run` stops with `elya: cannot run `<program>`: this platform cannot
   run programs`. `io.exit(status)` ends the program as the board's `exit`
-  hook does.
+  hook does, and `io.os()` answers `none`.
 - A recursion deeper than the stack stops with
   `elya: native stack overflow: recursion deeper than the 1024 KiB stack`,
   status 1, as on a host: a 4 KiB guard below the stack (the MPU on the

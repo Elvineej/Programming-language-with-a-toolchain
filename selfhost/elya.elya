@@ -48,7 +48,7 @@ fn build(o: Opts) -> Int {
                     BuiltIr(ir) -> {
                       let ll = out <> ".ll"
                       io.write_file(ll, ir)
-                      let status = io.run("clang\n-w\n-O2\n" <> ll <> "\n" <> runtime <> "/runtime.c\n-o\n" <> out <> "\n-no-pie\n-pthread")
+                      let status = io.run("clang\n-w\n-O2\n" <> ll <> "\n" <> runtime <> "/runtime.c\n-o\n" <> out <> link_flags(io.os()))
                       if status == 0 { io.println("built " <> out)
                         0 } else { io.println("elya: build: clang exited " <> int.to_string(status))
                         1 }
@@ -64,6 +64,12 @@ fn build(o: Opts) -> Int {
   }
 }
 
+// The Rust back end's link flags (`elya_codegen::link`), by platform (spec
+// 2026-11-28-elya-io-os D4): non-PIE on Linux (the IR addresses its strings
+// absolutely), threads on Unix (the program's stack is a thread's).
+fn link_flags(os: String) -> String {
+  if os == "linux" { "\n-no-pie\n-pthread" } else { if os == "windows" { "" } else { "\n-pthread" } }
+}
 // The status: 0 built, 1 not, 2 a usage error (spec 2026-11-28-elya-io-exit D5).
 pub fn main() / {IO} {
   io.exit(if io.arg_count() < 2 || io.arg(0) != "build" {

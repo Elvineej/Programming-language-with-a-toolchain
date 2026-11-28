@@ -8,9 +8,9 @@
 //! stage also builds the examples it can, to programs that behave as the
 //! Rust-built ones do, and refuses the others by name.
 //!
-//! On Unix only: the driver runs `clang` with the Rust back end's Unix flags
-//! (`-no-pie`, `-pthread`; spec D2) until it knows the platform.
-#![cfg(unix)]
+//! On every platform since the driver asks `io.os()` for `clang`'s flags
+//! (spec 2026-11-28-elya-io-os D4). Paths reach it with `/`, as the resolver
+//! in Elya splits a module's path there.
 
 #[allow(dead_code)]
 #[path = "../../../tests/support/selfhost_check.rs"]
@@ -31,6 +31,10 @@ fn elya_builds_itself_to_a_fixed_point() {
         .unwrap();
 }
 
+fn slashed(p: &Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
 fn exe(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
@@ -40,13 +44,13 @@ fn stage_build(root: &Path, compiler: &Path, source: &Path, out: &Path) -> (bool
     let o = Command::new(compiler)
         .current_dir(root)
         .arg("build")
-        .arg(source)
+        .arg(slashed(source))
         .arg("-o")
-        .arg(out)
+        .arg(slashed(out))
         .arg("--runtime")
-        .arg(root.join("crates/codegen/src"))
+        .arg(slashed(&root.join("crates/codegen/src")))
         .arg("--std")
-        .arg(root.join("src/std"))
+        .arg(slashed(&root.join("src/std")))
         .output()
         .expect("run a stage");
     let text = format!(

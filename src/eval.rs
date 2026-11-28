@@ -292,6 +292,7 @@ const IO_HOST: &[&str] = &[
     "io.arg",
     "io.run",
     "io.exit",
+    "io.os",
 ];
 
 /// The qualified name of the host's `io.<name>`, if it is one.
@@ -2238,7 +2239,7 @@ fn host_builtin(
                         _ => None,
                     },
                 ),
-                "io.read_file" | "io.read_stdin" | "io.arg" => (
+                "io.read_file" | "io.read_stdin" | "io.arg" | "io.os" => (
                     "String",
                     crate::literal::read_string(a).map(|s| Value::Str(s.into())),
                 ),
@@ -2342,7 +2343,20 @@ fn io_builtin(
                 .ok_or_else(|| rt(span, format!("argument {i} is not UTF-8")))
         }
         ("io.run", [Value::Str(command)]) => run_program(command, span),
+        ("io.os", []) => Ok(Value::Str(host_os().into())),
         _ => Err(rt(span, format!("{name}: wrong arguments"))),
+    }
+}
+
+/// `io.os()` (spec 2026-11-28-elya-io-os D1): the platform the program runs
+/// on, in the native runtime's words (`elya_platform_os`).
+fn host_os() -> &'static str {
+    match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "macos",
+        "windows" => "windows",
+        _ if cfg!(unix) => "unix",
+        _ => "none",
     }
 }
 
