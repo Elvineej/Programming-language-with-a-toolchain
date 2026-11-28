@@ -1,0 +1,259 @@
+// Elya's byte lexer, matching src/lex.rs (logos 0.14), except E0002:
+// float range diagnostics require float parsing and are deliberately omitted.
+// Scanning is O(n). Fragments are consed in O(1), then joined by halves:
+// O(k + m log(k + 1)) time for k fragments and m output bytes, O(n + m)
+// live space and O(log(k + 1)) non-tail depth. With fixed-width byte offsets,
+// m = O(n), giving O(n log n) overall with immutable copying concatenation.
+
+type Parts { End, Part(String, Parts) }
+type Joined { Joined(String, Parts) }
+type Output { Output(Parts, Int, Parts, Int) }
+type Number { Number(Int, Bool, Bool) }
+type Quoted { Quoted(Int, Bool) }
+
+// Parts are newest first; consume halves and concatenate in source order.
+fn halves(xs: Parts, n: Int) -> Joined {
+  if n == 0 { Joined("", xs) } else {
+    if n == 1 {
+      match xs { Part(s, rest) -> Joined(s, rest)  End -> Joined("", End) }
+    } else {
+      let h = n / 2
+      match halves(xs, h) {
+        Joined(a, rest) -> match halves(rest, n - h) {
+          Joined(b, tail) -> Joined(b <> a, tail)
+        }
+      }
+    }
+  }
+}
+
+fn joined(xs: Parts, n: Int) -> String {
+  match halves(xs, n) { Joined(s, rest) -> s }
+}
+
+fn at(s: String, i: Int) -> Int {
+  if i < string.length(s) { string.byte_at(s, i) } else { 0 - 1 }
+}
+
+fn width(c: Int) -> Int {
+  if c < 128 { 1 } else {
+    if c < 224 { 2 } else { if c < 240 { 3 } else { 4 } }
+  }
+}
+
+fn digit(c: Int) -> Bool { c >= 48 && c <= 57 }
+fn lower(c: Int) -> Bool { (c >= 97 && c <= 122) || c == 95 }
+fn upper(c: Int) -> Bool { c >= 65 && c <= 90 }
+fn ident(c: Int) -> Bool { lower(c) || upper(c) || digit(c) }
+
+fn digits(s: String, i: Int) -> Int {
+  let c = at(s, i)
+  if digit(c) || c == 95 { digits(s, i + 1) } else { i }
+}
+
+fn name_end(s: String, i: Int) -> Int {
+  if ident(at(s, i)) { name_end(s, i + 1) } else { i }
+}
+
+fn line_end(s: String, i: Int) -> Int {
+  if i == string.length(s) || at(s, i) == 10 { i } else { line_end(s, i + 1) }
+}
+
+// The regex body consumes '*' together with the following non-'/' character.
+// Thus '/***/' has no closing delimiter: the second '*' belongs to the body.
+// A failed regex is one error up to the last complete body unit.
+fn block_end(s: String, i: Int) -> Quoted {
+  if i >= string.length(s) { Quoted(i, False) } else {
+    if at(s, i) == 42 {
+      let d = at(s, i + 1)
+      if d == 47 { Quoted(i + 2, True) } else {
+        if d == 0 - 1 { Quoted(i, False) } else { block_end(s, i + 1 + width(d)) }
+      }
+    } else { block_end(s, i + width(at(s, i))) }
+  }
+}
+
+fn number(s: String, i: Int) -> Number {
+  let whole = digits(s, i + 1)
+  let dotted = at(s, whole) == 46 && digit(at(s, whole + 1))
+  let end = if dotted { digits(s, whole + 2) } else { whole }
+  let e = at(s, end)
+  let sign = at(s, end + 1)
+  let start = if sign == 43 || sign == 45 { end + 2 } else { end + 1 }
+  if (e == 101 || e == 69) && digit(at(s, start)) {
+    Number(digits(s, start + 1), True, !dotted)
+  } else { Number(end, dotted, False) }
+}
+
+fn without_underscores(s: String, i: Int, end: Int, xs: Parts, n: Int) -> String {
+  if i == end { joined(xs, n) } else {
+    if at(s, i) == 95 { without_underscores(s, i + 1, end, xs, n) } else {
+      without_underscores(s, i + 1, end, Part(string.slice(s, i, i + 1), xs), n + 1)
+    }
+  }
+}
+
+// A backslash followed by LF cannot match regex '.', but literal LF can match
+// the negated character class. Invalid escapes still consume a closed literal.
+fn quote_end(s: String, i: Int, valid: Bool) -> Quoted {
+  let c = at(s, i)
+  if c == 0 - 1 { Quoted(i, False) } else {
+    if c == 34 { Quoted(i + 1, valid) } else {
+      if c == 92 {
+        let d = at(s, i + 1)
+        if d == 10 || d == 0 - 1 { Quoted(i, False) } else {
+          let ok = d == 110 || d == 116 || d == 114 || d == 92 || d == 34
+          quote_end(s, i + 1 + width(d), valid && ok)
+        }
+      } else { quote_end(s, i + width(c), valid) }
+    }
+  }
+}
+
+// Unescape and re-escape in one pass. Every slice ends on a UTF-8 boundary.
+fn quoted_text(s: String, i: Int, end: Int, xs: Parts, n: Int) -> String {
+  if i == end { "\"" <> joined(xs, n) <> "\"" } else {
+    let c = at(s, i)
+    if c == 92 {
+      quoted_text(s, i + 2, end, Part(string.slice(s, i, i + 2), xs), n + 1)
+    } else {
+      let w = width(c)
+      let text = if c == 10 { "\\n" } else {
+        if c == 9 { "\\t" } else {
+          if c == 13 { "\\r" } else { string.slice(s, i, i + w) }
+        }
+      }
+      quoted_text(s, i + w, end, Part(text, xs), n + 1)
+    }
+  }
+}
+
+fn keyword(s: String) -> String {
+  match s {
+    "pub" -> "KwPub"  "fn" -> "KwFn"  "let" -> "KwLet"
+    "import" -> "KwImport"  "if" -> "KwIf"  "else" -> "KwElse"
+    "type" -> "KwType"  "linear" -> "KwLinear"  "match" -> "KwMatch"
+    "case" -> "KwCase"  "effect" -> "KwEffect"  "trait" -> "KwTrait"
+    "impl" -> "KwImpl"  "handle" -> "KwHandle"  "with" -> "KwWith"
+    "multi" -> "KwMulti"  "return" -> "KwReturn"  "const" -> "KwConst"
+    "True" -> "True"  "False" -> "False"  "Unit" -> "Unit"
+    _ -> ""
+  }
+}
+
+fn operator(s: String) -> String {
+  match s {
+    "+." -> "PlusDot"  "-." -> "MinusDot"  "*." -> "StarDot"  "/." -> "SlashDot"
+    "<." -> "LtDot"  "<=." -> "LeDot"  ">." -> "GtDot"  ">=." -> "GeDot"
+    "==" -> "EqEq"  "!=" -> "NotEq"  "<=" -> "Le"  ">=" -> "Ge"
+    "->" -> "Arrow"  "=>" -> "FatArrow"  "<>" -> "Concat"  "|>" -> "Pipe"
+    "&&" -> "AmpAmp"  "||" -> "PipePipe"  "|" -> "Bar"  ".." -> "DotDot"
+    "+" -> "Plus"  "-" -> "Minus"  "*" -> "Star"  "/" -> "Slash"
+    "%" -> "Percent"  "=" -> "Eq"  "<" -> "Lt"  ">" -> "Gt"
+    "!" -> "Bang"  "?" -> "Question"  "." -> "Dot"  "," -> "Comma"
+    ":" -> "Colon"  "(" -> "LParen"  ")" -> "RParen"  "{" -> "LBrace"
+    "}" -> "RBrace"  "[" -> "LBracket"  "]" -> "RBracket"  _ -> ""
+  }
+}
+
+fn token(out: Output, kind: String, start: Int, end: Int, payload: String) -> Output {
+  match out {
+    Output(ts, tn, ds, dn) -> {
+      let line = kind <> " " <> int.to_string(start) <> " " <> int.to_string(end) <> payload <> "\n"
+      Output(Part(line, ts), tn + 1, ds, dn)
+    }
+  }
+}
+
+fn error(out: Output, code: String, start: Int, end: Int) -> Output {
+  match out {
+    Output(ts, tn, ds, dn) -> {
+      let line = "error " <> code <> " " <> int.to_string(start) <> " " <> int.to_string(end) <> "\n"
+      Output(ts, tn, Part(line, ds), dn + 1)
+    }
+  }
+}
+
+fn punctuation(s: String, i: Int, out: Output) -> String {
+  let c = at(s, i)
+  let w = width(c)
+  // Only ASCII can start an operator. Do not slice a partial UTF-8 character.
+  let three = if c < 128 && i + 3 <= string.length(s) && at(s, i + 1) < 128 && at(s, i + 2) < 128 {
+    operator(string.slice(s, i, i + 3))
+  } else { "" }
+  let two = if c < 128 && i + 2 <= string.length(s) && at(s, i + 1) < 128 {
+    operator(string.slice(s, i, i + 2))
+  } else { "" }
+  if three != "" { scan(s, i + 3, token(out, three, i, i + 3, "")) } else {
+    if two != "" { scan(s, i + 2, token(out, two, i, i + 2, "")) } else {
+      let one = operator(string.slice(s, i, i + w))
+      if one != "" { scan(s, i + w, token(out, one, i, i + w, "")) } else {
+        scan(s, i + w, error(out, "E0001", i, i + w))
+      }
+    }
+  }
+}
+
+fn scan(s: String, i: Int, out: Output) -> String {
+  if i == string.length(s) {
+    match out { Output(ts, tn, ds, dn) -> joined(ts, tn) <> joined(ds, dn) }
+  } else {
+    let c = at(s, i)
+    if c == 32 || c == 9 || c == 13 || c == 10 || c == 12 {
+      scan(s, i + 1, out)
+    } else {
+      if c == 47 && at(s, i + 1) == 47 { scan(s, line_end(s, i + 2), out) } else {
+        if c == 47 && at(s, i + 1) == 42 {
+          match block_end(s, i + 2) {
+            Quoted(end, closed) -> {
+              let next = if closed { out } else { error(out, "E0001", i, end) }
+              scan(s, end, next)
+            }
+          }
+        } else {
+          if digit(c) {
+            match number(s, i) {
+              Number(end, floating, exponent) -> {
+                let kind = if floating { "Float" } else { "Int" }
+                let next = token(out, kind, i, end, " " <> without_underscores(s, i, end, End, 0))
+                let next = if exponent { error(next, "E0003", i, end) } else { next }
+                scan(s, end, next)
+              }
+            }
+          } else {
+            if lower(c) || upper(c) {
+              let end = name_end(s, i + 1)
+              let name = string.slice(s, i, end)
+              let kw = keyword(name)
+              let kind = if kw != "" { kw } else { if upper(c) { "Upper" } else { "Lower" } }
+              let payload = if kw != "" { "" } else { " " <> name }
+              scan(s, end, token(out, kind, i, end, payload))
+            } else {
+              if c == 34 {
+                match quote_end(s, i + 1, True) {
+                  Quoted(end, valid) -> {
+                    let next = if valid {
+                      token(out, "Str", i, end, " " <> quoted_text(s, i + 1, end - 1, End, 0))
+                    } else { error(out, "E0001", i, end) }
+                    scan(s, end, next)
+                  }
+                }
+              } else { punctuation(s, i, out) }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+pub fn lex_dump(src: String) -> String { scan(src, 0, Output(End, 0, End, 0)) }
+
+pub fn main() {
+  let text = if io.arg_count() > 0 { io.read_file(io.arg(0)) } else { "pub fn main() { 1e19 + 2 }\n" }
+  let dump = lex_dump(text)
+  // println adds one LF; the dump already ends in LF (and may be empty).
+  if string.length(dump) == 0 { Unit } else {
+    io.println(string.slice(dump, 0, string.length(dump) - 1))
+  }
+}
