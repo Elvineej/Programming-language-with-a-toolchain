@@ -18,13 +18,13 @@ fn builtin_names() -> List(String) {
   Cons("io.read_stdin", Cons("io.arg_count", Cons("io.arg", Cons("io.run", Cons("io.exit", Cons("io.os",
   Cons("buffer.new", Cons("buffer.push", Cons("buffer.finish", Cons("buffer.length",
   Cons("array.new", Cons("array.push", Cons("array.set", Cons("array.get", Cons("array.length",
-  Cons("int.to_string", Cons("float.to_string", Cons("float.of_int", Cons("float.truncate", Cons("float.round",
+  Cons("int.to_string", Cons("float.to_string", Cons("float.of_int", Cons("float.truncate", Cons("float.round", Cons("float.parse", Cons("float.to_bits", Cons("float.of_bits",
   Cons("string.length", Cons("string.byte_at", Cons("string.slice",
   Cons("int.wrapping_add", Cons("int.wrapping_sub", Cons("int.wrapping_mul",
   Cons("int.and", Cons("int.or", Cons("int.xor", Cons("int.shl", Cons("int.shr", Cons("int.ushr",
   Cons("time.now_ms", Cons("time.sleep_ms",
   Cons("op.name", Cons("op.show", Cons("op.perform", Cons("op.encode", Cons("op.decode",
-  Nil)))))))))))))))))))))))))))))))))))))))))))
+  Nil))))))))))))))))))))))))))))))))))))))))))))))
 }
 // `resolve::INT_BINARY_BUILTINS`.
 fn int_binary_builtins() -> List(String) {
@@ -32,7 +32,7 @@ fn int_binary_builtins() -> List(String) {
   Cons("xor", Cons("shl", Cons("shr", Cons("ushr", Nil)))))))))
 }
 // `resolve::FLOAT_CONVERSIONS`.
-fn float_conversions() -> List(String) { Cons("of_int", Cons("truncate", Cons("round", Nil))) }
+fn float_conversions() -> List(String) { Cons("of_int", Cons("truncate", Cons("round", Cons("parse", Cons("to_bits", Cons("of_bits", Nil)))))) }
 // `resolve::STRING_BUILTINS`.
 fn string_builtins() -> List(String) { Cons("length", Cons("byte_at", Cons("slice", Nil))) }
 // `resolve::BUFFER_BUILTINS`.

@@ -179,4 +179,18 @@ pub const FOCUSED: &[&str] = &[
     "type Box(a) { Box(fn(a, a, a, a) -> a) }\nfn get(b: Box(Int)) -> Int { match b { Box(f) -> f(1, 2, 3, 4) } }\npub fn main() -> Int { get(Box(fn(a, b, c, d) { a + b + c + d })) }\n",
     // Records: a function of four parameters never called is still written.
     "type T { A(Int) }\nfn unused(a: Int, b: Int, t: T, d: String) -> Int { match t { A(n) -> a + b + n + string.length(d) } }\npub fn main() -> Int { 7 }\n",
+    // Floats: arithmetic and its text, inf, NaN and -0.0 from arithmetic.
+    "pub fn main() / {IO} {\n  let z = 0.0\n  io.println(float.to_string(0.1 +. 0.2))\n  io.println(float.to_string(1.0 /. z))\n  io.println(float.to_string(z /. z))\n  io.println(float.to_string(-.z))\n  io.println(float.to_string(2.5e-310 *. 0.5 -. 1.0e300 *. 1.0e10))\n}\n",
+    // Floats: comparisons, NaN unequal to itself, -0.0 equal to 0.0.
+    "fn b(x: Bool) -> String { if x { \"T\" } else { \"F\" } }\npub fn main() / {IO} {\n  let n = 0.0 /. 0.0\n  io.println(b(n == n) <> b(n != n) <> b(n <. 1.0) <> b(0.0 == -0.0) <> b(1.5 >=. 1.5) <> b(2.0 >. 1.0) <> b(1.0 <=. 0.5))\n}\n",
+    // Floats: the conversions, the bits both ways, parse.
+    "pub fn main() / {IO} -> Int {\n  io.println(float.to_string(float.of_int(7) *. 0.5))\n  io.println(int.to_string(float.round(2.5) + float.truncate(-2.7)))\n  io.println(int.to_string(float.to_bits(1.0)))\n  io.println(float.to_string(float.of_bits(4611686018427387904)))\n  io.println(float.to_string(float.parse(\"1_000.125e-2\")))\n  float.round(-0.5)\n}\n",
+    // Floats: == on data compares a Float field as a float.
+    "type P { P(Float, Int) }\npub fn main() -> Bool { P(0.0, 1) == P(-0.0, 1) && P(0.0 /. 0.0, 1) != P(0.0 /. 0.0, 1) }\n",
+    // Floats: main answers a Float.
+    "pub fn main() -> Float { 1.5 *. 3.0 }\n",
+    // Floats: parse fails by name.
+    "pub fn main() -> Float { float.parse(\"1.5x\") }\n",
+    // Floats: in data, captured by a closure, summed in a tail loop.
+    "type L { N, C(Float, L) }\nfn sum(l: L, acc: Float) -> Float { match l { N -> acc  C(x, r) -> sum(r, acc +. x) } }\npub fn main() / {IO} {\n  let k = 0.25\n  let f = fn(x) { x *. k }\n  io.println(float.to_string(sum(C(f(2.0), C(1.0e-3, N)), 0.0)))\n}\n",
 ];

@@ -2253,6 +2253,69 @@ int64_t elya_float_to_int(const char *name, int64_t bits, int64_t round_half_awa
     return t;
 }
 
+/* `float.parse(text)` (spec 2026-11-28-elya-float-in-elya D1): the texts the
+ * evaluator's `float_text_value` accepts (`-`, digits, `.` digits, `e` sign
+ * digits; `_` only between two digits), to their nearest double's bits;
+ * another fails by name. */
+int64_t elya_float_parse(void *text) {
+    int64_t *h = (int64_t *)text;
+    const char *s = (const char *)&h[2];
+    int64_t n = h[1];
+    AnyBuf t = {0};
+    int ok = 1;
+    for (int64_t i = 0; i < n && ok; i++) {
+        char c = s[i];
+        if (c == '_') {
+            ok = i > 0 && i + 1 < n && s[i - 1] >= '0' && s[i - 1] <= '9' && s[i + 1] >= '0' &&
+                 s[i + 1] <= '9';
+        } else {
+            any_put(&t, &c, 1);
+        }
+    }
+    int64_t i = 0;
+    int64_t m = ok ? t.len : 0;
+#define FP_RUN()                                                                                  \
+    do {                                                                                           \
+        int64_t start_ = i;                                                                        \
+        while (i < m && t.p[i] >= '0' && t.p[i] <= '9') {                                         \
+            i++;                                                                                   \
+        }                                                                                          \
+        if (i == start_) {                                                                         \
+            ok = 0;                                                                                \
+        }                                                                                          \
+    } while (0)
+    if (ok && i < m && t.p[i] == '-') {
+        i++;
+    }
+    if (ok) {
+        FP_RUN();
+    }
+    if (ok && i < m && t.p[i] == '.') {
+        i++;
+        FP_RUN();
+    }
+    if (ok && i < m && (t.p[i] == 'e' || t.p[i] == 'E')) {
+        i++;
+        if (i < m && (t.p[i] == '+' || t.p[i] == '-')) {
+            i++;
+        }
+        FP_RUN();
+    }
+#undef FP_RUN
+    double x = 0;
+    if (!ok || i != m || !elya_parse_f64(t.p, (size_t)m, &x)) {
+        AnyBuf e = {0};
+        any_puts(&e, "elya: float.parse: `");
+        any_put(&e, s, n);
+        any_puts(&e, "` is not a number");
+        io_fail(&e);
+    }
+    elya_platform_scratch(t.p, 0);
+    int64_t bits;
+    memcpy(&bits, &x, sizeof bits);
+    return bits;
+}
+
 /* A perform whose handler has no clause for it. The type checker makes this
  * unreachable; a guard, never `unreachable`. */
 void elya_unhandled_effect(void) {

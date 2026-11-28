@@ -33,7 +33,7 @@ type Pattern {
 }
 type MatchArm { MatchArm(Sp(Pattern), Sp(Expr)) }
 type Expr {
-  EInt(Int), EFloat, EStr(String), EBool(Bool), EUnit, EVar(String),
+  EInt(Int), EFloat(Int), EStr(String), EBool(Bool), EUnit, EVar(String),
   EQualified(String, String), ECall(Sp(Expr), List(Sp(Expr))),
   EUnary(String, Sp(Expr)), EBinary(String, Sp(Expr), Sp(Expr)),
   EIf(Sp(Expr), Sp(Block), Sp(Block)), EBlock(Block),
@@ -128,6 +128,32 @@ fn start_at(borrow ts: Array(Token), src: String, s: State) -> Int {
 }
 fn end_at(borrow ts: Array(Token), src: String, s: State) -> Int {
   match s { State(p, _, _, _, _, _, _, _) -> { if p >= array.length(ts) { string.length(src) } else { match array.get(ts, p) { Token(_, _, b, _) -> b } } } }
+}
+// A float literal's bits (spec 2026-11-28-elya-float-in-elya D2): its
+// nearest double, through `float.parse`, when the text is one `float.parse`
+// takes (a literal the lexer already reported may not be); else 0, never
+// read, as the program has an error.
+fn float_bits(text: String) -> Int {
+  if float_text_ok(text, 0, string.length(text), 0) { float.to_bits(float.parse(text)) } else { 0 }
+}
+fn is_digit_at(t: String, i: Int, n: Int) -> Bool { i >= 0 && i < n && string.byte_at(t, i) >= 48 && string.byte_at(t, i) <= 57 }
+// `float_text_value`'s grammar, by state: 0 the start (a `-` may come),
+// 1 the integer digits (at least one), 2 after them, 3 the fraction's first
+// digit, 4 the fraction, 5 after `e`, 6 after its sign, 7 the exponent.
+fn float_text_ok(t: String, i: Int, n: Int, st: Int) -> Bool {
+  if i >= n { st == 2 || st == 4 || st == 7 } else {
+    let c = string.byte_at(t, i)
+    if c == 95 { is_digit_at(t, i - 1, n) && is_digit_at(t, i + 1, n) && float_text_ok(t, i + 1, n, st) } else {
+      let d = c >= 48 && c <= 57
+      if st == 0 { if c == 45 { float_text_ok(t, i + 1, n, 1) } else { d && float_text_ok(t, i + 1, n, 2) } } else {
+      if st == 1 { d && float_text_ok(t, i + 1, n, 2) } else {
+      if st == 2 { if d { float_text_ok(t, i + 1, n, 2) } else { if c == 46 { float_text_ok(t, i + 1, n, 3) } else { (c == 101 || c == 69) && float_text_ok(t, i + 1, n, 5) } } } else {
+      if st == 3 { d && float_text_ok(t, i + 1, n, 4) } else {
+      if st == 4 { if d { float_text_ok(t, i + 1, n, 4) } else { (c == 101 || c == 69) && float_text_ok(t, i + 1, n, 5) } } else {
+      if st == 5 { if c == 43 || c == 45 { float_text_ok(t, i + 1, n, 6) } else { d && float_text_ok(t, i + 1, n, 7) } } else {
+      if st == 6 { d && float_text_ok(t, i + 1, n, 7) } else { d && float_text_ok(t, i + 1, n, 7) } } } } } } }
+    }
+  }
 }
 fn text_at(borrow ts: Array(Token), src: String, s: State) -> String {
   match s { State(p, _, _, _, _, _, _, _) -> { if p >= array.length(ts) { "" } else { match array.get(ts, p) { Token(_, _, _, text) -> text } } } }
@@ -583,7 +609,7 @@ fn parse_atom(borrow ts: Array(Token), src: String, s: State, braces: Bool) -> R
       4 -> parse_lambda(ts, src, s)
       11 -> parse_match(ts, src, s, braces)
       16 -> parse_handle(ts, src, s, braces)
-      1 -> Read(Sp(EFloat, start, end), bump(ts, src, s))
+      1 -> Read(Sp(EFloat(float_bits(text_at(ts, src, s))), start, end), bump(ts, src, s))
       47 -> {
         let after = bump(ts, src, s)
         if peek(ts, src, after) == 0 {
@@ -594,7 +620,7 @@ fn parse_atom(borrow ts: Array(Token), src: String, s: State, braces: Bool) -> R
           }
         } else {
           if peek(ts, src, after) == 1 {
-            Read(Sp(EFloat, start, end_at(ts, src, after)), bump(ts, src, after))
+            Read(Sp(EFloat(float_bits("-" <> text_at(ts, src, after))), start, end_at(ts, src, after)), bump(ts, src, after))
           } else { parse_unary(ts, src, after, start, "-", braces) }
         }
       }
@@ -1731,7 +1757,7 @@ fn dump_expr(e: Sp(Expr), src: String, depth: Int, b: Buffer) -> Buffer {
         let b = dump_params(params, src, depth + 1, b)
         dump_block(body, src, depth + 1, b)
       }
-      EFloat -> dump_line(b, depth, "Float", start, end, dump_float_text(src, start, end, buffer.new()))
+      EFloat(_) -> dump_line(b, depth, "Float", start, end, dump_float_text(src, start, end, buffer.new()))
       EHandle(body, handler) -> {
         match handler {
           Handler(is_multi, any, clauses, ret) -> {

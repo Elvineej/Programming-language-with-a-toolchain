@@ -595,6 +595,8 @@ pub(crate) fn float_conversion<'ctx>(
                 .map_err(internal)?;
             b.build_bit_cast(f, i64t, "fw").map_err(internal)
         }
+        // The bits are the word (spec 2026-11-28-elya-float-in-elya D4).
+        "float.to_bits" | "float.of_bits" => Ok(x.into()),
         "float.truncate" | "float.round" => {
             let n = name.strip_prefix("float.").unwrap_or(name);
             let mode = i64t.const_int(u64::from(n == "round"), false);
@@ -612,6 +614,23 @@ pub(crate) fn float_conversion<'ctx>(
         }
         _ => Err(CodegenError::UnsupportedBuiltin(name.to_string())),
     }
+}
+
+/// `float.parse(text)` (spec 2026-11-28-elya-float-in-elya D1, D4): the
+/// runtime's `elya_float_parse`, which fails by name on a text that is not a
+/// number. Allocates nothing.
+pub(crate) fn float_parse<'ctx>(
+    b: &Builder<'ctx>,
+    lc: &LowerCtx<'_, 'ctx>,
+    s: PointerValue<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    b.build_call(lc.float_parse, &[s.into()], "fparse")
+        .map_err(internal)?
+        .try_as_basic_value()
+        .left()
+        .ok_or(CodegenError::Unsupported(
+            "elya_float_parse returned no value",
+        ))
 }
 
 /// `string.length`, `string.byte_at`, `string.slice` on lowered operands (spec
@@ -976,6 +995,9 @@ pub(crate) fn builtin_allocates(name: &str) -> bool {
             | "float.of_int"
             | "float.truncate"
             | "float.round"
+            | "float.parse"
+            | "float.to_bits"
+            | "float.of_bits"
     )
 }
 
@@ -1012,6 +1034,9 @@ pub(crate) fn is_native_builtin(name: &str) -> bool {
             | "float.of_int"
             | "float.truncate"
             | "float.round"
+            | "float.parse"
+            | "float.to_bits"
+            | "float.of_bits"
             | "string.length"
             | "string.byte_at"
             | "string.slice"
@@ -2204,11 +2229,19 @@ fn lower_expr<'ctx>(
         CoreKind::Builtin(builtin, args)
             if matches!(
                 builtin.as_str(),
-                "float.of_int" | "float.truncate" | "float.round"
+                "float.of_int"
+                    | "float.truncate"
+                    | "float.round"
+                    | "float.to_bits"
+                    | "float.of_bits"
             ) && args.len() == 1 =>
         {
             let x = lower_expr(ctx, func, b, lc, &args[0], env)?.into_int_value();
             float_conversion(ctx, b, lc, builtin, x)
+        }
+        CoreKind::Builtin(builtin, args) if builtin == "float.parse" && args.len() == 1 => {
+            let s = lower_expr(ctx, func, b, lc, &args[0], env)?.into_pointer_value();
+            float_parse(b, lc, s)
         }
         CoreKind::Builtin(builtin, args) if is_array_builtin(builtin) => {
             // As for `buffer.*`.
@@ -2929,6 +2962,9 @@ struct LowerCtx<'a, 'ctx> {
     /// `elya_float_to_int(name, bits, round)` (`ccc`; exits on NaN or outside
     /// `Int`, spec 2026-10-24-elya-float-part-2 D4).
     float_to_int: FunctionValue<'ctx>,
+    /// `elya_float_parse(s)` (`ccc`; exits on a text that is not a number,
+    /// spec 2026-11-28-elya-float-in-elya D1).
+    float_parse: FunctionValue<'ctx>,
     /// `elya_str_length(s)`, `elya_str_byte_at(s, i)` and
     /// `elya_str_slice(tag, s, from, to)` (`ccc`; the last two exit by name,
     /// spec 2026-10-24-elya-trace-text D1).
@@ -3269,6 +3305,11 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     let shift_range = module.add_function("elya_shift_range", shift_range_ty, None); // ccc
     let float_to_int_ty = i64t.fn_type(&[ptrt.into(), i64t.into(), i64t.into()], false);
     let float_to_int = module.add_function("elya_float_to_int", float_to_int_ty, None); // ccc
+    let float_parse = module.add_function(
+        "elya_float_parse",
+        i64t.fn_type(&[ptrt.into()], false),
+        None,
+    ); // ccc
     let str_length_ty = i64t.fn_type(&[ptrt.into()], false);
     let str_length = module.add_function("elya_str_length", str_length_ty, None); // ccc
     let str_byte_at_ty = i64t.fn_type(&[ptrt.into(), i64t.into()], false);
@@ -3347,6 +3388,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         any_check,
         shift_range,
         float_to_int,
+        float_parse,
         str_length,
         str_byte_at,
         str_slice,

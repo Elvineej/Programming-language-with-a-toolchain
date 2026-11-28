@@ -2338,7 +2338,7 @@ fn ctors(s: St, vs: List(Sp(VariantDecl)), result: Ty, vars: List(Int), rvs: Lis
 
 fn is_value(e: Expr) -> Bool {
   match e {
-    EVar(_) -> True  EQualified(_, _) -> True  EInt(_) -> True  EFloat -> True
+    EVar(_) -> True  EQualified(_, _) -> True  EInt(_) -> True  EFloat(_) -> True
     EStr(_) -> True  EBool(_) -> True  EUnit -> True  ELambda(_, _) -> True  _ -> False
   }
 }
@@ -2401,7 +2401,7 @@ fn binop_result(op: String) -> Ty {
 fn infer_inner(s: St, node: Expr, start: Int, end: Int, env: List(Entry), amb: Int) -> R(Ty) {
   match node {
     EInt(_) -> R(TB(0), s)
-    EFloat -> R(TB(1), s)
+    EFloat(_) -> R(TB(1), s)
     EStr(_) -> R(TB(3), s)
     EBool(_) -> R(TB(2), s)
     EUnit -> R(TB(4), s)
@@ -2542,14 +2542,16 @@ fn infer_args(s: St, args: List(Sp(Expr)), env: List(Entry), acc: List(Ty), amb:
 type Sig { Sig(List(Ty), Ty), NoSig }
 fn pure_builtin(m: String, n: String) -> Sig {
   if (m == "int" || m == "float") && n == "to_string" { Sig(Cons(if m == "int" { TB(0) } else { TB(1) }, Nil), TB(3)) } else {
-    if m == "float" && n == "of_int" { Sig(Cons(TB(0), Nil), TB(1)) } else {
+    if m == "float" && (n == "of_int" || n == "of_bits") { Sig(Cons(TB(0), Nil), TB(1)) } else {
+    if m == "float" && n == "parse" { Sig(Cons(TB(3), Nil), TB(1)) } else {
+    if m == "float" && n == "to_bits" { Sig(Cons(TB(1), Nil), TB(0)) } else {
       if m == "float" && (n == "truncate" || n == "round") { Sig(Cons(TB(1), Nil), TB(0)) } else {
         if m == "string" && n == "length" { Sig(Cons(TB(3), Nil), TB(0)) } else {
           if m == "string" && n == "byte_at" { Sig(Cons(TB(3), Cons(TB(0), Nil)), TB(0)) } else {
             if m == "string" && n == "slice" { Sig(Cons(TB(3), Cons(TB(0), Cons(TB(0), Nil))), TB(3)) } else {
               if m == "int" && (n == "wrapping_add" || n == "wrapping_sub" || n == "wrapping_mul" || n == "and" || n == "or" || n == "xor" || n == "shl" || n == "shr" || n == "ushr") {
                 Sig(Cons(TB(0), Cons(TB(0), Nil)), TB(0))
-              } else { NoSig }
+              } else { NoSig } } }
             }
           }
         }

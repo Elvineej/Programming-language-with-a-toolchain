@@ -19,7 +19,7 @@ fn has(xs: List(String), x: String) -> Bool { match xs { Nil -> False  Cons(y, r
 
 // ---- Core -------------------------------------------------------------------
 
-type CLit { LInt(Int), LBool(Bool), LStr(String), LUnit, LNegZero }
+type CLit { LInt(Int), LBool(Bool), LStr(String), LUnit, LNegZero, LFloat(Int) }
 type CPat { QWild, QVar(String), QCtor(String, List(CPat)), QLit(CLit) }
 type CParam { CParam(String, Ty) }
 type CArm { CArm(CPat, CExpr) }
@@ -175,11 +175,11 @@ fn is_builtin(n: String) -> Bool {
   has(Cons("io.println", Cons("io.read_file", Cons("io.file_exists", Cons("io.write_file", Cons("io.read_stdin", Cons("io.arg_count", Cons("io.arg", Cons("io.run", Cons("io.exit", Cons("io.os",
   Cons("buffer.new", Cons("buffer.push", Cons("buffer.finish", Cons("buffer.length",
   Cons("array.new", Cons("array.push", Cons("array.set", Cons("array.get", Cons("array.length",
-  Cons("int.to_string", Cons("float.to_string", Cons("float.of_int", Cons("float.truncate", Cons("float.round",
+  Cons("int.to_string", Cons("float.to_string", Cons("float.of_int", Cons("float.truncate", Cons("float.round", Cons("float.parse", Cons("float.to_bits", Cons("float.of_bits",
   Cons("string.length", Cons("string.byte_at", Cons("string.slice",
   Cons("int.wrapping_add", Cons("int.wrapping_sub", Cons("int.wrapping_mul", Cons("int.and", Cons("int.or", Cons("int.xor", Cons("int.shl", Cons("int.shr", Cons("int.ushr",
   Cons("time.now_ms", Cons("time.sleep_ms",
-  Cons("op.name", Cons("op.show", Cons("op.perform", Cons("op.encode", Cons("op.decode", Nil))))))))))))))))))))))))))))))))))))))))))), n)
+  Cons("op.name", Cons("op.show", Cons("op.perform", Cons("op.encode", Cons("op.decode", Nil)))))))))))))))))))))))))))))))))))))))))))))), n)
 }
 // `BinOp`'s `Debug` names, by the operator's symbol.
 fn prim_name(op: String) -> String {
@@ -289,7 +289,7 @@ fn mk(a: Int, b: Int, ty: Ty, k: Low(CKind)) -> Low(CExpr) {
 fn expr_at(cx: Cx, locals: List(String), x: Expr, a: Int, b: Int, ty: Ty) -> Low(CExpr) {
   match x {
     EInt(n) -> Ok(lit(LInt(n), a, b, ty))
-    EFloat -> Refused(unsupported("Float in Elya"))
+    EFloat(bits) -> Ok(lit(LFloat(bits), a, b, ty))
     EBool(v) -> Ok(lit(LBool(v), a, b, ty))
     EStr(v) -> if plain(v, 0) { Ok(lit(LStr(unescape(v)), a, b, ty)) } else { Refused(unsupported("a character Debug escapes")) }
     EUnit -> Ok(lit(LUnit, a, b, ty))
@@ -542,6 +542,9 @@ fn push_lit(l: CLit, b: Buffer) -> Buffer {
     LStr(v) -> buffer.push(debug_from(v, 0, 0, buffer.push(b, "\"")), "\"")
     LUnit -> buffer.push(b, "Unit")
     LNegZero -> buffer.push(b, "-0.0")
+    // Rust's `literal::float_text`, which is `float.to_string`'s text
+    // (spec 2026-11-28-elya-float-in-elya D3).
+    LFloat(n) -> buffer.push(b, float.to_string(float.of_bits(n)))
   }
 }
 type P { P(Buffer, Names) }

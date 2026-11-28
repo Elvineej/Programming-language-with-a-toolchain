@@ -27,6 +27,8 @@ type LTy { LI64, LI1, LPtr, LNone }
 fn lt_of(t: Ty) -> LTy {
   match t {
     TB(0) -> LI64
+    // A float is a word of its bits (spec 2026-11-28-elya-float-in-elya D4).
+    TB(1) -> LI64
     TB(2) -> LI1
     TB(4) -> LI64
     TB(3) -> LPtr
@@ -45,13 +47,13 @@ type Stage { InStage, Outside(String) }
 fn first(a: Stage, b: Stage) -> Stage { match a { InStage -> b  Outside(w) -> Outside(w) } }
 fn ty_ok(t: Ty) -> Stage { match lt_of(t) { LNone -> Outside("a value of a type outside the stage")  LPtr -> InStage  _ -> InStage } }
 fn builtins() -> List(String) {
-  Cons("io.println", Cons("int.to_string", Cons("string.length", Cons("string.byte_at", Cons("string.slice", Cons("int.wrapping_add", Cons("int.wrapping_sub", Cons("int.wrapping_mul", Cons("int.and", Cons("int.or", Cons("int.xor", Cons("int.shl", Cons("int.shr", Cons("int.ushr", Cons("array.new", Cons("array.push", Cons("array.set", Cons("array.get", Cons("array.length", Cons("buffer.new", Cons("buffer.push", Cons("buffer.finish", Cons("buffer.length", Cons("io.read_file", Cons("io.file_exists", Cons("io.write_file", Cons("io.read_stdin", Cons("io.arg_count", Cons("io.arg", Cons("io.run", Cons("io.exit", Cons("io.os", Nil))))))))))))))))))))))))))))))))
+  Cons("io.println", Cons("int.to_string", Cons("string.length", Cons("string.byte_at", Cons("string.slice", Cons("int.wrapping_add", Cons("int.wrapping_sub", Cons("int.wrapping_mul", Cons("int.and", Cons("int.or", Cons("int.xor", Cons("int.shl", Cons("int.shr", Cons("int.ushr", Cons("array.new", Cons("array.push", Cons("array.set", Cons("array.get", Cons("array.length", Cons("buffer.new", Cons("buffer.push", Cons("buffer.finish", Cons("buffer.length", Cons("io.read_file", Cons("io.file_exists", Cons("io.write_file", Cons("io.read_stdin", Cons("io.arg_count", Cons("io.arg", Cons("io.run", Cons("io.exit", Cons("io.os", Cons("float.to_string", Cons("float.of_int", Cons("float.truncate", Cons("float.round", Cons("float.parse", Cons("float.to_bits", Cons("float.of_bits", Nil)))))))))))))))))))))))))))))))))))))))
 }
 fn builtin_ok(n: String) -> Stage {
   if has(builtins(), n) { InStage } else { Outside("builtin " <> n) }
 }
 fn prim_ok(op: String) -> Stage {
-  if op == "Add" || op == "Sub" || op == "Mul" || op == "Div" || op == "Rem" || op == "Eq" || op == "Ne" || op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" || op == "Concat" { InStage } else { Outside("operator " <> op) }
+  if op == "Add" || op == "Sub" || op == "Mul" || op == "Div" || op == "Rem" || op == "Eq" || op == "Ne" || op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" || op == "Concat" || op == "AddF" || op == "SubF" || op == "MulF" || op == "DivF" || op == "LtF" || op == "LeF" || op == "GtF" || op == "GeF" { InStage } else { Outside("operator " <> op) }
 }
 fn has_fn(fs: List(CFn), n: String) -> Bool {
   match fs { Nil -> False  Cons(CFn(m, _, _), rest) -> m == n || has_fn(rest, n) }
@@ -200,7 +202,7 @@ fn sig_of(sigs: List(ESig), n: String) -> ESig {
 fn ty_lt(e: CExpr) -> LTy { match e { CExpr(_, _, t, _) -> lt_of(t) } }
 
 fn lit_value(l: CLit) -> String {
-  match l { LInt(n) -> int.to_string(n)  LBool(b) -> if b { "true" } else { "false" }  LUnit -> "0"  _ -> "0" }
+  match l { LInt(n) -> int.to_string(n)  LBool(b) -> if b { "true" } else { "false" }  LUnit -> "0"  LFloat(n) -> int.to_string(n)  LNegZero -> "-9223372036854775808"  _ -> "0" }
 }
 
 // A string literal: a private constant of its bytes, made a runtime string
@@ -296,7 +298,30 @@ fn shift(em: Emit, name: String, ins: String, a: String, b: String) -> Gotv {
     Fresh1(bad, em2) -> assign(trap_with(line(em2, bad <> " = icmp ugt i64 " <> b <> ", 63"), bad, "elya_shift_range(ptr @.name." <> name <> ", i64 " <> b <> ")"), ins <> " i64 " <> a <> ", " <> b, LI64)
   }
 }
-fn prim(cx: ECx, env: List(EBind), pend: List(Val), op: String, is_str: Bool, a: Val, b: Val, em: Emit) -> Gotv {
+// A float operation on two words (Rust's `float_prim`): bit casts to
+// `double`, IEEE arithmetic (no failure), and back; `==` is `oeq` and `!=`
+// `une`, so a NaN is unequal to itself and `-0.0` equals `0.0`; the
+// orderings are ordered (false with a NaN).
+fn float_prim(op: String, x: String, y: String, em: Emit) -> Gotv {
+  match fresh(em) {
+    Fresh1(fx, em2) -> match fresh(line(em2, fx <> " = bitcast i64 " <> x <> " to double")) {
+      Fresh1(fy, em3) -> {
+        let em4 = line(em3, fy <> " = bitcast i64 " <> y <> " to double")
+        let arith = if op == "AddF" { "fadd" } else { if op == "SubF" { "fsub" } else { if op == "MulF" { "fmul" } else { if op == "DivF" { "fdiv" } else { "" } } } }
+        if arith != "" {
+          match fresh(em4) {
+            Fresh1(r, em5) -> assign(line(em5, r <> " = " <> arith <> " double " <> fx <> ", " <> fy), "bitcast double " <> r <> " to i64", LI64)
+          }
+        } else {
+          let cc = if op == "Eq" { "oeq" } else { if op == "Ne" { "une" } else { if op == "LtF" { "olt" } else { if op == "LeF" { "ole" } else { if op == "GtF" { "ogt" } else { "oge" } } } } }
+          assign(em4, "fcmp " <> cc <> " double " <> fx <> ", " <> fy, LI1)
+        }
+      }
+    }
+  }
+}
+fn prim(cx: ECx, env: List(EBind), pend: List(Val), op: String, is_str: Bool, is_fl: Bool, a: Val, b: Val, em: Emit) -> Gotv {
+  if is_fl || string.length(op) == 4 && string.slice(op, 3, 4) == "F" { float_prim(op, vtext(a), vtext(b), em) } else {
   match a {
     Val(x, at) -> match b {
       Val(y, _) -> if op == "Add" { checked(em, "sadd", x, y) } else { if op == "Sub" { checked(em, "ssub", x, y) } else { if op == "Mul" { checked(em, "smul", x, y) } else {
@@ -331,6 +356,7 @@ fn prim(cx: ECx, env: List(EBind), pend: List(Val), op: String, is_str: Bool, a:
       } } }
     }
   }
+  }
 }
 
 // An array's words: a traced array (its own tag, after the string's) when
@@ -341,6 +367,7 @@ fn builtin(cx: ECx, env: List(EBind), pend: List(Val), n: String, args: List(CEx
   let a = vtext(nth(vs, 0))
   let b = vtext(nth(vs, 1))
   let rs = roots(env, pend, vs)
+  if string.length(n) > 6 && string.slice(n, 0, 6) == "float." { float_builtin(cx, rs, n, a, em) } else {
   if string.slice(n, 0, 3) == "arr" || string.slice(n, 0, 3) == "buf" || string.slice(n, 0, 3) == "io." && n != "io.println" { io_data(cx, rs, n, args, t, vs, em) } else {
   if n == "int.to_string" { rooted(em, roots(env, pend, vs), "call ptr @elya_int_to_string(i64 " <> stag(cx) <> ", i64 " <> a <> ")", LPtr) } else {
   if n == "io.println" { rooted(em, roots(env, pend, vs), "call void @elya_println(ptr " <> a <> ")", LNone) } else {
@@ -355,7 +382,18 @@ fn builtin(cx: ECx, env: List(EBind), pend: List(Val), n: String, args: List(CEx
   if n == "int.xor" { assign(em, "xor i64 " <> a <> ", " <> b, LI64) } else {
   if n == "int.shl" { shift(em, "shl", "shl", a, b) } else {
   if n == "int.shr" { shift(em, "shr", "ashr", a, b) } else {
-  if n == "int.ushr" { shift(em, "ushr", "lshr", a, b) } else { unknown(em, n) } } } } } } } } } } } } } } }
+  if n == "int.ushr" { shift(em, "ushr", "lshr", a, b) } else { unknown(em, n) } } } } } } } } } } } } } } } }
+}
+// `float.*` (spec 2026-11-28-elya-float-in-elya D4), as the Rust back end
+// lowers them: the text and the conversions through the runtime, `of_int` by
+// `sitofp`, the bits as the word itself.
+fn float_builtin(cx: ECx, rs: List(String), n: String, a: String, em: Emit) -> Gotv {
+  if n == "float.to_string" { rooted(em, rs, "call ptr @elya_float_to_string(i64 " <> stag(cx) <> ", i64 " <> a <> ")", LPtr) } else {
+  if n == "float.of_int" { match fresh(em) { Fresh1(f, em2) -> assign(line(em2, f <> " = sitofp i64 " <> a <> " to double"), "bitcast double " <> f <> " to i64", LI64) } } else {
+  if n == "float.truncate" { assign(em, "call i64 @elya_float_to_int(ptr @.name.truncate, i64 " <> a <> ", i64 0)", LI64) } else {
+  if n == "float.round" { assign(em, "call i64 @elya_float_to_int(ptr @.name.round, i64 " <> a <> ", i64 1)", LI64) } else {
+  if n == "float.parse" { assign(em, "call i64 @elya_float_parse(ptr " <> a <> ")", LI64) } else {
+  if n == "float.to_bits" || n == "float.of_bits" { Gotv(Val(a, LI64), em) } else { unknown(em, n) } } } } } }
 }
 // A builtin the dispatch does not know: text `clang` refuses, so a list and
 // a dispatch that disagree fail the build instead of compiling to undef.
@@ -393,7 +431,7 @@ fn emit(cx: ECx, env: List(EBind), pend: List(Val), e: CExpr, em: Emit) -> Gotv 
       KLambda(ps, body) -> lambda(cx, env, pend, ps, body, t, em)
       KLet(n, v, b) -> match emit(cx, env, pend, v, em) { Gotv(val, em2) -> emit(cx, Cons(EBind(n, val), env), pend, b, em2) }
       KPrim(op, Cons(a, Cons(b, Nil))) -> match emit(cx, env, pend, a, em) {
-        Gotv(va, em2) -> match emit(cx, env, Cons(va, pend), b, em2) { Gotv(vb, em3) -> prim(cx, env, pend, op, is_string(a), va, vb, em3) }
+        Gotv(va, em2) -> match emit(cx, env, Cons(va, pend), b, em2) { Gotv(vb, em3) -> prim(cx, env, pend, op, is_string(a), is_float(a), va, vb, em3) }
       }
       KCtor(n, Nil) -> match t {
         // A constructor with fields used as a value: `fn(a1, .., an) { C(a1, .., an) }`.
@@ -575,6 +613,7 @@ fn captures(env: List(EBind), names: List(String), acc: List(EBind)) -> List(EBi
 
 fn ty_of(e: CExpr) -> Ty { match e { CExpr(_, _, t, _) -> t } }
 fn is_string(e: CExpr) -> Bool { match ty_of(e) { TB(3) -> True  _ -> False } }
+fn is_float(e: CExpr) -> Bool { match ty_of(e) { TB(1) -> True  _ -> False } }
 // A constructor of a ground type is keyed by its name; one of a parametric
 // type's instance by its name and the instance (`Cons` of `List(Int)`).
 fn ctor_info(cs: List(CInfo), n: String, key: String) -> CInfo {
@@ -833,6 +872,11 @@ fn prelude() -> String {
   "@.name.shl = private unnamed_addr constant [4 x i8] c\"shl\\00\"\n" <>
   "@.name.shr = private unnamed_addr constant [4 x i8] c\"shr\\00\"\n" <>
   "@.name.ushr = private unnamed_addr constant [5 x i8] c\"ushr\\00\"\n" <>
+  "@.name.truncate = private unnamed_addr constant [9 x i8] c\"truncate\\00\"\n" <>
+  "@.name.round = private unnamed_addr constant [6 x i8] c\"round\\00\"\n" <>
+  "declare ptr @elya_float_to_string(i64, i64)\n" <>
+  "declare i64 @elya_float_to_int(ptr, i64, i64)\n" <>
+  "declare i64 @elya_float_parse(ptr)\n" <>
   "declare void @elya_println(ptr)\n" <>
   "declare void @elya_int_overflow()\n" <>
   "declare void @elya_div_zero()\n" <>
@@ -850,15 +894,22 @@ fn prelude() -> String {
 // The entry: `main`'s value printed as the Rust back end prints it, an
 // `Int` (or `Unit`, 0) by `elya_main_int` after the program, a `Bool` by
 // name.
-fn entry(cx: ECx, main_lt: LTy) -> String {
+// Whether `main` answers a `Float`: printed by its text, as the Rust back
+// end prints it (spec 2026-11-28-elya-float-in-elya D4).
+fn main_float(fs: List(CFn)) -> Bool {
+  match fs { Nil -> False  Cons(CFn(n, _, b), rest) -> if n == "main" { match ty_of(b) { TB(1) -> True  _ -> False } } else { main_float(rest) } }
+}
+fn entry(cx: ECx, main_lt: LTy, fl: Bool) -> String {
   "@.true = private unnamed_addr constant [4 x i8] c\"True\"\n@.false = private unnamed_addr constant [5 x i8] c\"False\"\n\n" <>
   "define i64 @elya_entry() {\nentry:\n  %v = call tailcc " <> lt_text(main_lt) <> " @elya.main()\n" <>
   (if main_lt == LI1 {
     "  %t = call ptr @elya_str_lit(i64 " <> stag(cx) <> ", ptr @.true, i64 4)\n  call void @elya_gc_push(ptr %t)\n  %f = call ptr @elya_str_lit(i64 " <> stag(cx) <> ", ptr @.false, i64 5)\n  call void @elya_gc_pop()\n  %s = select i1 %v, ptr %t, ptr %f\n  call void @elya_println(ptr %s)\n  ret i64 0\n}\n\n"
-  } else { "  ret i64 %v\n}\n\n" }) <>
+  } else { if fl {
+    "  %s = call ptr @elya_float_to_string(i64 " <> stag(cx) <> ", i64 %v)\n  call void @elya_println(ptr %s)\n  ret i64 0\n}\n\n"
+  } else { "  ret i64 %v\n}\n\n" } }) <>
   "define i32 @main(i32 %0, ptr %1) {\nentry:\n  call void @elya_gc_init(ptr @.gc_desc, i64 " <> int.to_string(rows(cx)) <> ")\n  call void @elya_eq_init(ptr @.eq_float, i64 " <> int.to_string(n_ctors(cx)) <> ")\n" <>
   "  call void @elya_args_init(i32 %0, ptr %1)\n  %v = call i64 @elya_start(ptr @elya_entry)\n" <>
-  (if main_lt == LI1 { "" } else { "  call void @elya_main_int(i64 %v)\n" }) <>
+  (if main_lt == LI1 || fl { "" } else { "  call void @elya_main_int(i64 %v)\n" }) <>
   "  call void @elya_gc_report()\n  ret i32 0\n}\n"
 }
 
@@ -956,6 +1007,14 @@ fn is_heap(t: Ty) -> Bool { lt_of(t) == LPtr }
 fn mask(fs: List(Ty), bit: Int, acc: Int) -> Int {
   match fs { Nil -> acc  Cons(f, rest) -> mask(rest, bit * 2, if is_heap(f) { acc + bit } else { acc }) }
 }
+// A constructor's float mask for `elya_eq`: bit i set iff field i is a
+// `Float`, compared as a float (spec 2026-10-23-elya-float-natively D2).
+fn fmask(fs: List(Ty), bit: Int, acc: Int) -> Int {
+  match fs { Nil -> acc  Cons(f, rest) -> fmask(rest, bit * 2, match f { TB(1) -> acc + bit  _ -> acc }) }
+}
+fn float_rows(cs: List(CInfo), b: String) -> String {
+  match cs { Nil -> b  Cons(CInfo(_, _, _, fs), rest) -> float_rows(rest, b <> "i64 " <> int.to_string(fmask(fs, 1, 0)) <> ", ") }
+}
 fn len_tys(ts: List(Ty), n: Int) -> Int { match ts { Nil -> n  Cons(_, rest) -> len_tys(rest, n + 1) } }
 fn desc_rows(cs: List(CInfo), b: String) -> String {
   match cs { Nil -> b  Cons(CInfo(_, _, _, fs), rest) -> desc_rows(rest, b <> "i64 " <> int.to_string(len_tys(fs, 0)) <> ", i64 " <> int.to_string(mask(fs, 1, 0)) <> ", ") }
@@ -970,7 +1029,7 @@ fn len_rows(rws: List(Row2), n: Int) -> Int { match rws { Nil -> n  Cons(_, rest
 fn tables(cx: ECx, rws: List(Row2)) -> String {
   match cx {
     ECx(_, cs, t) -> "@.gc_desc = private unnamed_addr constant [" <> int.to_string(2 * rows(cx)) <> " x i64] [" <> desc_rows(cs, "") <> closure_rows(rws, "") <> spare_rows(t - n_ctors(cx) - len_rows(rws, 0), "") <> "i64 0, i64 0, i64 -1, i64 0]\n" <>
-      "@.eq_float = private unnamed_addr constant [" <> int.to_string(n_ctors(cx) + 1) <> " x i64] zeroinitializer\n"
+      "@.eq_float = private unnamed_addr constant [" <> int.to_string(n_ctors(cx) + 1) <> " x i64] [" <> float_rows(cs, "") <> "i64 0]\n"
   }
 }
 
@@ -1160,7 +1219,7 @@ pub fn emit_module(m0: CModule) -> String {
       let cs = match use_fns(gs, fs, use_tys(gs, ground_fields(ground_cs, Nil), Insts(Nil, n))) { Insts(insts, _) -> rev_onto(rev(ground_cs), rev(insts)) }
       let cx = ECx(sigs, cs, len_infos(cs, 0) + sites_fns(fs, 0))
       match emit_fns(cx, fs, Emit(buffer.new(), 0, "entry", Mx(Nil, Nil, Nil, 0, Nil), 0)) {
-        Emit(body, _, _, Mx(ss, _, rws, _, _), _) -> buffer.finish(buffer.push(emit_strs(rev(ss), buffer.push(buffer.new(), prelude() <> tables(cx, rev(rws)))), buffer.finish(body) <> entry(cx, match sig_of(sigs, "main") { ESig(_, _, r) -> r })))
+        Emit(body, _, _, Mx(ss, _, rws, _, _), _) -> buffer.finish(buffer.push(emit_strs(rev(ss), buffer.push(buffer.new(), prelude() <> tables(cx, rev(rws)))), buffer.finish(body) <> entry(cx, match sig_of(sigs, "main") { ESig(_, _, r) -> r }, main_float(fs))))
       }
     }
   }

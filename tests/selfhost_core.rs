@@ -61,7 +61,7 @@ fn core_in_elya_agrees() {
     );
     let corpus = parse_support::corpus(Path::new(env!("CARGO_MANIFEST_DIR")));
     let scratch = parse_support::Scratch::new("core");
-    let (mut compared, mut floats) = (0, 0);
+    let (mut compared, mut escaped) = (0, 0);
     let cases = corpus
         .cases
         .iter()
@@ -83,14 +83,14 @@ fn core_in_elya_agrees() {
         };
         let (interpreter, result) = elya::eval::run_module_keeping_host(&module, World::Live, host);
         assert!(result.is_ok(), "{name}: {result:?}");
-        if interpreter.output() == support::FLOAT || interpreter.output() == support::ESCAPED {
-            floats += 1;
+        if interpreter.output() == support::ESCAPED {
+            escaped += 1;
             continue;
         }
         parse_support::assert_dump(&name, interpreter.output(), &want);
         compared += 1;
     }
-    println!("compared {compared}, {floats} with a Float literal skipped");
+    println!("compared {compared}, {escaped} with a character Debug escapes skipped");
     assert!(
         compared >= 350 + support::FOCUSED.len(),
         "at least 350 corpus programs, and the focused set ({compared})"

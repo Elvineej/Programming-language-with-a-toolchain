@@ -3533,10 +3533,12 @@ impl Infer {
         // fn(Float) -> Int`, pure (spec 2026-10-24-elya-float-part-2 D3, D4;
         // a failure is not an effect, as with checked `Int` arithmetic).
         if module == "float" && crate::resolve::FLOAT_CONVERSIONS.contains(&name) {
-            let (from, to) = if name == "of_int" {
-                (Ty::int(), Ty::float())
-            } else {
-                (Ty::float(), Ty::int())
+            // `parse : fn(String) -> Float`, `to_bits : fn(Float) -> Int`,
+            // `of_bits : fn(Int) -> Float` (spec 2026-11-28-elya-float-in-elya D1).
+            let (from, to) = match name {
+                "of_int" | "of_bits" => (Ty::int(), Ty::float()),
+                "parse" => (Ty::str(), Ty::float()),
+                _ => (Ty::float(), Ty::int()),
             };
             let want = Ty::Fn(vec![from], EffectRow::pure(), Box::new(to.clone()));
             let got = Ty::Fn(arg_ts, EffectRow::pure(), Box::new(to.clone()));

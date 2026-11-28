@@ -120,7 +120,31 @@ fn run(exe: &Path, stress: Option<&str>) -> Output {
     if let Some(n) = stress {
         cmd.env("ELYA_GC_STRESS", n);
     }
-    cmd.output().expect("run a built program")
+    // At most five minutes (the slowest corpus program under stress takes
+    // seconds): a program that does not end fails the test instead of
+    // hanging it (found by a negative control whose `<.` became an integer
+    // comparison and looped).
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd.spawn().expect("run a built program");
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(300)) {
+        Ok(out) => out.expect("run a built program"),
+        Err(_) => {
+            let _ = if cfg!(windows) {
+                Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .output()
+            } else {
+                Command::new("kill").args(["-9", &pid.to_string()]).output()
+            };
+            panic!("{}: did not end within five minutes", exe.display());
+        }
+    }
 }
 
 fn shown(o: &Output) -> (String, String, Option<i32>) {

@@ -80,15 +80,15 @@ fn native_proof() {
                 .map(|(i, t)| (format!("focused #{i}"), t.to_string())),
         );
     let mut largest: Option<(String, String)> = None;
-    let (mut compared, mut floats) = (0, 0);
+    let (mut compared, mut escaped) = (0, 0);
     for (name, text) in texts {
         let Some(want) = support::want(&text) else {
             continue;
         };
         let path = scratch.put(&text);
         let got = run(&path);
-        if got == support::FLOAT || got == support::ESCAPED {
-            floats += 1;
+        if got == support::ESCAPED {
+            escaped += 1;
             continue;
         }
         parse_support::assert_dump(&name, &got, &want);
@@ -99,7 +99,7 @@ fn native_proof() {
     }
     assert!(
         compared >= 350 + support::FOCUSED.len(),
-        "natively: at least 350 corpus programs, and the focused set ({compared}, {floats} with a Float literal)"
+        "natively: at least 350 corpus programs, and the focused set ({compared}, {escaped} with a character Debug escapes)"
     );
     let (name, text) = largest.expect("a program");
     let path = scratch.put(&text);

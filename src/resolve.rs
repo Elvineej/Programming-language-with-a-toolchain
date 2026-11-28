@@ -26,7 +26,8 @@ pub const INT_BINARY_BUILTINS: &[&str] = &[
 
 /// The `float.*` conversions (spec 2026-10-24-elya-float-part-2 D3, D4):
 /// `of_int : fn(Int) -> Float`, `truncate` and `round : fn(Float) -> Int`.
-pub const FLOAT_CONVERSIONS: &[&str] = &["of_int", "truncate", "round"];
+pub const FLOAT_CONVERSIONS: &[&str] =
+    &["of_int", "truncate", "round", "parse", "to_bits", "of_bits"];
 
 /// The `string.*` builtins (spec 2026-10-24-elya-trace-text D1): a string by
 /// byte. `length : fn(String) -> Int`, `byte_at : fn(String, Int) -> Int`,
@@ -115,6 +116,10 @@ pub fn builtins() -> &'static [&'static str] {
         "float.of_int",
         "float.truncate",
         "float.round",
+        // A float's text and bits (2026-11-28, spec 2026-11-28-elya-float-in-elya D1).
+        "float.parse",
+        "float.to_bits",
+        "float.of_bits",
         // A string by byte (2026-10-30, spec 2026-10-24-elya-trace-text D1).
         "string.length",
         "string.byte_at",

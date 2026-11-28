@@ -34,11 +34,6 @@ pub fn want(text: &str) -> Option<String> {
     })
 }
 
-/// What Core in Elya prints for a program with a `Float` literal, whose
-/// value its parser does not keep: such programs are not compared.
-#[allow(dead_code)]
-pub const FLOAT: &str = "refused Unsupported(\"Float in Elya\")\n";
-
 /// What it prints for a string literal holding a character Rust's `{:?}`
 /// may escape (a combining mark, a zero-width space, ...), which it does not
 /// decide: not compared either.
@@ -47,6 +42,11 @@ pub const ESCAPED: &str = "refused Unsupported(\"a character Debug escapes\")\n"
 
 #[allow(dead_code)]
 pub const FOCUSED: &[&str] = &[
+    // Float literals (spec 2026-11-28-elya-float-in-elya D2, D3): the nearest
+    // double of each, a subnormal, the largest, separators, a negative
+    // literal, `-0.0` written and `-.` (Core's own `-0.0`).
+    "pub fn main() -> Float { 0.1 +. 1.5 +. 1.0e300 +. 2.5e-310 +. 1.7976931348623157e308 +. 1_000.25 +. 0.30000000000000004 }\n",
+    "fn f(x: Float) -> Float { -.x }\npub fn main() -> Float { f(-0.0) +. -2.5 +. 3.0e-5 +. 12345678901234567890.0 }\n",
     // Strings: every escape, a raw tab and newline, a non-ASCII byte, in literals and patterns.
     "fn f(s) { match s { \"a\\\"b\\\\c\\n\\t\\r\" -> 1  \"\t\n\" -> 2  \"é\" -> 3  _ -> 4 } }\npub fn main() / {IO} { io.println(\"q\\\"\\\\\\n\" <> \"é\t\") }\n",
     // Unary and short-circuit operators.

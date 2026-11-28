@@ -528,6 +528,13 @@ pub(crate) fn float_conversion(
 ) -> Result<Value, RuntimeError> {
     match (name, args) {
         ("of_int", [Value::Int(n)]) => Ok(Value::Float(*n as f64)),
+        // Spec 2026-11-28-elya-float-in-elya D1: the bits as a signed word,
+        // both ways, exactly; a literal's text to its nearest double.
+        ("to_bits", [Value::Float(x)]) => Ok(Value::Int(x.to_bits() as i64)),
+        ("of_bits", [Value::Int(n)]) => Ok(Value::Float(f64::from_bits(*n as u64))),
+        ("parse", [Value::Str(s)]) => float_text_value(s)
+            .map(Value::Float)
+            .ok_or_else(|| rt(span, format!("float.parse: `{s}` is not a number"))),
         ("truncate" | "round", [Value::Float(x)]) => {
             if x.is_nan() {
                 return Err(rt(span, format!("float.{name}: NaN has no Int value")));
@@ -552,6 +559,49 @@ pub(crate) fn float_conversion(
         }
         _ => Err(rt(span, format!("float.{name}: a wrong argument"))),
     }
+}
+
+/// `float.parse`'s text (spec 2026-11-28-elya-float-in-elya D1): `-`, digits,
+/// a `.` and digits, an `e` or `E`, a sign and digits, the last two parts
+/// optional; `_` only between two digits. Its nearest double, or `None`.
+/// The native runtime accepts the same texts (`elya_float_parse`).
+pub fn float_text_value(s: &str) -> Option<f64> {
+    let b = s.as_bytes();
+    let digit = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
+    let mut clean = String::with_capacity(s.len());
+    for (i, &c) in b.iter().enumerate() {
+        if c == b'_' {
+            if i == 0 || !digit(i - 1) || !digit(i + 1) {
+                return None;
+            }
+        } else {
+            clean.push(c as char);
+        }
+    }
+    let t = clean.as_bytes();
+    let mut i = usize::from(t.first() == Some(&b'-'));
+    let run = |mut i: usize| {
+        let start = i;
+        while t.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        (i > start).then_some(i)
+    };
+    i = run(i)?;
+    if t.get(i) == Some(&b'.') {
+        i = run(i + 1)?;
+    }
+    if matches!(t.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(t.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        i = run(i)?;
+    }
+    if i != t.len() {
+        return None;
+    }
+    clean.parse().ok()
 }
 
 /// `buffer.new`, `buffer.push`, `buffer.finish` (spec 2026-11-14-elya-buffer

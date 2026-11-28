@@ -1432,7 +1432,13 @@ impl<'a, 'b, 'ctx> Cx<'a, 'b, 'ctx> {
                     vals[1].into_int_value(),
                 )
             }
-            "float.of_int" | "float.truncate" | "float.round" if vals.len() == 1 => {
+            "float.parse" if vals.len() == 1 => {
+                crate::float_parse(self.b, self.lc, vals[0].into_pointer_value())
+            }
+            "float.of_int" | "float.truncate" | "float.round" | "float.to_bits"
+            | "float.of_bits"
+                if vals.len() == 1 =>
+            {
                 crate::float_conversion(self.ctx, self.b, self.lc, name, vals[0].into_int_value())
             }
             n if n.starts_with("string.") && !vals.is_empty() => {

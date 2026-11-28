@@ -761,7 +761,7 @@ fn value_of(borrow occ: Array(List(KV)), borrow caps: Array(List(KL)), e: Sp(Exp
       }
       Sp(ELambda(_, _), a, b) -> pairs_with(ltab_get(caps, key(a, b)), key(a, b), acc)
       Sp(EInt(_), _, _) -> acc
-      Sp(EFloat, _, _) -> acc
+      Sp(EFloat(_), _, _) -> acc
       Sp(EStr(_), _, _) -> acc
       Sp(EBool(_), _, _) -> acc
       Sp(EUnit, _, _) -> acc
