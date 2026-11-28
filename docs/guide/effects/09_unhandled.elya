@@ -1,0 +1,8 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
+
+effect Ask { fn ask() -> String }
+
+pub fn main() {
+  io.println(ask())
+}

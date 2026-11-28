@@ -1,0 +1,17 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
+
+effect Ask { fn ask() -> String }
+
+fn call(f: fn() / {e} -> String) / {e} -> String { f() }
+
+fn print_result(f: fn() / {e} -> String) / {IO | e} -> Unit {
+  io.println(call(f))
+}
+
+pub fn main() / {IO} -> Unit {
+  print_result(fn() { "pure callback" })
+  handle print_result(fn() { ask() }) with {
+    Ask.ask() -> resume("effectful callback")
+  }
+}

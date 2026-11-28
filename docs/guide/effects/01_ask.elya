@@ -1,0 +1,16 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
+
+effect Ask { fn ask(prompt: String) -> String }
+
+fn greet() / {Ask} -> String {
+  "Hello, " <> ask("name")
+}
+
+pub fn main() {
+  let message = handle greet() with {
+    Ask.ask(prompt) -> resume(if prompt == "name" { "Ada" } else { "friend" })
+    return(text) -> text <> "!"
+  }
+  io.println(message)
+}
