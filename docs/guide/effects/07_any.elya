@@ -1,0 +1,26 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
+
+effect Dice { fn roll(sides: Int) -> Int }
+effect Clock { fn now() -> Int }
+
+fn trace(body) {
+  handle body() with any {
+    op(o) -> {
+      let answer = op.perform(o)
+      io.println(op.show(o) <> " = " <> op.encode(o, answer))
+      resume(answer)
+    }
+  }
+}
+
+pub fn main() {
+  let total = handle {
+    handle trace(fn() { roll(6) + now() }) with {
+      Dice.roll(sides) -> resume(sides)
+    }
+  } with {
+    Clock.now() -> resume(10)
+  }
+  io.println(int.to_string(total))
+}

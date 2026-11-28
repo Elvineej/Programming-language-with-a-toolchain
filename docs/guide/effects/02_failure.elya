@@ -1,0 +1,19 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
+
+type Never { }
+effect Fail { fn fail(reason: String) -> Never }
+
+fn checked_name(name: String) / {Fail} -> String {
+  if name == "" { match fail("missing name") { } } else { name }
+}
+
+pub fn main() {
+  let message = handle {
+    "Welcome, " <> checked_name("")
+  } with {
+    Fail.fail(reason) -> "Rejected: " <> reason
+    return(text) -> text <> "!"
+  }
+  io.println(message)
+}

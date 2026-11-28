@@ -1,0 +1,16 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
+
+effect Name { fn name() -> String }
+effect Title { fn title() -> String }
+
+pub fn main() {
+  let message = handle {
+    handle { title() <> " " <> name() } with {
+      Name.name() -> resume("Ada")
+    }
+  } with {
+    Title.title() -> resume("Dr.")
+  }
+  io.println(message)
+}

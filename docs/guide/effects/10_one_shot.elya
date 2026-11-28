@@ -1,0 +1,14 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
+
+effect Pick { fn pick() -> Int }
+
+pub fn main() {
+  let _ = handle pick() with {
+    Pick.pick() -> {
+      let _ = resume(1)
+      resume(2)
+    }
+  }
+  io.println("unreached")
+}

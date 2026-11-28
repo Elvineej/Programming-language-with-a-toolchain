@@ -1,0 +1,22 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
+
+effect State {
+  fn get() -> Int
+  fn put(value: Int) -> Unit
+}
+
+fn increment_twice() / {State} -> Int {
+  let _ = put(get() + 1)
+  let _ = put(get() + 1)
+  get()
+}
+
+pub fn main() {
+  let run = handle increment_twice() with {
+    State.get() -> fn(state: Int) { resume(state)(state) }
+    State.put(value) -> fn(state: Int) { resume(Unit)(value) }
+    return(result) -> fn(state: Int) { result }
+  }
+  io.println(int.to_string(run(40)))
+}

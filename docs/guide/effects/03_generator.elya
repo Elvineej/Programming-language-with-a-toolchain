@@ -1,0 +1,29 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
+
+effect Emit { fn emit(n: Int) -> Unit }
+type Step { Done, More(Int, fn() -> Step) }
+
+fn numbers() / {Emit} -> Unit {
+  let _ = emit(10)
+  emit(20)
+}
+
+fn start() -> Step {
+  handle numbers() with {
+    Emit.emit(n) -> More(n, fn() { resume(Unit) })
+    return(_) -> Done
+  }
+}
+
+fn print_steps(step: Step) / {IO} -> Unit {
+  match step {
+    Done -> io.println("done")
+    More(n, next) -> {
+      io.println(int.to_string(n))
+      print_steps(next())
+    }
+  }
+}
+
+pub fn main() { print_steps(start()) }

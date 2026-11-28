@@ -1,0 +1,16 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
+
+effect multi Flip { fn flip() -> Bool }
+
+fn choose() / {Flip} -> String {
+  if flip() { "heads" } else { "tails" }
+}
+
+pub fn main() {
+  let outcomes = handle choose() with multi {
+    Flip.flip() -> resume(True) <> " / " <> resume(False)
+    return(side) -> "[" <> side <> "]"
+  }
+  io.println(outcomes)
+}
