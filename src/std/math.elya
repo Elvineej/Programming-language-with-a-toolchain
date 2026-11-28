@@ -1,0 +1,163 @@
+// Elya. Copyright (c) 2026 Elvin Elakkattu (https://github.com/Elvineej).
+// SPDX-License-Identifier: PolyForm-Strict-1.0.0 (see LICENSE.md)
+
+// Return the magnitude of x, with checked overflow at Int's minimum.
+pub fn abs(x: Int) / {} -> Int {
+  if x < 0 { -x } else { x }
+}
+
+// Return the smaller of two integers.
+pub fn min(x: Int, y: Int) / {} -> Int {
+  if x < y { x } else { y }
+}
+
+// Return the larger of two integers.
+pub fn max(x: Int, y: Int) / {} -> Int {
+  if x > y { x } else { y }
+}
+
+// Limit x to the inclusive interval [lo, hi], assuming lo <= hi.
+pub fn clamp(x: Int, lo: Int, hi: Int) / {} -> Int {
+  min(max(x, lo), hi)
+}
+
+// Return -1, 0, or 1 according to the sign of x.
+pub fn sign(x: Int) / {} -> Int {
+  if x < 0 { -1 } else {
+    if x > 0 { 1 } else { 0 }
+  }
+}
+
+// Return the nonnegative greatest common divisor, with gcd(0, 0) = 0 and checked overflow if it exceeds Int's maximum.
+pub fn gcd(x: Int, y: Int) / {} -> Int {
+  if y == 0 { abs(x) } else { gcd(y, x % y) }
+}
+
+// Return the nonnegative least common multiple, or zero if either input is zero.
+pub fn lcm(x: Int, y: Int) / {} -> Int {
+  if x == 0 || y == 0 { 0 } else { abs((x / gcd(x, y)) * y) }
+}
+
+// Raise base to a nonnegative exponent by squaring, with checked overflow.
+pub fn pow(base: Int, exp: Int) / {} -> Int {
+  if exp == 0 {
+    1
+  } else {
+    if exp == 1 {
+      base
+    } else {
+      let half = pow(base, exp / 2)
+      let square = half * half
+      if exp % 2 == 0 { square } else { square * base }
+    }
+  }
+}
+
+// Search with lo <= sqrt(x) < hi, comparing mid to x / mid to avoid overflow.
+fn isqrt_between(x: Int, lo: Int, hi: Int) / {} -> Int {
+  if hi - lo == 1 {
+    lo
+  } else {
+    let mid = lo + (hi - lo) / 2
+    if mid <= x / mid { isqrt_between(x, mid, hi) } else { isqrt_between(x, lo, mid) }
+  }
+}
+
+// Return the floor of the square root of a nonnegative Int.
+pub fn isqrt(x: Int) / {} -> Int {
+  // 3037000500 is the first integer above the square root of Int's maximum.
+  isqrt_between(x, 0, 3037000500)
+}
+
+// Return the integer quotient rounded towards minus infinity.
+pub fn div_floor(x: Int, y: Int) / {} -> Int {
+  let q = x / y
+  let r = x % y
+  if r != 0 && (r < 0) != (y < 0) { q - 1 } else { q }
+}
+
+// Return the remainder with the divisor's sign, or zero for exact division.
+pub fn mod_floor(x: Int, y: Int) / {} -> Int {
+  let r = x % y
+  if r != 0 && (r < 0) != (y < 0) { r + y } else { r }
+}
+
+// Return the IEEE 754 bit pattern with the sign bit cleared.
+fn magnitude_bits(x: Float) / {} -> Int {
+  int.and(float.to_bits(x), 9223372036854775807)
+}
+
+// Clear the sign bit, including on zero and NaN.
+pub fn fabs(x: Float) / {} -> Float {
+  float.of_bits(magnitude_bits(x))
+}
+
+// Test whether the magnitude bit pattern lies above infinity's.
+pub fn is_nan(x: Float) / {} -> Bool {
+  magnitude_bits(x) > 9218868437227405312
+}
+
+// Test whether x is positive or negative infinity.
+pub fn is_infinite(x: Float) / {} -> Bool {
+  magnitude_bits(x) == 9218868437227405312
+}
+
+// Test whether x is finite, including zeros and subnormals.
+pub fn is_finite(x: Float) / {} -> Bool {
+  magnitude_bits(x) < 9218868437227405312
+}
+
+// Return the smaller float, favoring -0.0 over +0.0 and a number over a NaN.
+pub fn fmin(x: Float, y: Float) / {} -> Float {
+  if x <. y || is_nan(y) {
+    x
+  } else {
+    if y <. x || is_nan(x) {
+      y
+    } else {
+      if float.to_bits(x) < float.to_bits(y) { x } else { y }
+    }
+  }
+}
+
+// Return the larger float, favoring +0.0 over -0.0 and a number over a NaN.
+pub fn fmax(x: Float, y: Float) / {} -> Float {
+  if x >. y || is_nan(y) {
+    x
+  } else {
+    if y >. x || is_nan(x) {
+      y
+    } else {
+      if float.to_bits(x) > float.to_bits(y) { x } else { y }
+    }
+  }
+}
+
+// A binary64 can have a fractional part only below 2^52 in magnitude.
+fn can_have_fraction(x: Float) / {} -> Bool {
+  let magnitude = fabs(x)
+  magnitude >. 0.0 && magnitude <. 4503599627370496.0
+}
+
+// Round down, returning NaN, infinities, signed zero, and values outside Int's range unchanged.
+pub fn floor(x: Float) / {} -> Float {
+  if can_have_fraction(x) {
+    let whole = float.of_int(float.truncate(x))
+    if x <. whole { whole -. 1.0 } else { whole }
+  } else {
+    x
+  }
+}
+
+// Round up, returning NaN, infinities, signed zero, and values outside Int's range unchanged.
+pub fn ceil(x: Float) / {} -> Float {
+  if can_have_fraction(x) {
+    let t = float.truncate(x)
+    let whole = float.of_int(t)
+    if x >. whole { whole +. 1.0 } else {
+      if t == 0 { x *. 0.0 } else { whole }
+    }
+  } else {
+    x
+  }
+}

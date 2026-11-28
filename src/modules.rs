@@ -71,6 +71,7 @@ const STD_SOURCES: &[(&str, &str)] = &[
     // A hash map from strings over arrays (spec
     // 2026-11-14-elya-arrays-and-borrowing D7).
     ("elya/map", include_str!("std/map.elya")),
+    ("elya/math", include_str!("std/math.elya")),
 ];
 
 fn std_source(path: &str) -> Option<&'static str> {
