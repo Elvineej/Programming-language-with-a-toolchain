@@ -64,12 +64,13 @@ fn build(o: Opts) -> Int {
   }
 }
 
-pub fn main() / {IO} -> Int {
-  if io.arg_count() < 2 || io.arg(0) != "build" {
+// The status: 0 built, 1 not, 2 a usage error (spec 2026-11-28-elya-io-exit D5).
+pub fn main() / {IO} {
+  io.exit(if io.arg_count() < 2 || io.arg(0) != "build" {
     io.println("usage: elya build <file.elya> [-o <out>] [--runtime <dir>] [--std <dir>]")
     2
   } else {
     let file = io.arg(1)
     build(Opts(file, flag_value(2, "-o", stem(file)), flag_value(2, "--runtime", "crates/codegen/src"), flag_value(2, "--std", "src/std")))
-  }
+  })
 }

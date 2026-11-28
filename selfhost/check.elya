@@ -2564,7 +2564,7 @@ fn host_signature(m: String, n: String) -> Sig {
         if n == "file_exists" { Sig(Cons(TB(3), Nil), TB(2)) } else {
           if n == "write_file" { Sig(Cons(TB(3), Cons(TB(3), Nil)), TB(4)) } else {
             if n == "read_stdin" { Sig(Nil, TB(3)) } else {
-              if n == "arg_count" { Sig(Nil, TB(0)) } else { if n == "arg" { Sig(Cons(TB(0), Nil), TB(3)) } else { if n == "run" { Sig(Cons(TB(3), Nil), TB(0)) } else { NoSig } } }
+              if n == "arg_count" { Sig(Nil, TB(0)) } else { if n == "arg" { Sig(Cons(TB(0), Nil), TB(3)) } else { if n == "run" { Sig(Cons(TB(3), Nil), TB(0)) } else { if n == "exit" { Sig(Cons(TB(0), Nil), TB(4)) } else { NoSig } } } }
             }
           }
         }

@@ -57,6 +57,7 @@ pub const IO_BUILTINS: &[&str] = &[
     "arg_count",
     "arg",
     "run",
+    "exit",
 ];
 
 /// How many arguments a builtin takes (every name in [`builtins`]).
@@ -89,6 +90,8 @@ pub fn builtins() -> &'static [&'static str] {
         "io.arg",
         // Running a program (2026-11-27, spec 2026-11-27-elya-the-switch D1).
         "io.run",
+        // Ending with a status (2026-11-28, spec 2026-11-28-elya-io-exit D1).
+        "io.exit",
         // A linear text buffer (spec 2026-11-14-elya-buffer D2).
         "buffer.new",
         "buffer.push",

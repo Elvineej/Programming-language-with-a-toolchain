@@ -155,11 +155,15 @@ pub(crate) fn match_pattern(value: &Value, pat: &Pattern) -> Option<Vec<(String,
 #[derive(Debug)]
 pub struct RuntimeError {
     pub diag: Diagnostic,
+    /// `io.exit(status)` (spec 2026-11-28-elya-io-exit D3): the run ends here
+    /// with this status, and is not a failure (`diag` is not shown).
+    pub exit: Option<i32>,
 }
 
 fn rt(span: Span, msg: impl Into<String>) -> RuntimeError {
     RuntimeError {
         diag: Diagnostic::error("E0300", msg).with_label(span, "during evaluation"),
+        exit: None,
     }
 }
 
@@ -287,6 +291,7 @@ const IO_HOST: &[&str] = &[
     "io.arg_count",
     "io.arg",
     "io.run",
+    "io.exit",
 ];
 
 /// The qualified name of the host's `io.<name>`, if it is one.
@@ -1830,6 +1835,7 @@ pub mod cek {
                             span,
                             "this handler is one-shot: only a `with multi` handler of an `effect multi` resumes more than once",
                         ),
+                    exit: None,
                 });
             }
             rd.consumed.set(true);
@@ -2182,6 +2188,10 @@ fn host_builtin(
     args: &[Value],
     span: Span,
 ) -> Result<Value, RuntimeError> {
+    // Not a question to the world: never recorded (spec 2026-11-28-elya-io-exit D2).
+    if name == "io.exit" {
+        return Err(exit_program(args, span));
+    }
     let mut q = format!("{name}(");
     for (i, a) in args.iter().enumerate() {
         if i > 0 {
@@ -2333,6 +2343,19 @@ fn io_builtin(
         }
         ("io.run", [Value::Str(command)]) => run_program(command, span),
         _ => Err(rt(span, format!("{name}: wrong arguments"))),
+    }
+}
+
+/// `io.exit(status)` (spec 2026-11-28-elya-io-exit D1): the run ends with
+/// `status`, 0 to 255; another fails in the native runtime's words.
+fn exit_program(args: &[Value], span: Span) -> RuntimeError {
+    match args {
+        [Value::Int(n)] if (0..=255).contains(n) => RuntimeError {
+            diag: Diagnostic::error("E0300", "the program exited"),
+            exit: Some(*n as i32),
+        },
+        [Value::Int(n)] => rt(span, format!("io.exit: status {n} is outside 0..255")),
+        _ => rt(span, "io.exit expects a single Int"),
     }
 }
 

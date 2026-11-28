@@ -1926,6 +1926,33 @@ void elya_io_write_file(void *path, void *text) {
     elya_gc_pop();
 }
 
+/* `io.exit(status)` (spec 2026-11-28-elya-io-exit D1, D4): the program ends
+ * here with `status`, its output written first; 0 to 255, or a failure by
+ * name. Asks the world nothing, so a trace holds nothing for it (D2). */
+void elya_io_exit(int64_t status) {
+    if (status < 0 || status > 255) {
+        AnyBuf m = {0};
+        char digits[24];
+        int64_t len = 0;
+        uint64_t u = status < 0 ? (uint64_t)0 - (uint64_t)status : (uint64_t)status;
+        do {
+            digits[len++] = (char)('0' + u % 10);
+            u /= 10;
+        } while (u);
+        any_puts(&m, "elya: io.exit: status ");
+        if (status < 0) {
+            any_puts(&m, "-");
+        }
+        while (len) {
+            any_put(&m, &digits[--len], 1);
+        }
+        any_puts(&m, " is outside 0..255");
+        io_fail(&m);
+    }
+    elya_platform_flush();
+    elya_platform_exit((int)status);
+}
+
 /* `io.run(command)` (spec 2026-11-27-elya-the-switch D1): the command's lines
  * are the program and its arguments; the answer its exit status. Output
  * written before is flushed first, as the program shares the streams. */

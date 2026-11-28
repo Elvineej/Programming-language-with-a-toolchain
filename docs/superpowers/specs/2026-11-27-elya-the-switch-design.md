@@ -74,8 +74,8 @@ tests/io_run.rs (the evaluator: statuses, the three failures) and
 crates/codegen/tests/native_io_run.rs (statuses with the child's line in
 order, the failures in the same words, a record and a replay that runs
 nothing). The driver (D2) is `selfhost/elya.elya`; `main`'s value is its
-status (0 built, 1 not), printed as every native program's is, since Elya has
-no way to exit with a status of its own choosing yet. **The fixed point (D3)
+status (0 built, 1 not); since spec 2026-11-28-elya-io-exit it ends with
+that status (`io.exit`), 2 on a usage error. **The fixed point (D3)
 holds**: crates/codegen/tests/selfhost_switch.rs builds the driver with the
 Rust compiler (stage 1, 25 s), stage 1 builds it (stage 2, 86 s), stage 2
 builds it again (stage 3, 68 s), and stages 2 and 3 write the same IR, byte

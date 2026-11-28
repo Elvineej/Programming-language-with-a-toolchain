@@ -655,3 +655,26 @@ fn elya_version_names_the_author() {
         "{text}"
     );
 }
+
+/// `elya run` ends with the status `io.exit` gave, its output written (spec
+/// 2026-11-28-elya-io-exit D3).
+#[test]
+fn elya_run_ends_with_the_status_io_exit_gave() {
+    let dir = scratch("exit");
+    let prog = dir.join("exit.elya");
+    std::fs::write(
+        &prog,
+        "pub fn main() / {IO} {\n  io.println(\"before\")\n  io.exit(3)\n  io.println(\"after\")\n}\n",
+    )
+    .expect("write program");
+    for value in [false, true] {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_elya"));
+        c.arg("run");
+        if value {
+            c.arg("--value");
+        }
+        let out = c.arg(&prog).output().expect("spawn elya run");
+        assert_eq!(out.status.code(), Some(3), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "before\n", "{out:?}");
+    }
+}

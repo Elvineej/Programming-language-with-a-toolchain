@@ -54,6 +54,12 @@ fn stage_build(root: &Path, compiler: &Path, source: &Path, out: &Path) -> (bool
         String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr)
     );
+    // The driver's status says what happened (spec 2026-11-28-elya-io-exit D5).
+    assert_eq!(
+        o.status.code(),
+        Some(if out.exists() { 0 } else { 1 }),
+        "a stage's status and its output disagree: {text}"
+    );
     (out.exists(), text)
 }
 

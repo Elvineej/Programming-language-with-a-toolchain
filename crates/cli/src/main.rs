@@ -322,6 +322,9 @@ fn cmd(args: &[String], host: Option<elya::eval::Host>) -> ExitCode {
         // D1: the output a failing run produced is printed before its error.
         let o = elya::run_source_outcome_host(path, &text, &mut files(path), host);
         print!("{}", o.output);
+        if let Some(status) = o.status {
+            return ExitCode::from(status as u8);
+        }
         match o.error {
             None => {
                 surface_warnings(path, &text);
@@ -364,6 +367,9 @@ fn value_cmd(args: &[String], host: elya::eval::Host) -> ExitCode {
     };
     let o = elya::run_source_outcome_host(path, &text, &mut files(path), host);
     print!("{}", o.output);
+    if let Some(status) = o.status {
+        return ExitCode::from(status as u8);
+    }
     if let Some(diags) = o.error {
         eprint!("{diags}");
         return ExitCode::FAILURE;
@@ -576,6 +582,9 @@ fn trace_cmd(args: &[String], host: elya::eval::Host) -> ExitCode {
         }
     };
     print!("{}", o.output);
+    if let Some(status) = o.status {
+        return ExitCode::from(status as u8);
+    }
     match o.error {
         None => {
             surface_warnings(path, &text);

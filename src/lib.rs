@@ -112,6 +112,10 @@ pub fn run_source(name: &str, text: &str) -> Result<String, String> {
     }
     match eval::run_module(&module) {
         Ok(interp) => Ok(interp.output().to_string()),
+        // `io.exit`: the output is `run_source_outcome`'s to keep.
+        Err(eval::RuntimeError { exit: Some(s), .. }) => {
+            Err(format!("the program exited with status {s}\n"))
+        }
         Err(e) => Err(render(&[e.diag], &sm)),
     }
 }
@@ -129,6 +133,9 @@ pub struct RunOutcome {
     /// `Unit` is `0`), or why it has none (a function is not data, D2).
     pub line: Option<Result<String, String>>,
     pub error: Option<String>,
+    /// The status `io.exit` ended the run with (spec 2026-11-28-elya-io-exit
+    /// D3): not a failure, and no value.
+    pub status: Option<i32>,
 }
 
 pub fn run_source_outcome(name: &str, text: &str) -> RunOutcome {
@@ -164,6 +171,7 @@ impl RunOutcome {
             value: None,
             line: None,
             error: Some(error),
+            status: None,
         }
     }
 
@@ -189,12 +197,23 @@ impl RunOutcome {
                     _ => Err("main's value is not an `Int` or `Unit`".to_string()),
                 }),
                 error: None,
+                status: None,
+            },
+            Err(eval::RuntimeError {
+                exit: Some(status), ..
+            }) => RunOutcome {
+                output,
+                value: None,
+                line: None,
+                error: None,
+                status: Some(status),
             },
             Err(e) => RunOutcome {
                 output,
                 value: None,
                 line: None,
                 error: Some(render(&[e.diag], sm)),
+                status: None,
             },
         }
     }

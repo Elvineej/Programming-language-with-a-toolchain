@@ -787,6 +787,10 @@ pub(crate) fn io_builtin<'ctx>(
         ("io.arg_count", []) => value(call(lc.io_arg_count, &[])?),
         ("io.arg", [i]) => value(call(lc.io_arg, &[tag.into(), (*i).into()])?),
         ("io.run", [c]) => value(call(lc.io_run, &[(*c).into()])?),
+        ("io.exit", [s]) => {
+            call(lc.io_exit, &[(*s).into()])?;
+            Ok(i64t.const_int(0, false).into())
+        }
         _ => Err(CodegenError::UnsupportedBuiltin(name.to_string())),
     }
 }
@@ -1019,6 +1023,7 @@ pub(crate) fn is_native_builtin(name: &str) -> bool {
             | "io.arg_count"
             | "io.arg"
             | "io.run"
+            | "io.exit"
             | "buffer.new"
             | "buffer.push"
             | "buffer.finish"
@@ -2838,6 +2843,8 @@ struct LowerCtx<'a, 'ctx> {
     io_arg_count: FunctionValue<'ctx>,
     io_arg: FunctionValue<'ctx>,
     io_run: FunctionValue<'ctx>,
+    /// `elya_io_exit` (spec 2026-11-28-elya-io-exit D4).
+    io_exit: FunctionValue<'ctx>,
     /// `elya_buffer_*` (spec 2026-11-14-elya-buffer).
     buffer_new: FunctionValue<'ctx>,
     buffer_push: FunctionValue<'ctx>,
@@ -3087,6 +3094,11 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
     );
     let io_arg_count = module.add_function("elya_io_arg_count", i64t.fn_type(&[], false), None);
     let io_run = module.add_function("elya_io_run", i64t.fn_type(&[ptrt.into()], false), None);
+    let io_exit = module.add_function(
+        "elya_io_exit",
+        ctx.void_type().fn_type(&[i64t.into()], false),
+        None,
+    );
     let io_arg = module.add_function(
         "elya_io_arg",
         ptrt.fn_type(&[i64t.into(), i64t.into()], false),
@@ -3285,6 +3297,7 @@ fn build_module<'ctx>(ctx: &'ctx Context, core: &CoreModule) -> Result<Module<'c
         io_arg_count,
         io_arg,
         io_run,
+        io_exit,
         buffer_new,
         buffer_push,
         buffer_finish,

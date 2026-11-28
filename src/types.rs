@@ -3391,6 +3391,7 @@ impl Infer {
             ("io", "file_exists") => (vec![Ty::str()], Ty::bool()),
             ("io", "write_file") => (vec![Ty::str(), Ty::str()], Ty::unit()),
             ("io", "run") => (vec![Ty::str()], Ty::int()),
+            ("io", "exit") => (vec![Ty::int()], Ty::unit()),
             ("io", "read_stdin") => (Vec::new(), Ty::str()),
             ("io", "arg_count") => (Vec::new(), Ty::int()),
             ("io", "arg") => (vec![Ty::int()], Ty::str()),
