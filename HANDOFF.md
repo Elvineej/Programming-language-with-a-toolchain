@@ -30,7 +30,7 @@ then `PARKED.md`. The newest spec in `docs/superpowers/specs/` shows the house s
   that Ubuntu, so not the codegen suite). The VM's home goes with the session.
 - Parked, unmerged: `claude/outside-edit-tail-in-match` -- edits from another writer (not
   this session); superseded by `claude/tail-in-match`, kept until the maintainer says.
-- Linux gate at the tip of `main`: 1690 passed, 213 suites (2026-11-27), and configuration C
+- Linux gate at the tip of `main`: 1718 passed, 223 suites (2026-11-28), and configuration C
   (the boards on QEMU; `check.sh` fails without its tools unless
   `ELYA_BOARDS=skip`) 8 passed, 2 suites. **Look at the Windows
   gate after every push** (`gh run list`): it was red from cf3f028 to 145b662
@@ -865,8 +865,14 @@ write the same IR byte for byte (`selfhost_switch.rs`, Unix: the driver
 passes Unix flags to `clang`). The back end in Elya spills parameters past
 three into a record as the Rust back end does (spec
 `2026-11-27-elya-backend-argument-records-design.md`; Windows CI found it:
-win64 cannot guarantee a tail call to a function of more than five). Left
-before Rust can retire (spec D4): F6; handlers and `Float` in the back end in Elya; a
+win64 cannot guarantee a tail call to a function of more than five). Since then (2026-11-28, spec
+`2026-11-28-elya-retiring-rust-design.md` for the order): `io.exit` (the
+driver ends with its status), `io.os` (the driver's flags by platform, so the
+switch runs on Windows too, and passes there), and `Float` through the whole
+compiler in Elya (`float.parse`/`to_bits`/`of_bits`). Next for Claude:
+effects and handlers in the back end in Elya (spec
+`2026-11-28-elya-backend-effects-design.md`, stages E1-E6). Left
+before Rust can retire (spec D4): F6; handlers in the back end in Elya; a
 diagnostic renderer in Elya; the driver's platform flags and an exit status of
 its own; and the evaluator (`elya run`), or a decision that native `build` is
 the only way to run.
